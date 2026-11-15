@@ -4,8 +4,9 @@ These are the answers applied to the open questions of the four specs in `docs/s
 recommendation, applied so the specs could move on; **the user may overrule any of them**. Every row names exactly
 the spec sections it changed, so a decision is reverted by restoring those sections and putting its question back
 in that spec's "Open questions". Abbreviations: QT `query-tree.md`, ISO `isolation.md`, DISK `on-disk-format.md`,
-WIRE `wire-protocol.md`, ERR `errors.md`, DDL `ddl.md`. Rows Q30 onward were decided while writing `ddl.md`; to
-revert one, restore its sections and add its question to `ddl.md` §11.
+WIRE `wire-protocol.md`, ERR `errors.md`, DDL `ddl.md`, CAPI `c-api.md`. Rows Q30 onward were decided while
+writing `ddl.md`; to revert one, restore its sections and add its question to `ddl.md` §11. Rows C1 onward were
+decided while writing `c-api.md`; to revert one, rewrite its sections and add its question to `c-api.md` §16.
 
 ## Query tree, types and values
 
@@ -89,3 +90,20 @@ revert one, restore its sections and add its question to `ddl.md` §11.
 | Q41 | How is the catalog queried? | Read-only system views in the namespace `catalog`, a stable versioned contract; the `sys.*` trees are internal and cannot be scanned; types are reported as QT §12.3 bytes plus text. | DDL §4; DISK §3.9 |
 | Q42 | Generated columns and volatile defaults? | Generated columns are stored only; adding a column with a volatile default, a generated column or an identity column is a background fill, invisible until done. | DDL §2.7 rule 2, §8.2 |
 | Q43 | Catalog storage for the new objects? | `sys.objects` gains kinds 6–8, `definition` (replacing the empty `options`), `state` and `owner_oid`; `sys.columns` gains `column_id`, `type_oid`, `fill`, `generated`, `identity`, `state` and loses `dropped`; trees 4–7 are `sys.depends`, `sys.grants`, `sys.jobs`, `sys.sequence_state`; an update that changes a row's schema version logs the whole old row in its undo. | DISK §3.9, §5.2 (UPDATE payload) |
+
+## C ABI
+
+| Id | Question | Decision | Sections changed |
+|---|---|---|---|
+| C1 | Async completion: callback or pollable descriptor? | A completion queue with a level-triggered descriptor (`terndb_queue_fd`), drained on the caller's thread; no completion callbacks. Every waiting operation has a sync form equal to async plus wait. | CAPI §6, §12 (queue and op functions), §15.1 properties 14–15 |
+| C2 | Errors: thread-local last error or out-parameter? | An owned `terndb_error *` through a trailing `terndb_error **err` out-parameter (NULL allowed); no thread-local state. | CAPI §1 rule 4, §10, §12 (error functions) |
+| C3 | Structs or opaque option objects? | No struct with a visible layout anywhere in the ABI: options are opaque objects with typed setters, open settings a string key/value `terndb_config` (unknown keys refused), the allocator two function pointers to `terndb_init`. Enumerations are `int32_t` with `#define`s. | CAPI §1 rules 1–2, §3, §4.1, §5.2, §12 |
+| C4 | Client-chosen integer handles, as on the wire? | No: the library allocates transaction and statement handles; `terndb_begin_async` writes the handle at once so a begin, executes and commit pipeline without waiting. | CAPI §5.3 rules 2–3, §7 rule 1 |
+| C5 | Closing a database or connection with live dependants? | Permitted in any order: dependants stay valid to free and fail other calls with `C1006`; a batch outlives its result, connection and database. | CAPI §2.2 rules 3–4, §4.3, §5.1 rule 4 |
+| C6 | Codes for C-layer failures? | A new area `C` (`C1001`–`C1009`, `C2001`), and `D4001`–`D4004` for opening a database. Not sent on the wire. | ERR §1 rule 1, §6 (D4 rows), §7 (new); CAPI §10.3 |
+| C7 | Threads and blocking? | Embedded engine is thread-per-core plus one service thread; no caller code on a core thread except the allocator; a connection is used by one thread at a time (overlap detected, `C1004`); a blocking call from an engine thread is `C1003`. | CAPI §2.3, §2.4 |
+| C8 | Logging and metrics? | One process-wide log sink, called on the service thread from a bounded queue that drops rather than blocks; metrics pulled as snapshots per database with a minimum stable name set. | CAPI §11 |
+| C9 | Promotion as a function? | `terndb_promote` = snapshot to a directory then open it in disk mode; the source stays open. Opening a memory-mode directory in disk mode is promotion too. | CAPI §4.2 rule 4, §4.4 rule 3 |
+| C10 | Text across the ABI: `uint8_t` or `char`? | Text is `(const char *, size_t)` UTF-8, bytes `(const uint8_t *, size_t)`, neither NUL-terminated. | WIRE §9.1 rule 1; CAPI §1 rule 3 |
+| C11 | Role of an embedded session? | A new database gets a superuser login role `terndb`, which an embedded session takes by default; no authentication in-process. | CAPI §4.2 rule 2, §5.1 rule 1 (and see CAPI §16 question 7) |
+| C12 | Flow control for a pull API? | `prefetch_bytes` (default 4 MiB) bounds unpulled batches, mapped to wire credit in network mode. | CAPI §5.2 rule 3; §15.1 property 18 |

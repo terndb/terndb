@@ -1008,7 +1008,8 @@ fixes what that API MUST offer for results.
 
 1. Every object crosses the C boundary as an **opaque handle** (`terndb_result *`, `terndb_batch *`,
    `terndb_column *`, `terndb_type *`, `terndb_error *`). No sysl type, sysl string, slice or closure crosses it;
-   strings and buffers cross as `(const uint8_t *, size_t)` pairs; integers as `<stdint.h>` types.
+   text crosses as `(const char *, size_t)` UTF-8 pairs and buffers as `(const uint8_t *, size_t)` pairs, neither
+   NUL-terminated; integers as `<stdint.h>` types (`c-api.md` §1).
 2. A result is a **cursor over batches**: the caller pulls batches one at a time, and a batch stays valid until the
    caller frees it, independently of the result and of later batches.
 3. Column handles and buffer pointers obtained from a batch are borrowed from it and are valid until the batch is

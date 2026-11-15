@@ -16,7 +16,8 @@ from.*
 1. A **code** is one letter naming the area, then four decimal digits: `Q` query tree (validation, `query-tree.md`;
    the `Q6…` group is DDL validation, `ddl.md`),
    `R` runtime (evaluation, `query-tree.md`), `T` transactions and isolation (`isolation.md`), `W` wire
-   (`wire-protocol.md`), `D` storage (`on-disk-format.md`). The first digit groups related codes within an area.
+   (`wire-protocol.md`), `D` storage (`on-disk-format.md`; the `D4…` group is opening a database, `c-api.md` §4),
+   `C` the C ABI (`c-api.md`). The first digit groups related codes within an area.
 2. Every code has a **name**, unique across the registry, in `snake_case`. The name is an alias: specs, client
    libraries and server messages MAY use either, and they mean the same thing.
 3. On the wire and across the C ABI, `ErrorEntry.code` carries the **code**, never the name (`wire-protocol.md`
@@ -186,3 +187,24 @@ Raised under the rules of `on-disk-format.md`. None is retryable.
 | `D3001` | `format_unsupported` | The database's format is newer than this release, or a feature flag it does not know is set (§7.2, §3.10); the open is refused. |
 | `D3002` | `format_read_only` | A write to a database opened read-only because its format is older than this release can write (§7.2). |
 | `D3003` | `clone_unsupported` | An on-disk clone on a filesystem without reflink (§8.4). |
+| `D4001` | `database_locked` | Another process, or another open in this one, holds the database's `CONTROL` lock (§2 rule 4; `c-api.md` §4.2). |
+| `D4002` | `database_not_found` | Open with `create = never` of a directory that holds no database (`c-api.md` §4.2). |
+| `D4003` | `database_exists` | Open with `create = always`, or a snapshot or clone into a directory, that already holds a `CONTROL` (`c-api.md` §4.2, §4.4). |
+| `D4004` | `io_error` | A file of the database could not be read, created or synced (`details.errno`, `details.file`). |
+
+## 7. C ABI (`C`)
+
+Raised by `libterndb` itself under the rules of `c-api.md`, never sent on the wire. None is retryable or fatal.
+
+| Code | Name | Meaning |
+|---|---|---|
+| `C1001` | `invalid_handle` | A freed handle, or a handle of the wrong kind (checked in debug builds, `c-api.md` §2.4). |
+| `C1002` | `invalid_argument` | A NULL where one is required, an out-of-range index or value, an unknown or inapplicable configuration key. |
+| `C1003` | `wrong_thread` | A blocking call from an engine thread: the log sink or an allocator function (`c-api.md` §2.3). |
+| `C1004` | `concurrent_use` | A connection, or a transaction or statement of it, used by two threads at once. |
+| `C1005` | `invalid_state` | A call that the handle's state does not allow yet (result counts before the end, an operation's error while pending, a second `terndb_init` with other arguments). |
+| `C1006` | `closed` | A call on a handle whose connection or database has been closed. |
+| `C1007` | `not_supported` | An operation the database's mode does not support (snapshot or promotion of a disk-mode database). |
+| `C1008` | `not_initialized` | A call before `terndb_init`. |
+| `C1009` | `abi_mismatch` | The caller's header is of another ABI major, or a newer minor, than the library. |
+| `C2001` | `out_of_memory` | The allocator returned NULL outside any transaction. |
