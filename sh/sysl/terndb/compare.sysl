@@ -109,7 +109,7 @@ end common_integer
 
 // An exact numeric type as (digits before the point, digits after it): a decimal's own, or the
 // `decimal(p, 0)` an integer type coerces to (§4.1 rule 2).
-private exact_shape(t: Type) -> Option[(int, int)] = t match
+private[terndb] exact_shape(t: Type) -> Option[(int, int)] = t match
     Decimal(p, s) -> Some((int(p) - int(s), int(s)))
     Int8 | UInt8 -> Some((3, 0))
     Int16 | UInt16 -> Some((5, 0))
@@ -118,6 +118,62 @@ private exact_shape(t: Type) -> Option[(int, int)] = t match
     UInt64 -> Some((20, 0))
     Int128 -> Some((38, 0))
     _ -> None
+
+/** Whether `from` coerces to `to` by `query-tree.md` §4.1: exactly when `to` is their common type. */
+coerces(from: Type, to: Type) -> bool = common_type(from, to) match
+    Ok(t) -> t == to
+    Err(_) -> false
+
+/** How many §4.1 steps take `from` to `to`, or `None` where `from` does not coerce to `to`; overload
+ * resolution (§4.3 rule 2) chooses by it. Each arrow of a chain in §4.1 is one step (`int8 → int32` is
+ * two, `uint8 → int16` one, `int32 → decimal(12, 2)` two: to `decimal(10, 0)`, then widening), `T → T?`
+ * is one, `list → bag` one, and a record, union or relation takes the sum of its components' steps.
+ */
+coercion_steps(from: Type, to: Type) -> Option[int] =
+    if coerces(from, to) then Some(steps(from, to)) else None
+
+// The distance from `from` to `to`, which `from` is known to coerce to.
+private steps(from: Type, to: Type) -> int
+    if from == to then return 0
+    if to.is_nullable() then return (if from.is_nullable() then 0 else 1) + steps(from.base(), to.base())
+
+    val sf = signed_bits(from)
+    val uf = unsigned_bits(from)
+    val st = signed_bits(to)
+    val ut = unsigned_bits(to)
+
+    if uf > 0 && ut > 0 then return doublings(uf, ut)
+    if sf > 0 && st > 0 then return doublings(sf, st)
+    if uf > 0 && st > 0 then return 1 + doublings(2 * uf, st)
+
+    (from, to) match
+        (Decimal(_, _), Decimal(_, _)) -> 1
+        (_, Decimal(p, s)) ->
+            val (whole, _) = exact_shape(from).unwrap()
+            if s == 0 && int(p) == whole then 1 else 2
+        (Float32, Float64) -> 1
+        (Record(ff), Record(tf)) | (Union(ff), Union(tf)) ->
+            var n = 0
+
+            for i in 0..<ff.len()
+                n += steps(ff[i].ty, tf[i].ty)
+
+            n
+        (List(x), Bag(y)) -> 1 + steps(*x, *y)
+        (List(x), List(y)) | (Bag(x), Bag(y)) -> steps(*x, *y)
+        _ -> panic("steps: the types do not coerce")
+end steps
+
+// How many doublings take an integer width `a` to `b`.
+private doublings(a: int, b: int) -> int
+    var n = 0
+    var w = a
+
+    while w < b
+        w *= 2
+        n += 1
+
+    n
 
 /** `v`, of type `from`, as a value of `to`, a type `from` coerces to (`common_type` finds one). A
  * decimal's unscaled value is rescaled; a value too large for the rescaling is `R0001`.
@@ -366,9 +422,21 @@ private cmp_octets(x: []const u8, y: []const u8) -> int
  * null. A relation type anywhere in `t` is refused with `Q3006`.
  */
 eq(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError]
-    if has_relation(t) then return fail("Q3006", "eq on a relation type; use same")
-
+    check_equatable(t)?
     Ok(eq_of(t, a, b))
+
+/** Whether `eq` and `ne` are defined on `t`: `Q3006` where a relation type is anywhere in it. */
+check_equatable(t: Type) -> Result[unit, CodecError] =
+    if has_relation(t) then fail("Q3006", "eq on a relation type; use same") else Ok(())
+
+/** Whether the orderings are defined on `t`: `Q3006` where a relation type is anywhere in it, `Q3007`
+ * where a union, an interval or `json` is.
+ */
+check_orderable(t: Type) -> Result[unit, CodecError]
+    if has_relation(t) then return fail("Q3006", "an ordering comparison on a relation type")
+    if !orderable(t) then return fail("Q3007", "an ordering comparison on an unorderable type")
+
+    Ok(())
 
 /** `not eq`, null where `eq` is null, refused as `eq` is. */
 ne(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError] = Ok(eq(t, a, b)?.map(x -> !x))
@@ -410,9 +478,7 @@ end eq_of
 // The orderings: a relation anywhere in the type is `Q3006`, a union, an interval or `json` is
 // `Q3007`.
 private ordered(t: Type, a: Value, b: Value, holds: (int) -> bool) -> Result[Option[bool], CodecError]
-    if has_relation(t) then return fail("Q3006", "an ordering comparison on a relation type")
-    if !orderable(t) then return fail("Q3007", "an ordering comparison on an unorderable type")
-
+    check_orderable(t)?
     Ok(order_of(t, a, b).map(holds))
 
 // A record compares lexicographically, field by field: the first pair that is not equal decides, and a

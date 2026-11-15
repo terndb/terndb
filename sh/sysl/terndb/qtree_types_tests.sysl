@@ -1,0 +1,388 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The type checker against an in-memory catalog: the coercions of `query-tree.md` §4.1, the common
+// type (§4.2), overload resolution (§4.3) and the arithmetic result types (§4.4). The nodes, the
+// expressions, DML and the worked examples are in `qtree_types_node_tests.sysl`.
+
+// -- an in-memory catalog -------------------------------------------------------------------------
+
+struct FakeTable
+    name: QualName
+    info: TableInfo
+
+struct FakeType
+    name: QualName
+    ty: Type
+
+struct FakeFunction
+    name: string
+    sig: Signature
+
+struct FakeCatalog
+    tables: Buf[FakeTable]
+    types: Buf[FakeType]
+    overloads: Buf[FakeFunction]
+
+impl Catalog for FakeCatalog
+    table(self, name: QualName) -> Option[TableInfo]
+        for t in self.tables
+            if t.name == name then return Some(t.info)
+
+        None
+
+    named_type(self, name: QualName) -> Option[Type]
+        for t in self.types
+            if t.name == name then return Some(t.ty)
+
+        None
+
+    functions(self, name: string) -> Buf[Signature]
+        val out = buf[Signature]()
+
+        for f in self.overloads
+            if f.name == name then out.push(f.sig)
+
+        out
+
+cat_column(name: string, ty: Type) -> ColumnInfo = ColumnInfo(name, ty, true)
+
+fake_table(name: string, columns: []const ColumnInfo, unique: []const UniqueKey) -> FakeTable =
+    FakeTable(QualName("app", name), TableInfo(items_of(columns), items_of(unique), false))
+
+unique_key(name: string, columns: []const string) -> UniqueKey = UniqueKey(name, items_of(columns))
+
+/** `app.point`, a named record type. */
+point() -> Type = record([Field("x", Int32), Field("y", Int32)])
+
+/** The catalog every type test runs against: §16's tables, a table `app.t` with one column of each
+ * kind a test needs, a view, two named types and a few overloaded functions.
+ */
+fake() -> FakeCatalog
+    val tables = items_of([
+        fake_table("users", [cat_column("id", Int64), cat_column("name", Text)], [unique_key("users_pkey", ["id"])]),
+        fake_table("posts", [cat_column("id", Int64), cat_column("author_id", Int64), cat_column("title", Text), cat_column("created_at", Timestamp)], [unique_key("posts_pkey", ["id"])]),
+        fake_table("comments", [cat_column("id", Int64), cat_column("post_id", Int64), cat_column("body", Text)], [unique_key("comments_pkey", ["id"])]),
+        fake_table("photos", [cat_column("id", Int64), cat_column("created_at", Timestamp), cat_column("url", Text), cat_column("caption", Text)], [unique_key("photos_pkey", ["id"])]),
+        fake_table("counters", [cat_column("key", Text), cat_column("n", Int64)], [unique_key("counters_pkey", ["key"])]),
+        fake_table("t", [
+            cat_column("id", Int64),
+            cat_column("a", nullable(Int32)),
+            cat_column("d", nullable(Decimal(10, 2))),
+            ColumnInfo("gen", Int64, false),
+            cat_column("tags", list(Text)),
+            cat_column("f", Float64),
+            cat_column("u", UInt32),
+            cat_column("ts", Timestamp),
+            cat_column("flag", nullable(Bool)),
+            cat_column("name", Text),
+            cat_column("sr", Named("app", "sr")),
+            cat_column("p", nullable(Named("app", "point")))], [unique_key("t_pkey", ["id"]), unique_key("t_name_u", ["name", "u"])])])
+
+    tables.push(FakeTable(QualName("app", "v"), TableInfo(items_of([cat_column("id", Int64)]), buf[UniqueKey](), true)))
+
+    val types = items_of([FakeType(QualName("app", "sr"), search_result()), FakeType(QualName("app", "point"), point())])
+
+    val functions = items_of([
+        FakeFunction("f", Signature(items_of([Int32, Int64]), Text, true)),
+        FakeFunction("f", Signature(items_of([Int64, Int32]), Text, true)),
+        FakeFunction("g", Signature(items_of([Int64]), Int64, true)),
+        FakeFunction("g", Signature(items_of([Int16]), Int16, true)),
+        FakeFunction("h", Signature(items_of([nullable(Int64)]), Bool, false))])
+
+    FakeCatalog(tables, types, functions)
+end fake
+
+// -- running the checker --------------------------------------------------------------------------
+
+/** `env`'s typing, which must succeed. */
+typed(env: Envelope, file: string = __FILE__, line: long = __LINE__) -> Typing = type_envelope(env, fake()) match
+    Ok(t) -> t
+    Err(e) ->
+        assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+        Typing(None, buf[Type]())
+
+/** `env`'s result type, which it must have. */
+result_of(env: Envelope, file: string = __FILE__, line: long = __LINE__) -> Type = typed(env, file, line).result match
+    Some(t) -> t
+    None -> Bool
+
+/** The code `env` is refused with, or "ok". */
+typing_refusal(env: Envelope) -> string = type_envelope(env, fake()) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** `e` as the one item `x` of a projection over `app.t`, with `params` declared. */
+in_t(e: Expr, params: []const ParamDecl = []) -> Envelope = query(params, project(scan("app", "t", "t"), "r", [item("x", e)]))
+
+/** The type of the one column of the records of relation type `t`. */
+only_column(t: Type) -> Type = t match
+    Bag(e) | List(e) -> (*e) match
+        Record(fs) -> fs[0].ty
+        _ -> Bool
+    _ -> Bool
+
+/** The type `e` gets over `app.t`. */
+type_of(e: Expr, params: []const ParamDecl = [], file: string = __FILE__, line: long = __LINE__) -> Type =
+    only_column(result_of(in_t(e, params), file, line))
+
+/** The code `e` is refused with over `app.t`, or "ok". */
+refused_expr(e: Expr, params: []const ParamDecl = []) -> string = typing_refusal(in_t(e, params))
+
+same_type(got: Type, want: Type, file: string = __FILE__, line: long = __LINE__) =
+    assert(got == want, "the type is the one the spec gives", file, line)
+
+/** A literal of a scalar type; its value is never read by the checker. */
+constant(ty: Type) -> Expr = Literal(ty, Int(0))
+
+// -- §4.1 implicit coercions ----------------------------------------------------------------------
+
+@test
+integers_widen_losslessly_and_only_widen()
+    for (a, b) in [(Int8, Int16), (Int16, Int32), (Int32, Int64), (Int64, Int128), (Int8, Int128),
+                   (UInt8, UInt16), (UInt16, UInt32), (UInt32, UInt64), (UInt8, UInt64),
+                   (UInt8, Int16), (UInt16, Int32), (UInt32, Int64), (UInt64, Int128), (UInt8, Int64)]
+        assert(coerces(a, b), "an integer widens")
+
+    for (a, b) in [(Int8, UInt8), (Int16, UInt64), (Int64, Int32), (UInt64, Int64), (UInt16, Int16), (UInt32, UInt16)]
+        assert(!coerces(a, b), "a signed type never becomes unsigned, and nothing narrows")
+
+@test
+integers_coerce_to_the_decimal_that_holds_them_and_on()
+    for (a, p) in [(Int8, 3), (Int16, 5), (Int32, 10), (Int64, 19), (Int128, 38), (UInt8, 3), (UInt16, 5), (UInt32, 10), (UInt64, 20)]
+        assert(coerces(a, Decimal(u8(p), 0)), "an integer is its decimal(p, 0)")
+        assert(!coerces(a, Decimal(u8(p - 1), 0)), "and no narrower one")
+
+    assert(coerces(Int32, Decimal(12, 2)), "then onward by decimal widening")
+    assert(!coerces(Int64, Decimal(19, 1)), "a scale takes a whole digit from the 19")
+
+@test
+decimals_widen_when_neither_part_shrinks()
+    assert(coerces(Decimal(5, 2), Decimal(6, 2)), "a whole digit more")
+    assert(coerces(Decimal(5, 2), Decimal(6, 3)), "a fraction digit more")
+    assert(coerces(Decimal(5, 2), Decimal(7, 4)), "both")
+    assert(!coerces(Decimal(5, 2), Decimal(5, 3)), "the whole part would shrink")
+    assert(!coerces(Decimal(5, 2), Decimal(6, 1)), "the scale would shrink")
+
+@test
+floats_widen_and_never_narrow()
+    assert(coerces(Float32, Float64), "float32 to float64")
+    assert(!coerces(Float64, Float32), "never back")
+
+@test
+null_widening_applies_at_any_depth()
+    assert(coerces(Int32, nullable(Int32)), "T to T?")
+    assert(coerces(Int16, nullable(Int64)), "with a widening")
+    assert(coerces(record([Field("a", Int32)]), record([Field("a", nullable(Int32))])), "in a record field")
+    assert(coerces(list(Int32), list(nullable(Int32))), "in a relation's element")
+    assert(!coerces(nullable(Int32), Int32), "T? never becomes T")
+    assert(!coerces(record([Field("a", nullable(Int32))]), record([Field("a", Int32)])), "not in a field either")
+
+@test
+a_list_forgets_its_order_and_a_bag_never_gains_one()
+    assert(coerces(list(Int32), bag(Int32)), "list to bag")
+    assert(coerces(list(Int8), bag(Int16)), "with its element widened")
+    assert(!coerces(bag(Int32), list(Int32)), "bag to list is a Sort")
+
+@test
+records_and_unions_coerce_by_shape()
+    val ab = record([Field("a", Int16), Field("b", Text)])
+    assert(coerces(ab, record([Field("a", Int64), Field("b", Text)])), "componentwise")
+    assert(!coerces(ab, record([Field("b", Text), Field("a", Int16)])), "not in another order")
+    assert(!coerces(ab, record([Field("a", Int16), Field("c", Text)])), "not under another name")
+    assert(!coerces(ab, record([Field("a", Int16)])), "not to fewer fields")
+
+    val u = union_of([Field("x", record([Field("n", Int8)]))])
+    assert(coerces(u, union_of([Field("x", record([Field("n", Int32)]))])), "a union's payloads componentwise")
+    assert(!coerces(u, union_of([Field("y", record([Field("n", Int8)]))])), "not under another tag")
+
+@test
+everything_else_is_refused()
+    for (a, b) in [(Int32, Float64), (Float64, Int64), (Float32, Decimal(10, 2)), (Decimal(10, 2), Float64),
+                   (Int32, Text), (Text, Int32), (Text, Json), (Json, Text), (Bool, Int8), (Int8, Bool),
+                   (DateTime, Timestamp), (Timestamp, DateTime), (Date, DateTime), (nullable(Text), Text)]
+        assert(!coerces(a, b), "no implicit conversion")
+
+@test
+a_refused_coercion_is_q3001_where_an_expected_type_is_known()
+    val values = Values("v", items_of([Field("n", Int64)]), items_of([items_of([constant(Float64)])]))
+    assert_eq(typing_refusal(query([], values)), "Q3001")
+
+    val widened = Values("v", items_of([Field("n", Int64)]), items_of([items_of([constant(Int8)])]))
+    same_type(result_of(query([], widened)), list(record([Field("n", Int64)])))
+
+@test
+coercion_steps_count_each_arrow()
+    assert_eq(coercion_steps(Int32, Int32), Some(0))
+    assert_eq(coercion_steps(Int8, Int32), Some(2))
+    assert_eq(coercion_steps(UInt8, Int16), Some(1))
+    assert_eq(coercion_steps(UInt8, Int32), Some(2))
+    assert_eq(coercion_steps(Int32, Decimal(10, 0)), Some(1))
+    assert_eq(coercion_steps(Int32, Decimal(12, 2)), Some(2))
+    assert_eq(coercion_steps(Decimal(5, 2), Decimal(7, 2)), Some(1))
+    assert_eq(coercion_steps(Int8, nullable(Int16)), Some(2))
+    assert_eq(coercion_steps(list(Int8), bag(Int16)), Some(2))
+    assert_eq(coercion_steps(record([Field("a", Int8), Field("b", Int8)]), record([Field("a", Int16), Field("b", Int32)])), Some(3))
+    assert_eq(coercion_steps(Int64, Int32), None)
+
+// -- §4.2 common type -------------------------------------------------------------------------------
+
+private common(a: Type, b: Type) -> Option[Type] = common_type(a, b) match
+    Ok(t) -> Some(t)
+    Err(_) -> None
+
+@test
+a_decimal_common_type_keeps_the_wider_whole_part_and_the_wider_scale()
+    assert(common(Decimal(5, 2), Decimal(7, 0)) == Some(Decimal(9, 2)), "seven whole digits and two after")
+    assert(common(Decimal(10, 8), Decimal(10, 1)) == Some(Decimal(17, 8)), "nine whole digits and eight after")
+    assert(common(Int32, Decimal(5, 2)) == Some(Decimal(12, 2)), "an integer as its decimal(p, 0)")
+    assert(common(Decimal(38, 0), Decimal(10, 5)) == None, "past 38 digits there is none")
+    assert(common(UInt64, Decimal(38, 20)) == None, "nor for an integer that needs 20 whole digits")
+
+@test
+mixed_integer_widths_meet_at_the_signed_type_that_holds_both()
+    assert(common(Int8, Int64) == Some(Int64), "the wider signed type")
+    assert(common(UInt8, UInt32) == Some(UInt32), "the wider unsigned type")
+    assert(common(Int8, UInt8) == Some(Int16), "uint8 needs int16")
+    assert(common(Int16, UInt32) == Some(Int64), "uint32 needs int64")
+    assert(common(Int64, UInt64) == Some(Int128), "uint64 needs int128")
+    assert(common(Int32, Float64) == None, "an integer and a float have none")
+
+@test
+null_makes_the_common_type_nullable()
+    assert(common(nullable(Int32), Int64) == Some(nullable(Int64)), "one nullable side")
+    assert(common(Int16, nullable(Int16)) == Some(nullable(Int16)), "the same base type")
+    same_type(type_of(If(items_of([IfArm(constant(Bool), col("t", "a"))]), Some(constant(Int64)))), nullable(Int64))
+    same_type(type_of(If(items_of([IfArm(constant(Bool), Null(Int8))]), Some(constant(Int16)))), nullable(Int16))
+    same_type(type_of(call("coalesce", [col("t", "a"), constant(Int64)])), Int64)
+    same_type(type_of(call("coalesce", [col("t", "a"), Null(Int8)])), nullable(Int32))
+
+// -- §4.3 function and operator resolution ----------------------------------------------------------
+
+@test
+an_exact_overload_is_chosen()
+    same_type(type_of(call("f", [constant(Int32), constant(Int64)])), Text)
+    same_type(type_of(call("g", [constant(Int64)])), Int64)
+
+@test
+the_overload_reached_by_fewest_coercions_is_chosen()
+    // int8 reaches g(int16) in one step and g(int64) in three.
+    same_type(type_of(call("g", [constant(Int8)])), Int16)
+    same_type(type_of(call("g", [constant(Int32)])), Int64)
+
+@test
+a_tie_on_coercion_steps_is_ambiguous()
+    // (int32, int32) reaches both f(int32, int64) and f(int64, int32) in one step.
+    assert_eq(refused_expr(call("f", [constant(Int32), constant(Int32)])), "Q3003")
+
+@test
+no_reachable_overload_is_q3002()
+    assert_eq(refused_expr(call("f", [constant(Int64), constant(Int64)])), "Q3002")
+    assert_eq(refused_expr(call("f", [constant(Int32)])), "Q3002")
+    assert_eq(refused_expr(call("length", [constant(Int32)])), "Q3002")
+
+@test
+an_unknown_function_is_q2007()
+    assert_eq(refused_expr(call("frobnicate", [constant(Int32)])), "Q2007")
+
+@test
+a_strict_function_is_nullable_when_an_argument_is()
+    same_type(type_of(call("g", [col("t", "a")])), nullable(Int64))
+    same_type(type_of(call("length", [col("t", "name")])), Int64)
+    same_type(type_of(call("upper", [Null(Text)])), nullable(Text))
+
+@test
+a_non_strict_function_takes_its_declared_types()
+    same_type(type_of(call("h", [col("t", "id")])), Bool)
+    same_type(type_of(call("h", [Null(Int64)])), Bool)
+
+@test
+the_core_functions_type_as_the_catalog_gives()
+    same_type(type_of(call("eq", [col("t", "id"), col("t", "a")])), nullable(Bool))
+    same_type(type_of(call("lt", [col("t", "id"), constant(Int8)])), Bool)
+    same_type(type_of(call("same", [col("t", "id"), col("t", "a")])), Bool)
+    same_type(type_of(call("is_null", [col("t", "a")])), Bool)
+    same_type(type_of(call("and", [col("t", "flag"), constant(Bool)])), nullable(Bool))
+    same_type(type_of(call("not", [constant(Bool)])), Bool)
+    same_type(type_of(call("assert_not_null", [col("t", "a")])), Int32)
+    same_type(type_of(call("at_zone", [col("t", "ts"), constant(Text)])), DateTime)
+    same_type(type_of(call("from_zone", [constant(DateTime), constant(Text)])), Timestamp)
+    same_type(type_of(call("like", [col("t", "name"), constant(Text), constant(Text)])), Bool)
+    same_type(type_of(call("statement_timestamp", [])), Timestamp)
+    same_type(type_of(call("next_value", [constant(Text), constant(Text)])), Int64)
+
+@test
+comparisons_are_refused_where_their_types_forbid_them()
+    assert_eq(refused_expr(call("eq", [col("t", "id"), col("t", "name")])), "Q3001")
+    assert_eq(refused_expr(call("eq", [col("t", "tags"), col("t", "tags")])), "Q3006")
+    assert_eq(refused_expr(call("lt", [col("t", "sr"), col("t", "sr")])), "Q3007")
+    assert_eq(refused_expr(call("lt", [constant(Interval), constant(Interval)])), "Q3007")
+    assert_eq(refused_expr(call("and", [constant(Int32), constant(Bool)])), "Q3002")
+    same_type(type_of(call("same", [col("t", "tags"), col("t", "tags")])), Bool)
+
+// -- §4.4 arithmetic result types -------------------------------------------------------------------
+
+private arith(f: string, a: Type, b: Type) -> Type = type_of(call(f, [lit_or_null(a), lit_or_null(b)]))
+
+private arith_refusal(f: string, a: Type, b: Type) -> string = refused_expr(call(f, [lit_or_null(a), lit_or_null(b)]))
+
+// A literal of a non-null scalar type, a typed null of a nullable one.
+private lit_or_null(t: Type) -> Expr = if t.is_nullable() then Null(t.base()) else constant(t)
+
+@test
+integer_arithmetic_is_in_the_operands_common_type()
+    same_type(arith("add", Int32, Int64), Int64)
+    same_type(arith("sub", Int32, UInt32), Int64)
+    same_type(arith("mul", UInt8, UInt16), UInt16)
+    same_type(arith("div", Int8, Int8), Int8)
+    same_type(arith("mod", UInt64, Int8), Int128)
+    same_type(arith("add", nullable(Int32), Int32), nullable(Int32))
+    same_type(type_of(call("neg", [constant(Int8)])), Int8)
+    same_type(type_of(call("abs", [constant(UInt16)])), UInt16)
+    assert_eq(refused_expr(call("neg", [constant(UInt32)])), "Q3002")
+
+@test
+decimal_add_and_sub_grow_by_one_digit()
+    same_type(arith("add", Decimal(10, 2), Decimal(5, 4)), Decimal(13, 4))
+    same_type(arith("sub", Decimal(3, 0), Decimal(3, 0)), Decimal(4, 0))
+    same_type(arith("add", Decimal(38, 0), Decimal(38, 10)), Decimal(38, 10))
+    same_type(arith("add", Int32, Decimal(5, 2)), Decimal(13, 2))
+
+@test
+decimal_mul_adds_precisions_and_scales_and_refuses_a_scale_past_38()
+    same_type(arith("mul", Decimal(10, 2), Decimal(5, 4)), Decimal(15, 6))
+    same_type(arith("mul", Decimal(30, 10), Decimal(20, 10)), Decimal(38, 20))
+    same_type(arith("mul", Decimal(38, 19), Decimal(38, 19)), Decimal(38, 38))
+    assert_eq(arith_refusal("mul", Decimal(38, 20), Decimal(38, 19)), "Q3011")
+
+@test
+decimal_div_has_precision_38_and_scale_at_least_6()
+    same_type(arith("div", Decimal(10, 2), Decimal(5, 4)), Decimal(38, 6))
+    same_type(arith("div", Decimal(10, 8), Decimal(5, 4)), Decimal(38, 8))
+    same_type(arith("div", Int64, Int64), Int64)
+
+@test
+decimal_mod_is_bounded_by_the_divisor()
+    same_type(arith("mod", Decimal(10, 2), Decimal(5, 4)), Decimal(5, 4))
+    same_type(arith("mod", Decimal(20, 0), Decimal(38, 0)), Decimal(38, 0))
+
+@test
+float_arithmetic_is_in_the_wider_float()
+    same_type(arith("add", Float32, Float64), Float64)
+    same_type(arith("mul", Float32, Float32), Float32)
+
+@test
+mixing_a_float_with_an_exact_number_is_q3002()
+    assert_eq(arith_refusal("add", Float64, Int32), "Q3002")
+    assert_eq(arith_refusal("mul", Decimal(10, 2), Float32), "Q3002")
+    assert_eq(arith_refusal("add", Text, Int32), "Q3002")
+    assert_eq(arith_refusal("add", Bool, Bool), "Q3002")
+
+@test
+calendar_add_takes_an_interval()
+    same_type(arith("add", Timestamp, Interval), Timestamp)
+    same_type(arith("add", DateTime, Interval), DateTime)
+    same_type(arith("add", Date, Interval), DateTime)
+    assert_eq(arith_refusal("sub", Timestamp, Interval), "Q3002")

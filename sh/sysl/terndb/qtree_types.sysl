@@ -1,0 +1,1376 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The type checker of `query-tree.md`: the coercions and common types of §4, the typing rule of every
+// relational node (§6), expression (§7) and DML statement (§9), and the name checks only the catalog
+// or a type can settle (an unknown table, column, function, tag or field). It walks the tree in the
+// pre-order the structural checks walk it in, numbering the `Rel` and `Expr` nodes the same way, so
+// that the errors of both merge into the phases of §11.2 by the node they are about.
+//
+// An expression or relation that cannot be typed answers `None`, and an error has then been recorded,
+// by this walk or by the structural one; a parent of such a node records nothing more about it.
+
+/** What the type checker answers of a valid statement. */
+struct Typing derives Eq
+    /** The statement's result type (§5 rule 3): a `Query`'s relation type, a DML statement's `bag` of
+     * its `returning` records, or `None` for a DML statement without `returning`.
+     */
+    result: Option[Type]
+
+    /** The type of every `Rel` and `Expr` node of the statement, in pre-order; a relation's is its
+     * output type.
+     */
+    nodes: Buf[Type]
+
+/** `env` validated against `catalog`: the structural checks and the type checks, in the phases of
+ * §11.2, and the first error of the first phase that has one. A DDL statement gets the structural
+ * checks only, and no types.
+ */
+type_envelope(env: Envelope, catalog: &Catalog) -> Result[Typing, CodecError]
+    val structural = structural_phases(env)
+
+    if is_ddl(env.statement)
+        structural.first()?
+        return Ok(Typing(None, buf[Type]()))
+
+    var t = Typer(catalog, buf[Option[Type]](), no_phases(), FirstNode + 1, FirstNode, buf[Option[Type]](), buf[Cte]())
+
+    for p in env.params
+        t.params.push(t.resolve(p.ty))
+
+    val result = t.statement(env.statement)
+
+    structural.merged(t.found).first()?
+
+    val nodes = buf[Type]()
+
+    for n in t.nodes
+        nodes.push(n.unwrap())
+
+    Ok(Typing(result, nodes))
+end type_envelope
+
+// -- what a relation exposes --------------------------------------------------------------------
+
+/** A binder as the expressions that see it read it: the element type of its rows (a record, a union
+ * or a scalar, §2.5), and the columns added under it after the element's own (an `Unnest`'s
+ * ordinality). An outer join or an outer `Unnest` makes `elem` and `extra` nullable.
+ */
+private struct Binding
+    name: string
+    elem: Type
+    extra: Buf[Field]
+
+/** A relation's output: its kind (`list` when `ordered`), the binders it exposes in order (§8.4), and
+ * whether it is cardinality-one (§7.10 rule 1).
+ */
+private struct RelType
+    ordered: bool
+    binders: Buf[Binding]
+    card_one: bool
+
+/** A CTE in scope: its name, the element type its references read, and its kind. */
+private struct Cte
+    name: string
+    elem: Option[Type]
+    ordered: bool
+
+private binding(name: string, elem: Type) -> Binding = Binding(name, elem, buf[Field]())
+
+/** `b` on the null-supplying side of an outer join: every column nullable. */
+private outer_side(b: Binding) -> Binding
+    val extra = buf[Field]()
+
+    for f in b.extra
+        extra.push(Field(f.name, nullable(f.ty)))
+
+    Binding(b.name, nullable(b.elem), extra)
+
+/** The columns `b` exposes: a record element's fields, a union element's shared columns (§2.4 rule 4)
+ * or a scalar element's one column `value`, each nullable when the element is, then `extra`.
+ */
+private columns(b: Binding) -> Buf[Field]
+    val out = buf[Field]()
+    val nulls =b.elem.is_nullable()
+
+    for f in element_columns(b.elem.base())
+        out.push(Field(f.name, if nulls then nullable(f.ty) else f.ty))
+
+    out.extend(b.extra.view())
+    out
+
+private element_columns(elem: Type) -> Buf[Field] = elem match
+    Record(fs) -> fs
+    Union(vs) -> shared_columns(vs)
+    _ -> items_of([Field("value", elem)])
+
+/** The fields in every payload of a union with one name and the identical type, in the first
+ * payload's order (§2.4 rule 4).
+ */
+private shared_columns(variants: Buf[Field]) -> Buf[Field]
+    val out = buf[Field]()
+
+    for f in payload(variants[0].ty)
+        var everywhere = true
+
+        for v in variants
+            if field_type(payload(v.ty), f.name) != Some(f.ty) then everywhere = false
+
+        if everywhere then out.push(f)
+
+    out
+
+private variants_of(t: Type) -> Option[Buf[Field]] = t match
+    Union(vs) -> Some(vs)
+    _ -> None
+
+private payload(t: Type) -> Buf[Field] = t match
+    Record(fs) -> fs
+    _ -> buf[Field]()
+
+private field_type(fs: Buf[Field], name: string) -> Option[Type]
+    for f in fs
+        if f.name == name then return Some(f.ty)
+
+    None
+
+/** What `Row(b)` reads: the element itself, or a record of every column when `extra` adds some. */
+private row_type(b: Binding) -> Type = if b.extra.len() == 0 then b.elem else Record(columns(b))
+
+/** The element type of `r`'s output: its one binder's row, or a record of every exposed column. */
+private elem_of(r: RelType) -> Type
+    if r.binders.len() == 1 then return row_type(r.binders[0])
+
+    Record(output_columns(r))
+
+private output_columns(r: RelType) -> Buf[Field]
+    val out = buf[Field]()
+
+    for b in r.binders
+        out.extend(columns(b).view())
+
+    out
+
+/** `r`'s output type, `bag<E>` or `list<E>` (§6). */
+private relation_type(r: RelType) -> Type = if r.ordered then List(elem_of(r)) else Bag(elem_of(r))
+
+/** A new list of `a`'s binders, then `b`'s. */
+private joined(a: []const Binding, b: Buf[Binding]) -> Buf[Binding]
+    val out = buf[Binding]()
+    out.extend(a)
+    out.extend(b.view())
+    out
+
+/** The binders an expression attached to a node over `inner` sees (§8.3): `inner`'s, then `outer`. */
+private scope(inner: Option[RelType], outer: Buf[Binding]) -> Buf[Binding] = inner match
+    Some(r) -> joined(r.binders.view(), outer)
+    None -> joined([], outer)
+
+private find_binding(sees: Buf[Binding], name: string) -> Option[Binding]
+    for b in sees
+        if b.name == name then return Some(b)
+
+    None
+
+private discard[T](value: T) = ()
+
+// -- the core function catalog, §7.12 -----------------------------------------------------------
+
+/** The type of `Action()` (§9.5). */
+private action_type() -> Type =
+    union_of([Field("inserted", record([])), Field("updated", record([])), Field("deleted", record([]))])
+
+private is_aggregate(f: string) -> bool = f match
+    "count" | "sum" | "min" | "max" | "bool_and" | "bool_or" | "collect" | "string_agg" -> true
+    _ -> false
+
+private is_window_only(f: string) -> bool = f match
+    "row_number" | "rank" | "dense_rank" | "lag" | "lead" | "first_value" | "last_value" -> true
+    _ -> false
+
+/** The core functions typed by a rule of their own rather than by a list of overloads. */
+private is_rule_typed(f: string) -> bool = f match
+    "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "same" | "is_null" | "is_not_null" -> true
+    "and" | "or" | "not" | "add" | "sub" | "mul" | "div" | "mod" | "neg" | "abs" -> true
+    "coalesce" | "assert_not_null" -> true
+    _ -> false
+
+private strict(params: []const Type, result: Type) -> Signature = Signature(items_of(params), result, true)
+
+/** The core functions with fixed signatures (§7.12); all of them are strict. */
+private core_overloads(f: string) -> Buf[Signature] = f match
+    "concat" -> items_of([strict([Text, Text], Text)])
+    "length" -> items_of([strict([Text], Int64)])
+    "lower" | "upper" -> items_of([strict([Text], Text)])
+    "contains" | "starts_with" -> items_of([strict([Text, Text], Bool)])
+    "like" -> items_of([strict([Text, Text, Text], Bool)])
+    "at_zone" -> items_of([strict([Timestamp, Text], DateTime)])
+    "from_zone" -> items_of([strict([DateTime, Text], Timestamp)])
+    "statement_timestamp" -> items_of([strict([], Timestamp)])
+    "next_value" -> items_of([strict([Text, Text], Int64)])
+    _ -> buf[Signature]()
+
+private is_integer(t: Type) -> bool = t match
+    Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 -> true
+    _ -> false
+
+private is_unsigned(t: Type) -> bool = t match
+    UInt8 | UInt16 | UInt32 | UInt64 -> true
+    _ -> false
+
+private is_float(t: Type) -> bool = t match
+    Float32 | Float64 -> true
+    _ -> false
+
+private is_numeric(t: Type) -> bool = is_float(t) || exact_shape(t).is_some()
+
+/** `t`, made nullable when `null` is. */
+private null_if(nulls: bool, t: Type) -> Type = if nulls then nullable(t) else t
+
+private any_nullable(ts: Buf[Type]) -> bool
+    for t in ts
+        if t.is_nullable() then return true
+
+    false
+
+private min_int(a: int, b: int) -> int = if a < b then a else b
+
+private max_int(a: int, b: int) -> int = if a > b then a else b
+
+/** Whether a `Cast` from `from` to `to` is permitted (§7.6). A nullable value casts only to a nullable
+ * type; a `try` cast's target is nullable whatever its `type` says.
+ */
+private castable(from: Type, to: Type) -> bool
+    if from.is_nullable() && !to.is_nullable() then return false
+
+    val x = from.base()
+    val y = to.base()
+
+    if x == y then return true
+    if is_numeric(x) && is_numeric(y) then return true
+    if (x == Text && is_literal_type(y)) || (y == Text && is_literal_type(x)) then return true
+
+    (x, y) match
+        (Bytes, Uuid) | (Uuid, Bytes) -> true
+        (Record(a), Record(b)) | (Union(a), Union(b)) ->
+            if a.len() != b.len() then return false
+
+            for i in 0..<a.len()
+                if a[i].name != b[i].name || !castable(a[i].ty, b[i].ty) then return false
+
+            true
+        (List(a), List(b)) | (Bag(a), Bag(b)) | (List(a), Bag(b)) -> castable(*a, *b)
+        _ -> false
+end castable
+
+/** The rank of a frame bound kind, in the order a frame's start may not pass its end (§6.8). */
+private bound_rank(k: BoundKind) -> int = k match
+    UnboundedPreceding -> 0
+    Preceding -> 1
+    CurrentRow -> 2
+    Following -> 3
+    UnboundedFollowing -> 4
+
+private is_offset_bound(k: BoundKind) -> bool = k == Preceding || k == Following
+
+private is_calendar(t: Type) -> bool = t match
+    Date | Time | DateTime | Timestamp -> true
+    _ -> false
+
+// -- the walk -----------------------------------------------------------------------------------
+
+private struct Typer
+    catalog: &Catalog
+    params: Buf[Option[Type]]
+    found: Phases
+    next: u64
+    node: u64
+    nodes: Buf[Option[Type]]
+    ctes: Buf[Cte]
+
+    // -- recording ----------------------------------------------------------------------------
+
+    report(*self, code: string, message: string) = self.found.record(self.node, code, message)
+
+    /** `code` recorded against the current node; the node has no type. */
+    refuse[T](*self, code: string, message: string) -> Option[T]
+        self.report(code, message)
+        None
+
+    /** Enters a node: it becomes the current one and gets the next slot of `nodes`. Answers the node
+     * the caller restores on leaving.
+     */
+    enter(*self) -> u64
+        val was = self.node
+        self.node = self.next
+        self.next += 1
+        self.nodes.push(None)
+        was
+
+    /** `ty` resolved against the catalog: each named type replaced by its definition (`Q6004` where
+     * there is none), and a union payload that resolves to other than a record refused (`Q3014`).
+     */
+    resolve(*self, ty: Type) -> Option[Type] = ty match
+        Named(schema, name) ->
+            self.catalog.named_type(QualName(schema, name)) match
+                Some(def) -> self.resolve(def)
+                None -> self.refuse("Q6004", s"type '$schema.$name' is not in the catalog")
+        Nullable(inner) -> self.resolve(*inner).map(t -> nullable(t))
+        Record(fs) -> self.resolve_members(fs, false).map(m -> Record(m))
+        Union(vs) -> self.resolve_members(vs, true).map(m -> Union(m))
+        Bag(e) -> self.resolve(*e).map(t -> Bag(t))
+        List(e) -> self.resolve(*e).map(t -> List(t))
+        _ -> Some(ty)
+
+    resolve_members(*self, ms: Buf[Field], variants: bool) -> Option[Buf[Field]]
+        val out = buf[Field]()
+
+        for m in ms
+            val t = self.resolve(m.ty)?
+
+            if variants
+                t match
+                    Record(_) -> ()
+                    _ -> return self.refuse("Q3014", s"variant '${m.name}' has a payload that is not a record")
+
+            out.push(Field(m.name, t))
+
+        Some(out)
+
+    /** The type of a table's row: a record of its columns in catalog order. */
+    row_of(*self, t: TableInfo) -> Option[Type]
+        val fs = buf[Field]()
+
+        for c in t.columns
+            fs.push(Field(c.name, self.resolve(c.ty)?))
+
+        Some(Record(fs))
+
+    opt_row(*self, t: Option[TableInfo]) -> Option[Type] = t match
+        Some(info) -> self.row_of(info)
+        None -> None
+
+    /** The columns of `r`'s output, refused with `Q2005` where two share a plain name (§5 rule 5). */
+    unique_output(*self, r: RelType) -> Buf[Field]
+        val cs = output_columns(r)
+
+        for i in 0..<cs.len()
+            for j in 0..<i
+                if cs[i].name == cs[j].name then
+                    self.report("Q2005", s"output column '${cs[i].name}' appears twice")
+
+        cs
+
+    // -- statements, §5 and §9 ----------------------------------------------------------------
+
+    statement(*self, s: Statement) -> Option[Type]
+        val none = buf[Binding]()
+
+        s match
+            Query(rel) ->
+                val r = self.rel(rel, none)?
+                discard(self.unique_output(r))
+                Some(relation_type(r))
+            Insert(table, binder, old, columns, source, on_conflict, returning) ->
+                val info = self.target(table)
+                val src = self.rel(source, none)
+                val row = self.opt_row(info)
+
+                info match
+                    Some(t) ->
+                        for c in columns
+                            discard(self.column_target(t, c))
+
+                        src match
+                            Some(r) -> self.insert_source(t, columns, self.unique_output(r))
+                            None -> ()
+                    None -> ()
+
+                on_conflict match
+                    Some(oc) ->
+                        info match
+                            Some(t) -> self.conflict_target(t, oc.target)
+                            None -> ()
+
+                        oc.action match
+                            DoUpdate(set, where) ->
+                                val sees = buf[Binding]()
+                                self.bind_row(sees, binder, row)
+                                self.bind_row(sees, oc.excluded, row)
+                                self.assignments(info, set, sees)
+                                self.condition(self.opt_expr(where, sees))
+                            Nothing -> ()
+                    None -> ()
+
+                self.returning(returning, binder, old, row, none)
+            Update(table, binder, old, from, filter, set, returning) ->
+                val info = self.target(table)
+                val row = self.opt_row(info)
+                val joins = self.opt_binders(from)
+                val sees = buf[Binding]()
+                self.bind_row(sees, binder, row)
+                sees.extend(joins.view())
+
+                self.condition(self.opt_expr(filter, sees))
+                self.assignments(info, set, sees)
+                self.returning(returning, binder, old, row, joins)
+            Delete(table, binder, old, using, filter, returning) ->
+                val info = self.target(table)
+                val row = self.opt_row(info)
+                val joins = self.opt_binders(using)
+                val sees = buf[Binding]()
+                self.bind_row(sees, binder, row)
+                sees.extend(joins.view())
+
+                self.condition(self.opt_expr(filter, sees))
+                self.returning(returning, binder, old, row, joins)
+            _ -> None
+    end statement
+
+    /** A DML statement's table: one the catalog has (`Q2001`) and not a view (`Q5003`). */
+    target(*self, q: QualName) -> Option[TableInfo]
+        val t = self.catalog.table(q)
+
+        t match
+            Some(info) -> if info.is_view then self.report("Q5003", s"'${q.schema}.${q.name}' is a view, not a table")
+            None -> self.report("Q2001", s"no table '${q.schema}.${q.name}'")
+
+        t
+
+    /** `b` seeing `row` pushed onto `sees`, where the row is known. */
+    bind_row(*self, sees: Buf[Binding], b: string, row: Option[Type]) = row match
+        Some(t) -> sees.push(binding(b, t))
+        None -> ()
+
+    opt_binders(*self, r: Option[Rel]) -> Buf[Binding] = r match
+        Some(x) ->
+            self.rel(x, buf[Binding]()) match
+                Some(t) -> t.binders
+                None -> buf[Binding]()
+        None -> buf[Binding]()
+
+    /** The column `name` of `t` as an insert or update target: one it has (`Q2003`) that may be
+     * written (`Q5003`).
+     */
+    column_target(*self, t: TableInfo, name: string) -> Option[Type]
+        for c in t.columns
+            if c.name == name
+                if !c.writable then return self.refuse("Q5003", s"column '$name' is generated and may not be written")
+
+                return self.resolve(c.ty)
+
+        self.refuse("Q2003", s"the table has no column '$name'")
+
+    /** A value of type `from` stored into a column of type `to` (§9.2 rule 1, §9.4 rule 1). */
+    store(*self, from: Type, to: Type, what: string)
+        if coerces(from, to) then return
+        if from.is_nullable() && coerces(from.base(), to) then
+            return self.report("Q3005", s"$what is nullable and its column is NOT NULL")
+
+        self.report("Q3001", s"$what does not coerce to its column's type")
+
+    insert_source(*self, t: TableInfo, columns: Buf[string], source: Buf[Field])
+        if source.len() != columns.len() then
+            return self.report("Q3001", s"the source has ${source.len()} columns and the insert names ${columns.len()}")
+
+        for i in 0..<columns.len()
+            self.column_type(t, columns[i]) match
+                Some(to) -> self.store(source[i].ty, to, s"source column '${source[i].name}'")
+                None -> ()
+
+    /** The resolved type of `t`'s column `name`, quietly absent where it has none. */
+    column_type(*self, t: TableInfo, name: string) -> Option[Type]
+        for c in t.columns
+            if c.name == name then return self.resolve(c.ty)
+
+        None
+
+    /** An upsert's target: the columns of a unique key, in any order, or a unique key's name (§9.3
+     * rule 1, `Q5004`).
+     */
+    conflict_target(*self, t: TableInfo, target: ConflictTarget)
+        for k in t.unique
+            val hit = target match
+                Columns(names) -> same_columns(k.columns, names)
+                Constraint(name) -> k.name == name
+
+            if hit then return
+
+        self.report("Q5004", "the conflict target is no unique key of the table")
+
+    /** A `set` list: each value typed and stored into its column. */
+    assignments(*self, info: Option[TableInfo], set: Buf[Item], sees: Buf[Binding])
+        for it in set
+            val v = self.expr(it.expr, sees)
+
+            info match
+                Some(t) ->
+                    self.column_target(t, it.name) match
+                        Some(to) -> v match
+                            Some(from) -> self.store(from, to, s"the value set into '${it.name}'")
+                            None -> ()
+                        None -> ()
+                None -> ()
+
+    /** The result of a DML statement: `bag` of its `returning` records, which see the written row as
+     * `binder`, the row before the statement as `old` with every column nullable (§9.1), and the
+     * `from`/`using` binders; `None` without a returning list.
+     */
+    returning(*self, items: Buf[Item], binder: string, old: Option[string], row: Option[Type], joins: Buf[Binding]) -> Option[Type]
+        val sees = buf[Binding]()
+        self.bind_row(sees, binder, row)
+
+        old match
+            Some(o) -> self.bind_row(sees, o, row.map(t -> nullable(t)))
+            None -> ()
+
+        sees.extend(joins.view())
+
+        val fs = self.item_fields(items, sees)
+
+        if items.len() == 0 then return None
+
+        fs.map(f -> Bag(Record(f)))
+
+    // -- relations, §6 ------------------------------------------------------------------------
+
+    /** `r` typed, its expressions also seeing `outer` (§8.3 step 2). */
+    rel(*self, r: Rel, outer: Buf[Binding]) -> Option[RelType]
+        val parent = self.enter()
+        val slot = self.nodes.len() - 1
+        val t = self.rel_body(r, outer)
+
+        t match
+            Some(x) -> self.nodes[slot] = Some(relation_type(x))
+            None -> ()
+
+        self.node = parent
+        t
+
+    rel_body(*self, r: Rel, outer: Buf[Binding]) -> Option[RelType] = r match
+        Scan(table, binder) ->
+            self.catalog.table(table) match
+                Some(t) -> Some(single(false, binding(binder, self.row_of(t)?), false))
+                None -> self.refuse("Q2001", s"no table or view '${table.schema}.${table.name}'")
+        Values(binder, columns, rows) ->
+            val fs = self.resolve_members(columns, false)
+
+            for row in rows
+                for i in 0..<row.len()
+                    val t = self.expr(row[i], outer)
+
+                    (t, fs) match
+                        (Some(from), Some(cs)) ->
+                            if i < cs.len() && !coerces(from, cs[i].ty) then
+                                self.report("Q3001", s"a value of column '${cs[i].name}' does not coerce to its type")
+                        _ -> ()
+
+            Some(single(true, binding(binder, Record(fs?)), false))
+        ParamScan(binder, param) ->
+            val t = self.param_type(param)?
+
+            t match
+                Bag(e) -> Some(single(false, binding(binder, *e), false))
+                List(e) -> Some(single(true, binding(binder, *e), false))
+                Nullable(inner) ->
+                    self.refuse(if inner.is_relation() then "Q3005" else "Q3001", s"parameter $param is not a non-null relation")
+                _ -> self.refuse("Q3001", s"parameter $param is not a relation")
+        Filter(input, predicate) ->
+            val inner = self.rel(*input, outer)
+            self.condition(self.expr(predicate, scope(inner, outer)))
+            inner
+        Project(input, binder, items) ->
+            val inner = self.rel(*input, outer)
+            val fs = self.item_fields(items, scope(inner, outer))
+            val i = inner?
+            Some(single(i.ordered, binding(binder, Record(fs?)), i.card_one))
+        Join(kind, left, right, on, mark, binder) ->
+            val l = self.rel(*left, outer)
+            val r2 = self.rel(*right, outer)
+            val kept = kind match
+                Inner -> Combine(false, false, true)
+                Left | SingleJoin -> Combine(false, true, true)
+                Right -> Combine(true, false, true)
+                Full -> Combine(true, true, true)
+                Semi | Anti | MarkJoin -> Combine(false, false, false)
+
+            self.combine(l, r2, on, outer, kept, if kind == MarkJoin then mark else None, binder)
+        Apply(kind, left, right, on, mark, binder) ->
+            val l = self.rel(*left, outer)
+            val r2 = self.rel(*right, joined(scope(l, buf[Binding]()).view(), outer))
+            val kept = kind match
+                Cross -> Combine(false, false, true)
+                Outer | SingleApply -> Combine(false, true, true)
+                SemiApply | AntiApply | MarkApply -> Combine(false, false, false)
+
+            self.combine(l, r2, on, outer, kept, if kind == MarkApply then mark else None, binder)
+        Aggregate(input, binder, keys, aggs) ->
+            val inner = self.rel(*input, outer)
+            val sees = scope(inner, outer)
+            val ks = self.item_fields(keys, sees)
+            var ok = true
+            val fs = buf[Field]()
+
+            for a in aggs
+                self.agg_call(a.call, sees) match
+                    Some(t) -> fs.push(Field(a.name, t))
+                    None -> ok = false
+
+            discard(inner?)
+
+            if !ok then return None
+
+            val all = buf[Field]()
+            all.extend(ks?.view())
+            all.extend(fs.view())
+            Some(single(false, binding(binder, Record(all)), keys.len() == 0))
+        Window(input, binder, items) ->
+            val inner = self.rel(*input, outer)
+            val sees = scope(inner, outer)
+            var ok = true
+            val fs = buf[Field]()
+
+            for it in items
+                self.win_call(it.call, sees) match
+                    Some(t) -> fs.push(Field(it.name, t))
+                    None -> ok = false
+
+            val i = inner?
+
+            if !ok then return None
+
+            val bs = joined(i.binders.view(), buf[Binding]())
+            bs.push(binding(binder, Record(fs)))
+            Some(RelType(i.ordered, bs, i.card_one))
+        Sort(input, keys) ->
+            val inner = self.rel(*input, outer)
+            self.sort_keys(keys, scope(inner, outer))
+            Some(RelType(true, inner?.binders, false))
+        Limit(input, count, offset, ties, arbitrary) ->
+            val inner = self.rel(*input, outer)
+            self.limit_value(self.opt_expr(count, outer), "count")
+            self.limit_value(self.opt_expr(offset, outer), "offset")
+
+            val i = inner?
+
+            if !i.ordered && !arbitrary then self.report("Q3008", "a Limit of a bag needs arbitrary set")
+
+            if ties
+                (*input) match
+                    Sort(_, _) -> ()
+                    _ -> self.report("Q3008", "a Limit with ties needs a Sort as its input")
+
+            Some(RelType(i.ordered, i.binders, false))
+        Distinct(input) -> Some(RelType(false, self.rel(*input, outer)?.binders, false))
+        SetOp(_, _, binder, inputs) -> self.set_op(binder, inputs, outer)
+        With(recursive, ctes, body) -> self.with(recursive, ctes, *body, outer)
+        CteRef(name, binder) ->
+            var i = self.ctes.len()
+
+            while i > 0
+                i -= 1
+
+                val c = self.ctes[i]
+
+                if c.name == name then return Some(single(c.ordered, binding(binder, c.elem?), false))
+
+            None
+        Nest(input, binder, keys, name, items, order) ->
+            val inner = self.rel(*input, outer)
+            val sees = scope(inner, outer)
+            val ks = self.item_fields(keys, sees)
+            val fs = self.item_fields(items, sees)
+            self.sort_keys(order, sees)
+            discard(inner?)
+
+            val nested: Type = Record(fs?)
+            val all = buf[Field]()
+            all.extend(ks?.view())
+            all.push(Field(name, if order.len() > 0 then List(nested) else Bag(nested)))
+            Some(single(false, binding(binder, Record(all)), false))
+        Unnest(input, binder, value, outer_rows, ordinality) ->
+            val inner = self.rel(*input, outer)
+            val v = self.expr(value, scope(inner, outer))?
+            val i = inner?
+
+            val elem = v.base() match
+                Bag(e) ->
+                    if ordinality.is_some() then self.report("Q3008", "ordinality needs a list to unnest")
+                    *e
+                List(e) -> *e
+                _ -> return self.refuse("Q3001", "Unnest's value is not a relation")
+
+            val extra = buf[Field]()
+
+            ordinality match
+                Some(n) -> extra.push(Field(n, Int64))
+                None -> ()
+
+            val b = Binding(binder, elem, extra)
+            val bs = joined(i.binders.view(), buf[Binding]())
+            bs.push(if outer_rows then outer_side(b) else b)
+            Some(RelType(false, bs, false))
+        Tag(input, binder, ty, tag) ->
+            val inner = self.rel(*input, outer)
+            val t = self.resolve(ty)?
+            val i = inner?
+
+            val vs = t match
+                Union(vs) -> vs
+                _ -> return self.refuse("Q3001", "Tag's type is not a union")
+
+            val p = field_type(vs, tag)
+
+            if p == None then return self.refuse("Q2010", s"the union has no tag '$tag'")
+            if !coerces(elem_of(i), p.unwrap()) then
+                return self.refuse("Q3001", s"the rows do not coerce to the payload of '$tag'")
+
+            Some(single(i.ordered, binding(binder, t), i.card_one))
+    end rel_body
+
+    param_type(*self, index: u64) -> Option[Type] =
+        if index < u64(self.params.len()) then self.params[usize(index)] else None
+
+    /** A join's or an apply's output (§6.5, §6.6): the left binders, nullable when `kept.left_null`;
+     * the right ones when `kept.right`, nullable when `kept.right_null`; and a mark join's binder
+     * with its one column `mark`.
+     */
+    combine(*self, l: Option[RelType], r: Option[RelType], on: Option[Expr], outer: Buf[Binding], kept: Combine, mark: Option[string], binder: Option[string]) -> Option[RelType]
+        val sees = joined(scope(l, buf[Binding]()).view(), scope(r, outer))
+        val cond = self.opt_expr(on, sees)
+        self.condition(cond)
+
+        val lt = l?
+        val rt = r?
+        val bs = buf[Binding]()
+
+        for b in lt.binders
+            bs.push(if kept.left_null then outer_side(b) else b)
+
+        if kept.right
+            for b in rt.binders
+                bs.push(if kept.right_null then outer_side(b) else b)
+
+        mark match
+            Some(m) ->
+                val nulls =cond.map(t -> t.is_nullable()).unwrap_or(false)
+                bs.push(binding(binder?, record([Field(m, null_if(nulls, Bool))])))
+            None -> ()
+
+        Some(RelType(false, bs, false))
+    end combine
+
+    /** A `Limit`'s count or offset: `int64` (`Q3001`), never null (`Q3005`). */
+    limit_value(*self, t: Option[Type], what: string) = t match
+        Some(x) ->
+            if x.base() != Int64 then self.report("Q3001", s"a Limit's $what is not int64")
+            else if x.is_nullable() then self.report("Q3005", s"a Limit's $what is nullable")
+        None -> ()
+
+    set_op(*self, binder: string, inputs: Buf[Rel], outer: Buf[Binding]) -> Option[RelType]
+        val rs = buf[RelType]()
+        var ok = true
+
+        for i in inputs
+            self.rel(i, outer) match
+                Some(r) ->
+                    discard(self.unique_output(r))
+                    rs.push(r)
+                None -> ok = false
+
+        if !ok || rs.len() == 0 then return None
+
+        val first = elem_of(rs[0])
+        var unions = false
+
+        for r in rs
+            if variants_of(elem_of(r).base()).is_some() then unions = true
+
+        if unions
+            for r in rs
+                if elem_of(r) != first then return self.refuse("Q3010", "set operation inputs of union elements differ")
+
+            return Some(single(false, binding(binder, first), false))
+
+        val cs = element_columns(first.base())
+        val types = buf[Type]()
+
+        for c in cs
+            types.push(null_if(first.is_nullable(), c.ty))
+
+        for k in 1..<rs.len()
+            val other = element_columns(elem_of(rs[k]).base())
+            val nulls =elem_of(rs[k]).is_nullable()
+
+            if other.len() != cs.len() then return self.refuse("Q3010", "set operation inputs differ in their number of columns")
+
+            for j in 0..<cs.len()
+                common_type(types[j], null_if(nulls, other[j].ty)) match
+                    Ok(t) -> types[j] = t
+                    Err(_) -> return self.refuse("Q3010", s"set operation column '${cs[j].name}' has no common type")
+
+        first.base() match
+            Record(_) ->
+                val fs = buf[Field]()
+
+                for j in 0..<cs.len()
+                    fs.push(Field(cs[j].name, types[j]))
+
+                Some(single(false, binding(binder, Record(fs)), false))
+            _ -> Some(single(false, binding(binder, types[0]), false))
+    end set_op
+
+    with(*self, recursive: bool, ctes: Buf[CteDef], body: Rel, outer: Buf[Binding]) -> Option[RelType]
+        val depth = self.ctes.len()
+        val declared = buf[Option[Type]]()
+
+        for c in ctes
+            c.columns match
+                Some(cs) -> declared.push(self.resolve_members(cs, false).map(fs -> Record(fs)))
+                None -> declared.push(None)
+
+        if recursive
+            for i in 0..<ctes.len()
+                self.ctes.push(Cte(ctes[i].name, declared[i], false))
+
+        for i in 0..<ctes.len()
+            val r = self.rel(ctes[i].rel, outer)
+            var elem = declared[i]
+
+            (r, declared[i]) match
+                (Some(t), Some(d)) ->
+                    val got = element_columns(elem_of(t).base())
+                    val want = element_columns(d)
+
+                    if got.len() != want.len()
+                        self.report("Q3001", s"CTE '${ctes[i].name}' declares ${want.len()} columns and its query has ${got.len()}")
+                    else
+                        for j in 0..<got.len()
+                            if !coerces(got[j].ty, want[j].ty) then
+                                self.report("Q3001", s"column '${want[j].name}' of CTE '${ctes[i].name}' does not coerce to its declared type")
+                (Some(t), None) -> if ctes[i].columns.is_none() then elem = Some(elem_of(t))
+                _ -> ()
+
+            if !recursive then self.ctes.push(Cte(ctes[i].name, elem, r.map(t -> t.ordered).unwrap_or(false)))
+
+        val exposed = self.rel(body, outer)
+        self.ctes.truncate(depth)
+        exposed
+    end with
+
+    // -- aggregate and window calls, §6.7 and §6.8 ---------------------------------------------
+
+    agg_call(*self, c: AggCall, sees: Buf[Binding]) -> Option[Type]
+        val args = self.exprs(c.args, sees)
+        self.condition(self.opt_expr(c.filter, sees))
+        self.sort_keys(c.order, sees)
+
+        val f = c.function
+
+        if !is_aggregate(f) then return self.not_this_kind(f, "an aggregate")
+        if c.order.len() > 0 && f != "collect" && f != "string_agg" then
+            return self.refuse("Q3002", s"'$f' does not honour an order")
+
+        self.aggregate(f, args?, c.order.len() > 0)
+
+    /** A function name used where another kind of function is needed: `Q3002` for a function of the
+     * catalog, `Q2007` for no function at all.
+     */
+    not_this_kind(*self, f: string, what: string) -> Option[Type]
+        if is_aggregate(f) || is_window_only(f) || is_rule_typed(f) || core_overloads(f).len() > 0 || self.catalog.functions(f).len() > 0 then
+            return self.refuse("Q3002", s"'$f' is not $what")
+
+        self.refuse("Q2007", s"no function '$f'")
+
+    /** A core aggregate's result type (§6.7 rule 4). */
+    aggregate(*self, f: string, args: Buf[Type], ordered: bool) -> Option[Type]
+        if f == "count"
+            if args.len() > 1 then return self.refuse("Q3002", "count takes zero arguments or one")
+
+            return Some(Int64)
+
+        if f == "string_agg"
+            if args.len() != 2 || args[0].base() != Text || args[1].base() != Text then
+                return self.refuse("Q3002", "string_agg takes two text arguments")
+
+            return Some(nullable(Text))
+
+        if args.len() != 1 then return self.refuse("Q3002", s"'$f' takes one argument")
+
+        val x = args[0]
+        val b = x.base()
+
+        f match
+            "sum" ->
+                if is_integer(b) then return Some(nullable(Int128))
+                if is_float(b) then return Some(nullable(Float64))
+
+                b match
+                    Decimal(_, s) -> Some(nullable(Decimal(38, s)))
+                    _ -> self.refuse("Q3002", "sum takes a number")
+            "min" | "max" ->
+                check_orderable(x) match
+                    Ok(()) -> Some(nullable(x))
+                    Err(e) -> self.refuse(e.code, s"'$f' needs an ordered type")
+            "bool_and" | "bool_or" ->
+                if b == Bool then Some(nullable(Bool)) else self.refuse("Q3002", s"'$f' takes a bool")
+            _ ->
+                if b.is_relation() then return self.refuse("Q3014", "collect of a relation would nest a relation in a relation")
+
+                if ordered then Some(List(x)) else Some(Bag(x))
+    end aggregate
+
+    win_call(*self, w: WinCall, sees: Buf[Binding]) -> Option[Type]
+        val args = self.exprs(w.args, sees)
+        discard(self.exprs(w.partition, sees))
+        val keys = self.sort_keys(w.order, sees)
+
+        w.frame match
+            Some(fr) -> self.frame(fr, keys)
+            None -> ()
+
+        val f = w.function
+
+        if is_aggregate(f) then return self.aggregate(f, args?, false)
+        if !is_window_only(f) then return self.not_this_kind(f, "a window function")
+
+        val a = args?
+
+        f match
+            "row_number" | "rank" | "dense_rank" ->
+                if a.len() != 0 then self.refuse("Q3002", s"'$f' takes no arguments") else Some(Int64)
+            "lag" | "lead" ->
+                if a.len() < 1 || a.len() > 3 then return self.refuse("Q3002", s"'$f' takes one to three arguments")
+                if a.len() >= 2 && !coerces(a[1], Int64) then return self.refuse("Q3002", s"the offset of '$f' is not int64")
+                if a.len() < 3 then return Some(nullable(a[0]))
+
+                common_type(a[0], a[2]) match
+                    Ok(t) -> Some(t)
+                    Err(e) -> self.refuse(e.code, s"the default of '$f' has no common type with its value")
+            _ ->
+                if a.len() != 1 then self.refuse("Q3002", s"'$f' takes one argument") else Some(nullable(a[0]))
+    end win_call
+
+    /** A window frame (§6.8): its start not after its end, an offset exactly on a `preceding` or
+     * `following` bound, and a `range` offset only with one order key (`Q5008`); a `rows` or
+     * `groups` offset is `int64`, a `range` one coerces to a numeric key's type or is an `interval`
+     * for a date or time key (`Q3001`).
+     */
+    frame(*self, fr: Frame, keys: Buf[Option[Type]])
+        val starts = self.opt_expr(fr.start.offset, buf[Binding]())
+        val ends = self.opt_expr(fr.end.offset, buf[Binding]())
+
+        if bound_rank(fr.start.kind) > bound_rank(fr.end.kind) || fr.start.kind == UnboundedFollowing || fr.end.kind == UnboundedPreceding then
+            return self.report("Q5008", "the frame starts after it ends")
+
+        for b in [fr.start, fr.end]
+            if is_offset_bound(b.kind) != b.offset.is_some() then
+                return self.report("Q5008", "an offset is given exactly on a preceding or following bound")
+
+        val with_offset = fr.start.offset.is_some() || fr.end.offset.is_some()
+
+        if fr.unit == Range && with_offset && keys.len() != 1 then
+            return self.report("Q5008", "a range frame with an offset needs exactly one order key")
+
+        for t in [starts, ends]
+            t match
+                Some(o) -> if !self.fits_offset(fr.unit, o, keys) then self.report("Q3001", "a frame offset does not fit its frame")
+                None -> ()
+    end frame
+
+    fits_offset(self, unit: FrameUnit, o: Type, keys: Buf[Option[Type]]) -> bool
+        if unit != Range then return o == Int64
+
+        keys[0] match
+            Some(k) -> if is_calendar(k.base()) then o == Interval else is_numeric(k.base()) && coerces(o, k.base())
+            None -> true
+
+    // -- expressions, §7 ----------------------------------------------------------------------
+
+    exprs(*self, es: Buf[Expr], sees: Buf[Binding]) -> Option[Buf[Type]]
+        val out = buf[Type]()
+        var ok = true
+
+        for e in es
+            self.expr(e, sees) match
+                Some(t) -> out.push(t)
+                None -> ok = false
+
+        if ok then Some(out) else None
+
+    opt_expr(*self, e: Option[Expr], sees: Buf[Binding]) -> Option[Type] = e match
+        Some(x) -> self.expr(x, sees)
+        None -> None
+
+    item_fields(*self, items: Buf[Item], sees: Buf[Binding]) -> Option[Buf[Field]]
+        val out = buf[Field]()
+        var ok = true
+
+        for it in items
+            self.expr(it.expr, sees) match
+                Some(t) -> out.push(Field(it.name, t))
+                None -> ok = false
+
+        if ok then Some(out) else None
+
+    sort_keys(*self, keys: Buf[SortKey], sees: Buf[Binding]) -> Buf[Option[Type]]
+        val out = buf[Option[Type]]()
+
+        for k in keys
+            out.push(self.expr(k.expr, sees))
+
+        out
+
+    /** A condition: `bool` or `bool?` (`Q3004`). */
+    condition(*self, t: Option[Type]) = t match
+        Some(x) -> if x.base() != Bool then self.report("Q3004", "a condition is not bool")
+        None -> ()
+
+    expr(*self, e: Expr, sees: Buf[Binding]) -> Option[Type]
+        val parent = self.enter()
+        val slot = self.nodes.len() - 1
+        val t = self.expr_body(e, sees)
+        self.nodes[slot] = t
+        self.node = parent
+        t
+
+    expr_body(*self, e: Expr, sees: Buf[Binding]) -> Option[Type] = e match
+        Col(binder, name) ->
+            val b = find_binding(sees, binder)?
+            val t = field_type(columns(b), name)
+
+            if t == None then self.refuse("Q2003", s"binder '$binder' has no column '$name'") else t
+        Row(binder) -> Some(row_type(find_binding(sees, binder)?))
+        Param(index) -> self.param_type(index)
+        Null(ty) -> self.resolve(ty).map(t -> nullable(t))
+        Literal(ty, _) -> if is_literal_type(ty) then Some(ty) else self.refuse("Q3017", "a literal's type must be a non-null scalar")
+        Call(function, args) ->
+            val ts = self.exprs(args, sees)
+
+            if is_aggregate(function) || is_window_only(function) then
+                return self.refuse("Q3013", s"'$function' is an aggregate or window function and is outside Aggregate and Window")
+
+            self.call(function, ts?)
+        Cast(inner, ty, mode) ->
+            val from = self.expr(*inner, sees)
+            val to = self.resolve(ty)?
+            val target = if mode == Try then nullable(to) else to
+
+            if castable(from?, target) then Some(target) else self.refuse("Q3012", "the cast is not permitted")
+        If(arms, otherwise) ->
+            var ok = true
+            val values = buf[Type]()
+
+            for a in arms
+                self.condition(self.expr(a.cond, sees))
+
+                self.expr(a.value, sees) match
+                    Some(t) -> values.push(t)
+                    None -> ok = false
+
+            otherwise match
+                Some(x) ->
+                    self.expr(*x, sees) match
+                        Some(t) -> values.push(t)
+                        None -> ok = false
+                None -> ()
+
+            if !ok then return None
+
+            val t = self.common(values)?
+            Some(if otherwise.is_some() then t else nullable(t))
+        Match(scrutinee, arms, otherwise) -> self.match_expr(*scrutinee, arms, otherwise, sees)
+        Record(fields) -> self.item_fields(fields, sees).map(fs -> Record(fs))
+        Field(inner, name) ->
+            val t = self.expr(*inner, sees)?
+
+            t.base() match
+                Record(fs) ->
+                    field_type(fs, name) match
+                        Some(f) -> Some(null_if(t.is_nullable(), f))
+                        None -> self.refuse("Q2011", s"the record has no field '$name'")
+                _ -> self.refuse("Q3001", s"field '$name' is read from a value that is not a record")
+        Variant(ty, tag, inner) ->
+            val v = self.expr(*inner, sees)
+            val t = self.resolve(ty)?
+
+            val vs = t match
+                Union(vs) -> vs
+                _ -> return self.refuse("Q3001", "Variant's type is not a union")
+
+            val p = field_type(vs, tag)
+
+            if p == None then return self.refuse("Q2010", s"the union has no tag '$tag'")
+            if !coerces(v?, p.unwrap()) then return self.refuse("Q3001", s"the value does not coerce to the payload of '$tag'")
+
+            Some(t)
+        Relation(rel) ->
+            val r = self.rel(*rel, sees)?
+            discard(self.unique_output(r))
+            Some(relation_type(r))
+        Scalar(rel) ->
+            val r = self.rel(*rel, sees)?
+            val cs = self.unique_output(r)
+
+            if cs.len() != 1 then return self.refuse("Q5009", s"a scalar subquery has ${cs.len()} columns")
+
+            Some(if r.card_one then cs[0].ty else nullable(cs[0].ty))
+        Exists(rel) ->
+            discard(self.rel(*rel, sees)?)
+            Some(Bool)
+        In(es, rel) ->
+            val ts = self.exprs(es, sees)
+            val r = self.rel(*rel, sees)?
+            val cs = output_columns(r)
+            val left = ts?
+
+            if cs.len() != left.len() then return self.refuse("Q3001", s"In compares ${left.len()} values with ${cs.len()} columns")
+
+            var nulls = false
+
+            for i in 0..<cs.len()
+                val t = common_type(left[i], cs[i].ty) match
+                    Ok(t) -> t
+                    Err(e) -> return self.refuse(e.code, s"In's value ${i} and column '${cs[i].name}' have no common type")
+
+                check_equatable(t) match
+                    Ok(()) -> ()
+                    Err(e) -> return self.refuse(e.code, e.message)
+
+                if t.is_nullable() then nulls = true
+
+            Some(null_if(nulls, Bool))
+        Action -> Some(action_type())
+    end expr_body
+
+    /** The common type of `ts` (§4.2, `Q3001`). */
+    common(*self, ts: Buf[Type]) -> Option[Type]
+        var t = ts[0]
+
+        for i in 1..<ts.len()
+            t = common_type(t, ts[i]) match
+                Ok(c) -> c
+                Err(e) -> return self.refuse(e.code, "the values have no common type")
+
+        Some(t)
+
+    match_expr(*self, scrutinee: Expr, arms: Buf[MatchArm], otherwise: Option[&Expr], sees: Buf[Binding]) -> Option[Type]
+        val s = self.expr(scrutinee, sees)
+        val vs = s match
+            Some(t) -> variants_of(t.base())
+            None -> None
+
+        var ok = true
+        val values = buf[Type]()
+
+        for a in arms
+            val inner = joined(sees.view(), buf[Binding]())
+
+            vs match
+                Some(v) ->
+                    field_type(v, a.tag) match
+                        Some(p) -> inner.push(binding(a.binder, p))
+                        None -> ()
+                None -> ()
+
+            self.expr(a.expr, inner) match
+                Some(t) -> values.push(t)
+                None -> ok = false
+
+        otherwise match
+            Some(x) ->
+                self.expr(*x, sees) match
+                    Some(t) -> values.push(t)
+                    None -> ok = false
+            None -> ()
+
+        val v = s?
+        val variants = vs match
+            Some(x) -> x
+            None -> return self.refuse("Q3001", "Match's value is not a union")
+
+        for i in 0..<arms.len()
+            if field_type(variants, arms[i].tag) == None then return self.refuse("Q2010", s"the union has no tag '${arms[i].tag}'")
+
+            for j in 0..<i
+                if arms[i].tag == arms[j].tag then return self.refuse("Q3009", s"tag '${arms[i].tag}' has two arms")
+
+        if otherwise.is_none()
+            var missing = ""
+
+            for t in variants
+                var covered = false
+
+                for a in arms
+                    if a.tag == t.name then covered = true
+
+                if !covered then missing = if missing.len == 0 then t.name else missing + ", " + t.name
+
+            if missing.len > 0 then return self.refuse("Q3009", s"Match covers no arm for: $missing")
+
+        if !ok then return None
+
+        Some(null_if(v.is_nullable(), self.common(values)?))
+    end match_expr
+
+    // -- calls, §4.3, §4.4 and §7.12 --------------------------------------------------------------
+
+    call(*self, f: string, args: Buf[Type]) -> Option[Type]
+        if !is_rule_typed(f) then return self.overloaded(f, args)
+
+        val nulls =any_nullable(args)
+
+        f match
+            "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "same" ->
+                if args.len() != 2 then return self.refuse("Q3002", s"'$f' takes two arguments")
+
+                val t = common_type(args[0], args[1]) match
+                    Ok(t) -> t
+                    Err(e) -> return self.refuse(e.code, s"the operands of '$f' have no common type")
+
+                if f == "same" then return Some(Bool)
+
+                val check = if f == "eq" || f == "ne" then check_equatable(t) else check_orderable(t)
+
+                check match
+                    Ok(()) -> Some(null_if(nulls, Bool))
+                    Err(e) -> self.refuse(e.code, e.message)
+            "is_null" | "is_not_null" ->
+                if args.len() != 1 then self.refuse("Q3002", s"'$f' takes one argument") else Some(Bool)
+            "and" | "or" | "not" ->
+                val n: usize = if f == "not" then 1 else 2
+
+                if args.len() != n then return self.refuse("Q3002", s"'$f' takes $n arguments")
+
+                for a in args
+                    if a.base() != Bool then return self.refuse("Q3002", s"'$f' takes bool arguments")
+
+                Some(null_if(nulls, Bool))
+            "neg" | "abs" ->
+                if args.len() != 1 || !is_numeric(args[0].base()) then return self.refuse("Q3002", s"'$f' takes one number")
+                if f == "neg" && is_unsigned(args[0].base()) then return self.refuse("Q3002", "neg of an unsigned value")
+
+                Some(args[0])
+            "coalesce" ->
+                if args.len() == 0 then return self.refuse("Q3002", "coalesce takes at least one argument")
+
+                val t = self.common(args)?
+                var all = true
+
+                for a in args
+                    if !a.is_nullable() then all = false
+
+                Some(if all then t else t.base())
+            "assert_not_null" ->
+                if args.len() != 1 then self.refuse("Q3002", "assert_not_null takes one argument") else Some(args[0].base())
+            _ ->
+                if args.len() != 2 then return self.refuse("Q3002", s"'$f' takes two arguments")
+
+                self.arithmetic(f, args[0].base(), args[1].base()).map(t -> null_if(nulls, t))
+    end call
+
+    /** `add sub mul div mod` on two non-null operand types (§4.4, and §7.12's calendar `add`). */
+    arithmetic(*self, f: string, x: Type, y: Type) -> Option[Type]
+        if f == "add" && y == Interval
+            x match
+                Timestamp -> return Some(Timestamp)
+                DateTime | Date -> return Some(DateTime)
+                _ -> ()
+
+        if !is_numeric(x) || !is_numeric(y) then return self.refuse("Q3002", s"no overload of '$f' takes these operands")
+        if is_float(x) != is_float(y) then return self.refuse("Q3002", s"'$f' mixes a float with an exact number")
+
+        if is_float(x) || (is_integer(x) && is_integer(y))
+            common_type(x, y) match
+                Ok(t) -> return Some(t)
+                Err(e) -> return self.refuse(e.code, s"the operands of '$f' have no common type")
+
+        // A decimal and an integer or a decimal: the integer is the `decimal(p, 0)` of §4.1 rule 2.
+        val (w1, s1) = exact_shape(x).unwrap()
+        val (w2, s2) = exact_shape(y).unwrap()
+        val p1 = w1 + s1
+        val p2 = w2 + s2
+
+        f match
+            "add" | "sub" ->
+                val s = max_int(s1, s2)
+                Some(Decimal(u8(min_int(38, max_int(w1, w2) + s + 1)), u8(s)))
+            "mul" ->
+                val s = s1 + s2
+
+                if s > 38 then return self.refuse("Q3011", "the product's scale is beyond 38")
+
+                Some(Decimal(u8(min_int(38, p1 + p2)), u8(s)))
+            "div" -> Some(Decimal(38, u8(max_int(6, max_int(s1, s2)))))
+            _ ->
+                val s = max_int(s1, s2)
+                Some(Decimal(u8(min_int(38, w2 + s)), u8(s)))
+    end arithmetic
+
+    /** A function typed by its overloads (§4.3): the core catalog's, else the catalog's (`Q2007` where
+     * neither has the name). The overload reached by the fewest coercion steps is chosen; none is
+     * `Q3002` and a tie `Q3003`.
+     */
+    overloaded(*self, f: string, args: Buf[Type]) -> Option[Type]
+        var sigs = core_overloads(f)
+
+        if sigs.len() == 0 then sigs = self.catalog.functions(f)
+        if sigs.len() == 0 then return self.refuse("Q2007", s"no function '$f'")
+
+        var best: Option[Signature] = None
+        var fewest = 0
+        var tied = false
+
+        for sig in sigs
+            if sig.params.len() != args.len() then continue
+
+            var total = 0
+            var reached = true
+
+            for i in 0..<args.len()
+                coercion_steps(if sig.strict then args[i].base() else args[i], sig.params[i]) match
+                    Some(n) -> total += n
+                    None -> reached = false
+
+            if !reached then continue
+
+            if best == None || total < fewest
+                best = Some(sig)
+                fewest = total
+                tied = false
+            else if total == fewest
+                tied = true
+
+        val chosen = best match
+            Some(s) -> s
+            None -> return self.refuse("Q3002", s"no overload of '$f' takes these arguments")
+
+        if tied then return self.refuse("Q3003", s"more than one overload of '$f' is reached by $fewest coercions")
+
+        Some(if chosen.strict then null_if(any_nullable(args), chosen.result) else chosen.result)
+    end overloaded
+end Typer
+
+/** Which sides of a join's or an apply's inputs it keeps, and which it makes nullable. */
+private struct Combine
+    left_null: bool
+    right_null: bool
+    right: bool
+
+/** A relation exposing one binder. */
+private single(ordered: bool, b: Binding, card_one: bool) -> RelType = RelType(ordered, items_of([b]), card_one)
+
+/** Whether `a` and `b` name the same columns, in any order. */
+private same_columns(a: Buf[string], b: Buf[string]) -> bool
+    if a.len() != b.len() then return false
+
+    for x in b
+        var hit = false
+
+        for y in a
+            if x == y then hit = true
+
+        if !hit then return false
+
+    true

@@ -10,10 +10,15 @@ import sysl.container.{Set, set}
 // error (`Q4…`, `Q5…`, the other `Q6…`), and within a phase the one that comes first in pre-order.
 
 /** `env` checked as above; the first error of the first phase that has one. */
-check_envelope(env: Envelope) -> Result[unit, CodecError]
+check_envelope(env: Envelope) -> Result[unit, CodecError] = structural_phases(env).first()
+
+/** What the structural checks find in `env`, phase by phase, for `type_envelope` to merge with what
+ * the type checker finds.
+ */
+private[terndb] structural_phases(env: Envelope) -> Phases
     // The first walk only learns which binders the statement introduces anywhere, so the second can
     // tell a binder that is not visible (`Q2006`) from one that does not exist (`Q2002`).
-    var gather = Checker(true, set[string](), set[string](), buf[bool](), buf[string](), false, Unrestricted, None, None, None)
+    var gather = Checker(true, set[string](), set[string](), buf[bool](), buf[string](), false, Unrestricted, no_phases(), FirstNode, FirstNode)
     gather.statement(env.statement)
 
     val used = buf[bool]()
@@ -21,28 +26,71 @@ check_envelope(env: Envelope) -> Result[unit, CodecError]
     for _ in 0..<env.params.len()
         used.push(false)
 
-    var c = Checker(false, gather.all, set[string](), used, buf[string](), false, Unrestricted, None, None, None)
+    var c = Checker(false, gather.all, set[string](), used, buf[string](), false, Unrestricted, no_phases(), FirstNode + 1, FirstNode)
     c.statement(env.statement)
 
-    c.names_error match
-        Some(e) -> return Err(e)
-        None -> ()
-
-    c.types_error match
-        Some(e) -> return Err(e)
-        None -> ()
-
-    // `/params/<i>` comes before `/statement` in pre-order.
+    // `/params/<i>` comes before `/statement` in pre-order: node 0, before every node of the statement.
     if is_ddl(env.statement) && env.params.len() > 0 then
-        return fail("Q6001", "a DDL statement declares parameters")
+        c.found.record(0, "Q6001", "a DDL statement declares parameters")
 
     for i in 0..<used.len()
-        if !used[i] then return fail("Q4002", s"parameter $i is declared and never referenced")
+        if !used[i] then c.found.record(0, "Q4002", s"parameter $i is declared and never referenced")
 
-    c.structure_error match
-        Some(e) -> Err(e)
-        None -> Ok(())
-end check_envelope
+    c.found
+end structural_phases
+
+// -- the phases of §11.2 ------------------------------------------------------------------------
+
+/** The pre-order index of the statement root; its `Rel` and `Expr` nodes follow it, and 0 stands for
+ * `/params`.
+ */
+private[terndb] const FirstNode: u64 = 1
+
+/** An error, and the pre-order index of the `Rel` or `Expr` node it is about. */
+private[terndb] struct Found
+    node: u64
+    error: CodecError
+
+/** The first error of each phase of §11.2, by pre-order of the node it is about. */
+private[terndb] struct Phases
+    names: Option[Found]
+    types: Option[Found]
+    structure: Option[Found]
+
+    /** `code` recorded in its phase (§11.2, `ddl.md` §3.1 rule 4), unless that phase holds an error
+     * about a node no later in pre-order.
+     */
+    record(*self, node: u64, code: string, message: string)
+        val f = Found(node, CodecError(code, message))
+
+        if code.starts_with("Q2") || code == "Q6002" || code == "Q6004"
+            self.names = earlier(self.names, Some(f))
+        else if code.starts_with("Q3") || code == "Q6005"
+            self.types = earlier(self.types, Some(f))
+        else
+            self.structure = earlier(self.structure, Some(f))
+
+    /** Each phase's earlier error of `self` and `other`. */
+    merged(self, other: Phases) -> Phases =
+        Phases(earlier(self.names, other.names), earlier(self.types, other.types), earlier(self.structure, other.structure))
+
+    /** The first error of the first phase that has one. */
+    first(self) -> Result[unit, CodecError]
+        for p in [self.names, self.types, self.structure]
+            p match
+                Some(f) -> return Err(f.error)
+                None -> ()
+
+        Ok(())
+end Phases
+
+private[terndb] no_phases() -> Phases = Phases(None, None, None)
+
+// The one of `a` and `b` about the node earlier in pre-order, `a` on a tie.
+private earlier(a: Option[Found], b: Option[Found]) -> Option[Found] = (a, b) match
+    (Some(x), Some(y)) -> if y.node < x.node then b else a
+    (None, _) -> b
+    _ -> a
 
 private struct Checker
     gathering: bool
@@ -52,24 +100,26 @@ private struct Checker
     ctes: Buf[string]
     in_returning: bool
     rules: DefnRules
-    names_error: Option[CodecError]
-    types_error: Option[CodecError]
-    structure_error: Option[CodecError]
+    found: Phases
+    next: u64
+    node: u64
 
     // -- recording ----------------------------------------------------------------------------
 
-    /** `code` recorded in its phase (§11.2, `ddl.md` §3.1 rule 4), unless that phase has one. */
+    /** `code` recorded in its phase against the node being checked. */
     report(*self, code: string, message: string)
         if self.gathering then return
 
-        val e = CodecError(code, message)
+        self.found.record(self.node, code, message)
 
-        if code.starts_with("Q2") || code == "Q6002"
-            if self.names_error == None then self.names_error = Some(e)
-        else if code.starts_with("Q3") || code == "Q6005"
-            if self.types_error == None then self.types_error = Some(e)
-        else if self.structure_error == None
-            self.structure_error = Some(e)
+    /** The pre-order index of a node being entered, which becomes the current one; the caller
+     * restores the one it answers when it leaves.
+     */
+    enter(*self) -> u64
+        val was = self.node
+        self.node = self.next
+        self.next += 1
+        was
 
     /** A binder being introduced: non-empty (§8.2 rule 2, `Q5009`) and unique in the statement
      * (`Q2004`).
@@ -182,9 +232,11 @@ private struct Checker
      */
     rel(*self, r: Rel, outer: Buf[string], hidden: Buf[string]) -> Buf[string]
         val was = self.in_returning
+        val parent = self.enter()
         self.in_returning = false
         val exposed = self.rel_body(r, outer, hidden)
         self.in_returning = was
+        self.node = parent
         exposed
 
     rel_body(*self, r: Rel, outer: Buf[string], hidden: Buf[string]) -> Buf[string] = r match
@@ -363,7 +415,12 @@ private struct Checker
         Some(x) -> self.expr(*x, sees, hidden)
         None -> ()
 
-    expr(*self, e: Expr, sees: Buf[string], hidden: Buf[string]) -> unit = e match
+    expr(*self, e: Expr, sees: Buf[string], hidden: Buf[string])
+        val parent = self.enter()
+        self.expr_body(e, sees, hidden)
+        self.node = parent
+
+    expr_body(*self, e: Expr, sees: Buf[string], hidden: Buf[string]) -> unit = e match
         Col(binder, _) ->
             self.reads(binder)
             self.refer(binder, sees, hidden)
@@ -411,7 +468,7 @@ private struct Checker
                 self.report("Q6006", "a definition expression holds Action()")
             else if !self.in_returning
                 self.report("Q5002", "Action() is valid only in a returning list")
-    end expr
+    end expr_body
 
     /** A relation inside an expression, which no definition expression may hold (`ddl.md` §2.12
      * rule 2).

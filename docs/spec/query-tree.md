@@ -284,9 +284,13 @@ Operators are functions with stable names (§7.12). A call `f(a₁…aₙ)` reso
 
 1. If one overload of `f` accepts the argument types exactly, it is chosen.
 2. Otherwise, the overloads reachable by implicit coercions are collected; if exactly one needs the
-   fewest coercion steps, it is chosen. If several tie, `Q3003`. If none, `Q3002`.
+   fewest coercion steps, it is chosen. If several tie, `Q3003`. If none, `Q3002`. A call's steps are
+   the sum over its arguments; each arrow of a chain in §4.1 is one step (`int8 → int32` is two,
+   `uint8 → int16` one, `int32 → decimal(12, 2)` two: to `decimal(10, 0)`, then widening), `T → T?`
+   is one, `list → bag` is one, and a record, union or relation takes the sum of its components'.
 3. A function is **strict** unless the catalog says otherwise: its result is `R?` if any argument is
-   nullable, and null when any argument is null.
+   nullable, and null when any argument is null. A strict overload's parameters are non-null types,
+   and an argument is matched against one by its non-null base type.
 
 ### 4.4 Arithmetic result types
 
@@ -296,8 +300,9 @@ Operators are functions with stable names (§7.12). A call `f(a₁…aₙ)` reso
    `mod`'s sign follows the dividend; division by zero is `R0002`.
 2. Decimal `add`/`sub`: `s = max(s₁, s₂)`, `p = min(38, max(p₁ − s₁, p₂ − s₂) + s + 1)`. `mul`:
    `s = s₁ + s₂`, `p = min(38, p₁ + p₂)`; if `s > 38` the call is refused with `Q3011`. `div`:
-   `s = max(6, s₁, s₂)`, `p = 38`, rounded half away from zero. A result outside the result type's range
-   is `R0001`.
+   `s = max(6, s₁, s₂)`, `p = 38`, rounded half away from zero. `mod`, whose result is smaller than
+   its divisor: `s = max(s₁, s₂)`, `p = min(38, p₂ − s₂ + s)`. An integer operand of a decimal one is
+   its `decimal(p, 0)` of §4.1 rule 2. A result outside the result type's range is `R0001`.
 3. Float arithmetic is IEEE 754 in the operands' common type; it never raises errors.
 4. Mixing float with integer or decimal operands is refused (`Q3002`).
 
@@ -334,7 +339,9 @@ Statement = Query | Insert | Update | Delete | DDL statement (ddl.md §3)
 
 Every `Rel` has an **output type**: `bag<E>` or `list<E>`, where `E` is a record of its output
 columns (or a union, §6.15). The column of the output, their names and their types are fixed by the
-rules below. "Exposes" refers to the binders a node makes visible to the expressions of its parent
+rules below. A node that exposes one binder has that binder's element type as `E` (a record, a union,
+or the scalar of a scalar relation); a node that exposes several has the record of all their columns
+in the order of §8.4. "Exposes" refers to the binders a node makes visible to the expressions of its parent
 (§8.2).
 
 | Node | Fields | Output kind | Exposes |
@@ -373,8 +380,8 @@ reads the view's stored query in its place (`ddl.md` §2.9).
 
 ### 6.3 ParamScan
 
-Reads a relation-valued parameter as a source. The parameter MUST have a relation type (`Q3001`); its
-element type's fields are the output columns. This is the bulk-load path: one execution, any number of
+Reads a relation-valued parameter as a source. The parameter MUST have a relation type (`Q3001`), and
+not a nullable one (`Q3005`); its element type's fields are the output columns. This is the bulk-load path: one execution, any number of
 rows (§10.4).
 
 ### 6.4 Filter and Project
@@ -440,11 +447,17 @@ conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as
 
 `WinCall = { function, args, partition: [Expr], order: [SortKey], frame: Frame? }`. Each item adds one
 column under binder `as`; the input's rows, binders, kind and order are unchanged. Ranking functions
-(`row_number`, `rank`, `dense_rank`) → `int64`; `lag`, `lead`, `first_value`, `last_value`; and every
-core aggregate. `Frame = { unit: rows | range | groups, start: Bound, end: Bound, exclude: none |
+(`row_number`, `rank`, `dense_rank`) take no arguments → `int64`; `lag(x)`, `lag(x, n)` and `lead`
+likewise → `X?`, `lag(x, n, d)` → the common type of `x` and `d`, with `n` coercing to `int64`;
+`first_value(x)`, `last_value(x)` → `X?`; and every core aggregate, typed as in §6.7. Any other
+function there is `Q3002`, or `Q2007` when no catalog has it. `Frame = { unit: rows | range | groups, start: Bound, end: Bound, exclude: none |
 current | group | ties }`; `Bound = { kind: unbounded_preceding | preceding | current |
-following | unbounded_following, offset: Expr? }`. An invalid frame (start after end, `range` with an
-offset and not exactly one order key) is `Q5008`.
+following | unbounded_following, offset: Expr? }`. An invalid frame (start after end, in the order
+the kinds are listed; a start of `unbounded_following` or an end of `unbounded_preceding`; an offset
+absent from a `preceding` or `following` bound or present on another; `range` with an offset and not
+exactly one order key) is `Q5008`. A `rows` or `groups` offset is `int64`; a `range` offset coerces
+to a numeric key's type, or is an `interval` for a `date`, `time`, `datetime` or `timestamp` key
+(`Q3001`).
 
 ### 6.9 Sort
 
@@ -456,7 +469,7 @@ relations.
 
 ### 6.10 Limit
 
-1. `count` and `offset` MUST be `int64` (`Q3001`) and MUST NOT reference the input's binders; they MAY
+1. `count` and `offset` MUST be `int64` (`Q3001`; no coercion, and `int64?` is `Q3005`) and MUST NOT reference the input's binders; they MAY
    reference parameters and outer binders. A negative value is `R0006`. Absent `count` means no limit;
    absent `offset` means 0.
 2. The input MUST be a list (`Q3008`) unless `arbitrary` is `true`, in which case any `count` rows of a
@@ -506,7 +519,9 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
    input row, and emits one row per element: the input's columns followed by the element's columns
    (for a scalar relation, the one column `value`, §2.5) under binder `as`. With `outer = true`, an input row whose relation is empty or null emits one row
    with every element column null (so they are nullable). `ordinality` adds an `int64` column, 1-based,
-   under `as`; it requires `value` to be a list (`Q3008`).
+   under `as`; it requires `value` to be a list (`Q3008`). With `outer = true` the ordinality column is
+   nullable too, null in the padded row; with an ordinality, `Row(as)` is the record of every column
+   under `as`, the element's then the ordinality.
 
 ### 6.15 Tag and union-element relations
 
@@ -573,7 +588,9 @@ be evaluated, so their runtime errors do not occur.
 any two numeric types (range-checked; rounding half away from zero into decimal and integer targets);
 between `text` and every scalar (parsing and printing the forms of §3.5); `bytes` ↔ `uuid` (16 octets); records, unions and relations
 componentwise where shapes match; `list<E> → bag<E>`. Anything else, including `bag → list`,
-`timestamp ↔ datetime` and `T? → T`, is `Q3012`. The zone conversions are functions
+`timestamp ↔ datetime` and `T? → T`, is `Q3012`. Nullability is judged at every level: a nullable
+value (or component) casts only to a nullable type, except that a `try` cast's target is `type?`
+whatever `type` says, so `try` takes a nullable value to any permitted base. The zone conversions are functions
 (`at_zone(timestamp, text) → datetime`, `from_zone(datetime, text) → timestamp`); a non-null value is
 obtained from a nullable one with `assert_not_null(x) → T` (`R0004` on null).
 
@@ -623,11 +640,19 @@ the core operators' names and typing:
 - `coalesce(x₁…xₙ)`: common type, nullable iff every argument is nullable;
 - `assert_not_null`, `at_zone`, `from_zone` (§7.6);
 - text: `concat length lower upper contains starts_with like` (`like` takes its escape character as an
-  argument);
+  argument), all strict: `concat(text, text) → text`, `length(text) → int64`, `lower(text)` and
+  `upper(text) → text`, `contains(text, text)` and `starts_with(text, text) → bool`,
+  `like(text, text, text) → bool`;
 - time: `add(timestamp, interval)` computes calendar parts in UTC; `add(datetime, interval)` and
   `add(date, interval) → datetime` compute in civil time; `statement_timestamp() → timestamp`;
 - sequences: `next_value(schema: text, name: text) → int64`, which draws the next value of a sequence
   (`ddl.md` §2.7). It is **volatile**: each call draws a new value, and it is never folded.
+
+The operands of the comparisons, `same` and `coalesce` meet at their common type (§4.2, `Q3001`);
+`eq`/`ne` then refuse a relation type anywhere in it (`Q3006`) and the orderings an unorderable one
+(`Q3007`). `and`, `or` and `not` take `bool`/`bool?` (`Q3002`) and are `bool?` when an argument is.
+The core functions resolve before a catalog's own; a name no catalog has is `Q2007`. A function the
+catalog has that is not an aggregate, written as an `AggCall`, is `Q3002`.
 
 ## 8. Names, binders and scoping
 
@@ -708,7 +733,9 @@ set: [(name, Expr)], where: Expr? } }`
 2. For each source row: if no existing row conflicts on `target`, the row is inserted. Otherwise, with
    `nothing` the row is skipped; with `update`, if `where` is absent or `true` the existing row is
    updated by `set`, evaluated with `as` (the existing row) and `excluded` (the proposed row) visible;
-   else it is skipped. Skipped rows produce no `returning` row and are not counted.
+   else it is skipped. Skipped rows produce no `returning` row and are not counted. Both `as` and
+   `excluded` have the table's row type; `target`'s columns match a unique key's in any order, and a
+   constraint name matches a unique constraint's or a unique index's name.
 3. A statement that would insert or update the same target row twice is `R0007`.
 
 ### 9.4 Update and Delete
@@ -1160,8 +1187,10 @@ Parameters: `$0: text`, `$1: int64`. Table `app.counters(key text primary key, n
 
 Result type `bag<{key: text, n: int64, previous: int64?, action: union<inserted: {}, updated: {},
 deleted: {}>}>`. First run with (`"hits"`, 1): one row `{hits, 1, null, inserted}`. Second run with
-(`"hits"`, 5): `{hits, 6, 1, updated}`. Binding `$1` to null is `Q4005`; declaring `$1: int64?` makes
-the `set` nullable into a `NOT NULL` column and is refused with `Q3005`.
+(`"hits"`, 5): `{hits, 6, 1, updated}`. Binding `$1` to null is `Q4005`. Declaring `$1: int64?`,
+and the `Values` column `n: int64?` that carries it, makes the source column `n` nullable into a
+`NOT NULL` column and is refused with `Q3005` (§9.2 rule 1); with the `Values` column left `int64`,
+the nullable parameter is refused where it meets that column, with `Q3001` (§6.2).
 
 ## 17. Open questions
 

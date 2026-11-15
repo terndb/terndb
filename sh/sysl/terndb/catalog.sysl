@@ -1,0 +1,51 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// What the type checker asks of the catalog (`ddl.md` §2): a table's or view's columns and keys, a
+// named type's definition, and the overloads of a function the catalog adds to the core ones
+// (`query-tree.md` §7.12). The checker reads it through `Catalog` and never sees how it is stored.
+
+/** A column as a statement sees it: its name, its type (`T?` unless it is `NOT NULL`, §2.2 rule 3),
+ * and whether a statement may name it as an insert or update target (`false` for a generated column
+ * and an identity column declared `always`, `query-tree.md` §9.2 rule 2).
+ */
+struct ColumnInfo derives Eq
+    name: string
+    ty: Type
+    writable: bool
+
+/** A unique constraint or unique index, the primary key among them: an upsert's possible targets
+ * (§9.3 rule 1).
+ */
+struct UniqueKey derives Eq
+    name: string
+    columns: Buf[string]
+
+/** A table or a view: its columns in catalog order, its unique keys, and which of the two it is. */
+struct TableInfo derives Eq
+    columns: Buf[ColumnInfo]
+    unique: Buf[UniqueKey]
+    is_view: bool
+
+/** One overload of a function: its parameter types, its result type, and whether it is strict
+ * (§4.3 rule 3). A strict overload's parameters are non-null types, and its result is nullable when an
+ * argument is.
+ */
+struct Signature derives Eq
+    params: Buf[Type]
+    result: Type
+    strict: bool
+
+/** The catalog as the type checker reads it, at the version a statement is validated against. */
+trait Catalog
+    /** The table or view `name`, or `None` where there is none (`Q2001`). */
+    table(self, name: QualName) -> Option[TableInfo]
+
+    /** The definition of the named type `name` (`ddl.md` §2.8), or `None` (`Q6004`). */
+    named_type(self, name: QualName) -> Option[Type]
+
+    /** The overloads of a function the catalog defines beyond the core catalog; empty where it defines
+     * none.
+     */
+    functions(self, name: string) -> Buf[Signature]

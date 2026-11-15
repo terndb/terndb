@@ -1,0 +1,705 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The typing rule of every relational node (`query-tree.md` §6), expression (§7) and DML statement
+// (§9), each with a tree it types and one it refuses; the worked examples of §16; and the phases of
+// §11.2 the type errors take their place in. The catalog and the helpers are `qtree_types_tests.sysl`'s.
+
+private t_row() -> Type = record([
+    Field("id", Int64), Field("a", nullable(Int32)), Field("d", nullable(Decimal(10, 2))), Field("gen", Int64),
+    Field("tags", list(Text)), Field("f", Float64), Field("u", UInt32), Field("ts", Timestamp),
+    Field("flag", nullable(Bool)), Field("name", Text), Field("sr", search_result()), Field("p", nullable(point()))])
+
+private users_row() -> Type = record([Field("id", Int64), Field("name", Text)])
+
+private q(rel: Rel) -> Envelope = query([], rel)
+
+private t_scan() -> Rel = scan("app", "t", "t")
+
+/** `r` projected to the columns `names` of binder `b`. */
+private pick(r: Rel, b: string, names: []const string) -> Rel
+    val items = buf[Item]()
+
+    for n in names
+        items.push(item(n, col(b, n)))
+
+    Project(r, "out", items)
+
+private one_agg(input: Rel, f: string, args: []const Expr, order: []const SortKey) -> Rel =
+    Aggregate(input, "g", no_items(), items_of([NamedAgg("x", AggCall(f, items_of(args), false, None, items_of(order)))]))
+
+private one_win(input: Rel, f: string, args: []const Expr, order: []const SortKey, frame: Option[Frame]) -> Rel =
+    Window(input, "w", items_of([NamedWin("x", WinCall(f, items_of(args), buf[Expr](), items_of(order), frame))]))
+
+/** The type of column `name` of `r`'s output. */
+private column_of(r: Type, name: string) -> Type = r match
+    Bag(e) | List(e) -> (*e) match
+        Record(fs) ->
+            for f in fs
+                if f.name == name then return f.ty
+
+            Bool
+        _ -> Bool
+    _ -> Bool
+
+private rows_of(t: Type) -> Type = t match
+    Bag(e) | List(e) -> *e
+    _ -> Bool
+
+// -- §6.1 Scan, §6.2 Values, §6.3 ParamScan ---------------------------------------------------------
+
+@test
+a_scan_is_a_bag_of_the_table_s_rows_with_named_types_resolved()
+    same_type(result_of(q(t_scan())), bag(t_row()))
+
+@test
+a_scan_of_an_unknown_table_is_q2001()
+    assert_eq(typing_refusal(q(scan("app", "nope", "n"))), "Q2001")
+
+@test
+an_unknown_named_type_is_q6004()
+    assert_eq(refused_expr(Null(Named("app", "nope"))), "Q6004")
+
+@test
+values_is_a_list_of_its_declared_columns()
+    val v = Values("v", items_of([Field("k", Text), Field("n", nullable(Int64))]), items_of([
+        items_of([constant(Text), constant(Int8)]), items_of([constant(Text), Null(Int32)])]))
+    same_type(result_of(q(v)), list(record([Field("k", Text), Field("n", nullable(Int64))])))
+
+@test
+a_nullable_value_into_a_non_null_values_column_is_q3001()
+    val v = Values("v", items_of([Field("n", Int64)]), items_of([items_of([Null(Int64)])]))
+    assert_eq(typing_refusal(q(v)), "Q3001")
+
+@test
+a_param_scan_reads_a_relation_parameter_s_kind_and_element()
+    val elem = record([Field("k", Text), Field("n", Int64)])
+    same_type(result_of(query([param("rows", list(elem))], ParamScan("p", 0))), list(elem))
+    same_type(result_of(query([param("rows", bag(Int32))], ParamScan("p", 0))), bag(Int32))
+
+@test
+a_param_scan_of_a_scalar_or_a_nullable_relation_is_refused()
+    assert_eq(typing_refusal(query([param("n", Int64)], ParamScan("p", 0))), "Q3001")
+    assert_eq(typing_refusal(query([param("rows", nullable(bag(Int32)))], ParamScan("p", 0))), "Q3005")
+
+// -- §6.4 Filter and Project ------------------------------------------------------------------------
+
+@test
+a_filter_keeps_its_input_s_type_and_takes_a_nullable_predicate()
+    same_type(result_of(q(filter(t_scan(), col("t", "flag")))), bag(t_row()))
+
+@test
+a_filter_predicate_that_is_not_bool_is_q3004()
+    assert_eq(typing_refusal(q(filter(t_scan(), col("t", "id")))), "Q3004")
+
+@test
+a_project_keeps_its_input_s_kind()
+    val sorted = sort([asc(col("t", "id"))], t_scan())
+    same_type(result_of(q(pick(sorted, "t", ["id", "name"]))), list(record([Field("id", Int64), Field("name", Text)])))
+
+@test
+a_column_a_binder_does_not_have_is_q2003()
+    assert_eq(refused_expr(col("t", "nope")), "Q2003")
+
+// -- §6.5 Join, §6.6 Apply --------------------------------------------------------------------------
+
+private join(kind: JoinKind) -> Rel =
+    Join(kind, scan("app", "users", "u"), scan("app", "posts", "p"), Some(eq(col("u", "id"), col("p", "author_id"))), None, None)
+
+private posts_row() -> Type =
+    record([Field("id", Int64), Field("author_id", Int64), Field("title", Text), Field("created_at", Timestamp)])
+
+@test
+outer_joins_make_the_null_supplying_side_nullable()
+    val got = pick(join(Left), "u", ["name"])
+    same_type(result_of(q(Project(join(Left), "out", items_of([item("name", col("u", "name")), item("title", col("p", "title"))])))),
+        bag(record([Field("name", Text), Field("title", nullable(Text))])))
+    same_type(result_of(q(Project(join(Right), "out", items_of([item("name", col("u", "name")), item("title", col("p", "title"))])))),
+        bag(record([Field("name", nullable(Text)), Field("title", Text)])))
+    same_type(result_of(q(Project(join(Full), "out", items_of([item("name", col("u", "name")), item("post", Row("p"))])))),
+        bag(record([Field("name", nullable(Text)), Field("post", nullable(posts_row()))])))
+    same_type(result_of(q(got)), bag(record([Field("name", Text)])))
+
+@test
+an_inner_join_exposes_both_sides_and_a_semi_join_the_left_only()
+    same_type(rows_of(result_of(q(Project(join(Inner), "out", items_of([item("t", col("p", "title"))]))))), record([Field("t", Text)]))
+    same_type(result_of(q(join(Semi))), bag(users_row()))
+    same_type(result_of(q(join(Anti))), bag(users_row()))
+    assert_eq(typing_refusal(q(Project(join(Semi), "out", items_of([item("t", col("p", "title"))])))), "Q2006")
+
+@test
+a_mark_join_adds_a_mark_column_that_is_nullable_when_on_is()
+    val m = Join(MarkJoin, t_scan(), scan("app", "users", "u"), Some(eq(col("t", "a"), col("u", "id"))), Some("hit"), Some("m"))
+    same_type(column_of(result_of(q(Project(m, "out", items_of([item("hit", col("m", "hit"))])))), "hit"), nullable(Bool))
+
+    val n = Join(MarkJoin, t_scan(), scan("app", "users", "u"), Some(eq(col("t", "id"), col("u", "id"))), Some("hit"), Some("m"))
+    same_type(column_of(result_of(q(Project(n, "out", items_of([item("hit", col("m", "hit"))])))), "hit"), Bool)
+
+@test
+a_join_condition_that_is_not_bool_is_q3004()
+    val j = Join(Inner, scan("app", "users", "u"), scan("app", "posts", "p"), Some(col("u", "id")), None, None)
+    assert_eq(typing_refusal(q(pick(j, "u", ["id"]))), "Q3004")
+
+    // Unprojected, the join's output has two columns `id`, which the root may not (§5 rule 5), and that
+    // name error comes first.
+    assert_eq(typing_refusal(q(j)), "Q2005")
+
+@test
+an_outer_apply_makes_its_right_side_nullable_and_lets_it_see_the_left()
+    val right = filter(scan("app", "posts", "p"), eq(col("p", "author_id"), col("u", "id")))
+    val a = Apply(Outer, scan("app", "users", "u"), right, None, None, None)
+    same_type(result_of(q(Project(a, "out", items_of([item("u", col("u", "name")), item("t", col("p", "title"))])))),
+        bag(record([Field("u", Text), Field("t", nullable(Text))])))
+
+    val c = Apply(Cross, scan("app", "users", "u"), right, None, None, None)
+    same_type(column_of(result_of(q(Project(c, "out", items_of([item("t", col("p", "title"))])))), "t"), Text)
+
+@test
+an_apply_condition_that_is_not_bool_is_q3004()
+    val a = Apply(Cross, scan("app", "users", "u"), scan("app", "posts", "p"), Some(col("p", "title")), None, None)
+    assert_eq(typing_refusal(q(pick(a, "p", ["title"]))), "Q3004")
+
+// -- §6.7 Aggregate ---------------------------------------------------------------------------------
+
+private agg_type(f: string, args: []const Expr, order: []const SortKey = []) -> Type =
+    column_of(result_of(q(one_agg(t_scan(), f, args, order))), "x")
+
+private agg_refusal(f: string, args: []const Expr, order: []const SortKey = []) -> string =
+    typing_refusal(q(one_agg(t_scan(), f, args, order)))
+
+@test
+the_core_aggregates_have_the_types_of_6_7()
+    same_type(agg_type("count", []), Int64)
+    same_type(agg_type("count", [col("t", "a")]), Int64)
+    same_type(agg_type("sum", [col("t", "a")]), nullable(Int128))
+    same_type(agg_type("sum", [col("t", "u")]), nullable(Int128))
+    same_type(agg_type("sum", [col("t", "d")]), nullable(Decimal(38, 2)))
+    same_type(agg_type("sum", [col("t", "f")]), nullable(Float64))
+    same_type(agg_type("min", [col("t", "name")]), nullable(Text))
+    same_type(agg_type("max", [col("t", "a")]), nullable(Int32))
+    same_type(agg_type("bool_or", [col("t", "flag")]), nullable(Bool))
+    same_type(agg_type("collect", [col("t", "name")]), bag(Text))
+    same_type(agg_type("collect", [Row("t")]), bag(t_row()))
+    same_type(agg_type("collect", [col("t", "name")], [asc(col("t", "id"))]), list(Text))
+    same_type(agg_type("string_agg", [col("t", "name"), constant(Text)], [asc(col("t", "id"))]), nullable(Text))
+
+@test
+an_aggregate_with_keys_emits_them_first()
+    val a = Aggregate(t_scan(), "g", items_of([item("k", col("t", "name"))]), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
+    same_type(result_of(q(a)), bag(record([Field("k", Text), Field("n", Int64)])))
+
+@test
+aggregates_are_refused_where_their_arguments_or_order_do_not_fit()
+    assert_eq(agg_refusal("sum", [col("t", "name")]), "Q3002")
+    assert_eq(agg_refusal("sum", [col("t", "a")], [asc(col("t", "id"))]), "Q3002")
+    assert_eq(agg_refusal("min", [col("t", "sr")]), "Q3007")
+    assert_eq(agg_refusal("collect", [col("t", "tags")]), "Q3014")
+    assert_eq(agg_refusal("lower", [col("t", "name")]), "Q3002")
+    assert_eq(agg_refusal("frobnicate", [col("t", "name")]), "Q2007")
+
+@test
+an_aggregate_call_outside_aggregate_and_window_is_q3013()
+    assert_eq(refused_expr(call("count", [])), "Q3013")
+    assert_eq(refused_expr(call("row_number", [])), "Q3013")
+    assert_eq(agg_refusal("sum", [call("max", [col("t", "a")])]), "Q3013")
+
+@test
+an_aggregate_filter_that_is_not_bool_is_q3004()
+    val a = Aggregate(t_scan(), "g", no_items(), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, Some(col("t", "id")), buf[SortKey]()))]))
+    assert_eq(typing_refusal(q(a)), "Q3004")
+
+// -- §6.8 Window ------------------------------------------------------------------------------------
+
+private win_type(f: string, args: []const Expr) -> Type =
+    column_of(result_of(q(pick(one_win(t_scan(), f, args, [asc(col("t", "id"))], None), "w", ["x"]))), "x")
+
+private frame_refusal(unit: FrameUnit, start: Bound, finish: Bound, order: []const SortKey) -> string =
+    typing_refusal(q(one_win(t_scan(), "count", [], order, Some(Frame(unit, start, finish, ExcludeNone)))))
+
+private bound(kind: BoundKind, offset: Option[Expr]) -> Bound = Bound(kind, offset)
+
+@test
+window_functions_have_the_types_of_6_8()
+    same_type(win_type("row_number", []), Int64)
+    same_type(win_type("dense_rank", []), Int64)
+    same_type(win_type("lag", [col("t", "name")]), nullable(Text))
+    same_type(win_type("lead", [col("t", "name"), constant(Int64), constant(Text)]), Text)
+    same_type(win_type("first_value", [col("t", "id")]), nullable(Int64))
+    same_type(win_type("count", []), Int64)
+    same_type(win_type("sum", [col("t", "id")]), nullable(Int128))
+
+@test
+a_window_keeps_its_input_s_columns_and_kind_and_adds_its_own()
+    val w = one_win(sort([asc(col("u", "id"))], scan("app", "users", "u")), "rank", [], [asc(col("u", "id"))], None)
+    same_type(result_of(q(w)), list(record([Field("id", Int64), Field("name", Text), Field("x", Int64)])))
+
+@test
+window_calls_and_frames_are_refused_where_they_do_not_fit()
+    assert_eq(typing_refusal(q(one_win(t_scan(), "rank", [col("t", "id")], [], None))), "Q3002")
+    assert_eq(typing_refusal(q(one_win(t_scan(), "upper", [col("t", "name")], [], None))), "Q3002")
+    assert_eq(frame_refusal(Rows, bound(CurrentRow, None), bound(UnboundedPreceding, None), []), "Q5008")
+    assert_eq(frame_refusal(Rows, bound(Following, Some(constant(Int64))), bound(Preceding, Some(constant(Int64))), []), "Q5008")
+    assert_eq(frame_refusal(Rows, bound(Preceding, None), bound(CurrentRow, None), []), "Q5008")
+    assert_eq(frame_refusal(Range, bound(Preceding, Some(constant(Int64))), bound(CurrentRow, None), [asc(col("t", "id")), asc(col("t", "u"))]), "Q5008")
+    assert_eq(frame_refusal(Rows, bound(Preceding, Some(constant(Text))), bound(CurrentRow, None), []), "Q3001")
+    assert_eq(frame_refusal(Range, bound(Preceding, Some(constant(Int64))), bound(CurrentRow, None), [asc(col("t", "ts"))]), "Q3001")
+    assert_eq(frame_refusal(Range, bound(Preceding, Some(constant(Interval))), bound(CurrentRow, None), [asc(col("t", "ts"))]), "ok")
+    assert_eq(frame_refusal(Groups, bound(Preceding, Some(constant(Int64))), bound(Following, Some(constant(Int64))), []), "ok")
+
+// -- §6.9 Sort, §6.10 Limit, §6.11 Distinct ---------------------------------------------------------
+
+@test
+a_sort_is_a_list_and_may_key_on_any_type()
+    same_type(result_of(q(sort([asc(col("t", "sr")), desc(col("t", "tags"))], t_scan()))), list(t_row()))
+
+@test
+a_sort_key_naming_an_unknown_column_is_q2003()
+    assert_eq(typing_refusal(q(sort([asc(col("t", "nope"))], t_scan()))), "Q2003")
+
+@test
+a_limit_keeps_its_input_s_kind()
+    same_type(result_of(q(limit(constant(Int64), sort([asc(col("t", "id"))], t_scan())))), list(t_row()))
+    same_type(result_of(q(Limit(t_scan(), Some(constant(Int64)), None, false, true))), bag(t_row()))
+    same_type(result_of(q(Limit(sort([asc(col("t", "id"))], t_scan()), None, Some(constant(Int64)), true, false))), list(t_row()))
+
+@test
+a_limit_is_refused_on_a_bag_on_ties_without_a_sort_and_on_a_count_that_is_not_int64()
+    assert_eq(typing_refusal(q(limit(constant(Int64), t_scan()))), "Q3008")
+    assert_eq(typing_refusal(q(Limit(filter(sort([asc(col("t", "id"))], t_scan()), constant(Bool)), Some(constant(Int64)), None, true, false))), "Q3008")
+    assert_eq(typing_refusal(q(limit(constant(Int32), sort([asc(col("t", "id"))], t_scan())))), "Q3001")
+    assert_eq(typing_refusal(query([param("n", nullable(Int64))], limit(Param(0), sort([asc(col("t", "id"))], t_scan())))), "Q3005")
+
+@test
+distinct_is_a_bag()
+    same_type(result_of(q(Distinct(sort([asc(col("t", "id"))], t_scan())))), bag(t_row()))
+    assert_eq(typing_refusal(q(Distinct(scan("app", "nope", "n")))), "Q2001")
+
+// -- §6.12 SetOp ------------------------------------------------------------------------------------
+
+private ids(table: string, b: string, out: string) -> Rel = Project(scan("app", table, b), out, items_of([item("id", col(b, "id"))]))
+
+@test
+set_op_columns_unify_to_their_common_type_under_the_first_input_s_names()
+    val small = Project(t_scan(), "a", items_of([item("k", col("t", "a")), item("n", col("t", "name"))]))
+    val big = Project(scan("app", "users", "u"), "b", items_of([item("id", col("u", "id")), item("name", col("u", "name"))]))
+    same_type(result_of(q(SetOp(Union, true, "s", items_of([small, big])))), bag(record([Field("k", nullable(Int64)), Field("n", Text)])))
+
+@test
+set_op_inputs_that_do_not_unify_are_q3010()
+    val two = Project(scan("app", "users", "u"), "b", items_of([item("id", col("u", "id")), item("name", col("u", "name"))]))
+    assert_eq(typing_refusal(q(SetOp(Union, false, "s", items_of([ids("users", "u2", "a"), two])))), "Q3010")
+
+    val text = Project(scan("app", "users", "u"), "b", items_of([item("id", col("u", "name"))]))
+    assert_eq(typing_refusal(q(SetOp(Except, false, "s", items_of([ids("posts", "p", "a"), text])))), "Q3010")
+
+@test
+set_op_inputs_with_union_elements_must_have_identical_unions()
+    val other = union_of([Field("Post", record([Field("id", Int64)]))])
+    val posts = Project(scan("app", "posts", "p"), "a", items_of([item("id", col("p", "id")), item("created_at", col("p", "created_at")), item("title", col("p", "title"))]))
+    val tagged = Tag(posts, "t1", search_result(), "Post")
+    val mine = Tag(ids("posts", "p2", "b"), "t2", other, "Post")
+    assert_eq(typing_refusal(q(SetOp(Union, true, "s", items_of([tagged, mine])))), "Q3010")
+
+@test
+set_op_input_columns_need_unique_names()
+    val dup = Join(Inner, ids("users", "u", "a"), ids("posts", "p", "b"), None, None, None)
+    val two = Project(scan("app", "users", "u2"), "c", items_of([item("id", col("u2", "id")), item("other", col("u2", "id"))]))
+    assert_eq(typing_refusal(q(SetOp(Union, true, "s", items_of([two, dup])))), "Q2005")
+
+// -- §6.13 With and CteRef --------------------------------------------------------------------------
+
+@test
+a_cte_reference_reads_the_cte_s_output()
+    val w = With(false, items_of([CteDef("c", None, sort([asc(col("u", "id"))], scan("app", "users", "u")))]), CteRef("c", "r"))
+    same_type(result_of(q(w)), list(users_row()))
+
+@test
+a_recursive_cte_reads_its_declared_columns()
+    val cols = items_of([Field("n", Int64)])
+    val seed = Values("s", items_of([Field("n", Int64)]), items_of([items_of([constant(Int8)])]))
+    val step = Project(filter(CteRef("c", "c1"), call("lt", [col("c1", "n"), constant(Int64)])), "st", items_of([item("n", call("add", [col("c1", "n"), constant(Int64)]))]))
+    val w = With(true, items_of([CteDef("c", Some(cols), SetOp(Union, false, "u", items_of([seed, step])))]), CteRef("c", "r"))
+    same_type(result_of(q(w)), bag(record([Field("n", Int64)])))
+
+@test
+a_cte_whose_query_does_not_fit_its_declared_columns_is_q3001()
+    val cols = items_of([Field("n", Int64), Field("m", Int64)])
+    val w = With(false, items_of([CteDef("c", Some(cols), ids("users", "u", "a"))]), CteRef("c", "r"))
+    assert_eq(typing_refusal(q(w)), "Q3001")
+
+    val texts = items_of([Field("n", Int64)])
+    val v = With(false, items_of([CteDef("c", Some(texts), Project(scan("app", "users", "u"), "a", items_of([item("n", col("u", "name"))])))]), CteRef("c", "r"))
+    assert_eq(typing_refusal(q(v)), "Q3001")
+
+// -- §6.14 Nest and Unnest --------------------------------------------------------------------------
+
+@test
+nest_emits_its_keys_and_a_bag_or_a_sorted_list_of_its_items()
+    val n = Nest(scan("app", "posts", "p"), "n", items_of([item("author", col("p", "author_id"))]), "posts",
+        items_of([item("id", col("p", "id")), item("title", col("p", "title"))]), buf[SortKey]())
+    val items = record([Field("id", Int64), Field("title", Text)])
+    same_type(result_of(q(n)), bag(record([Field("author", Int64), Field("posts", bag(items))])))
+
+    val o = Nest(scan("app", "posts", "p"), "n", items_of([item("author", col("p", "author_id"))]), "posts",
+        items_of([item("id", col("p", "id")), item("title", col("p", "title"))]), items_of([desc(col("p", "id"))]))
+    same_type(result_of(q(o)), bag(record([Field("author", Int64), Field("posts", list(items))])))
+
+@test
+nest_items_naming_an_unknown_column_are_q2003()
+    val n = Nest(scan("app", "posts", "p"), "n", no_items(), "posts", items_of([item("id", col("p", "nope"))]), buf[SortKey]())
+    assert_eq(typing_refusal(q(n)), "Q2003")
+
+@test
+unnest_adds_the_element_s_columns_nullable_when_outer()
+    val plain = Unnest(t_scan(), "e", col("t", "tags"), false, Some("i"))
+    same_type(result_of(q(pick(plain, "e", ["value", "i"]))), bag(record([Field("value", Text), Field("i", Int64)])))
+
+    val outer = Unnest(t_scan(), "e", col("t", "tags"), true, None)
+    same_type(result_of(q(Project(outer, "out", items_of([item("id", col("t", "id")), item("v", col("e", "value"))])))),
+        bag(record([Field("id", Int64), Field("v", nullable(Text))])))
+
+@test
+unnest_of_a_nested_relation_reads_its_records()
+    val users = Project(scan("app", "users", "u"), "uu", items_of([item("id", col("u", "id")), item("posts",
+        Relation(Project(filter(scan("app", "posts", "p"), eq(col("p", "author_id"), col("u", "id"))), "pp", items_of([item("title", col("p", "title"))]))))]))
+    val flat = Unnest(users, "e", col("uu", "posts"), false, None)
+    same_type(result_of(q(pick(flat, "e", ["title"]))), bag(record([Field("title", Text)])))
+
+@test
+unnest_of_a_scalar_or_ordinality_of_a_bag_is_refused()
+    assert_eq(typing_refusal(q(Unnest(t_scan(), "e", col("t", "id"), false, None))), "Q3001")
+    val bags = Unnest(t_scan(), "e", Cast(col("t", "tags"), bag(Text), Strict), false, Some("i"))
+    assert_eq(typing_refusal(q(bags)), "Q3008")
+
+// -- §6.15 Tag and union-element relations ----------------------------------------------------------
+
+private post_items() -> Rel =
+    Project(scan("app", "posts", "p"), "a", items_of([item("id", col("p", "id")), item("created_at", col("p", "created_at")), item("title", col("p", "title"))]))
+
+@test
+a_tag_makes_a_relation_of_union_values_whose_shared_columns_read_plainly()
+    val tagged = Tag(post_items(), "s", Named("app", "sr"), "Post")
+    same_type(result_of(q(tagged)), bag(search_result()))
+    same_type(result_of(q(pick(tagged, "s", ["id", "created_at"]))), bag(record([Field("id", Int64), Field("created_at", Timestamp)])))
+    assert_eq(typing_refusal(q(pick(tagged, "s", ["title"]))), "Q2003")
+
+@test
+a_tag_is_refused_for_a_type_that_is_no_union_an_unknown_tag_or_rows_that_do_not_fit()
+    assert_eq(typing_refusal(q(Tag(post_items(), "s", point(), "Post"))), "Q3001")
+    assert_eq(typing_refusal(q(Tag(post_items(), "s", search_result(), "Video"))), "Q2010")
+    assert_eq(typing_refusal(q(Tag(post_items(), "s", search_result(), "Photo"))), "Q3001")
+
+// -- §7 expressions ---------------------------------------------------------------------------------
+
+@test
+col_and_row_read_the_binder_s_types()
+    same_type(type_of(col("t", "d")), nullable(Decimal(10, 2)))
+    same_type(type_of(Row("t")), t_row())
+    assert_eq(refused_expr(Row("nobody")), "Q2002")
+
+@test
+a_param_has_its_declared_type_and_is_checked_against_its_use()
+    same_type(type_of(Param(0), [param("p", nullable(Decimal(5, 1)))]), nullable(Decimal(5, 1)))
+    same_type(type_of(call("add", [col("t", "id"), Param(0)]), [param("p", Int32)]), Int64)
+    assert_eq(refused_expr(call("add", [col("t", "id"), Param(0)]), [param("p", Text)]), "Q3002")
+    assert_eq(typing_refusal(query([param("p", Int64)], filter(t_scan(), Param(0)))), "Q3004")
+    assert_eq(typing_refusal(query([param("p", Text)], limit(Param(0), sort([asc(col("t", "id"))], t_scan())))), "Q3001")
+
+@test
+null_and_literal_have_their_types()
+    same_type(type_of(Null(Named("app", "point"))), nullable(point()))
+    same_type(type_of(constant(Uuid)), Uuid)
+    assert_eq(refused_expr(Literal(nullable(Int64), Int(0))), "Q3017")
+
+@test
+permitted_casts_have_their_target_type()
+    same_type(type_of(Cast(col("t", "id"), Int8, Strict)), Int8)
+    same_type(type_of(Cast(col("t", "f"), Decimal(10, 2), Try)), nullable(Decimal(10, 2)))
+    same_type(type_of(Cast(col("t", "name"), Date, Strict)), Date)
+    same_type(type_of(Cast(col("t", "ts"), Text, Strict)), Text)
+    same_type(type_of(Cast(constant(Bytes), Uuid, Strict)), Uuid)
+    same_type(type_of(Cast(col("t", "tags"), bag(Text), Strict)), bag(Text))
+    same_type(type_of(Cast(col("t", "p"), nullable(record([Field("x", Text), Field("y", Int64)])), Strict)), nullable(record([Field("x", Text), Field("y", Int64)])))
+    same_type(type_of(Cast(col("t", "a"), Int64, Try)), nullable(Int64))
+
+@test
+other_casts_are_q3012()
+    assert_eq(refused_expr(Cast(Cast(col("t", "tags"), bag(Text), Strict), list(Text), Strict)), "Q3012")
+    assert_eq(refused_expr(Cast(col("t", "ts"), DateTime, Strict)), "Q3012")
+    assert_eq(refused_expr(Cast(col("t", "a"), Int32, Strict)), "Q3012")
+    assert_eq(refused_expr(Cast(col("t", "flag"), nullable(Int8), Strict)), "Q3012")
+    assert_eq(refused_expr(Cast(col("t", "p"), nullable(record([Field("y", Int32), Field("x", Int32)])), Strict)), "Q3012")
+
+@test
+if_is_the_common_type_of_its_values_nullable_without_else()
+    same_type(type_of(If(items_of([IfArm(col("t", "flag"), col("t", "u"))]), Some(col("t", "id")))), Int64)
+    same_type(type_of(If(items_of([IfArm(constant(Bool), col("t", "id"))]), None)), nullable(Int64))
+
+@test
+if_is_refused_for_a_condition_that_is_not_bool_or_values_with_no_common_type()
+    assert_eq(refused_expr(If(items_of([IfArm(col("t", "id"), col("t", "id"))]), None)), "Q3004")
+    assert_eq(refused_expr(If(items_of([IfArm(constant(Bool), col("t", "id"))]), Some(col("t", "name")))), "Q3001")
+
+private label(arms: []const MatchArm, otherwise: Option[&Expr]) -> Expr = Match(col("t", "sr"), items_of(arms), otherwise)
+
+@test
+match_is_the_common_type_of_its_arms_reading_each_payload()
+    same_type(type_of(label([MatchArm("Post", "x", col("x", "title")), MatchArm("Photo", "y", col("y", "url"))], None)), Text)
+    same_type(type_of(label([MatchArm("Post", "x", col("x", "id"))], Some(constant(Int8)))), Int64)
+    same_type(type_of(Match(Null(search_result()), items_of([MatchArm("Post", "x", col("x", "id"))]), Some(constant(Int64)))), nullable(Int64))
+
+@test
+match_is_refused_for_a_value_that_is_no_union_an_unknown_tag_or_arms_that_do_not_cover()
+    assert_eq(refused_expr(Match(col("t", "id"), items_of([MatchArm("Post", "x", constant(Int64))]), None)), "Q3001")
+    assert_eq(refused_expr(label([MatchArm("Video", "x", constant(Int64))], Some(constant(Int64)))), "Q2010")
+    assert_eq(refused_expr(label([MatchArm("Post", "x", col("x", "id"))], None)), "Q3009")
+    assert_eq(refused_expr(label([MatchArm("Post", "x", col("x", "id")), MatchArm("Post", "y", col("y", "id"))], Some(constant(Int64)))), "Q3009")
+    assert_eq(refused_expr(label([MatchArm("Post", "x", col("x", "url")), MatchArm("Photo", "y", col("y", "url"))], None)), "Q2003")
+
+@test
+record_field_and_variant_build_and_read_values()
+    val r: Expr = Record(items_of([item("k", col("t", "name")), item("n", col("t", "a"))]))
+    same_type(type_of(r), record([Field("k", Text), Field("n", nullable(Int32))]))
+    same_type(type_of(Field(r, "n")), nullable(Int32))
+    same_type(type_of(Field(col("t", "p"), "x")), nullable(Int32))
+
+    val post: Expr = Record(items_of([item("id", col("t", "id")), item("created_at", col("t", "ts")), item("title", col("t", "name"))]))
+    same_type(type_of(Variant(Named("app", "sr"), "Post", post)), search_result())
+
+@test
+record_field_and_variant_are_refused_where_names_or_types_do_not_fit()
+    assert_eq(refused_expr(Record(items_of([item("k", col("t", "id")), item("k", col("t", "id"))]))), "Q2005")
+    assert_eq(refused_expr(Field(col("t", "p"), "z")), "Q2011")
+    assert_eq(refused_expr(Field(col("t", "id"), "x")), "Q3001")
+    assert_eq(refused_expr(Variant(search_result(), "Video", Record(no_items()))), "Q2010")
+    assert_eq(refused_expr(Variant(search_result(), "Post", Record(no_items()))), "Q3001")
+    assert_eq(refused_expr(Variant(point(), "Post", Record(no_items()))), "Q3001")
+
+@test
+relation_scalar_and_exists_type_their_subqueries()
+    val posts = filter(scan("app", "posts", "p"), eq(col("p", "author_id"), col("t", "id")))
+    same_type(type_of(Relation(pick(posts, "p", ["title"]))), bag(record([Field("title", Text)])))
+    same_type(type_of(Scalar(pick(posts, "p", ["title"]))), nullable(Text))
+    same_type(type_of(Scalar(one_agg(posts, "count", [], []))), Int64)
+    same_type(type_of(Scalar(pick(one_agg(posts, "max", [col("p", "id")], []), "g", ["x"]))), nullable(Int64))
+    same_type(type_of(Exists(posts)), Bool)
+
+@test
+relation_scalar_and_exists_are_refused_where_their_subqueries_do_not_fit()
+    val posts = scan("app", "posts", "p")
+    assert_eq(refused_expr(Relation(Join(Inner, posts, scan("app", "users", "u"), None, None, None))), "Q2005")
+    assert_eq(refused_expr(Scalar(pick(posts, "p", ["id", "title"]))), "Q5009")
+    assert_eq(refused_expr(Exists(scan("app", "nope", "n"))), "Q2001")
+
+@test
+in_is_bool_and_nullable_when_a_comparison_can_be()
+    val ids = pick(scan("app", "users", "u"), "u", ["id"])
+    same_type(type_of(In(items_of([col("t", "u")]), ids)), Bool)
+    same_type(type_of(In(items_of([col("t", "a")]), pick(scan("app", "users", "u2"), "u2", ["id"]))), nullable(Bool))
+    same_type(type_of(In(items_of([col("t", "id"), col("t", "name")]), scan("app", "users", "u3"))), Bool)
+
+@test
+in_is_refused_for_a_width_or_a_type_that_does_not_compare()
+    assert_eq(refused_expr(In(items_of([col("t", "id")]), scan("app", "users", "u"))), "Q3001")
+    assert_eq(refused_expr(In(items_of([col("t", "name")]), pick(scan("app", "users", "u"), "u", ["id"]))), "Q3001")
+    assert_eq(refused_expr(In(items_of([col("t", "tags")]), pick(t_scan2(), "t2", ["tags"]))), "Q3006")
+
+private t_scan2() -> Rel = scan("app", "t", "t2")
+
+// -- §9 DML ------------------------------------------------------------------------------------------
+
+private counters_row() -> Type = record([Field("key", Text), Field("n", Int64)])
+
+/** The type of `Action()` (§9.5). */
+private action_union() -> Type =
+    union_of([Field("inserted", record([])), Field("updated", record([])), Field("deleted", record([]))])
+
+private insert(columns: []const string, source: Rel, returning: []const Item) -> Statement =
+    Insert(QualName("app", "t"), "t", None, items_of(columns), source, None, items_of(returning))
+
+private values_of(columns: []const Field, row: []const Expr) -> Rel = Values("v", items_of(columns), items_of([items_of(row)]))
+
+@test
+an_insert_without_returning_has_no_result_type()
+    val env = envelope([], insert(["id", "name"], values_of([Field("id", Int32), Field("name", Text)], [constant(Int32), constant(Text)]), []))
+    assert(typed(env).result == None, "no returning, no result")
+
+@test
+an_insert_s_source_columns_coerce_to_the_named_columns()
+    // An int16 is a decimal(5, 0), which decimal(10, 2) holds; an int32 would need decimal(12, 2).
+    val src = values_of([Field("id", Int8), Field("a", Int16), Field("d", Int16)], [constant(Int8), constant(Int16), constant(Int16)])
+    val env = envelope([], insert(["id", "a", "d"], src, [item("id", col("t", "id")), item("d", col("t", "d"))]))
+    same_type(result_of(env), bag(record([Field("id", Int64), Field("d", nullable(Decimal(10, 2)))])))
+
+@test
+an_insert_is_refused_for_a_count_a_type_or_a_null_that_does_not_fit()
+    val two = values_of([Field("id", Int64), Field("name", Text)], [constant(Int64), constant(Text)])
+    assert_eq(typing_refusal(envelope([], insert(["id"], two, []))), "Q3001")
+
+    val text = values_of([Field("id", Text)], [constant(Text)])
+    assert_eq(typing_refusal(envelope([], insert(["id"], text, []))), "Q3001")
+
+    val maybe = values_of([Field("id", nullable(Int64))], [Null(Int64)])
+    assert_eq(typing_refusal(envelope([], insert(["id"], maybe, []))), "Q3005")
+    assert_eq(typing_refusal(envelope([], insert(["a"], maybe, []))), "Q3001")
+
+@test
+an_insert_is_refused_for_a_column_it_may_not_name()
+    val one = values_of([Field("x", Int64)], [constant(Int64)])
+    assert_eq(typing_refusal(envelope([], insert(["gen"], one, []))), "Q5003")
+    assert_eq(typing_refusal(envelope([], insert(["nope"], one, []))), "Q2003")
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "v"), "t", None, items_of(["id"]), one, None, buf[Item]()))), "Q5003")
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "nope"), "t", None, items_of(["id"]), one, None, buf[Item]()))), "Q2001")
+
+@test
+an_insert_source_needs_unique_column_names()
+    val dup = Join(Inner, ids("users", "u", "a"), ids("posts", "p", "b"), None, None, None)
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "t"), "t", None, items_of(["id", "u"]), dup, None, buf[Item]()))), "Q2005")
+
+@test
+an_upsert_targets_a_unique_key()
+    val one = values_of([Field("id", Int64)], [constant(Int64)])
+    val by_columns = OnConflict(Columns(items_of(["u", "name"])), "x", Nothing)
+    val ok = Insert(QualName("app", "t"), "t", None, items_of(["id"]), one, Some(by_columns), buf[Item]())
+    assert_eq(typing_refusal(envelope([], ok)), "ok")
+
+    val by_name = OnConflict(Constraint("t_pkey"), "x", DoUpdate(items_of([item("a", col("x", "a"))]), Some(col("t", "flag"))))
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "t"), "t", None, items_of(["id"]), one, Some(by_name), buf[Item]()))), "ok")
+
+    val wrong = OnConflict(Columns(items_of(["name"])), "x", Nothing)
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "t"), "t", None, items_of(["id"]), one, Some(wrong), buf[Item]()))), "Q5004")
+
+    val unnamed = OnConflict(Constraint("t_nope"), "x", Nothing)
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "t"), "t", None, items_of(["id"]), one, Some(unnamed), buf[Item]()))), "Q5004")
+
+@test
+an_upsert_s_set_and_where_are_typed_against_the_table()
+    val one = values_of([Field("id", Int64)], [constant(Int64)])
+    val set_text = OnConflict(Constraint("t_pkey"), "x", DoUpdate(items_of([item("id", col("x", "name"))]), None))
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "t"), "t", None, items_of(["id"]), one, Some(set_text), buf[Item]()))), "Q3001")
+
+    val where_int = OnConflict(Constraint("t_pkey"), "x", DoUpdate(items_of([item("a", col("x", "a"))]), Some(col("t", "id"))))
+    assert_eq(typing_refusal(envelope([], Insert(QualName("app", "t"), "t", None, items_of(["id"]), one, Some(where_int), buf[Item]()))), "Q3004")
+
+@test
+an_update_returns_the_written_row_and_the_old_one_nullable()
+    val u = Update(QualName("app", "counters"), "c", Some("o"), None, Some(eq(col("c", "key"), constant(Text))),
+        items_of([item("n", call("add", [col("c", "n"), constant(Int8)]))]),
+        items_of([item("n", col("c", "n")), item("was", col("o", "n")), item("row", Row("o")), item("action", Action)]))
+    same_type(result_of(envelope([], u)), bag(record([Field("n", Int64), Field("was", nullable(Int64)), Field("row", nullable(counters_row())), Field("action", action_union())])))
+
+@test
+an_update_sees_its_from_binders()
+    val u = Update(QualName("app", "posts"), "p", None, Some(scan("app", "users", "u")), Some(eq(col("p", "author_id"), col("u", "id"))),
+        items_of([item("title", col("u", "name"))]), items_of([item("who", col("u", "name"))]))
+    same_type(result_of(envelope([], u)), bag(record([Field("who", Text)])))
+
+private set(name: string, e: Expr) -> Statement =
+    Update(QualName("app", "t"), "t", None, None, None, items_of([item(name, e)]), buf[Item]())
+
+@test
+an_update_is_refused_for_a_value_that_does_not_fit_its_column()
+    assert_eq(typing_refusal(envelope([], set("id", col("t", "name")))), "Q3001")
+    assert_eq(typing_refusal(envelope([], set("id", col("t", "a")))), "Q3005")
+    assert_eq(typing_refusal(envelope([], set("gen", constant(Int64)))), "Q5003")
+    assert_eq(typing_refusal(envelope([], set("nope", constant(Int64)))), "Q2003")
+    assert_eq(typing_refusal(envelope([], Update(QualName("app", "t"), "t", None, None, Some(col("t", "id")), items_of([item("a", Null(Int32))]), buf[Item]()))), "Q3004")
+
+@test
+a_delete_returns_the_removed_rows()
+    val d = Delete(QualName("app", "users"), "u", None, Some(scan("app", "posts", "p")), Some(eq(col("p", "author_id"), col("u", "id"))),
+        items_of([item("name", col("u", "name")), item("title", col("p", "title"))]))
+    same_type(result_of(envelope([], d)), bag(record([Field("name", Text), Field("title", Text)])))
+    assert_eq(typing_refusal(envelope([], Delete(QualName("app", "v"), "u", None, None, None, buf[Item]()))), "Q5003")
+    assert_eq(typing_refusal(envelope([], Delete(QualName("app", "users"), "u", None, None, Some(col("u", "name")), buf[Item]()))), "Q3004")
+
+// -- §16 worked examples ----------------------------------------------------------------------------
+
+@test
+the_users_and_posts_example_types_as_16_1_states()
+    val comments = bag(record([Field("id", Int64), Field("body", Text)]))
+    val posts = list(record([Field("id", Int64), Field("title", Text), Field("comments", comments)]))
+    same_type(result_of(users_and_posts()), list(record([Field("id", Int64), Field("name", Text), Field("post_count", Int64), Field("posts", posts)])))
+
+@test
+the_search_example_types_as_16_2_states()
+    same_type(result_of(search()), list(search_result()))
+
+@test
+the_match_projection_of_16_2_types_and_refuses_a_missing_arm()
+    val label = Match(Row("s"), items_of([MatchArm("Post", "x", col("x", "title")), MatchArm("Photo", "y", col("y", "url"))]), None)
+    val env = query([param("q", Text), param("first", Int64)], project(the_search_rel(), "out", [item("id", col("s", "id")), item("label", label)]))
+    same_type(result_of(env), list(record([Field("id", Int64), Field("label", Text)])))
+
+    val short = Match(Row("s"), items_of([MatchArm("Post", "x", col("x", "title"))]), None)
+    val bad = query([param("q", Text), param("first", Int64)], project(the_search_rel(), "out", [item("id", col("s", "id")), item("label", short)]))
+    assert_eq(typing_refusal(bad), "Q3009")
+
+    type_envelope(bad, fake()) match
+        Err(e) -> assert(e.message.ends_with("Photo"), "the missing tag is named")
+        Ok(_) -> assert(false, "refused")
+
+private the_search_rel() -> Rel = search().statement match
+    Query(r) -> r
+    _ -> t_scan()
+
+@test
+the_upsert_example_types_as_16_3_states()
+    same_type(result_of(upsert()), bag(record([Field("key", Text), Field("n", Int64), Field("previous", nullable(Int64)), Field("action", action_union())])))
+
+/** §16.3's upsert with `$1` declared `delta` and the `Values` column `n` that carries it `column`. */
+private upsert_with(delta: Type, column: Type) -> Envelope
+    val source = Values("v", items_of([Field("key", Text), Field("n", column)]), items_of([items_of([Param(0), Param(1)])]))
+    val set = items_of([item("n", call("add", [col("t", "n"), col("x", "n")]))])
+
+    envelope([param("key", Text), param("delta", delta)], Insert(QualName("app", "counters"), "t", Some("o"),
+        items_of(["key", "n"]), source, Some(OnConflict(Columns(items_of(["key"])), "x", DoUpdate(set, None))),
+        items_of([item("key", col("t", "key")), item("n", col("t", "n"))])))
+
+@test
+the_upsert_with_a_nullable_delta_is_q3005()
+    assert_eq(typing_refusal(upsert_with(Int64, Int64)), "ok")
+    assert_eq(typing_refusal(upsert_with(nullable(Int64), nullable(Int64))), "Q3005")
+
+    // A nullable parameter in a non-null Values column is refused there, before the insert sees it.
+    assert_eq(typing_refusal(upsert_with(nullable(Int64), Int64)), "Q3001")
+
+// -- node types and the phases of §11.2 -----------------------------------------------------------------
+
+@test
+every_node_has_its_type_in_pre_order()
+    val row = record([Field("id", Int64), Field("name", Text)])
+    val env = query([param("id", Int64)], filter(scan("app", "users", "u"), eq(col("u", "id"), Param(0))))
+    val t = typed(env)
+    assert_eq(t.nodes.len(), 5)
+    same_type(t.nodes[0], bag(row))
+    same_type(t.nodes[1], bag(row))
+    same_type(t.nodes[2], Bool)
+    same_type(t.nodes[3], Int64)
+    same_type(t.nodes[4], Int64)
+
+@test
+a_name_error_comes_before_a_type_error_and_a_type_error_before_a_structure_error()
+    // Q3004 at the filter, Q2002 deeper down: the names phase comes first.
+    val both = filter(scan("app", "users", "u"), call("add", [col("nobody", "id"), constant(Int64)]))
+    assert_eq(typing_refusal(q(filter(both, col("u", "id")))), "Q2002")
+
+    // An unused parameter (Q4002) waits for the type error.
+    assert_eq(typing_refusal(query([param("unused", Int64)], filter(scan("app", "users", "u"), col("u", "id")))), "Q3004")
+
+@test
+within_a_phase_the_error_first_in_pre_order_is_reported()
+    // Two type errors: the Limit's Q3008 precedes its input Filter's Q3004.
+    val inner = filter(scan("app", "users", "u"), col("u", "id"))
+    assert_eq(typing_refusal(q(limit(constant(Int64), inner))), "Q3008")
+
+    // Two name errors from the two walks: the structural Q2005 at the Project precedes the type
+    // checker's Q2007 at the call inside it.
+    assert_eq(typing_refusal(q(Project(scan("app", "users", "u"), "o", items_of([item("a", call("frob", [])), item("a", constant(Int8))])))), "Q2005")
+
+    // And the other way round: the type checker's Q2001 at the outer Scan precedes the structural
+    // Q2002 inside the filter of the subquery after it.
+    val sub = Exists(filter(scan("app", "users", "u"), call("eq", [col("ghost", "id"), constant(Int64)])))
+    assert_eq(typing_refusal(q(filter(scan("app", "nope", "n"), sub))), "Q2001")
