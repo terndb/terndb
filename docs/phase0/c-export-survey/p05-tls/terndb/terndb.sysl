@@ -1,0 +1,10 @@
+module terndb
+
+@thread_local var engine_tag = false
+
+@export("terndb_engine_enter")
+engine_enter()
+    engine_tag = true
+
+@export("terndb_on_engine")
+on_engine() -> bool = engine_tag

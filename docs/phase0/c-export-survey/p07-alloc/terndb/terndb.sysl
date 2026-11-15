@@ -1,0 +1,33 @@
+module terndb
+
+import sysl.buf.{Buf, buf}
+
+extern "malloc" c_malloc(n: usize) -> *u8
+extern "free" c_free(p: *u8)
+
+var alloc_fn: *extern(usize) -> *u8 = &c_malloc
+var free_fn: *extern(*u8) -> unit = &c_free
+var allocs: u64 = 0
+
+@export("terndb_alloc_hook")
+alloc_hook(n: usize) -> *u8
+    allocs += 1
+    alloc_fn(n)
+
+@export("terndb_free_hook")
+free_hook(p: *u8) = free_fn(p)
+
+@export("terndb_set_allocator")
+set_allocator(a: *extern(usize) -> *u8, f: *extern(*u8) -> unit)
+    alloc_fn = a
+    free_fn = f
+
+@export("terndb_work")
+work(n: i32) -> i64
+    var b: Buf[string] = buf()
+    for i in 0..<n
+        b.push(s"key-$i")
+    i64(b.len())
+
+@export("terndb_allocs")
+count() -> u64 = allocs

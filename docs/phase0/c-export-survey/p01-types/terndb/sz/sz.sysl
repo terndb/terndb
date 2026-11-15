@@ -1,0 +1,9 @@
+module terndb.sz
+
+@include("<stddef.h>")
+
+c type
+    Size = "size_t"
+
+@export("terndb_len")
+len(n: Size) -> Size = n

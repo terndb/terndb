@@ -1,0 +1,2 @@
+@export("b_two")
+two() -> i32 = 2
