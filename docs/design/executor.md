@@ -8,9 +8,10 @@ written into `query-tree.md` itself, and this note points at it.
 
 The code is `sh/sysl/terndb/exec_*.sysl`. This first slice covers what does not depend on storage:
 column vectors, expression evaluation, and the operators `Values`, `ParamScan`, `Filter`,
-`Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Tag` and `Join` (§4.1), a source over in-memory
-batches standing in for `Scan`, and the conversion of an operator's output into result batches.
-Windows, `Nest`/`Unnest`, `Apply`, set operations, DML, storage, MVCC and the planner come later.
+`Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Tag`, `Join` (§4.1), and `Nest`, `Unnest`,
+`Apply` with the subquery expressions (§4.2), a source over in-memory batches standing in for `Scan`,
+and the conversion of an operator's output into result batches. Windows, set operations, DML,
+storage, MVCC and the unnesting planner come later.
 
 ## 1. Column vectors
 
@@ -254,16 +255,49 @@ build on the smaller side, probe streaming, with the same composite batches and 
 bookkeeping. Until then the merge join is the equi-join; it is blocking on both sides, where a hash
 join would block on the build side only.
 
+### 4.2 Nested relations and correlation
+
+The code is `exec_nest.sysl`.
+
+**Correlation is per row, by re-planning.** A correlated subtree — an `Apply`'s right input, the
+`rel` of a `Relation`, `Scalar`, `Exists` or `In` — is kept as a `SubPlan`: the `Rel`, the position
+of its types in `Typing.nodes`, and the outer rows already bound where it stands. The planner plans it
+once where it stands, only to step over its types and learn its output's shape. At run time it is
+planned again for every outer row, with that row's binders (one-row vectors, a composite searched by
+member) as `Planner.outer`; every `Col` or `Row` of one of them becomes a `Param` whose value is
+appended to that plan's own copy of the parameters. The subtree's operators therefore never see a
+binder they do not expose, and a nested subquery captures the outer rows of every level above it.
+This is §6.6 rule 3's per-row meaning, the reference an unnesting planner (§6.6 rule 2, Neumann–Kemper)
+will be checked against; until that planner exists the executor does not meet rule 2.
+
+- **Apply** (§6.6): per left row, the right input re-planned for the row and joined to that one row
+  by the nested-loop `JoinOp` of the corresponding kind (`cross` as `inner`, `outer` as `left`), so
+  `semi`, `anti`, `mark` and `single`, `on`'s three values and `R0003` are §4.1's code. With an empty
+  left input the right input is never planned or run (§6.6 rule 4, written into the spec by this work).
+- **Relation, Scalar, Exists, In** (§7.9–§7.11): per row of the batch, the subtree is run to the end
+  and flattened. `Relation` is offsets and one `concat` of every row's rows; `Scalar` is the one
+  column of the one row, null for none, `R0003` for two; `Exists` whether a row came; `In` compares
+  the row's tuple with each row's columns under `eq` in their common type, value at a time. An `If`
+  evaluates them only on the rows its arm selects (§3.4).
+- **Nest** (§6.14 rule 1): planned as the `Aggregate` the rule says it equals — the same keys and one
+  `collect` of a `Record` of the items with the `order` — so it is sort-based, like `Aggregate`.
+- **Unnest** (§6.14 rule 2): per input batch, `value` evaluated, and each slot's range of the
+  relation's child taken with one `take`; a padded row (`outer`, empty or null relation) takes a null
+  slot appended after the child. The output is a composite, the input's binders and `as` (the element,
+  or with an ordinality a record of the element's columns and the 1-based position), cut into
+  `BatchSize` batches.
+
 ## 5. What this note relies on in `query-tree.md`
 
 §3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
-the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.5, §6.7, §6.9–§6.11 and §6.15 for
-the operators; §7.1–§7.8 and §7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
+the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.7, §6.9–§6.11, §6.14 and §6.15 for
+the operators; §7.1–§7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
 its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
 `and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the calendar `add`
 (all in §7.12); when a join's `on` is evaluated and `single`'s `R0003` (§6.5 rules 8 and 9); a
 group's key, `filter`, `distinct`, and the values of `sum`, `min`, `max` and `string_agg` (§6.7 rules
-5–7).
+5–7); when an `Apply`'s right input and a subquery are evaluated (§6.6 rule 4); a keyless `Nest` of no
+rows, and an `Unnest` without `outer` of an empty or null relation (§6.14 rules 1 and 2).
 
 ## 6. Where the survey's sysl gaps cost speed
 

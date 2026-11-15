@@ -18,13 +18,13 @@ const Composite: string = ""
 // -- what an input exposes ------------------------------------------------------------------------
 
 /** The binders `l` exposes, in order, each with the type of its rows. */
-private exposed(l: Lowered) -> Buf[Field] =
+private[terndb] exposed(l: Lowered) -> Buf[Field] =
     if l.binder == Composite then fields_of_type(l.elem) else items_of([Field(l.binder, l.elem)])
 
 /** The rows of each binder in a batch `v` of an input exposing `binder`, in the order `exposed`
  * names them.
  */
-private parts_of(binder: string, v: ColumnVector) -> Buf[ColumnVector]
+private[terndb] parts_of(binder: string, v: ColumnVector) -> Buf[ColumnVector]
     if binder != Composite then return items_of([v])
 
     v.lanes match

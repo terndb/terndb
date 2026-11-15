@@ -1,0 +1,339 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Nested relations (`query-tree.md` §6.6, §6.14, §7.9–§7.11, `docs/design/executor.md` §4.2): `Nest`,
+// `Unnest`, `Apply`, and the subquery expressions `Relation`, `Scalar`, `Exists` and `In`.
+//
+// A correlated subtree — an `Apply`'s right input, a subquery expression's `rel` — is planned again for
+// every outer row, with that row's binders visible (§8.3 step 2). Each reference to one of them becomes
+// a parameter holding the row's value, appended to the parameters of that one plan, so the subtree's
+// operators never see a binder they do not expose. This is the per-row meaning §6.6 rule 3 gives, the
+// reference an unnesting planner is checked against.
+
+/** A correlated subtree, kept to be planned once per outer row: the relation, the type checker's
+ * types and where the subtree's own begin, the tables, and the outer rows already bound where the
+ * subtree was found, one row per binder.
+ */
+struct SubPlan
+    rel: Rel
+    types: Buf[Type]
+    at: usize
+    tables: Buf[MemTable]
+    outer: Buf[Binder]
+
+// -- correlated references ----------------------------------------------------------------------
+
+/** The one row of binder `name` among the outer rows `bs`: a binder of its own, or a member of a
+ * composite (`exec_join.sysl`).
+ */
+private outer_rows(bs: Buf[Binder], name: string) -> Option[ColumnVector]
+    for b in bs
+        if b.name == name then return Some(b.rows)
+
+        if b.name == Composite
+            val fs = fields_of_type(b.rows.ty)
+
+            for j in 0..<fs.len()
+                if fs[j].name == name then return Some(b.rows.member(j))
+
+    None
+
+/** The value `e`, of type `ty`, has when it is a `Col` or a `Row` of one of the outer rows `bs`: what
+ * the planner binds as a parameter in its place.
+ */
+private[terndb] outer_value(bs: Buf[Binder], e: Expr, ty: Type) -> Option[Value] = e match
+    Col(b, name) -> outer_rows(bs, b).map(rows -> value_at(column(rows, name, ty), 0))
+    Row(b) -> outer_rows(bs, b).map(rows -> value_at(rows.as_type(ty), 0))
+    _ -> None
+
+/** The batches of `s` for row `i` of `env`: the subtree planned with that row's binders, and those
+ * already bound, visible, and run to the end; flat, as a client would see them (§8.4).
+ */
+private run_for_row(s: SubPlan, env: Env, i: usize) -> Result[Buf[ColumnVector], CodecError]
+    val one = items_of([i])
+    val outer = buf[Binder]()
+    outer.extend(env.take(one.view()).binders.view())
+    outer.extend(s.outer.view())
+    drain(flat_input(plan_sub(s, env.ctx, outer)))
+
+private rows_in(bs: Buf[ColumnVector]) -> usize
+    var n: usize = 0
+
+    for b in bs
+        n += b.len
+
+    n
+
+// -- the subquery expressions, §7.9–§7.11 -------------------------------------------------------
+
+/** `x`, a `Relation`, `Scalar`, `Exists` or `In`, over the rows of `env`: its `rel` run once per row.
+ * `Relation` is the rows as one relation slot per row (§7.9); `Scalar` the one column of the one row,
+ * null for none and `R0003` for more (§7.10 rule 1); `Exists` whether there is a row (§7.10 rule 2);
+ * `In` SQL's membership of the row's tuple (§7.11).
+ */
+private[terndb] eval_subquery(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
+    val s = x.sub.unwrap()
+    val tuple = buf[ColumnVector]()
+
+    for k in x.kids
+        tuple.push(eval(k, env)?)
+
+    val parts = buf[ColumnVector]()
+    val offsets = buf[u32]()
+    val flags = buf[Value]()
+    offsets.push(0)
+
+    for i in 0..<env.n
+        val bs = run_for_row(s, env, i)?
+        val n = rows_in(bs)
+
+        x.e match
+            Relation(_) ->
+                parts.extend(bs.view())
+                offsets.push(offsets[offsets.len() - 1] + u32(n))
+            Scalar(_) ->
+                if n > 1 then return fail("R0003", "a scalar subquery has more than one row")
+
+                parts.push(if n == 0 then repeated(x.ty, Null, 1) else first_column(bs[0], x.ty))
+            Exists(_) -> flags.push(Bool(n > 0))
+            _ -> flags.push(member_of(tuple, i, bs)?)
+
+    x.e match
+        Relation(_) ->
+            val e = x.ty.base() match
+                Bag(t) | List(t) -> *t
+                _ -> panic("a relation subquery has a relation type")
+
+            val rows = buf[ColumnVector]()
+
+            for p in parts
+                rows.push(p.as_type(e))
+
+            Ok(ColumnVector(x.ty, env.n, buf[u8](), Elems(offsets, concat(e, rows.view()))))
+        Scalar(_) -> Ok(concat(x.ty, parts.view()))
+        _ -> Ok(vector_of(x.ty, flags.view()))
+end eval_subquery
+
+/** The first column of the rows `b` (a record's first field, a union's first shared column, a scalar
+ * element itself), as `ty`.
+ */
+private first_column(b: ColumnVector, ty: Type) -> ColumnVector = column(b, element_columns(b.ty.base())[0].name, ty)
+
+/** `In` for row `i` (§7.11): `true` if some row of `bs` is `eq` to the tuple, column by column, in the
+ * two sides' common type; else null if some comparison was null; else `false`.
+ */
+private member_of(tuple: Buf[ColumnVector], i: usize, bs: Buf[ColumnVector]) -> Result[Value, CodecError]
+    var unknown = false
+
+    for b in bs
+        val cs = buf[ColumnVector]()
+
+        for f in element_columns(b.ty.base())
+            cs.push(column(b, f.name, if b.ty.is_nullable() then nullable(f.ty) else f.ty))
+
+        for r in 0..<b.len
+            var all = true
+            var null_seen = false
+
+            for k in 0..<tuple.len()
+                val (a, c) = (tuple[k], cs[k])
+                val t = common_type(a.ty, c.ty)?
+                val e = eq(t, coerce(value_at(a, i), a.ty, t)?, coerce(value_at(c, r), c.ty, t)?)?
+
+                e match
+                    Some(true) -> ()
+                    Some(false) -> all = false
+                    None -> null_seen = true
+
+            if all && !null_seen then return Ok(Bool(true))
+            if all then unknown = true
+
+    Ok(if unknown then Null else Bool(false))
+end member_of
+
+// -- Nest, §6.14 rule 1 ---------------------------------------------------------------------------
+
+/** `Nest` over `inner`: by rule 1 it is `Aggregate` with the same keys and the one call
+ * `collect(Record(items))` with `order`, so it is planned as that aggregate. `elem` is the node's
+ * row, the keys then the nested relation; `xs` are the typed `items`.
+ */
+private[terndb] plan_nest(inner: Lowered, binder: string, elem: Type, keys: Buf[TExpr], items: Buf[Item], xs: Buf[TExpr], order: Buf[TKey], ctx: Ctx) -> Lowered
+    val fs = fields_of_type(elem)
+    val nested = fs[fs.len() - 1].ty.base() match
+        Bag(t) | List(t) -> *t
+        _ -> panic("a Nest's last column is a relation")
+
+    val row: Expr = Record(items)
+    val call = TAgg("collect", items_of([TExpr(row, nested, xs, None)]), false, None, order)
+    Lowered(AggregateOp(inner.op, inner.binder, inner.elem, elem, keys, items_of([call]), ctx, None), binder, elem, buf[TKey]())
+
+// -- Unnest, §6.14 rule 2 -------------------------------------------------------------------------
+
+/** `Unnest` of `value` over `inner`, its element's columns (and the ordinality) under `binder`, beside
+ * the input's binders: a composite, as a join's output is.
+ */
+private[terndb] plan_unnest(inner: Lowered, binder: string, value: TExpr, outer: bool, ordinality: Option[string], ctx: Ctx) -> Lowered
+    val e = value.ty.base() match
+        Bag(t) | List(t) -> *t
+        _ -> panic("Unnest's value is a relation")
+
+    val elem = if outer then nullable(e) else e
+
+    val member = ordinality match
+        None -> elem
+        Some(name) ->
+            val fs = buf[Field]()
+
+            for f in element_columns(elem.base())
+                fs.push(Field(f.name, if outer then nullable(f.ty) else f.ty))
+
+            fs.push(Field(name, if outer then nullable(Int64) else Int64))
+            Record(fs)
+
+    val out = buf[Field]()
+    out.extend(exposed(inner).view())
+    out.push(Field(binder, member))
+
+    val op = UnnestOp(inner.op, inner.binder, value, outer, ordinality.is_some(), elem, member, Record(out), ctx, buf[ColumnVector](), 0)
+    Lowered(op, Composite, Record(out), buf[TKey]())
+end plan_unnest
+
+/** The rows of `Unnest`: per input row, one per element of its relation, in the relation's order;
+ * with `outer`, one row with the element null for an empty or null relation, and none without.
+ */
+struct UnnestOp
+    input: &Operator
+    binder: string
+    value: TExpr
+    outer: bool
+    ordinality: bool
+    elem: Type
+    member: Type
+    out_ty: Type
+    ctx: Ctx
+    queue: Buf[ColumnVector]
+    at: usize
+
+impl Operator for UnnestOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        loop
+            if self.at < self.queue.len()
+                self.at += 1
+                return Ok(Some(self.queue[self.at - 1]))
+
+            val b = self.input.next_batch()? match
+                Some(b) -> b
+                None -> return Ok(None)
+
+            val v = eval(self.value, env_of(self.ctx, self.binder, b))?
+            self.queue = batches_of(unnest_rows(b, self.binder, v, self.outer, self.ordinality, self.elem, self.member, self.out_ty))
+            self.at = 0
+
+/** The output of one input batch `b`, whose relations are `v`. */
+private unnest_rows(b: ColumnVector, binder: string, v: ColumnVector, outer: bool, ordinality: bool, elem: Type, member: Type, out_ty: Type) -> ColumnVector
+    val (offsets, child) = v.lanes match
+        Elems(o, c) -> (o, *c)
+        _ -> panic("Unnest's value is a relation")
+
+    // `rows[k]` is the input row of output row `k`, and `picks[k]` its element; a padded row picks
+    // the one null slot after the elements.
+    val rows = buf[usize]()
+    val picks = buf[usize]()
+    val ords = buf[Value]()
+
+    for i in 0..<b.len
+        val lo = usize(offsets[i])
+        val hi = if v.is_valid(i) then usize(offsets[i + 1]) else lo
+
+        if lo == hi && outer
+            rows.push(i)
+            picks.push(child.len)
+            ords.push(Null)
+
+        for k in lo..<hi
+            rows.push(i)
+            picks.push(k)
+            ords.push(Int(i128(k - lo + 1)))
+
+    val from = if outer then concat(elem, [child.as_type(elem), repeated(elem, Null, 1)]) else child
+    val taken = take(from, picks.view())
+
+    val m = if !ordinality then taken else
+        val fs = fields_of_type(member)
+        val cs = buf[ColumnVector]()
+
+        for j in 0..<fs.len() - 1
+            cs.push(column(taken, fs[j].name, fs[j].ty))
+
+        cs.push(vector_of(fs[fs.len() - 1].ty, ords.view()))
+        ColumnVector(member, rows.len(), buf[u8](), Members(cs))
+
+    val parts = buf[ColumnVector]()
+
+    for p in parts_of(binder, b)
+        parts.push(take(p, rows.view()))
+
+    parts.push(m)
+    ColumnVector(out_ty, rows.len(), buf[u8](), Members(parts))
+end unnest_rows
+
+// -- Apply, §6.6 ----------------------------------------------------------------------------------
+
+private join_kind(k: ApplyKind) -> JoinKind = k match
+    Cross -> Inner
+    Outer -> Left
+    SemiApply -> Semi
+    AntiApply -> Anti
+    MarkApply -> MarkJoin
+    SingleApply -> SingleJoin
+
+/** `Apply` of `kind` over `l` and the correlated `right`: per left row, `right` planned with the row
+ * visible and joined to that one row as the `Join` of the same kind (`cross` as `inner`, `outer` as
+ * `left`). `shape` is `right` planned where the `Apply` stands, which gives the output's binders and
+ * type and is not run.
+ */
+private[terndb] plan_apply(kind: ApplyKind, l: Lowered, right: SubPlan, shape: Lowered, on: Option[TExpr], mark: Option[string], binder: Option[string], ctx: Ctx) -> Lowered
+    val jk = join_kind(kind)
+    val out = plan_join(jk, l, shape, on, mark, binder, ctx, false)
+    val op = ApplyOp(l.op, l.binder, l.elem, right, jk, on, mark, binder, ctx, buf[ColumnVector](), 0)
+    Lowered(op, out.binder, out.elem, buf[TKey]())
+
+struct ApplyOp
+    left: &Operator
+    lbinder: string
+    lelem: Type
+    right: SubPlan
+    kind: JoinKind
+    on: Option[TExpr]
+    mark: Option[string]
+    binder: Option[string]
+    ctx: Ctx
+    queue: Buf[ColumnVector]
+    at: usize
+
+impl Operator for ApplyOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        loop
+            if self.at < self.queue.len()
+                self.at += 1
+                return Ok(Some(self.queue[self.at - 1]))
+
+            val b = self.left.next_batch()? match
+                Some(b) -> b
+                None -> return Ok(None)
+
+            val pieces = buf[ColumnVector]()
+
+            for i in 0..<b.len
+                val row = take(b, items_of([i]).view())
+                val outer = buf[Binder]()
+                outer.push(Binder(self.lbinder, row))
+                outer.extend(self.right.outer.view())
+
+                val l = Lowered(mem_source(items_of([row])), self.lbinder, self.lelem, buf[TKey]())
+                val j = plan_join(self.kind, l, plan_sub(self.right, self.ctx, outer), self.on, self.mark, self.binder, self.ctx, false)
+                pieces.extend(drain(j.op)?.view())
+
+            self.queue = if pieces.len() == 0 then pieces else batches_of(concat(pieces[0].ty, pieces.view()))
+            self.at = 0

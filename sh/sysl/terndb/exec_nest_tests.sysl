@@ -1,0 +1,324 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `Nest` and `Unnest` (`query-tree.md` §6.14) through the type checker and the planner, over tables
+// held as batches of a chosen size and over relation-valued parameters. Outputs are compared with the
+// rows the spec means as multisets, with `same` on a bag (§3.1), which also compares nested bags as
+// multisets and nested lists in order.
+
+// -- tables and running a tree --------------------------------------------------------------------
+
+/** A table `app.<name>` of `cols` holding `rows`, cut into batches of `size`. */
+struct XnTable
+    name: string
+    cols: Buf[Field]
+    rows: Buf[Value]
+    size: usize
+
+xn_table(name: string, cols: []const Field, rows: Buf[Value], size: usize) -> XnTable = XnTable(name, items_of(cols), rows, size)
+
+xn_catalog(ts: []const XnTable) -> FakeCatalog
+    val tables = buf[FakeTable]()
+
+    for t in ts
+        val cs = buf[ColumnInfo]()
+
+        for f in t.cols
+            cs.push(cat_column(f.name, f.ty))
+
+        tables.push(fake_table(t.name, cs.view(), []))
+
+    FakeCatalog(tables, buf[FakeType](), buf[FakeFunction]())
+
+xn_mem(ts: []const XnTable) -> Buf[MemTable]
+    val out = buf[MemTable]()
+
+    for t in ts
+        val bs = buf[ColumnVector]()
+        var at: usize = 0
+
+        while at < t.rows.len()
+            val end = if at + t.size < t.rows.len() then at + t.size else t.rows.len()
+            bs.push(vector_of(record(t.cols.view()), t.rows.view()[at..<end]))
+            at = end
+
+        out.push(MemTable(QualName("app", t.name), bs))
+
+    out
+
+/** `r` over `ts` with `params` of the types `decls`: its result type, and its rows as a client sees
+ * them, flat (§8.4); every batch has 1 to `BatchSize` rows.
+ */
+xn_run(ts: []const XnTable, decls: []const ParamDecl, params: []const Value, r: Rel) -> Result[(Type, Buf[Value]), CodecError]
+    val q = envelope(decls, Query(r))
+    val typing = type_envelope(q, xn_catalog(ts))?
+    val root = plan_query(q, typing, xe_ctx(params), xn_mem(ts))
+    val out = buf[Value]()
+
+    for b in drain(root.op)?
+        assert(b.len > 0 && b.len <= BatchSize)
+        out.extend(values_of(if root.binder == Composite then flatten(b) else b).view())
+
+    Ok((typing.result.unwrap(), out))
+
+xn_code(r: Result[(Type, Buf[Value]), CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** Whether `got` and `want` are one multiset of rows of the relation type `t`. */
+xn_same(t: Type, got: Buf[Value], want: Buf[Value]) -> bool = t.base() match
+    Bag(e) | List(e) -> same(bag(*e), Relation(got), Relation(want))
+    _ -> false
+
+xn_check(r: Result[(Type, Buf[Value]), CodecError], want: Buf[Value], what: string, file: string = __FILE__, line: long = __LINE__)
+    val (t, got) = r.unwrap()
+    assert(xn_same(t, got, want), s"$what: ${got.len()} rows, ${want.len()} wanted", file, line)
+
+no_keys() -> Buf[SortKey] = buf[SortKey]()
+
+xn_elems(v: Value) -> Buf[Value] = v match
+    Relation(es) -> es
+    _ -> panic("a relation value was expected")
+
+opt(v: Option[i128]) -> Value = v match
+    Some(n) -> Int(n)
+    None -> Null
+
+// -- Nest -----------------------------------------------------------------------------------------
+
+/** `{k: int64?, v: text?}`. */
+private xn_kv() -> [2]Field = [Field("k", nullable(Int64)), Field("v", nullable(Text))]
+
+private xn_t(rows: Buf[Value], size: usize) -> [1]XnTable = [xn_table("t", xn_kv(), rows, size)]
+
+/** `t` nested by `k` into `vs`, ordered by `order`. */
+private xn_nest_t(keyed: bool, order: Buf[SortKey]) -> Rel
+    val keys = if keyed then items_of([item("k", col("t", "k"))]) else buf[Item]()
+    Nest(scan("app", "t", "t"), "n", keys, "vs", items_of([item("v", col("t", "v"))]), order)
+
+@test
+a_nest_of_no_rows_has_no_group_and_a_keyless_one_has_one_empty_group()
+    xn_check(xn_run(xn_t(buf[Value](), 4), [], [], xn_nest_t(true, no_keys())), buf[Value](), "keyed")
+
+    // Rule 1: a keyless Nest is a keyless Aggregate, which has one group also of no rows (§6.7 rule 1).
+    xn_check(xn_run(xn_t(buf[Value](), 4), [], [], xn_nest_t(false, no_keys())), rows_of([rec([rel([])])]), "keyless")
+
+/** `n` rows `{i % 3, "v<i>"}`, the key null on every seventh row and the value on every fifth. */
+private xn_spread(n: usize) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<n
+        out.push(rec([if i % 7 == 6 then Null else Int(i128(i % 3)), if i % 5 == 4 then Null else Text(s"v$i")]))
+
+    out
+
+/** The groups of `xn_spread(n)` by key, each `{k, vs: [{v}]}`. */
+private xn_spread_groups(n: usize) -> Buf[Value]
+    val rows = xn_spread(n)
+    val out = buf[Value]()
+
+    for key in [Some(0i128), Some(1i128), Some(2i128), None]
+        val vs = buf[Value]()
+
+        for r in rows
+            val fs = xj_fields(r)
+
+            if fs[0] == opt(key) then vs.push(rec([fs[1]]))
+
+        if vs.len() > 0 then out.push(rec([opt(key), Relation(vs)]))
+
+    out
+
+@test
+a_group_spans_batches_and_nulls_group_together()
+    // 2500 rows in batches of 1000: every group has rows in all three batches.
+    xn_check(xn_run(xn_t(xn_spread(2500), 1000), [], [], xn_nest_t(true, no_keys())), xn_spread_groups(2500), "spread")
+    xn_check(xn_run(xn_t(xn_spread(5), 2), [], [], xn_nest_t(true, no_keys())), xn_spread_groups(5), "small")
+
+@test
+an_ordered_nest_is_a_list_in_its_order_with_nulls_in_keys_and_values()
+    val rows = rows_of([
+        rec([Int(1), Text("b")]), rec([Int(2), Text("x")]), rec([Int(1), Null]), rec([Int(1), Text("c")]),
+        rec([Null, Text("a")]), rec([Int(1), Text("a")]), rec([Null, Null])])
+    val order = items_of([SortKey(col("t", "v"), true, false)])
+    val r = xn_run(xn_t(rows, 2), [], [], xn_nest_t(true, order))
+
+    val (t, _) = r.unwrap()
+    assert(t == bag(record([Field("k", nullable(Int64)), Field("vs", list(record([Field("v", nullable(Text))])))])))
+
+    val want = rows_of([
+        rec([Int(1), rel([rec([Text("c")]), rec([Text("b")]), rec([Text("a")]), rec([Null])])]),
+        rec([Int(2), rel([rec([Text("x")])])]),
+        rec([Null, rel([rec([Text("a")]), rec([Null])])])])
+    xn_check(r, want, "ordered")
+
+/** `{a, b, c: int64, v: text}`: 36 rows, each `(a, b, c)` of `2 × 3 × 2` three times. */
+private xn_abc() -> [1]XnTable
+    val rows = buf[Value]()
+
+    for i in 0..<36
+        rows.push(rec([Int(i128(i % 2)), Int(i128((i / 2) % 3)), Int(i128((i / 6) % 2)), Text(s"v$i")]))
+
+    [xn_table("s", [Field("a", Int64), Field("b", Int64), Field("c", Int64), Field("v", Text)], rows, 7)]
+
+private xn_vs(a: usize, b: usize, c: usize) -> Value
+    val out = buf[Value]()
+
+    for i in 0..<36
+        if i % 2 == a && (i / 2) % 3 == b && (i / 6) % 2 == c then out.push(rec([Text(s"v$i")]))
+
+    Relation(out)
+
+@test
+nests_nest_two_and_three_levels_deep()
+    val by_c = Nest(scan("app", "s", "s"), "n1", items_of([item("a", col("s", "a")), item("b", col("s", "b"))]), "cs",
+        items_of([item("c", col("s", "c")), item("v", col("s", "v"))]), no_keys())
+    val two = Nest(by_c, "n2", items_of([item("a", col("n1", "a"))]), "bs", items_of([item("b", col("n1", "b")), item("cs", col("n1", "cs"))]), no_keys())
+
+    val want2 = buf[Value]()
+
+    for a in 0..<2
+        val bs = buf[Value]()
+
+        for b in 0..<3
+            val cs = buf[Value]()
+
+            for c in 0..<2
+                for v in xn_elems(xn_vs(a, b, c))
+                    cs.push(rec([Int(i128(c)), xj_fields(v)[0]]))
+
+            bs.push(rec([Int(i128(b)), Relation(cs)]))
+
+        want2.push(rec([Int(i128(a)), Relation(bs)]))
+
+    xn_check(xn_run(xn_abc(), [], [], two), want2, "two levels")
+
+    val by_v = Nest(scan("app", "s", "s"), "m1", items_of([item("a", col("s", "a")), item("b", col("s", "b")), item("c", col("s", "c"))]), "vs",
+        items_of([item("v", col("s", "v"))]), no_keys())
+    val m2 = Nest(by_v, "m2", items_of([item("a", col("m1", "a")), item("b", col("m1", "b"))]), "cs", items_of([item("c", col("m1", "c")), item("vs", col("m1", "vs"))]), no_keys())
+    val three = Nest(m2, "m3", items_of([item("a", col("m2", "a"))]), "bs", items_of([item("b", col("m2", "b")), item("cs", col("m2", "cs"))]), no_keys())
+
+    val want3 = buf[Value]()
+
+    for a in 0..<2
+        val bs = buf[Value]()
+
+        for b in 0..<3
+            val cs = buf[Value]()
+
+            for c in 0..<2
+                cs.push(rec([Int(i128(c)), xn_vs(a, b, c)]))
+
+            bs.push(rec([Int(i128(b)), Relation(cs)]))
+
+        want3.push(rec([Int(i128(a)), Relation(bs)]))
+
+    xn_check(xn_run(xn_abc(), [], [], three), want3, "three levels")
+end nests_nest_two_and_three_levels_deep
+
+// -- Unnest ---------------------------------------------------------------------------------------
+
+/** `bag<{id: int64, xs: list<int64>?}>`, the parameter the Unnest tests read. */
+private xn_lists_type() -> Type = bag(record([Field("id", Int64), Field("xs", nullable(list(Int64)))]))
+
+private xn_ints(xs: []const i128) -> Value
+    val out = buf[Value]()
+
+    for x in xs
+        out.push(Int(x))
+
+    Relation(out)
+
+/** Ids 1 to 4: `[10, 20, 30]`, `[]`, null, `[40]`. */
+private xn_lists() -> Value = rel([
+    rec([Int(1), xn_ints([10, 20, 30])]), rec([Int(2), xn_ints([])]), rec([Int(3), Null]), rec([Int(4), xn_ints([40])])])
+
+private xn_unnest(padded: bool, ordinality: Option[string]) -> Rel = Unnest(ParamScan("p", 0), "x", col("p", "xs"), padded, ordinality)
+
+private xn_unnest_run(r: Rel, lists: Value) -> Result[(Type, Buf[Value]), CodecError] =
+    xn_run([], [param("lists", xn_lists_type())], [lists], r)
+
+@test
+unnest_emits_a_row_per_element_and_outer_pads_the_empty_and_the_null()
+    val (one, none, four) = (xn_ints([10, 20, 30]), xn_ints([]), xn_ints([40]))
+    val inner = rows_of([rec([Int(1), one, Int(10)]), rec([Int(1), one, Int(20)]), rec([Int(1), one, Int(30)]), rec([Int(4), four, Int(40)])])
+    xn_check(xn_unnest_run(xn_unnest(false, None), xn_lists()), inner, "inner")
+
+    val outer = buf[Value]()
+    outer.extend(inner.view())
+    outer.push(rec([Int(2), none, Null]))
+    outer.push(rec([Int(3), Null, Null]))
+    xn_check(xn_unnest_run(xn_unnest(true, None), xn_lists()), outer, "outer")
+
+    // The element column of an outer Unnest is nullable, of an inner one not (§6.14 rule 2).
+    val (t, _) = xn_unnest_run(xn_unnest(true, None), xn_lists()).unwrap()
+    assert(t == bag(record([Field("id", Int64), Field("xs", nullable(list(Int64))), Field("value", nullable(Int64))])))
+
+@test
+unnest_of_only_empty_relations_is_empty_inner_and_padded_outer()
+    val lists = rel([rec([Int(1), xn_ints([])]), rec([Int(2), Null])])
+    xn_check(xn_unnest_run(xn_unnest(false, None), lists), buf[Value](), "inner")
+    xn_check(xn_unnest_run(xn_unnest(true, None), lists), rows_of([rec([Int(1), xn_ints([]), Null]), rec([Int(2), Null, Null])]), "outer")
+    xn_check(xn_unnest_run(xn_unnest(true, Some("i")), lists), rows_of([rec([Int(1), xn_ints([]), Null, Null]), rec([Int(2), Null, Null, Null])]), "outer, ordinality")
+
+@test
+ordinality_counts_each_list_from_one_and_is_null_in_a_padded_row()
+    val (one, four) = (xn_ints([10, 20, 30]), xn_ints([40]))
+    val inner = rows_of([
+        rec([Int(1), one, Int(10), Int(1)]), rec([Int(1), one, Int(20), Int(2)]), rec([Int(1), one, Int(30), Int(3)]), rec([Int(4), four, Int(40), Int(1)])])
+    xn_check(xn_unnest_run(xn_unnest(false, Some("i")), xn_lists()), inner, "inner")
+
+    val outer = buf[Value]()
+    outer.extend(inner.view())
+    outer.push(rec([Int(2), xn_ints([]), Null, Null]))
+    outer.push(rec([Int(3), Null, Null, Null]))
+    xn_check(xn_unnest_run(xn_unnest(true, Some("i")), xn_lists()), outer, "outer")
+
+    // With an ordinality, Row(as) is the element's columns then the ordinality (§6.14 rule 2).
+    val r = Project(xn_unnest(false, Some("i")), "r", items_of([item("id", col("p", "id")), item("x", Row("x"))]))
+    val want = rows_of([
+        rec([Int(1), rec([Int(10), Int(1)])]), rec([Int(1), rec([Int(20), Int(2)])]), rec([Int(1), rec([Int(30), Int(3)])]), rec([Int(4), rec([Int(40), Int(1)])])])
+    xn_check(xn_unnest_run(r, xn_lists()), want, "Row(x)")
+
+@test
+an_unnest_of_many_elements_is_cut_into_batches()
+    val xs = buf[Value]()
+
+    for i in 0..<2500
+        xs.push(Int(i128(i)))
+
+    val (t, rows) = xn_unnest_run(xn_unnest(false, Some("i")), rel([rec([Int(7), Relation(xs)])])).unwrap()
+    assert_eq(rows.len(), 2500)
+
+    for i in 0..<2500
+        assert(xj_fields(rows[i])[3] == Int(i128(i + 1)), s"ordinality of row $i")
+
+    assert(xn_same(t, rows, rows))
+
+// -- round trips ----------------------------------------------------------------------------------
+
+@test
+nest_then_unnest_gives_back_the_rows()
+    val rows = xn_spread(300)
+    val unnested = Unnest(xn_nest_t(true, no_keys()), "e", col("n", "vs"), false, None)
+    val r = Project(unnested, "r", items_of([item("k", col("n", "k")), item("v", col("e", "v"))]))
+    xn_check(xn_run(xn_t(rows, 64), [], [], r), rows, "nest then unnest")
+
+@test
+unnest_then_nest_gives_back_the_relations()
+    val elem = record([Field("id", Int64), Field("ys", bag(record([Field("y", nullable(Int64))])))])
+    val groups = buf[Value]()
+
+    for id in 0..<40
+        val ys = buf[Value]()
+
+        for j in 0..<(id % 5 + 1)
+            ys.push(rec([if (id + j) % 4 == 0 then Null else Int(i128(j % 3))]))
+
+        groups.push(rec([Int(i128(id)), Relation(ys)]))
+
+    val un = Unnest(ParamScan("p", 0), "e", col("p", "ys"), false, None)
+    val r = Nest(un, "n", items_of([item("id", col("p", "id"))]), "ys", items_of([item("y", col("e", "y"))]), no_keys())
+    xn_check(xn_run([], [param("groups", bag(elem))], [Relation(groups)], r), groups, "unnest then nest")

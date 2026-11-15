@@ -29,18 +29,48 @@ private struct Planner
     at: usize
     ctx: Ctx
     tables: Buf[MemTable]
+    /** The outer rows a correlated subtree is planned for, one per binder (`exec_nest.sysl`). */
+    outer: Buf[Binder]
 
     take_type(*self) -> Type
         val t = self.types[self.at]
         self.at += 1
         t
 
+    /** `v` appended to the parameters: the index a correlated reference reads it at. */
+    bind(*self, v: Value) -> u64
+        val ps = buf[Value]()
+        ps.extend(self.ctx.params.view())
+        ps.push(v)
+        self.ctx = Ctx(ps, self.ctx.now)
+        u64(ps.len() - 1)
+
+    /** `r` kept to be planned per outer row, and planned here once for its shape, which steps over
+     * its types.
+     */
+    sub(*self, r: Rel) -> (SubPlan, Lowered)
+        val s = SubPlan(r, self.types, self.at, self.tables, self.outer)
+        (s, self.rel(r))
+
     expr(*self, e: Expr) -> TExpr
         val ty = self.take_type()
         val kids = buf[TExpr]()
 
         e match
-            Col(_, _) | Row(_) | Param(_) | Null(_) | Literal(_, _) -> ()
+            Col(_, _) | Row(_) ->
+                outer_value(self.outer, e, ty) match
+                    Some(v) -> return TExpr(Param(self.bind(v)), ty, kids, None)
+                    None -> ()
+            Relation(r) | Scalar(r) | Exists(r) ->
+                val (s, _) = self.sub(*r)
+                return TExpr(e, ty, kids, Some(s))
+            In(es, r) ->
+                for a in es
+                    kids.push(self.expr(a))
+
+                val (s, _) = self.sub(*r)
+                return TExpr(e, ty, kids, Some(s))
+            Param(_) | Null(_) | Literal(_, _) -> ()
             Call(f, args) ->
                 f match
                     "at_zone" | "from_zone" | "next_value" -> panic(s"the executor does not run '$f'")
@@ -69,9 +99,9 @@ private struct Planner
             Record(fields) ->
                 for f in fields
                     kids.push(self.expr(f.expr))
-            _ -> panic("the executor does not run Relation, Scalar, Exists, In or Action")
+            _ -> panic("the executor does not run Action")
 
-        TExpr(e, ty, kids)
+        TExpr(e, ty, kids, None)
     end expr
 
     opt_expr(*self, e: Option[Expr]) -> Option[TExpr] = e match
@@ -166,6 +196,30 @@ private struct Planner
                     cs.push(TAgg(c.function, args, c.distinct, filter, order))
 
                 Lowered(AggregateOp(inner.op, inner.binder, inner.elem, elem, ks, cs, self.ctx, None), binder, elem, none)
+            Nest(input, binder, keys, _, items, order) ->
+                val inner = self.rel(*input)
+                val ks = buf[TExpr]()
+                val xs = buf[TExpr]()
+                val os = buf[TKey]()
+
+                for k in keys
+                    ks.push(self.expr(k.expr))
+
+                for it in items
+                    xs.push(self.expr(it.expr))
+
+                for k in order
+                    os.push(TKey(self.expr(k.expr), k.desc, k.nulls_first))
+
+                plan_nest(inner, binder, elem, ks, items, xs, os, self.ctx)
+            Unnest(input, binder, value, padded, ordinality) ->
+                val inner = self.rel(*input)
+                val v = self.expr(value)
+                plan_unnest(inner, binder, v, padded, ordinality, self.ctx)
+            Apply(kind, left, right, on, mark, binder) ->
+                val l = self.rel(*left)
+                val (s, shape) = self.sub(*right)
+                plan_apply(kind, l, s, shape, self.opt_expr(on), mark, binder, self.ctx)
             _ -> panic("the executor does not run this relational node")
     end rel
 end Planner
@@ -178,8 +232,13 @@ plan_query(env: Envelope, typing: Typing, ctx: Ctx, tables: Buf[MemTable]) -> Lo
         Query(r) -> r
         _ -> panic("plan_query: the statement is not a query")
 
-    var p = Planner(typing.nodes, 0, ctx, tables)
+    var p = Planner(typing.nodes, 0, ctx, tables, buf[Binder]())
     p.rel(rel)
+
+/** The correlated subtree `s` planned with `ctx` for the outer rows `outer` (`exec_nest.sysl`). */
+private[terndb] plan_sub(s: SubPlan, ctx: Ctx, outer: Buf[Binder]) -> Lowered
+    var p = Planner(s.types, s.at, ctx, s.tables, outer)
+    p.rel(s.rel)
 
 /** `env` type-checked against `catalog`, run with `ctx` over `tables`, and its output as the result
  * format's batches for parameter tuple 0: what an `Execute` of the query sends after its header.

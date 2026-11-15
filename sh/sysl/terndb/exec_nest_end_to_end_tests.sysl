@@ -1,0 +1,127 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The nested result of `query-tree.md` §16.1 — users, their three newest posts with comments, and a
+// post count — type-checked, planned, executed, encoded as the result format's batches and decoded
+// again; and `wire-protocol.md` §6.6's worked batch produced by a query tree, octet for octet.
+
+private xw_user_cols() -> [2]Field = [Field("id", Int64), Field("name", Text)]
+
+private xw_post_cols() -> [4]Field = [Field("id", Int64), Field("author_id", Int64), Field("title", Text), Field("created_at", Timestamp)]
+
+private xw_comment_cols() -> [3]Field = [Field("id", Int64), Field("post_id", Int64), Field("body", Text)]
+
+/** Post `id` by `author`, titled `title`, made at `at`. */
+private xw_post(id: i128, author: i128, title: string, at: i128) -> Value = rec([Int(id), Int(author), Text(title), Int(at)])
+
+private xw_comment(id: i128, post: i128, body: string) -> Value = rec([Int(id), Int(post), Text(body)])
+
+/** Three users; ann has five posts, two made at one instant, bo none and cy one. */
+private xw_tables() -> [3]XnTable = [
+    xn_table("users", xw_user_cols(), rows_of([rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")]), rec([Int(3), Text("cy")])]), 2),
+    xn_table("posts", xw_post_cols(), rows_of([
+        xw_post(10, 1, "a", 100), xw_post(11, 1, "b", 300), xw_post(12, 1, "c", 200), xw_post(13, 1, "d", 400),
+        xw_post(14, 3, "e", 50), xw_post(15, 1, "f", 300)]), 4),
+    xn_table("comments", xw_comment_cols(), rows_of([
+        xw_comment(100, 13, "x"), xw_comment(101, 13, "y"), xw_comment(102, 11, "z"), xw_comment(103, 10, "w"),
+        xw_comment(104, 14, "q")]), 3)]
+
+/** `{id, title, comments}` of a post. */
+private xw_p(id: i128, title: string, comments: []const Value) -> Value
+    val cs = buf[Value]()
+    cs.extend(comments)
+    rec([Int(id), Text(title), Relation(cs)])
+
+private xw_c(id: i128, body: string) -> Value = rec([Int(id), Text(body)])
+
+/** What §16.1 means over `xw_tables`, the first `first` users. */
+private xw_expected(first: usize) -> Buf[Value]
+    // ann's posts newest first, ties by id descending: 13 (400), 15 and 11 (300), then 12 and 10.
+    val ann = rec([Int(1), Text("ann"), Int(5), rel([xw_p(13, "d", [xw_c(100, "x"), xw_c(101, "y")]), xw_p(15, "f", []), xw_p(11, "b", [xw_c(102, "z")])])])
+    val bo = rec([Int(2), Text("bo"), Int(0), rel([])])
+    val cy = rec([Int(3), Text("cy"), Int(1), rel([xw_p(14, "e", [xw_c(104, "q")])])])
+    val all = [ann, bo, cy]
+    val out = buf[Value]()
+
+    for i in 0..<first
+        out.push(all[i])
+
+    out
+
+/** `env` run to its result batches over `ts`, and the batches decoded. */
+private xw_decoded(env: Envelope, ts: []const XnTable, params: []const Value) -> (Type, Buf[Buf[u8]], Buf[Value])
+    val (result, batches) = run_query(env, xn_catalog(ts), xe_ctx(params), xn_mem(ts)).unwrap()
+    val tree = column_tree(result).unwrap()
+    val rows = buf[Value]()
+
+    for payload in batches
+        rows.extend(decode_batch(tree, payload.view()).unwrap().rows().view())
+
+    (result, batches, rows)
+
+@test
+the_users_posts_and_comments_query_runs_and_its_result_decodes()
+    for first in [3usize, 2usize]
+        val (result, batches, rows) = xw_decoded(users_and_posts(), xw_tables(), [Int(i128(first)), Int(3)])
+        val comment = record([Field("id", Int64), Field("body", Text)])
+        val post = record([Field("id", Int64), Field("title", Text), Field("comments", bag(comment))])
+        val user = record([Field("id", Int64), Field("name", Text), Field("post_count", Int64), Field("posts", list(post))])
+
+        assert(result == list(user), "§16.1's result type")
+        assert_eq(batches.len(), 1)
+        // A list compares in order, and so do the posts; the comments are a bag.
+        assert(same(result, Relation(rows), Relation(xw_expected(first))), s"the first $first users")
+
+@test
+the_users_posts_and_comments_query_runs_against_the_type_checker_s_catalog()
+    // §16.1's tree exactly as written, checked against the catalog the type tests use.
+    val q = users_and_posts()
+    val typing = type_envelope(q, fake()).unwrap()
+    val ts = xw_tables()
+    val root = plan_query(q, typing, xe_ctx([Int(50), Int(3)]), xn_mem(ts))
+    val rows = values_of(drain_rows(root.op, root.elem).unwrap())
+    assert(same(typing.result.unwrap(), Relation(rows), Relation(xw_expected(3))))
+
+// -- wire-protocol.md §6.6, from a query tree -----------------------------------------------------
+
+private xw_status() -> Type = union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))])
+
+/** §6.6's data as three tables: ann (active) with posts 10 and 11 and one comment on 10, bo (banned
+ * for spam) with none.
+ */
+private xw_golden_tables() -> [3]XnTable = [
+    xn_table("users", [Field("id", Int64), Field("name", Text), Field("status", xw_status())],
+        rows_of([rec([Int(1), Text("ann"), variant(0, rec([]))]), rec([Int(2), Text("bo"), variant(1, rec([Text("spam")]))])]), 1),
+    xn_table("posts", xw_post_cols(), rows_of([xw_post(11, 1, "yo", 100), xw_post(10, 1, "hi", 200)]), 1),
+    xn_table("comments", xw_comment_cols(), rows_of([xw_comment(100, 10, "ok")]), 1)]
+
+/** §16.1's statement with the user's `status` beside its other columns. */
+private xw_with_status() -> Envelope
+    val users = limit(Param(0), sort([asc(col("u", "id"))], scan("app", "users", "u")))
+    val count = Aggregate(filter(scan("app", "posts", "p1"), eq(col("p1", "author_id"), col("u", "id"))), "pc",
+        no_items(), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
+    val comments = project(filter(scan("app", "comments", "c"), eq(col("c", "post_id"), col("p", "id"))), "cc",
+        [item("id", col("c", "id")), item("body", col("c", "body"))])
+    val posts = project(
+        limit(Param(1), sort([desc(col("p", "created_at")), desc(col("p", "id"))],
+            filter(scan("app", "posts", "p"), eq(col("p", "author_id"), col("u", "id"))))),
+        "pp",
+        [item("id", col("p", "id")), item("title", col("p", "title")), item("comments", Relation(comments))])
+
+    query([param("first", Int64), param("posts_first", Int64)], project(users, "r", [
+        item("id", col("u", "id")),
+        item("name", col("u", "name")),
+        item("post_count", Scalar(count)),
+        item("status", col("u", "status")),
+        item("posts", Relation(posts))]))
+
+@test
+the_wire_worked_batch_is_what_a_query_tree_produces()
+    val (result, batches, rows) = xw_decoded(xw_with_status(), xw_golden_tables(), [Int(50), Int(3)])
+
+    assert(result == users_type(), "§6.6's type")
+    assert_eq(batches.len(), 1)
+    same_bytes(batches[0], hex(users_batch_hex), "§6.6's batch payload, from the executor")
+    assert(rows == users_rows())

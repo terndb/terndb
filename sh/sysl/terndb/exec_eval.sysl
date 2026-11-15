@@ -8,12 +8,14 @@ import sysl.buf.{Buf, buf}
 /** An expression with the type the type checker gave it, and its subexpressions in the pre-order the
  * checker walks them (`Typing.nodes`): a call's arguments; a cast's, a field's or a variant's operand;
  * an `If`'s conditions and values in turn, then its `else`; a `Match`'s scrutinee, its arms, then its
- * `else`; a record's fields.
+ * `else`; a record's fields; an `In`'s values. A subquery expression's `rel` is `sub`, planned per
+ * row (`exec_nest.sysl`).
  */
 struct TExpr
     e: Expr
     ty: Type
     kids: Buf[TExpr]
+    sub: Option[SubPlan]
 
 /** What every expression of one execution reads: the parameter values (§10.1), each of its declared
  * type, and the statement's timestamp (§7.12), in microseconds since the Unix epoch.
@@ -112,6 +114,7 @@ eval(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
                 cs.push(if k == j then payload else empty_vector(vs[k].ty))
 
             Ok(ColumnVector(x.ty, n, buf[u8](), Tags(tags, offsets, cs)))
+        Relation(_) | Scalar(_) | Exists(_) | In(_, _) -> eval_subquery(x, env)
         _ -> panic("eval: the executor does not evaluate this expression")
 end eval
 

@@ -1,0 +1,139 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `Apply` (`query-tree.md` §6.6) and the subquery expressions `Scalar`, `Exists` and `In` (§7.10–§7.11),
+// run per outer row. The oracle is the `Join` each one means: an `Apply` whose right input does not
+// reference the left one is the `Join` of the same kind (`cross` as `inner`, `outer` as `left`), and a
+// correlated `Filter` on the right is the same as that `Join` with the filter's condition as `on`.
+// `In` is a `mark` join, `Exists` a `semi` join and `Scalar` a `single` one (§6.6 rule 1).
+
+/** `a` of `{ak: int64?, v: text}` and `b` of `{bk: int64?, w: text}`, in batches of 2 and 3. */
+private xa_tables(aks: []const i128, bks: []const i128) -> [2]XnTable = [
+    xn_table("a", [Field("ak", nullable(Int64)), Field("v", Text)], xj_rows("a", aks), 2),
+    xn_table("b", [Field("bk", nullable(Int64)), Field("w", Text)], xj_rows("b", bks), 3)]
+
+/** Left keys meeting no, many and one right row (1, 2, 3), and a null. */
+private xa_dup() -> [2]XnTable = xa_tables([1, 2, 2, 3, -1], [2, 2, 3, 4, -1])
+
+/** No right key twice, so `single` never fails. */
+private xa_unique() -> [2]XnTable = xa_tables([1, 2, 2, 3, -1], [2, 3, 4, -1])
+
+private xa_kinds() -> [6](ApplyKind, JoinKind, string) = [
+    (Cross, Inner, "cross"), (Outer, Left, "outer"), (SemiApply, Semi, "semi"), (AntiApply, Anti, "anti"),
+    (MarkApply, MarkJoin, "mark"), (SingleApply, SingleJoin, "single")]
+
+private xa_mark(k: JoinKind) -> Option[string] = if k == MarkJoin then Some("m") else None
+
+private xa_binder(k: JoinKind) -> Option[string] = if k == MarkJoin then Some("mk") else None
+
+private xa_keys() -> Expr = call("eq", [col("a", "ak"), col("b", "bk")])
+
+/** `got` and `want` both fail with one code, or both succeed with one multiset of rows. */
+private xa_agree(got: Result[(Type, Buf[Value]), CodecError], want: Result[(Type, Buf[Value]), CodecError], what: string)
+    assert_eq(xn_code(got), xn_code(want), what)
+
+    if xn_code(want) == "ok"
+        val (t, rows) = want.unwrap()
+        val (gt, grows) = got.unwrap()
+        assert(gt == t, s"$what: the types differ")
+        assert(xn_same(t, grows, rows), s"$what: ${grows.len()} rows, ${rows.len()} wanted")
+
+@test
+an_uncorrelated_apply_is_the_join_of_its_kind()
+    for ts in [xa_dup(), xa_unique()]
+        for (ak, jk, what) in xa_kinds()
+            val apply = Apply(ak, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), xa_mark(jk), xa_binder(jk))
+            val join = Join(jk, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), xa_mark(jk), xa_binder(jk))
+            xa_agree(xn_run(ts, [], [], apply), xn_run(ts, [], [], join), what)
+
+@test
+a_correlated_apply_runs_its_right_input_per_left_row()
+    // Zero right rows for key 1, many for 2, one for 3, none for the null key.
+    for ts in [xa_dup(), xa_unique()]
+        for (ak, jk, what) in xa_kinds()
+            val right = Filter(scan("app", "b", "b"), xa_keys())
+            val apply = Apply(ak, scan("app", "a", "a"), right, None, xa_mark(jk), xa_binder(jk))
+            // With `on` absent a mark is never null: a join that means it tests `eq` as never null.
+            val on = if jk == MarkJoin then call("coalesce", [xa_keys(), Literal(Bool, Bool(false))]) else xa_keys()
+            val join = Join(jk, scan("app", "a", "a"), scan("app", "b", "b"), Some(on), xa_mark(jk), xa_binder(jk))
+            xa_agree(xn_run(ts, [], [], apply), xn_run(ts, [], [], join), s"correlated $what")
+
+@test
+a_correlated_apply_reads_parameters_beside_the_left_row()
+    val decls = [param("not", Text)]
+    val params: [1]Value = [Text("b1")]
+    val cond = call("and", [xa_keys(), call("ne", [col("b", "w"), Param(0)])])
+
+    for ts in [xa_dup(), xa_unique()]
+        for (ak, jk, what) in xa_kinds()
+            if jk == MarkJoin then continue
+
+            val apply = Apply(ak, scan("app", "a", "a"), Filter(scan("app", "b", "b"), cond), None, None, None)
+            val join = Join(jk, scan("app", "a", "a"), scan("app", "b", "b"), Some(cond), None, None)
+            xa_agree(xn_run(ts, decls, params, apply), xn_run(ts, decls, params, join), s"parameter $what")
+
+@test
+an_apply_inside_an_apply_sees_both_outer_rows()
+    val ts = xa_dup()
+    val inner = Apply(Cross, Filter(scan("app", "b", "b"), xa_keys()), Filter(scan("app", "b", "c"), call("eq", [col("c", "bk"), col("a", "ak")])), None, None, None)
+    val apply = Apply(Cross, scan("app", "a", "a"), inner, None, None, None)
+    val join = Join(Inner, Join(Inner, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), None, None),
+        scan("app", "b", "c"), Some(call("eq", [col("c", "bk"), col("a", "ak")])), None, None)
+    val out = items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("w2", col("c", "w"))])
+    xa_agree(xn_run(ts, [], [], Project(apply, "r", out)), xn_run(ts, [], [], Project(join, "r", out)), "nested")
+
+@test
+an_apply_over_an_empty_left_input_never_runs_its_right_input()
+    // The right input would divide by zero for every left row (§6.6 rule 4).
+    val ts = xa_tables([], [1, 2])
+    val boom = Project(scan("app", "b", "b"), "q", items_of([item("x", call("div", [Literal(Int64, Int(1)), Literal(Int64, Int(0))]))]))
+    assert_eq(xn_code(xn_run(ts, [], [], Apply(Outer, scan("app", "a", "a"), boom, None, None, None))), "ok")
+    assert_eq(xn_code(xn_run(xa_tables([1], [1]), [], [], Apply(Outer, scan("app", "a", "a"), boom, None, None, None))), "R0002")
+
+// -- the subquery expressions -------------------------------------------------------------------
+
+@test
+in_is_a_mark_join_with_sql_null_semantics()
+    for ts in [xa_dup(), xa_unique(), xa_tables([1, -1], []), xa_tables([1, -1, 4], [-1, 4])]
+        val sub = Project(scan("app", "b", "b"), "bb", items_of([item("bk", col("b", "bk"))]))
+        val via_in = Project(scan("app", "a", "a"), "r", items_of([item("ak", col("a", "ak")), item("v", col("a", "v")), item("m", In(items_of([col("a", "ak")]), sub))]))
+        val join = Join(MarkJoin, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), Some("m"), Some("mk"))
+        xa_agree(xn_run(ts, [], [], via_in), xn_run(ts, [], [], join), "In")
+
+@test
+exists_is_a_semi_join_and_its_negation_an_anti_join()
+    for ts in [xa_dup(), xa_unique(), xa_tables([1, 2], [])]
+        val sub = Filter(scan("app", "b", "b"), xa_keys())
+        val semi = Join(Semi, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), None, None)
+        val anti = Join(Anti, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), None, None)
+        xa_agree(xn_run(ts, [], [], Filter(scan("app", "a", "a"), Exists(sub))), xn_run(ts, [], [], semi), "Exists")
+        xa_agree(xn_run(ts, [], [], Filter(scan("app", "a", "a"), call("not", [Exists(sub)]))), xn_run(ts, [], [], anti), "not Exists")
+
+@test
+scalar_is_a_single_join_null_for_no_row_and_r0003_for_two()
+    val sub = Project(Filter(scan("app", "b", "b"), xa_keys()), "bb", items_of([item("w", col("b", "w"))]))
+    val via = Project(scan("app", "a", "a"), "r", items_of([item("v", col("a", "v")), item("w", Scalar(sub))]))
+    val join = Project(Join(SingleJoin, scan("app", "a", "a"), scan("app", "b", "b"), Some(xa_keys()), None, None), "r",
+        items_of([item("v", col("a", "v")), item("w", col("b", "w"))]))
+    xa_agree(xn_run(xa_unique(), [], [], via), xn_run(xa_unique(), [], [], join), "Scalar")
+    assert_eq(xn_code(xn_run(xa_dup(), [], [], via)), "R0003")
+
+@test
+a_keyless_aggregate_under_scalar_is_never_null()
+    val count = Aggregate(Filter(scan("app", "b", "b"), xa_keys()), "c", buf[Item](), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, no_keys()))]))
+    val r = Project(scan("app", "a", "a"), "r", items_of([item("v", col("a", "v")), item("n", Scalar(count))]))
+    val (t, rows) = xn_run(xa_dup(), [], [], r).unwrap()
+    assert(t == bag(record([Field("v", Text), Field("n", Int64)])))
+
+    val want = rows_of([rec([Text("a0"), Int(0)]), rec([Text("a1"), Int(2)]), rec([Text("a2"), Int(2)]), rec([Text("a3"), Int(1)]), rec([Text("a4"), Int(0)])])
+    assert(xn_same(t, rows, want))
+
+@test
+a_subquery_in_an_unselected_if_arm_is_not_run()
+    // The Scalar has two rows, R0003, for the left key 2; the If selects it only for key 1.
+    val sub = Project(Filter(scan("app", "b", "b"), xa_keys()), "bb", items_of([item("w", col("b", "w"))]))
+    val pick = If(items_of([IfArm(call("eq", [col("a", "ak"), Literal(Int64, Int(1))]), Scalar(sub))]), None)
+    val r = Project(scan("app", "a", "a"), "r", items_of([item("w", pick)]))
+    assert_eq(xn_code(xn_run(xa_dup(), [], [], r)), "ok")

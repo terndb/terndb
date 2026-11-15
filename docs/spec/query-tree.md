@@ -436,6 +436,12 @@ conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as
    keeps its per-outer-row meaning through unnesting (it becomes a partitioned window or a grouped
    aggregate on the outer key).
 3. A client MAY send `Apply` directly. Its meaning is the per-row one, whatever the plan.
+4. The right input is evaluated for each left row and for no other: when the left input is empty it is
+   not evaluated at all, so a runtime error in it does not occur. A runtime error the right input
+   raises for some left row is raised by the `Apply`. `on` is evaluated as §6.5 rules 8 and 9 say, on
+   the pairs of one left row and the right rows evaluated for it. The subquery expressions (§7.9–§7.11)
+   follow the same rule for the rows they are evaluated on, so an `If` arm that is not selected
+   (§7.5) does not evaluate its subqueries.
 
 ### 6.7 Aggregate
 
@@ -538,11 +544,14 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
 1. `Nest` groups its input by `keys` under `same` and emits, per group, the keys followed by one
    column `name` holding the group's rows as `bag<{items}>` (or `list<{items}>`, sorted by `order`, when
    `order` is non-empty). It MUST equal `Aggregate` with the same keys and the single aggregate
-   `collect(Record(items))` with that `order`.
+   `collect(Record(items))` with that `order`. So with no `keys` the whole input is one group, also when
+   it is empty: one row whose `name` is the empty relation (§6.7 rule 1). The keys of a group are those
+   of its first row in input order, and within a bag the rows keep no particular order.
 2. `Unnest` evaluates `value`, a relation-typed expression that MAY reference the input's binders, per
    input row, and emits one row per element: the input's columns followed by the element's columns
    (for a scalar relation, the one column `value`, §2.5) under binder `as`. With `outer = true`, an input row whose relation is empty or null emits one row
-   with every element column null (so they are nullable). `ordinality` adds an `int64` column, 1-based,
+   with every element column null (so they are nullable); with `outer = false` it emits none, and a
+   null relation is treated as an empty one. Without an ordinality, `Row(as)` of the padded row is null. `ordinality` adds an `int64` column, 1-based,
    under `as`; it requires `value` to be a list (`Q3008`). With `outer = true` the ordinality column is
    nullable too, null in the padded row; with an ordinality, `Row(as)` is the record of every column
    under `as`, the element's then the ordinality.
