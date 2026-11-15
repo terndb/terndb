@@ -186,8 +186,7 @@ private[terndb] struct KeyOrder
 
             return if !a == self.nulls_first then -1 else 1
 
-        val order = self.order
-        val c = order(i, j)
+        val c = self.order(i, j)
         if self.desc then -c else c
 
 private[terndb] key_order(v: ColumnVector, desc: bool, nulls_first: bool) -> KeyOrder = KeyOrder(v, slot_order(v), desc, nulls_first)
