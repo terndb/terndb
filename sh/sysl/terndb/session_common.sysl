@@ -1,0 +1,82 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// What both session machines share: a message bound for a stream, version negotiation (§2.2), the
+// transports the methods depend on (§2.4), options filled from defaults (§5.2 rule 2), and the
+// construction of an `Error` (§8.1).
+
+/** A message to send, and the stream it goes on. */
+struct Outgoing derives Eq
+    stream: u64
+    m: Message
+
+/** The transport a connection runs over, which decides the methods it allows (§2.4). */
+enum Transport
+    OverTls
+    OverUnix
+
+/** Whether `method` may run over `t`: `-plus` needs TLS, `peer` a Unix socket (§2.4's table). */
+method_allowed(method: string, t: Transport) -> bool =
+    if method == ScramPlus then t == OverTls
+    elif method == PeerMethod then t == OverUnix
+    else method == ScramPlain || method == TokenMethod
+
+/** The version both lists support: the highest major present in both, at the lesser of the two
+ * `max_minor`s (§2.2 rule 1).
+ */
+negotiate(ours: []const Version, theirs: []const Version) -> Option[Version]
+    var best: Option[Version] = None
+
+    for a in ours
+        for b in theirs
+            if a.major == b.major
+                val minor = if a.max_minor < b.max_minor then a.max_minor else b.max_minor
+                best match
+                    Some(v) -> if a.major > v.major then best = Some(Version(a.major, minor))
+                    None -> best = Some(Version(a.major, minor))
+
+    best
+
+/** `o` with every absent field taken from the connection's defaults (§5.2 rule 2). The server's own
+ * defaults apply to what is still absent, and are the engine's to fill.
+ */
+fill_options(o: TxnOptions, d: SessionDefaults) -> TxnOptions =
+    TxnOptions(either(o.isolation, d.isolation), either(o.synchronous, d.synchronous), o.read_only, o.after,
+        either(o.lock_timeout_ms, d.lock_timeout_ms), either(o.replica_wait_timeout_ms, d.replica_wait_timeout_ms), o.max_lag_ms)
+
+private either[T](a: Option[T], b: Option[T]) -> Option[T] = if a.is_some() then a else b
+
+/** Whether `m` ends its request's stream (§3.3). */
+is_terminal(m: Message) -> bool = m match
+    Prepared(_, _, _) | Complete(_, _) | OkReply | TxnBegun(_, _, _) | TxnCommitted(_, _) | TxnStatus(_, _) | ErrorReply(_) -> true
+    _ -> false
+
+/** Whether `m` opens a stream: a request of §3.2. */
+is_request(m: Message) -> bool = m.type_code() >= 0x10 && m.type_code() <= 0x26
+
+/** The transaction handle a request names, 0 for none. */
+txn_of(m: Message) -> u64 = m match
+    ExecuteMsg(e) -> e.txn
+    ExecutePreparedMsg(e) -> e.txn
+    Begin(t, _) | Commit(t) | Rollback(t) -> t
+    Savepoint(t, _) | RollbackToSavepoint(t, _) | ReleaseSavepoint(t, _) -> t
+    _ -> 0
+
+/** The `Error` that reports `f`, whose transaction is now `state`. */
+wire_error(f: Failure, state: TxnEffect) -> WireError =
+    WireError(f.entries, is_retryable_code(f.entries[0].code), state, f.txid, f.tuple)
+
+/** An `Error` of one entry. */
+error_message(code: string, message: string, state: TxnEffect, txid: Option[u64]) -> Message
+    val f = failure(code, message)
+    ErrorReply(wire_error(Failure(f.entries, txid, None), state))
+
+/** An `Error` of `cancelled` (`T1007`), with the reason in its details when there is one (§7.3). */
+cancelled_message(reason: string, state: TxnEffect, txid: Option[u64]) -> Message
+    val details = buf[Detail]()
+    if reason.len > 0 then details.push(Detail("reason", reason))
+
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry("T1007", "the request was cancelled", "", details, None))
+    ErrorReply(WireError(entries, true, state, txid, None))

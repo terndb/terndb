@@ -1,0 +1,272 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Requests (`wire-protocol.md` §4.3–§4.6, §7.2): an autocommit execute streamed under credit,
+// pipelining and multiplexing, prepared and digest execution, implicit commits, and the limits and
+// refusals of each (§10.1 properties 9, 10, 14–16, 19, 24, 27).
+
+sx_open() -> Duo
+    var d = sx_duo("alice", [ScramPlus])
+    d.connect()
+    assert(d.connected(), "connected")
+    d
+
+/** The octets of one one-row batch, which is what each canned batch of statement 1 is. */
+sx_one_batch() -> u64 = u64(sx_batch([0]).len())
+
+@test
+srq_an_autocommit_execute_streams_its_batches_under_credit()
+    var d = sx_open()
+    val one = sx_one_batch()
+    val s = d.send(sx_execute_credit(0, 1, one))
+
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146")
+    assert(d.c.credit_of(s) == Some(0), "the client counts the credit spent")
+
+    d.grant(s, one)
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146 type 146")
+
+    // The last batch leaves no credit, and Complete needs none (§7.2 rule 5).
+    d.grant(s, one)
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146 type 146 type 146 type 147")
+    assert(d.seen(s).len() == 5, "the client accepted every response")
+    assert(d.on(s)[4] == Complete(sx_counts([3]), None), "three rows, nothing committed")
+    assert_eq(d.c.outstanding(), 0)
+
+@test
+srq_a_batch_larger_than_the_credit_is_delivered_after_one_credit()
+    var d = sx_open()
+    val s = d.send(sx_execute_credit(0, 7, 0))
+
+    assert_eq(sx_codes(d.on(s)), "type 145")
+    d.grant(s, 1)
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146 type 147")
+    assert(d.c.outstanding() == 0, "ended")
+
+@test
+srq_credit_of_zero_and_credit_for_a_closed_stream_change_nothing()
+    var d = sx_open()
+    val s = d.send(sx_execute_credit(0, 1, 0))
+    d.grant(s, 0)
+    assert_eq(sx_codes(d.on(s)), "type 145")
+
+    val done = d.send(sx_execute(0, 2))
+    val before = d.served.len()
+    d.grant(done, 100)
+    d.cancel(done)
+    d.grant(999, 100)
+    assert(d.served.len() == before && d.connected(), "ignored, and the connection carries on")
+
+@test
+srq_pipelined_requests_interleave_and_each_ends_once()
+    var d = sx_open()
+    // The first waits for credit after one batch, and the others run past it.
+    val ss = d.pipeline([sx_execute_credit(0, 1, sx_one_batch()), sx_execute(0, 7), sx_execute(0, 2), TransactionStatus(42)])
+    assert_eq(sx_codes(d.on(ss[0])), "type 145 type 146")
+    d.grant(ss[0], 100000)
+
+    assert_eq(sx_codes(d.on(ss[0])), "type 145 type 146 type 146 type 146 type 147")
+    assert_eq(sx_codes(d.on(ss[1])), "type 145 type 146 type 147")
+    assert_eq(sx_codes(d.on(ss[2])), "type 145 type 147")
+    assert_eq(sx_codes(d.on(ss[3])), "type 162")
+
+    // Multiplexed: the second request's header goes out before the first one's Complete.
+    var first_complete: usize = 0
+    var second_header: usize = 0
+    for i in 0..<d.served.len()
+        val o = d.served[i]
+        if o.stream == ss[0] && o.m.type_code() == 0x93 then first_complete = i
+        if o.stream == ss[1] && o.m.type_code() == 0x91 then second_header = i
+    assert(second_header < first_complete, "the streams interleave")
+    assert_eq(d.c.outstanding(), 0)
+
+@test
+srq_prepare_and_execute_by_handle()
+    var d = sx_open()
+    val p = d.send(Prepare(9, sx_envelope(1)))
+    assert(d.on(p)[0] == Prepared(sx_shape(1), 1, Some(bag(Int64))), "Prepared")
+
+    val e = d.send(ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByHandle(9), buf())))
+    assert_eq(sx_codes(d.on(e)), "type 145 type 146 type 146 type 146 type 147")
+
+    assert_eq(sx_codes(d.on(d.send(Prepare(9, sx_envelope(2))))), "W2006")
+    val again = ExecuteMsg(Execute(0, None, no_exec_options(), sx_envelope(2), buf(), Some(9)))
+    assert_eq(sx_codes(d.on(d.send(again))), "W2006")
+
+    assert_eq(sx_codes(d.on(d.send(ClosePrepared(9)))), "type 148")
+    assert_eq(sx_codes(d.on(d.send(ClosePrepared(9)))), "type 148")
+    assert_eq(sx_codes(d.on(d.send(sx_by_handle(9)))), "W2005")
+
+@test
+srq_prepare_with_handle_0_registers_nothing()
+    var d = sx_open()
+    assert_eq(sx_codes(d.on(d.send(Prepare(0, sx_envelope(1))))), "type 144")
+    assert_eq(sx_codes(d.on(d.send(sx_by_handle(0)))), "W2005")
+
+    // A tree that does not validate is reported with its [QT] code (§8.3 rule 1).
+    assert_eq(sx_codes(d.on(d.send(Prepare(3, sx_envelope(4))))), "Q3001")
+    assert(!d.s.has_prepared(3), "nothing registered")
+
+sx_by_handle(h: u64) -> Message = ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByHandle(h), buf()))
+
+sx_counts(xs: []const u64) -> Buf[u64]
+    val b = buf[u64]()
+    for x in xs
+        b.push(x)
+    b
+
+@test
+srq_a_handle_registered_in_the_same_flight_is_used_after_it()
+    var d = sx_open()
+    val reg = ExecuteMsg(Execute(0, None, no_exec_options(), sx_envelope(2), buf(), Some(4)))
+    val ss = d.pipeline([reg, sx_by_handle(4)])
+
+    assert_eq(sx_codes(d.on(ss[0])), "type 145 type 147")
+    assert_eq(sx_codes(d.on(ss[1])), "type 145 type 147")
+
+@test
+srq_a_catalog_change_revalidates_and_a_changed_type_is_w2007()
+    var d = sx_open()
+    d.send(Prepare(9, sx_envelope(1)))
+    d.send(Prepare(8, sx_envelope(2)))
+
+    // Same type after the change: it runs.
+    d.engine.catalog = 2
+    assert_eq(sx_codes(d.on(d.send(sx_by_handle(8)))), "type 145 type 147")
+
+    var c = d.engine.canned[0]
+    c.result = Some(bag(Text))
+    d.engine.canned[0] = c
+    d.engine.catalog = 3
+    assert_eq(sx_codes(d.on(d.send(sx_by_handle(9)))), "W2007")
+    assert(!d.s.has_prepared(9), "the handle is released")
+    assert_eq(sx_codes(d.on(d.send(sx_by_handle(9)))), "W2005")
+
+@test
+srq_execute_by_digest_runs_or_is_w2004()
+    var d = sx_open()
+    d.engine.cache.push(1)
+
+    val hit = ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByDigest(sx_shape(1)), buf()))
+    assert_eq(sx_codes(d.on(d.send(hit))), "type 145 type 146 type 146 type 146 type 147")
+
+    val miss = ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByDigest(sx_shape(2)), buf()))
+    val s = d.send(miss)
+    assert_eq(sx_codes(d.on(s)), "W2004")
+    d.on(s)[0] match
+        ErrorReply(e) -> assert(e.retryable && e.txn_state == Unaffected, "retryable, nothing affected")
+        _ -> assert(false, "an Error")
+
+@test
+srq_failures_get_their_layer_codes()
+    var d = sx_open()
+
+    // Validation: [QT], before any header.
+    assert_eq(sx_codes(d.on(d.send(sx_execute(0, 4)))), "Q3001")
+
+    // Runtime, after a batch: the Error replaces Complete and carries the txid.
+    val s = d.send(sx_execute(0, 5))
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146 R0002")
+    d.on(s)[2] match
+        ErrorReply(e) -> assert(e.txid.is_some() && !e.retryable && e.txn_state == Unaffected, "txid, implicit rolled back")
+        _ -> assert(false, "an Error")
+
+@test
+srq_an_implicit_write_commits_and_advances_the_causal_token()
+    var d = sx_open()
+    val s = d.send(sx_execute(0, 6))
+
+    assert(d.on(s)[2] == Complete(sx_counts([1]), Some(500)), "Complete carries the commit")
+    assert_eq(d.c.causal_token(), 500)
+    assert(d.c.causal_options(no_txn_options()).after == Some(500), "after is the token")
+
+@test
+srq_a_request_past_max_in_flight_is_w2008_and_not_counted()
+    var d = sx_open()
+    val ms = buf[Message]()
+    for _ in 0..<17
+        ms.push(sx_execute(0, 3))
+    val ss = d.pipeline(ms.view())
+
+    for i in 0..<16
+        assert_eq(sx_codes(d.on(ss[i])), "type 145")
+    assert_eq(sx_codes(d.on(ss[16])), "W2008")
+    d.on(ss[16])[0] match
+        ErrorReply(e) -> assert(e.retryable, "retryable")
+        _ -> assert(false, "an Error")
+
+    // One finishing makes room for the next.
+    d.cancel(ss[0])
+    val next = d.send(sx_execute(0, 2))
+    assert_eq(sx_codes(d.on(next)), "type 145 type 147")
+
+@test
+srq_a_request_id_not_above_the_last_is_w1006()
+    var d = sx_open()
+    d.send(sx_execute(0, 2))
+    d.inject(1, sx_execute(0, 2))
+
+    assert(sx_code(d.served[d.served.len() - 1].m) == "W1006" && d.server_closed, "fatal")
+    assert(d.server_fatal.unwrap().code == "W1006", "the reassembler's refusal")
+
+@test
+srq_implicit_options_on_a_transaction_are_w2011_alone()
+    var d = sx_open()
+    // The encoder will not write it, so the payload is an implicit Execute with its txn set to 3.
+    val p = encode_payload(ExecuteMsg(Execute(0, Some(no_txn_options()), no_exec_options(), sx_envelope(1), buf(), None)), 1).unwrap()
+    p[0] = 3
+    d.c2s.extend(frame(0x11, 5, false, p.view()).view())
+    d.flush()
+
+    assert_eq(sx_codes(d.on(5)), "W2011")
+    assert(!d.server_closed, "not fatal after the handshake")
+
+@test
+srq_goodbye_drains_and_refuses_new_requests()
+    var d = sx_open()
+    val busy = d.send(sx_execute(0, 3))
+
+    d.take_server(d.s.shutdown(100, 1000))
+    d.flush()
+    assert(d.saw(Departing("W4001", "the server is shutting down", 1000)), "the client hears Goodbye")
+    assert_eq(code_of(d.c.request(sx_execute(0, 1), 100)), "W4001")
+
+    d.inject(50, sx_execute(0, 1))
+    assert_eq(sx_codes(d.on(50)), "W4001")
+
+    d.tick(1100)
+    assert_eq(sx_codes(d.on(busy)), "type 145 T1007")
+    assert(d.server_closed, "closed after the grace")
+    d.on(busy)[1] match
+        ErrorReply(e) -> assert(e.entries[0].details[0] == Detail("reason", "shutdown"), "reason shutdown")
+        _ -> assert(false, "an Error")
+
+@test
+srq_a_client_refuses_a_batch_sent_without_credit()
+    var c = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    c.hello(0)
+    c.receive(sx_arrival(ServerHelloMsg(ServerHello(1, 1, 1, 0, "x", 65536, TokenMethod, buf(), "")), 0), 0)
+    c.receive(sx_arrival(ReadyMsg(Ready(1, Primary, 16, 1, MinMessageSize, 0, 0, buf())), 0), 0)
+
+    val s = c.request(sx_execute_credit(0, 1, 0), 0).unwrap().stream
+    c.receive(sx_arrival(ResultHeaderMsg(ResultHeader(11, 100, sx_shape(1), Some(bag(Int64)))), s), 0)
+    val st = c.receive(sx_arrival(BatchReply(sx_batch([1])), s), 0)
+    assert_eq(code_of_fatal(st.fatal), "W1001")
+
+    // A batch for a statement that returns nothing is W1008; a reply of the wrong kind is W1001.
+    var k = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    k.hello(0)
+    k.receive(sx_arrival(ServerHelloMsg(ServerHello(1, 1, 1, 0, "x", 65536, TokenMethod, buf(), "")), 0), 0)
+    k.receive(sx_arrival(ReadyMsg(Ready(1, Primary, 16, 1, MinMessageSize, 0, 0, buf())), 0), 0)
+    val t = k.request(sx_execute(0, 2), 0).unwrap().stream
+    k.receive(sx_arrival(ResultHeaderMsg(ResultHeader(11, 100, sx_shape(2), None)), t), 0)
+    assert_eq(code_of_fatal(k.receive(sx_arrival(BatchReply(sx_batch([1])), t), 0).fatal), "W1008")
+
+    var w = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    w.hello(0)
+    w.receive(sx_arrival(ServerHelloMsg(ServerHello(1, 1, 1, 0, "x", 65536, TokenMethod, buf(), "")), 0), 0)
+    w.receive(sx_arrival(ReadyMsg(Ready(1, Primary, 16, 1, MinMessageSize, 0, 0, buf())), 0), 0)
+    val u = w.request(Begin(1, no_txn_options()), 0).unwrap().stream
+    assert_eq(code_of_fatal(w.receive(sx_arrival(OkReply, u), 0).fatal), "W1001")

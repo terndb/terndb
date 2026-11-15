@@ -1,0 +1,294 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The handshake (`wire-protocol.md` §2): each authentication method end to end, the version and
+// method negotiation, and every refusal with its code (§10.1 properties 5–8).
+
+/** The arrival of message `m` on `stream`, as a reassembler would deliver it. */
+sx_arrival(m: Message, stream: u64) -> Arrival = Whole(RawMessage(m.type_code(), stream, encode_payload(m, 1).unwrap()))
+
+/** The type codes the server sent on stream 0. */
+sx_handshake(d: Duo) -> string = sx_codes(d.on(0))
+
+sx_unix(user: string, methods: []const string) -> Duo
+    var cc = sx_client_config(user, methods)
+    cc.transport = OverUnix
+    cc.exporter = buf()
+    var sc = sx_server_config()
+    sc.transport = OverUnix
+    sc.exporter = buf()
+    sx_duo_with(cc, sc)
+
+/** The fatal code each side ended with. */
+sx_fatal(d: Duo) -> string
+    val s = d.server_fatal match
+        Some(e) -> e.code
+        None -> "-"
+    val c = d.client_fatal match
+        Some(e) -> e.code
+        None -> "-"
+    s"$s $c"
+
+@test
+ssh_scram_plus_over_tls_reaches_ready()
+    var d = sx_duo("alice", [ScramPlus])
+    d.connect()
+
+    assert(d.connected(), "both ends are open")
+    assert_eq(sx_handshake(d), "type 129 type 131")
+    assert(d.saw(Connected(d.c.ready.unwrap())), "the client reports Ready")
+    assert_eq(d.c.causal_token(), 50)
+
+@test
+ssh_scram_without_binding_over_unix_reaches_ready()
+    var d = sx_unix("alice", [ScramPlain])
+    d.connect()
+
+    assert(d.connected(), "both ends are open")
+    assert_eq(sx_handshake(d), "type 129 type 131")
+
+@test
+ssh_a_token_reaches_ready()
+    var d = sx_duo("svc", [TokenMethod])
+    d.connect()
+    assert(d.connected(), "a token in ClientHello.initial")
+
+    // Token second: the server ignores `initial` and the token comes in an AuthResponse.
+    var e = sx_duo("svc", [PeerMethod, TokenMethod])
+    e.connect()
+    assert(e.connected(), "a token in an AuthResponse")
+
+@test
+ssh_peer_reaches_ready_with_no_round()
+    var d = sx_unix("ed", [PeerMethod])
+    d.connect()
+
+    assert(d.connected(), "peer authentication")
+    assert_eq(sx_handshake(d), "type 129 type 131")
+
+@test
+ssh_scram_not_first_runs_in_auth_challenge()
+    var d = sx_duo("alice", [TokenMethod, ScramPlus])
+    d.authority.denied.push("alice/token")
+    d.connect()
+
+    assert(d.connected(), "SCRAM as the second method")
+    assert_eq(sx_handshake(d), "type 129 type 130 type 131")
+
+@test
+ssh_versions_negotiate_to_the_highest_common_major_and_least_minor()
+    assert(negotiate([Version(2, 1), Version(1, 3)], [Version(2, 5), Version(1, 1)]) == Some(Version(2, 1)), "2.1")
+    assert(negotiate([Version(3, 0), Version(1, 3)], [Version(2, 5), Version(1, 1)]) == Some(Version(1, 1)), "1.1")
+    assert(negotiate([Version(2, 0)], [Version(1, 1)]).is_none(), "none")
+
+    var sc = sx_server_config()
+    sc.wire_versions = sx_versions([Version(1, 0)])
+    var d = sx_duo_with(sx_client_config("alice", [ScramPlus]), sc)
+    d.connect()
+
+    assert(d.connected() && d.c.minor == 0 && d.s.minor == 0, "the lesser minor")
+
+@test
+ssh_no_common_version_is_w1005_or_q1005()
+    var sc = sx_server_config()
+    sc.wire_versions = sx_versions([Version(2, 0)])
+    var d = sx_duo_with(sx_client_config("alice", [ScramPlus]), sc)
+    d.connect()
+    assert_eq(sx_handshake(d), "W1005")
+    assert(d.server_closed && d.client_closed, "both ends close")
+
+    var tc = sx_server_config()
+    tc.tree_versions = sx_versions([Version(2, 0)])
+    var e = sx_duo_with(sx_client_config("alice", [ScramPlus]), tc)
+    e.connect()
+    assert_eq(sx_fatal(e), "Q1005 Q1005")
+
+@test
+ssh_a_remote_default_on_wire_1_0_is_w1001()
+    var cc = sx_client_config("alice", [ScramPlus])
+    cc.defaults = SessionDefaults(None, Some(Remote), None, None, None)
+    var sc = sx_server_config()
+    sc.wire_versions = sx_versions([Version(1, 0)])
+    var d = sx_duo_with(cc, sc)
+    d.connect()
+
+    assert_eq(sx_fatal(d), "W1001 W1001")
+
+@test
+ssh_every_failed_credential_is_w3001()
+    var cc = sx_client_config("alice", [ScramPlus])
+    cc.password = "wrong"
+    var wrong = sx_duo_with(cc, sx_server_config())
+    wrong.connect()
+    assert_eq(sx_fatal(wrong), "W3001 W3001")
+
+    // An unknown user runs the whole exchange against a decoy and fails the same way.
+    var unknown = sx_duo("mallory", [ScramPlus])
+    unknown.connect()
+    assert_eq(sx_fatal(unknown), "W3001 W3001")
+    assert_eq(sx_handshake(unknown), "type 129 W3001")
+
+    var cd = sx_client_config("svc", [TokenMethod])
+    cd.token = sx_salt()
+    var bad_token = sx_duo_with(cd, sx_server_config())
+    bad_token.connect()
+    assert_eq(sx_fatal(bad_token), "W3001 W3001")
+
+    var wrong_peer = sx_unix("alice", [PeerMethod])
+    wrong_peer.connect()
+    assert_eq(sx_fatal(wrong_peer), "W3001 W3001")
+
+@test
+ssh_altered_channel_binding_fails_scram_plus()
+    var cc = sx_client_config("alice", [ScramPlus])
+    cc.exporter = sx_salt()
+    var d = sx_duo_with(cc, sx_server_config())
+    d.connect()
+
+    assert_eq(sx_fatal(d), "W3001 W3001")
+
+@test
+ssh_no_permitted_method_is_w3002()
+    var d = sx_duo("alice", [ScramPlus])
+    d.authority.denied.push("alice/scram-sha-256-plus")
+    d.connect()
+    assert_eq(sx_fatal(d), "W3002 W3002")
+
+    // `peer` is never offered over TLS, nor `-plus` over a Unix socket.
+    var peer = sx_duo("ed", [PeerMethod])
+    peer.connect()
+    assert_eq(sx_fatal(peer), "W3002 W3002")
+
+    var plus = sx_unix("alice", [ScramPlus])
+    plus.connect()
+    assert_eq(sx_fatal(plus), "W3002 W3002")
+
+@test
+ssh_the_client_refuses_a_downgrade_from_channel_binding()
+    var d = sx_duo("alice", [ScramPlus, ScramPlain])
+    d.authority.denied.push("alice/scram-sha-256-plus")
+    d.connect()
+    assert_eq(sx_fatal(d), "- W3002")
+    assert(d.client_closed, "the client closes")
+
+    var cc = sx_client_config("alice", [ScramPlus, ScramPlain])
+    cc.allow_downgrade = true
+    var e = sx_duo_with(cc, sx_server_config())
+    e.authority.denied.push("alice/scram-sha-256-plus")
+    e.connect()
+    assert(e.connected(), "allowed when configured")
+
+@test
+ssh_an_unknown_database_is_w3004_after_authentication()
+    var cc = sx_client_config("alice", [ScramPlus])
+    cc.database = "nope"
+    var d = sx_duo_with(cc, sx_server_config())
+    d.connect()
+
+    assert_eq(sx_handshake(d), "type 129 W3004")
+
+    // Before authentication succeeds the failure is W3001, whatever the database.
+    cc.password = "wrong"
+    var e = sx_duo_with(cc, sx_server_config())
+    e.connect()
+    assert_eq(sx_fatal(e), "W3001 W3001")
+
+@test
+ssh_anything_before_client_hello_is_w1004()
+    var d = sx_duo("alice", [ScramPlus])
+    d.inject(0, Ping(1))
+    assert_eq(sx_handshake(d), "W1004")
+    assert(d.server_closed, "fatal")
+
+    var e = sx_duo("alice", [ScramPlus])
+    e.inject(1, sx_execute(0, 1))
+    assert_eq(sx_handshake(e), "W1004")
+
+@test
+ssh_a_request_before_ready_is_w1004()
+    var d = sx_duo("alice", [ScramPlus])
+    val st = d.c.hello(0)
+    d.take_client(st)
+    d.inject(1, sx_execute(0, 1))
+
+    assert_eq(sx_handshake(d), "type 129 W1004")
+
+    // The client will not send one either.
+    var e = sx_duo("alice", [ScramPlus])
+    assert_eq(code_of(e.c.request(sx_execute(0, 1), 0)), "W1004")
+
+@test
+ssh_a_second_hello_or_a_stray_auth_response_is_w1004()
+    var d = sx_duo("alice", [ScramPlus])
+    d.connect()
+    d.inject(0, ClientHelloMsg(token_hello([Version(1, 0)])))
+    assert_eq(sx_code(d.on(0)[2]), "W1004")
+
+    var e = sx_duo("alice", [ScramPlus])
+    e.connect()
+    e.inject(0, AuthResponse(buf()))
+    assert_eq(sx_code(e.on(0)[2]), "W1004")
+
+    // Peer has no round: ServerHello and Ready answer ClientHello together (§2.4 rule 7).
+    var p = sx_unix("ed", [PeerMethod])
+    val st = p.s.receive(sx_arrival(ClientHelloMsg(sx_hello_message(sx_client_config("ed", [PeerMethod]))), 0), 0)
+    assert(st.out.len() == 2 && p.s.phase == Serving, "peer answers ServerHello and Ready at once")
+
+@test
+ssh_the_client_refuses_handshake_messages_out_of_order()
+    var c = client_session(sx_client_config("alice", [ScramPlus]), 0)
+    c.hello(0)
+    val ready = Ready(1, Primary, 16, 1, MinMessageSize, 0, 0, buf())
+    val st = c.receive(sx_arrival(ReadyMsg(ready), 0), 0)
+    assert(st.close && code_of_fatal(st.fatal) == "W1004", "Ready before ServerHello")
+
+    var t = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    t.hello(0)
+    val hello = ServerHello(1, 1, 1, 0, "x", 65536, TokenMethod, buf(), "")
+    t.receive(sx_arrival(ServerHelloMsg(hello), 0), 0)
+    val again = t.receive(sx_arrival(ServerHelloMsg(hello), 0), 0)
+    assert(code_of_fatal(again.fatal) == "W1004", "a second ServerHello")
+
+    var u = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    u.hello(0)
+    u.receive(sx_arrival(ServerHelloMsg(hello), 0), 0)
+    val challenge = u.receive(sx_arrival(AuthChallenge(buf()), 0), 0)
+    assert(code_of_fatal(challenge.fatal) == "W1004", "an AuthChallenge for a token")
+
+    var v = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    v.hello(0)
+    val other = ServerHello(1, 1, 1, 0, "x", 65536, ScramPlain, buf(), "")
+    assert(code_of_fatal(v.receive(sx_arrival(ServerHelloMsg(other), 0), 0).fatal) == "W3002", "a method not offered")
+
+    var w = client_session(sx_client_config("svc", [TokenMethod]), 0)
+    w.hello(0)
+    val newer = ServerHello(1, 2, 1, 0, "x", 65536, TokenMethod, buf(), "")
+    assert(code_of_fatal(w.receive(sx_arrival(ServerHelloMsg(newer), 0), 0).fatal) == "W1001", "a minor not offered")
+
+@test
+ssh_a_slow_handshake_is_closed_after_ten_seconds()
+    var d = sx_duo("alice", [ScramPlus])
+    val st = d.c.hello(0)
+    d.take_client(st)
+    // The client never hears the server-first-message, so it never answers.
+    d.client_closed = true
+    d.flush()
+    assert(d.s.phase == Authenticating, "waiting for the client-final-message")
+
+    d.take_server(d.s.tick(9999))
+    assert(!d.server_closed, "not yet")
+    d.take_server(d.s.tick(10000))
+    assert(d.server_closed && d.s.phase == Ended, "closed at the deadline")
+
+code_of_fatal(e: Option[CodecError]) -> string = e match
+    Some(x) -> x.code
+    None -> "none"
+
+/** The `ClientHello` a session of configuration `cc` opens with. */
+sx_hello_message(cc: ClientConfig) -> ClientHello
+    var c = client_session(cc, 0)
+    c.hello(0).out[0].m match
+        ClientHelloMsg(h) -> h
+        _ -> token_hello([Version(1, 0)])

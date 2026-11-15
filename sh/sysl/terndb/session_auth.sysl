@@ -1,0 +1,231 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.crypto.{hmac256, pbkdf2_hmac256, sha256, verify}
+import sysl.encoding.{Alphabet, base64_decode, base64_decoded_len, base64_string}
+import sysl.text.from_utf8
+
+// The arithmetic and the message syntax of the authentication methods (`wire-protocol.md` §2.4):
+// SCRAM-SHA-256 as RFC 5802 and RFC 7677 define it, with or without RFC 9266's `tls-exporter`
+// channel binding, and the hashed lookup of a token. Every nonce, salt and channel-binding octet is
+// the caller's, so the same inputs always give the same messages; the hashing is `sysl.crypto`'s.
+
+const ScramPlus = "scram-sha-256-plus"
+const ScramPlain = "scram-sha-256"
+const TokenMethod = "token"
+const PeerMethod = "peer"
+
+/** The least length of a token (§2.4 rule 6). */
+const MinTokenSize: usize = 32
+
+/** What a server stores for a SCRAM user (RFC 5802 §3): never the password, only the salt, the
+ * iteration count and the two keys derived from it.
+ */
+struct ScramVerifier derives Eq
+    salt: Buf[u8]
+    iterations: u32
+    stored_key: [32]u8
+    server_key: [32]u8
+
+/** The verifier for `password` under `salt` and `iterations`, which is how a user is provisioned. The
+ * password is used as its UTF-8 octets (§2.4 rule 5).
+ */
+scram_verifier(password: string, salt: []const u8, iterations: u32) -> Result[ScramVerifier, CodecError]
+    val salted = salted_password(password, salt, iterations)?
+    val client_key = hmac256(salted[..], "Client Key".bytes)
+    val stored = buf[u8]()
+    stored.extend(salt)
+
+    Ok(ScramVerifier(stored, iterations, sha256(client_key[..]), hmac256(salted[..], "Server Key".bytes)))
+
+private salted_password(password: string, salt: []const u8, iterations: u32) -> Result[[32]u8, CodecError]
+    var out: [32]u8 = [0; 32]
+
+    pbkdf2_hmac256(password.bytes, salt, iterations, out[..]) match
+        Ok(_) -> Ok(out)
+        Err(_) -> fail("W3001", "the SCRAM iteration count must be at least one")
+
+/** The GS2 header a SCRAM method's client-first-message opens with: channel binding by
+ * `tls-exporter` for the `-plus` method, none otherwise.
+ */
+gs2_header(method: string) -> string = if method == ScramPlus then "p=tls-exporter,," else "n,,"
+
+/** A SCRAM `saslname`: `=` and `,` escaped (RFC 5802 §5.1). */
+private saslname(user: string) -> string = user.replace_all("=", "=3D").replace_all(",", "=2C")
+
+/** The client-first-message for `method`, `user` and the client's nonce. */
+client_first(method: string, user: string, nonce: string) -> string = s"${gs2_header(method)}${client_first_bare(user, nonce)}"
+
+private client_first_bare(user: string, nonce: string) -> string = s"n=${saslname(user)},r=$nonce"
+
+/** A client-first-message taken apart: its GS2 header, and the bare message after it with the
+ * client's nonce.
+ */
+struct ClientFirst derives Eq
+    gs2: string
+    bare: string
+    nonce: string
+
+/** The client-first-message `text` sent for `method`. A header that does not match the method, an
+ * `authzid`, or a missing nonce fails authentication (`W3001`, §2.1 rule 3).
+ */
+parse_client_first(method: string, text: string) -> Result[ClientFirst, CodecError]
+    val first = text.index_of(",")
+    if first.is_none() then return refused_auth("the client-first-message has no GS2 header")
+
+    val second = text.index_of_from(",", first.unwrap() + 1)
+    if second.is_none() then return refused_auth("the client-first-message has no GS2 header")
+
+    val flag = text[..<first.unwrap()]
+    val authzid = text[first.unwrap() + 1..<second.unwrap()]
+    val gs2 = text[..<second.unwrap() + 1]
+    val bare = text[second.unwrap() + 1..]
+
+    if authzid.len != 0 then return refused_auth("an authzid is not supported")
+    if method == ScramPlus && flag != "p=tls-exporter" then return refused_auth("scram-sha-256-plus binds the channel by tls-exporter")
+    if method == ScramPlain && flag != "n" && flag != "y" then return refused_auth("scram-sha-256 sends no channel binding")
+
+    val parts = bare.split(",")
+    if parts.len < 2 || !parts[0].starts_with("n=") || !parts[1].starts_with("r=") || parts[1].len < 3 then
+        return refused_auth("the client-first-message is n=<user>,r=<nonce>")
+
+    Ok(ClientFirst(gs2, bare, parts[1][2..]))
+
+/** The server-first-message: the client's nonce with the server's appended, the salt, the count. */
+server_first(client_nonce: string, server_nonce: string, v: ScramVerifier) -> string =
+    s"r=$client_nonce$server_nonce,s=${base64_string(v.salt.view(), Alphabet.Standard, true)},i=${v.iterations}"
+
+/** A server-first-message taken apart, as the client reads it. */
+struct ServerFirst derives Eq
+    nonce: string
+    salt: Buf[u8]
+    iterations: u32
+
+parse_server_first(text: string, client_nonce: string) -> Result[ServerFirst, CodecError]
+    val parts = text.split(",")
+
+    if parts.len < 3 || !parts[0].starts_with("r=") || !parts[1].starts_with("s=") || !parts[2].starts_with("i=") then
+        return refused_auth("the server-first-message is r=<nonce>,s=<salt>,i=<count>")
+
+    val nonce = parts[0][2..]
+    if !nonce.starts_with(client_nonce) || nonce.len <= client_nonce.len then
+        return refused_auth("the server's nonce does not extend the client's")
+
+    val salt = unbase64(parts[1][2..])?
+    var count: u64 = 0
+
+    for c in parts[2][2..].bytes
+        if c < u8('0') || c > u8('9') || count > 0xffff_ffff then return refused_auth("the iteration count is not a number")
+        count = count * 10 + u64(c - u8('0'))
+
+    if count == 0 || count > 0xffff_ffff then return refused_auth("the iteration count is out of range")
+
+    Ok(ServerFirst(nonce, salt, u32(count)))
+
+/** The channel-binding attribute's value: the GS2 header and, for `-plus`, the TLS exporter's
+ * octets (RFC 9266), in base64.
+ */
+channel_binding(gs2: string, exporter: []const u8) -> string
+    val b = buf[u8]()
+    b.extend(gs2.bytes)
+    if gs2.starts_with("p=") then b.extend(exporter)
+
+    base64_string(b.view(), Alphabet.Standard, true)
+
+/** The client-final-message without its proof: the channel binding and the combined nonce. */
+private final_without_proof(gs2: string, exporter: []const u8, nonce: string) -> string =
+    s"c=${channel_binding(gs2, exporter)},r=$nonce"
+
+/** RFC 5802 §3's `AuthMessage`. */
+private auth_message(first_bare: string, server_first: string, without_proof: string) -> string =
+    s"$first_bare,$server_first,$without_proof"
+
+/** What a SCRAM client computes from the server-first-message: the client-final-message to send,
+ * and the server-final-message it must then receive.
+ */
+struct ClientFinal derives Eq
+    message: string
+    expected_final: string
+
+/** The client's half of RFC 5802 §3, from its password and the messages so far. */
+client_final(password: string, user: string, client_nonce: string, gs2: string, exporter: []const u8,
+        sf_text: string) -> Result[ClientFinal, CodecError]
+    val sf = parse_server_first(sf_text, client_nonce)?
+    val salted = salted_password(password, sf.salt.view(), sf.iterations)?
+    val client_key = hmac256(salted[..], "Client Key".bytes)
+    val stored = sha256(client_key[..])
+    val without = final_without_proof(gs2, exporter, sf.nonce)
+    val am = auth_message(client_first_bare(user, client_nonce), sf_text, without)
+    val signature = hmac256(stored[..], am.bytes)
+    val server_signature = hmac256(hmac256(salted[..], "Server Key".bytes)[..], am.bytes)
+
+    Ok(ClientFinal(s"$without,p=${base64_string(xor32(client_key, signature)[..], Alphabet.Standard, true)}",
+        s"v=${base64_string(server_signature[..], Alphabet.Standard, true)}"))
+
+/** The server's check of a client-final-message against what it sent: the channel binding must be
+ * the header the client opened with plus, for `-plus`, this connection's exporter octets; the nonce
+ * must be the combined one; and the proof must recover the stored key (RFC 5802 §3). It answers the
+ * server-final-message; every failure is `W3001`.
+ */
+server_final(v: ScramVerifier, first: ClientFirst, sf_text: string, combined_nonce: string, exporter: []const u8,
+        cf_text: string) -> Result[string, CodecError]
+    val at = cf_text.index_of(",p=")
+    if at.is_none() then return refused_auth("the client-final-message has no proof")
+
+    val without = cf_text[..<at.unwrap()]
+
+    if without != final_without_proof(first.gs2, exporter, combined_nonce) then
+        return refused_auth("the channel binding or the nonce does not match")
+
+    val proof = unbase64(cf_text[at.unwrap() + 3..])?
+    if proof.len() != 32 then return refused_auth("a SCRAM-SHA-256 proof is 32 octets")
+
+    val am = auth_message(first.bare, sf_text, without)
+    val signature = hmac256(v.stored_key[..], am.bytes)
+    var key: [32]u8 = [0; 32]
+
+    for i in 0..<32
+        key[i] = proof[i] ^ signature[i]
+
+    if !verify(sha256(key[..])[..], v.stored_key[..]) then return refused_auth("the proof is wrong")
+
+    Ok(s"v=${base64_string(hmac256(v.server_key[..], am.bytes)[..], Alphabet.Standard, true)}")
+
+/** A verifier no password matches, used for an unknown user so that the exchange runs to its end and
+ * fails with the same code as a wrong password (§2.1 rule 3).
+ */
+decoy_verifier(user: string) -> ScramVerifier
+    val seed = sha256(s"terndb unknown user $user".bytes)
+    val salt = buf[u8]()
+    salt.extend(seed[..<16])
+
+    ScramVerifier(salt, 4096, sha256(seed[..]), seed)
+
+/** The SHA-256 a server looks a token up by (§2.4 rule 6). */
+token_hash(token: []const u8) -> [32]u8 = sha256(token)
+
+private xor32(a: [32]u8, b: [32]u8) -> [32]u8
+    var out: [32]u8 = [0; 32]
+
+    for i in 0..<32
+        out[i] = a[i] ^ b[i]
+
+    out
+
+private unbase64(text: string) -> Result[Buf[u8], CodecError]
+    var out = buf[u8]()
+    for _ in 0..<base64_decoded_len(text.bytes)
+        out.push(0)
+
+    base64_decode(text.bytes, out.view_mut()) match
+        Ok(n) ->
+            out.truncate(n)
+            Ok(out)
+        Err(_) -> refused_auth("a SCRAM attribute is not base64")
+
+/** Octets as the UTF-8 text an authentication message is. */
+auth_text(octets: []const u8) -> Result[string, CodecError] = from_utf8(octets) match
+    Ok(s) -> Ok(s)
+    Err(_) -> refused_auth("an authentication message is not UTF-8")
+
+private refused_auth[T](why: string) -> Result[T, CodecError] = fail("W3001", why)

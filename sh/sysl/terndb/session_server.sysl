@@ -1,0 +1,866 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The server's half of a native-protocol session (`wire-protocol.md` §2, §4.3–§4.6, §5, §7): a pure
+// machine. It is fed what the reassembler delivers and the time, and answers the messages to send
+// and what changed; it opens no socket and reads no clock. The engine behind it is an `Executor`,
+// the user directory an `Authority`.
+//
+// Requests are kept in arrival order. One starts when nothing ahead of it must finish first: an
+// earlier request on its transaction (§4.6 rule 2), or an earlier request registering the prepared
+// handle it names (§4.6 rule 4). Started statements stream one batch per round, so results of
+// independent requests interleave (§3.3 rule 2), and none sends a batch without credit (§7.2).
+
+/** A server's settings for one connection. */
+struct ServerConfig
+    wire_versions: Buf[Version]
+    tree_versions: Buf[Version]
+    server_version: string
+    /** The largest frame the server receives (`ServerHello.max_frame_size`). */
+    max_frame_size: u64
+    max_in_flight: u64
+    max_open_txns: u64
+    max_message_size: u64
+    connection_id: u64
+    role: Role
+    transport: Transport
+    /** The SCRAM server nonce for this connection, from a cryptographic generator. */
+    server_nonce: string
+    /** The TLS exporter's channel-binding octets (RFC 9266); empty off TLS. */
+    exporter: Buf[u8]
+    /** The operating-system user of a Unix-socket peer, as the socket reports it. */
+    peer_user: Option[string]
+    /** Compression codecs the server supports, in its preference order (§6.4.7). */
+    compression: Buf[string]
+    /** How long a connection may take to reach `Ready` (§2.1 rule 4). */
+    handshake_timeout_ms: u64
+    /** How long a connection may carry no traffic before the server says `Goodbye` (§7.4). */
+    idle_timeout_ms: Option[u64]
+
+/** Where a session's handshake has got to. */
+enum Phase
+    AwaitingHello
+    Authenticating
+    Serving
+    /** `Goodbye` has been sent; no request is accepted (§3.4 rule 5). */
+    Draining
+    Ended
+
+/** What the handshake fixed, for the reassembler and the encoder: the wire minor, the limits this
+ * end receives under, and the largest frame it may send.
+ */
+struct Negotiated derives Eq
+    minor: u64
+    receive: Limits
+    send_frame_size: u64
+
+/** What one input to a server session comes to. */
+struct Step
+    out: Buf[Outgoing]
+    negotiated: Option[Negotiated]
+    /** The connection is to be closed once `out` is sent. */
+    close: bool
+    /** The connection-fatal refusal that closed it, when one did. */
+    fatal: Option[CodecError]
+
+/** What a server must say in the next authentication round. */
+private enum Round
+    NoRound
+    TokenOctets
+    ScramFirst
+    ScramFinal
+
+/** One request, from arrival to its terminal message. */
+private struct Req
+    stream: u64
+    m: Message
+    txn: u64
+    started: bool
+    done: bool
+    /** Cancelled before it started: its `Error` is sent, and it takes effect when it is reached. */
+    tombstone: bool
+    cursor: u64
+    txid: Option[u64]
+    /** `None` is unlimited credit. */
+    credit: Option[i64]
+    /** The one batch produced beyond what credit has let out (§7.2 rule 4). */
+    held: Option[Buf[u8]]
+    started_at: u64
+    waited: u64
+    wait_since: Option[u64]
+    timeout_ms: Option[u64]
+
+/** An open explicit transaction. */
+private struct Txn
+    handle: u64
+    txid: u64
+    /** The code of the error that aborted it. */
+    aborted: Option[string]
+    /** Savepoint names, oldest first; a later one of a name shadows an earlier (§5.5 rule 1). */
+    savepoints: Buf[string]
+
+/** A registered prepared statement. */
+private struct Registered
+    handle: u64
+    envelope: Buf[u8]
+    described: Described
+
+struct ServerSession
+    config: ServerConfig
+    phase: Phase
+    /** The negotiated wire minor. */
+    minor: u64
+    private exec: &Executor
+    private authority: &Authority
+    private opened_at: u64
+    private last_traffic: u64
+    private drain_until: u64
+    private user: string
+    private database: string
+    private defaults: SessionDefaults
+    private method: string
+    private round: Round
+    private scram_first: Option[ClientFirst]
+    private scram_server_first: string
+    private scram_verifier: Option[ScramVerifier]
+    private pending: Buf[&Req]
+    private txns: Buf[&Txn]
+    private prepared: Buf[&Registered]
+    private out: Buf[Outgoing]
+    private negotiated: Option[Negotiated]
+    private closing: bool
+    private fatal: Option[CodecError]
+
+    /** How many explicit transactions are open. */
+    open_txns(self) -> usize = self.txns.len()
+
+    /** How many requests have not yet sent their terminal message. */
+    in_flight(self) -> usize
+        var n: usize = 0
+        for r in self.pending
+            if !r.done && !r.tombstone then n += 1
+        n
+
+    /** Whether prepared handle `h` is registered. */
+    has_prepared(self, h: u64) -> bool = self.find_prepared(h).is_some()
+
+    /** One arrival from the reassembler, at time `now`. */
+    receive(*self, a: Arrival, now: u64) -> Step
+        self.last_traffic = now
+
+        a match
+            Refused(stream, code) ->
+                if self.phase == Serving || self.phase == Draining then
+                    self.send(stream, error_message(code, "too many requests are in flight", Unaffected, None))
+            Whole(raw) ->
+                raw.decode(self.minor) match
+                    Ok(m) -> self.deliver(raw.stream, m, now)
+                    Err(e) ->
+                        // A misplaced option is refused alone once the handshake is over (§8.1 rule 8).
+                        if e.code == "W2011" && raw.stream != 0 && (self.phase == Serving || self.phase == Draining) then
+                            self.send(raw.stream, error_message(e.code, e.message, Unaffected, None))
+                        else
+                            self.die(e)
+
+        self.advance(now)
+        self.step()
+
+    /** The passage of time: the handshake deadline, statement timeouts, the idle timeout and the
+     * end of a `Goodbye`'s grace (§2.1 rule 4, §7.3 rule 3, §7.4, §3.4 rule 5).
+     */
+    tick(*self, now: u64) -> Step
+        if self.phase == AwaitingHello || self.phase == Authenticating
+            if now - self.opened_at >= self.config.handshake_timeout_ms
+                self.teardown()
+                self.closing = true
+            return self.step()
+
+        if self.phase == Ended then return self.step()
+
+        self.advance(now)
+        self.expire_statements(now)
+
+        if self.phase == Draining && (now >= self.drain_until || self.in_flight() == 0)
+            for r in self.pending
+                if !r.done && !r.tombstone then self.end_cancelled(r, "shutdown")
+            self.teardown()
+            self.closing = true
+        elif self.phase == Serving
+            self.config.idle_timeout_ms match
+                Some(t) ->
+                    if now - self.last_traffic >= t
+                        self.send(0, Goodbye("W4002", "the connection was idle", 0))
+                        self.teardown()
+                        self.closing = true
+                None -> ()
+
+        self.step()
+
+    /** The server is shutting down: `Goodbye` with `W4001`, then in-flight requests have `grace_ms`
+     * to finish (§3.4 rule 5).
+     */
+    shutdown(*self, now: u64, grace_ms: u64) -> Step
+        if self.phase == Serving
+            self.send(0, Goodbye("W4001", "the server is shutting down", grace_ms))
+            self.phase = Draining
+            self.drain_until = now + grace_ms
+            if self.in_flight() == 0
+                self.teardown()
+                self.closing = true
+        elif self.phase != Ended
+            self.teardown()
+            self.closing = true
+
+        self.step()
+
+    /** The reassembler refused the input; every such refusal is connection-fatal (§1.3 rule 2). */
+    refuse(*self, e: CodecError) -> Step
+        if self.phase != Ended then self.die(e)
+        self.step()
+
+    /** The transport has ended: every open transaction is rolled back (§5.1 rule 3). */
+    lost(*self) -> Step
+        self.teardown()
+        self.step()
+
+    // -- dispatch --------------------------------------------------------------------------------
+
+    private deliver(*self, stream: u64, m: Message, now: u64)
+        if self.phase == Ended then return
+
+        if self.phase == AwaitingHello
+            m match
+                ClientHelloMsg(h) -> self.hello(h)
+                _ -> self.die_with("W1004", "the client must send ClientHello first")
+            return
+
+        m match
+            Ping(v) -> self.send(0, Pong(v))
+            Terminate -> self.teardown()
+            ClientHelloMsg(_) -> self.die_with("W1004", "ClientHello is sent once")
+            AuthResponse(data) ->
+                if self.phase == Authenticating && self.round != NoRound
+                    self.auth_round(data)
+                else
+                    self.die_with("W1004", "no authentication round is open")
+            Cancel -> self.cancel(stream)
+            Credit(n) -> self.add_credit(stream, n)
+            _ ->
+                if self.phase == Authenticating
+                    self.die_with("W1004", "a request before Ready")
+                elif self.phase == Draining
+                    self.send(stream, error_message("W4001", "the server is shutting down", Unaffected, None))
+                else
+                    self.enqueue(stream, m, now)
+
+    private send(*self, stream: u64, m: Message) = self.out.push(Outgoing(stream, m))
+
+    private step(*self) -> Step
+        val s = Step(self.out, self.negotiated, self.closing, self.fatal)
+        self.out = buf()
+        self.negotiated = None
+        s
+
+    /** A connection-fatal refusal: an `Error` on stream 0, then the close (§8.1 rule 8). */
+    private die(*self, e: CodecError)
+        self.send(0, ErrorReply(wire_error(failure_of(e), Unaffected)))
+        self.fatal = Some(e)
+        self.teardown()
+        self.closing = true
+
+    private die_with(*self, code: string, message: string) = self.die(CodecError(code, "", message, buf()))
+
+    /** Every started statement stopped and every open transaction rolled back; nothing more is sent. */
+    private teardown(*self)
+        for r in self.pending
+            if r.started && !r.done then self.exec.cancel(r.cursor)
+            r.done = true
+
+        for t in self.txns
+            self.exec.rollback(t.txid)
+
+        self.pending = buf()
+        self.txns = buf()
+        self.phase = Ended
+        self.closing = true
+
+    // -- the handshake (§2) ----------------------------------------------------------------------
+
+    private hello(*self, h: ClientHello)
+        val wire = negotiate(self.config.wire_versions.view(), h.wire_versions.view())
+        if wire.is_none() then return self.die_with("W1005", "no common wire protocol major version")
+
+        val tree = negotiate(self.config.tree_versions.view(), h.tree_versions.view())
+        if tree.is_none() then return self.die_with("Q1005", "no common tree schema major version")
+
+        self.minor = wire.unwrap().max_minor
+        val sync = h.defaults.synchronous
+        if self.minor == 0 && (sync == Some(Remote) || sync == Some(RemoteApply)) then
+            return self.die_with("W1001", "a remote synchronous level needs wire 1.1")
+
+        self.user = h.user
+        self.database = h.database
+        self.defaults = h.defaults
+        self.phase = Authenticating
+
+        var chosen = ""
+        for m in h.auth_methods
+            if chosen.len == 0 && self.offers(m, h.user, h.database) then chosen = m
+
+        if chosen.len == 0 then return self.die_with("W3002", "no authentication method the client offers is permitted")
+
+        self.method = chosen
+        self.negotiated = Some(Negotiated(self.minor,
+            Limits(self.config.max_frame_size, self.config.max_message_size, self.config.max_in_flight), h.max_frame_size))
+
+        // `initial` belongs to the client's first method, and is ignored for any other (§2.4 rule 5).
+        val initial = if chosen == h.auth_methods[0] then h.initial else None
+        var data = buf[u8]()
+
+        if chosen == PeerMethod
+            self.server_hello(wire.unwrap(), tree.unwrap(), h, data)
+            val os_user = self.config.peer_user.unwrap_or("")
+            if self.authority.peer_permits(os_user, self.user) then self.authenticated(buf())
+            else self.die_with("W3001", "authentication failed")
+            return
+
+        initial match
+            None ->
+                self.round = if chosen == TokenMethod then TokenOctets else ScramFirst
+                self.server_hello(wire.unwrap(), tree.unwrap(), h, data)
+            Some(first) ->
+                if chosen == TokenMethod
+                    self.server_hello(wire.unwrap(), tree.unwrap(), h, data)
+                    self.check_token(first)
+                else
+                    self.scram_start(first) match
+                        Ok(sf) ->
+                            data = sf
+                            self.server_hello(wire.unwrap(), tree.unwrap(), h, data)
+                        Err(e) -> self.die(e)
+    end hello
+
+    /** Whether the server permits `m` for this user, database and transport (§2.4 rule 4). */
+    private offers(self, m: string, user: string, database: string) -> bool
+        if !method_allowed(m, self.config.transport) then return false
+        if m == PeerMethod && self.config.peer_user.is_none() then return false
+
+        self.authority.permits(user, database, m)
+
+    private server_hello(*self, wire: Version, tree: Version, h: ClientHello, data: Buf[u8])
+        var codec = ""
+        for c in h.compression
+            if codec.len == 0
+                for mine in self.config.compression
+                    if mine == c then codec = c
+
+        self.send(0, ServerHelloMsg(ServerHello(wire.major, wire.max_minor, tree.major, tree.max_minor,
+            self.config.server_version, self.config.max_frame_size, self.method, data, codec)))
+
+    private auth_round(*self, data: Buf[u8])
+        self.round match
+            TokenOctets -> self.check_token(data)
+            ScramFirst ->
+                self.scram_start(data) match
+                    Ok(sf) -> self.send(0, AuthChallenge(sf))
+                    Err(e) -> self.die(e)
+            ScramFinal -> self.scram_finish(data)
+            NoRound -> self.die_with("W1004", "no authentication round is open")
+
+    private check_token(*self, token: Buf[u8])
+        self.round = NoRound
+
+        if token.len() >= MinTokenSize && self.authority.token_user(token_hash(token.view())) == Some(self.user) then
+            self.authenticated(buf())
+        else
+            self.die_with("W3001", "authentication failed")
+
+    /** The client-first-message in, the server-first-message out. An unknown user gets a decoy
+     * verifier, so the exchange fails only at its end, as a wrong password does (§2.1 rule 3).
+     */
+    private scram_start(*self, data: Buf[u8]) -> Result[Buf[u8], CodecError]
+        val first = parse_client_first(self.method, auth_text(data.view())?)?
+        val v = self.authority.verifier(self.user).unwrap_or(decoy_verifier(self.user))
+        val sf = server_first(first.nonce, self.config.server_nonce, v)
+
+        self.scram_first = Some(first)
+        self.scram_server_first = sf
+        self.scram_verifier = Some(v)
+        self.round = ScramFinal
+
+        val out = buf[u8]()
+        out.extend(sf.bytes)
+        Ok(out)
+
+    private scram_finish(*self, data: Buf[u8])
+        self.round = NoRound
+        val first = self.scram_first.unwrap()
+        val nonce = s"${first.nonce}${self.config.server_nonce}"
+        val known = self.authority.verifier(self.user).is_some()
+
+        val r = auth_text(data.view()) match
+            Ok(text) -> server_final(self.scram_verifier.unwrap(), first, self.scram_server_first, nonce,
+                self.config.exporter.view(), text)
+            Err(e) -> Err(e)
+
+        r match
+            Ok(text) ->
+                if !known then return self.die_with("W3001", "authentication failed")
+                val final = buf[u8]()
+                final.extend(text.bytes)
+                self.authenticated(final)
+            Err(_) -> self.die_with("W3001", "authentication failed")
+
+    /** Authentication has succeeded: an unknown database is reported now (§3.4 rule 2), and
+     * otherwise `Ready`.
+     */
+    private authenticated(*self, final: Buf[u8])
+        if !self.authority.has_database(self.database) then return self.die_with("W3004", s"unknown database ${self.database}")
+
+        self.send(0, ReadyMsg(Ready(self.config.connection_id, self.config.role, self.config.max_in_flight,
+            self.config.max_open_txns, self.config.max_message_size, self.exec.horizon(), self.exec.catalog_version(), final)))
+        self.phase = Serving
+
+    // -- scheduling (§4.6) -----------------------------------------------------------------------
+
+    private enqueue(*self, stream: u64, m: Message, now: u64)
+        val txn = txn_of(m)
+
+        m match
+            Rollback(t) -> self.preempt(t)
+            _ -> ()
+
+        val r: &Req = Req(stream, m, txn, false, false, false, 0, None, None, None, now, 0, None, None)
+        self.pending.push(r)
+
+    /** Whether request `i` must wait for one ahead of it. */
+    private blocked(self, i: usize) -> bool
+        val r = self.pending[i]
+        val h = handle_named(r.m)
+
+        for j in 0..<i
+            val e = self.pending[j]
+            if !e.done
+                if r.txn != 0 && e.txn == r.txn then return true
+                if h != 0 && !e.started && handle_registered(e.m) == h then return true
+
+        false
+
+    private advance(*self, now: u64)
+        loop
+            if self.phase != Serving && self.phase != Draining then return
+
+            var progressed = false
+            var i: usize = 0
+
+            while i < self.pending.len()
+                val r = self.pending[i]
+                if !r.done
+                    if !r.started
+                        if !self.blocked(i)
+                            self.begin_request(r, now)
+                            progressed = true
+                    elif self.pump(r, now) then progressed = true
+                i += 1
+
+            val left = buf[&Req]()
+            for r in self.pending
+                if !r.done then left.push(r)
+            self.pending = left
+
+            if !progressed then return
+
+    /** Starts request `r`; most kinds also end at once. */
+    private begin_request(*self, r: &Req, now: u64)
+        r.started = true
+        r.started_at = now
+
+        if r.tombstone
+            // A cancelled request takes effect in its place: it aborts its transaction (§7.3 rule 1).
+            r.done = true
+            r.m match
+                Begin(_, _) -> ()
+                _ -> self.abort_txn(r.txn, "T1007")
+            return
+
+        r.m match
+            Prepare(h, envelope) -> self.do_prepare(r, h, envelope)
+            ClosePrepared(h) ->
+                self.unregister(h)
+                self.reply(r, OkReply)
+            TransactionStatus(txid) ->
+                self.exec.status(txid) match
+                    Ok(o) -> self.reply(r, TxnStatus(o.state, o.commit))
+                    Err(f) -> self.reply(r, ErrorReply(wire_error(f, Unaffected)))
+            Begin(t, options) -> self.do_begin(r, t, options)
+            Commit(t) -> self.do_commit(r, t)
+            Rollback(t) ->
+                self.find_txn(t) match
+                    Some(x) ->
+                        self.exec.rollback(x.txid)
+                        self.drop_txn(t)
+                        self.reply(r, OkReply)
+                    None -> self.reply(r, error_message("W2001", s"no transaction $t is open", Unaffected, None))
+            Savepoint(t, name) -> self.do_savepoint(r, t, name)
+            RollbackToSavepoint(t, name) -> self.do_rollback_to(r, t, name)
+            ReleaseSavepoint(t, name) -> self.do_release(r, t, name)
+            ExecuteMsg(e) -> self.do_execute(r, e.txn, e.implicit, e.options, Some(e.envelope), None, e.params, e.prepare_as)
+            ExecutePreparedMsg(e) -> self.do_execute(r, e.txn, e.implicit, e.options, None, Some(e.plan), e.params, None)
+            _ -> self.reply(r, error_message("W1001", "not a request", Unaffected, None))
+    end begin_request
+
+    private reply(*self, r: &Req, m: Message)
+        self.send(r.stream, m)
+        if is_terminal(m) then r.done = true
+
+    // -- prepared statements (§4.4) --------------------------------------------------------------
+
+    private do_prepare(*self, r: &Req, h: u64, envelope: Buf[u8])
+        if h != 0 && self.has_prepared(h) then
+            return self.reply(r, error_message("W2006", s"prepared handle $h is registered", Unaffected, None))
+
+        self.exec.describe(envelope) match
+            Ok(d) ->
+                if h != 0 then self.prepared.push(Registered(h, envelope, d))
+                self.reply(r, Prepared(d.shape, d.catalog_version, d.result_type))
+            Err(f) -> self.reply(r, ErrorReply(wire_error(f, Unaffected)))
+
+    private find_prepared(self, h: u64) -> Option[&Registered]
+        for p in self.prepared
+            if p.handle == h then return Some(p)
+        None
+
+    private unregister(*self, h: u64)
+        val left = buf[&Registered]()
+        for p in self.prepared
+            if p.handle != h then left.push(p)
+        self.prepared = left
+
+    // -- transactions (§5) -----------------------------------------------------------------------
+
+    private find_txn(self, t: u64) -> Option[&Txn]
+        for x in self.txns
+            if x.handle == t then return Some(x)
+        None
+
+    private drop_txn(*self, t: u64)
+        val left = buf[&Txn]()
+        for x in self.txns
+            if x.handle != t then left.push(x)
+        self.txns = left
+
+    /** Transaction `t`, if open, is aborted by an error of `code`; the first abort's code is kept. */
+    private abort_txn(*self, t: u64, code: string)
+        self.find_txn(t) match
+            Some(x) -> if x.aborted.is_none() then x.aborted = Some(code)
+            None -> ()
+
+    /** The `Error` for failure `f` of a request on transaction `t` (0 for none). An error in an
+     * explicit transaction aborts it, except `W2004`, which ran nothing and is retried in the same
+     * transaction (§5.3 rule 1).
+     */
+    private fail_in(*self, r: &Req, t: u64, f: Failure)
+        val code = f.entries[0].code
+        val x = if t == 0 then None else self.find_txn(t)
+
+        val state = x match
+            Some(_) ->
+                if code == "W2004" then Unaffected
+                else
+                    self.abort_txn(t, code)
+                    Aborted
+            None -> Unaffected
+
+        val txid = if f.txid.is_some() then f.txid else r.txid
+        self.reply(r, ErrorReply(wire_error(Failure(f.entries, txid, f.tuple), state)))
+
+    /** The transaction a request on handle `t` runs in, or the reply that refuses it: `W2001` for a
+     * handle that is not open, `W2003` for an aborted one (§5.1 rule 2, §5.3 rule 2).
+     */
+    private usable(*self, r: &Req, t: u64) -> Option[&Txn]
+        self.find_txn(t) match
+            None ->
+                self.reply(r, error_message("W2001", s"no transaction $t is open", Unaffected, None))
+                None
+            Some(x) ->
+                if x.aborted.is_some()
+                    self.reply(r, error_message("W2003", s"transaction $t is aborted", Aborted, Some(x.txid)))
+                    return None
+                Some(x)
+
+    private do_begin(*self, r: &Req, t: u64, options: TxnOptions)
+        if t == 0 then return self.reply(r, error_message("W2001", "0 is not a transaction handle", Closed, None))
+        if self.find_txn(t).is_some() then
+            return self.reply(r, error_message("W2002", s"transaction $t is open", Unaffected, None))
+        if u64(self.txns.len()) >= self.config.max_open_txns then
+            return self.reply(r, error_message("W2016", s"at most ${self.config.max_open_txns} transactions may be open", Closed, None))
+
+        self.exec.begin(fill_options(options, self.defaults)) match
+            Ok(b) ->
+                self.txns.push(Txn(t, b.txid, None, buf()))
+                self.reply(r, TxnBegun(b.txid, b.snapshot, b.effective))
+            Err(f) -> self.reply(r, ErrorReply(wire_error(f, Closed)))
+
+    private do_commit(*self, r: &Req, t: u64)
+        val x = self.find_txn(t)
+        if x.is_none() then return self.reply(r, error_message("W2001", s"no transaction $t is open", Unaffected, None))
+
+        val txn = x.unwrap()
+        self.drop_txn(t)
+
+        txn.aborted match
+            Some(code) ->
+                // The commit of an aborted transaction names what aborted it (§5.3 rule 3).
+                self.exec.rollback(txn.txid)
+                self.reply(r, error_message(code, s"transaction $t was aborted", Closed, Some(txn.txid)))
+            None ->
+                self.exec.commit(txn.txid) match
+                    Ok(c) -> self.reply(r, TxnCommitted(txn.txid, c))
+                    Err(f) ->
+                        val txid = if f.txid.is_some() then f.txid else Some(txn.txid)
+                        self.reply(r, ErrorReply(wire_error(Failure(f.entries, txid, f.tuple), Closed)))
+
+    private do_savepoint(*self, r: &Req, t: u64, name: string)
+        self.usable(r, t) match
+            Some(x) ->
+                self.exec.savepoint(x.txid, name) match
+                    Ok(_) ->
+                        x.savepoints.push(name)
+                        self.reply(r, OkReply)
+                    Err(f) -> self.fail_in(r, t, f)
+            None -> ()
+
+    private do_rollback_to(*self, r: &Req, t: u64, name: string)
+        val x = self.find_txn(t)
+        if x.is_none() then return self.reply(r, error_message("W2001", s"no transaction $t is open", Unaffected, None))
+
+        val txn = x.unwrap()
+        savepoint_index(txn, name) match
+            None -> self.fail_in(r, t, failure("W2012", s"no savepoint $name is set"))
+            Some(i) ->
+                self.exec.rollback_to(txn.txid, name) match
+                    Ok(_) ->
+                        // Every savepoint predates the abort, since none is set on an aborted
+                        // transaction, so rolling back to one clears it (§5.5 rules 2 and 4).
+                        txn.savepoints.truncate(i + 1)
+                        txn.aborted = None
+                        self.reply(r, OkReply)
+                    Err(f) -> self.fail_in(r, t, f)
+
+    private do_release(*self, r: &Req, t: u64, name: string)
+        self.usable(r, t) match
+            Some(x) ->
+                savepoint_index(x, name) match
+                    None -> self.fail_in(r, t, failure("W2012", s"no savepoint $name is set"))
+                    Some(i) ->
+                        self.exec.release(x.txid, name) match
+                            Ok(_) ->
+                                x.savepoints.truncate(i)
+                                self.reply(r, OkReply)
+                            Err(f) -> self.fail_in(r, t, f)
+            None -> ()
+
+    // -- statements (§4.3–§4.5, §7) --------------------------------------------------------------
+
+    private do_execute(*self, r: &Req, t: u64, implicit: Option[TxnOptions], options: ExecOptions,
+            tree: Option[Buf[u8]], plan: Option[PlanRef], params: Buf[u8], prepare_as: Option[u64])
+        var txid: u64 = 0
+
+        if t != 0
+            self.usable(r, t) match
+                Some(x) -> txid = x.txid
+                None -> return
+            r.txid = Some(txid)
+
+        val envelope = tree match
+            Some(e) -> e
+            None ->
+                self.resolve_plan(r, t, plan.unwrap()) match
+                    Some(e) -> e
+                    None -> return
+
+        val register = prepare_as.unwrap_or(0)
+        if register != 0 && self.has_prepared(register) then
+            return self.fail_in(r, t, failure("W2006", s"prepared handle $register is registered"))
+
+        val s = Invocation(txid, fill_options(implicit.unwrap_or(no_txn_options()), self.defaults), options, envelope, params)
+
+        self.exec.start(s) match
+            Err(f) -> self.fail_in(r, t, f)
+            Ok(st) ->
+                if register != 0 then
+                    self.prepared.push(Registered(register, envelope,
+                        Described(st.header.shape, self.exec.catalog_version(), st.header.result_type)))
+                r.cursor = st.cursor
+                r.txid = Some(st.header.txid)
+                r.credit = options.credit.map(c -> i64(c))
+                val own = options.statement_timeout_ms
+                r.timeout_ms = if own.is_some() then own else self.defaults.statement_timeout_ms
+                self.send(r.stream, ResultHeaderMsg(st.header))
+    end do_execute
+
+    /** The tree a `PlanRef` runs, or `None` once the reply refusing it is sent: `W2005` for an
+     * unknown handle, `W2007` for a result type a catalog change altered (and the handle is
+     * released), `W2004` for a digest not in the plan cache (§4.4 rules 4–6).
+     */
+    private resolve_plan(*self, r: &Req, t: u64, plan: PlanRef) -> Option[Buf[u8]]
+        plan match
+            ByDigest(shape) ->
+                val e = self.exec.cached(shape)
+                if e.is_none() then self.fail_in(r, t, failure("W2004", "the shape is not in the plan cache"))
+                e
+            ByHandle(h) ->
+                val p = self.find_prepared(h)
+                if p.is_none()
+                    self.fail_in(r, t, failure("W2005", s"no prepared handle $h is registered"))
+                    return None
+
+                val reg = p.unwrap()
+                if reg.described.catalog_version != self.exec.catalog_version()
+                    self.exec.describe(reg.envelope) match
+                        Err(f) ->
+                            self.fail_in(r, t, f)
+                            return None
+                        Ok(d) ->
+                            if d.result_type != reg.described.result_type
+                                self.unregister(h)
+                                self.fail_in(r, t, failure("W2007", s"the result type of prepared handle $h changed"))
+                                return None
+                            reg.described = d
+
+                Some(reg.envelope)
+
+    /** One step of a started statement: the next batch, sent if it has credit and held if not, or
+     * its end, which needs no credit (§7.2 rules 3–5). Answers whether anything was sent.
+     */
+    private pump(*self, r: &Req, now: u64) -> bool
+        if r.held.is_none()
+            self.exec.next(r.cursor) match
+                Ok(BatchReady(payload)) -> r.held = Some(payload)
+                Ok(NotYet) -> return false
+                Ok(NoMore) ->
+                    self.exec.finish(r.cursor) match
+                        Ok(f) -> self.reply(r, Complete(f.counts, f.commit))
+                        Err(f) -> self.fail_in(r, r.txn, f)
+                    return true
+                Err(f) ->
+                    self.fail_in(r, r.txn, f)
+                    return true
+
+        r.credit match
+            Some(c) ->
+                if c <= 0
+                    if r.wait_since.is_none() then r.wait_since = Some(now)
+                    return false
+            None -> ()
+
+        r.wait_since match
+            Some(since) ->
+                r.waited += now - since
+                r.wait_since = None
+            None -> ()
+
+        val payload = r.held.unwrap()
+        r.held = None
+        r.credit = r.credit.map(c -> c - i64(payload.len()))
+        self.send(r.stream, BatchReply(payload))
+        true
+
+    /** Statements that have run longer than their `statement_timeout_ms`, the time spent waiting
+     * for credit not counted (§7.2 rule 4, §7.3 rule 3), end with `cancelled`.
+     */
+    private expire_statements(*self, now: u64)
+        for r in self.pending
+            if r.started && !r.done && r.timeout_ms.is_some()
+                val waiting = r.wait_since match
+                    Some(since) -> now - since
+                    None -> 0
+                if now - r.started_at - r.waited - waiting >= r.timeout_ms.unwrap() then
+                    self.end_cancelled(r, "statement_timeout")
+
+    // -- cancellation and credit (§7) -------------------------------------------------------------
+
+    private find_open(self, stream: u64) -> Option[&Req]
+        for r in self.pending
+            if r.stream == stream && !r.done && !r.tombstone then return Some(r)
+        None
+
+    /** Stops request `r` and sends its `cancelled`. A started statement is stopped in the engine and
+     * aborts its explicit transaction now; one not yet started becomes a tombstone that does so when
+     * it is reached, so the abort keeps its place in the transaction's order.
+     */
+    private end_cancelled(*self, r: &Req, reason: string)
+        val explicit = r.txn != 0
+        val state = r.m match
+            Begin(_, _) -> Closed
+            _ -> if explicit then Aborted else Unaffected
+
+        if r.started
+            self.exec.cancel(r.cursor)
+            r.done = true
+            if explicit then self.abort_txn(r.txn, "T1007")
+        else
+            r.tombstone = true
+
+        self.send(r.stream, cancelled_message(reason, state, r.txid))
+
+    private cancel(*self, stream: u64)
+        self.find_open(stream) match
+            Some(r) ->
+                r.m match
+                    // A received Commit cannot be cancelled (§5.4 rule 4).
+                    Commit(_) -> ()
+                    _ -> self.end_cancelled(r, "")
+            None -> ()
+
+    private add_credit(*self, stream: u64, n: u64)
+        self.find_open(stream) match
+            Some(r) -> r.credit = r.credit.map(c -> c + i64(n))
+            None -> ()
+
+    /** A `Rollback` pre-empts its transaction: a running request on it is cancelled, and the queued
+     * ones ahead fail with `cancelled` without running, except `Begin`, `Commit` and `Rollback`,
+     * which keep their turn (§5.4 rule 3).
+     */
+    private preempt(*self, t: u64)
+        if t == 0 then return
+
+        for r in self.pending
+            if r.txn == t && !r.done && !r.tombstone
+                val keeps = r.m match
+                    Begin(_, _) | Commit(_) | Rollback(_) -> true
+                    _ -> false
+                if !keeps then self.end_cancelled(r, "")
+end ServerSession
+
+/** The prepared handle a request names, 0 for none (§4.6 rule 4). */
+private handle_named(m: Message) -> u64 = m match
+    Prepare(h, _) -> h
+    ClosePrepared(h) -> h
+    ExecuteMsg(e) -> e.prepare_as.unwrap_or(0)
+    ExecutePreparedMsg(e) -> e.plan match
+        ByHandle(h) -> h
+        ByDigest(_) -> 0
+    _ -> 0
+
+/** The newest savepoint of `name` in `x`, if one is set. */
+private savepoint_index(x: &Txn, name: string) -> Option[usize]
+    var i = x.savepoints.len()
+
+    while i > 0
+        i -= 1
+        if x.savepoints[i] == name then return Some(i)
+
+    None
+
+/** The prepared handle a request registers, 0 for none. */
+private handle_registered(m: Message) -> u64 = m match
+    Prepare(h, _) -> h
+    ExecuteMsg(e) -> e.prepare_as.unwrap_or(0)
+    _ -> 0
+
+/** A server session for a connection accepted at time `now`, before its `ClientHello`. */
+server_session(config: ServerConfig, exec: &Executor, authority: &Authority, now: u64) -> ServerSession =
+    ServerSession(config, AwaitingHello, 0, exec, authority, now, now, 0, "", "", no_session_defaults(), "", NoRound, None,
+        "", None, buf(), buf(), buf(), buf(), None, false, None)

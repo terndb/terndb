@@ -150,9 +150,12 @@ client                                        server
 2. The server MUST answer `ClientHello` with `ServerHello` or with a fatal `Error` on stream 0. After an `Error` on
    stream 0 the server MUST close the connection.
 3. The server MUST NOT send `Ready` until authentication has succeeded, and MUST close the connection after a
-   failed one with `W3001`, whatever the reason (wrong password, unknown user, method not permitted for the user).
+   failed one with `W3001`, whatever the reason (wrong password, unknown user, a wrong token, a peer that may not
+   log in as the user). An unknown user's SCRAM exchange runs to its end against a decoy verifier and fails there.
+   When no offered method is permitted at all, no credential was checked and the code is `W3002` (§2.4 rule 4).
    *Rationale: one code reveals nothing about which part was wrong.*
-4. A server SHOULD close a connection that has not reached `Ready` within 10 seconds.
+4. A server SHOULD close a connection that has not reached `Ready` within 10 seconds. It closes it without a
+   message.
 
 ### 2.2 Version negotiation
 
@@ -160,6 +163,8 @@ client                                        server
    versions ([QT] §13) the client supports. For each list the server picks the highest major present in both, and
    for it `min(client max_minor, server max_minor)`. `ServerHello` reports both choices.
 2. No common wire major is `W1005`; no common tree major is `Q1005` ([QT] §13.4). Either is fatal.
+   A `ServerHello` naming a major the client did not offer, or a minor above the client's `max_minor` for it, is
+   `W1001`, and the client closes the connection.
 3. The wire version and the tree version are independent: a tree-schema minor (new node kinds) needs no wire
    change, and a wire minor needs no tree change.
 4. A wire **minor** version MAY add message types, flags, enum values, error codes and fields. An added field MUST
@@ -204,22 +209,28 @@ client                                        server
    secret to manage.*
 3. A client MUST refuse a server that chooses `scram-sha-256`
    (without `-plus`) on a TLS connection where the client offered `-plus`, unless the client is configured to
-   allow it.
+   allow it. The client closes the connection with `W3002`, as it does when the server chooses a method the
+   client did not offer.
    *Rationale: the downgrade from `-plus` is the attack channel binding exists to stop.*
 4. The server chooses the **first** method in the client's list that it permits for this user, database and
    transport. None permitted is `W3002` (fatal; it is not `W3001`, because no credential was checked).
 5. **SCRAM exchange.** `ClientHello.initial` carries the SCRAM client-first-message when the client's first method
    is a SCRAM method. `ServerHello.auth_data` carries the server-first-message. `AuthResponse` carries the
    client-final-message. `Ready.auth_final` carries the server-final-message, which the client MUST verify before
-   sending any request; a failed verification MUST close the connection. If the server chose a method other than
-   the client's first, it MUST ignore `initial`, and the client sends its first message for the chosen method in
-   an `AuthResponse`.
+   sending any request; a failed verification MUST close the connection (`W3001` at the client). If the server
+   chose a method other than the client's first, it MUST ignore `initial`, and the client sends its first message
+   for the chosen method in an `AuthResponse`. For SCRAM the server-first-message then travels in an
+   `AuthChallenge`, and the client-final-message in a second `AuthResponse`; `ServerHello.auth_data` is empty.
+   The user is `ClientHello.user`: the SCRAM `n=` attribute is ignored, an `authzid` fails authentication, and
+   the password is used as its UTF-8 octets, without SASLprep.
 6. **Token.** The token's octets are `ClientHello.initial` (or the first `AuthResponse`). A token is an **opaque
    random** string of at least 32 octets from a cryptographic generator, issued by the server and bound to one
    user; the server stores only its SHA-256 hash and validates a token by hashing it and looking the hash up. There
    are no signed tokens (JWT, PASETO) in 1.0.
 7. **Peer.** The server sends `ServerHello` with `auth_method = "peer"` and then `Ready` without waiting.
-8. `AuthChallenge` exists for methods with more than one server round; neither SCRAM nor token uses it in 1.0.
+8. `AuthChallenge` exists for methods with more than one server round; in 1.0 only a SCRAM method that is not
+   the client's first uses it (rule 5). A `ServerHello`, `AuthChallenge` or `Ready` the client is not waiting
+   for, and an `AuthResponse` when no round is open, are `W1004`.
 9. TLS client certificates are not an authentication method in 1.0. Mutual TLS (a certificate mapped to a user)
    comes in Phase 2, as a new method name.
 
@@ -290,6 +301,9 @@ unlisted type is reserved. In 1.0 all are `W1001`.
    then the terminal message. Nothing follows a terminal message on its stream.
 2. Responses to different requests MAY interleave at frame granularity and MAY complete in any order, subject to
    the ordering rules of §4.6.
+3. A client refuses with `W1001` a response that is not one of its request's in this table, or that comes out
+   of the table's order (a `Batch` before the `ResultHeader`, a second `ResultHeader`); a `Batch` for a statement
+   whose `result_type` is absent is `W1008`.
 
 ### 3.4 Handshake and control messages
 
@@ -568,7 +582,9 @@ params := uvar tuple_count                    (≥ 1)
    connection-scoped. `Begin` opens it; `Commit` or `Rollback` closes it, after which the handle may be used again
    by a later `Begin`.
    *Rationale: as with prepared handles, `Begin, Execute, Execute, Commit` can be sent as one pipelined flight.*
-2. `Begin` on a handle that is open is `W2002`. Any other request on a handle that is not open is `W2001`.
+2. `Begin` on a handle that is open is `W2002`, which leaves that transaction as it was (`txn_state =
+   unaffected`). Any other request on a handle that is not open is `W2001`. Handle 0 is never open: `Begin`,
+   `Commit`, `Rollback` and the savepoint requests naming it are `W2001`.
 3. A transaction belongs to its connection. When the connection ends, every open transaction MUST be rolled back.
    A connection may hold up to `max_open_txns` open transactions at once, running independently (§4.6).
 
@@ -595,7 +611,11 @@ params := uvar tuple_count                    (≥ 1)
 
 1. Any error in a request on an open transaction — a validation error, a runtime error, an abort — aborts the
    transaction ([ISO] §5.1) unless it occurred after a savepoint that the client then rolls back to. The `Error`
-   reports `txn_state = aborted` (§8.1).
+   reports `txn_state = aborted` (§8.1). The session's own refusals count: `W2005`, `W2006`, `W2007` and
+   `W2012` abort it too. Three do not: `W2004`, which ran nothing and is retried in the same transaction with
+   `Execute`; `W2002` (§5.1 rule 2); and `W2003`, which finds it aborted already. Since no savepoint can be set
+   on an aborted transaction (§5.5 rule 4), every savepoint predates the error, and rolling back to any of them
+   clears the aborted state.
 2. Every later request on an aborted transaction other than `Rollback`, `RollbackToSavepoint` and `Commit` MUST fail
    with `W2003` (`transaction_aborted`) without running.
 3. `Commit` of an aborted transaction MUST fail with an `Error` whose first entry carries the code of the error
@@ -612,7 +632,9 @@ params := uvar tuple_count                    (≥ 1)
    handle; the client resolves it as in §5.6.
 3. `Rollback` rolls the transaction back and answers `Ok`. It **pre-empts**: if a request on the transaction is
    running, the server MUST cancel it (it ends with `cancelled`), and every request queued on the transaction ahead
-   of the `Rollback` MUST fail with `cancelled` without running. `Rollback` of an unknown handle is `W2001`.
+   of the `Rollback` MUST fail with `cancelled` without running. A queued `Begin`, `Commit` or `Rollback` is not
+   pre-empted: it keeps its turn, so `Begin, Rollback` sent together opens and then closes the transaction.
+   `Rollback` of an unknown handle is `W2001`.
 4. `Commit` cannot be cancelled: a `Cancel` naming a `Commit` MUST be ignored once the server has received it.
    *Rationale: a cancellable commit would add a second unknown-outcome path.*
 
@@ -952,7 +974,8 @@ The encoding is **Arrow-shaped but not Arrow IPC**.
    *Rationale: per-request credit stops one slow consumer of a large result from stalling the other streams on a
    multiplexed connection, which TCP's single window cannot do.*
 3. The server MUST NOT start sending a `Batch` while the request's credit is zero or negative. It MAY start one
-   whose size exceeds the remaining credit, which then goes negative by the difference.
+   whose size exceeds the remaining credit, which then goes negative by the difference. A client refuses with
+   `W1001` a `Batch` that starts while the credit it has granted is spent.
    *Rationale: a row larger than the window can always be delivered, so no credit setting deadlocks.*
 4. While a request waits for credit, the server MUST suspend producing its result (holding at most one batch
    beyond what it has sent) and MUST NOT time it out on `statement_timeout_ms` for the time spent waiting. Locks
@@ -968,6 +991,8 @@ The encoding is **Arrow-shaped but not Arrow IPC**.
    terminal message if it finished first). The request then had no effect, unless it was a statement in an
    explicit transaction, in which case that transaction is aborted ([ISO] §5.2).
 2. A `Cancel` naming a closed or never-opened stream, or a `Commit` already received (§5.4.4), MUST be ignored.
+   A request cancelled while it waits its turn on a transaction gets its `cancelled` at once, and its abort of the
+   transaction takes effect in its place in the transaction's order (§4.6 rule 2).
 3. `statement_timeout_ms` (from `ExecOptions`, else the connection default) ends a request that runs longer with
    `cancelled`, `details.reason = "statement_timeout"`.
 4. A server MUST process `Cancel` and `Credit` without waiting behind any other request on the connection.
@@ -1102,8 +1127,8 @@ protocol test harness that drives a real server, or both. **D** = decoder test, 
 5. (S) Version negotiation picks the highest common major and `min` of the minors, for wire and tree separately;
    no common major is `W1005` / `Q1005`.
 6. (S) No request is processed before `Ready`; one sent earlier is `W1004`.
-7. (S) A wrong password, an unknown user, and a method not permitted for the user all produce `W3001`, with
-   identical timing within the server's configured noise bound.
+7. (S) A wrong password, an unknown user, a wrong token and a peer that may not log in as the user all produce
+   `W3001`, with identical timing within the server's configured noise bound; no permitted method is `W3002`.
 8. (S) SCRAM-SHA-256-PLUS fails when the channel binding data is altered; the client refuses a server-final with a
    wrong signature.
 9. (S) Request ids that are zero or not increasing are `W1006`; `Cancel`/`Credit` naming closed ids are ignored.

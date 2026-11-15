@@ -7,7 +7,8 @@
 // itself: its nodes, their canonical encoding, the structural checks and the shape digest
 // (`docs/spec/query-tree.md` §5–§12); and the native wire protocol's framing and messages: the preface,
 // frames, fragmentation and reassembly, every message of its catalogue and parameter blocks
-// (`docs/spec/wire-protocol.md` §1–§4, §8.1, `docs/spec/replication.md` §2–§5).
+// (`docs/spec/wire-protocol.md` §1–§4, §8.1, `docs/spec/replication.md` §2–§5); and the session state
+// machines of both ends, with the engine behind the server as an `Executor` (§2, §4.3–§4.6, §5, §7).
 
 package {
   name    = "terndb"

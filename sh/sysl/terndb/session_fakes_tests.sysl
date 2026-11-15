@@ -1,0 +1,467 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The doubles the session tests drive the machines with: an engine that answers canned statements
+// by the first octet of their envelope, a user directory, and a pair of machines joined through real
+// encoders and reassemblers, so every message crosses the wire's own framing.
+
+/** A statement the fake engine knows, named by the first octet of its envelope. */
+struct Canned
+    id: u8
+    result: Option[Type]
+    batches: Buf[Buf[u8]]
+    count: u64
+    writes: bool
+    start_fails: Option[Failure]
+    finish_fails: Option[Failure]
+    busy: bool
+
+struct Cursor
+    id: u64
+    canned: Canned
+    at: usize
+    txid: u64
+    implicit: bool
+
+struct Settled
+    txid: u64
+    state: TxnState
+    commit: Option[u64]
+
+struct FakeEngine
+    catalog: u64
+    horizon_at: u64
+    next_txid: u64
+    next_cursor: u64
+    next_commit: u64
+    canned: Buf[Canned]
+    cursors: Buf[&Cursor]
+    /** Every call that changes something, in order. */
+    log: Buf[string]
+    commit_fails: Option[Failure]
+    cache: Buf[u8]
+    settled: Buf[Settled]
+    wrote: Buf[u64]
+
+/** The shape digest of canned statement `id`. */
+sx_shape(id: u8) -> [32]u8 = [id; 32]
+
+sx_envelope(id: u8) -> Buf[u8]
+    val b = buf[u8]()
+    b.push(id)
+    b
+
+/** One batch of bag<int64> holding `rows`. */
+sx_batch(rows: []const i128) -> Buf[u8]
+    val vs = buf[Value]()
+    for n in rows
+        vs.push(Int(n))
+    encode_batch(bag(Int64), vs.view(), 0).unwrap()
+
+sx_batches(n: u64) -> Buf[Buf[u8]]
+    val out = buf[Buf[u8]]()
+    for i in 0..<n
+        out.push(sx_batch([i128(i)]))
+    out
+
+sx_failure(code: string) -> Failure = failure(code, s"a canned $code")
+
+// The canned statements: 1 reads three batches; 2 writes and returns nothing; 3 never finishes; 4
+// fails validation; 5 fails at its end after a batch; 6 writes and returns a batch; 7 returns one
+// batch of forty rows.
+sx_canned() -> Buf[Canned]
+    val c = buf[Canned]()
+    c.push(Canned(1, Some(bag(Int64)), sx_batches(3), 3, false, None, None, false))
+    c.push(Canned(2, None, buf(), 5, true, None, None, false))
+    c.push(Canned(3, Some(bag(Int64)), buf(), 0, false, None, None, true))
+    c.push(Canned(4, Some(bag(Int64)), buf(), 0, false, Some(sx_failure("Q3001")), None, false))
+    c.push(Canned(5, Some(bag(Int64)), sx_batches(1), 1, false, None, Some(sx_failure("R0002")), false))
+    c.push(Canned(6, Some(bag(Int64)), sx_batches(1), 1, true, None, None, false))
+
+    val rows = buf[i128]()
+    for i in 0..<40
+        rows.push(i128(i))
+    val big = buf[Buf[u8]]()
+    big.push(sx_batch(rows.view()))
+    c.push(Canned(7, Some(bag(Int64)), big, 40, false, None, None, false))
+    c
+
+sx_engine() -> &FakeEngine = FakeEngine(1, 50, 10, 1, 500, sx_canned(), buf(), buf(), None, buf(), buf(), buf())
+
+impl FakeEngine
+    find(self, id: u8) -> Option[Canned]
+        for c in self.canned
+            if c.id == id then return Some(c)
+        None
+
+    cursor(self, id: u64) -> &Cursor
+        for c in self.cursors
+            if c.id == id then return c
+        assert(false, s"no cursor $id")
+        self.cursors[0]
+
+    settle(*self, txid: u64, state: TxnState, commit: Option[u64]) = self.settled.push(Settled(txid, state, commit))
+
+    /** Whether the log holds `entry`. */
+    logged(self, entry: string) -> bool
+        for l in self.log
+            if l == entry then return true
+        false
+
+impl Executor for FakeEngine
+    horizon(self) -> u64 = self.horizon_at
+
+    catalog_version(self) -> u64 = self.catalog
+
+    describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
+        val c = self.find(envelope[0])
+        if c.is_none() then return Err(sx_failure("Q1001"))
+
+        val canned = c.unwrap()
+        canned.start_fails match
+            Some(f) -> Err(f)
+            None -> Ok(Described(sx_shape(canned.id), self.catalog, canned.result))
+
+    cached(*self, shape: [32]u8) -> Option[Buf[u8]]
+        for id in self.cache
+            if sx_shape(id) == shape then return Some(sx_envelope(id))
+        None
+
+    begin(*self, options: TxnOptions) -> Result[Begun, Failure]
+        val txid = self.next_txid
+        self.next_txid += 1
+        self.log.push(s"begin $txid")
+        Ok(Begun(txid, 100, options.isolation.unwrap_or(Serializable)))
+
+    start(*self, s: Invocation) -> Result[Started, Failure]
+        val d = self.describe(s.envelope)?
+        val txid = if s.txid != 0 then s.txid else self.next_txid
+        if s.txid == 0 then self.next_txid += 1
+
+        val id = self.next_cursor
+        self.next_cursor += 1
+        self.cursors.push(Cursor(id, self.find(s.envelope[0]).unwrap(), 0, txid, s.txid == 0))
+        self.log.push(s"start ${s.envelope[0]} in $txid")
+        Ok(Started(id, ResultHeader(txid, 100, d.shape, d.result_type)))
+
+    next(*self, cursor: u64) -> Result[Produced, Failure]
+        val c = self.cursor(cursor)
+        if c.canned.busy then return Ok(NotYet)
+        if c.at < c.canned.batches.len()
+            c.at += 1
+            return Ok(BatchReady(c.canned.batches[c.at - 1]))
+        Ok(NoMore)
+
+    finish(*self, cursor: u64) -> Result[Finished, Failure]
+        val c = self.cursor(cursor)
+        c.canned.finish_fails match
+            Some(f) -> return Err(Failure(f.entries, Some(c.txid), None))
+            None -> ()
+
+        val counts = buf[u64]()
+        counts.push(c.canned.count)
+        var commit: Option[u64] = None
+
+        if c.canned.writes
+            if c.implicit
+                commit = Some(self.next_commit)
+                self.settle(c.txid, Committed, commit)
+                self.next_commit += 1
+            else
+                self.wrote.push(c.txid)
+
+        self.log.push(s"finish $cursor")
+        Ok(Finished(counts, commit))
+
+    cancel(*self, cursor: u64) = self.log.push(s"cancel $cursor")
+
+    commit(*self, txid: u64) -> Result[Option[u64], Failure]
+        self.commit_fails match
+            Some(f) ->
+                self.log.push(s"commit failed $txid")
+                return Err(Failure(f.entries, Some(txid), None))
+            None -> ()
+
+        var wrote = false
+        for t in self.wrote
+            if t == txid then wrote = true
+
+        self.log.push(s"commit $txid")
+        if !wrote then return Ok(None)
+
+        val n = self.next_commit
+        self.next_commit += 1
+        self.settle(txid, Committed, Some(n))
+        Ok(Some(n))
+
+    rollback(*self, txid: u64)
+        self.log.push(s"rollback $txid")
+        self.settle(txid, Aborted, None)
+
+    savepoint(*self, txid: u64, name: string) -> Result[unit, Failure]
+        self.log.push(s"savepoint $txid $name")
+        Ok(())
+
+    rollback_to(*self, txid: u64, name: string) -> Result[unit, Failure]
+        self.log.push(s"rollback_to $txid $name")
+        Ok(())
+
+    release(*self, txid: u64, name: string) -> Result[unit, Failure]
+        self.log.push(s"release $txid $name")
+        Ok(())
+
+    status(*self, txid: u64) -> Result[Outcome, Failure]
+        for s in self.settled
+            if s.txid == txid then return Ok(Outcome(s.state, s.commit))
+        if txid < 10 then return Err(sx_failure("W2010"))
+        Ok(Outcome(InProgress, None))
+
+/** The fake user directory: `alice` by SCRAM (password `pencil`), `svc` by token, `ed` by peer,
+ * and the database `app`. A `user/method` in `denied` is not permitted.
+ */
+struct FakeAuthority
+    alice: ScramVerifier
+    token: Buf[u8]
+    denied: Buf[string]
+
+sx_token() -> Buf[u8]
+    val t = buf[u8]()
+    for i in 0..<32
+        t.push(u8(i + 100))
+    t
+
+sx_salt() -> Buf[u8]
+    val s = buf[u8]()
+    for i in 0..<16
+        s.push(u8(i))
+    s
+
+sx_authority() -> &FakeAuthority = FakeAuthority(scram_verifier("pencil", sx_salt().view(), 4096).unwrap(), sx_token(), buf())
+
+impl Authority for FakeAuthority
+    permits(self, user: string, database: string, method: string) -> bool
+        for d in self.denied
+            if d == s"$user/$method" then return false
+        true
+
+    verifier(self, user: string) -> Option[ScramVerifier] = if user == "alice" then Some(self.alice) else None
+
+    token_user(self, hash: [32]u8) -> Option[string] = if hash == token_hash(self.token.view()) then Some("svc") else None
+
+    peer_permits(self, os_user: string, user: string) -> bool = os_user == user
+
+    has_database(self, database: string) -> bool = database == "app"
+
+sx_strings(xs: []const string) -> Buf[string]
+    val b = buf[string]()
+    for x in xs
+        b.push(x)
+    b
+
+sx_versions(xs: []const Version) -> Buf[Version]
+    val b = buf[Version]()
+    for x in xs
+        b.push(x)
+    b
+
+sx_server_config() -> ServerConfig =
+    ServerConfig(sx_versions([Version(1, 1)]), sx_versions([Version(1, 0)]), "terndb test", 1048576, 16, 2, MinMessageSize, 7,
+        Primary, OverTls, "SERVERNONCE", sx_exporter(), Some("ed"), sx_strings(["zstd"]), 10000, Some(300000))
+
+sx_exporter() -> Buf[u8]
+    val e = buf[u8]()
+    for i in 0..<32
+        e.push(u8(200 - i))
+    e
+
+sx_client_config(user: string, methods: []const string) -> ClientConfig =
+    ClientConfig(sx_versions([Version(1, 1)]), sx_versions([Version(1, 0)]), user, "app", "tests", sx_strings(methods),
+        "pencil", sx_token(), "CLIENTNONCE", sx_exporter(), OverTls, false, 1048576, no_session_defaults(), buf(), 60000, 10000)
+
+/** A client and a server joined by real frames: each side's output is encoded, pushed through the
+ * other side's reassembler and delivered, until both directions are quiet.
+ */
+struct Duo
+    c: ClientSession
+    s: ServerSession
+    engine: &FakeEngine
+    authority: &FakeAuthority
+    cr: Reassembler
+    sr: Reassembler
+    c2s: Buf[u8]
+    s2c: Buf[u8]
+    c_minor: u64
+    s_minor: u64
+    c_frame: u64
+    s_frame: u64
+    now: u64
+    events: Buf[Event]
+    /** Everything the server sent, in order. */
+    served: Buf[Outgoing]
+    client_closed: bool
+    server_closed: bool
+    client_fatal: Option[CodecError]
+    server_fatal: Option[CodecError]
+
+sx_duo_with(cc: ClientConfig, sc: ServerConfig) -> Duo
+    val engine = sx_engine()
+    val authority = sx_authority()
+    val pre = buf[u8]()
+    push_preface(pre)
+
+    Duo(client_session(cc, 0), server_session(sc, engine, authority, 0), engine, authority, reassembler(Client), reassembler(Server),
+        pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(), false, false, None, None)
+
+sx_duo(user: string, methods: []const string) -> Duo = sx_duo_with(sx_client_config(user, methods), sx_server_config())
+
+impl Duo
+    take_client(*self, st: ClientStep)
+        for o in st.out
+            self.c2s.extend(encode_frames(o.m, o.stream, self.c_minor, usize(self.c_frame)).unwrap().view())
+            if o.stream != 0 && is_request(o.m) then self.cr.sent(o.stream)
+
+        st.negotiated match
+            Some(n) ->
+                self.c_minor = n.minor
+                self.cr.minor = n.minor
+                self.cr.limits = n.receive
+                self.c_frame = n.send_frame_size
+            None -> ()
+
+        for e in st.events
+            self.events.push(e)
+
+        if st.close then self.client_closed = true
+        if st.fatal.is_some() then self.client_fatal = st.fatal
+
+    take_server(*self, st: Step)
+        st.negotiated match
+            Some(n) ->
+                self.s_minor = n.minor
+                self.sr.minor = n.minor
+                self.sr.limits = n.receive
+                self.s_frame = n.send_frame_size
+            None -> ()
+
+        for o in st.out
+            self.s2c.extend(encode_frames(o.m, o.stream, self.s_minor, usize(self.s_frame)).unwrap().view())
+            self.served.push(o)
+            if o.stream != 0 && is_terminal(o.m) then self.sr.answered(o.stream)
+
+        if st.close then self.server_closed = true
+        if st.fatal.is_some() then self.server_fatal = st.fatal
+
+    /** Delivers octets both ways until neither side has anything to say. */
+    flush(*self)
+        loop
+            if self.c2s.len() == 0 && self.s2c.len() == 0 then return
+
+            val up = self.c2s
+            self.c2s = buf()
+            if !self.server_closed && up.len() > 0
+                self.sr.push(up.view()) match
+                    Ok(arrivals) ->
+                        for a in arrivals
+                            val st = self.s.receive(a, self.now)
+                            self.take_server(st)
+                    Err(e) -> self.take_server(self.s.refuse(e))
+
+            val down = self.s2c
+            self.s2c = buf()
+            if !self.client_closed && down.len() > 0
+                self.cr.push(down.view()) match
+                    Ok(arrivals) ->
+                        for a in arrivals
+                            val st = self.c.receive(a, self.now)
+                            self.take_client(st)
+                    Err(e) -> self.take_client(self.c.refuse(e))
+
+    /** The handshake, run to its end. */
+    connect(*self)
+        val st = self.c.hello(self.now)
+        self.take_client(st)
+        self.flush()
+
+    /** Sends request `m` through the client, answering its stream. */
+    send(*self, m: Message) -> u64
+        val st = self.c.request(m, self.now).unwrap()
+        val stream = st.stream
+        self.take_client(st)
+        self.flush()
+        stream
+
+    /** Sends requests `ms` in one flight before anything is delivered. */
+    pipeline(*self, ms: []const Message) -> Buf[u64]
+        val streams = buf[u64]()
+        for m in ms
+            val st = self.c.request(m, self.now).unwrap()
+            streams.push(st.stream)
+            self.take_client(st)
+        self.flush()
+        streams
+
+    /** Sends `m` on `stream` straight to the server, past the client's own checks. */
+    inject(*self, stream: u64, m: Message)
+        self.c2s.extend(encode_frames(m, stream, self.c_minor, usize(self.c_frame)).unwrap().view())
+        self.flush()
+
+    grant(*self, stream: u64, octets: u64)
+        val st = self.c.grant(stream, octets, self.now)
+        self.take_client(st)
+        self.flush()
+
+    cancel(*self, stream: u64)
+        val st = self.c.cancel(stream, self.now)
+        self.take_client(st)
+        self.flush()
+
+    tick(*self, at: u64)
+        self.now = at
+        val ss = self.s.tick(at)
+        self.take_server(ss)
+        val cs = self.c.tick(at)
+        self.take_client(cs)
+        self.flush()
+
+    /** What the server sent on `stream`, in order. */
+    on(self, stream: u64) -> Buf[Message]
+        val out = buf[Message]()
+        for o in self.served
+            if o.stream == stream then out.push(o.m)
+        out
+
+    /** The responses the client accepted on `stream`. */
+    seen(self, stream: u64) -> Buf[Message]
+        val out = buf[Message]()
+        for e in self.events
+            e match
+                Response(s, m) -> if s == stream then out.push(m)
+                _ -> ()
+        out
+
+    /** Whether the client reported `e`. */
+    saw(self, e: Event) -> bool
+        for x in self.events
+            if x == e then return true
+        false
+
+    connected(self) -> bool = self.c.phase == Open && self.s.phase == Serving
+
+/** The code of an `Error`, or the type of any other message as a code-like word. */
+sx_code(m: Message) -> string = m match
+    ErrorReply(e) -> e.entries[0].code
+    _ -> s"type ${m.type_code()}"
+
+/** The codes and types `ms` came to, for one comparison. */
+sx_codes(ms: Buf[Message]) -> string
+    var out = ""
+    for m in ms
+        out = if out.len == 0 then sx_code(m) else s"$out ${sx_code(m)}"
+    out
+
+sx_execute(txn: u64, id: u8) -> Message = ExecuteMsg(Execute(txn, None, no_exec_options(), sx_envelope(id), buf(), None))
+
+sx_execute_credit(txn: u64, id: u8, credit: u64) -> Message =
+    ExecuteMsg(Execute(txn, None, ExecOptions(Some(credit), None, None, None), sx_envelope(id), buf(), None))

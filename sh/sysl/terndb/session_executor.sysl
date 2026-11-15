@@ -1,0 +1,143 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// What a server session hands to the engine, and what it asks of the user directory. The session
+// machine owns the protocol: the handshake, the order of requests, transaction handles and their
+// states, prepared handles, credit, cancellation and timeouts. An `Executor` owns the data: it
+// validates trees, runs statements, opens and ends transactions. An `Authority` owns who may log in.
+// Neither is ever called with anything the protocol has not already accepted.
+
+/** What validation says of a statement (§4.4 rule 1). */
+struct Described derives Eq
+    shape: [32]u8
+    catalog_version: u64
+    result_type: Option[Type]
+
+/** An opened transaction (§5.2 rule 1). */
+struct Begun derives Eq
+    txid: u64
+    snapshot: u64
+    effective: Isolation
+
+/** A statement for the engine to run. `txid` is the explicit transaction it runs in, or 0 for an
+ * implicit one, whose options are then `implicit`, already filled from the connection's defaults
+ * (§4.5 rule 1, §5.2 rule 2).
+ */
+struct Invocation derives Eq
+    txid: u64
+    implicit: TxnOptions
+    options: ExecOptions
+    envelope: Buf[u8]
+    params: Buf[u8]
+
+/** A started statement: the `ResultHeader` it answers with, and the cursor the calls that follow name
+ * it by.
+ */
+struct Started derives Eq
+    cursor: u64
+    header: ResultHeader
+
+/** What one step of a running statement produced. */
+enum Produced derives Eq
+    /** One `Batch` payload (§6.4). */
+    BatchReady(payload: Buf[u8])
+    /** Nothing yet; the statement is still working. */
+    NotYet
+    /** Every batch has been produced. */
+    NoMore
+
+/** How a statement ended: `Complete`'s fields (§3.6). */
+struct Finished derives Eq
+    counts: Buf[u64]
+    commit: Option[u64]
+
+/** A failure the engine reports: the `Error`'s entries, in [QT] §11.2's order, with the txid and
+ * parameter tuple it concerns. Whether it is retryable and what it did to the transaction are the
+ * session's to say.
+ */
+struct Failure derives Eq
+    entries: Buf[ErrorEntry]
+    txid: Option[u64]
+    tuple: Option[u64]
+
+/** The failure of one entry, with no txid or tuple. */
+failure(code: string, message: string) -> Failure
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry(code, message, "", buf(), None))
+    Failure(entries, None, None)
+
+/** The failure that reports refusal `e`. */
+failure_of(e: CodecError) -> Failure
+    val entries = buf[ErrorEntry]()
+    entries.push(entry_of(e, None))
+    Failure(entries, None, None)
+
+/** `TxnStatus`'s answer (§5.6 rule 2). */
+struct Outcome derives Eq
+    state: TxnState
+    commit: Option[u64]
+
+/** The engine, as a server session drives it. Every call is synchronous and returns at once; a
+ * statement that takes time says `NotYet` from `next` and is asked again.
+ */
+trait Executor
+    /** The visible horizon, for `Ready.horizon`. */
+    horizon(self) -> u64
+
+    /** The catalog version now (§4.4 rule 4). */
+    catalog_version(self) -> u64
+
+    /** Validates a tree envelope without running it (`Prepare`, §4.4 rule 1). */
+    describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
+
+    /** The tree whose shape digest is `shape` in this role's plan cache, if it is there (§4.4 rule 5). */
+    cached(*self, shape: [32]u8) -> Option[Buf[u8]]
+
+    /** Opens a transaction with options already filled from the connection's defaults. */
+    begin(*self, options: TxnOptions) -> Result[Begun, Failure]
+
+    /** Validates, binds and starts a statement, answering its header (§4.3 rules 1–2). */
+    start(*self, s: Invocation) -> Result[Started, Failure]
+
+    /** The next step of a started statement. */
+    next(*self, cursor: u64) -> Result[Produced, Failure]
+
+    /** Ends a statement that produced `NoMore`, committing its implicit transaction if it has one. */
+    finish(*self, cursor: u64) -> Result[Finished, Failure]
+
+    /** Stops a started statement; it has no effect (§7.3 rule 1). */
+    cancel(*self, cursor: u64)
+
+    /** Commits an explicit transaction, answering its commit number, absent for an empty write set. */
+    commit(*self, txid: u64) -> Result[Option[u64], Failure]
+
+    /** Rolls an explicit transaction back. */
+    rollback(*self, txid: u64)
+
+    savepoint(*self, txid: u64, name: string) -> Result[unit, Failure]
+
+    /** Undoes everything after savepoint `name`, which the session knows is set. */
+    rollback_to(*self, txid: u64, name: string) -> Result[unit, Failure]
+
+    /** Forgets savepoint `name` and every one after it, keeping their effects. */
+    release(*self, txid: u64, name: string) -> Result[unit, Failure]
+
+    /** What became of transaction `txid` (§5.6 rule 2). */
+    status(*self, txid: u64) -> Result[Outcome, Failure]
+
+/** The user directory, as the handshake consults it. */
+trait Authority
+    /** Whether `user` may log in to `database` by `method` (§2.4 rule 4). */
+    permits(self, user: string, database: string, method: string) -> bool
+
+    /** The SCRAM verifier stored for `user`, if there is one. */
+    verifier(self, user: string) -> Option[ScramVerifier]
+
+    /** The user a token of this SHA-256 hash was issued to (§2.4 rule 6). */
+    token_user(self, hash: [32]u8) -> Option[string]
+
+    /** Whether the operating-system user `os_user` may log in as `user` (§2.4 rule 7). */
+    peer_permits(self, os_user: string, user: string) -> bool
+
+    has_database(self, database: string) -> bool

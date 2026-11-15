@@ -1,0 +1,573 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.crypto.verify
+
+// The client's half of a native-protocol session (`wire-protocol.md` §2, §3.3, §5, §7): a pure
+// machine, fed what the reassembler delivers and the time. It runs the handshake and checks the
+// server's half of it, numbers requests (§1.5 rule 1), checks that each response is one §3.3 allows
+// in the order it allows, and keeps what a client library needs: the requests outstanding, their
+// credit, each transaction handle's state, the causal token for `after` ([ISO] §3.6 R3) and the
+// transactions whose outcome is unknown (§5.6).
+//
+// A client sends no `Error`, so every refusal here closes the connection without a message.
+
+struct ClientConfig
+    wire_versions: Buf[Version]
+    tree_versions: Buf[Version]
+    user: string
+    database: string
+    application: string
+    /** The methods to offer, in preference order (§2.4 rule 4). */
+    auth_methods: Buf[string]
+    password: string
+    token: Buf[u8]
+    /** The SCRAM client nonce, from a cryptographic generator. */
+    client_nonce: string
+    /** The TLS exporter's channel-binding octets (RFC 9266); empty off TLS. */
+    exporter: Buf[u8]
+    transport: Transport
+    /** Whether a server may choose `scram-sha-256` over TLS when `-plus` was offered (§2.4 rule 3). */
+    allow_downgrade: bool
+    /** The largest frame the client receives (`ClientHello.max_frame_size`). */
+    max_frame_size: u64
+    defaults: SessionDefaults
+    compression: Buf[string]
+    /** How long the connection may be idle before a `Ping` (§7.4). */
+    ping_interval_ms: u64
+    /** How long a `Ping` may go unanswered before the client gives the connection up. */
+    pong_timeout_ms: u64
+
+enum ClientPhase
+    Unstarted
+    AwaitingServerHello
+    Authenticating
+    Open
+    /** The server has said `Goodbye`; requests in flight may still finish. */
+    Leaving
+    Shut
+
+/** What the client learned from one input. */
+enum Event derives Eq
+    Connected(r: Ready)
+    /** A response to request `stream`, already checked against §3.3. */
+    Response(stream: u64, m: Message)
+    Ponged(opaque: u64)
+    Departing(code: string, message: string, grace_ms: u64)
+    /** Transaction `txid` may or may not have committed; resolve it with `TransactionStatus` (§5.6). */
+    Unresolved(txid: u64)
+    /** A transaction whose outcome was unknown has been resolved. */
+    Resolved(txid: u64, state: TxnState)
+    /** The server did not answer a `Ping` in time. */
+    KeepaliveExpired
+
+/** What one input to a client session comes to. `stream` is the id a new request was given. */
+struct ClientStep
+    out: Buf[Outgoing]
+    events: Buf[Event]
+    negotiated: Option[Negotiated]
+    stream: u64
+    close: bool
+    fatal: Option[CodecError]
+
+/** What the client knows of a transaction handle it began. */
+enum HandleState
+    Opening
+    Live
+    Doomed
+
+private struct Handle
+    handle: u64
+    txid: Option[u64]
+    state: HandleState
+
+/** A request sent and not yet ended. */
+private struct Sent
+    stream: u64
+    m: Message
+    header: Option[ResultHeader]
+    tree: Option[ColumnTree]
+    credit: Option[i64]
+    received: u64
+
+private struct PingSent
+    opaque: u64
+    at: u64
+
+struct ClientSession
+    config: ClientConfig
+    phase: ClientPhase
+    minor: u64
+    /** The `Ready` the server sent. */
+    ready: Option[Ready]
+    private method: string
+    private initial_used: bool
+    private expected_final: string
+    private next_stream: u64
+    private next_ping: u64
+    private last_sent: u64
+    private sent: Buf[&Sent]
+    private handles: Buf[&Handle]
+    private pings: Buf[PingSent]
+    private causal: u64
+    private unknown: Buf[u64]
+    private out: Buf[Outgoing]
+    private events: Buf[Event]
+    private negotiated: Option[Negotiated]
+    private stream: u64
+    private closing: bool
+    private fatal: Option[CodecError]
+
+    /** How many requests are outstanding. */
+    outstanding(self) -> usize = self.sent.len()
+
+    /** The credit request `stream` has left, `None` when it is unlimited or not outstanding. */
+    credit_of(self, stream: u64) -> Option[i64]
+        for s in self.sent
+            if s.stream == stream then return s.credit
+        None
+
+    /** The state of transaction handle `h`, if the client holds it open. */
+    handle_state(self, h: u64) -> Option[HandleState]
+        for x in self.handles
+            if x.handle == h then return Some(x.state)
+        None
+
+    /** The causal token: the highest commit number this connection has seen, or the horizon at
+     * `Ready` ([ISO] §3.6 R3).
+     */
+    causal_token(self) -> u64 = self.causal
+
+    /** `o` reading at least everything this connection has seen commit: `after` filled in with the
+     * causal token when it is absent.
+     */
+    causal_options(self, o: TxnOptions) -> TxnOptions =
+        if o.after.is_some() then o
+        else TxnOptions(o.isolation, o.synchronous, o.read_only, Some(self.causal), o.lock_timeout_ms, o.replica_wait_timeout_ms, o.max_lag_ms)
+
+    /** The transactions whose outcome is unknown and not yet resolved (§5.6 rule 1). */
+    unresolved(self) -> Buf[u64] = self.unknown
+
+    /** Opens the handshake: `ClientHello`, carrying the first method's first message (§2.4 rule 5). */
+    hello(*self, now: u64) -> ClientStep
+        val first = self.config.auth_methods[0]
+        self.initial_used = true
+
+        val initial: Option[Buf[u8]] =
+            if first == ScramPlus || first == ScramPlain then Some(octets_of(client_first(first, self.config.user, self.config.client_nonce)))
+            elif first == TokenMethod then Some(self.config.token)
+            else None
+
+        self.emit(0, ClientHelloMsg(ClientHello(self.config.wire_versions, self.config.tree_versions, self.config.user,
+            self.config.database, self.config.application, self.config.auth_methods, initial, self.config.max_frame_size,
+            self.config.defaults, self.config.compression)), now)
+        self.phase = AwaitingServerHello
+        self.step()
+
+    /** Sends request `m` on a new stream, whose id the step carries. A request before `Ready`
+     * breaks §2.1 rule 1 and one after `Goodbye` §3.4 rule 5; both are refused here, unsent.
+     */
+    request(*self, m: Message, now: u64) -> Result[ClientStep, CodecError]
+        if !is_request(m) then return malformed("only a request opens a stream")
+        if self.phase == Leaving then return fail("W4001", "the server is shutting down")
+        if self.phase != Open then return fail("W1004", "no request may be sent before Ready")
+
+        val stream = self.next_stream
+        self.next_stream += 1
+
+        val credit: Option[i64] = m match
+            ExecuteMsg(e) -> e.options.credit.map(c -> i64(c))
+            ExecutePreparedMsg(e) -> e.options.credit.map(c -> i64(c))
+            _ -> None
+
+        self.sent.push(Sent(stream, m, None, None, credit, 0))
+
+        m match
+            Begin(h, _) -> self.handles.push(Handle(h, None, Opening))
+            _ -> ()
+
+        self.emit(stream, m, now)
+        self.stream = stream
+        Ok(self.step())
+
+    /** Grants request `stream` `octets` more credit (§7.2 rule 2). */
+    grant(*self, stream: u64, octets: u64, now: u64) -> ClientStep
+        for s in self.sent
+            if s.stream == stream then s.credit = s.credit.map(c -> c + i64(octets))
+
+        self.emit(stream, Credit(octets), now)
+        self.step()
+
+    /** Asks the server to stop request `stream` (§7.3). */
+    cancel(*self, stream: u64, now: u64) -> ClientStep
+        self.emit(stream, Cancel, now)
+        self.step()
+
+    /** Ends the session: `Terminate`, and the connection closes (§3.4 rule 4). */
+    terminate(*self, now: u64) -> ClientStep
+        self.emit(0, Terminate, now)
+        self.shut()
+        self.step()
+
+    /** The passage of time: a `Ping` on an idle connection, and the end of one that does not answer
+     * (§7.4).
+     */
+    tick(*self, now: u64) -> ClientStep
+        if self.phase != Open && self.phase != Leaving then return self.step()
+
+        if self.pings.len() > 0 && now - self.pings[0].at >= self.config.pong_timeout_ms
+            self.events.push(KeepaliveExpired)
+            self.shut()
+        elif self.pings.len() == 0 && now - self.last_sent >= self.config.ping_interval_ms
+            val v = self.next_ping
+            self.next_ping += 1
+            self.pings.push(PingSent(v, now))
+            self.emit(0, Ping(v), now)
+
+        self.step()
+
+    /** The reassembler refused the input, which closes the connection. */
+    refuse(*self, e: CodecError) -> ClientStep
+        self.die(e)
+        self.step()
+
+    /** The connection has ended without a goodbye. */
+    lost(*self) -> ClientStep
+        self.shut()
+        self.step()
+
+    /** One arrival from the reassembler, at time `now`. */
+    receive(*self, a: Arrival, now: u64) -> ClientStep
+        if self.phase == Shut then return self.step()
+
+        a match
+            Refused(_, code) -> self.die(CodecError(code, "", "the reassembler refused a message", buf()))
+            Whole(raw) ->
+                raw.decode(self.minor) match
+                    Ok(m) ->
+                        self.deliver(raw.stream, m, now) match
+                            Ok(_) -> ()
+                            Err(e) -> self.die(e)
+                    Err(e) -> self.die(e)
+
+        self.step()
+
+    // -- the handshake ----------------------------------------------------------------------------
+
+    private deliver(*self, stream: u64, m: Message, now: u64) -> Result[unit, CodecError]
+        if stream != 0 then return self.response(stream, m)
+
+        m match
+            ServerHelloMsg(h) ->
+                if self.phase != AwaitingServerHello then return fail("W1004", "ServerHello out of order")
+                self.server_hello(h, now)?
+            AuthChallenge(data) ->
+                if self.phase != Authenticating || self.expected_final.len != 0 || !is_scram(self.method) then
+                    return fail("W1004", "no authentication round is open")
+                self.scram_final(data, now)?
+            ReadyMsg(r) ->
+                if self.phase != Authenticating then return fail("W1004", "Ready out of order")
+                self.on_ready(r)?
+            Pong(v) ->
+                if self.pings.len() == 0 || self.pings[0].opaque != v then return malformed("a Pong answers no Ping")
+                self.pings.remove(0)
+                self.events.push(Ponged(v))
+            Goodbye(code, message, grace) ->
+                if self.phase == Open then self.phase = Leaving
+                self.events.push(Departing(code, message, grace))
+            ErrorReply(e) ->
+                val first = e.entries[0]
+                return Err(CodecError(first.code, first.path, first.message, first.details))
+            _ -> return malformed("a message that does not travel on stream 0 from the server")
+
+        Ok(())
+
+    private server_hello(*self, h: ServerHello, now: u64) -> Result[unit, CodecError]
+        if !offered(self.config.wire_versions.view(), h.wire_major, h.wire_minor) then
+            return malformed("the server chose a wire version the client did not offer")
+        if !offered(self.config.tree_versions.view(), h.tree_major, h.tree_minor) then
+            return malformed("the server chose a tree version the client did not offer")
+
+        var known = false
+        for m in self.config.auth_methods
+            if m == h.auth_method then known = true
+
+        if !known then return fail("W3002", "the server chose a method the client did not offer")
+
+        // A downgrade from channel binding is refused unless it is allowed (§2.4 rule 3).
+        var offered_plus = false
+        for m in self.config.auth_methods
+            if m == ScramPlus then offered_plus = true
+
+        if h.auth_method == ScramPlain && offered_plus && self.config.transport == OverTls && !self.config.allow_downgrade then
+            return fail("W3002", "the server dropped channel binding")
+
+        self.method = h.auth_method
+        self.minor = h.wire_minor
+        self.phase = Authenticating
+        self.negotiated = Some(Negotiated(h.wire_minor, Limits(self.config.max_frame_size, 0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff),
+            h.max_frame_size))
+
+        // The initial message was for the first method only (§2.4 rule 5).
+        val first = h.auth_method == self.config.auth_methods[0]
+
+        if is_scram(h.auth_method)
+            if first
+                self.scram_final(h.auth_data, now)?
+            else
+                self.emit(0, AuthResponse(octets_of(client_first(h.auth_method, self.config.user, self.config.client_nonce))), now)
+        elif h.auth_method == TokenMethod && !first
+            self.emit(0, AuthResponse(self.config.token), now)
+
+        Ok(())
+
+    private scram_final(*self, data: Buf[u8], now: u64) -> Result[unit, CodecError]
+        val cf = client_final(self.config.password, self.config.user, self.config.client_nonce, gs2_header(self.method),
+            self.config.exporter.view(), auth_text(data.view())?)?
+
+        self.expected_final = cf.expected_final
+        self.emit(0, AuthResponse(octets_of(cf.message)), now)
+        Ok(())
+
+    /** `Ready`: for SCRAM the server-final-message is verified before anything else (§2.4 rule 5),
+     * and the limits are checked (§2.3 rule 5).
+     */
+    private on_ready(*self, r: Ready) -> Result[unit, CodecError]
+        if is_scram(self.method)
+            if self.expected_final.len == 0 || !verify(r.auth_final.view(), self.expected_final.bytes) then
+                return fail("W3001", "the server's signature is wrong")
+
+        self.phase = Open
+        self.ready = Some(r)
+        self.causal = r.horizon
+        self.events.push(Connected(r))
+        Ok(())
+
+    // -- responses (§3.3) -------------------------------------------------------------------------
+
+    private find_sent(self, stream: u64) -> Option[&Sent]
+        for s in self.sent
+            if s.stream == stream then return Some(s)
+        None
+
+    private find_handle(self, h: u64) -> Option[&Handle]
+        for x in self.handles
+            if x.handle == h then return Some(x)
+        None
+
+    private drop_handle(*self, h: u64)
+        val left = buf[&Handle]()
+        for x in self.handles
+            if x.handle != h then left.push(x)
+        self.handles = left
+
+    private end_request(*self, stream: u64)
+        val left = buf[&Sent]()
+        for s in self.sent
+            if s.stream != stream then left.push(s)
+        self.sent = left
+
+    private see_commit(*self, c: Option[u64])
+        c match
+            Some(n) -> if n > self.causal then self.causal = n
+            None -> ()
+
+    /** A response on request `stream`: one §3.3 allows for that request, in its order; any other is
+     * `W1001`, and a batch that §6 does not allow `W1008`.
+     */
+    private response(*self, stream: u64, m: Message) -> Result[unit, CodecError]
+        if self.phase != Open && self.phase != Leaving then return fail("W1004", "a response before Ready")
+
+        val s = self.find_sent(stream)
+        if s.is_none() then return malformed(s"a response on stream $stream, which is not an open request")
+
+        val req = s.unwrap()
+
+        m match
+            ErrorReply(e) -> self.failed(req, e)
+            _ -> self.answered(req, m)?
+
+        self.events.push(Response(stream, m))
+        if is_terminal(m) then self.end_request(stream)
+        Ok(())
+
+    private answered(*self, req: &Sent, m: Message) -> Result[unit, CodecError]
+        val fits = req.m match
+            Prepare(_, _) -> m.type_code() == 0x90
+            ExecuteMsg(_) | ExecutePreparedMsg(_) -> self.execute_reply(req, m)?
+            ClosePrepared(_) | Rollback(_) | Savepoint(_, _) | RollbackToSavepoint(_, _) | ReleaseSavepoint(_, _) -> m == OkReply
+            Begin(_, _) -> m.type_code() == 0xa0
+            Commit(_) -> m.type_code() == 0xa1
+            TransactionStatus(_) -> m.type_code() == 0xa2
+            _ -> false
+
+        if !fits then return malformed(s"type ${m.type_code()} does not answer request type ${req.m.type_code()} here")
+
+        req.m match
+            Begin(h, _) ->
+                self.find_handle(h) match
+                    Some(x) ->
+                        m match
+                            TxnBegun(txid, _, _) -> x.txid = Some(txid)
+                            _ -> ()
+                        x.state = Live
+                    None -> ()
+            Commit(h) ->
+                m match
+                    TxnCommitted(_, c) -> self.see_commit(c)
+                    _ -> ()
+                self.drop_handle(h)
+            Rollback(h) -> self.drop_handle(h)
+            RollbackToSavepoint(h, _) ->
+                self.find_handle(h) match
+                    Some(x) -> x.state = Live
+                    None -> ()
+            TransactionStatus(txid) ->
+                m match
+                    TxnStatus(state, c) ->
+                        self.see_commit(c)
+                        if state != InProgress then self.resolve(txid, state)
+                    _ -> ()
+            ExecuteMsg(_) | ExecutePreparedMsg(_) ->
+                m match
+                    Complete(_, c) -> self.see_commit(c)
+                    _ -> ()
+            _ -> ()
+
+        Ok(())
+
+    /** `ResultHeader`, then `Batch`es only for a statement that returns a value, each started with
+     * credit left (§7.2 rule 3), then `Complete`.
+     */
+    private execute_reply(*self, req: &Sent, m: Message) -> Result[bool, CodecError]
+        m match
+            ResultHeaderMsg(h) ->
+                if req.header.is_some() then return Ok(false)
+                req.header = Some(h)
+                h.result_type match
+                    Some(t) -> req.tree = Some(as_bad_batch(column_tree(t))?)
+                    None -> ()
+                Ok(true)
+            BatchReply(payload) ->
+                if req.header.is_none() then return Ok(false)
+                if req.tree.is_none() then return fail("W1008", "a batch for a statement that returns no value")
+
+                req.credit match
+                    Some(c) -> if c <= 0 then return malformed("a batch sent without credit")
+                    None -> ()
+
+                as_bad_batch(decode_batch(req.tree.unwrap(), payload.view()))?
+                req.credit = req.credit.map(c -> c - i64(payload.len()))
+                req.received += 1
+                Ok(true)
+            Complete(_, _) -> Ok(req.header.is_some())
+            _ -> Ok(false)
+
+    /** An `Error` ends its request; its `txn_state` says what became of the transaction (§8.1 rule
+     * 6), and `commit_unknown` leaves an outcome to resolve (§5.4 rule 2).
+     */
+    private failed(*self, req: &Sent, e: WireError)
+        val h = txn_of(req.m)
+
+        if h != 0
+            e.txn_state match
+                Aborted ->
+                    self.find_handle(h) match
+                        Some(x) -> x.state = Doomed
+                        None -> ()
+                Closed -> self.drop_handle(h)
+                Unaffected ->
+                    req.m match
+                        Begin(_, _) -> self.drop_handle(h)
+                        _ -> ()
+
+        if e.entries[0].code == "T2001"
+            e.txid match
+                Some(txid) -> self.mark_unknown(txid)
+                None -> ()
+
+    private mark_unknown(*self, txid: u64)
+        for t in self.unknown
+            if t == txid then return
+
+        self.unknown.push(txid)
+        self.events.push(Unresolved(txid))
+
+    private resolve(*self, txid: u64, state: TxnState)
+        val left = buf[u64]()
+        var found = false
+
+        for t in self.unknown
+            if t == txid then found = true else left.push(t)
+
+        self.unknown = left
+        if found then self.events.push(Resolved(txid, state))
+
+    // -- sending and ending -----------------------------------------------------------------------
+
+    private emit(*self, stream: u64, m: Message, now: u64)
+        self.out.push(Outgoing(stream, m))
+        self.last_sent = now
+
+    private step(*self) -> ClientStep
+        val s = ClientStep(self.out, self.events, self.negotiated, self.stream, self.closing, self.fatal)
+        self.out = buf()
+        self.events = buf()
+        self.negotiated = None
+        self.stream = 0
+        s
+
+    private die(*self, e: CodecError)
+        self.fatal = Some(e)
+        self.shut()
+
+    /** The connection is over. A `Commit` still outstanding, and an implicit statement that may
+     * write whose `ResultHeader` arrived but not its `Complete`, leave an outcome to resolve
+     * (§5.6 rule 1, §4.3 rule 2).
+     */
+    private shut(*self)
+        if self.phase == Shut then return
+
+        for s in self.sent
+            s.m match
+                Commit(h) ->
+                    self.find_handle(h) match
+                        Some(x) -> if x.txid.is_some() then self.mark_unknown(x.txid.unwrap())
+                        None -> ()
+                ExecuteMsg(e) -> if e.txn == 0 then self.unknown_if_writing(s, e.implicit)
+                ExecutePreparedMsg(e) -> if e.txn == 0 then self.unknown_if_writing(s, e.implicit)
+                _ -> ()
+
+        self.sent = buf()
+        self.handles = buf()
+        self.phase = Shut
+        self.closing = true
+
+    private unknown_if_writing(*self, s: &Sent, implicit: Option[TxnOptions])
+        val read_only = implicit match
+            Some(o) -> o.read_only == Some(true)
+            None -> false
+
+        if !read_only
+            s.header match
+                Some(h) -> self.mark_unknown(h.txid)
+                None -> ()
+end ClientSession
+
+private is_scram(method: string) -> bool = method == ScramPlus || method == ScramPlain
+
+private octets_of(text: string) -> Buf[u8]
+    val b = buf[u8]()
+    b.extend(text.bytes)
+    b
+
+/** Whether `versions` offers `major` at a minor of at least `minor`. */
+private offered(versions: []const Version, major: u64, minor: u64) -> bool
+    for v in versions
+        if v.major == major && minor <= v.max_minor then return true
+    false
+
+/** A client session before its `ClientHello`. */
+client_session(config: ClientConfig, now: u64) -> ClientSession =
+    ClientSession(config, Unstarted, 0, None, "", false, "", 1, 1, now, buf(), buf(), buf(), 0, buf(), buf(), buf(), None, 0,
+        false, None)

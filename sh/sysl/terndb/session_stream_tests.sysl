@@ -1,0 +1,137 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Cancellation, timeouts and keepalive (`wire-protocol.md` §7.3, §7.4, §2.1 rule 4), with time
+// injected (§10.1 property 20).
+
+sx_timed(txn: u64, id: u8, credit: Option[u64], timeout: u64) -> Message =
+    ExecuteMsg(Execute(txn, None, ExecOptions(credit, None, None, Some(timeout)), sx_envelope(id), buf(), None))
+
+@test
+sst_cancel_mid_stream_ends_with_cancelled_and_nothing_after()
+    var d = sx_open()
+    val one = sx_one_batch()
+    val s = d.send(sx_execute_credit(0, 1, one))
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146")
+
+    d.cancel(s)
+    assert_eq(sx_codes(d.on(s)), "type 145 type 146 T1007")
+    val e = sx_error(d.on(s)[2])
+    assert(e.retryable && e.txn_state == Unaffected, "retryable, implicit rolled back")
+    assert(d.engine.logged("cancel 1"), "the engine stopped it")
+
+    // Nothing follows the terminal message, even with more credit.
+    d.grant(s, 1000)
+    d.cancel(s)
+    assert(d.on(s).len() == 3 && d.c.outstanding() == 0, "closed")
+
+@test
+sst_cancel_in_an_explicit_transaction_aborts_it()
+    var d = sx_open()
+    d.send(Begin(1, no_txn_options()))
+    val s = d.send(sx_execute(1, 3))
+    d.cancel(s)
+
+    assert_eq(sx_error(d.on(s)[1]).txn_state, Aborted)
+    assert_eq(sx_codes(d.on(d.send(sx_execute(1, 1)))), "W2003")
+    assert_eq(sx_codes(d.on(d.send(Commit(1)))), "T1007")
+
+@test
+sst_a_received_commit_cannot_be_cancelled()
+    var d = sx_open()
+    val ss = d.pipeline([Begin(1, no_txn_options()), sx_execute(1, 3), Commit(1)])
+    assert_eq(sx_codes(d.on(ss[2])), "")
+
+    d.cancel(ss[2])
+    assert_eq(sx_codes(d.on(ss[2])), "")
+
+    // The statement ahead of it is cancelled, so the Commit answers with that code.
+    d.cancel(ss[1])
+    assert_eq(sx_codes(d.on(ss[1])), "type 145 T1007")
+    assert_eq(sx_codes(d.on(ss[2])), "T1007")
+    assert(sx_error(d.on(ss[2])[0]).txn_state == Closed, "and closes the handle")
+
+@test
+sst_a_queued_request_cancelled_aborts_its_transaction_in_its_place()
+    var d = sx_open()
+    val ss = d.pipeline([Begin(1, no_txn_options()), sx_execute(1, 3), sx_execute(1, 1)])
+
+    d.cancel(ss[2])
+    assert_eq(sx_codes(d.on(ss[2])), "T1007")
+    assert(!d.engine.logged("start 1 in 10"), "it never ran")
+
+    d.cancel(ss[1])
+    assert_eq(sx_codes(d.on(d.send(RollbackToSavepoint(1, "x")))), "W2012")
+    assert_eq(sx_codes(d.on(d.send(Rollback(1)))), "type 148")
+
+@test
+sst_a_statement_timeout_cancels_and_credit_waits_do_not_count()
+    var d = sx_open()
+    val s = d.send(sx_timed(0, 3, None, 100))
+
+    d.tick(99)
+    assert_eq(sx_codes(d.on(s)), "type 145")
+    d.tick(100)
+    assert_eq(sx_codes(d.on(s)), "type 145 T1007")
+    assert(sx_error(d.on(s)[1]).entries[0].details[0] == Detail("reason", "statement_timeout"), "the reason")
+
+    // Waiting for credit from 100 to 1000 is not running time.
+    val w = d.send(sx_timed(0, 1, Some(0), 100))
+    d.tick(1000)
+    assert_eq(sx_codes(d.on(w)), "type 145")
+    d.grant(w, 100000)
+    assert_eq(sx_codes(d.on(w)), "type 145 type 146 type 146 type 146 type 147")
+
+@test
+sst_the_session_default_statement_timeout_applies()
+    var cc = sx_client_config("alice", [ScramPlus])
+    cc.defaults = SessionDefaults(None, None, None, Some(50), None)
+    var d = sx_duo_with(cc, sx_server_config())
+    d.connect()
+
+    val s = d.send(sx_execute(0, 3))
+    d.tick(50)
+    assert_eq(sx_codes(d.on(s)), "type 145 T1007")
+
+@test
+sst_ping_is_answered_in_order()
+    var d = sx_open()
+    d.inject(0, Ping(5))
+    d.inject(0, Ping(6))
+
+    val pongs = buf[u64]()
+    for o in d.served
+        o.m match
+            Pong(v) -> pongs.push(v)
+            _ -> ()
+    assert(pongs.len() == 2 && pongs[0] == 5 && pongs[1] == 6, "each value, in order")
+
+@test
+sst_the_client_pings_an_idle_connection_and_gives_up_on_silence()
+    var d = sx_open()
+    d.tick(59999)
+    assert(!d.saw(Ponged(1)), "not idle yet")
+    d.tick(60000)
+    assert(d.saw(Ponged(1)), "a Ping at 60 s, and its Pong")
+
+    // A Ping the server never sees goes unanswered.
+    val st = d.c.tick(120000)
+    assert(st.out.len() == 1, "a second Ping")
+    val late = d.c.tick(130000)
+    assert(late.close && d.c.phase == Shut, "closed after the Pong timeout")
+    var expired = false
+    for e in late.events
+        if e == KeepaliveExpired then expired = true
+    assert(expired, "the client says why")
+
+@test
+sst_an_idle_server_says_goodbye_with_w4002()
+    var d = sx_open()
+    d.take_server(d.s.tick(299999))
+    assert(!d.server_closed, "not yet")
+
+    d.take_server(d.s.tick(300000))
+    d.flush()
+    assert(d.server_closed && d.saw(Departing("W4002", "the connection was idle", 0)), "Goodbye, then the close")

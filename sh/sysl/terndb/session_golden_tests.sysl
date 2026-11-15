@@ -1,0 +1,127 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{base64_decode, base64_decoded_len}
+
+// The §10.2 vectors that describe a sequence, replayed through the machines: V8's RFC 7677 exchange.
+// The server, fed the client's half, must answer exactly the server's half, and the client, fed the
+// server's half, must send exactly the client's half and accept the server's signature.
+
+const rfc_salt = "W22ZaJ0SNY7soEsUEjb6gQ=="
+const rfc_client_nonce = "rOprNGfwEbeRWgbNEkqO"
+const rfc_server_nonce = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0"
+const rfc_server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+const rfc_client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+const rfc_server_final = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+
+sx_rfc_salt() -> Buf[u8]
+    var out = buf[u8]()
+    for _ in 0..<base64_decoded_len(rfc_salt.bytes)
+        out.push(0)
+    val n = base64_decode(rfc_salt.bytes, out.view_mut()).unwrap()
+    out.truncate(n)
+    out
+
+/** RFC 7677's user: `user`, password `pencil`, in database `app`. */
+struct RfcAuthority
+    v: ScramVerifier
+
+impl Authority for RfcAuthority
+    permits(self, user: string, database: string, method: string) -> bool = true
+    verifier(self, user: string) -> Option[ScramVerifier] = if user == "user" then Some(self.v) else None
+    token_user(self, hash: [32]u8) -> Option[string] = None
+    peer_permits(self, os_user: string, user: string) -> bool = false
+    has_database(self, database: string) -> bool = database == "app"
+
+sx_rfc_server() -> ServerSession
+    val engine = sx_engine()
+    engine.horizon_at = 1000
+    val authority: &RfcAuthority = RfcAuthority(scram_verifier("pencil", sx_rfc_salt().view(), 4096).unwrap())
+    val sc = ServerConfig(sx_versions([Version(1, 1)]), sx_versions([Version(1, 0)]), "terndb 0.0.1", 1048576, 128, 16,
+        64 * 1024 * 1024, 1, Primary, OverUnix, rfc_server_nonce, buf(), None, buf(), 10000, None)
+    server_session(sc, engine, authority, 0)
+
+sx_rfc_client() -> ClientSession
+    val cc = ClientConfig(sx_versions([Version(1, 1)]), sx_versions([Version(1, 0)]), "user", "app", "", sx_strings([ScramPlain]),
+        "pencil", buf(), rfc_client_nonce, buf(), OverUnix, false, 1048576,
+        SessionDefaults(Some(Snapshot), Some(On), Some(1000), Some(30000), Some(5000)), sx_strings(["zstd"]), 60000, 10000)
+    client_session(cc, 0)
+
+sx_encoded(out: Buf[Outgoing]) -> Buf[u8]
+    val b = buf[u8]()
+    for o in out
+        b.extend(encode_frames(o.m, o.stream, 1, 1048576).unwrap().view())
+    b
+
+@test
+sgo_the_rfc_7677_arithmetic()
+    val v = scram_verifier("pencil", sx_rfc_salt().view(), 4096).unwrap()
+    val sf = server_first(rfc_client_nonce, rfc_server_nonce, v)
+    assert_eq(sf, rfc_server_first)
+
+    val cf = client_final("pencil", "user", rfc_client_nonce, "n,,", [], sf).unwrap()
+    assert_eq(cf.message, rfc_client_final)
+    assert_eq(cf.expected_final, rfc_server_final)
+
+    val first = parse_client_first(ScramPlain, s"n,,n=user,r=$rfc_client_nonce").unwrap()
+    val nonce = s"$rfc_client_nonce$rfc_server_nonce"
+    assert_eq(server_final(v, first, sf, nonce, [], rfc_client_final).unwrap(), rfc_server_final)
+
+    // One altered octet of the proof fails it.
+    val wrong = rfc_client_final.replace_all("p=dHzb", "p=dHzc")
+    assert_eq(code_of(server_final(v, first, sf, nonce, [], wrong)), "W3001")
+
+@test
+sgo_the_server_answers_the_client_half_of_v8_with_the_server_half()
+    val c2s = vector(embed("../../../docs/spec/vectors/wire/scram-exchange-c2s.txt"))
+    val s2c = vector(embed("../../../docs/spec/vectors/wire/scram-exchange-s2c.txt"))
+    var s = sx_rfc_server()
+    var r = reassembler(Server)
+    val pre = buf[u8]()
+    push_preface(pre)
+    r.push(pre.view()).unwrap()
+
+    val sent = buf[Outgoing]()
+    for a in r.push(c2s.octets.view()).unwrap()
+        val st = s.receive(a, 0)
+        for o in st.out
+            sent.push(o)
+
+    assert(s.phase == Serving, "authenticated")
+    same_bytes(sx_encoded(sent), s2c.octets, "the server's half of the exchange")
+
+@test
+sgo_the_client_answers_the_server_half_of_v8_with_the_client_half()
+    val c2s = vector(embed("../../../docs/spec/vectors/wire/scram-exchange-c2s.txt"))
+    val s2c = vector(embed("../../../docs/spec/vectors/wire/scram-exchange-s2c.txt"))
+    var c = sx_rfc_client()
+    var r = reassembler(Client)
+    r.minor = 1
+
+    val sent = buf[Outgoing]()
+    for o in c.hello(0).out
+        sent.push(o)
+
+    for a in r.push(s2c.octets.view()).unwrap()
+        val st = c.receive(a, 0)
+        assert(st.fatal.is_none(), "accepted")
+        for o in st.out
+            sent.push(o)
+
+    assert(c.phase == Open, "the server's signature verified")
+    same_bytes(sx_encoded(sent), c2s.octets, "the client's half of the exchange")
+
+@test
+sgo_the_client_refuses_a_wrong_server_signature()
+    var c = sx_rfc_client()
+    c.hello(0)
+    c.receive(sx_arrival(ServerHelloMsg(scram_server_hello()), 0), 0)
+
+    val forged = buf[u8]()
+    forged.extend("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".bytes)
+    var ready = scram_ready()
+    ready.auth_final = forged
+    val st = c.receive(sx_arrival(ReadyMsg(ready), 0), 0)
+
+    assert(st.close && code_of_fatal(st.fatal) == "W3001", "a wrong signature closes the connection")
