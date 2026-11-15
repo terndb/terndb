@@ -180,7 +180,7 @@ a_type_continues_its_node_s_depth()
     assert_eq(tree_refusal(tree_bytes(deep_param(MaxTreeDepth - 2)).view()), "ok")
     assert_eq(tree_refusal(tree_bytes(deep_param(MaxTreeDepth - 1)).view()), "Q1006")
 
-@test(ignore: "sysl gives every temporary of a function its own stack slot, so read_rel's frame is ~50 KB and 254 levels overflow an 8 MB stack")
+@test
 the_deepest_tree_is_accepted_and_one_deeper_is_not()
     val deepest = tree_bytes(nested(MaxTreeDepth - 2))
     assert_eq(tree_refusal(deepest.view()), "ok")
