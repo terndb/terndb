@@ -172,7 +172,7 @@ private[terndb] slot_order(v: ColumnVector) -> &Fn(usize, usize) -> i8 = v.lanes
 /** A sort key's values for every row, and how its rows order: null first or last at the top level
  * per `nulls_first`, `desc` reversing the order of the values (§6.9).
  */
-private struct KeyOrder
+private[terndb] struct KeyOrder
     v: ColumnVector
     order: &Fn(usize, usize) -> i8
     desc: bool
@@ -190,9 +190,9 @@ private struct KeyOrder
         val c = order(i, j)
         if self.desc then -c else c
 
-private key_order(v: ColumnVector, desc: bool, nulls_first: bool) -> KeyOrder = KeyOrder(v, slot_order(v), desc, nulls_first)
+private[terndb] key_order(v: ColumnVector, desc: bool, nulls_first: bool) -> KeyOrder = KeyOrder(v, slot_order(v), desc, nulls_first)
 
-private compare_rows(keys: Buf[KeyOrder], i: usize, j: usize) -> i8
+private[terndb] compare_rows(keys: Buf[KeyOrder], i: usize, j: usize) -> i8
     for k in keys
         val c = k.compare(i, j)
 
@@ -201,7 +201,7 @@ private compare_rows(keys: Buf[KeyOrder], i: usize, j: usize) -> i8
     0
 
 /** The rows `0..<n` in the order of `keys`, rows equal on every key in their input order. */
-private sorted_rows(keys: Buf[KeyOrder], n: usize) -> Buf[usize]
+private[terndb] sorted_rows(keys: Buf[KeyOrder], n: usize) -> Buf[usize]
     var rows = all_rows(n)
     var scratch = all_rows(n)
 

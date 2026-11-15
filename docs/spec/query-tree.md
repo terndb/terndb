@@ -410,6 +410,15 @@ rows (§10.4).
    the decorrelated form of a scalar subquery.
 7. The output is a bag. *Rationale: preserving order across joins forbids hash joins; order is
    restored with `Sort`.*
+8. `on` is a condition on **pairs** of rows, one from each input, and is evaluated only for pairs:
+   when either input is empty it is not evaluated at all, so a runtime error in it does not occur.
+   When `on` is an `and` (at any nesting) one of whose conjuncts is not `true` for a pair, the other
+   conjuncts MAY go unevaluated for that pair, and a runtime error they would raise then does not
+   occur; this relaxes §7.12 rule 1 for `on` alone. If every pair's `on` evaluates without error, the
+   join raises no error from `on`. *Rationale: a join that finds its pairs by their keys (sorting or
+   hashing on the `eq` conjuncts) never forms the pairs whose keys differ.*
+9. `single` raises `R0003` once a second right row makes `on` `true` for one left row; which of a
+   statement's runtime errors is raised first, when there are several, is not specified.
 
 ### 6.6 Apply (correlated source form)
 

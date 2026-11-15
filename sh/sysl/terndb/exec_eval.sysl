@@ -49,9 +49,18 @@ struct Env
         bs.extend(self.binders.view())
         Env(self.n, bs, self.ctx)
 
+    /** The rows of binder `name`: a binder of the environment, or a member of a composite, the rows
+     * of a node exposing several binders (`exec_join.sysl`).
+     */
     binder(self, name: string) -> ColumnVector
         for b in self.binders
             if b.name == name then return b.rows
+
+            if b.name == Composite
+                val fs = fields_of_type(b.rows.ty)
+
+                for j in 0..<fs.len()
+                    if fs[j].name == name then return b.rows.member(j)
 
         panic(s"no binder '$name' is visible")
 
@@ -120,7 +129,7 @@ private[terndb] member_index(fs: Buf[Field], name: string) -> usize
  * a union's shared column (§2.4 rule 4), or a scalar element's one column `value`. A null row reads
  * as null.
  */
-private column(rows: ColumnVector, name: string, ty: Type) -> ColumnVector = rows.ty.base() match
+private[terndb] column(rows: ColumnVector, name: string, ty: Type) -> ColumnVector = rows.ty.base() match
     Record(fs) ->
         val c = rows.member(member_index(fs, name))
 

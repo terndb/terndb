@@ -1,0 +1,732 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort_stable_by
+
+// Joins (`query-tree.md` §6.5, `docs/design/executor.md` §4.1).
+//
+// A join exposes several binders, so its batch is a **composite**: a record with one member per
+// exposed binder, named after it and holding that binder's rows, handed up under the binder name
+// `Composite`. An expression above the join finds each binder among the members (`Env.binder`); what
+// a client sees is the flat record of every binder's columns (§8.4), which `flatten` makes.
+
+/** The binder name of a composite batch. No binder of a tree has it, since a binder is never empty
+ * (§8.2 rule 2).
+ */
+const Composite: string = ""
+
+// -- what an input exposes ------------------------------------------------------------------------
+
+/** The binders `l` exposes, in order, each with the type of its rows. */
+private exposed(l: Lowered) -> Buf[Field] =
+    if l.binder == Composite then fields_of_type(l.elem) else items_of([Field(l.binder, l.elem)])
+
+/** The rows of each binder in a batch `v` of an input exposing `binder`, in the order `exposed`
+ * names them.
+ */
+private parts_of(binder: string, v: ColumnVector) -> Buf[ColumnVector]
+    if binder != Composite then return items_of([v])
+
+    v.lanes match
+        Members(cs) -> cs
+        _ -> panic("parts_of: a composite batch is a record")
+
+/** `fs` appended to `out`, each nullable when `outer`: the binders of an outer join's null-supplying
+ * side (§6.5 rule 3).
+ */
+private side_fields(fs: Buf[Field], outer: bool, out: Buf[Field])
+    for f in fs
+        out.push(Field(f.name, if outer then nullable(f.ty) else f.ty))
+
+private names_of(fs: Buf[Field]) -> Buf[string]
+    val out = buf[string]()
+
+    for f in fs
+        out.push(f.name)
+
+    out
+
+// -- the flat output ------------------------------------------------------------------------------
+
+/** A composite batch as the flat record of its binders' columns, binder by binder (§8.4): a record
+ * binder's fields, a union binder's shared columns (§2.4 rule 4), a scalar binder's `value`, each
+ * nullable when the binder's rows are.
+ */
+private[terndb] flatten(v: ColumnVector) -> ColumnVector
+    val bs = fields_of_type(v.ty)
+    val fs = buf[Field]()
+    val cs = buf[ColumnVector]()
+
+    for j in 0..<bs.len()
+        val b = bs[j]
+
+        for f in element_columns(b.ty.base())
+            val ty = if b.ty.is_nullable() then nullable(f.ty) else f.ty
+            fs.push(Field(f.name, ty))
+            cs.push(column(v.member(j), f.name, ty))
+
+    ColumnVector(Record(fs), v.len, buf[u8](), Members(cs))
+
+/** The batches of a composite input, flattened. */
+struct FlatOp
+    input: &Operator
+
+impl Operator for FlatOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError] = self.input.next_batch()? match
+        Some(b) -> Ok(Some(flatten(b)))
+        None -> Ok(None)
+
+/** `l`'s operator, its batches flattened when they are composites: what a consumer of the output's
+ * columns, rather than of its binders, reads.
+ */
+private[terndb] flat_input(l: Lowered) -> &Operator = if l.binder == Composite then FlatOp(l.op) else l.op
+
+/** `Distinct` (§6.11) over a composite input: the rows are compared by their flat columns, which is
+ * what `same` of two output rows means, and handed up as composites for the binders above.
+ */
+struct CompositeDistinctOp
+    input: &Operator
+    elem: Type
+    out: Option[&Operator]
+
+impl Operator for CompositeDistinctOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if self.out.is_none()
+            val all = drain_rows(self.input, self.elem)?
+            val flat = flatten(all)
+            val orders = buf[KeyOrder]()
+
+            for j in 0..<fields_of_type(flat.ty).len()
+                orders.push(key_order(flat.member(j), false, true))
+
+            val rows = sorted_rows(orders, all.len)
+            val kept = buf[usize]()
+
+            for k in 0..<rows.len()
+                if k == 0 || compare_rows(orders, rows[k - 1], rows[k]) != 0 then kept.push(rows[k])
+
+            self.out = Some(mem_source(batches_of(take(all, kept.view()))))
+
+        self.out.unwrap().next_batch()
+
+// -- planning -------------------------------------------------------------------------------------
+
+/** A conjunct `eq(a, b)` or `same(a, b)` of a join's `on`, `a` reading only the left input's binders
+ * and `b` only the right's: a key a merge join sorts and matches both sides by, at their common type
+ * `ty`. Under `eq` a key holding a null anywhere matches nothing (§3.2); under `same` (`nulls_match`)
+ * it matches the keys it is `same` as (§3.1).
+ */
+private struct EquiKey
+    left: TExpr
+    right: TExpr
+    ty: Type
+    nulls_match: bool
+
+/** The binders `x` reads. */
+private binders_in(x: TExpr, out: Buf[string])
+    x.e match
+        Col(b, _) | Row(b) -> out.push(b)
+        _ -> ()
+
+    for k in x.kids
+        binders_in(k, out)
+
+/** Whether `x` reads at least one binder and none but `names`. */
+private reads_only(x: TExpr, names: Buf[string]) -> bool
+    val bs = buf[string]()
+    binders_in(x, bs)
+
+    for b in bs
+        var known = false
+
+        for n in names
+            if n == b then known = true
+
+        if !known then return false
+
+    bs.len() > 0
+
+/** `x`'s conjuncts, through every `and`, sorted into equi-keys between `left` and `right` and the
+ * rest.
+ */
+private split_on(x: TExpr, left: Buf[string], right: Buf[string], keys: Buf[EquiKey], rest: Buf[TExpr])
+    x.e match
+        Call(f, _) ->
+            if f == "and"
+                split_on(x.kids[0], left, right, keys, rest)
+                split_on(x.kids[1], left, right, keys, rest)
+                return
+
+            if f == "eq" || f == "same"
+                val (a, b) = (x.kids[0], x.kids[1])
+                val t = common_type(a.ty, b.ty).unwrap()
+
+                if reads_only(a, left) && reads_only(b, right)
+                    keys.push(EquiKey(a, b, t, f == "same"))
+                    return
+
+                if reads_only(b, left) && reads_only(a, right)
+                    keys.push(EquiKey(b, a, t, f == "same"))
+                    return
+        _ -> ()
+
+    rest.push(x)
+end split_on
+
+/** What a join operator is given: its kind, each input's binder and row type, the type of a pair
+ * of rows as `on` sees them (§8.3) and of an output batch, `on` and its split into equi-keys and the
+ * conjuncts left over, and the execution's context.
+ */
+private struct JoinSpec
+    kind: JoinKind
+    lbinder: string
+    lelem: Type
+    rbinder: string
+    relem: Type
+    pair_ty: Type
+    out_ty: Type
+    on: Option[TExpr]
+    keys: Buf[EquiKey]
+    conds: Buf[TExpr]
+    nullable_on: bool
+    ctx: Ctx
+
+/** The operator of a `Join` (§6.5) of `kind` over `l` and `r`, with its typed `on`, and for a mark
+ * join its `mark` column under `binder`. When `on` has a conjunct equating the two sides it is a
+ * merge join on every such conjunct, with the rest of `on` tested on the pairs the keys match;
+ * otherwise, or when `merge` is false, a block nested-loop join testing `on` on every pair.
+ */
+private[terndb] plan_join(kind: JoinKind, l: Lowered, r: Lowered, on: Option[TExpr], mark: Option[string], binder: Option[string], ctx: Ctx, merge: bool) -> Lowered
+    val lfs = exposed(l)
+    val rfs = exposed(r)
+    val pair = buf[Field]()
+    side_fields(lfs, false, pair)
+    side_fields(rfs, false, pair)
+
+    val keys = buf[EquiKey]()
+    val rest = buf[TExpr]()
+
+    if merge
+        on match
+            Some(x) -> split_on(x, names_of(lfs), names_of(rfs), keys, rest)
+            None -> ()
+
+    // A merge join tests what the keys leave of `on`; a nested loop tests `on` itself.
+    val conds = on match
+        Some(x) -> if keys.len() > 0 then rest else items_of([x])
+        None -> buf[TExpr]()
+
+    val nullable_on = on.map(x -> x.ty.is_nullable()).unwrap_or(false)
+    val out = buf[Field]()
+
+    val (out_binder, out_ty) = kind match
+        Semi | Anti -> (l.binder, l.elem)
+        MarkJoin ->
+            side_fields(lfs, false, out)
+            out.push(Field(binder.unwrap(), record([Field(mark.unwrap(), if nullable_on then nullable(Bool) else Bool)])))
+            (Composite, Record(out))
+        _ ->
+            side_fields(lfs, kind == Right || kind == Full, out)
+            side_fields(rfs, kind == Left || kind == Full || kind == SingleJoin, out)
+            (Composite, Record(out))
+
+    val spec = JoinSpec(kind, l.binder, l.elem, r.binder, r.elem, Record(pair), out_ty, on, keys, conds, nullable_on, ctx)
+    Lowered(join_op(spec, l.op, r.op), out_binder, out_ty, buf[TKey]())
+end plan_join
+
+// -- the operator ---------------------------------------------------------------------------------
+
+/** A run of left rows `ls[l0..<l1]` and right rows `rs[r0..<r1]` with equal keys: every pair of
+ * them is a candidate.
+ */
+private struct Group
+    l0: usize
+    l1: usize
+    r0: usize
+    r1: usize
+
+private join_op(spec: JoinSpec, left: &Operator, right: &Operator) -> &Operator =
+    JoinOp(spec, left, right, false, false, false, empty_vector(spec.lelem), buf[ColumnVector](), false, 0, 0, buf[u8](), buf[bool](),
+        empty_vector(spec.relem), buf[ColumnVector](), buf[bool](), buf[usize](), buf[usize](), buf[Group](), buf[bool](), false,
+        buf[ColumnVector](), 0, 0)
+
+private falses(n: usize) -> Buf[bool]
+    val out = buf[bool]()
+
+    for _ in 0..<n
+        out.push(false)
+
+    out
+
+/** Whether `v` holds a null at any depth of its records and unions. */
+private holds_null(v: Value) -> bool = v match
+    Null -> true
+    Record(fs) ->
+        for f in fs
+            if holds_null(f) then return true
+
+        false
+    Variant(_, p) -> holds_null(*p)
+    _ -> false
+
+/** The rows that `skip` leaves among `orders`' rows `offset..<offset + skip.len()`, sorted by
+ * `orders` (stable).
+ */
+private sorted_subset(orders: Buf[KeyOrder], skip: Buf[bool], offset: usize) -> Buf[usize]
+    var rows = buf[usize]()
+
+    for i in 0..<skip.len()
+        if !skip[i] then rows.push(offset + i)
+
+    var scratch = buf[usize]()
+    scratch.extend(rows.view())
+
+    if !sort_stable_by(rows.view_mut(), scratch.view_mut(), (p, q) -> compare_rows(orders, p, q) < 0) then
+        panic("sorted_subset: the scratch is too short")
+
+    rows
+
+/** A join. The right input is read whole on the first call. A nested-loop join then takes the left
+ * input a batch at a time and considers every pair of that batch's rows with the right rows; a merge
+ * join reads the left input whole too, sorts both sides by their keys and considers the pairs of each
+ * run of equal keys. Either way the pairs are considered `BatchSize` at a time, a left row is finished
+ * (null-extended, kept, dropped or marked) once all its pairs have been, and the right rows no pair
+ * matched are null-extended at the end. The output is cut into batches of `BatchSize`.
+ */
+private struct JoinOp
+    spec: JoinSpec
+    left: &Operator
+    right: &Operator
+    started: bool
+    left_done: bool
+    done: bool
+    // the left rows in play, and how far their pairs have been considered
+    rows: ColumnVector
+    lparts: Buf[ColumnVector]
+    live: bool
+    cursor: usize
+    group: usize
+    hits: Buf[u8]
+    unknown: Buf[bool]
+    // every right row, and whether some pair has matched it
+    rights: ColumnVector
+    rparts: Buf[ColumnVector]
+    rhit: Buf[bool]
+    // a merge join's sorted rows (a right row offset by the left's count) and their runs
+    ls: Buf[usize]
+    rs: Buf[usize]
+    groups: Buf[Group]
+    lnull: Buf[bool]
+    rnull: bool
+    // the output not yet handed up
+    out: Buf[ColumnVector]
+    out_at: usize
+    out_count: usize
+
+    private merge(self) -> bool = self.spec.keys.len() > 0
+
+    /** Reads the right input, and for a merge join the left input, whole. */
+    private start(*self) -> Result[unit, CodecError]
+        self.started = true
+        self.rights = drain_rows(self.right, self.spec.relem)?
+        self.rparts = parts_of(self.spec.rbinder, self.rights)
+        self.rhit = falses(self.rights.len)
+        // With no left batch at all, the null-extended right rows still need the left binders' shape.
+        self.lparts = parts_of(self.spec.lbinder, self.rows)
+
+        if self.merge()
+            self.open(drain_rows(self.left, self.spec.lelem)?)
+            self.left_done = true
+
+            // A key is evaluated only when the other side has a row, as a nested loop would (§6.5 rule 8).
+            if self.rows.len > 0 && self.rights.len > 0 then self.match_keys()?
+
+        Ok(())
+
+    /** Puts `b` in play as the left rows. */
+    private open(*self, b: ColumnVector)
+        self.rows = b
+        self.lparts = parts_of(self.spec.lbinder, b)
+        self.live = true
+        self.cursor = 0
+        self.group = 0
+        self.hits = buf[u8]()
+        self.unknown = falses(b.len)
+
+        for _ in 0..<b.len
+            self.hits.push(0)
+
+    /** Evaluates both sides' keys, sorts each side by them with `cmp` (§3.3), and finds the runs of
+     * rows whose keys are `same`; under `eq` a row whose key holds a null takes no part.
+     */
+    private match_keys(*self) -> Result[unit, CodecError]
+        val nl = self.rows.len
+        val nr = self.rights.len
+        val lenv = env_of(self.spec.ctx, self.spec.lbinder, self.rows)
+        val renv = env_of(self.spec.ctx, self.spec.rbinder, self.rights)
+        val orders = buf[KeyOrder]()
+        self.lnull = falses(nl)
+        val rnull = falses(nr)
+
+        for k in self.spec.keys
+            val a = coerce_vector(eval(k.left, lenv)?, k.ty)?.as_type(k.ty)
+            val b = coerce_vector(eval(k.right, renv)?, k.ty)?.as_type(k.ty)
+
+            if !k.nulls_match
+                for i in 0..<nl
+                    if !a.is_valid(i) || (!is_scalar_type(k.ty) && holds_null(value_at(a, i))) then self.lnull[i] = true
+
+                for j in 0..<nr
+                    if !b.is_valid(j) || (!is_scalar_type(k.ty) && holds_null(value_at(b, j))) then rnull[j] = true
+
+            // One vector of both sides' keys, so that a left row and a right row compare as two of its rows.
+            orders.push(key_order(concat(k.ty, [a, b]), false, true))
+
+        for j in 0..<nr
+            if rnull[j] then self.rnull = true
+
+        val ls = sorted_subset(orders, self.lnull, 0)
+        val rs = sorted_subset(orders, rnull, nl)
+        var a: usize = 0
+        var b: usize = 0
+
+        while a < ls.len() && b < rs.len()
+            val c = compare_rows(orders, ls[a], rs[b])
+
+            if c < 0
+                a += 1
+            elif c > 0
+                b += 1
+            else
+                var a2 = a + 1
+                var b2 = b + 1
+
+                while a2 < ls.len() && compare_rows(orders, ls[a], ls[a2]) == 0
+                    a2 += 1
+
+                while b2 < rs.len() && compare_rows(orders, rs[b], rs[b2]) == 0
+                    b2 += 1
+
+                self.groups.push(Group(a, a2, b, b2))
+                a = a2
+                b = b2
+
+        self.ls = ls
+        self.rs = rs
+        Ok(())
+    end match_keys
+
+    /** The next pairs to consider, at most `BatchSize` of them, as left and right row indices; none
+     * once every pair of the left rows in play has been.
+     */
+    private next_pairs(*self) -> (Buf[usize], Buf[usize])
+        val li = buf[usize]()
+        val ri = buf[usize]()
+        val nr = self.rights.len
+
+        if !self.merge()
+            val total = self.rows.len * nr
+
+            while self.cursor < total && li.len() < BatchSize
+                li.push(self.cursor / nr)
+                ri.push(self.cursor % nr)
+                self.cursor += 1
+
+            return (li, ri)
+
+        val nl = self.rows.len
+
+        while self.group < self.groups.len() && li.len() < BatchSize
+            val g = self.groups[self.group]
+            val w = g.r1 - g.r0
+            val total = (g.l1 - g.l0) * w
+
+            while self.cursor < total && li.len() < BatchSize
+                li.push(self.ls[g.l0 + self.cursor / w])
+                ri.push(self.rs[g.r0 + self.cursor % w] - nl)
+                self.cursor += 1
+
+            if self.cursor == total
+                self.group += 1
+                self.cursor = 0
+
+        (li, ri)
+    end next_pairs
+
+    /** Rows `li` of the left rows in play and `ri` of the right rows, paired, as `on` sees them. */
+    private pairs(self, li: []const usize, ri: []const usize) -> ColumnVector
+        val cs = buf[ColumnVector]()
+
+        for p in self.lparts
+            cs.push(take(p, li))
+
+        for p in self.rparts
+            cs.push(take(p, ri))
+
+        ColumnVector(self.spec.pair_ty, li.len, buf[u8](), Members(cs)).as_type(self.spec.pair_ty)
+
+    /** For each pair, whether every one of `conds` is `true` for it, and whether their conjunction is
+     * null rather than `false` (§7.12, three-valued `and`).
+     */
+    private truth(self, conds: Buf[TExpr], li: []const usize, ri: []const usize) -> Result[(Buf[bool], Buf[bool]), CodecError]
+        val n = li.len
+        val yes = buf[bool]()
+        val unknown = falses(n)
+        val no = falses(n)
+
+        for _ in 0..<n
+            yes.push(true)
+
+        if conds.len() == 0 then return Ok((yes, unknown))
+
+        val env = env_of(self.spec.ctx, Composite, self.pairs(li, ri))
+
+        for c in conds
+            val v = eval(c, env)?
+            val bs = v.lanes match
+                Bools(x) -> x
+                _ -> panic("JoinOp: `on` is not bool")
+
+            for k in 0..<n
+                if !v.is_valid(k)
+                    yes[k] = false
+                    unknown[k] = true
+                elif !bs[k]
+                    yes[k] = false
+                    no[k] = true
+
+        for k in 0..<n
+            if no[k] then unknown[k] = false
+
+        Ok((yes, unknown))
+    end truth
+
+    /** Tests the pairs `li`/`ri`: a pair `on` holds for counts as a match of both rows, and is output
+     * by the joins that output pairs; a second match of a left row is `R0003` for `single` (§6.5 rule 6).
+     */
+    private consider(*self, li: Buf[usize], ri: Buf[usize]) -> Result[unit, CodecError]
+        val (yes, unknown) = self.truth(self.spec.conds, li.view(), ri.view())?
+        val pl = buf[usize]()
+        val pr = buf[usize]()
+
+        for k in 0..<li.len()
+            val i = li[k]
+
+            if yes[k]
+                if self.hits[i] < 2 then self.hits[i] += 1
+                if self.spec.kind == SingleJoin && self.hits[i] > 1 then
+                    return fail("R0003", "a row of a single join's left input matches more than one right row")
+
+                self.rhit[ri[k]] = true
+                pl.push(i)
+                pr.push(ri[k])
+            elif unknown[k]
+                self.unknown[i] = true
+
+        self.spec.kind match
+            Semi | Anti | MarkJoin -> ()
+            _ -> self.emit(pl, pr, false, false)
+
+        Ok(())
+    end consider
+
+    /** Finishes the left rows in play, all their pairs considered: a left, full or single join
+     * null-extends the ones nothing matched, a semi join keeps the matched ones and an anti join the
+     * others, and a mark join marks each (§6.5 rules 3–6).
+     */
+    private finish_block(*self) -> Result[unit, CodecError]
+        val n = self.rows.len
+        val kind = self.spec.kind
+        val matched = buf[usize]()
+        val unmatched = buf[usize]()
+
+        for i in 0..<n
+            if self.hits[i] > 0 then matched.push(i) else unmatched.push(i)
+
+        kind match
+            Left | Full | SingleJoin -> self.emit(unmatched, unmatched, false, true)
+            Semi -> self.emit_left(matched)
+            Anti -> self.emit_left(unmatched)
+            MarkJoin ->
+                if self.merge() && self.spec.nullable_on && self.rights.len > 0 then self.mark_unknowns(unmatched)?
+
+                self.emit_marks()
+            _ -> ()
+
+        Ok(())
+
+    /** For a merge join's unmatched left rows, whether `on` is null for some right row (§6.5 rule 5),
+     * which the keys alone do not say. With one scalar `eq` key and nothing else in `on`, it is null
+     * exactly where the left key is null or some right key is; otherwise `on` is evaluated on each
+     * such row's pairs with every right row.
+     */
+    private mark_unknowns(*self, rows: Buf[usize]) -> Result[unit, CodecError]
+        val ks = self.spec.keys
+
+        if ks.len() == 1 && self.spec.conds.len() == 0 && !ks[0].nulls_match && is_scalar_type(ks[0].ty)
+            for i in rows
+                self.unknown[i] = self.lnull[i] || self.rnull
+
+            return Ok(())
+
+        val on = items_of([self.spec.on.unwrap()])
+        var li = buf[usize]()
+        var ri = buf[usize]()
+
+        for i in rows
+            for j in 0..<self.rights.len
+                li.push(i)
+                ri.push(j)
+
+                if li.len() == BatchSize
+                    self.note_unknowns(on, li, ri)?
+                    li = buf[usize]()
+                    ri = buf[usize]()
+
+        self.note_unknowns(on, li, ri)
+    end mark_unknowns
+
+    private note_unknowns(*self, on: Buf[TExpr], li: Buf[usize], ri: Buf[usize]) -> Result[unit, CodecError]
+        val (_, unknown) = self.truth(on, li.view(), ri.view())?
+
+        for k in 0..<li.len()
+            if unknown[k] then self.unknown[li[k]] = true
+
+        Ok(())
+
+    /** The right rows no pair matched, null-extended on the left, for a right or full join. */
+    private finish_right(*self)
+        if self.spec.kind != Right && self.spec.kind != Full then return
+
+        val rows = buf[usize]()
+
+        for j in 0..<self.rights.len
+            if !self.rhit[j] then rows.push(j)
+
+        self.emit(rows, rows, true, false)
+
+    // -- output --------------------------------------------------------------------------------------
+
+    private push(*self, v: ColumnVector)
+        if v.len == 0 then return
+
+        self.out.push(v)
+        self.out_count += v.len
+
+    /** The pairs `li`/`ri` as output rows, a side made null where it is `absent`, `BatchSize` at a
+     * time.
+     */
+    private emit(*self, li: Buf[usize], ri: Buf[usize], left_absent: bool, right_absent: bool)
+        var at: usize = 0
+
+        while at < li.len()
+            val end = if at + BatchSize < li.len() then at + BatchSize else li.len()
+            val cs = buf[ColumnVector]()
+            gather(self.lparts, li.view()[at..<end], left_absent, cs)
+            gather(self.rparts, ri.view()[at..<end], right_absent, cs)
+            self.push(ColumnVector(self.spec.out_ty, end - at, buf[u8](), Members(cs)).as_type(self.spec.out_ty))
+            at = end
+
+    /** Left rows `rows` as they are, for a semi or anti join. */
+    private emit_left(*self, rows: Buf[usize])
+        var at: usize = 0
+
+        while at < rows.len()
+            val end = if at + BatchSize < rows.len() then at + BatchSize else rows.len()
+            self.push(take(self.rows, rows.view()[at..<end]).as_type(self.spec.out_ty))
+            at = end
+
+    /** Every left row in play with its mark: `true` if a pair matched it, else null if `on` was null
+     * for one, else `false` (§6.5 rule 5).
+     */
+    private emit_marks(*self)
+        val fs = fields_of_type(self.spec.out_ty)
+        val mark_rec = fs[fs.len() - 1].ty
+        val mark_ty = fields_of_type(mark_rec)[0].ty
+        var at: usize = 0
+
+        while at < self.rows.len
+            val end = if at + BatchSize < self.rows.len then at + BatchSize else self.rows.len
+            val rows = buf[usize]()
+            val marks = buf[bool]()
+            val valid = buf[bool]()
+
+            for i in at..<end
+                rows.push(i)
+                marks.push(self.hits[i] > 0)
+                valid.push(self.hits[i] > 0 || !self.unknown[i])
+
+            val cs = buf[ColumnVector]()
+            gather(self.lparts, rows.view(), false, cs)
+
+            val m = ColumnVector(mark_ty, end - at, bits_of(valid.view()), Bools(marks))
+            cs.push(ColumnVector(mark_rec, end - at, buf[u8](), Members(items_of([m]))))
+            self.push(ColumnVector(self.spec.out_ty, end - at, buf[u8](), Members(cs)).as_type(self.spec.out_ty))
+            at = end
+    end emit_marks
+
+    /** The next `BatchSize` rows of the output, or every row left when fewer remain. */
+    private pop(*self) -> ColumnVector
+        val parts = buf[ColumnVector]()
+        var n: usize = 0
+
+        while n < BatchSize && self.out_at < self.out.len()
+            val p = self.out[self.out_at]
+
+            if n + p.len <= BatchSize
+                parts.push(p)
+                n += p.len
+                self.out_at += 1
+            else
+                parts.push(slice(p, 0, BatchSize - n))
+                self.out[self.out_at] = slice(p, BatchSize - n, p.len)
+                n = BatchSize
+
+        self.out_count -= n
+
+        if self.out_at == self.out.len()
+            self.out = buf[ColumnVector]()
+            self.out_at = 0
+
+        concat(self.spec.out_ty, parts.view())
+    end pop
+
+    /** One step: the inputs read, a block of pairs considered, the left rows in play finished, the
+     * next left batch put in play, or the right rows finished.
+     */
+    private step(*self) -> Result[unit, CodecError]
+        if !self.started then return self.start()
+
+        if self.live
+            val (li, ri) = self.next_pairs()
+
+            if li.len() > 0 then return self.consider(li, ri)
+
+            self.live = false
+            return self.finish_block()
+
+        if !self.left_done
+            self.left.next_batch()? match
+                Some(b) ->
+                    self.open(b)
+                    return Ok(())
+                None -> self.left_done = true
+
+        self.finish_right()
+        self.done = true
+        Ok(())
+    end step
+end JoinOp
+
+/** Rows `rows` of each of `parts` appended to `out`, or as many nulls when the side is `absent`. */
+private gather(parts: Buf[ColumnVector], rows: []const usize, absent: bool, out: Buf[ColumnVector])
+    for p in parts
+        out.push(if absent then repeated(nullable(p.ty), Null, rows.len) else take(p, rows))
+
+impl Operator for JoinOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        loop
+            if self.out_count >= BatchSize || (self.done && self.out_count > 0) then return Ok(Some(self.pop()))
+            if self.done then return Ok(None)
+
+            self.step()?

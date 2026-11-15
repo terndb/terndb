@@ -14,8 +14,9 @@ struct MemTable
     name: QualName
     batches: Buf[ColumnVector]
 
-/** A lowered relation: its operator, the binder it exposes and that binder's element type, and, for
- * a `Sort`, its keys (which a `Limit` with ties above it compares by).
+/** A lowered relation: its operator, the binder it exposes and the type of its batches, and, for a
+ * `Sort`, its keys (which a `Limit` with ties above it compares by). A node exposing several binders
+ * exposes them as one composite (`exec_join.sysl`): binder `Composite`, batches a record of binders.
  */
 struct Lowered
     op: &Operator
@@ -106,7 +107,7 @@ private struct Planner
             Filter(input, predicate) ->
                 val inner = self.rel(*input)
                 val p = self.expr(predicate)
-                Lowered(FilterOp(inner.op, inner.binder, p, self.ctx), inner.binder, elem, none)
+                Lowered(FilterOp(inner.op, inner.binder, p, self.ctx), inner.binder, inner.elem, none)
             Project(input, binder, items) ->
                 val inner = self.rel(*input)
                 val xs = buf[TExpr]()
@@ -122,19 +123,24 @@ private struct Planner
                 for k in keys
                     ks.push(TKey(self.expr(k.expr), k.desc, k.nulls_first))
 
-                Lowered(SortOp(inner.op, inner.binder, elem, ks, self.ctx, None), inner.binder, elem, ks)
+                Lowered(SortOp(inner.op, inner.binder, inner.elem, ks, self.ctx, None), inner.binder, inner.elem, ks)
             Limit(input, count, offset, ties, _) ->
                 val inner = self.rel(*input)
                 val c = self.opt_expr(count)
                 val o = self.opt_expr(offset)
                 val op = LimitOp(inner.op, inner.binder, c, o, ties, inner.keys, self.ctx, false, 0, false, 0, None, false)
-                Lowered(op, inner.binder, elem, none)
+                Lowered(op, inner.binder, inner.elem, none)
             Distinct(input) ->
                 val inner = self.rel(*input)
-                Lowered(DistinctOp(inner.op, elem, None), inner.binder, elem, none)
+                val op: &Operator = if inner.binder == Composite then CompositeDistinctOp(inner.op, inner.elem, None) else DistinctOp(inner.op, elem, None)
+                Lowered(op, inner.binder, inner.elem, none)
             Tag(input, binder, _, tag) ->
                 val inner = self.rel(*input)
-                Lowered(TagOp(inner.op, elem, member_index(fields_of_type(elem), tag)), binder, elem, none)
+                Lowered(TagOp(flat_input(inner), elem, member_index(fields_of_type(elem), tag)), binder, elem, none)
+            Join(kind, left, right, on, mark, binder) ->
+                val l = self.rel(*left)
+                val r2 = self.rel(*right)
+                plan_join(kind, l, r2, self.opt_expr(on), mark, binder, self.ctx, true)
             _ -> panic("the executor does not run this relational node")
     end rel
 end Planner
@@ -157,4 +163,4 @@ run_query(env: Envelope, catalog: &Catalog, ctx: Ctx, tables: Buf[MemTable]) -> 
     val typing = type_envelope(env, catalog)?
     val result = typing.result.unwrap()
     val root = plan_query(env, typing, ctx, tables)
-    Ok((result, result_batches(result, root.op, 0)?))
+    Ok((result, result_batches(result, flat_input(root), 0)?))

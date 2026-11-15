@@ -1,0 +1,477 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort_stable_by
+
+// Joins (`query-tree.md` §6.5) through the type checker and the planner, over two tables `app.a` and
+// `app.b` held as batches of chosen sizes. Each output is compared, as a multiset, with an oracle that
+// computes §6.5 a value at a time from `compare.sysl`'s `eq`, `same` and `lt`. Every case runs twice:
+// with `on` as written, which a merge join runs when it equates the two sides, and wrapped in
+// `not(not(…))`, which means the same but hides the keys, so that a nested-loop join runs it.
+
+// -- tables -------------------------------------------------------------------------------------------
+
+/** Two tables, `a` of `acols` and `b` of `bcols`, holding `arows` and `brows` in batches of the
+ * sizes `asizes` and `bsizes` (as far as the rows reach, the rest in one more).
+ */
+struct XjData
+    acols: Buf[Field]
+    bcols: Buf[Field]
+    arows: Buf[Value]
+    brows: Buf[Value]
+    asizes: Buf[usize]
+    bsizes: Buf[usize]
+
+xj_catalog(d: XjData) -> FakeCatalog
+    val acs = buf[ColumnInfo]()
+    val bcs = buf[ColumnInfo]()
+
+    for f in d.acols
+        acs.push(cat_column(f.name, f.ty))
+
+    for f in d.bcols
+        bcs.push(cat_column(f.name, f.ty))
+
+    FakeCatalog(items_of([fake_table("a", acs.view(), []), fake_table("b", bcs.view(), [])]), buf[FakeType](), buf[FakeFunction]())
+
+private xj_batches(elem: Type, rows: Buf[Value], sizes: Buf[usize]) -> Buf[ColumnVector]
+    val out = buf[ColumnVector]()
+    var at: usize = 0
+
+    for s in sizes
+        val end = if at + s < rows.len() then at + s else rows.len()
+        out.push(vector_of(elem, rows.view()[at..<end]))
+        at = end
+
+    if at < rows.len() then out.push(vector_of(elem, rows.view()[at..]))
+
+    out
+
+xj_tables(d: XjData) -> Buf[MemTable] = items_of([
+    MemTable(QualName("app", "a"), xj_batches(record(d.acols.view()), d.arows, d.asizes)),
+    MemTable(QualName("app", "b"), xj_batches(record(d.bcols.view()), d.brows, d.bsizes))])
+
+/** The output rows of `r` as a client sees them, flat (§8.4); every batch has 1 to `BatchSize` rows. */
+xj_run(d: XjData, r: Rel) -> Result[Buf[Value], CodecError]
+    val q = envelope([], Query(r))
+    val typing = type_envelope(q, xj_catalog(d))?
+    val root = plan_query(q, typing, xe_ctx([]), xj_tables(d))
+    val out = buf[Value]()
+
+    for b in drain(root.op)?
+        assert(b.len > 0 && b.len <= BatchSize)
+        out.extend(values_of(if root.binder == Composite then flatten(b) else b).view())
+
+    Ok(out)
+
+xj_code(r: Result[Buf[Value], CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** `{<key>: int64?, <name>: text}`. */
+private xj_kv(key: string, name: string) -> Buf[Field] = items_of([Field(key, nullable(Int64)), Field(name, Text)])
+
+/** Rows `{k, "<p><i>"}` with the keys `ks`, a negative key standing for null. */
+xj_rows(p: string, ks: []const i128) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<ks.len
+        out.push(rec([if ks[i] < 0 then Null else Int(ks[i]), Text(s"$p$i")]))
+
+    out
+
+/** `a` of `{ak: int64?, v: text}` and `b` of `{bk: int64?, w: text}`. */
+xj_data(arows: Buf[Value], brows: Buf[Value], asizes: []const usize, bsizes: []const usize) -> XjData =
+    XjData(xj_kv("ak", "v"), xj_kv("bk", "w"), arows, brows, items_of(asizes), items_of(bsizes))
+
+// -- the oracle -------------------------------------------------------------------------------------
+
+xj_fields(v: Value) -> Buf[Value] = v match
+    Record(fs) -> fs
+    _ -> panic("a record row was expected")
+
+xj_cat(a: Value, b: Value) -> Value
+    val fs = buf[Value]()
+    fs.extend(xj_fields(a).view())
+    fs.extend(xj_fields(b).view())
+    Record(fs)
+
+private xj_nulls(n: usize) -> Value
+    val fs = buf[Value]()
+
+    for _ in 0..<n
+        fs.push(Null)
+
+    Record(fs)
+
+/** §6.5 value at a time: every left row against every right row, `on` three-valued; the rows flat. */
+xj_oracle(kind: JoinKind, d: XjData, on: (Value, Value) -> Option[bool]) -> Result[Buf[Value], string]
+    val out = buf[Value]()
+    val rhit = buf[bool]()
+
+    for _ in d.brows
+        rhit.push(false)
+
+    for a in d.arows
+        var hits = 0
+        var unknown = false
+
+        for j in 0..<d.brows.len()
+            val r = on(a, d.brows[j])
+
+            if r == Some(true)
+                hits += 1
+                rhit[j] = true
+
+                if kind != Semi && kind != Anti && kind != MarkJoin then out.push(xj_cat(a, d.brows[j]))
+            elif r.is_none()
+                unknown = true
+
+        if kind == SingleJoin && hits > 1 then return Err("R0003")
+
+        kind match
+            Left | Full | SingleJoin -> if hits == 0 then out.push(xj_cat(a, xj_nulls(d.bcols.len())))
+            Semi -> if hits > 0 then out.push(a)
+            Anti -> if hits == 0 then out.push(a)
+            MarkJoin -> out.push(xj_cat(a, rec([if hits > 0 then Bool(true) elif unknown then Null else Bool(false)])))
+            _ -> ()
+
+    if kind == Right || kind == Full
+        for j in 0..<d.brows.len()
+            if !rhit[j] then out.push(xj_cat(xj_nulls(d.acols.len()), d.brows[j]))
+
+    Ok(out)
+end xj_oracle
+
+/** The flat row type of `kind`'s output, every column nullable: a type every output row has. */
+xj_row_type(kind: JoinKind, d: XjData) -> Type
+    val fs = buf[Field]()
+
+    for f in d.acols
+        fs.push(Field(f.name, nullable(f.ty)))
+
+    kind match
+        Semi | Anti -> ()
+        MarkJoin -> fs.push(Field("mark", nullable(Bool)))
+        _ ->
+            for f in d.bcols
+                fs.push(Field(f.name, nullable(f.ty)))
+
+    Record(fs)
+
+/** `xs` sorted by `cmp` (§3.3) as rows of `t`. */
+xj_sorted(t: Type, xs: Buf[Value]) -> Buf[Value]
+    var rows = all_rows(xs.len())
+    var scratch = all_rows(xs.len())
+
+    if !sort_stable_by(rows.view_mut(), scratch.view_mut(), (p, q) -> cmp(t, xs[p], xs[q]) < 0) then
+        panic("xj_sorted: the scratch is too short")
+
+    val out = buf[Value]()
+
+    for r in rows
+        out.push(xs[r])
+
+    out
+
+/** Whether `got` and `want` are the same multiset of rows of `t` under `same` (§3.1). */
+xj_bag_eq(t: Type, got: Buf[Value], want: Buf[Value]) -> bool
+    if got.len() != want.len() then return false
+
+    val g = xj_sorted(t, got)
+    val w = xj_sorted(t, want)
+
+    for i in 0..<g.len()
+        if !same(t, g[i], w[i]) then return false
+
+    true
+
+/** `on` hidden from the planner's key search without changing what it means (§7.12, Kleene `not`). */
+xj_hidden(on: Expr) -> Expr = call("not", [call("not", [on])])
+
+xj_join(kind: JoinKind, on: Option[Expr]) -> Rel =
+    if kind == MarkJoin then Join(kind, scan("app", "a", "a"), scan("app", "b", "b"), on, Some("mark"), Some("m"))
+    else Join(kind, scan("app", "a", "a"), scan("app", "b", "b"), on, None, None)
+
+xj_kinds() -> [8]JoinKind = [Inner, Left, Right, Full, Semi, Anti, MarkJoin, SingleJoin]
+
+xj_kind_name(k: JoinKind) -> string = k match
+    Inner -> "inner"
+    Left -> "left"
+    Right -> "right"
+    Full -> "full"
+    Semi -> "semi"
+    Anti -> "anti"
+    MarkJoin -> "mark"
+    SingleJoin -> "single"
+
+/** `kind` with `on` over `d`, as written and hidden, against the oracle: the same rows, or the same
+ * error code.
+ */
+xj_check(kind: JoinKind, d: XjData, on: Expr, oracle: (Value, Value) -> Option[bool])
+    val want = xj_oracle(kind, d, oracle)
+
+    for form in [on, xj_hidden(on)]
+        val got = xj_run(d, xj_join(kind, Some(form)))
+
+        want match
+            Ok(rows) ->
+                assert(got.is_ok(), s"${xj_kind_name(kind)}: ${xj_code(got)}")
+                assert(xj_bag_eq(xj_row_type(kind, d), got.unwrap(), rows), s"${xj_kind_name(kind)}: the rows differ")
+            Err(code) -> assert_eq(xj_code(got), code)
+
+xj_k(row: Value) -> Value = xj_fields(row)[0]
+
+private xj_s(row: Value) -> Value = xj_fields(row)[1]
+
+xj_kleene_and(a: Option[bool], b: Option[bool]) -> Option[bool] =
+    if a == Some(false) || b == Some(false) then Some(false) elif a == Some(true) && b == Some(true) then Some(true) else None
+
+/** `eq(a.ak, b.bk)` (§3.2). */
+xj_eq_k(a: Value, b: Value) -> Option[bool] = eq(nullable(Int64), xj_k(a), xj_k(b)).unwrap()
+
+xj_on_eq() -> Expr = call("eq", [col("a", "ak"), col("b", "bk")])
+
+// -- every kind ---------------------------------------------------------------------------------------
+
+/** Keys with duplicates, nulls, and rows unmatched on both sides. */
+xj_mixed() -> XjData =
+    xj_data(xj_rows("a", [1, 2, 2, -1, 3, 5, -1, 1]), xj_rows("b", [2, -1, 1, 2, 4, 2, -1]), [3, 1], [2, 2])
+
+@test
+every_kind_on_an_equi_key_with_nulls_and_duplicates()
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), xj_on_eq(), xj_eq_k)
+
+@test
+a_null_key_on_either_side_matches_nothing_under_eq()
+    val d = xj_data(xj_rows("a", [-1, 1]), xj_rows("b", [-1, 1]), [], [])
+
+    for on in [xj_on_eq(), xj_hidden(xj_on_eq())]
+        val rows = xj_run(d, xj_join(Inner, Some(on))).unwrap()
+        assert_eq(rows.len(), 1)
+        assert(xj_k(rows[0]) == Int(1))
+
+@test
+a_null_key_matches_a_null_key_under_same()
+    val on = call("same", [col("a", "ak"), col("b", "bk")])
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), on, (a: Value, b: Value) -> Some(same(nullable(Int64), xj_k(a), xj_k(b))))
+
+    val d = xj_data(xj_rows("a", [-1, 1]), xj_rows("b", [-1, 1]), [], [])
+    assert_eq(xj_run(d, xj_join(Inner, Some(on))).unwrap().len(), 2)
+
+@test
+the_outer_joins_null_extend_the_unmatched_rows()
+    val d = xj_data(xj_rows("a", [1, 2]), xj_rows("b", [1, 3]), [], [])
+    val a1 = rec([Int(1), Text("a0")])
+    val a2 = rec([Int(2), Text("a1")])
+    val b1 = rec([Int(1), Text("b0")])
+    val b3 = rec([Int(3), Text("b1")])
+    val nil = rec([Null, Null])
+    val left = items_of([xj_cat(a1, b1), xj_cat(a2, nil)])
+    val right = items_of([xj_cat(a1, b1), xj_cat(nil, b3)])
+    val full = items_of([xj_cat(a1, b1), xj_cat(a2, nil), xj_cat(nil, b3)])
+    val t = xj_row_type(Full, d)
+
+    for on in [xj_on_eq(), xj_hidden(xj_on_eq())]
+        assert(xj_bag_eq(t, xj_run(d, xj_join(Left, Some(on))).unwrap(), left))
+        assert(xj_bag_eq(t, xj_run(d, xj_join(Right, Some(on))).unwrap(), right))
+        assert(xj_bag_eq(t, xj_run(d, xj_join(Full, Some(on))).unwrap(), full))
+        assert(xj_bag_eq(t, xj_run(d, xj_join(SingleJoin, Some(on))).unwrap(), left))
+
+/** `a` and `b` with keys that are never null. */
+private xj_required(arows: Buf[Value], brows: Buf[Value]) -> XjData =
+    XjData(items_of([Field("ak", Int64), Field("v", Text)]), items_of([Field("bk", Int64), Field("w", Text)]), arows, brows, buf[usize](), buf[usize]())
+
+private xj_result_type(d: XjData, kind: JoinKind) -> Type =
+    run_query(envelope([], Query(xj_join(kind, Some(xj_on_eq())))), xj_catalog(d), xe_ctx([]), xj_tables(d)).unwrap().0
+
+@test
+the_outer_sides_columns_become_nullable()
+    val d = xj_required(xj_rows("a", [1]), xj_rows("b", [1]))
+    val (ak, v) = (Field("ak", Int64), Field("v", Text))
+    val (bk, w) = (Field("bk", Int64), Field("w", Text))
+    val (ak_, v_) = (Field("ak", nullable(Int64)), Field("v", nullable(Text)))
+    val (bk_, w_) = (Field("bk", nullable(Int64)), Field("w", nullable(Text)))
+    assert(xj_result_type(d, Inner) == bag(record([ak, v, bk, w])))
+    assert(xj_result_type(d, Left) == bag(record([ak, v, bk_, w_])))
+    assert(xj_result_type(d, SingleJoin) == bag(record([ak, v, bk_, w_])))
+    assert(xj_result_type(d, Right) == bag(record([ak_, v_, bk, w])))
+    assert(xj_result_type(d, Full) == bag(record([ak_, v_, bk_, w_])))
+    assert(xj_result_type(d, Semi) == bag(record([ak, v])))
+
+@test
+a_single_join_with_two_matches_is_r0003()
+    val d = xj_data(xj_rows("a", [1, 2]), xj_rows("b", [2, 2]), [], [])
+
+    for on in [xj_on_eq(), xj_hidden(xj_on_eq())]
+        assert_eq(xj_code(xj_run(d, xj_join(SingleJoin, Some(on)))), "R0003")
+
+    // At most one match per left row is a left join.
+    xj_check(SingleJoin, xj_data(xj_rows("a", [1, 2, 2]), xj_rows("b", [2, 3]), [], []), xj_on_eq(), xj_eq_k)
+
+// -- the mark -----------------------------------------------------------------------------------------
+
+/** The marks of `a`'s rows, in the order of the rows by `cmp`. */
+private xj_marks(d: XjData, on: Expr) -> Buf[Value]
+    val out = buf[Value]()
+
+    for r in xj_sorted(xj_row_type(MarkJoin, d), xj_run(d, xj_join(MarkJoin, Some(on))).unwrap())
+        out.push(xj_fields(r)[2])
+
+    out
+
+@test
+a_mark_is_true_on_a_match_else_null_if_on_was_null_else_false()
+    // In order by key: null, 1, 2.
+    val left = xj_rows("a", [1, 2, -1])
+
+    for on in [xj_on_eq(), xj_hidden(xj_on_eq())]
+        // A null on the right makes every unmatched mark null: `2 IN (1, null)` is null.
+        assert(xj_marks(xj_data(left, xj_rows("b", [1, -1]), [], []), on) == items_of([Null, Bool(true), Null]))
+        // No null on the right: an unmatched key is false, a null key null.
+        assert(xj_marks(xj_data(left, xj_rows("b", [1]), [], []), on) == items_of([Null, Bool(true), Bool(false)]))
+        // No right rows: every mark is false, a null key's too.
+        assert(xj_marks(xj_data(left, buf[Value](), [], []), on) == items_of([Bool(false), Bool(false), Bool(false)]))
+
+@test
+a_mark_is_bool_when_on_cannot_be_null()
+    val d = xj_required(xj_rows("a", [1, 2]), xj_rows("b", [1]))
+    assert(xj_result_type(d, MarkJoin) == bag(record([Field("ak", Int64), Field("v", Text), Field("mark", Bool)])))
+    assert(xj_marks(d, xj_on_eq()) == items_of([Bool(true), Bool(false)]))
+
+    val n = xj_mixed()
+    assert(xj_result_type(n, MarkJoin) == bag(record([Field("ak", nullable(Int64)), Field("v", Text), Field("mark", nullable(Bool))])))
+
+@test
+a_residual_condition_beside_the_key()
+    // `a.ak = b.bk and a.v < b.w`, where a key match whose residual is false makes `on` false, not null.
+    val on = call("and", [xj_on_eq(), call("lt", [col("a", "v"), col("b", "w")])])
+    val oracle = (a: Value, b: Value) -> xj_kleene_and(xj_eq_k(a, b), lt(Text, xj_s(a), xj_s(b)).unwrap())
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), on, oracle)
+
+    // A residual that can be null: `a.ak = b.bk and a.ak > 1`.
+    val gt1 = call("and", [xj_on_eq(), call("gt", [col("a", "ak"), Literal(Int64, Int(1))])])
+    val gt1_oracle = (a: Value, b: Value) -> xj_kleene_and(xj_eq_k(a, b), gt(nullable(Int64), xj_k(a), Int(1)).unwrap())
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), gt1, gt1_oracle)
+
+// -- inputs and batches -------------------------------------------------------------------------------
+
+private xj_every_kind(d: XjData)
+    for kind in xj_kinds()
+        xj_check(kind, d, xj_on_eq(), xj_eq_k)
+
+@test
+an_empty_input_on_either_side()
+    xj_every_kind(xj_data(buf[Value](), xj_rows("b", [1, -1, 2]), [], []))
+    xj_every_kind(xj_data(xj_rows("a", [1, -1, 2]), buf[Value](), [], []))
+    xj_every_kind(xj_data(buf[Value](), buf[Value](), [], []))
+
+@test
+a_key_group_spanning_batches_gives_its_whole_cross_product()
+    // 40 left rows and 30 right rows of key 7, in batches of 1, 2 and 7, between rows of other keys:
+    // one group of 1 200 pairs, more than a batch.
+    val ak = buf[i128]()
+    val bk = buf[i128]()
+
+    for i in 0..<45
+        ak.push(if i < 3 || i > 42 then i128(i) else 7)
+
+    for i in 0..<34
+        bk.push(if i < 2 || i > 31 then i128(100 + i) else 7)
+
+    val d = xj_data(xj_rows("a", ak.view()), xj_rows("b", bk.view()), [1, 2, 7, 7], [7, 2, 1])
+    xj_every_kind(d)
+    assert_eq(xj_run(d, xj_join(Inner, Some(xj_on_eq()))).unwrap().len(), 40 * 30)
+
+@test
+a_non_equi_condition_runs_as_a_nested_loop()
+    val on = call("lt", [col("a", "ak"), col("b", "bk")])
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), on, (a: Value, b: Value) -> lt(nullable(Int64), xj_k(a), xj_k(b)).unwrap())
+
+@test
+no_condition_is_a_cross_join()
+    val d = xj_mixed()
+    assert_eq(xj_run(d, xj_join(Inner, None)).unwrap().len(), d.arows.len() * d.brows.len())
+
+    for kind in xj_kinds()
+        val want = xj_oracle(kind, d, (a: Value, b: Value) -> Some(true))
+        val got = xj_run(d, xj_join(kind, None))
+
+        want match
+            Ok(rows) -> assert(xj_bag_eq(xj_row_type(kind, d), got.unwrap(), rows), xj_kind_name(kind))
+            Err(code) -> assert_eq(xj_code(got), code)
+
+@test
+a_key_that_fails_fails_only_when_the_other_side_has_rows()
+    // `a.ak / 0 = b.bk` divides by zero on a left row with a key, once there is a pair to test.
+    val on = call("eq", [call("div", [col("a", "ak"), Literal(Int64, Int(0))]), col("b", "bk")])
+    val d = xj_data(xj_rows("a", [1]), xj_rows("b", [1]), [], [])
+    val no_right = xj_data(xj_rows("a", [1]), buf[Value](), [], [])
+
+    for form in [on, xj_hidden(on)]
+        assert_eq(xj_code(xj_run(d, xj_join(Inner, Some(form)))), "R0002")
+        assert_eq(xj_code(xj_run(no_right, xj_join(Left, Some(form)))), "ok")
+
+// -- record keys --------------------------------------------------------------------------------------
+
+/** `{x: int64?, n: {z: int64?}}`: a record with a nested record. */
+private xj_point() -> Type = record([Field("x", nullable(Int64)), Field("n", record([Field("z", nullable(Int64))]))])
+
+/** The point `{x, n: {z}}`, a negative part standing for null. */
+private xj_pt(x: i128, z: i128) -> Value = rec([if x < 0 then Null else Int(x), rec([if z < 0 then Null else Int(z)])])
+
+private xj_points(p: string, ps: []const Value) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<ps.len
+        out.push(rec([ps[i], Text(s"$p$i")]))
+
+    out
+
+@test
+a_record_key_with_a_nested_record_matches_only_without_nulls()
+    val acols = items_of([Field("ap", nullable(xj_point())), Field("v", Text)])
+    val bcols = items_of([Field("bp", nullable(xj_point())), Field("w", Text)])
+    val ap = [xj_pt(1, 1), xj_pt(1, 2), xj_pt(1, -1), xj_pt(-1, 1), Null, xj_pt(1, 1), xj_pt(2, 0)]
+    val bp = [xj_pt(1, 1), xj_pt(1, -1), xj_pt(-1, 1), Null, xj_pt(2, 0), xj_pt(2, 0), xj_pt(3, 3)]
+    val sizes: [2]usize = [2, 3]
+    val d = XjData(acols, bcols, xj_points("a", ap), xj_points("b", bp), items_of(sizes), buf[usize]())
+    val t = nullable(xj_point())
+    val on = call("eq", [col("a", "ap"), col("b", "bp")])
+
+    for kind in xj_kinds()
+        xj_check(kind, d, on, (a: Value, b: Value) -> eq(t, xj_k(a), xj_k(b)).unwrap())
+
+    // Only the null-free points match: (1, 1) twice with (1, 1) once, (2, 0) with (2, 0) twice.
+    assert_eq(xj_run(d, xj_join(Inner, Some(on))).unwrap().len(), 4)
+
+    val same_on = call("same", [col("a", "ap"), col("b", "bp")])
+
+    for kind in xj_kinds()
+        xj_check(kind, d, same_on, (a: Value, b: Value) -> Some(same(t, xj_k(a), xj_k(b))))
+
+    // Under `same` a point with a null part matches its equal too: (1, null), (null, 1) and null.
+    assert_eq(xj_run(d, xj_join(Inner, Some(same_on))).unwrap().len(), 7)
+
+@test
+a_key_on_a_field_of_a_nested_record()
+    val acols = items_of([Field("ap", nullable(xj_point())), Field("v", Text)])
+    val ap = [xj_pt(1, 1), xj_pt(1, 2), xj_pt(1, -1), Null, xj_pt(5, 2)]
+    val d = XjData(acols, xj_kv("bk", "w"), xj_points("a", ap), xj_rows("b", [2, 1, -1, 2]), buf[usize](), buf[usize]())
+    val on = call("eq", [col("b", "bk"), Field(Field(col("a", "ap"), "n"), "z")])
+    val oracle = (a: Value, b: Value) -> xj_k(a) match
+        Record(fs) -> eq(nullable(Int64), xj_fields(fs[1])[0], xj_k(b)).unwrap()
+        _ -> eq(nullable(Int64), Null, xj_k(b)).unwrap()
+
+    for kind in xj_kinds()
+        xj_check(kind, d, on, oracle)

@@ -110,7 +110,7 @@ private columns(b: Binding) -> Buf[Field]
     out.extend(b.extra.view())
     out
 
-private element_columns(elem: Type) -> Buf[Field] = elem match
+private[terndb] element_columns(elem: Type) -> Buf[Field] = elem match
     Record(fs) -> fs
     Union(vs) -> shared_columns(vs)
     _ -> items_of([Field("value", elem)])

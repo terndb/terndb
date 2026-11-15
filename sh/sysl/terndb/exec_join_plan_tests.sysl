@@ -1,0 +1,186 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Joins among other nodes: merge and nested-loop joins agreeing on generated inputs, the operators
+// that read a join's binders (`Filter`, `Project`, `Sort`, `Limit`, `Distinct`), joins of joins, and a
+// typed tree run to its encoded result and decoded again (`query-tree.md` §6.5, §8.3, §8.4).
+
+// -- agreement on generated inputs --------------------------------------------------------------------
+
+/** `n` rows `{k, "<p><i>"}` with keys drawn from `0..<range` by a linear congruential generator seeded
+ * with `seed`, one in `nulls` of them null (none when `nulls` is 0).
+ */
+private xg_rows(p: string, n: usize, range: u64, nulls: u64, seed: u64) -> Buf[Value]
+    val ks = buf[i128]()
+    var s = seed
+
+    for _ in 0..<n
+        s = (s * 1103515245 + 12345) % 2147483648
+        val x = s >> 8
+        ks.push(if nulls > 0 && x % nulls == 0 then -1 else i128((x / 7) % range))
+
+    xj_rows(p, ks.view())
+
+@test
+merge_and_nested_loop_joins_agree_on_generated_inputs()
+    // A left side of more than a batch, keys from a small range so that groups are large, and nulls.
+    val seeds: [3]u64 = [1, 2, 3]
+
+    for seed in seeds
+        val d = xj_data(xg_rows("a", BatchSize + 37, 9, 6, seed), xg_rows("b", 70, 9, 5, seed * 31), [100, 1, 500], [3, 30])
+        val on = call("and", [xj_on_eq(), call("ne", [col("a", "v"), col("b", "w")])])
+
+        for kind in xj_kinds()
+            if kind != SingleJoin
+                val merged = xj_run(d, xj_join(kind, Some(on))).unwrap()
+                val looped = xj_run(d, xj_join(kind, Some(xj_hidden(on)))).unwrap()
+                assert(xj_bag_eq(xj_row_type(kind, d), merged, looped), s"${xj_kind_name(kind)}, seed $seed")
+
+    // A single join needs unique right keys; with duplicates it is R0003 both ways.
+    val one = xj_data(xg_rows("a", 300, 40, 7, 5), xj_rows("b", [0, 3, 6, 9, 12, -1, 15]), [], [])
+    xj_check(SingleJoin, one, xj_on_eq(), xj_eq_k)
+    val dup = xj_data(xg_rows("a", 300, 40, 7, 5), xg_rows("b", 60, 10, 0, 9), [], [])
+    xj_check(SingleJoin, dup, xj_on_eq(), xj_eq_k)
+
+// -- nodes above a join -------------------------------------------------------------------------------
+
+private xg_small() -> XjData = xj_data(xj_rows("a", [1, 2, 2, 3, -1]), xj_rows("b", [2, 2, 3, 4]), [2], [1])
+
+@test
+a_filter_and_a_project_read_both_binders_of_a_join()
+    val join = xj_join(Inner, Some(xj_on_eq()))
+    val kept = Filter(join, call("eq", [col("b", "w"), Literal(Text, Text("b1"))]))
+    val proj = Project(kept, "p", items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("k", col("a", "ak"))]))
+    val rows = xj_run(xg_small(), proj).unwrap()
+    val t = record([Field("v", Text), Field("w", Text), Field("k", nullable(Int64))])
+    // b1 has key 2, which a1 and a2 have.
+    assert(xj_bag_eq(t, rows, items_of([rec([Text("a1"), Text("b1"), Int(2)]), rec([Text("a2"), Text("b1"), Int(2)])])))
+
+@test
+a_project_reads_a_null_extended_binder_as_null()
+    // `Row(b)` and `b.w` of a left join's unmatched rows are null.
+    val join = xj_join(Left, Some(xj_on_eq()))
+    val proj = Project(join, "p", items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("brow", Row("b"))]))
+    val rows = xj_run(xg_small(), proj).unwrap()
+    assert_eq(rows.len(), 7)
+
+    for r in rows
+        val fs = xj_fields(r)
+        val unmatched = fs[0] == Text("a0") || fs[0] == Text("a4")
+        assert(unmatched == (fs[1] == Null))
+        assert(unmatched == (fs[2] == Null))
+
+@test
+a_sort_and_a_limit_above_a_join_order_by_either_side()
+    val join = xj_join(Full, Some(xj_on_eq()))
+    val sorted = Sort(join, items_of([SortKey(col("b", "w"), false, true), SortKey(col("a", "v"), true, false)]))
+    val rows = xj_run(xg_small(), Limit(sorted, Some(Literal(Int64, Int(4))), None, false, false)).unwrap()
+    // w null first (a0, a4 unmatched; v descending: a4, a0), then b0 with a2, a1 (v descending).
+    val vs = buf[Value]()
+
+    for r in rows
+        vs.push(xj_fields(r)[1])
+
+    assert(vs == items_of([Text("a4"), Text("a0"), Text("a2"), Text("a1")]))
+
+@test
+a_distinct_above_a_join_compares_its_flat_columns()
+    // A cross join of two equal left rows with one right row: two equal output rows, one kept.
+    val d = xj_data(items_of([rec([Int(1), Text("x")]), rec([Int(1), Text("x")]), rec([Int(2), Text("x")])]), xj_rows("b", [7]), [1], [])
+    val rows = xj_run(d, Distinct(xj_join(Inner, None))).unwrap()
+    assert_eq(rows.len(), 2)
+
+    // The binders survive a Distinct: a Project above it still reads them.
+    val proj = Project(Distinct(xj_join(Inner, None)), "p", items_of([item("k", col("a", "ak")), item("w", col("b", "w"))]))
+    assert_eq(xj_run(d, proj).unwrap().len(), 2)
+
+@test
+a_tag_above_a_join_wraps_its_flat_rows()
+    val flat = record([Field("ak", nullable(Int64)), Field("v", Text), Field("bk", nullable(Int64)), Field("w", Text)])
+    val shape = union_of([Field("pair", flat), Field("none", record([]))])
+    val rows = xj_run(xg_small(), Tag(xj_join(Inner, Some(xj_on_eq())), "u", shape, "pair")).unwrap()
+    assert_eq(rows.len(), 5)
+
+    for r in rows
+        r match
+            Variant(tag, payload) ->
+                assert_eq(tag, 0)
+                assert_eq(xj_fields(*payload).len(), 4)
+            _ -> assert(false, "a union row was expected")
+
+// -- joins of joins -----------------------------------------------------------------------------------
+
+@test
+a_join_of_a_join_sees_all_three_binders()
+    // (a ⋈ b on a.ak = b.bk) left-joined with c, another scan of b, on c.bk = a.ak + 1.
+    val ab = xj_join(Inner, Some(xj_on_eq()))
+    val on = call("eq", [col("c", "bk"), call("add", [col("a", "ak"), Literal(Int64, Int(1))])])
+    val abc = Join(Left, ab, scan("app", "b", "c"), Some(on), None, None)
+    val proj = Project(abc, "p", items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("cw", col("c", "w"))]))
+    val rows = xj_run(xg_small(), proj).unwrap()
+    val t = record([Field("v", Text), Field("w", Text), Field("cw", nullable(Text))])
+    // a1 and a2 (key 2) each match b0 and b1, and key 3 is c's b2; a3 (key 3) matches b2, and key 4 is c's b3.
+    val want = buf[Value]()
+
+    for a in ["a1", "a2"]
+        for b in ["b0", "b1"]
+            want.push(rec([Text(a), Text(b), Text("b2")]))
+
+    want.push(rec([Text("a3"), Text("b2"), Text("b3")]))
+    assert(xj_bag_eq(t, rows, want))
+
+    // The same with the nested loop on the outer join.
+    val looped = Project(Join(Left, ab, scan("app", "b", "c"), Some(xj_hidden(on)), None, None), "p", items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("cw", col("c", "w"))]))
+    assert(xj_bag_eq(t, xj_run(xg_small(), looped).unwrap(), want))
+
+@test
+a_semi_join_and_a_mark_join_over_a_join_keep_its_binders()
+    val ab = xj_join(Inner, Some(xj_on_eq()))
+    val on = call("eq", [col("c", "bk"), call("add", [col("a", "ak"), Literal(Int64, Int(1))])])
+    val semi = Project(Join(Semi, ab, scan("app", "b", "c"), Some(on), None, None), "p", items_of([item("v", col("a", "v")), item("w", col("b", "w"))]))
+    // Of the four (a, b) pairs of key 2 and the one of key 3, all have a c of key + 1.
+    assert_eq(xj_run(xg_small(), semi).unwrap().len(), 5)
+
+    val marked = Project(Join(MarkJoin, ab, scan("app", "b", "c"), Some(call("eq", [col("c", "bk"), col("a", "ak")])), Some("hit"), Some("m")), "p", items_of([item("v", col("a", "v")), item("hit", col("m", "hit"))]))
+    val rows = xj_run(xg_small(), marked).unwrap()
+    assert_eq(rows.len(), 5)
+
+    for r in rows
+        assert(xj_fields(r)[1] == Bool(true))
+
+// -- end to end ---------------------------------------------------------------------------------------
+
+/** `r` over the tables of `d`, run to the result format's batches and decoded. */
+private xg_decoded(d: XjData, r: Rel) -> (Type, Buf[Value])
+    val (result, batches) = run_query(envelope([], Query(r)), xj_catalog(d), xe_ctx([]), xj_tables(d)).unwrap()
+    val tree = column_tree(result).unwrap()
+    val rows = buf[Value]()
+
+    for payload in batches
+        rows.extend(decode_batch(tree, payload.view()).unwrap().rows().view())
+
+    (result, rows)
+
+@test
+a_typed_join_tree_runs_and_its_result_decodes()
+    // A full join at the root: its flat columns, null-extended on both sides, over several batches.
+    val ks = buf[i128]()
+
+    for i in 0..<(2 * BatchSize)
+        ks.push(i128(i % 1500))
+
+    val d = xj_data(xj_rows("a", ks.view()), xj_rows("b", [3, -1, 1600]), [700], [])
+    val (result, rows) = xg_decoded(d, xj_join(Full, Some(xj_on_eq())))
+    assert(result == bag(xj_row_type(Full, d)))
+
+    val want = xj_oracle(Full, d, xj_eq_k).unwrap()
+    assert_eq(rows.len(), want.len())
+    assert(xj_bag_eq(xj_row_type(Full, d), rows, want))
+
+    // A mark join under a Project, as an `IN` would be planned.
+    val proj = Project(xj_join(MarkJoin, Some(xj_on_eq())), "p", items_of([item("v", col("a", "v")), item("found", col("m", "mark"))]))
+    val (pt, prows) = xg_decoded(xj_data(xj_rows("a", [1, 2, -1]), xj_rows("b", [1, -1]), [], []), proj)
+    assert(pt == bag(record([Field("v", Text), Field("found", nullable(Bool))])))
+    assert(xj_bag_eq(record([Field("v", Text), Field("found", nullable(Bool))]), prows, items_of([rec([Text("a0"), Bool(true)]), rec([Text("a1"), Null]), rec([Text("a2"), Null])])))

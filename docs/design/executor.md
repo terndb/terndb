@@ -8,8 +8,8 @@ written into `query-tree.md` itself, and this note points at it.
 
 The code is `sh/sysl/terndb/exec_*.sysl`. This first slice covers what does not depend on storage:
 column vectors, expression evaluation, and the operators `Values`, `ParamScan`, `Filter`,
-`Project`, `Sort`, `Limit`, `Distinct` and `Tag`, a source over in-memory batches standing in for
-`Scan`, and the conversion of an operator's output into result batches. Joins, aggregates,
+`Project`, `Sort`, `Limit`, `Distinct`, `Tag` and `Join` (§4.1), a source over in-memory batches
+standing in for `Scan`, and the conversion of an operator's output into result batches. Aggregates,
 windows, `Nest`/`Unnest`, `Apply`, set operations, DML, storage, MVCC and the planner come later.
 
 ## 1. Column vectors
@@ -73,15 +73,16 @@ and the value-at-a-time paths of §3.5).
 
 **A batch is at most `BatchSize` = 1024 rows** — small enough that a batch of fixed-width columns
 stays in L1/L2 across a chain of kernels, large enough that the per-batch dispatch (one `match` on
-the type and the function per expression node) is noise. Every node exposes one binder in this
-slice (§6, "Exposes"), so a batch is **one `ColumnVector` of the node's element type** `E`: a
-record, a union (§6.15) or a scalar.
+the type and the function per expression node) is noise. A batch is **one `ColumnVector`**: for a
+node exposing one binder (§6, "Exposes"), of the node's element type `E` — a record, a union
+(§6.15) or a scalar; for a join, which exposes several, a composite of its binders' rows (§4.1).
 
 Operators are **pulled**: `trait Operator { next_batch(*self) -> Result[Option[ColumnVector],
 CodecError] }`. `Some` is a batch of at least one row — an operator never hands up an empty batch,
 which matches §6.4 rule 1 for the result — and `None` is the end. An operator holds its input as an
-`&Operator`, so a tree is built from trait objects and dispatches once per batch. `Sort` and
-`Distinct` drain their input on their first call; the rest stream.
+`&Operator`, so a tree is built from trait objects and dispatches once per batch. `Sort`,
+`Distinct` and a merge join drain their input on their first call, and every join its right input;
+the rest stream.
 
 Expressions are evaluated over a batch against an `Env`: the binders visible at the node (§8.3),
 each a name and a vector, and the execution's context — the parameter values (§10.1) and the
@@ -180,15 +181,74 @@ correct and slow, and are the first candidates for kernels when a benchmark asks
 **Output.** `result_batches` pulls the root and turns each batch into a `Batch` payload with
 `encode_batch` (`encode.sysl`) through `value_at`, so the output decodes with `decode_batch`. A
 direct encoder that copies the lanes (§1) is the fast path the layout was chosen for, and it is
-not written yet.
+not written yet. A root that exposes several binders is flattened first (§4.1).
+
+### 4.1 Joins
+
+The code is `exec_join.sysl`. Every kind of §6.5 — `inner`, `left`, `right`, `full`, `semi`,
+`anti`, `mark`, `single` — is one operator, `JoinOp`, with two ways of finding the pairs of rows
+whose `on` it tests.
+
+**Composites.** A join exposes several binders (§6.5 rule 3, §8.2), so its batch is a *composite*:
+a record with one member per exposed binder, named after it, holding that binder's rows as their
+element type (made nullable on an outer join's null-supplying side, so that `Row(b)` of a
+null-extended row is null). It is handed up under the binder name `Composite`, the empty string,
+which no binder can have (§8.2 rule 2), and `Env.binder` looks a name up among a composite's
+members. A join of a join flattens the inner composite into its own, so composites never nest.
+`Filter`, `Sort` and `Limit` pass composites through untouched. Two consumers need the flat record
+of every binder's columns in §8.4 order instead, which `flatten` builds: the result at the root
+(and `Tag`, which coerces whole rows), and `Distinct`, whose `same` is over output columns.
+`CompositeDistinctOp` compares rows by their flat columns but hands up composites, so the binders
+stay visible above it.
+
+**Merge join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
+of `and`) with `a` reading only left binders and `b` only right ones. Both inputs are drained. Each
+key is evaluated over each side, coerced to the two operands' common type, and both sides sorted by
+the keys with `cmp` (§3.3) through one vector of both sides' keys, so that a left and a right row
+compare as two rows of it. Runs of equal keys on the two sides are a group, and every pair of a
+group is a candidate. **`cmp` orders nulls, but `eq` never matches them**: under `eq`, a row whose
+key holds a null at any depth (a null field of a record key, a null payload of a union key) never
+enters a group, since `eq` of it is null or `false` and never `true` (§3.2); under `same` nulls are
+ordinary values and match each other (§3.1). The other conjuncts of `on`, the residual, are tested
+on the candidates only.
+
+**Block nested-loop join**, for every other `on` (and an absent one, a cross join). The right input
+is drained; each left batch is paired with every right row, row-major.
+
+**Common to both.** Candidates are tested `BatchSize` pairs at a time: the pairs' rows are gathered
+into one composite with `take` and `on` (or the residual) is evaluated over it like any expression.
+Per left row the operator counts matches (to two) and notes whether `on` was null for some pair; per
+right row it notes a match. Once a left row's pairs are all tested — at the end of its batch for the
+nested loop, after the last group for the merge — it is finished: null-extended (`left`, `full`,
+`single` with no match), kept or dropped (`semi`, `anti`), or marked. A second match for one left
+row under `single` is `R0003` at once. After the last left row, `right` and `full` null-extend the
+right rows nothing matched. Output is queued as pieces of at most `BatchSize` rows and handed up in
+batches of exactly `BatchSize` until the last, never empty.
+
+**A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a merge
+join's keys do not say for a left row they did not match. When `on` is `bool` it never is. With one
+scalar `eq` key and no residual, the mark is null exactly when the left key is null or some right
+key is (and there is a right row). Otherwise `on` is evaluated on that left row's pairs with every
+right row.
+
+**When `on` is evaluated** is §6.5 rule 8, written into the spec by this work: only on pairs, so
+never when a side is empty (the merge join evaluates no key then), and a conjunct may go unevaluated
+on a pair another conjunct already makes not `true` — which is what lets the merge join skip the
+pairs whose keys differ.
+
+**Hash join is the intended equi-join** once sysl has a fast seeded hash (the survey's gap, §6):
+build on the smaller side, probe streaming, with the same composite batches and the same per-row
+bookkeeping. Until then the merge join is the equi-join; it is blocking on both sides, where a hash
+join would block on the build side only.
 
 ## 5. What this note relies on in `query-tree.md`
 
-§3.1–§3.3 for every comparison and for `Sort` and `Distinct`; §4.1–§4.2 for the coercions the
-executor applies; §4.4 for arithmetic; §6.2–§6.4, §6.9–§6.11 and §6.15 for the operators; §7.1–§7.8
-and §7.12 for the expressions; §10.1 for parameters. Rules written into it by this work: the
-evaluation of `and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the
-calendar `add` (all in §7.12).
+§3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
+the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.5, §6.9–§6.11 and §6.15 for the
+operators; §7.1–§7.8 and §7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and its
+output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
+`and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the calendar `add`
+(all in §7.12); when a join's `on` is evaluated and `single`'s `R0003` (§6.5 rules 8 and 9).
 
 ## 6. Where the survey's sysl gaps cost speed
 
