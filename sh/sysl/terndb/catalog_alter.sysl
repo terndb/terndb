@@ -354,7 +354,7 @@ impl MemCatalog
                 u
             None ->
                 val cast = Cast(Col("row", name), ty, Strict)
-                definition_type(*self, columns, cast).map_err(e -> CodecError("Q6008", s"no conversion of '$name' to its new type (${e.code})"))?
+                definition_type(*self, columns, cast).map_err(e -> refusal("Q6008", s"no conversion of '$name' to its new type (${e.code})", []))?
                 cast
 
         val views = self.views_reading(self.qual_name(ti), name)

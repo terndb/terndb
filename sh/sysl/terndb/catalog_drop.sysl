@@ -458,7 +458,7 @@ impl MemCatalog
 end MemCatalog
 
 private broken(t: CatTable, e: CodecError) -> CodecError =
-    CodecError("Q6007", s"the change would break a definition of table '${t.name}' (${e.code}: ${e.message})")
+    refusal("Q6007", s"the change would break a definition of table '${t.name}' (${e.code}: ${e.message})", [])
 
 contains_name(xs: Buf[QualName], x: QualName) -> bool
     for y in xs
