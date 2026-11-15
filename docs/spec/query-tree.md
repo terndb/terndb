@@ -481,7 +481,9 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
 
 1. `CteDef = { name, columns: [(name, Type)]?, rel: Rel }`. Names are unique in one `With` (`Q2004`).
    A `CteRef` names a CTE of an enclosing `With` (`Q2008`); its output is the CTE's, under its own
-   binder.
+   binder. In a non-recursive `With`, a CTE is in scope in the CTEs after it and in the body, not in its
+   own `rel`; in a recursive one, every CTE of the `With` is in scope in every `rel` and the body. The
+   nearest enclosing `With` that defines a name is the one a reference names.
 2. Every `CteRef` of a non-recursive CTE observes one and the same value within a statement. The
    planner MAY inline a CTE whose body is free of volatile functions.
 3. With `recursive = true`, each CTE MUST declare `columns` (`Q5001`) and its `rel` MUST be a `SetOp`
@@ -639,14 +641,17 @@ resolves one. Names compare byte-for-byte.
 1. Columns are referenced by **binder and name**: `Col(binder, name)`. Ordinals are never used in a
    tree. *Rationale: names survive column reordering, read well in `EXPLAIN`, and are what a client
    building trees by hand already has; resolution to positions is the server's job.*
-2. A binder is a non-empty string introduced by a node's `as` field (or a `Match` arm). Every binder
-   MUST be unique across the whole statement (`Q2004`). *Rationale: no shadowing, so a reference has
+2. A binder is a non-empty string (`Q5009`) introduced by a node's `as` field (or a `Match` arm, or
+   a DML node's `old` or `excluded`). Every binder MUST be unique across the whole statement
+   (`Q2004`). A `Match` arm's binder is visible in that arm's expression only. *Rationale: no shadowing, so a reference has
    exactly one possible meaning and the error is always "unknown", never "ambiguous".*
 3. The nodes listed with `as` in §6 introduce a binder; their consumers see their columns only
    through it. `Filter`, `Sort`, `Limit` and `Distinct` pass their input's exposed binders through
    unchanged. `Join` and `Apply` expose per §6.5; `Window` and `Unnest` add their own binder to the
    input's.
-4. A `Join` or `Apply` binder is required for `mark` and otherwise MUST be absent (`Q5009`).
+4. A `Join` or `Apply` binder and its `mark` column name are both required for `mark` and otherwise
+   MUST both be absent (`Q5009`). A reference from a `Join`'s right input to a binder of its left
+   input is `Q5006` (§6.5 rule 2), not `Q2006`.
 
 ### 8.3 Scope
 
@@ -721,7 +726,7 @@ set: [(name, Expr)], where: Expr? } }`
 ### 9.5 Returning and Action
 
 `returning` items see `as`, `old`, and the `from`/`using` binders. `Action()` is valid only in
-`returning` (`Q5002`) and has type `union<inserted: {}, updated: {}, deleted: {}>`. The result is a bag
+`returning` (`Q5002`), outside any subquery of a returning item, and has type `union<inserted: {}, updated: {}, deleted: {}>`. The result is a bag
 of the returning records.
 
 ## 10. Parameters, shape and batches
@@ -740,7 +745,9 @@ of the returning records.
 The **shape form** of a validated statement is its canonical encoding (§12) at the server's current
 schema version, after: (a) every `ParamDecl.name` is made absent; (b) `spans` is made absent; (c) every
 binder is replaced by `b<i>` and every CTE name by `c<i>`, numbered in order of first introduction in
-pre-order. Output column names, parameter types, literal types and values, table names and everything
+pre-order. A binder is introduced by an `as`, a `Match` arm, a DML node's `as`, `old` or `excluded`; a
+CTE name by its `CteDef`. A reference (`Col`, `Row`, `CteRef`) takes the number of what it resolves
+to (§8.3, §6.13), so an inner CTE that reuses an outer name gets its own. Output column names, parameter types, literal types and values, table names and everything
 else are kept.
 
 1. Two statements have the **same shape** iff their shape forms are byte-identical.
@@ -805,7 +812,7 @@ The same bytes cross the C ABI and the wire. `wire-protocol.md` frames them and 
 | `str` | `uvar` byte length, then UTF-8 |
 | `list<X>` | `uvar` count, then each `X` |
 | `opt<X>` | `0x00`, or `0x01` then `X` |
-| `enum` | `uvar` ordinal |
+| `enum` | `uvar` ordinal, from 0 in the order the spec lists the values; one past the last is `Q1002` |
 | `node` | `uvar` kind, `uvar` payload length, then the payload: the node's fields in the order this spec lists them |
 
 The encoding is **canonical**: one tree has exactly one encoding. A decoder MUST refuse with `Q1003` a
@@ -820,6 +827,11 @@ Envelope  := uvar major, uvar minor, list<ParamDecl>, node Statement, opt<Spans>
 ParamDecl := opt<str> name, Type
 Spans     := list<(uvar node_preorder_index, uvar start, uvar end)>   ordered by index
 ```
+
+A span's index counts the statement's `Statement`, `Rel` and `Expr` nodes from 0 (the `Statement`) in
+the order their kinds appear in the encoding; `Type` nodes are not counted. The indexes MUST strictly
+increase (`Q1003`, so a set of spans has one encoding). An index past the last node, or a `start`
+after its `end`, is `Q1001`.
 
 ### 12.3 Types
 
@@ -867,8 +879,14 @@ Rel kinds: 1 `Scan`, 2 `Values`, 3 `ParamScan`, 4 `Filter`, 5 `Project`, 6 `Join
 7 `If`, 8 `Match`, 9 `Record`, 10 `Field`, 11 `Variant`, 12 `Relation`, 13 `Scalar`, 14 `Exists`, 15 `In`,
 16 `Action`, 17 `Literal` (payload `Type`, then the value's §12.6 encoding). The auxiliary records `AggCall`, `WinCall`, `Frame`, `Bound`, `SortKey`, `CteDef`,
 `OnConflict` are encoded inline as their fields in order (not as nodes); a choice inside them
-(`OnConflict.target`, `action`) is an `enum` followed by the chosen alternative's fields. Kind 0 and
-kinds 64 and above in every family are reserved.
+(`OnConflict.target`, `action`) is an `enum` followed by the chosen alternative's fields (`target`: 0
+`columns`, then `list<str>`, 1 `constraint`, then `str`; `action`: 0 `nothing`, 1 `update`, then `set`
+and `where`). An optional list (`CteDef.columns`) is `opt<list<…>>`; `Values.rows` is
+`list<list<node>>`. Kind 0 and kinds 64 and above in every family are reserved.
+
+A `Literal`'s value can be read only through its type, so the decoder checks that type as it reads
+it: one that is not a non-null scalar is refused with `Q3017` during decoding, the one `Q3…` code the
+decode phase (§11.2) raises.
 
 ### 12.5 Statement kinds
 
@@ -901,6 +919,31 @@ use the columnar result encoding of `wire-protocol.md` §6, which holds each **f
 payload** in exactly the octets this table gives that scalar, so one scalar decoder serves parameters,
 literals and result columns. If the wire spec needs a different fixed-width scalar encoding, it changes
 this table in the same commit.
+
+### 12.7 Worked encoding
+
+`(query :rel (filter :input (scan :table app.t :as t) :predicate (call eq t.id $0)))`, with one
+parameter `$0` named `id` of type `int64` and no spans, is these 40 octets:
+
+```
+01 00                      major 1, minor 0
+01  01 02 69 64  03 00     one ParamDecl: name "id", Type int64 (kind 3, empty payload)
+01 1c                      Statement Query, 28-octet payload
+  04 1a                    Rel Filter, 26 octets
+    01 08 03 61 70 70 01 74 01 74          Scan: "app", "t", binder "t"
+    05 0e 02 65 71 02                      Call "eq", two arguments
+      01 05 01 74 02 69 64                 Col "t" "id"
+      03 01 00                             Param 0
+00                         no spans
+```
+
+Its shape form (§10.2) drops the parameter's name and renames the binder `t` to `b0`, which grows
+the `Scan`, the `Col` and every length around them:
+
+```
+01 00  01 00 03 00  01 1e  04 1c  01 09 03 61 70 70 01 74 02 62 30
+05 0f 02 65 71 02  01 06 02 62 30 02 69 64  03 01 00  00
+```
 
 ## 13. Versioning and negotiation
 

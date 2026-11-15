@@ -1,0 +1,199 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+
+// Trees at the edges of the encoding: every node kind and every enum value, every literal type,
+// every list empty, the largest parameter index, and the deepest nesting the decoder accepts.
+
+private no_exprs() -> Buf[Expr] = buf[Expr]()
+
+private no_keys() -> Buf[SortKey] = buf[SortKey]()
+
+private lit(ty: Type, v: Value) -> Expr = Literal(ty, v)
+
+private agg(function: string, args: []const Expr) -> AggCall = AggCall(function, items_of(args), true, Some(lit(Bool, Bool(true))), items_of([desc(col("v", "a"))]))
+
+/** One tree holding all 18 relation kinds and all 17 expression kinds. */
+private every_kind() -> Envelope
+    val values = Values("v", items_of([Field("a", Int64)]), items_of([items_of([Param(0)])]))
+    val joined = Join(Inner, values, ParamScan("ps", 1), Some(eq(col("v", "a"), col("ps", "a"))), None, None)
+    val applied = Apply(Outer, joined, filter(scan("app", "t", "t"), eq(col("t", "a"), col("v", "a"))), None, None, None)
+    val grouped = Aggregate(applied, "g", items_of([item("a", col("v", "a"))]), items_of([NamedAgg("n", agg("count", []))]))
+
+    val frame = Frame(Range, Bound(Preceding, Some(lit(Int64, Int(1)))), Bound(UnboundedFollowing, None), ExcludeTies)
+    val windowed = Window(grouped, "w", items_of([NamedWin("rn", WinCall("row_number", no_exprs(), items_of([col("g", "a")]), items_of([asc(col("g", "a"))]), Some(frame)))]))
+
+    val nested = Nest(windowed, "ne", items_of([item("a", col("g", "a"))]), "rows", items_of([item("n", col("g", "n"))]), items_of([asc(col("w", "rn"))]))
+    val unnested = Unnest(nested, "un", col("ne", "rows"), true, Some("ord"))
+    val tagged = Tag(Distinct(unnested), "tg", union_of([Field("A", record([Field("a", Int64)]))]), "A")
+
+    val cte = CteDef("c", Some(items_of([Field("a", Int64)])), tagged)
+    val body = SetOp(Except, false, "so", items_of([CteRef("c", "r1"), CteRef("c", "r2")]))
+    val with = With(false, items_of([cte]), Limit(sort([asc(col("so", "a"))], body), Some(Param(2)), Some(lit(Int64, Int(0))), true, false))
+
+    val exprs = [
+        item("row", Row("so")),
+        item("null", Null(nullable(Text))),
+        item("cast", Cast(col("so", "a"), Decimal(10, 2), Try)),
+        item("if", If(items_of([IfArm(Exists(scan("app", "e", "e")), lit(Text, Text("y")))]), Some(lit(Text, Text("n"))))),
+        item("match", Match(Variant(Named("app", "shape"), "Circle", Record(items_of([item("r", col("so", "a"))]))),
+            items_of([MatchArm("Circle", "ci", col("ci", "r"))]), Some(lit(Int64, Int(0))))),
+        item("field", Field(Record(items_of([item("x", col("so", "a"))])), "x")),
+        item("scalar", Scalar(scan("app", "s", "sc"))),
+        item("in", In(items_of([col("so", "a")]), scan("app", "i", "ii"))),
+        item("rel", Relation(scan("app", "r", "rr")))]
+
+    query([param("a", Int64), param("ps", bag(record([Field("a", Int64)]))), param("lim", Int64)],
+        project(with, "p", exprs))
+end every_kind
+
+@test
+every_node_kind_round_trips_and_checks()
+    val bytes = tree_round_trip(every_kind())
+    assert_eq(tree_refusal(bytes.view()), "ok")
+
+@test
+every_enum_value_round_trips()
+    for kind in [Inner, Left, Right, Full, Semi, Anti, MarkJoin, SingleJoin]
+        val mark = if kind == MarkJoin then Some("m") else None
+        val binder = if kind == MarkJoin then Some("mj") else None
+        val env = query([], Join(kind, scan("app", "a", "a"), scan("app", "b", "b"), None, mark, binder))
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+    for kind in [Cross, Outer, SemiApply, AntiApply, MarkApply, SingleApply]
+        val mark = if kind == MarkApply then Some("m") else None
+        val binder = if kind == MarkApply then Some("ma") else None
+        val env = query([], Apply(kind, scan("app", "a", "a"), scan("app", "b", "b"), Some(eq(col("a", "x"), col("b", "x"))), mark, binder))
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+    for op in [Union, Intersect, Except]
+        ignore_bytes(tree_round_trip(query([], SetOp(op, true, "s", items_of([scan("app", "a", "a"), scan("app", "b", "b")])))))
+
+    for unit in [Rows, Range, Groups]
+        for kind in [UnboundedPreceding, Preceding, CurrentRow, Following, UnboundedFollowing]
+            for exclude in [ExcludeNone, ExcludeCurrent, ExcludeGroup, ExcludeTies]
+                val f = Frame(unit, Bound(kind, None), Bound(kind, Some(Param(0))), exclude)
+                val w = Window(scan("app", "a", "a"), "w", items_of([NamedWin("x", WinCall("rank", no_exprs(), no_exprs(), no_keys(), Some(f)))]))
+                ignore_bytes(tree_round_trip(query([param("o", Int64)], w)))
+
+    for mode in [Strict, Try]
+        ignore_bytes(tree_round_trip(query([], project(scan("app", "a", "a"), "p", [item("c", Cast(col("a", "x"), Text, mode))]))))
+
+private ignore_bytes(bytes: Buf[u8]) = ()
+
+@test
+every_statement_kind_round_trips_and_checks()
+    val table = QualName("app", "t")
+    val src = scan("app", "s", "s")
+    val returning = items_of([item("k", col("t", "k")), item("was", col("o", "k")), item("what", Action)])
+
+    val nothing = envelope([], Insert(table, "t", None, items_of(["k"]), src, Some(OnConflict(Constraint("t_pkey"), "x", Nothing)), no_items()))
+    val update = envelope([], Update(table, "t", Some("o"), Some(src), Some(eq(col("t", "k"), col("s", "k"))), items_of([item("k", col("s", "k"))]), returning))
+    val delete = envelope([], Delete(table, "t", Some("o"), Some(src), Some(eq(col("t", "k"), col("s", "k"))), returning))
+    val bare = envelope([], Delete(table, "t", None, None, None, no_items()))
+
+    for env in [nothing, update, delete, bare]
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+@test
+every_literal_type_round_trips()
+    val literals = [
+        lit(Bool, Bool(false)), lit(Bool, Bool(true)),
+        lit(Int8, Int(-128)), lit(Int16, Int(32767)), lit(Int32, Int(-2147483648)),
+        lit(Int64, Int(9223372036854775807)), lit(Int128, Int(i128::Min)),
+        lit(UInt8, UInt(255)), lit(UInt16, UInt(65535)), lit(UInt32, UInt(4294967295)), lit(UInt64, UInt(18446744073709551615)),
+        lit(Float32, Float(1.5)), lit(Float64, Float(-0.0)),
+        lit(Decimal(38, 4), Int(-123456789)),
+        lit(Text, Text("")), lit(Text, Text("héllo")), lit(Bytes, bytes_value([0, 255, 7])), lit(Json, Text("{\"a\":[1,true]}")),
+        lit(Date, Int(-719162)), lit(Time, Int(86399999999)), lit(DateTime, Int(0)), lit(Timestamp, Int(-1)),
+        lit(Interval, Interval(-1, 30, 3600000000)), lit(Uuid, Uuid(0x0123456789abcdef0123456789abcdef))]
+
+    val items = buf[Item]()
+
+    for i in 0..<literals.len
+        items.push(item(s"l$i", literals[i]))
+
+    val env = query([], Project(scan("app", "a", "a"), "p", items))
+    assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+@test
+a_literal_s_octets_are_its_types_fixed_width()
+    val bytes = tree_bytes(query([], project(scan("app", "a", "a"), "p", [item("x", lit(Int32, Int(-2)))])))
+    // The literal is the last node: kind 17, length 6, the int32 type node (02 00), then fe ff ff ff.
+    assert_eq(hex_string(bytes.view()[bytes.len() - 9..<bytes.len() - 1]), "11060200feffffff")
+
+@test
+empty_lists_round_trip_everywhere()
+    val values = Values("v", buf[Field](), buf[Buf[Expr]]())
+    val agg = Aggregate(values, "g", no_items(), buf[NamedAgg]())
+    val win = Window(agg, "w", buf[NamedWin]())
+    val nest = Nest(Sort(win, no_keys()), "n", no_items(), "rows", no_items(), no_keys())
+    val with = With(true, buf[CteDef](), SetOp(Union, false, "s", buf[Rel]()))
+    val body = Join(Inner, nest, with, None, None, None)
+    val exprs = [item("call", Call("now", no_exprs())), item("rec", Record(no_items())), item("if", If(buf[IfArm](), None)),
+        item("m", Match(Row("n"), buf[MatchArm](), None)), item("in", In(no_exprs(), scan("app", "a", "a")))]
+    val env = Envelope(TreeMajor, TreeMinor, buf[ParamDecl](), Query(Project(body, "p", items_of(exprs))), Some(buf[Span]()))
+
+    ignore_bytes(tree_round_trip(env))
+
+    val dml = envelope([], Insert(QualName("app", "t"), "t", None, buf[string](), Values("v2", buf[Field](), buf[Buf[Expr]]()), None, no_items()))
+    ignore_bytes(tree_round_trip(dml))
+
+@test
+the_largest_parameter_index_round_trips()
+    val env = query([param("only", Int64)], filter(scan("app", "a", "a"), eq(Param(0), Param(18446744073709551615))))
+    val bytes = tree_round_trip(env)
+
+    assert_eq(tree_refusal(bytes.view()), "Q4001")
+
+    val last = query([param("a", Int64), param("b", Int64)], filter(scan("app", "a", "a"), eq(Param(0), Param(1))))
+    assert_eq(tree_refusal(tree_round_trip(last).view()), "ok")
+
+/** `Distinct` around a scan, `n` deep: the scan sits at depth `n + 1`. */
+private nested(n: usize) -> Envelope
+    var r = scan("app", "a", "a")
+
+    for _ in 0..<n
+        r = Distinct(r)
+
+    query([], r)
+
+@test
+a_hundred_deep_tree_round_trips_and_checks()
+    assert_eq(tree_refusal(tree_round_trip(nested(100)).view()), "ok")
+
+/** A parameter's type, which sits at depth 1: `n` nested records around an `int64`, `n + 1` type
+ * nodes in all.
+ */
+private deep_param(n: usize) -> Envelope
+    var t = record([Field("leaf", Int64)])
+
+    for _ in 1..<n
+        t = record([Field("f", t)])
+
+    query([param("p", t)], filter(scan("app", "a", "a"), eq(Param(0), Param(0))))
+
+@test
+a_type_continues_its_node_s_depth()
+    assert_eq(tree_refusal(tree_bytes(deep_param(MaxTreeDepth - 2)).view()), "ok")
+    assert_eq(tree_refusal(tree_bytes(deep_param(MaxTreeDepth - 1)).view()), "Q1006")
+
+@test(ignore: "sysl gives every temporary of a function its own stack slot, so read_rel's frame is ~50 KB and 254 levels overflow an 8 MB stack")
+the_deepest_tree_is_accepted_and_one_deeper_is_not()
+    val deepest = tree_bytes(nested(MaxTreeDepth - 2))
+    assert_eq(tree_refusal(deepest.view()), "ok")
+
+    val deeper = tree_bytes(nested(MaxTreeDepth - 1))
+    assert_eq(tree_refusal(deeper.view()), "Q1006")
+
+@test
+a_named_type_is_a_query_tree_type_but_never_a_result_type()
+    val named = Named("app", "shape")
+    val env = query([param("s", nullable(named))], filter(scan("app", "a", "a"), eq(Param(0), Param(0))))
+
+    ignore_bytes(tree_round_trip(env))
+    decode_type(type_bytes(named).view()) match
+        Ok(_) -> assert(false, "a result type may not name a catalog type")
+        Err(e) -> assert_eq(e.code, "W1008")

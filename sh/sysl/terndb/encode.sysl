@@ -143,7 +143,7 @@ private struct Encoder
             val lane = self.lanes[k]
 
             if node.nullable then bufs.push(if lane.nulls == 0 then empty else lane.validity)
-            if lane.n >= Limit then return fail("W2014", "a column holds too many slots")
+            if lane.n >= BatchLimit then return fail("W2014", "a column holds too many slots")
 
             node.kind match
                 Fixed(_) | Nested -> bufs.push(lane.main)
@@ -164,7 +164,7 @@ private struct Encoder
         push_uvar(out, u64(bufs.len()))
 
         for b in bufs
-            if b.len() >= Limit then return fail("W2014", "a buffer is too long")
+            if b.len() >= BatchLimit then return fail("W2014", "a buffer is too long")
             push_uvar(out, u64(b.len()))
 
         pad_to_8(out)
@@ -178,7 +178,7 @@ private struct Encoder
 end Encoder
 
 /** Every slot count, offset and buffer length is below 2³¹ (`wire-protocol.md` §6.3 rule 8). */
-private[terndb] const Limit: usize = 1 << 31
+private[terndb] const BatchLimit: usize = 1 << 31
 
 private mismatch[T](k: usize, what: string) -> Result[T, CodecError] =
     fail("Q3001", s"column node $k: $what")
@@ -194,7 +194,10 @@ private fits_signed(n: i128, w: usize) -> bool
     val half = i128(1) << (8 * w - 1)
     n >= -half && n < half
 
-private push_scalar(out: Buf[u8], ty: Type, v: Value, w: usize, k: usize) -> Result[unit, CodecError]
+/** `v`, a value of the fixed-width scalar `ty`, as its `w` octets (`query-tree.md` §12.6), which is
+ * also its slot in a result column. A value of the wrong kind or range is `Q3001`, naming column `k`.
+ */
+private[terndb] push_scalar(out: Buf[u8], ty: Type, v: Value, w: usize, k: usize) -> Result[unit, CodecError]
     ty match
         Bool -> v match
             Bool(b) -> out.push(if b then 1 else 0)
@@ -230,7 +233,7 @@ private push_scalar(out: Buf[u8], ty: Type, v: Value, w: usize, k: usize) -> Res
     Ok(())
 end push_scalar
 
-private octets_of(ty: Type, v: Value, k: usize) -> Result[[]const u8, CodecError] = ty match
+private[terndb] octets_of(ty: Type, v: Value, k: usize) -> Result[[]const u8, CodecError] = ty match
     Bytes -> v match
         Bytes(b) -> Ok(b.view())
         _ -> mismatch(k, "bytes were expected")

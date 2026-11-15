@@ -81,9 +81,7 @@ struct Column
 
         v
 
-    interval_at(self, i: usize) -> Value
-        val b = self.fixed_at(i)
-        Interval(i32.wrap(get_u32_le(b).unwrap()), i32.wrap(get_u32_le(b[4..]).unwrap()), i64.wrap(get_u64_le(b[8..]).unwrap()))
+    interval_at(self, i: usize) -> Value = fixed_value(Interval, self.fixed_at(i))
 
     /** A varbin slot's octets, as a view of the payload. */
     bytes_at(self, i: usize) -> []const u8 = self.aux()[offset_at(self.main(), i)..<offset_at(self.main(), i + 1)]
@@ -131,13 +129,7 @@ struct Column
         val ty = self.ty()
 
         self.info().kind match
-            Fixed(_) -> ty match
-                Bool -> Bool(self.bool_at(i))
-                UInt8 | UInt16 | UInt32 | UInt64 -> UInt(self.uint_at(i))
-                Float32 | Float64 -> Float(self.float_at(i))
-                Interval -> self.interval_at(i)
-                Uuid -> Uuid(self.uuid_at(i))
-                _ -> Int(self.int_at(i))
+            Fixed(_) -> fixed_value(ty, self.fixed_at(i))
             VarBin -> ty match
                 Bytes -> bytes_value(self.bytes_at(i))
                 _ -> Text(self.text_at(i))
@@ -161,6 +153,24 @@ struct Column
                 Relation(elems)
     end value
 end Column
+
+/** The value of the fixed-width scalar `ty` whose octets are `b` (`query-tree.md` §12.6): the one
+ * scalar decoder that result columns, parameters and literals share.
+ */
+private[terndb] fixed_value(ty: Type, b: []const u8) -> Value = ty match
+    Bool -> Bool(b[0] == 1)
+    UInt8 | UInt16 | UInt32 | UInt64 -> UInt(u64(unsigned_le(b)))
+    Float32 -> Float(real(f32.from_bits(get_u32_le(b).unwrap())))
+    Float64 -> Float(real.from_bits(get_u64_le(b).unwrap()))
+    Interval -> Interval(i32.wrap(get_u32_le(b).unwrap()), i32.wrap(get_u32_le(b[4..]).unwrap()), i64.wrap(get_u64_le(b[8..]).unwrap()))
+    Uuid ->
+        var v: u128 = 0
+
+        for x in b
+            v = v << 8 | u128(x)
+
+        Uuid(v)
+    _ -> Int(signed_le(b))
 
 private offset_at(b: []const u8, i: usize) -> usize = usize(get_u32_le(b[4 * i..]).unwrap())
 
@@ -226,7 +236,7 @@ end decode_batch
 private bad[T](what: string) -> Result[T, CodecError] = fail("W1008", what)
 
 private below_limit(v: u64) -> Result[usize, CodecError]
-    if v >= u64(Limit) then return bad("a length or count is not below 2^31")
+    if v >= u64(BatchLimit) then return bad("a length or count is not below 2^31")
     Ok(usize(v))
 
 // Padding to the next multiple of 8 from the start of the payload, which must be zero.

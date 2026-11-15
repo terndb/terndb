@@ -1,0 +1,267 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Inputs the decoder and the structural checks refuse, each with its `errors.md` code. The byte
+// cases start from §12.7's worked encoding (`worked_hex`, 40 octets) and break one thing; the offsets
+// named are that listing's.
+
+private worked_bytes() -> Buf[u8] = hex(worked_hex)
+
+private broken(at: usize, v: u8) -> string = tree_refusal(with_octet(worked_bytes(), at, v).view())
+
+private refused(spaced: string) -> string = tree_refusal(hex(spaced).view())
+
+@test
+every_truncation_of_a_tree_is_refused()
+    val whole = worked_bytes()
+
+    for n in 0..<whole.len()
+        assert_eq(tree_refusal(whole.view()[0..<n]), "Q1001")
+
+    val bigger = tree_bytes(users_and_posts())
+
+    for n in 0..<bigger.len()
+        assert_eq(tree_refusal(bigger.view()[0..<n]), "Q1001")
+
+@test
+octets_after_the_envelope_are_refused()
+    val longer = worked_bytes()
+    longer.push(0)
+    assert_eq(tree_refusal(longer.view()), "Q1001")
+
+@test
+a_payload_length_that_disagrees_with_its_contents_is_refused()
+    // The statement claims one octet more (the spans tag), the filter one fewer.
+    assert_eq(broken(10, 0x1d), "Q1001")
+    assert_eq(broken(12, 0x19), "Q1001")
+
+@test
+a_non_minimal_uvar_is_refused_wherever_it_is()
+    // The major version, the parameter count, a parameter index and a node length, each with a
+    // redundant continuation octet, and every enclosing length grown to match.
+    assert_eq(refused("81 00 00 01 01 02 69 64 03 00 01 1c 04 1a 01 08 03 61 70 70 01 74 01 74 05 0e 02 65 71 02 01 05 01 74 02 69 64 03 01 00 00"), "Q1003")
+    assert_eq(refused("01 00 81 00 01 02 69 64 03 00 01 1c 04 1a 01 08 03 61 70 70 01 74 01 74 05 0e 02 65 71 02 01 05 01 74 02 69 64 03 01 00 00"), "Q1003")
+    assert_eq(refused("01 00 01 01 02 69 64 03 00 01 1d 04 1b 01 08 03 61 70 70 01 74 01 74 05 0f 02 65 71 02 01 05 01 74 02 69 64 03 02 80 00 00"), "Q1003")
+    assert_eq(refused("01 00 01 01 02 69 64 03 00 01 1d 04 1b 01 88 00 03 61 70 70 01 74 01 74 05 0e 02 65 71 02 01 05 01 74 02 69 64 03 01 00 00"), "Q1003")
+
+@test
+a_bool_or_opt_tag_other_than_0_or_1_is_refused()
+    assert_eq(broken(3, 2), "Q1003")
+    assert_eq(broken(39, 2), "Q1003")
+
+    val bytes = tree_bytes(query([], filter(scan("app", "a", "a"), Literal(Bool, Bool(true)))))
+    assert_eq(tree_refusal(with_octet(bytes, bytes.len() - 2, 2).view()), "Q1003")
+
+@test
+a_doubled_nullable_is_refused()
+    assert_eq(refused("01 00 01 01 02 69 64 14 04 14 02 03 00 01 1c 04 1a 01 08 03 61 70 70 01 74 01 74 05 0e 02 65 71 02 01 05 01 74 02 69 64 03 01 00 00"), "Q1003")
+
+@test
+another_tree_version_is_refused()
+    assert_eq(broken(0, 2), "Q1005")
+    assert_eq(broken(0, 0), "Q1005")
+    assert_eq(broken(1, 1), "Q1005")
+
+@test
+unknown_and_reserved_kinds_are_refused()
+    assert_eq(broken(9, 0), "Q1002")
+    assert_eq(broken(9, 5), "Q1002")
+    assert_eq(broken(9, 0x20), "Q1002")
+    assert_eq(broken(11, 0), "Q1002")
+    assert_eq(broken(11, 0x13), "Q1002")
+    assert_eq(broken(23, 0), "Q1002")
+    assert_eq(broken(23, 0x12), "Q1002")
+    assert_eq(broken(7, 0x1b), "Q1002")
+    assert_eq(broken(7, 0x21), "Q1002")
+
+@test
+an_enum_ordinal_past_its_last_value_is_refused()
+    // A join's kind is the first octet of its payload: envelope 01 00 00, statement 01 <len>,
+    // join 06 <len>, kind.
+    val join = tree_bytes(query([], Join(SingleJoin, scan("app", "a", "a"), scan("app", "b", "b"), None, None, None)))
+    assert_eq(join[7], 7)
+    assert_eq(tree_refusal(with_octet(join, 7, 8).view()), "Q1002")
+
+    val apply = tree_bytes(query([], Apply(SingleApply, scan("app", "a", "a"), scan("app", "b", "b"), None, None, None)))
+    assert_eq(apply[7], 5)
+    assert_eq(tree_refusal(with_octet(apply, 7, 6).view()), "Q1002")
+
+@test
+invalid_utf8_in_a_name_is_refused()
+    assert_eq(broken(5, 0xff), "Q1004")
+    assert_eq(broken(20, 0xc3), "Q1004")
+    assert_eq(broken(26, 0x80), "Q1004")
+
+// The literal `x: int32 -2` projected from a scan, and the same with the literal's type made an empty
+// record, which is no scalar.
+const literal_hex = "01 00 00 01 19 05 17 01 08 03 61 70 70 01 61 01 61 01 70 01 01 78 11 06 02 00 fe ff ff ff 00"
+const record_literal_hex = "01 00 00 01 1a 05 18 01 08 03 61 70 70 01 61 01 61 01 70 01 01 78 11 07 10 01 00 fe ff ff ff 00"
+
+@test
+a_literal_is_encoded_by_its_type()
+    val env = query([], project(scan("app", "a", "a"), "p", [item("x", Literal(Int32, Int(-2)))]))
+    same_bytes(tree_round_trip(env), hex(literal_hex), "an int32 literal")
+
+@test
+a_literal_whose_type_is_not_a_non_null_scalar_is_refused()
+    assert_eq(refused(record_literal_hex), "Q3017")
+
+    val nullable_literal = query([], project(scan("app", "a", "a"), "p", [item("x", Literal(nullable(Int32), Int(1)))]))
+    assert_eq(encode_envelope(nullable_literal).unwrap_err().code, "Q3017")
+
+    val wrong_value = query([], project(scan("app", "a", "a"), "p", [item("x", Literal(Int8, Int(300)))]))
+    assert_eq(encode_envelope(wrong_value).unwrap_err().code, "Q3001")
+
+@test
+a_json_literal_not_in_canonical_form_is_refused()
+    val spaced = query([], project(scan("app", "a", "a"), "p", [item("j", Literal(Json, Text("[1, 2]")))]))
+    assert_eq(tree_refusal(tree_bytes(spaced).view()), "Q1007")
+
+    val canonical = query([], project(scan("app", "a", "a"), "p", [item("j", Literal(Json, Text("[1,2]")))]))
+    assert_eq(tree_refusal(tree_bytes(canonical).view()), "ok")
+
+private with_spans(spans: []const Span) -> string
+    var env = worked()
+    env.spans = Some(items_of(spans))
+    tree_refusal(tree_bytes(env).view())
+
+@test
+spans_out_of_order_or_out_of_range_are_refused()
+    assert_eq(with_spans([Span(0, 0, 1), Span(5, 2, 3)]), "ok")
+    assert_eq(with_spans([Span(2, 0, 1), Span(1, 2, 3)]), "Q1003")
+    assert_eq(with_spans([Span(1, 0, 1), Span(1, 2, 3)]), "Q1003")
+    assert_eq(with_spans([Span(6, 0, 1)]), "Q1001")
+    assert_eq(with_spans([Span(0, 3, 2)]), "Q1001")
+
+// -- the structural checks ----------------------------------------------------------------------
+
+private q(rel: Rel) -> Envelope = query([], rel)
+
+@test
+a_binder_introduced_twice_is_refused()
+    assert_eq(check_refusal(q(Join(Inner, scan("app", "a", "x"), scan("app", "b", "x"), None, None, None))), "Q2004")
+
+    val arm = Match(Row("a"), items_of([MatchArm("T", "a", col("a", "v"))]), None)
+    assert_eq(check_refusal(q(project(scan("app", "t", "a"), "p", [item("m", arm)]))), "Q2004")
+
+    val ctes = items_of([CteDef("c", None, scan("app", "a", "a")), CteDef("c", None, scan("app", "b", "b"))])
+    assert_eq(check_refusal(q(With(false, ctes, CteRef("c", "r")))), "Q2004")
+
+@test
+an_unknown_binder_is_refused()
+    assert_eq(check_refusal(q(filter(scan("app", "a", "a"), eq(col("nobody", "x"), col("a", "x"))))), "Q2002")
+    assert_eq(check_refusal(q(project(scan("app", "a", "a"), "p", [item("r", Row("nobody"))]))), "Q2002")
+
+@test
+a_binder_that_exists_but_is_not_visible_is_refused()
+    // A projection's items do not see its own binder; a limit's count does not see its input; a
+    // sibling subquery's binder is not visible.
+    assert_eq(check_refusal(q(project(scan("app", "a", "a"), "p", [item("x", col("p", "x"))]))), "Q2006")
+    assert_eq(check_refusal(q(Limit(scan("app", "a", "a"), Some(col("a", "n")), None, false, false))), "Q2006")
+
+    val two = project(scan("app", "a", "a"), "p", [item("r", Relation(scan("app", "b", "b"))), item("x", col("b", "x"))])
+    assert_eq(check_refusal(q(two)), "Q2006")
+
+    // A match arm's binder is visible in its own arm only.
+    val arms = items_of([MatchArm("T", "m1", col("m1", "v")), MatchArm("U", "m2", col("m1", "v"))])
+    assert_eq(check_refusal(q(project(scan("app", "a", "a"), "p", [item("m", Match(Row("a"), arms, None))]))), "Q2006")
+
+@test
+correlated_references_are_visible()
+    val corr = project(scan("app", "a", "a"), "p", [item("r", Relation(filter(scan("app", "b", "b"), eq(col("b", "x"), col("a", "x")))))])
+    assert_eq(check_refusal(q(corr)), "ok")
+
+    val apply = Apply(Cross, scan("app", "a", "a"), filter(scan("app", "b", "b"), eq(col("b", "x"), col("a", "x"))), None, None, None)
+    assert_eq(check_refusal(q(apply)), "ok")
+
+@test
+a_join_s_right_input_may_not_refer_to_its_left()
+    val join = Join(Inner, scan("app", "a", "a"), filter(scan("app", "b", "b"), eq(col("b", "x"), col("a", "x"))), None, None, None)
+    assert_eq(check_refusal(q(join)), "Q5006")
+
+@test
+a_cte_reference_needs_an_enclosing_with()
+    assert_eq(check_refusal(q(CteRef("c", "r"))), "Q2008")
+
+    // A non-recursive CTE does not see itself; a recursive one does, and declares its columns.
+    val itself = items_of([CteDef("c", None, CteRef("c", "inner"))])
+    assert_eq(check_refusal(q(With(false, itself, CteRef("c", "r")))), "Q2008")
+
+    val cols = Some(items_of([Field("n", Int64)]))
+    val seed = SetOp(Union, false, "u", items_of([scan("app", "a", "a"), CteRef("c", "inner")]))
+    assert_eq(check_refusal(q(With(true, items_of([CteDef("c", cols, seed)]), CteRef("c", "r")))), "ok")
+    assert_eq(check_refusal(q(With(true, items_of([CteDef("c", None, seed)]), CteRef("c", "r")))), "Q5001")
+
+    // Out of its With, the name is gone again.
+    val scoped = Join(Inner, With(false, items_of([CteDef("c", None, scan("app", "a", "a"))]), CteRef("c", "r1")), CteRef("c", "r2"), None, None, None)
+    assert_eq(check_refusal(q(scoped)), "Q2008")
+
+@test
+duplicate_output_names_are_refused()
+    assert_eq(check_refusal(q(project(scan("app", "a", "a"), "p", [item("x", col("a", "x")), item("x", col("a", "y"))]))), "Q2005")
+
+    val record: Expr = Record(items_of([item("f", col("a", "x")), item("f", col("a", "y"))]))
+    assert_eq(check_refusal(q(project(scan("app", "a", "a"), "p", [item("r", record)]))), "Q2005")
+
+@test
+parameter_references_are_checked()
+    assert_eq(check_refusal(query([param("a", Int64)], filter(scan("app", "a", "a"), eq(Param(1), Param(0))))), "Q4001")
+    assert_eq(check_refusal(query([], ParamScan("ps", 0))), "Q4001")
+    assert_eq(check_refusal(query([param("a", Int64), param("b", Int64)], filter(scan("app", "a", "a"), eq(Param(1), Param(1))))), "Q4002")
+
+@test
+arity_and_required_fields_are_checked()
+    assert_eq(check_refusal(q(Project(scan("app", "a", "a"), "p", no_items()))), "Q5009")
+    assert_eq(check_refusal(q(SetOp(Union, true, "s", items_of([scan("app", "a", "a")])))), "Q5009")
+    assert_eq(check_refusal(q(scan("app", "a", ""))), "Q5009")
+
+    val narrow = Values("v", items_of([Field("a", Int64), Field("b", Int64)]), items_of([items_of([Literal(Int64, Int(1))])]))
+    assert_eq(check_refusal(q(narrow)), "Q5009")
+
+    // A mark join needs its column and binder; another kind may have neither.
+    assert_eq(check_refusal(q(Join(MarkJoin, scan("app", "a", "a"), scan("app", "b", "b"), None, Some("m"), None))), "Q5009")
+    assert_eq(check_refusal(q(Join(MarkJoin, scan("app", "a", "a"), scan("app", "b", "b"), None, None, Some("mj")))), "Q5009")
+    assert_eq(check_refusal(q(Join(Inner, scan("app", "a", "a"), scan("app", "b", "b"), None, None, Some("j")))), "Q5009")
+    assert_eq(check_refusal(q(Apply(Outer, scan("app", "a", "a"), scan("app", "b", "b"), None, Some("m"), None))), "Q5009")
+
+    val update = envelope([], Update(QualName("app", "t"), "t", None, None, None, no_items(), no_items()))
+    assert_eq(check_refusal(update), "Q5009")
+
+@test
+dml_assignments_and_action_are_checked()
+    val twice = envelope([], Insert(QualName("app", "t"), "t", None, items_of(["k", "k"]), scan("app", "s", "s"), None, no_items()))
+    assert_eq(check_refusal(twice), "Q5005")
+
+    val set = items_of([item("k", col("s", "k")), item("k", col("s", "j"))])
+    val update = envelope([], Update(QualName("app", "t"), "t", None, Some(scan("app", "s", "s")), None, set, no_items()))
+    assert_eq(check_refusal(update), "Q5005")
+
+    assert_eq(check_refusal(q(project(scan("app", "a", "a"), "p", [item("w", Action)]))), "Q5002")
+
+    // `old` is seen by `returning` only.
+    val old_in_filter = envelope([], Delete(QualName("app", "t"), "t", Some("o"), None, Some(eq(col("o", "k"), col("t", "k"))), no_items()))
+    assert_eq(check_refusal(old_in_filter), "Q2006")
+
+    // Action inside a subquery of a returning item is not in the returning list itself.
+    val nested = items_of([item("r", Relation(project(scan("app", "s", "s"), "p", [item("w", Action)])))])
+    assert_eq(check_refusal(envelope([], Delete(QualName("app", "t"), "t", None, None, None, nested))), "Q5002")
+
+@test
+the_first_phase_with_an_error_wins_and_then_the_first_in_pre_order()
+    // An unused parameter (phase 4) and an unknown binder (phase 2): the name error is reported.
+    val both_phases = query([param("a", Int64)], filter(scan("app", "a", "a"), eq(col("zz", "x"), col("a", "x"))))
+    assert_eq(check_envelope(both_phases).unwrap_err().code, "Q2002")
+
+    // Two name errors: the first in pre-order.
+    val two = filter(filter(scan("app", "a", "a"), col("gone", "x")), col("p", "x"))
+    val env = q(project(two, "p", [item("x", col("a", "x"))]))
+    assert(check_envelope(env).unwrap_err().message.contains("gone"))
+
+    // A structure error in the tree and an unused parameter: `/params/0` comes first.
+    val unused = query([param("a", Int64)], Project(scan("app", "a", "a"), "p", no_items()))
+    assert_eq(check_refusal(unused), "Q4002")
+
+    // A decode error stops before any check.
+    assert_eq(broken(20, 0xff), "Q1004")

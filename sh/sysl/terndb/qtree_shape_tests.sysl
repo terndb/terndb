@@ -1,0 +1,111 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+
+// The shape form and shape digest of `query-tree.md` §10.2: what a statement's shape keeps and what
+// it forgets.
+
+private digest(env: Envelope) -> string = hex_string(shape_digest(env).unwrap())
+
+/** §16.1's statement with every binder renamed, the parameters renamed and spans added. */
+private renamed_users_and_posts() -> Envelope
+    var other = users_and_posts_as(["users", "x", "agg", "cm", "inner", "post", "projected", "out"])
+    other.params = items_of([ParamDecl(Some("n"), Int64), ParamDecl(None, Int64)])
+    other.spans = Some(items_of([Span(0, 0, 400), Span(3, 10, 20)]))
+    other
+
+@test
+a_renamed_statement_has_the_same_shape()
+    val env = users_and_posts()
+    val other = renamed_users_and_posts()
+
+    assert(other != env, "the trees really differ")
+    same_bytes(shape_form(other).unwrap(), shape_form(env).unwrap(), "the shape forms")
+    assert_eq(digest(other), digest(env))
+
+@test
+the_digest_is_the_sha256_of_the_shape_form()
+    for env in [worked(), users_and_posts(), search(), upsert()]
+        val form = shape_form(env).unwrap()
+        assert_eq(digest(env), hex_string(sha256_of(form)))
+        assert_eq(shape_digest(env).unwrap().len, 32)
+
+private sha256_of(b: Buf[u8]) -> [32]u8 = sysl.crypto.sha256(b.view())
+
+@test
+parameter_values_are_not_part_of_the_shape()
+    // Two executions of §16.3 bind different values to the same tree: one shape, one digest. A
+    // parameter's name and the spans are not part of it either.
+    val first = upsert()
+    var second = upsert()
+    second.params = items_of([ParamDecl(None, Text), ParamDecl(Some("by"), Int64)])
+
+    assert_eq(digest(first), digest(second))
+
+@test
+literals_are_part_of_the_shape()
+    val with_literal = query([], filter(scan("app", "t", "t"), eq(col("t", "id"), Literal(Int64, Int(7)))))
+    val other_literal = query([], filter(scan("app", "t", "t"), eq(col("t", "id"), Literal(Int64, Int(8)))))
+    val with_param = query([param("id", Int64)], filter(scan("app", "t", "t"), eq(col("t", "id"), Param(0))))
+
+    assert(digest(with_literal) != digest(other_literal), "a literal's value is kept")
+    assert(digest(with_literal) != digest(with_param), "a literal is not a parameter")
+
+@test
+statements_of_different_shape_have_different_digests()
+    val base = digest(worked())
+
+    val other_table = query([param("id", Int64)], filter(scan("app", "u", "t"), eq(col("t", "id"), Param(0))))
+    val other_column = query([param("id", Int64)], filter(scan("app", "t", "t"), eq(col("t", "key"), Param(0))))
+    val other_type = query([param("id", Int32)], filter(scan("app", "t", "t"), eq(col("t", "id"), Param(0))))
+    val other_function = query([param("id", Int64)], filter(scan("app", "t", "t"), call("ne", [col("t", "id"), Param(0)])))
+
+    val digests = [base, digest(other_table), digest(other_column), digest(other_type), digest(other_function)]
+
+    for i in 0..<digests.len
+        for j in 0..<i
+            assert(digests[i] != digests[j], s"shapes $i and $j differ")
+
+@test
+binders_are_numbered_in_pre_order()
+    // Two binders swapped between the sides of a join: the shapes differ, because `b0` is then the
+    // other table's.
+    val ab = query([], Join(Inner, scan("app", "a", "x"), scan("app", "b", "y"), Some(eq(col("x", "k"), col("y", "k"))), None, None))
+    val ba = query([], Join(Inner, scan("app", "a", "y"), scan("app", "b", "x"), Some(eq(col("y", "k"), col("x", "k"))), None, None))
+    val renamed = query([], Join(Inner, scan("app", "a", "p"), scan("app", "b", "q"), Some(eq(col("p", "k"), col("q", "k"))), None, None))
+    val flipped = query([], Join(Inner, scan("app", "a", "x"), scan("app", "b", "y"), Some(eq(col("y", "k"), col("x", "k"))), None, None))
+
+    assert_eq(digest(ab), digest(ba))
+    assert_eq(digest(ab), digest(renamed))
+    assert(digest(ab) != digest(flipped), "which side a reference names is kept")
+
+@test
+cte_names_are_numbered_and_resolved_by_scope()
+    val one = q2(With(false, items_of([CteDef("first", None, scan("app", "a", "a"))]), CteRef("first", "r")))
+    val two = q2(With(false, items_of([CteDef("other", None, scan("app", "a", "a"))]), CteRef("other", "r")))
+
+    assert_eq(digest(one), digest(two))
+
+    // An inner With may reuse an outer CTE's name; a reference resolves to the nearest one, so these
+    // two are of different shape.
+    val outer_ref = q2(With(false, items_of([CteDef("c", None, scan("app", "a", "a"))]),
+        Join(Inner, With(false, items_of([CteDef("d", None, scan("app", "b", "b"))]), CteRef("c", "r1")), CteRef("c", "r2"), None, None, None)))
+    val inner_ref = q2(With(false, items_of([CteDef("c", None, scan("app", "a", "a"))]),
+        Join(Inner, With(false, items_of([CteDef("c", None, scan("app", "b", "b"))]), CteRef("c", "r1")), CteRef("c", "r2"), None, None, None)))
+
+    assert(digest(outer_ref) != digest(inner_ref), "a reference keeps which CTE it names")
+
+private q2(rel: Rel) -> Envelope = query([], rel)
+
+@test
+the_shape_form_decodes_as_a_tree()
+    // The shape form is itself a canonical encoding (§10.2), with the parameter names and spans gone.
+    val form = shape_form(users_and_posts()).unwrap()
+    val back = read_envelope(form.view()).unwrap()
+
+    assert(back.spans == None)
+    assert(back.params[0].name == None)
+    assert_eq(tree_refusal(form.view()), "ok")
+    same_bytes(shape_form(back).unwrap(), form, "the shape form of a shape form is itself")

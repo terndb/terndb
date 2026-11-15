@@ -1,0 +1,534 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.crypto.sha256
+
+// The canonical encoding of a query tree (`query-tree.md` §12), and the shape form and shape digest
+// of §10.2, which are the same encoding with the names that do not change a statement's meaning
+// replaced.
+
+/** `env` in its canonical encoding. A `Literal` whose value is not of its type, or whose type is not
+ * a non-null scalar, is refused (`Q3001`, `Q3017`); nothing else can fail.
+ */
+encode_envelope(env: Envelope) -> Result[Buf[u8], CodecError]
+    var w = TreeWriter(false, map[string, string](), buf[CteName](), 0, 0, None)
+    val out = buf[u8]()
+    w.envelope(env, out)
+    w.finish(out)
+
+/** The shape form of `env` (§10.2): its encoding with every parameter name and the spans absent,
+ * every binder renamed `b<i>` and every CTE name `c<i>`, numbered in pre-order of introduction.
+ */
+shape_form(env: Envelope) -> Result[Buf[u8], CodecError]
+    var w = TreeWriter(true, map[string, string](), buf[CteName](), 0, 0, None)
+    val out = buf[u8]()
+    w.envelope(env, out)
+    w.finish(out)
+
+/** The SHA-256 of `env`'s shape form (§10.2 rule 2). */
+shape_digest(env: Envelope) -> Result[[32]u8, CodecError]
+    val form = shape_form(env)?
+    Ok(sha256(form.view()))
+
+// A CTE name as the shape form spells it, in scope while its `With` is being written.
+private struct CteName
+    name: string
+    shape: string
+
+private struct TreeWriter
+    shape: bool
+    binders: Map[string, string]
+    ctes: Buf[CteName]
+    next_binder: usize
+    next_cte: usize
+    err: Option[CodecError]
+
+    finish(self, out: Buf[u8]) -> Result[Buf[u8], CodecError] = self.err match
+        Some(e) -> Err(e)
+        None -> Ok(out)
+
+    // -- names ------------------------------------------------------------------------------
+
+    /** A binder where it is introduced. */
+    intro(*self, b: string, out: Buf[u8])
+        if !self.shape then return push_str(out, b)
+
+        val renamed = s"b${self.next_binder}"
+        self.next_binder += 1
+        self.binders.put(b, renamed)
+        push_str(out, renamed)
+
+    /** A binder where it is referred to. */
+    refer(self, b: string, out: Buf[u8])
+        if !self.shape then return push_str(out, b)
+
+        self.binders.get(b) match
+            Some(renamed) -> push_str(out, renamed)
+            None -> push_str(out, b)
+
+    /** A CTE name where it is defined; the name comes into scope with `bind_cte`. */
+    cte_intro(*self, name: string, out: Buf[u8]) -> string
+        if !self.shape
+            push_str(out, name)
+            return name
+
+        val renamed = s"c${self.next_cte}"
+        self.next_cte += 1
+        push_str(out, renamed)
+        renamed
+
+    bind_cte(self, name: string, shape: string) = self.ctes.push(CteName(name, shape))
+
+    cte_ref(self, name: string, out: Buf[u8])
+        if self.shape
+            var i = self.ctes.len()
+
+            while i > 0
+                i -= 1
+
+                if self.ctes[i].name == name then return push_str(out, self.ctes[i].shape)
+
+        push_str(out, name)
+
+    opt_intro(*self, b: Option[string], out: Buf[u8]) = b match
+        Some(x) ->
+            out.push(1)
+            self.intro(x, out)
+        None -> out.push(0)
+
+    // -- the envelope and the statement --------------------------------------------------------
+
+    envelope(*self, env: Envelope, out: Buf[u8])
+        push_uvar(out, env.major)
+        push_uvar(out, env.minor)
+        push_uvar(out, u64(env.params.len()))
+
+        for p in env.params
+            if self.shape then out.push(0) else opt_str(p.name, out)
+            encode_type(p.ty, out)
+
+        self.statement(env.statement, out)
+
+        if self.shape then return out.push(0)
+
+        env.spans match
+            Some(spans) ->
+                out.push(1)
+                push_uvar(out, u64(spans.len()))
+
+                for s in spans
+                    push_uvar(out, s.node)
+                    push_uvar(out, s.start)
+                    push_uvar(out, s.end)
+            None -> out.push(0)
+    end envelope
+
+    statement(*self, s: Statement, out: Buf[u8])
+        val body = buf[u8]()
+
+        s match
+            Query(rel) -> self.rel(rel, body)
+            Insert(table, binder, old, columns, source, on_conflict, returning) ->
+                qual(table, body)
+                self.intro(binder, body)
+                self.opt_intro(old, body)
+                push_uvar(body, u64(columns.len()))
+
+                for c in columns
+                    push_str(body, c)
+
+                self.rel(source, body)
+
+                on_conflict match
+                    Some(oc) ->
+                        body.push(1)
+                        self.on_conflict(oc, body)
+                    None -> body.push(0)
+
+                self.items(returning, body)
+            Update(table, binder, old, from, filter, set, returning) ->
+                qual(table, body)
+                self.intro(binder, body)
+                self.opt_intro(old, body)
+                self.opt_rel(from, body)
+                self.opt_expr(filter, body)
+                self.items(set, body)
+                self.items(returning, body)
+            Delete(table, binder, old, using, filter, returning) ->
+                qual(table, body)
+                self.intro(binder, body)
+                self.opt_intro(old, body)
+                self.opt_rel(using, body)
+                self.opt_expr(filter, body)
+                self.items(returning, body)
+
+        node(statement_kind(s), body, out)
+    end statement
+
+    on_conflict(*self, oc: OnConflict, out: Buf[u8])
+        oc.target match
+            Columns(names) ->
+                push_uvar(out, 0)
+                push_uvar(out, u64(names.len()))
+
+                for n in names
+                    push_str(out, n)
+            Constraint(name) ->
+                push_uvar(out, 1)
+                push_str(out, name)
+
+        self.intro(oc.excluded, out)
+
+        oc.action match
+            Nothing -> push_uvar(out, 0)
+            DoUpdate(set, where) ->
+                push_uvar(out, 1)
+                self.items(set, out)
+                self.opt_expr(where, out)
+    end on_conflict
+
+    // -- relations --------------------------------------------------------------------------
+
+    rel(*self, r: Rel, out: Buf[u8])
+        val body = buf[u8]()
+
+        r match
+            Scan(table, binder) ->
+                qual(table, body)
+                self.intro(binder, body)
+            Values(binder, columns, rows) ->
+                self.intro(binder, body)
+                fields(columns, body)
+                push_uvar(body, u64(rows.len()))
+
+                for row in rows
+                    self.exprs(row, body)
+            ParamScan(binder, param) ->
+                self.intro(binder, body)
+                push_uvar(body, param)
+            Filter(input, predicate) ->
+                self.rel(*input, body)
+                self.expr(predicate, body)
+            Project(input, binder, items) ->
+                self.rel(*input, body)
+                self.intro(binder, body)
+                self.items(items, body)
+            Join(kind, left, right, on, mark, binder) -> self.join(join_ordinal(kind), *left, *right, on, mark, binder, body)
+            Apply(kind, left, right, on, mark, binder) -> self.join(apply_ordinal(kind), *left, *right, on, mark, binder, body)
+            Aggregate(input, binder, keys, aggs) ->
+                self.rel(*input, body)
+                self.intro(binder, body)
+                self.items(keys, body)
+                push_uvar(body, u64(aggs.len()))
+
+                for a in aggs
+                    push_str(body, a.name)
+                    self.agg_call(a.call, body)
+            Window(input, binder, items) ->
+                self.rel(*input, body)
+                self.intro(binder, body)
+                push_uvar(body, u64(items.len()))
+
+                for it in items
+                    push_str(body, it.name)
+                    self.win_call(it.call, body)
+            Sort(input, keys) ->
+                self.rel(*input, body)
+                self.sort_keys(keys, body)
+            Limit(input, count, offset, ties, arbitrary) ->
+                self.rel(*input, body)
+                self.opt_expr(count, body)
+                self.opt_expr(offset, body)
+                flag(ties, body)
+                flag(arbitrary, body)
+            Distinct(input) -> self.rel(*input, body)
+            SetOp(op, all, binder, inputs) ->
+                push_uvar(body, setop_ordinal(op))
+                flag(all, body)
+                self.intro(binder, body)
+                push_uvar(body, u64(inputs.len()))
+
+                for i in inputs
+                    self.rel(i, body)
+            With(recursive, ctes, body_rel) -> self.with(recursive, ctes, *body_rel, body)
+            CteRef(name, binder) ->
+                self.cte_ref(name, body)
+                self.intro(binder, body)
+            Nest(input, binder, keys, name, items, order) ->
+                self.rel(*input, body)
+                self.intro(binder, body)
+                self.items(keys, body)
+                push_str(body, name)
+                self.items(items, body)
+                self.sort_keys(order, body)
+            Unnest(input, binder, value, outer, ordinality) ->
+                self.rel(*input, body)
+                self.intro(binder, body)
+                self.expr(value, body)
+                flag(outer, body)
+                opt_str(ordinality, body)
+            Tag(input, binder, ty, tag) ->
+                self.rel(*input, body)
+                self.intro(binder, body)
+                encode_type(ty, body)
+                push_str(body, tag)
+
+        node(r.kind(), body, out)
+    end rel
+
+    join(*self, kind: u64, left: Rel, right: Rel, on: Option[Expr], mark: Option[string], binder: Option[string], out: Buf[u8])
+        push_uvar(out, kind)
+        self.rel(left, out)
+        self.rel(right, out)
+        self.opt_expr(on, out)
+        opt_str(mark, out)
+        self.opt_intro(binder, out)
+
+    // A non-recursive CTE comes into scope after its own body; a recursive one before it, so it can
+    // refer to itself. Every CTE of the `With` is out of scope again once the `With` is written.
+    with(*self, recursive: bool, ctes: Buf[CteDef], body_rel: Rel, out: Buf[u8])
+        val depth = self.ctes.len()
+
+        flag(recursive, out)
+        push_uvar(out, u64(ctes.len()))
+
+        for c in ctes
+            val shape = self.cte_intro(c.name, out)
+
+            c.columns match
+                Some(cols) ->
+                    out.push(1)
+                    fields(cols, out)
+                None -> out.push(0)
+
+            if recursive then self.bind_cte(c.name, shape)
+
+            self.rel(c.rel, out)
+
+            if !recursive then self.bind_cte(c.name, shape)
+
+        self.rel(body_rel, out)
+        self.ctes.truncate(depth)
+    end with
+
+    opt_rel(*self, r: Option[Rel], out: Buf[u8]) = r match
+        Some(x) ->
+            out.push(1)
+            self.rel(x, out)
+        None -> out.push(0)
+
+    agg_call(*self, a: AggCall, out: Buf[u8])
+        push_str(out, a.function)
+        self.exprs(a.args, out)
+        flag(a.distinct, out)
+        self.opt_expr(a.filter, out)
+        self.sort_keys(a.order, out)
+
+    win_call(*self, c: WinCall, out: Buf[u8])
+        push_str(out, c.function)
+        self.exprs(c.args, out)
+        self.exprs(c.partition, out)
+        self.sort_keys(c.order, out)
+
+        c.frame match
+            Some(f) ->
+                out.push(1)
+                push_uvar(out, unit_ordinal(f.unit))
+                self.bound(f.start, out)
+                self.bound(f.end, out)
+                push_uvar(out, exclude_ordinal(f.exclude))
+            None -> out.push(0)
+
+    bound(*self, b: Bound, out: Buf[u8])
+        push_uvar(out, bound_ordinal(b.kind))
+        self.opt_expr(b.offset, out)
+
+    sort_keys(*self, keys: Buf[SortKey], out: Buf[u8])
+        push_uvar(out, u64(keys.len()))
+
+        for k in keys
+            self.expr(k.expr, out)
+            flag(k.desc, out)
+            flag(k.nulls_first, out)
+
+    items(*self, items: Buf[Item], out: Buf[u8])
+        push_uvar(out, u64(items.len()))
+
+        for it in items
+            push_str(out, it.name)
+            self.expr(it.expr, out)
+
+    // -- expressions ------------------------------------------------------------------------
+
+    exprs(*self, es: Buf[Expr], out: Buf[u8])
+        push_uvar(out, u64(es.len()))
+
+        for e in es
+            self.expr(e, out)
+
+    opt_expr(*self, e: Option[Expr], out: Buf[u8]) = e match
+        Some(x) ->
+            out.push(1)
+            self.expr(x, out)
+        None -> out.push(0)
+
+    opt_boxed(*self, e: Option[&Expr], out: Buf[u8]) = e match
+        Some(x) ->
+            out.push(1)
+            self.expr(*x, out)
+        None -> out.push(0)
+
+    expr(*self, e: Expr, out: Buf[u8])
+        val body = buf[u8]()
+
+        e match
+            Col(binder, name) ->
+                self.refer(binder, body)
+                push_str(body, name)
+            Row(binder) -> self.refer(binder, body)
+            Param(index) -> push_uvar(body, index)
+            Null(ty) -> encode_type(ty, body)
+            Call(function, args) ->
+                push_str(body, function)
+                self.exprs(args, body)
+            Cast(inner, ty, mode) ->
+                self.expr(*inner, body)
+                encode_type(ty, body)
+                push_uvar(body, if mode == Strict then 0 else 1)
+            If(arms, otherwise) ->
+                push_uvar(body, u64(arms.len()))
+
+                for a in arms
+                    self.expr(a.cond, body)
+                    self.expr(a.value, body)
+
+                self.opt_boxed(otherwise, body)
+            Match(scrutinee, arms, otherwise) ->
+                self.expr(*scrutinee, body)
+                push_uvar(body, u64(arms.len()))
+
+                for a in arms
+                    push_str(body, a.tag)
+                    self.intro(a.binder, body)
+                    self.expr(a.expr, body)
+
+                self.opt_boxed(otherwise, body)
+            Record(fs) -> self.items(fs, body)
+            Field(inner, name) ->
+                self.expr(*inner, body)
+                push_str(body, name)
+            Variant(ty, tag, inner) ->
+                encode_type(ty, body)
+                push_str(body, tag)
+                self.expr(*inner, body)
+            Relation(rel) -> self.rel(*rel, body)
+            Scalar(rel) -> self.rel(*rel, body)
+            Exists(rel) -> self.rel(*rel, body)
+            In(es, rel) ->
+                self.exprs(es, body)
+                self.rel(*rel, body)
+            Action -> ()
+            Literal(ty, value) ->
+                encode_type(ty, body)
+
+                push_literal(body, ty, value) match
+                    Ok(()) -> ()
+                    Err(why) -> if self.err == None then self.err = Some(why)
+
+        node(e.kind(), body, out)
+    end expr
+end TreeWriter
+
+// -- the pieces every family shares ------------------------------------------------------------
+
+/** A `node`: its kind, its payload's length, then the payload (§12.1). */
+private node(kind: u64, body: Buf[u8], out: Buf[u8])
+    push_uvar(out, kind)
+    push_uvar(out, u64(body.len()))
+    out.extend(body.view())
+
+private flag(b: bool, out: Buf[u8]) = out.push(if b then 1 else 0)
+
+private opt_str(s: Option[string], out: Buf[u8]) = s match
+    Some(x) ->
+        out.push(1)
+        push_str(out, x)
+    None -> out.push(0)
+
+private qual(q: QualName, out: Buf[u8])
+    push_str(out, q.schema)
+    push_str(out, q.name)
+
+private fields(fs: Buf[Field], out: Buf[u8])
+    push_uvar(out, u64(fs.len()))
+
+    for f in fs
+        push_str(out, f.name)
+        encode_type(f.ty, out)
+
+/** Whether `t` is a type a `Literal` may have: a scalar, not nullable (§7.3). */
+private[terndb] is_literal_type(t: Type) -> bool = t match
+    Text | Bytes | Json -> true
+    _ -> t.width() > 0
+
+/** A literal's value in the §12.6 encoding of its type. */
+private[terndb] push_literal(out: Buf[u8], ty: Type, v: Value) -> Result[unit, CodecError]
+    if !is_literal_type(ty) then return fail("Q3017", "a literal's type must be a non-null scalar")
+
+    ty match
+        Text | Json -> v match
+            Text(s) -> push_str(out, s)
+            _ -> return fail("Q3001", "a text literal's value is not text")
+        Bytes -> v match
+            Bytes(b) ->
+                push_uvar(out, u64(b.len()))
+                out.extend(b.view())
+            _ -> return fail("Q3001", "a bytes literal's value is not bytes")
+        _ -> push_scalar(out, ty, v, ty.width(), 0) match
+            Ok(()) -> ()
+            Err(e) -> return fail(e.code, "a literal's value does not match its type")
+
+    Ok(())
+end push_literal
+
+private[terndb] join_ordinal(k: JoinKind) -> u64 = k match
+    Inner -> 0
+    Left -> 1
+    Right -> 2
+    Full -> 3
+    Semi -> 4
+    Anti -> 5
+    MarkJoin -> 6
+    SingleJoin -> 7
+
+private[terndb] apply_ordinal(k: ApplyKind) -> u64 = k match
+    Cross -> 0
+    Outer -> 1
+    SemiApply -> 2
+    AntiApply -> 3
+    MarkApply -> 4
+    SingleApply -> 5
+
+private setop_ordinal(op: SetOpKind) -> u64 = op match
+    Union -> 0
+    Intersect -> 1
+    Except -> 2
+
+private unit_ordinal(u: FrameUnit) -> u64 = u match
+    Rows -> 0
+    Range -> 1
+    Groups -> 2
+
+private bound_ordinal(k: BoundKind) -> u64 = k match
+    UnboundedPreceding -> 0
+    Preceding -> 1
+    CurrentRow -> 2
+    Following -> 3
+    UnboundedFollowing -> 4
+
+private exclude_ordinal(x: FrameExclude) -> u64 = x match
+    ExcludeNone -> 0
+    ExcludeCurrent -> 1
+    ExcludeGroup -> 2
+    ExcludeTies -> 3

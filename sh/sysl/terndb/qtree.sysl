@@ -1,0 +1,275 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The query tree of `query-tree.md` §5–§9: the envelope, its statement, and the relational and
+// expression nodes the statement is made of. Field order is the spec's, which is also the order the
+// canonical encoding (§12) writes them in. The spec's `as` field, the binder a node introduces, is
+// `binder` here.
+
+/** The tree schema version an envelope declares (§13). */
+const TreeMajor: u64 = 1
+const TreeMinor: u64 = 0
+
+/** A catalog name, `(schema, name)` (§8.1). */
+struct QualName derives Eq
+    schema: string
+    name: string
+
+/** A named expression: a projection item, a key, a record field, an assignment. */
+struct Item derives Eq
+    name: string
+    expr: Expr
+
+struct ParamDecl derives Eq
+    name: Option[string]
+    ty: Type
+
+/** A node's source range, by the node's pre-order index in the encoded statement (§5 rule 4). */
+struct Span derives Eq
+    node: u64
+    start: u64
+    end: u64
+
+struct Envelope derives Eq
+    major: u64
+    minor: u64
+    params: Buf[ParamDecl]
+    statement: Statement
+    spans: Option[Buf[Span]]
+
+enum Statement derives Eq
+    Query(rel: Rel)
+    Insert(table: QualName, binder: string, old: Option[string], columns: Buf[string], source: Rel, on_conflict: Option[OnConflict], returning: Buf[Item])
+    Update(table: QualName, binder: string, old: Option[string], from: Option[Rel], filter: Option[Expr], set: Buf[Item], returning: Buf[Item])
+    Delete(table: QualName, binder: string, old: Option[string], using: Option[Rel], filter: Option[Expr], returning: Buf[Item])
+
+/** The node kind a statement is encoded under (§12.5). */
+statement_kind(s: Statement) -> u64 = s match
+    Query(_) -> 1
+    Insert(_, _, _, _, _, _, _) -> 2
+    Update(_, _, _, _, _, _, _) -> 3
+    Delete(_, _, _, _, _, _) -> 4
+
+// -- the enumerations, each encoded as its ordinal in the spec's order --------------------------
+
+enum JoinKind
+    Inner
+    Left
+    Right
+    Full
+    Semi
+    Anti
+    MarkJoin
+    SingleJoin
+
+enum ApplyKind
+    Cross
+    Outer
+    SemiApply
+    AntiApply
+    MarkApply
+    SingleApply
+
+enum SetOpKind
+    Union
+    Intersect
+    Except
+
+enum CastMode
+    Strict
+    Try
+
+enum FrameUnit
+    Rows
+    Range
+    Groups
+
+enum BoundKind
+    UnboundedPreceding
+    Preceding
+    CurrentRow
+    Following
+    UnboundedFollowing
+
+enum FrameExclude
+    ExcludeNone
+    ExcludeCurrent
+    ExcludeGroup
+    ExcludeTies
+
+// -- the auxiliary records, encoded inline (§12.4) ------------------------------------------------
+
+struct SortKey derives Eq
+    expr: Expr
+    desc: bool
+    nulls_first: bool
+
+struct AggCall derives Eq
+    function: string
+    args: Buf[Expr]
+    distinct: bool
+    filter: Option[Expr]
+    order: Buf[SortKey]
+
+struct NamedAgg derives Eq
+    name: string
+    call: AggCall
+
+struct Bound derives Eq
+    kind: BoundKind
+    offset: Option[Expr]
+
+struct Frame derives Eq
+    unit: FrameUnit
+    start: Bound
+    end: Bound
+    exclude: FrameExclude
+
+struct WinCall derives Eq
+    function: string
+    args: Buf[Expr]
+    partition: Buf[Expr]
+    order: Buf[SortKey]
+    frame: Option[Frame]
+
+struct NamedWin derives Eq
+    name: string
+    call: WinCall
+
+struct CteDef derives Eq
+    name: string
+    columns: Option[Buf[Field]]
+    rel: Rel
+
+/** `OnConflict.target`: the columns of a unique key, or a constraint's name. */
+enum ConflictTarget derives Eq
+    Columns(names: Buf[string])
+    Constraint(name: string)
+
+/** `OnConflict.action`. */
+enum ConflictAction derives Eq
+    Nothing
+    DoUpdate(set: Buf[Item], where: Option[Expr])
+
+struct OnConflict derives Eq
+    target: ConflictTarget
+    excluded: string
+    action: ConflictAction
+
+struct IfArm derives Eq
+    cond: Expr
+    value: Expr
+
+struct MatchArm derives Eq
+    tag: string
+    binder: string
+    expr: Expr
+
+// -- relational nodes, §6 ---------------------------------------------------------------------
+
+enum Rel derives Eq
+    Scan(table: QualName, binder: string)
+    Values(binder: string, columns: Buf[Field], rows: Buf[Buf[Expr]])
+    ParamScan(binder: string, param: u64)
+    Filter(input: &Rel, predicate: Expr)
+    Project(input: &Rel, binder: string, items: Buf[Item])
+    Join(kind: JoinKind, left: &Rel, right: &Rel, on: Option[Expr], mark: Option[string], binder: Option[string])
+    Apply(kind: ApplyKind, left: &Rel, right: &Rel, on: Option[Expr], mark: Option[string], binder: Option[string])
+    Aggregate(input: &Rel, binder: string, keys: Buf[Item], aggs: Buf[NamedAgg])
+    Window(input: &Rel, binder: string, items: Buf[NamedWin])
+    Sort(input: &Rel, keys: Buf[SortKey])
+    Limit(input: &Rel, count: Option[Expr], offset: Option[Expr], ties: bool, arbitrary: bool)
+    Distinct(input: &Rel)
+    SetOp(op: SetOpKind, all: bool, binder: string, inputs: Buf[Rel])
+    With(recursive: bool, ctes: Buf[CteDef], body: &Rel)
+    CteRef(name: string, binder: string)
+    Nest(input: &Rel, binder: string, keys: Buf[Item], name: string, items: Buf[Item], order: Buf[SortKey])
+    Unnest(input: &Rel, binder: string, value: Expr, outer: bool, ordinality: Option[string])
+    Tag(input: &Rel, binder: string, ty: Type, tag: string)
+
+    /** The node kind this relation is encoded under (§12.4). */
+    kind(self) -> u64 = self match
+        Scan(_, _) -> 1
+        Values(_, _, _) -> 2
+        ParamScan(_, _) -> 3
+        Filter(_, _) -> 4
+        Project(_, _, _) -> 5
+        Join(_, _, _, _, _, _) -> 6
+        Apply(_, _, _, _, _, _) -> 7
+        Aggregate(_, _, _, _) -> 8
+        Window(_, _, _) -> 9
+        Sort(_, _) -> 10
+        Limit(_, _, _, _, _) -> 11
+        Distinct(_) -> 12
+        SetOp(_, _, _, _) -> 13
+        With(_, _, _) -> 14
+        CteRef(_, _) -> 15
+        Nest(_, _, _, _, _, _) -> 16
+        Unnest(_, _, _, _, _) -> 17
+        Tag(_, _, _, _) -> 18
+    end kind
+end Rel
+
+// -- expressions, §7 ----------------------------------------------------------------------------
+
+enum Expr derives Eq
+    Col(binder: string, name: string)
+    Row(binder: string)
+    Param(index: u64)
+    Null(ty: Type)
+    Call(function: string, args: Buf[Expr])
+    Cast(expr: &Expr, ty: Type, mode: CastMode)
+    If(arms: Buf[IfArm], otherwise: Option[&Expr])
+    Match(expr: &Expr, arms: Buf[MatchArm], otherwise: Option[&Expr])
+    Record(fields: Buf[Item])
+    Field(expr: &Expr, name: string)
+    Variant(ty: Type, tag: string, expr: &Expr)
+    Relation(rel: &Rel)
+    Scalar(rel: &Rel)
+    Exists(rel: &Rel)
+    In(exprs: Buf[Expr], rel: &Rel)
+    Action
+    Literal(ty: Type, value: Value)
+
+    /** The node kind this expression is encoded under (§12.4). */
+    kind(self) -> u64 = self match
+        Col(_, _) -> 1
+        Row(_) -> 2
+        Param(_) -> 3
+        Null(_) -> 4
+        Call(_, _) -> 5
+        Cast(_, _, _) -> 6
+        If(_, _) -> 7
+        Match(_, _, _) -> 8
+        Record(_) -> 9
+        Field(_, _) -> 10
+        Variant(_, _, _) -> 11
+        Relation(_) -> 12
+        Scalar(_) -> 13
+        Exists(_) -> 14
+        In(_, _) -> 15
+        Action -> 16
+        Literal(_, _) -> 17
+    end kind
+end Expr
+
+// -- building trees by hand ---------------------------------------------------------------------
+
+/** `items` as the `Buf` a node holds. */
+items_of[T](items: []const T) -> Buf[T]
+    val b = buf[T]()
+    b.extend(items)
+    b
+
+/** An envelope at the current tree version, with no spans. */
+envelope(params: []const ParamDecl, statement: Statement) -> Envelope =
+    Envelope(TreeMajor, TreeMinor, items_of(params), statement, None)
+
+col(binder: string, name: string) -> Expr = Col(binder, name)
+
+call(function: string, args: []const Expr) -> Expr = Call(function, items_of(args))
+
+item(name: string, expr: Expr) -> Item = Item(name, expr)
+
+scan(schema: string, table: string, binder: string) -> Rel = Scan(QualName(schema, table), binder)

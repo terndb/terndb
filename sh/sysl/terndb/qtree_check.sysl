@@ -1,0 +1,419 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// The structural checks of `query-tree.md` §11 that need no catalog and no types: binders and their
+// scope (§8), parameter references (§10.1), and the required and forbidden fields of §6, §7 and §9.
+// They run in the phases of §11.2: every name error (`Q2…`) before any parameter or structure error
+// (`Q4…`, `Q5…`), and within a phase the one that comes first in pre-order.
+
+/** `env` checked as above; the first error of the first phase that has one. */
+check_envelope(env: Envelope) -> Result[unit, CodecError]
+    // The first walk only learns which binders the statement introduces anywhere, so the second can
+    // tell a binder that is not visible (`Q2006`) from one that does not exist (`Q2002`).
+    var gather = Checker(true, set[string](), set[string](), buf[bool](), buf[string](), false, None, None)
+    gather.statement(env.statement)
+
+    val used = buf[bool]()
+
+    for _ in 0..<env.params.len()
+        used.push(false)
+
+    var c = Checker(false, gather.all, set[string](), used, buf[string](), false, None, None)
+    c.statement(env.statement)
+
+    c.names_error match
+        Some(e) -> return Err(e)
+        None -> ()
+
+    // `/params/<i>` comes before `/statement` in pre-order.
+    for i in 0..<used.len()
+        if !used[i] then return fail("Q4002", s"parameter $i is declared and never referenced")
+
+    c.structure_error match
+        Some(e) -> Err(e)
+        None -> Ok(())
+end check_envelope
+
+private struct Checker
+    gathering: bool
+    all: Set[string]
+    seen: Set[string]
+    used: Buf[bool]
+    ctes: Buf[string]
+    in_returning: bool
+    names_error: Option[CodecError]
+    structure_error: Option[CodecError]
+
+    // -- recording ----------------------------------------------------------------------------
+
+    report(*self, code: string, message: string)
+        if self.gathering then return
+
+        val e = CodecError(code, message)
+
+        if code.starts_with("Q2")
+            if self.names_error == None then self.names_error = Some(e)
+        else if self.structure_error == None
+            self.structure_error = Some(e)
+
+    /** A binder being introduced: non-empty (§8.2 rule 2, `Q5009`) and unique in the statement
+     * (`Q2004`).
+     */
+    intro(*self, b: string)
+        if self.gathering then return ignore(self.all.add(b))
+
+        if b.len == 0 then self.report("Q5009", "a binder is empty")
+        if !self.seen.add(b) then self.report("Q2004", s"binder '$b' is introduced twice")
+
+    opt_intro(*self, b: Option[string]) = b match
+        Some(x) -> self.intro(x)
+        None -> ()
+
+    /** A reference to binder `b` from an expression that sees `visible`; `hidden` holds the binders
+     * of the left input of each `Join` whose right input the reference is inside (§6.5 rule 2).
+     */
+    refer(*self, b: string, visible: Buf[string], hidden: Buf[string])
+        if holds(visible, b) then return
+
+        if holds(hidden, b)
+            self.report("Q5006", s"a join's right input refers to '$b' of its left input; that is an Apply")
+        else if self.all.has(b)
+            self.report("Q2006", s"binder '$b' is not visible here")
+        else
+            self.report("Q2002", s"binder '$b' is unknown")
+
+    param(*self, index: u64)
+        if index >= u64(self.used.len())
+            self.report("Q4001", s"parameter $index is not declared")
+        else
+            self.used[usize(index)] = true
+
+    unique_names(*self, items: Buf[Item], code: string, what: string)
+        val names = set[string]()
+
+        for it in items
+            if !names.add(it.name) then self.report(code, s"$what '${it.name}' appears twice")
+
+    // -- statements ---------------------------------------------------------------------------
+
+    statement(*self, s: Statement)
+        val none = buf[string]()
+
+        s match
+            Query(rel) -> ignore(self.rel(rel, none, none))
+            Insert(_, binder, old, columns, source, on_conflict, returning) ->
+                self.intro(binder)
+                self.opt_intro(old)
+
+                val names = set[string]()
+
+                for c in columns
+                    if !names.add(c) then self.report("Q5005", s"column '$c' is listed twice")
+
+                ignore(self.rel(source, none, none))
+
+                on_conflict match
+                    Some(oc) ->
+                        self.intro(oc.excluded)
+
+                        oc.action match
+                            DoUpdate(set, where) ->
+                                val sees = both([binder, oc.excluded], none)
+                                self.unique_names(set, "Q5005", "column")
+                                self.items(set, sees, none)
+                                self.opt_expr(where, sees, none)
+                            Nothing -> ()
+                    None -> ()
+
+                self.returning(returning, with_old([binder], old))
+            Update(_, binder, old, from, filter, set, returning) ->
+                self.intro(binder)
+                self.opt_intro(old)
+
+                val joined = self.opt_rel(from)
+                val sees = both([binder], joined)
+
+                self.opt_expr(filter, sees, none)
+
+                if set.len() == 0 then self.report("Q5009", "an update sets no column")
+
+                self.unique_names(set, "Q5005", "column")
+                self.items(set, sees, none)
+                self.returning(returning, both(with_old([binder], old).view(), joined))
+            Delete(_, binder, old, using, filter, returning) ->
+                self.intro(binder)
+                self.opt_intro(old)
+
+                val joined = self.opt_rel(using)
+
+                self.opt_expr(filter, both([binder], joined), none)
+                self.returning(returning, both(with_old([binder], old).view(), joined))
+    end statement
+
+    opt_rel(*self, r: Option[Rel]) -> Buf[string] = r match
+        Some(x) -> self.rel(x, buf[string](), buf[string]())
+        None -> buf[string]()
+
+    returning(*self, items: Buf[Item], sees: Buf[string])
+        self.in_returning = true
+        self.items(items, sees, buf[string]())
+        self.in_returning = false
+
+    // -- relations ----------------------------------------------------------------------------
+
+    /** Checks `r`, whose expressions also see `outer` (§8.3 step 2), and answers the binders it
+     * exposes to its parent.
+     */
+    rel(*self, r: Rel, outer: Buf[string], hidden: Buf[string]) -> Buf[string]
+        val was = self.in_returning
+        self.in_returning = false
+        val exposed = self.rel_body(r, outer, hidden)
+        self.in_returning = was
+        exposed
+
+    rel_body(*self, r: Rel, outer: Buf[string], hidden: Buf[string]) -> Buf[string] = r match
+        Scan(_, binder) ->
+            self.intro(binder)
+            one(binder)
+        Values(binder, columns, rows) ->
+            self.intro(binder)
+
+            for row in rows
+                if row.len() != columns.len() then self.report("Q5009", "a row of values has the wrong width")
+                self.exprs(row, outer, hidden)
+
+            one(binder)
+        ParamScan(binder, param) ->
+            self.intro(binder)
+            self.param(param)
+            one(binder)
+        Filter(input, predicate) ->
+            val inner = self.rel(*input, outer, hidden)
+            self.expr(predicate, both(inner.view(), outer), hidden)
+            inner
+        Project(input, binder, items) ->
+            val inner = self.rel(*input, outer, hidden)
+            self.intro(binder)
+
+            if items.len() == 0 then self.report("Q5009", "a projection has no items")
+
+            self.unique_names(items, "Q2005", "output column")
+            self.items(items, both(inner.view(), outer), hidden)
+            one(binder)
+        Join(kind, left, right, on, mark, binder) ->
+            val l = self.rel(*left, outer, hidden)
+            val r2 = self.rel(*right, outer, both(l.view(), hidden))
+            self.opt_expr(on, both(both(l.view(), r2).view(), outer), hidden)
+            self.mark_fields(kind == MarkJoin, mark, binder)
+
+            kind match
+                Semi | Anti -> l
+                MarkJoin -> with_old(l.view(), binder)
+                _ -> both(l.view(), r2)
+        Apply(kind, left, right, on, mark, binder) ->
+            val l = self.rel(*left, outer, hidden)
+            val r2 = self.rel(*right, both(l.view(), outer), hidden)
+            self.opt_expr(on, both(both(l.view(), r2).view(), outer), hidden)
+            self.mark_fields(kind == MarkApply, mark, binder)
+
+            kind match
+                SemiApply | AntiApply -> l
+                MarkApply -> with_old(l.view(), binder)
+                _ -> both(l.view(), r2)
+        Aggregate(input, binder, keys, aggs) ->
+            val inner = self.rel(*input, outer, hidden)
+            val sees = both(inner.view(), outer)
+            self.intro(binder)
+            self.items(keys, sees, hidden)
+
+            for a in aggs
+                self.exprs(a.call.args, sees, hidden)
+                self.opt_expr(a.call.filter, sees, hidden)
+                self.sort_keys(a.call.order, sees, hidden)
+
+            one(binder)
+        Window(input, binder, items) ->
+            val inner = self.rel(*input, outer, hidden)
+            val sees = both(inner.view(), outer)
+            self.intro(binder)
+
+            for it in items
+                self.win_call(it.call, sees, hidden)
+
+            with_old(inner.view(), Some(binder))
+        Sort(input, keys) ->
+            val inner = self.rel(*input, outer, hidden)
+            self.sort_keys(keys, both(inner.view(), outer), hidden)
+            inner
+        Limit(input, count, offset, _, _) ->
+            val inner = self.rel(*input, outer, hidden)
+            self.opt_expr(count, outer, hidden)
+            self.opt_expr(offset, outer, hidden)
+            inner
+        Distinct(input) -> self.rel(*input, outer, hidden)
+        SetOp(_, _, binder, inputs) ->
+            self.intro(binder)
+
+            if inputs.len() < 2 then self.report("Q5009", "a set operation has fewer than two inputs")
+
+            for i in inputs
+                ignore(self.rel(i, outer, hidden))
+
+            one(binder)
+        With(recursive, ctes, body) -> self.with(recursive, ctes, *body, outer, hidden)
+        CteRef(name, binder) ->
+            if !holds(self.ctes, name) then self.report("Q2008", s"no enclosing With defines CTE '$name'")
+            self.intro(binder)
+            one(binder)
+        Nest(input, binder, keys, _, items, order) ->
+            val inner = self.rel(*input, outer, hidden)
+            val sees = both(inner.view(), outer)
+            self.intro(binder)
+            self.items(keys, sees, hidden)
+            self.items(items, sees, hidden)
+            self.sort_keys(order, sees, hidden)
+            one(binder)
+        Unnest(input, binder, value, _, _) ->
+            val inner = self.rel(*input, outer, hidden)
+            self.intro(binder)
+            self.expr(value, both(inner.view(), outer), hidden)
+            with_old(inner.view(), Some(binder))
+        Tag(input, binder, _, _) ->
+            ignore(self.rel(*input, outer, hidden))
+            self.intro(binder)
+            one(binder)
+    end rel_body
+
+    // §8.2 rule 4 and §6.5 rule 5: a mark join names its column and its binder; no other kind does.
+    mark_fields(*self, is_mark: bool, mark: Option[string], binder: Option[string])
+        if is_mark != mark.is_some() || is_mark != binder.is_some() then
+            self.report("Q5009", "a mark join needs a mark column and a binder, and no other join has either")
+
+        self.opt_intro(binder)
+
+    with(*self, recursive: bool, ctes: Buf[CteDef], body: Rel, outer: Buf[string], hidden: Buf[string]) -> Buf[string]
+        val depth = self.ctes.len()
+        val names = set[string]()
+
+        for c in ctes
+            if !names.add(c.name) then self.report("Q2004", s"CTE '${c.name}' is defined twice in one With")
+
+        if recursive
+            for c in ctes
+                self.ctes.push(c.name)
+
+        for c in ctes
+            if recursive && c.columns.is_none() then self.report("Q5001", s"recursive CTE '${c.name}' declares no columns")
+
+            ignore(self.rel(c.rel, outer, hidden))
+
+            if !recursive then self.ctes.push(c.name)
+
+        val exposed = self.rel(body, outer, hidden)
+        self.ctes.truncate(depth)
+        exposed
+    end with
+
+    win_call(*self, w: WinCall, sees: Buf[string], hidden: Buf[string])
+        self.exprs(w.args, sees, hidden)
+        self.exprs(w.partition, sees, hidden)
+        self.sort_keys(w.order, sees, hidden)
+
+        w.frame match
+            Some(f) ->
+                self.opt_expr(f.start.offset, sees, hidden)
+                self.opt_expr(f.end.offset, sees, hidden)
+            None -> ()
+
+    sort_keys(*self, keys: Buf[SortKey], sees: Buf[string], hidden: Buf[string])
+        for k in keys
+            self.expr(k.expr, sees, hidden)
+
+    items(*self, items: Buf[Item], sees: Buf[string], hidden: Buf[string])
+        for it in items
+            self.expr(it.expr, sees, hidden)
+
+    // -- expressions --------------------------------------------------------------------------
+
+    exprs(*self, es: Buf[Expr], sees: Buf[string], hidden: Buf[string])
+        for e in es
+            self.expr(e, sees, hidden)
+
+    opt_expr(*self, e: Option[Expr], sees: Buf[string], hidden: Buf[string]) = e match
+        Some(x) -> self.expr(x, sees, hidden)
+        None -> ()
+
+    opt_boxed(*self, e: Option[&Expr], sees: Buf[string], hidden: Buf[string]) = e match
+        Some(x) -> self.expr(*x, sees, hidden)
+        None -> ()
+
+    expr(*self, e: Expr, sees: Buf[string], hidden: Buf[string]) -> unit = e match
+        Col(binder, _) -> self.refer(binder, sees, hidden)
+        Row(binder) -> self.refer(binder, sees, hidden)
+        Param(index) -> self.param(index)
+        Null(_) | Literal(_, _) -> ()
+        Call(_, args) -> self.exprs(args, sees, hidden)
+        Cast(inner, _, _) -> self.expr(*inner, sees, hidden)
+        If(arms, otherwise) ->
+            for a in arms
+                self.expr(a.cond, sees, hidden)
+                self.expr(a.value, sees, hidden)
+
+            self.opt_boxed(otherwise, sees, hidden)
+        Match(scrutinee, arms, otherwise) ->
+            self.expr(*scrutinee, sees, hidden)
+
+            for a in arms
+                self.intro(a.binder)
+                self.expr(a.expr, with_old(sees.view(), Some(a.binder)), hidden)
+
+            self.opt_boxed(otherwise, sees, hidden)
+        Record(fields) ->
+            self.unique_names(fields, "Q2005", "record field")
+            self.items(fields, sees, hidden)
+        Field(inner, _) -> self.expr(*inner, sees, hidden)
+        Variant(_, _, inner) -> self.expr(*inner, sees, hidden)
+        Relation(rel) -> ignore(self.rel(*rel, sees, hidden))
+        Scalar(rel) -> ignore(self.rel(*rel, sees, hidden))
+        Exists(rel) -> ignore(self.rel(*rel, sees, hidden))
+        In(es, rel) ->
+            self.exprs(es, sees, hidden)
+            ignore(self.rel(*rel, sees, hidden))
+        Action ->
+            if !self.in_returning then self.report("Q5002", "Action() is valid only in a returning list")
+end Checker
+
+// -- binder lists -------------------------------------------------------------------------------
+
+private holds(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+
+    false
+
+private one(b: string) -> Buf[string]
+    val out = buf[string]()
+    out.push(b)
+    out
+
+/** A new list: `a`, then `b`. */
+private both(a: []const string, b: Buf[string]) -> Buf[string]
+    val out = buf[string]()
+    out.extend(a)
+    out.extend(b.view())
+    out
+
+/** A new list: `a`, then `extra` when it is present. */
+private with_old(a: []const string, extra: Option[string]) -> Buf[string]
+    val out = buf[string]()
+    out.extend(a)
+
+    extra match
+        Some(x) -> out.push(x)
+        None -> ()
+
+    out
+
+private ignore[T](value: T) = ()

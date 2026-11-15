@@ -19,6 +19,11 @@ push_uvar(out: Buf[u8], v: u64)
 
         out.push(low | 0x80)
 
+/** `s` as a `str`: its byte length as a `uvar`, then its UTF-8. */
+push_str(out: Buf[u8], s: string)
+    push_uvar(out, u64(s.len))
+    out.extend(s.bytes)
+
 /** Zero octets until `out`'s length is a multiple of 8. */
 pad_to_8(out: Buf[u8])
     while out.len() % 8 != 0
@@ -67,6 +72,14 @@ struct Reader
 
             shift += 7
     end uvar
+
+    /** A `bool`, or the tag of an `opt`: `0x00` or `0x01`, and any other octet is `Q1003`. */
+    flag(*self) -> Result[bool, CodecError]
+        val b = self.byte()?
+
+        if b > 1 then return fail("Q1003", "a bool or an opt tag is neither 0 nor 1")
+
+        Ok(b == 1)
 
     /** A `str`: a `uvar` length, then that many octets of UTF-8 (`Q1004` otherwise). */
     str(*self) -> Result[string, CodecError]

@@ -1,0 +1,191 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.crypto.sha256
+import sysl.encoding.hex_string
+
+// The worked encoding of `query-tree.md` §12.7, byte for byte, and the trees of §16, each of which
+// encodes, decodes to the same tree, re-encodes to the same bytes and passes the structural checks.
+
+// -- what the query-tree tests share ------------------------------------------------------------
+
+/** `env` encoded, which must succeed. */
+tree_bytes(env: Envelope) -> Buf[u8] = encode_envelope(env).unwrap()
+
+/** The code `bytes` are refused with, decoded and checked, or "ok". */
+tree_refusal(bytes: []const u8) -> string = decode_envelope(bytes) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** The code `env` is refused with by the structural checks, or "ok". */
+check_refusal(env: Envelope) -> string = check_envelope(env) match
+    Ok(()) -> "ok"
+    Err(e) -> e.code
+
+/** Encode, decode, compare, and re-encode: the bytes. */
+tree_round_trip(env: Envelope, file: string = __FILE__, line: long = __LINE__) -> Buf[u8]
+    val bytes = tree_bytes(env)
+    val back = read_envelope(bytes.view()).unwrap()
+
+    assert(back == env, "the tree decodes as it was encoded", file, line)
+    same_bytes(tree_bytes(back), bytes, "the decoded tree re-encodes to the same bytes", file, line)
+    bytes
+
+param(name: string, ty: Type) -> ParamDecl = ParamDecl(Some(name), ty)
+
+query(params: []const ParamDecl, rel: Rel) -> Envelope = envelope(params, Query(rel))
+
+asc(e: Expr) -> SortKey = SortKey(e, false, false)
+
+desc(e: Expr) -> SortKey = SortKey(e, true, false)
+
+project(input: Rel, binder: string, items: []const Item) -> Rel = Project(input, binder, items_of(items))
+
+filter(input: Rel, predicate: Expr) -> Rel = Filter(input, predicate)
+
+limit(count: Expr, input: Rel) -> Rel = Limit(input, Some(count), None, false, false)
+
+sort(keys: []const SortKey, input: Rel) -> Rel = Sort(input, items_of(keys))
+
+eq(a: Expr, b: Expr) -> Expr = call("eq", [a, b])
+
+no_items() -> Buf[Item] = buf[Item]()
+
+// -- the worked encoding, §12.7 ---------------------------------------------------------------
+
+/** `(query :rel (filter :input (scan :table app.t :as t) :predicate (call eq t.id $0)))`, with
+ * `$0` named `id` and of type `int64`.
+ */
+worked() -> Envelope = query([param("id", Int64)], filter(scan("app", "t", "t"), eq(col("t", "id"), Param(0))))
+
+const worked_hex = """
+    01 00 01 01 02 69 64 03 00
+    01 1c
+    04 1a
+    01 08 03 61 70 70 01 74 01 74
+    05 0e 02 65 71 02
+    01 05 01 74 02 69 64
+    03 01 00
+    00
+    """
+
+const worked_shape_hex = """
+    01 00 01 00 03 00
+    01 1e
+    04 1c
+    01 09 03 61 70 70 01 74 02 62 30
+    05 0f 02 65 71 02
+    01 06 02 62 30 02 69 64
+    03 01 00
+    00
+    """
+
+@test
+the_worked_example_encodes_as_the_spec_writes_it()
+    same_bytes(tree_round_trip(worked()), hex(worked_hex), "§12.7's bytes")
+    assert_eq(tree_refusal(hex(worked_hex).view()), "ok")
+
+@test
+the_worked_example_decodes_to_its_tree()
+    assert(decode_envelope(hex(worked_hex).view()).unwrap() == worked())
+
+@test
+the_worked_shape_form_is_the_spec_s()
+    same_bytes(shape_form(worked()).unwrap(), hex(worked_shape_hex), "§12.7's shape form")
+
+    val digest = shape_digest(worked()).unwrap()
+    assert_eq(hex_string(digest), hex_string(sha256(hex(worked_shape_hex).view())))
+
+@test
+spans_ride_after_the_statement()
+    var env = worked()
+    val spans = buf[Span]()
+    spans.push(Span(0, 0, 40))
+    spans.push(Span(2, 18, 23))
+    env.spans = Some(spans)
+
+    val bytes = tree_round_trip(env)
+    assert_eq(hex_string(bytes.view()[bytes.len() - 8..]), "0102000028021217")
+
+// -- §16.1 ----------------------------------------------------------------------------------
+
+users_and_posts() -> Envelope = users_and_posts_as(["u", "p1", "pc", "c", "cc", "p", "pp", "r"])
+
+/** §16.1's statement with its eight binders named by `b`: `u p1 pc c cc p pp r` in the listing. */
+users_and_posts_as(b: [8]string) -> Envelope
+    val (u, p1, pc, c, cc, p, pp, r) = (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7])
+    val users = limit(Param(0), sort([asc(col(u, "id"))], scan("app", "users", u)))
+
+    val count = Aggregate(filter(scan("app", "posts", p1), eq(col(p1, "author_id"), col(u, "id"))), pc,
+        no_items(), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
+
+    val comments = project(filter(scan("app", "comments", c), eq(col(c, "post_id"), col(p, "id"))), cc,
+        [item("id", col(c, "id")), item("body", col(c, "body"))])
+
+    val posts = project(
+        limit(Param(1), sort([desc(col(p, "created_at")), desc(col(p, "id"))],
+            filter(scan("app", "posts", p), eq(col(p, "author_id"), col(u, "id"))))),
+        pp,
+        [item("id", col(p, "id")), item("title", col(p, "title")), item("comments", Relation(comments))])
+
+    query([param("first", Int64), param("posts_first", Int64)], project(users, r, [
+        item("id", col(u, "id")),
+        item("name", col(u, "name")),
+        item("post_count", Scalar(count)),
+        item("posts", Relation(posts))]))
+end users_and_posts_as
+
+@test
+users_and_posts_round_trips_and_checks()
+    val bytes = tree_round_trip(users_and_posts())
+    assert_eq(tree_refusal(bytes.view()), "ok")
+
+// -- §16.2 ----------------------------------------------------------------------------------
+
+search_result() -> Type
+    val post = record([Field("id", Int64), Field("created_at", Timestamp), Field("title", Text)])
+    val photo = record([Field("id", Int64), Field("created_at", Timestamp), Field("url", Text)])
+    union_of([Field("Post", post), Field("Photo", photo)])
+
+search() -> Envelope
+    val posts = project(filter(scan("app", "posts", "p"), call("contains", [col("p", "title"), Param(0)])), "a",
+        [item("id", col("p", "id")), item("created_at", col("p", "created_at")), item("title", col("p", "title"))])
+
+    val photos = project(filter(scan("app", "photos", "f"), call("contains", [col("f", "caption"), Param(0)])), "b",
+        [item("id", col("f", "id")), item("created_at", col("f", "created_at")), item("url", col("f", "url"))])
+
+    val union = SetOp(Union, true, "s", items_of([Tag(posts, "t1", search_result(), "Post"), Tag(photos, "t2", search_result(), "Photo")]))
+
+    query([param("q", Text), param("first", Int64)],
+        limit(Param(1), sort([desc(col("s", "created_at")), asc(col("s", "id"))], union)))
+
+@test
+search_round_trips_and_checks()
+    val bytes = tree_round_trip(search())
+    assert_eq(tree_refusal(bytes.view()), "ok")
+
+/** §16.2's projection that reads variant fields through `Match`. */
+@test
+the_match_projection_round_trips_and_checks()
+    val label = Match(Row("s"), items_of([MatchArm("Post", "x", col("x", "title")), MatchArm("Photo", "y", col("y", "url"))]), None)
+    val inner = SetOp(Union, true, "s", items_of([scan("app", "posts", "p"), scan("app", "photos", "f")]))
+    val env = query([], project(inner, "out", [item("id", col("s", "id")), item("label", label)]))
+
+    assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+// -- §16.3 ----------------------------------------------------------------------------------
+
+upsert() -> Envelope
+    val source = Values("v", items_of([Field("key", Text), Field("n", Int64)]), items_of([items_of([Param(0), Param(1)])]))
+    val set = items_of([item("n", call("add", [col("t", "n"), col("x", "n")]))])
+    val target = Columns(items_of(["key"]))
+
+    envelope([param("key", Text), param("delta", Int64)], Insert(QualName("app", "counters"), "t", Some("o"),
+        items_of(["key", "n"]), source, Some(OnConflict(target, "x", DoUpdate(set, None))),
+        items_of([item("key", col("t", "key")), item("n", col("t", "n")), item("previous", col("o", "n")), item("action", Action)])))
+
+@test
+upsert_round_trips_and_checks()
+    val bytes = tree_round_trip(upsert())
+    assert_eq(tree_refusal(bytes.view()), "ok")

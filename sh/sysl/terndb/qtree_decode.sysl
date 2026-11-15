@@ -1,0 +1,478 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Reading a query tree's canonical encoding (`query-tree.md` §12) back into the tree of §5–§9. The
+// decoder refuses every input that is not the one encoding of some tree: truncation, a payload
+// length that disagrees with its contents and trailing octets are `Q1001`; an unknown or reserved
+// kind or enum ordinal `Q1002`; a non-minimal `uvar`, a `bool` or `opt` tag other than 0 or 1, a
+// doubled nullable and spans out of order `Q1003`; bad UTF-8 `Q1004`; another tree version `Q1005`;
+// nesting past `MaxTreeDepth` `Q1006`; a `json` literal not in canonical form `Q1007`. A literal whose
+// type is not a non-null scalar is `Q3017`, found here because its value cannot be read without it.
+
+/** How deep nodes may nest, counting the statement as depth 0, before `Q1006` (`errors.md`: at
+ * least 256). A type inside a node continues the count.
+ */
+const MaxTreeDepth: usize = 256
+
+/** The envelope that is the whole of `bytes`, decoded and then checked by `check_envelope`. */
+decode_envelope(bytes: []const u8) -> Result[Envelope, CodecError]
+    val env = read_envelope(bytes)?
+    check_envelope(env)?
+    Ok(env)
+
+/** The envelope that is the whole of `bytes`, decoded only: the `Q1…` phase of §11.2. */
+read_envelope(bytes: []const u8) -> Result[Envelope, CodecError]
+    var r = Reader(bytes, 0)
+    var nodes: u64 = 0
+
+    val major = r.uvar()?
+    val minor = r.uvar()?
+
+    if major != TreeMajor || minor > TreeMinor then
+        return fail("Q1005", s"tree version $major.$minor is not supported")
+
+    val params = buf[ParamDecl]()
+
+    for _ in 0..<r.uvar()?
+        val name = opt_name(&r)?
+        params.push(ParamDecl(name, read_tree_type(&r, 1)?))
+
+    val statement = read_statement(&r, &nodes)?
+    val spans = read_spans(&r, nodes)?
+
+    if r.left() != 0 then return fail("Q1001", "octets follow the envelope")
+
+    Ok(Envelope(major, minor, params, statement, spans))
+end read_envelope
+
+private read_spans(r: *Reader, nodes: u64) -> Result[Option[Buf[Span]], CodecError]
+    if !r.flag()? then return Ok(None)
+
+    val spans = buf[Span]()
+
+    for _ in 0..<r.uvar()?
+        val node = r.uvar()?
+        val start = r.uvar()?
+        val end = r.uvar()?
+
+        if node >= nodes then return fail("Q1001", "a span names a node the statement does not have")
+        if start > end then return fail("Q1001", "a span ends before it starts")
+        if spans.len() > 0 && node <= spans[spans.len() - 1].node then
+            return fail("Q1003", "spans are not in increasing node order")
+
+        spans.push(Span(node, start, end))
+
+    Ok(Some(spans))
+end read_spans
+
+// -- nodes --------------------------------------------------------------------------------------
+
+/** A node's header: its kind, and a reader over exactly its payload. Counts the node. */
+private open_node(r: *Reader, nodes: *u64, depth: usize) -> Result[(u64, Reader), CodecError]
+    if depth >= MaxTreeDepth then return fail("Q1006", "the tree nests too deeply")
+
+    val kind = r.uvar()?
+    val len = r.uvar()?
+    val body = Reader(r.take(len)?, 0)
+    *nodes += 1
+    Ok((kind, body))
+
+private close_node(body: Reader) -> Result[unit, CodecError]
+    if body.left() != 0 then return fail("Q1001", "a node's payload length does not match its contents")
+    Ok(())
+
+private read_statement(r: *Reader, nodes: *u64) -> Result[Statement, CodecError]
+    var (kind, body) = open_node(r, nodes, 0)?
+    val b = &body
+
+    val s = kind match
+        1 -> Query(read_rel(b, nodes, 1)?)
+        2 ->
+            val table = qual_name(b)?
+            val binder = b.str()?
+            val old = opt_name(b)?
+            val columns = buf[string]()
+
+            for _ in 0..<b.uvar()?
+                columns.push(b.str()?)
+
+            val source = read_rel(b, nodes, 1)?
+            val on_conflict = if b.flag()? then Some(read_on_conflict(b, nodes, 1)?) else None
+            Insert(table, binder, old, columns, source, on_conflict, read_items(b, nodes, 1)?)
+        3 ->
+            val table = qual_name(b)?
+            val binder = b.str()?
+            val old = opt_name(b)?
+            val from = opt_rel(b, nodes, 1)?
+            val filter = opt_expr(b, nodes, 1)?
+            val set = read_items(b, nodes, 1)?
+            Update(table, binder, old, from, filter, set, read_items(b, nodes, 1)?)
+        4 ->
+            val table = qual_name(b)?
+            val binder = b.str()?
+            val old = opt_name(b)?
+            val using = opt_rel(b, nodes, 1)?
+            val filter = opt_expr(b, nodes, 1)?
+            Delete(table, binder, old, using, filter, read_items(b, nodes, 1)?)
+        32..63 -> return fail("Q1002", "a DDL statement is decoded by the DDL codec (ddl.md §3)")
+        _ -> return fail("Q1002", "unknown or reserved statement kind")
+
+    close_node(body)?
+    Ok(s)
+end read_statement
+
+private read_on_conflict(r: *Reader, nodes: *u64, depth: usize) -> Result[OnConflict, CodecError]
+    val target = ordinal(r, 2)? match
+        0 ->
+            val names = buf[string]()
+
+            for _ in 0..<r.uvar()?
+                names.push(r.str()?)
+
+            Columns(names)
+        _ -> Constraint(r.str()?)
+
+    val excluded = r.str()?
+
+    val action = ordinal(r, 2)? match
+        0 -> Nothing
+        _ ->
+            val set = read_items(r, nodes, depth)?
+            DoUpdate(set, opt_expr(r, nodes, depth)?)
+
+    Ok(OnConflict(target, excluded, action))
+end read_on_conflict
+
+private read_rel(r: *Reader, nodes: *u64, depth: usize) -> Result[Rel, CodecError]
+    var (kind, body) = open_node(r, nodes, depth)?
+    val b = &body
+    val d = depth + 1
+
+    val rel = kind match
+        1 ->
+            val table = qual_name(b)?
+            Scan(table, b.str()?)
+        2 ->
+            val binder = b.str()?
+            val columns = read_fields(b, d)?
+            val rows = buf[Buf[Expr]]()
+
+            for _ in 0..<b.uvar()?
+                rows.push(read_exprs(b, nodes, d)?)
+
+            Values(binder, columns, rows)
+        3 ->
+            val binder = b.str()?
+            ParamScan(binder, b.uvar()?)
+        4 ->
+            val input = read_rel(b, nodes, d)?
+            Filter(input, read_expr(b, nodes, d)?)
+        5 ->
+            val input = read_rel(b, nodes, d)?
+            val binder = b.str()?
+            Project(input, binder, read_items(b, nodes, d)?)
+        6 ->
+            val kind = join_kind(ordinal(b, 8)?)
+            val left = read_rel(b, nodes, d)?
+            val right = read_rel(b, nodes, d)?
+            val on = opt_expr(b, nodes, d)?
+            val mark = opt_name(b)?
+            Join(kind, left, right, on, mark, opt_name(b)?)
+        7 ->
+            val kind = apply_kind(ordinal(b, 6)?)
+            val left = read_rel(b, nodes, d)?
+            val right = read_rel(b, nodes, d)?
+            val on = opt_expr(b, nodes, d)?
+            val mark = opt_name(b)?
+            Apply(kind, left, right, on, mark, opt_name(b)?)
+        8 ->
+            val input = read_rel(b, nodes, d)?
+            val binder = b.str()?
+            val keys = read_items(b, nodes, d)?
+            val aggs = buf[NamedAgg]()
+
+            for _ in 0..<b.uvar()?
+                val name = b.str()?
+                aggs.push(NamedAgg(name, read_agg_call(b, nodes, d)?))
+
+            Aggregate(input, binder, keys, aggs)
+        9 ->
+            val input = read_rel(b, nodes, d)?
+            val binder = b.str()?
+            val items = buf[NamedWin]()
+
+            for _ in 0..<b.uvar()?
+                val name = b.str()?
+                items.push(NamedWin(name, read_win_call(b, nodes, d)?))
+
+            Window(input, binder, items)
+        10 ->
+            val input = read_rel(b, nodes, d)?
+            Sort(input, read_sort_keys(b, nodes, d)?)
+        11 ->
+            val input = read_rel(b, nodes, d)?
+            val count = opt_expr(b, nodes, d)?
+            val offset = opt_expr(b, nodes, d)?
+            val ties = b.flag()?
+            Limit(input, count, offset, ties, b.flag()?)
+        12 -> Distinct(read_rel(b, nodes, d)?)
+        13 ->
+            val op = setop_kind(ordinal(b, 3)?)
+            val all = b.flag()?
+            val binder = b.str()?
+            val inputs = buf[Rel]()
+
+            for _ in 0..<b.uvar()?
+                inputs.push(read_rel(b, nodes, d)?)
+
+            SetOp(op, all, binder, inputs)
+        14 ->
+            val recursive = b.flag()?
+            val ctes = buf[CteDef]()
+
+            for _ in 0..<b.uvar()?
+                val name = b.str()?
+                val columns = if b.flag()? then Some(read_fields(b, d)?) else None
+                ctes.push(CteDef(name, columns, read_rel(b, nodes, d)?))
+
+            With(recursive, ctes, read_rel(b, nodes, d)?)
+        15 ->
+            val name = b.str()?
+            CteRef(name, b.str()?)
+        16 ->
+            val input = read_rel(b, nodes, d)?
+            val binder = b.str()?
+            val keys = read_items(b, nodes, d)?
+            val name = b.str()?
+            val items = read_items(b, nodes, d)?
+            Nest(input, binder, keys, name, items, read_sort_keys(b, nodes, d)?)
+        17 ->
+            val input = read_rel(b, nodes, d)?
+            val binder = b.str()?
+            val value = read_expr(b, nodes, d)?
+            val outer = b.flag()?
+            Unnest(input, binder, value, outer, opt_name(b)?)
+        18 ->
+            val input = read_rel(b, nodes, d)?
+            val binder = b.str()?
+            val ty = read_tree_type(b, d)?
+            Tag(input, binder, ty, b.str()?)
+        _ -> return fail("Q1002", "unknown or reserved relation kind")
+
+    close_node(body)?
+    Ok(rel)
+end read_rel
+
+private read_agg_call(r: *Reader, nodes: *u64, depth: usize) -> Result[AggCall, CodecError]
+    val function = r.str()?
+    val args = read_exprs(r, nodes, depth)?
+    val distinct = r.flag()?
+    val filter = opt_expr(r, nodes, depth)?
+    Ok(AggCall(function, args, distinct, filter, read_sort_keys(r, nodes, depth)?))
+
+private read_win_call(r: *Reader, nodes: *u64, depth: usize) -> Result[WinCall, CodecError]
+    val function = r.str()?
+    val args = read_exprs(r, nodes, depth)?
+    val partition = read_exprs(r, nodes, depth)?
+    val order = read_sort_keys(r, nodes, depth)?
+
+    val frame = if r.flag()?
+        val unit = frame_unit(ordinal(r, 3)?)
+        val start = read_bound(r, nodes, depth)?
+        val end = read_bound(r, nodes, depth)?
+        Some(Frame(unit, start, end, frame_exclude(ordinal(r, 4)?)))
+    else
+        None
+
+    Ok(WinCall(function, args, partition, order, frame))
+
+private read_bound(r: *Reader, nodes: *u64, depth: usize) -> Result[Bound, CodecError]
+    val kind = bound_kind(ordinal(r, 5)?)
+    Ok(Bound(kind, opt_expr(r, nodes, depth)?))
+
+private read_sort_keys(r: *Reader, nodes: *u64, depth: usize) -> Result[Buf[SortKey], CodecError]
+    val keys = buf[SortKey]()
+
+    for _ in 0..<r.uvar()?
+        val e = read_expr(r, nodes, depth)?
+        val desc = r.flag()?
+        keys.push(SortKey(e, desc, r.flag()?))
+
+    Ok(keys)
+
+private read_items(r: *Reader, nodes: *u64, depth: usize) -> Result[Buf[Item], CodecError]
+    val items = buf[Item]()
+
+    for _ in 0..<r.uvar()?
+        val name = r.str()?
+        items.push(Item(name, read_expr(r, nodes, depth)?))
+
+    Ok(items)
+
+private read_fields(r: *Reader, depth: usize) -> Result[Buf[Field], CodecError]
+    val fields = buf[Field]()
+
+    for _ in 0..<r.uvar()?
+        val name = r.str()?
+        fields.push(Field(name, read_tree_type(r, depth)?))
+
+    Ok(fields)
+
+private opt_rel(r: *Reader, nodes: *u64, depth: usize) -> Result[Option[Rel], CodecError] =
+    if r.flag()? then Ok(Some(read_rel(r, nodes, depth)?)) else Ok(None)
+
+// -- expressions --------------------------------------------------------------------------------
+
+private read_exprs(r: *Reader, nodes: *u64, depth: usize) -> Result[Buf[Expr], CodecError]
+    val es = buf[Expr]()
+
+    for _ in 0..<r.uvar()?
+        es.push(read_expr(r, nodes, depth)?)
+
+    Ok(es)
+
+private opt_expr(r: *Reader, nodes: *u64, depth: usize) -> Result[Option[Expr], CodecError] =
+    if r.flag()? then Ok(Some(read_expr(r, nodes, depth)?)) else Ok(None)
+
+private opt_boxed(r: *Reader, nodes: *u64, depth: usize) -> Result[Option[&Expr], CodecError] =
+    if r.flag()? then Ok(Some(read_expr(r, nodes, depth)?)) else Ok(None)
+
+private read_expr(r: *Reader, nodes: *u64, depth: usize) -> Result[Expr, CodecError]
+    var (kind, body) = open_node(r, nodes, depth)?
+    val b = &body
+    val d = depth + 1
+
+    val e = kind match
+        1 ->
+            val binder = b.str()?
+            Col(binder, b.str()?)
+        2 -> Row(b.str()?)
+        3 -> Param(b.uvar()?)
+        4 -> Null(read_tree_type(b, d)?)
+        5 ->
+            val function = b.str()?
+            Call(function, read_exprs(b, nodes, d)?)
+        6 ->
+            val inner = read_expr(b, nodes, d)?
+            val ty = read_tree_type(b, d)?
+            Cast(inner, ty, if ordinal(b, 2)? == 0 then Strict else Try)
+        7 ->
+            val arms = buf[IfArm]()
+
+            for _ in 0..<b.uvar()?
+                val cond = read_expr(b, nodes, d)?
+                arms.push(IfArm(cond, read_expr(b, nodes, d)?))
+
+            If(arms, opt_boxed(b, nodes, d)?)
+        8 ->
+            val scrutinee = read_expr(b, nodes, d)?
+            val arms = buf[MatchArm]()
+
+            for _ in 0..<b.uvar()?
+                val tag = b.str()?
+                val binder = b.str()?
+                arms.push(MatchArm(tag, binder, read_expr(b, nodes, d)?))
+
+            Match(scrutinee, arms, opt_boxed(b, nodes, d)?)
+        9 -> Record(read_items(b, nodes, d)?)
+        10 ->
+            val inner = read_expr(b, nodes, d)?
+            Field(inner, b.str()?)
+        11 ->
+            val ty = read_tree_type(b, d)?
+            val tag = b.str()?
+            Variant(ty, tag, read_expr(b, nodes, d)?)
+        12 -> Relation(read_rel(b, nodes, d)?)
+        13 -> Scalar(read_rel(b, nodes, d)?)
+        14 -> Exists(read_rel(b, nodes, d)?)
+        15 ->
+            val es = read_exprs(b, nodes, d)?
+            In(es, read_rel(b, nodes, d)?)
+        16 -> Action
+        17 ->
+            val ty = read_tree_type(b, d)?
+            Literal(ty, read_literal(b, ty)?)
+        _ -> return fail("Q1002", "unknown or reserved expression kind")
+
+    close_node(body)?
+    Ok(e)
+end read_expr
+
+/** A literal's value, in the §12.6 encoding of its type `ty`. */
+private[terndb] read_literal(r: *Reader, ty: Type) -> Result[Value, CodecError]
+    if !is_literal_type(ty) then return fail("Q3017", "a literal's type must be a non-null scalar")
+
+    ty match
+        Text -> Ok(Text(r.str()?))
+        Json ->
+            val text = r.str()?
+
+            if canonical_json(text) != Some(text) then
+                return fail("Q1007", "a json literal is not a JSON text in canonical form")
+
+            Ok(Text(text))
+        Bytes ->
+            val n = r.uvar()?
+            Ok(bytes_value(r.take(n)?))
+        Bool -> Ok(Bool(r.flag()?))
+        _ -> Ok(fixed_value(ty, r.take(u64(ty.width()))?))
+end read_literal
+
+// -- the small pieces ---------------------------------------------------------------------------
+
+private opt_name(r: *Reader) -> Result[Option[string], CodecError] =
+    if r.flag()? then Ok(Some(r.str()?)) else Ok(None)
+
+private qual_name(r: *Reader) -> Result[QualName, CodecError]
+    val schema = r.str()?
+    Ok(QualName(schema, r.str()?))
+
+/** An `enum` with `n` values: an ordinal at or past `n` is `Q1002`. */
+private ordinal(r: *Reader, n: u64) -> Result[u64, CodecError]
+    val v = r.uvar()?
+
+    if v >= n then return fail("Q1002", "an enum ordinal is out of range")
+
+    Ok(v)
+
+private join_kind(v: u64) -> JoinKind = v match
+    0 -> Inner
+    1 -> Left
+    2 -> Right
+    3 -> Full
+    4 -> Semi
+    5 -> Anti
+    6 -> MarkJoin
+    _ -> SingleJoin
+
+private apply_kind(v: u64) -> ApplyKind = v match
+    0 -> Cross
+    1 -> Outer
+    2 -> SemiApply
+    3 -> AntiApply
+    4 -> MarkApply
+    _ -> SingleApply
+
+private setop_kind(v: u64) -> SetOpKind = v match
+    0 -> Union
+    1 -> Intersect
+    _ -> Except
+
+private frame_unit(v: u64) -> FrameUnit = v match
+    0 -> Rows
+    1 -> Range
+    _ -> Groups
+
+private bound_kind(v: u64) -> BoundKind = v match
+    0 -> UnboundedPreceding
+    1 -> Preceding
+    2 -> CurrentRow
+    3 -> Following
+    _ -> UnboundedFollowing
+
+private frame_exclude(v: u64) -> FrameExclude = v match
+    0 -> ExcludeNone
+    1 -> ExcludeCurrent
+    2 -> ExcludeGroup
+    _ -> ExcludeTies

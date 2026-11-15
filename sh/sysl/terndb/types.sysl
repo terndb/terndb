@@ -8,8 +8,11 @@ struct Field derives Eq
     name: string
     ty: Type
 
-/** A query-tree type (`query-tree.md` §2), structural only: a named catalog type never reaches a
- * result (`wire-protocol.md` §6.1 rule 4), so there is no variant for one.
+/** A query-tree type (`query-tree.md` §2).
+ *
+ * `Named` is a reference to a catalog type (§12.3 kind 32), which a statement may declare but a result
+ * never carries (`wire-protocol.md` §6.1 rule 4): `decode_type` and `decode_result_type` refuse it,
+ * and only the query tree's decoder reads one.
  *
  * `Nullable` never wraps a `Nullable` (§2.2); `nullable()` is the constructor that keeps the rule,
  * and the decoder refuses the doubled form with `Q1003`.
@@ -42,6 +45,7 @@ enum Type derives Eq
     Union(variants: Buf[Field])
     Bag(elem: &Type)
     List(elem: &Type)
+    Named(schema: string, name: string)
 
     /** The node kind this type is encoded under (`query-tree.md` §12.3). */
     kind(self) -> u64 = self match
@@ -72,6 +76,7 @@ enum Type derives Eq
         UInt32 -> 24
         UInt64 -> 25
         Json -> 26
+        Named(_, _) -> 32
     end kind
 
     /** The octets one value occupies in a result column, or 0 where the type is not fixed-width
@@ -131,6 +136,9 @@ encode_type(t: Type, out: Buf[u8])
         Union(variants) -> encode_members(variants, body)
         Bag(elem) -> encode_type(*elem, body)
         List(elem) -> encode_type(*elem, body)
+        Named(schema, name) ->
+            push_str(body, schema)
+            push_str(body, name)
         _ -> ()
 
     push_uvar(out, t.kind())
@@ -142,8 +150,7 @@ private encode_members(members: Buf[Field], out: Buf[u8])
     push_uvar(out, u64(members.len()))
 
     for m in members
-        push_uvar(out, u64(m.name.len))
-        out.extend(m.name.bytes)
+        push_str(out, m.name)
         encode_type(m.ty, out)
 
 /** How deep a type may nest before it is refused with `Q1006` (`errors.md`: at least 256). */
@@ -152,7 +159,7 @@ const MaxTypeDepth: usize = 256
 /** The `Type` node that is the whole of `bytes`, validated as `query-tree.md` §2 and §12 require. */
 decode_type(bytes: []const u8) -> Result[Type, CodecError]
     var r = Reader(bytes, 0)
-    val t = read_type(&r, 0)?
+    val t = read_type(&r, 0, false)?
 
     if r.at != bytes.len then return fail("Q1001", "octets follow the type")
 
@@ -168,19 +175,24 @@ decode_result_type(bytes: []const u8) -> Result[Type, CodecError]
 
     Ok(t)
 
-private read_type(r: *Reader, depth: usize) -> Result[Type, CodecError]
+/** A `Type` node of a query tree at nesting `depth`, which may name a catalog type (§12.3 kind 32). */
+private[terndb] read_tree_type(r: *Reader, depth: usize) -> Result[Type, CodecError] = read_type(r, depth, true)
+
+// `named` says whether a catalog type reference may appear: in a query tree it may, in a result type
+// it is `W1008`.
+private read_type(r: *Reader, depth: usize, named: bool) -> Result[Type, CodecError]
     if depth >= MaxTypeDepth then return fail("Q1006", "the type nests too deeply")
 
     val kind = r.uvar()?
     val len = r.uvar()?
     var body = Reader(r.take(len)?, 0)
-    val t = read_body(&body, kind, depth)?
+    val t = read_body(&body, kind, depth, named)?
 
     if body.left() != 0 then return fail("Q1001", "a type node's payload length does not match its contents")
 
     Ok(t)
 
-private read_body(r: *Reader, kind: u64, depth: usize) -> Result[Type, CodecError] = kind match
+private read_body(r: *Reader, kind: u64, depth: usize, named: bool) -> Result[Type, CodecError] = kind match
     0 -> Ok(Bool)
     1 -> Ok(Int16)
     2 -> Ok(Int32)
@@ -197,18 +209,19 @@ private read_body(r: *Reader, kind: u64, depth: usize) -> Result[Type, CodecErro
     13 -> Ok(Timestamp)
     14 -> Ok(Interval)
     15 -> Ok(Uuid)
-    16 -> Ok(Record(read_members(r, depth, false)?))
-    17 -> Ok(Union(read_members(r, depth, true)?))
-    18 -> Ok(Bag(read_elem(r, depth)?))
-    19 -> Ok(List(read_elem(r, depth)?))
-    20 -> read_nullable(r, depth)
+    16 -> Ok(Record(read_members(r, depth, false, named)?))
+    17 -> Ok(Union(read_members(r, depth, true, named)?))
+    18 -> Ok(Bag(read_elem(r, depth, named)?))
+    19 -> Ok(List(read_elem(r, depth, named)?))
+    20 -> read_nullable(r, depth, named)
     21 -> Ok(Int8)
     22 -> Ok(UInt8)
     23 -> Ok(UInt16)
     24 -> Ok(UInt32)
     25 -> Ok(UInt64)
     26 -> Ok(Json)
-    32..63 -> fail("W1008", "a result type is structural and may not name a catalog type")
+    32..63 if !named -> fail("W1008", "a result type is structural and may not name a catalog type")
+    32 -> read_named(r)
     _ -> fail("Q1002", "unknown or reserved type kind")
 end read_body
 
@@ -220,15 +233,20 @@ private read_decimal(r: *Reader) -> Result[Type, CodecError]
 
     Ok(Decimal(u8(p), u8(s)))
 
-private read_nullable(r: *Reader, depth: usize) -> Result[Type, CodecError]
-    val inner = read_type(r, depth + 1)?
+private read_named(r: *Reader) -> Result[Type, CodecError]
+    val schema = r.str()?
+    val name = r.str()?
+    Ok(Named(schema, name))
+
+private read_nullable(r: *Reader, depth: usize, named: bool) -> Result[Type, CodecError]
+    val inner = read_type(r, depth + 1, named)?
 
     if inner.is_nullable() then return fail("Q1003", "a nullable type wraps a nullable type")
 
     Ok(Nullable(inner))
 
-private read_elem(r: *Reader, depth: usize) -> Result[Type, CodecError]
-    val elem = read_type(r, depth + 1)?
+private read_elem(r: *Reader, depth: usize, named: bool) -> Result[Type, CodecError]
+    val elem = read_type(r, depth + 1, named)?
 
     if elem.base().is_relation() then
         return fail("Q3014", "a relation's element may not be a relation")
@@ -236,8 +254,9 @@ private read_elem(r: *Reader, depth: usize) -> Result[Type, CodecError]
     Ok(elem)
 
 // A record's fields or a union's variants. Names are non-empty and unique (`Q3015`); a union has 1
-// to 65,536 variants (`Q3016`), each payload a record (`Q3014`).
-private read_members(r: *Reader, depth: usize, variants: bool) -> Result[Buf[Field], CodecError]
+// to 65,536 variants (`Q3016`), each payload a record (`Q3014`) or a catalog type reference, which
+// validation resolves.
+private read_members(r: *Reader, depth: usize, variants: bool, named: bool) -> Result[Buf[Field], CodecError]
     val count = r.uvar()?
 
     if variants && (count == 0 || count > 65536) then
@@ -252,11 +271,11 @@ private read_members(r: *Reader, depth: usize, variants: bool) -> Result[Buf[Fie
         if name.len == 0 || !seen.add(name) then
             return fail("Q3015", "a member name is empty or repeated")
 
-        val ty = read_type(r, depth + 1)?
+        val ty = read_type(r, depth + 1, named)?
 
         if variants then
             ty match
-                Record(_) -> ()
+                Record(_) | Named(_, _) -> ()
                 _ -> return fail("Q3014", "a union variant's payload must be a record")
 
         members.push(Field(name, ty))
