@@ -220,6 +220,7 @@ private distinct_of(seen: Seen, args: Buf[ColumnVector], n: usize) -> Seen
 private aggregate_column(f: string, ty: Type, args: Buf[ColumnVector], seen: Seen) -> Result[ColumnVector, CodecError] = f match
     "count" -> Ok(count_column(if args.len() == 0 then None else Some(args[0]), seen))
     "sum" -> sum_column(args[0], ty, seen)
+    "avg" -> avg_column(args[0], ty, seen)
     "min" -> Ok(pick_column(args[0], ty, seen, -1))
     "max" -> Ok(pick_column(args[0], ty, seen, 1))
     "bool_and" -> Ok(bool_column(args[0], ty, seen, false))
@@ -259,16 +260,9 @@ private sum_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector
         val out = buf[real]()
 
         for g in 0..<seen.groups()
-            var acc = 0.0
-            var any = false
-
-            for p in seen.of(g)
-                if x.is_valid(p)
-                    acc = if any then acc + v[p] else v[p]
-                    any = true
-
+            val (acc, n) = float_sum(x, v, seen.of(g))
             out.push(acc)
-            valid.push(any)
+            valid.push(n > 0)
 
         return Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), F64s(out)))
 
@@ -281,20 +275,96 @@ private sum_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector
     val out = buf[i128]()
 
     for g in 0..<seen.groups()
-        var acc: i256 = 0
-        var any = false
-
-        for p in seen.of(g)
-            if x.is_valid(p)
-                acc += i256(v[p])
-                any = true
+        val (acc, n) = exact_sum(x, v, seen.of(g))
 
         if acc < i256(lo) || acc > i256(hi) then return overflow()
 
         out.push(i128.wrap(acc))
-        valid.push(any)
+        valid.push(n > 0)
 
     Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), I128s(out)))
+
+/** `avg` of each group's non-null values, null where there are none. An integer or a decimal is the
+ * exact sum over the count, rounded half away from zero to the result's scale, and `R0001` where that
+ * lies outside the result type; a float is the float sum of `sum` over the count (§6.7 rule 7).
+ */
+private avg_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector, CodecError]
+    val valid = buf[bool]()
+
+    if ty.base() == Float64
+        val v = reals_of(x.lanes)
+        val out = buf[real]()
+
+        for g in 0..<seen.groups()
+            val (acc, n) = float_sum(x, v, seen.of(g))
+            out.push(if n > 0 then acc / real(n) else 0.0)
+            valid.push(n > 0)
+
+        return Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), F64s(out)))
+
+    val from = x.ty.base() match
+        Decimal(_, s) -> s
+        _ -> 0
+
+    val to = ty.base() match
+        Decimal(_, s) -> s
+        _ -> panic("avg of an exact number is a decimal")
+
+    val bound = i256(pow10(38))
+    val up = i256(pow10(to - from))
+    val v = wide_of(x.lanes)
+    val out = buf[i128]()
+
+    for g in 0..<seen.groups()
+        val (acc, n) = exact_sum(x, v, seen.of(g))
+
+        if n == 0
+            out.push(0)
+            valid.push(false)
+            continue
+
+        // The sum of at most 2⁶⁴ values of 128 bits, scaled by at most 10⁶, fits in 256 bits.
+        val num = acc * up
+        val d = i256(n)
+        val q = num / d
+        val rem = num % d
+        val twice = if rem < 0 then -2 * rem else 2 * rem
+
+        // Half away from zero, as decimal `div` rounds (§4.4 rule 2).
+        val r = if twice >= d then (if num < 0 then q - 1 else q + 1) else q
+
+        if r >= bound || r <= -bound then return overflow()
+
+        out.push(i128.wrap(r))
+        valid.push(true)
+
+    Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), I128s(out)))
+
+/** The exact sum of the non-null values of `x` at the positions `at`, and how many there are. */
+private exact_sum(x: ColumnVector, v: Buf[i128], at: []const usize) -> (i256, i64)
+    var acc: i256 = 0
+    var n: i64 = 0
+
+    for p in at
+        if x.is_valid(p)
+            acc += i256(v[p])
+            n += 1
+
+    (acc, n)
+
+/** The IEEE sum of the non-null values of `x` at the positions `at`, in that order from the first
+ * value, and how many there are.
+ */
+private float_sum(x: ColumnVector, v: Buf[real], at: []const usize) -> (real, i64)
+    var acc = 0.0
+    var n: i64 = 0
+
+    for p in at
+        if x.is_valid(p)
+            acc = if n > 0 then acc + v[p] else v[p]
+            n += 1
+
+    (acc, n)
 
 /** `min` (`want` −1) or `max` (`want` 1) of each group's non-null values by `cmp` (§3.3), the first
  * of equal ones in the group's order; null where there are none.

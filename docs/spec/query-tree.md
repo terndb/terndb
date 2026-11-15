@@ -453,7 +453,9 @@ conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as
 3. Aggregate calls MUST appear only in `Aggregate.aggs` and `Window.items` (`Q3013`). `HAVING` is a
    `Filter` above the `Aggregate`.
 4. Core aggregates: `count()` (rows) and `count(x)` (non-null `x`) → `int64`; `sum` → `int128` for
-   integer inputs, `decimal(38, s)` for `decimal(p, s)`, `float64` for floats; `min`, `max` (any type
+   integer inputs, `decimal(38, s)` for `decimal(p, s)`, `float64` for floats; `avg` → `decimal(38, 6)`
+   for integer inputs, `decimal(38, max(s, 6))` for `decimal(p, s)`, `float64` for floats, and any
+   other argument is `Q3002`; `min`, `max` (any type
    with `cmp`); `bool_and`, `bool_or`; `collect(x)` where `x` is a record, union or scalar (§2.5) → `bag<X>`, or
    `list<X>` when `order` is non-empty. Over an empty set every core aggregate except `count` and
    `collect` (empty relation) yields null, so its result type is nullable.
@@ -469,6 +471,14 @@ conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as
    type (`int128`, or an unscaled value beyond `10³⁸ − 1` in magnitude), whatever the order of the
    rows. `sum` of floats is the IEEE sum in `float64`, taken in reading order **starting from the first
    value** (so the sum of `−0.0` alone is `−0.0`); a NaN makes it NaN, and `+∞` with `−∞` is NaN.
+   `avg` of integers or decimals is the exact sum (an integer being its `decimal(p, 0)`, §4.1 rule 2)
+   divided by the count of non-null values, rounded **half away from zero** to the result's scale, as
+   decimal `div` rounds (§4.4 rule 2). The sum is never bounded, so only the average can overflow: it
+   is `R0001` exactly when the rounded average lies outside the result type (an unscaled value beyond
+   `10³⁸ − 1` in magnitude), whatever the order of the rows. `avg` of floats is the `sum` of floats
+   above divided by the count in `float64`. *Rationale*: a scale of 6 is decimal `div`'s least scale,
+   so `avg(x)` of a decimal equals `div(sum(x), count(x))` in type and value wherever the sum fits,
+   and it leaves 32 integer digits, room for the mean of any `int64` or `uint64` column.
    `min` and `max` keep the first of values equal under `cmp`. `string_agg(v, sep)` joins the non-null
    values in reading order, each after the first preceded by its own row's `sep` (nothing where `sep`
    is null), and is null where there is no non-null value.
