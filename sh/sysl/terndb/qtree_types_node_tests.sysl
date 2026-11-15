@@ -186,6 +186,30 @@ the_core_aggregates_have_the_types_of_6_7()
     same_type(agg_type("string_agg", [col("t", "name"), constant(Text)], [asc(col("t", "id"))]), nullable(Text))
 
 @test
+avg_is_decimal_38_6_over_integers_widens_a_decimal_s_scale_to_6_and_is_float64_over_floats()
+    same_type(agg_type("avg", [col("t", "a")]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [col("t", "id")]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [col("t", "u")]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [constant(Int8)]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [constant(Int128)]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [constant(UInt64)]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [col("t", "d")]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [constant(Decimal(20, 6))]), nullable(Decimal(38, 6)))
+    same_type(agg_type("avg", [constant(Decimal(30, 9))]), nullable(Decimal(38, 9)))
+    same_type(agg_type("avg", [col("t", "f")]), nullable(Float64))
+    same_type(agg_type("avg", [constant(Float32)]), nullable(Float64))
+    same_type(win_type("avg", [col("t", "id")]), nullable(Decimal(38, 6)))
+
+@test
+avg_refuses_an_argument_that_is_not_a_number_and_an_order()
+    assert_eq(agg_refusal("avg", [col("t", "name")]), "Q3002")
+    assert_eq(agg_refusal("avg", [col("t", "flag")]), "Q3002")
+    assert_eq(agg_refusal("avg", [col("t", "ts")]), "Q3002")
+    assert_eq(agg_refusal("avg", []), "Q3002")
+    assert_eq(agg_refusal("avg", [col("t", "a"), col("t", "a")]), "Q3002")
+    assert_eq(agg_refusal("avg", [col("t", "a")], [asc(col("t", "id"))]), "Q3002")
+
+@test
 an_aggregate_with_keys_emits_them_first()
     val a = Aggregate(t_scan(), "g", items_of([item("k", col("t", "name"))]), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
     same_type(result_of(q(a)), bag(record([Field("k", Text), Field("n", Int64)])))

@@ -192,7 +192,7 @@ private action_type() -> Type =
     union_of([Field("inserted", record([])), Field("updated", record([])), Field("deleted", record([]))])
 
 private is_aggregate(f: string) -> bool = f match
-    "count" | "sum" | "min" | "max" | "bool_and" | "bool_or" | "collect" | "string_agg" -> true
+    "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "collect" | "string_agg" -> true
     _ -> false
 
 private is_window_only(f: string) -> bool = f match
@@ -938,6 +938,13 @@ private struct Typer
                 b match
                     Decimal(_, s) -> Some(nullable(Decimal(38, s)))
                     _ -> self.refuse("Q3002", "sum takes a number")
+            "avg" ->
+                if is_integer(b) then return Some(nullable(Decimal(38, 6)))
+                if is_float(b) then return Some(nullable(Float64))
+
+                b match
+                    Decimal(_, s) -> Some(nullable(Decimal(38, if s > 6 then s else 6)))
+                    _ -> self.refuse("Q3002", "avg takes a number")
             "min" | "max" ->
                 check_orderable(x) match
                     Ok(()) -> Some(nullable(x))

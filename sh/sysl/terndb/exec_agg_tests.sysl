@@ -281,6 +281,186 @@ a_float32_sum_is_float64()
     assert(elem == record([Field("s", nullable(Float64))]))
     assert(got[0] == rec([xg_f(3.75)]))
 
+// -- avg ----------------------------------------------------------------------------------------------
+
+/** The reference `avg` of `xs`, nulls skipped: a float's sum over the count, or an exact value's sum,
+ * scaled by `up`, over the count and rounded half away from zero; null where there is no value.
+ */
+private xg_r_avg(xs: Buf[Value], up: i128) -> Value
+    var s: i128 = 0
+    var fs = 0.0
+    var n: i128 = 0
+    var float = false
+
+    for x in xs
+        x match
+            Int(a) ->
+                s += a
+                n += 1
+            Float(a) ->
+                fs = if n > 0 then fs + a else a
+                n += 1
+                float = true
+            _ -> ()
+
+    if n == 0 then return Null
+
+    if float then return Float(fs / real(n))
+
+    val m = if s < 0 then -s else s
+    val q = (2 * m * up + n) / (2 * n)
+    Int(if s < 0 then -q else q)
+
+/** `avg` of a column of type `t` holding `xs`: the result's type and its value. */
+private xg_avg(t: Type, xs: []const Value) -> (Type, Value)
+    val rows = buf[Value]()
+
+    for x in xs
+        rows.push(rec([x]))
+
+    val (elem, got) = xg_run([Field("v", t)], rows.view(), [], [NamedAgg("a", xg_call("avg", [xg_t("v")]))]).unwrap()
+    val ty = elem match
+        Record(fs) -> fs[0].ty
+        _ -> panic("a record was expected")
+
+    (ty, xe_field(got[0], 0))
+
+@test
+an_integer_avg_is_decimal_38_6_for_every_integer_type()
+    for t in [Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64]
+        val (ty, v) = xg_avg(nullable(t), [Int(1), Null, Int(2)])
+        assert(ty == nullable(Decimal(38, 6)))
+        assert(v == Int(1500000), s"$v")
+
+    assert(xg_avg(Int8, [Int(-128), Int(-127)]).1 == Int(-127500000))
+    assert(xg_avg(UInt64, [Int(18446744073709551615), Int(18446744073709551615)]).1 == Int(18446744073709551615 * pow10(6)))
+    assert(xg_avg(Int64, [Int(9223372036854775807), Int(9223372036854775807), Int(9223372036854775807)]).1 == Int(9223372036854775807 * pow10(6)))
+
+@test
+a_decimal_avg_keeps_a_scale_of_at_least_6()
+    val (t2, v2) = xg_avg(nullable(Decimal(5, 2)), [Int(123), Null, Int(-456), Int(99999)])
+    assert(t2 == nullable(Decimal(38, 6)))
+    // (1.23 − 4.56 + 999.99) / 3 = 332.22
+    assert(v2 == Int(332220000), s"$v2")
+
+    val (t8, v8) = xg_avg(Decimal(20, 8), [Int(1), Int(2)])
+    assert(t8 == nullable(Decimal(38, 8)))
+    // 0.000000015 rounds away from zero at scale 8.
+    assert(v8 == Int(2), s"$v8")
+
+@test
+an_exact_avg_rounds_half_away_from_zero_at_exact_halves()
+    val d = Decimal(38, 6)
+    assert(xg_avg(d, [Int(1), Int(0)]).1 == Int(1))
+    assert(xg_avg(d, [Int(-1), Int(0)]).1 == Int(-1))
+    assert(xg_avg(d, [Int(5), Int(0)]).1 == Int(3))
+    assert(xg_avg(d, [Int(-5), Int(0)]).1 == Int(-3))
+    // Just below and above a half.
+    assert(xg_avg(d, [Int(5), Int(0), Int(0), Int(0)]).1 == Int(1))
+    assert(xg_avg(d, [Int(-7), Int(0), Int(0), Int(0)]).1 == Int(-2))
+    assert(xg_avg(d, [Int(1), Int(0), Int(0)]).1 == Int(0))
+    assert(xg_avg(d, [Int(2), Int(0), Int(0)]).1 == Int(1))
+
+    // An integer's half: 1 / 128 = 0.0078125, which is 0.007813 at scale 6.
+    for sign in [1, -1]
+        val xs = buf[Value]()
+        xs.push(Int(i128(sign)))
+
+        for _ in 0..<127
+            xs.push(Int(0))
+
+        assert(xg_avg(Int32, xs.view()).1 == Int(i128(sign) * 7813))
+
+@test
+a_float_avg_is_the_float_sum_over_the_count()
+    val (t, v) = xg_avg(nullable(Float64), [xg_f(1.0), Null, xg_f(2.0), xg_f(4.0)])
+    assert(t == nullable(Float64))
+    assert(v == xg_f(7.0 / 3.0), s"$v")
+    val (t32, v32) = xg_avg(Float32, [xg_f(1.5), xg_f(2.25)])
+    assert(t32 == nullable(Float64))
+    assert(v32 == xg_f(1.875))
+    assert(xg_is_nan(xg_avg(Float64, [xg_f(1.0), xg_f(nan())]).1))
+    assert(xg_is_nan(xg_avg(Float64, [xg_f(infinity()), xg_f(-infinity())]).1))
+    assert(xg_negative_zero(xg_avg(Float64, [xg_f(-0.0)]).1))
+    // Reading order: 2⁵³ + 1 + 1 loses both ones, each a tie to even; their sum first would not.
+    val e = 9007199254740992.0
+    assert(xg_avg(Float64, [xg_f(e), xg_f(1.0), xg_f(1.0)]).1 == xg_f(e / 3.0))
+
+@test
+avg_of_no_value_is_null()
+    for t in [nullable(Int64), nullable(Decimal(10, 2)), nullable(Float64)]
+        assert(xg_avg(t, []).1 == Null)
+        assert(xg_avg(t, [Null, Null]).1 == Null)
+
+    // A grouped all-null group is null beside a group that has values.
+    val rows = [rec([Int(1), Null, Null, Null]), rec([Int(2), Int(3), Null, Null]), rec([Int(1), Null, Null, Null])]
+    val got = xg_rows(xg_small_cols(), rows, [item("k", xg_t("k"))], [NamedAgg("a", xg_call("avg", [xg_t("v")]))])
+    assert(got[0] == rec([Int(1), Null]))
+    assert(got[1] == rec([Int(2), Int(3000000)]))
+
+@test
+avg_never_overflows_on_the_sum_and_is_r0001_outside_its_type()
+    // The sum passes int128, and the average does not.
+    val top = pow10(38) - 1
+    val d = Decimal(38, 6)
+    assert(xg_avg(d, [Int(top), Int(top), Int(top)]).1 == Int(top))
+    assert(xg_avg(d, [Int(-top), Int(-top)]).1 == Int(-top))
+    assert(xg_avg(d, [Int(top), Int(-top), Int(top)]).1 == Int(xg_div_away(top, 3)))
+    val s = [NamedAgg("s", xg_call("sum", [xg_t("v")]))]
+    assert_eq(xg_code(xg_run([Field("v", d)], [rec([Int(top)]), rec([Int(top)])], [], s)), "R0001")
+
+    // An int128 average beyond 10³² does not fit decimal(38, 6).
+    val big: i128 = 170141183460469231731687303715884105727
+    val a = [NamedAgg("a", xg_call("avg", [xg_t("v")]))]
+    assert_eq(xg_code(xg_run([Field("v", Int128)], [rec([Int(big)]), rec([Int(big)])], [], a)), "R0001")
+    assert_eq(xg_code(xg_run([Field("v", Int128)], [rec([Int(-big)])], [], a)), "R0001")
+    assert_eq(xg_code(xg_run([Field("v", Int128)], [rec([Int(pow10(32))])], [], a)), "R0001")
+    assert(xg_avg(Int128, [Int(pow10(32) - 1)]).1 == Int((pow10(32) - 1) * pow10(6)))
+    // A filter that drops the large value avoids the error.
+    val f = [NamedAgg("a", xg_filtered("avg", [xg_t("v")], call("lt", [xg_t("v"), Literal(Int128, Int(2))])))]
+    assert(xg_rows([Field("v", Int128)], [rec([Int(big)]), rec([Int(1)])], [], f)[0] == rec([Int(1000000)]))
+
+/** `n / d` rounded half away from zero, for `n` ≥ 0 and `d` > 0. */
+private xg_div_away(n: i128, d: i128) -> i128 = n / d + (if 2 * (n % d) >= d then 1 else 0)
+
+@test
+avg_groups_span_batch_boundaries()
+    for n in [1, BatchSize, BatchSize + 1, 3 * BatchSize + 7]
+        val rows = buf[Value]()
+
+        for i in 0..<n
+            rows.push(rec([Int(i128(i % 3)), Int(i128(i) * 7 - 1000), Null, Null]))
+
+        for sizes in [[1, 2, BatchSize - 3], [BatchSize, 0, BatchSize], [7, 7, 7]]
+            val got = xg_rows_sized(rows, sizes, [item("k", xg_t("k"))])
+
+            for r in got
+                val k = xe_field(r, 0)
+                val vs = buf[Value]()
+
+                for row in rows
+                    if xe_field(row, 0) == k then vs.push(xe_field(row, 1))
+
+                assert(xe_field(r, 1) == xg_r_avg(vs, pow10(6)), s"n $n: $r")
+
+            val all = xg_rows_sized(rows, sizes, [])
+            assert(xe_field(all[0], 0) == xg_r_avg(xg_column(rows, 1), pow10(6)))
+
+private xg_rows_sized(rows: Buf[Value], sizes: []const usize, keys: []const Item) -> Buf[Value] =
+    xg_run_sized(xg_small_cols(), rows.view(), sizes, keys, [NamedAgg("a", xg_call("avg", [xg_t("v")]))]).unwrap().1
+
+@test
+avg_honours_distinct_and_filter()
+    val rows = [rec([Int(1), Int(1), Bool(true), Null]), rec([Int(1), Int(1), Bool(false), Null]), rec([Int(1), Int(2), Null, Null]),
+        rec([Int(1), Null, Bool(true), Null]), rec([Int(1), Int(4), Bool(true), Null])]
+    val got = xg_rows(xg_small_cols(), rows, [], [
+        NamedAgg("a", xg_call("avg", [xg_t("v")])),
+        NamedAgg("d", xg_distinct("avg", [xg_t("v")])),
+        NamedAgg("f", xg_filtered("avg", [xg_t("v")], xg_t("b"))),
+        NamedAgg("x", xg_filtered("avg", [xg_t("v")], call("gt", [xg_t("v"), xe_lit(9)])))])
+    // 8 / 4, (1 + 2 + 4) / 3, (1 + 4) / 2, and no row.
+    assert(got[0] == rec([Int(2000000), Int(2333333), Int(2500000), Null]), s"${got[0]}")
+
 // -- min and max ---------------------------------------------------------------------------------------
 
 @test
@@ -398,7 +578,7 @@ private xg_row(i: usize, pattern: int) -> Value
 
     rec([k, Text(s"s${i % 4}"), Int(i128((i * 13) % 41) - 20), Float(f), Bool(i % 3 != 0), Int(i128((i * 37) % 1000))])
 
-private xg_agree_calls() -> [14]NamedAgg = [
+private xg_agree_calls() -> [17]NamedAgg = [
     NamedAgg("n", xg_call("count", [])),
     NamedAgg("nv", xg_call("count", [xg_t("v")])),
     NamedAgg("sv", xg_call("sum", [xg_t("v")])),
@@ -412,7 +592,10 @@ private xg_agree_calls() -> [14]NamedAgg = [
     NamedAgg("vs", xg_call("collect", [xg_t("v")])),
     NamedAgg("gs", xg_call("string_agg", [xg_t("g"), Literal(Text, Text(","))])),
     NamedAgg("dv", xg_distinct("count", [xg_t("v")])),
-    NamedAgg("fv", xg_filtered("sum", [xg_t("v")], xg_t("b")))]
+    NamedAgg("fv", xg_filtered("sum", [xg_t("v")], xg_t("b"))),
+    NamedAgg("av", xg_call("avg", [xg_t("v")])),
+    NamedAgg("af", xg_call("avg", [xg_t("f")])),
+    NamedAgg("ad", xg_call("avg", [xg_t("d")]))]
 
 /** Column `j` of `rows`, in order. */
 private xg_column(rows: Buf[Value], j: usize) -> Buf[Value]
@@ -535,7 +718,8 @@ private xg_expected(rows: Buf[Value]) -> Buf[Value]
         out.push(rec([keys[j], Int(i128(m.len())), xg_r_count(v), xg_r_sum(v), xg_r_sum(f), xg_r_sum(d),
             xg_r_pick(nullable(Int64), v, -1), xg_r_pick(nullable(Float64), f, 1), xg_r_pick(nullable(Text), g, -1),
             xg_r_bool(b, false), xg_r_bool(b, true), Relation(v), xg_r_join(g, ","),
-            xg_r_count(xg_r_distinct(nullable(Int64), v)), xg_r_sum(kept)]))
+            xg_r_count(xg_r_distinct(nullable(Int64), v)), xg_r_sum(kept),
+            xg_r_avg(v, pow10(6)), xg_r_avg(f, 1), xg_r_avg(d, pow10(4))]))
 
     out
 
