@@ -1,0 +1,467 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Dependencies (`ddl.md` §2.11) and the drops they govern. Dependencies are read from the
+// definitions themselves rather than kept beside them: a view's scans and the columns it reads
+// through each scan's binder, a constraint's and an index's columns, a foreign key's referenced key,
+// the named types a type, column, definition or view names, and the sequences a definition draws
+// from. A drop whose target has dependents is `Q6007` unless `cascade` drops them first; `cascade`
+// drops views, indexes and constraints, never a table or a column.
+
+/** One row of `sys.depends` (§2.11): `dependent`'s definition refers to `referenced`. */
+struct Depend derives Eq
+    dependent: Obj
+    referenced: Obj
+
+impl MemCatalog
+    view_name(self, i: usize) -> QualName = QualName(self.namespace_by_oid(self.views[i].ns).name, self.views[i].name)
+
+    type_name(self, i: usize) -> QualName = QualName(self.namespace_by_oid(self.types[i].ns).name, self.types[i].name)
+
+    sequence_name(self, i: usize) -> QualName = QualName(self.namespace_by_oid(self.sequences[i].ns).name, self.sequences[i].name)
+
+    /** The views that scan the table or view `name`. */
+    views_scanning(self, name: QualName) -> Buf[Obj]
+        val out = buf[Obj]()
+
+        for v in self.views
+            if rel_refs(v.query).binders_of(name).len() > 0 then out.push(Obj(KindView, v.oid))
+
+        out
+
+    /** The foreign keys that reference the key `ids` of table `oid`, or any key of it when `ids` is
+     * empty.
+     */
+    foreign_keys_to(self, oid: u64, ids: Buf[u32]) -> Buf[Obj]
+        val out = buf[Obj]()
+
+        for c in self.constraints
+            c.kind match
+                ConForeignKey(_, target, ref_ids, _, _, _) ->
+                    if target == oid && (ids.len() == 0 || same_ids(ref_ids, ids)) then out.push(Obj(KindConstraint, c.oid))
+                _ -> ()
+
+        out
+
+    /** The objects that must be dropped before `o` can be, which `cascade` drops (§2.11). */
+    dependents(self, o: Obj) -> Buf[Obj] = o.kind match
+        KindTable ->
+            val i = self.table_by_oid(o.oid).unwrap()
+            val out = self.views_scanning(self.qual_name(i))
+
+            for f in self.foreign_keys_to(o.oid, buf[u32]())
+                val c = self.constraints[self.constraint_by_oid(f.oid).unwrap()]
+                if c.table != o.oid then out.push(f)
+
+            out
+        KindView ->
+            for i in 0..<self.views.len()
+                if self.views[i].oid == o.oid then return self.views_scanning(self.view_name(i))
+
+            buf[Obj]()
+        KindConstraint ->
+            val c = self.constraints[self.constraint_by_oid(o.oid).unwrap()]
+
+            c.kind match
+                ConPrimaryKey(ids) | ConUnique(ids) ->
+                    val out = buf[Obj]()
+
+                    for f in self.foreign_keys_to(c.table, ids)
+                        if f.oid != c.oid then out.push(f)
+
+                    out
+                _ -> buf[Obj]()
+        _ -> buf[Obj]()
+
+    /** Every dependency between objects, as `sys.depends` records it (§2.11). */
+    depends(self) -> Buf[Depend]
+        val out = buf[Depend]()
+
+        for c in self.constraints
+            out.push(Depend(Obj(KindConstraint, c.oid), Obj(KindTable, c.table)))
+
+            c.kind match
+                ConForeignKey(_, target, _, _, _, _) -> out.push(Depend(Obj(KindConstraint, c.oid), Obj(KindTable, target)))
+                _ -> ()
+
+        for x in self.indexes
+            out.push(Depend(Obj(KindIndex, x.oid), Obj(KindTable, x.table)))
+
+        for s in self.sequences
+            if s.owner_table != 0 then out.push(Depend(Obj(KindSequence, s.oid), Obj(KindTable, s.owner_table)))
+
+        for v in self.views
+            val refs = rel_refs(v.query)
+
+            for s in refs.scans
+                self.table_at(s.table) match
+                    Some(i) -> out.push(Depend(Obj(KindView, v.oid), Obj(KindTable, self.tables[i].oid)))
+                    None -> ()
+
+                self.view_at(s.table) match
+                    Some(i) -> out.push(Depend(Obj(KindView, v.oid), Obj(KindView, self.views[i].oid)))
+                    None -> ()
+
+            self.type_depends(out, Obj(KindView, v.oid), refs)
+
+        for t in self.types
+            self.type_depends(out, Obj(KindType, t.oid), type_refs(t.ty))
+
+        for t in self.tables
+            for c in t.columns
+                self.type_depends(out, Obj(KindTable, t.oid), type_refs(c.ty))
+
+        out
+    end depends
+
+    type_depends(self, out: Buf[Depend], from: Obj, refs: TreeRefs)
+        for q in refs.types
+            self.type_at(q) match
+                Some(i) -> out.push(Depend(from, Obj(KindType, self.types[i].oid)))
+                None -> ()
+
+    // -- what blocks a drop that cascade cannot ---------------------------------------------------
+
+    /** Every definition expression of table `t`: defaults, generation expressions, fills, the
+     * conversions of converting columns, its checks, and its indexes' expressions and predicates.
+     */
+    definitions_of(self, t: CatTable) -> Buf[Expr]
+        val out = buf[Expr]()
+
+        for c in t.columns
+            for e in [c.default, c.generated, c.fill, c.using]
+                e match
+                    Some(x) -> out.push(x)
+                    None -> ()
+
+        for c in self.constraints
+            if c.table == t.oid
+                c.kind match
+                    ConCheck(e) -> out.push(e)
+                    _ -> ()
+
+        for x in self.indexes
+            if x.table == t.oid
+                for k in x.keys
+                    k.key match
+                        KeyOver(e) -> out.push(e)
+                        _ -> ()
+
+                x.predicate match
+                    Some(p) -> out.push(p)
+                    None -> ()
+
+        out
+    end definitions_of
+
+    /** What uses named type `q`, other than type `except`: a column, a definition, another type or a
+     * view (§2.8 rule 6); `None` when nothing does.
+     */
+    type_user(self, q: QualName, except: u64) -> Option[string]
+        for t in self.tables
+            for c in t.columns
+                if type_refs(c.ty).names_type(q) then return Some(s"column '${t.name}.${c.name}'")
+
+                c.target match
+                    Some(ty) -> if type_refs(ty).names_type(q) then return Some(s"column '${t.name}.${c.name}'")
+                    None -> ()
+
+            for e in self.definitions_of(t)
+                if expr_refs(e).names_type(q) then return Some(s"a definition of table '${t.name}'")
+
+        for t in self.types
+            if t.oid != except && type_refs(t.ty).names_type(q) then return Some(s"type '${t.name}'")
+
+        for v in self.views
+            if rel_refs(v.query).names_type(q) then return Some(s"view '${v.name}'")
+
+        None
+
+    /** What draws from sequence `q` in its definitions, other than table `except`; `None` when nothing. */
+    sequence_user(self, q: QualName, except: u64) -> Option[string]
+        for t in self.tables
+            if t.oid != except
+                for e in self.definitions_of(t)
+                    if contains_name(expr_refs(e).sequences, q) then return Some(s"a definition of table '${t.name}'")
+
+        None
+
+    // -- removing objects -------------------------------------------------------------------------
+
+    /** `o` dropped, its dependents first when `cascade` is set (`Q6007` when it is not). */
+    drop_object(*self, o: Obj, cascade: bool) -> Result[(), CodecError]
+        if !self.exists(o) then return Ok(())
+
+        val deps = self.dependents(o)
+        if deps.len() > 0 && !cascade then return fail("Q6007", s"${self.describe(deps[0])} depends on ${self.describe(o)}")
+
+        for d in deps
+            self.drop_object(d, true)?
+
+        self.remove(o)
+
+    exists(self, o: Obj) -> bool = o.kind match
+        KindTable -> self.table_by_oid(o.oid).is_some()
+        KindConstraint -> self.constraint_by_oid(o.oid).is_some()
+        KindIndex -> self.index_by_oid(o.oid).is_some()
+        KindView ->
+            for v in self.views
+                if v.oid == o.oid then return true
+
+            false
+        _ -> true
+
+    describe(self, o: Obj) -> string = o.kind match
+        KindTable -> s"table '${self.tables[self.table_by_oid(o.oid).unwrap()].name}'"
+        KindConstraint -> s"constraint '${self.constraints[self.constraint_by_oid(o.oid).unwrap()].name}'"
+        KindIndex -> s"index '${self.indexes[self.index_by_oid(o.oid).unwrap()].name}'"
+        KindView ->
+            for v in self.views
+                if v.oid == o.oid then return s"view '${v.name}'"
+
+            "a view"
+        _ -> "an object"
+
+    /** Removes `o` and what is part of it: a table's constraints, indexes and identity sequences, a
+     * unique constraint's index, and every grant on any of them.
+     */
+    remove(*self, o: Obj) -> Result[(), CodecError]
+        self.forget_grants(o)
+
+        o.kind match
+            KindTable ->
+                var i = 0
+
+                while i < self.constraints.len()
+                    if self.constraints[i].table == o.oid then self.constraints.remove(i) else i += 1
+
+                i = 0
+
+                while i < self.indexes.len()
+                    if self.indexes[i].table == o.oid then self.indexes.remove(i) else i += 1
+
+                i = 0
+
+                while i < self.sequences.len()
+                    if self.sequences[i].owner_table == o.oid
+                        self.forget_grants(Obj(KindSequence, self.sequences[i].oid))
+                        self.sequences.remove(i)
+                    else
+                        i += 1
+
+                self.tables.remove(self.table_by_oid(o.oid).unwrap())
+            KindView ->
+                for i in 0..<self.views.len()
+                    if self.views[i].oid == o.oid
+                        self.views.remove(i)
+                        return Ok(())
+            KindConstraint ->
+                val ci = self.constraint_by_oid(o.oid).unwrap()
+                val index = self.constraints[ci].index
+                self.constraints.remove(ci)
+
+                self.index_by_oid(index) match
+                    Some(x) -> self.indexes.remove(x)
+                    None -> ()
+            KindIndex -> self.indexes.remove(self.index_by_oid(o.oid).unwrap())
+            _ -> ()
+
+        Ok(())
+    end remove
+
+    // -- the drop statements ----------------------------------------------------------------------
+
+    /** That no other table draws from the identity sequences of table `ti` (`Q6007`). */
+    check_owned_sequences(self, ti: usize, column: u32) -> Result[(), CodecError]
+        val t = self.tables[ti]
+
+        for i in 0..<self.sequences.len()
+            val s = self.sequences[i]
+
+            if s.owner_table == t.oid && (column == 0 || s.owner_column == column)
+                self.sequence_user(self.sequence_name(i), t.oid) match
+                    Some(u) -> return fail("Q6007", s"$u draws from sequence '${s.name}'")
+                    None -> ()
+
+        Ok(())
+
+    drop_table(*self, name: QualName, if_exists: bool, cascade: bool, who: u64) -> Result[(), CodecError]
+        val ti = self.table_at(name) match
+            Some(i) -> i
+            None -> return if if_exists then Ok(()) else fail("Q2001", s"no table '${name.schema}.${name.name}'")
+
+        self.need_owner(who, self.table_target(ti))?
+        self.check_owned_sequences(ti, 0)?
+        self.drop_object(Obj(KindTable, self.tables[ti].oid), cascade)
+
+    drop_view(*self, name: QualName, if_exists: bool, cascade: bool, who: u64) -> Result[(), CodecError]
+        val vi = self.view_at(name) match
+            Some(i) -> i
+            None -> return if if_exists then Ok(()) else fail("Q6003", s"no view '${name.schema}.${name.name}'")
+
+        self.need_owner(who, self.view_target(vi))?
+        self.drop_object(Obj(KindView, self.views[vi].oid), cascade)
+
+    drop_index(*self, name: QualName, if_exists: bool, who: u64) -> Result[(), CodecError]
+        val xi = self.index_at(name) match
+            Some(i) -> i
+            None -> return if if_exists then Ok(()) else fail("Q6003", s"no index '${name.schema}.${name.name}'")
+
+        val x = self.indexes[xi]
+        self.need_owner(who, self.table_target(self.table_by_oid(x.table).unwrap()))?
+        if x.constraint != 0 then return fail("Q6007", s"index '${x.name}' backs a constraint; drop the constraint")
+        self.indexes.remove(xi)
+        Ok(())
+
+    drop_type(*self, name: QualName, if_exists: bool, who: u64) -> Result[(), CodecError]
+        val ti = self.type_at(name) match
+            Some(i) -> i
+            None -> return if if_exists then Ok(()) else fail("Q6004", s"type '${name.schema}.${name.name}' is not in the catalog")
+
+        self.need_owner(who, self.type_target(ti))?
+        self.remove_type(ti)
+
+    /** Removes type `ti`, which nothing may use (`Q6007`). */
+    remove_type(*self, ti: usize) -> Result[(), CodecError]
+        val t = self.types[ti]
+
+        self.type_user(self.type_name(ti), t.oid) match
+            Some(u) -> return fail("Q6007", s"$u uses type '${t.name}'")
+            None -> ()
+
+        self.forget_grants(Obj(KindType, t.oid))
+        self.types.remove(ti)
+        Ok(())
+
+    /** Removes sequence `si`, which no identity may own and no definition draw from (`Q6007`). */
+    remove_sequence(*self, si: usize) -> Result[(), CodecError]
+        val s = self.sequences[si]
+        if s.owner_table != 0 then return fail("Q6007", s"sequence '${s.name}' belongs to an identity column")
+
+        self.sequence_user(self.sequence_name(si), 0) match
+            Some(u) -> return fail("Q6007", s"$u draws from sequence '${s.name}'")
+            None -> ()
+
+        self.forget_grants(Obj(KindSequence, s.oid))
+        self.sequences.remove(si)
+        Ok(())
+
+    namespace_empty(self, ns: u64) -> bool
+        for t in self.tables
+            if t.ns == ns then return false
+
+        for v in self.views
+            if v.ns == ns then return false
+
+        for s in self.sequences
+            if s.ns == ns then return false
+
+        for t in self.types
+            if t.ns == ns then return false
+
+        true
+
+    drop_sequence(*self, name: QualName, if_exists: bool, who: u64) -> Result[(), CodecError]
+        val si = self.sequence_at(name) match
+            Some(i) -> i
+            None -> return if if_exists then Ok(()) else fail("Q6003", s"no sequence '${name.schema}.${name.name}'")
+
+        self.need_owner(who, self.sequence_target(si))?
+        self.remove_sequence(si)
+
+    /** Drops namespace `name`; with `cascade`, every object in it first, in dependency order (§2.1):
+     * views, then tables, then sequences, then types, each type once nothing uses it.
+     */
+    drop_namespace(*self, name: string, if_exists: bool, cascade: bool, who: u64) -> Result[(), CodecError]
+        val ni = self.namespace_at(name) match
+            Some(i) -> i
+            None -> return if if_exists then Ok(()) else fail("Q6003", s"no namespace '$name'")
+
+        val ns = self.namespaces[ni].oid
+        self.need_owner(who, self.namespace_target(ni))?
+
+        if !self.namespace_empty(ns) && !cascade then return fail("Q6007", s"namespace '$name' is not empty")
+
+        for v in self.views.copy()
+            if v.ns == ns then self.drop_object(Obj(KindView, v.oid), true)?
+
+        for t in self.tables.copy()
+            if t.ns == ns
+                self.check_owned_sequences(self.table_by_oid(t.oid).unwrap(), 0)?
+                self.drop_object(Obj(KindTable, t.oid), true)?
+
+        for s in self.sequences.copy()
+            if s.ns == ns then self.remove_sequence(self.sequence_at(QualName(name, s.name)).unwrap())?
+
+        loop
+            var dropped = false
+            var left = false
+
+            for i in 0..<self.types.len()
+                if self.types[i].ns == ns
+                    left = true
+
+                    if self.type_user(self.type_name(i), self.types[i].oid).is_none()
+                        self.remove_type(i)?
+                        dropped = true
+                        break
+
+            if !left then break
+            if !dropped then return fail("Q6007", s"a type of namespace '$name' is used outside it")
+
+        self.forget_grants(Obj(KindNamespace, ns))
+        self.namespaces.remove(self.namespace_at(name).unwrap())
+        Ok(())
+    end drop_namespace
+
+    // -- checking what a change leaves ------------------------------------------------------------
+
+    /** That every view still types to the columns it has, and every definition of every table still
+     * types (`Q6007` naming the first that does not): what a change of a column or a named type owes
+     * the objects that depend on it.
+     */
+    revalidate(self) -> Result[(), CodecError]
+        for v in self.views
+            view_columns(self, v.query) match
+                Ok(cs) -> if cs != v.columns then return fail("Q6007", s"the change would change the columns of view '${v.name}'")
+                Err(e) -> return fail("Q6007", s"the change would break view '${v.name}' (${e.code}: ${e.message})")
+
+        for t in self.tables
+            for c in t.columns
+                if c.generated.is_some() then self.check_generated(t.columns, c).map_err(e -> broken(t, e))?
+
+            for k in self.constraints
+                if k.table == t.oid
+                    k.kind match
+                        ConCheck(e) -> check_condition(self, t.columns, e).map_err(x -> broken(t, x))?
+                        _ -> ()
+
+            for x in self.indexes
+                if x.table == t.oid
+                    for k in x.keys
+                        k.key match
+                            KeyOver(e) ->
+                                val ty = definition_type(self, t.columns, e).map_err(err -> broken(t, err))?
+                                if !is_key_component(ty) then return fail("Q6007", s"the change would break index '${x.name}'")
+                            KeyOn(id) ->
+                                t.column_by_id(id) match
+                                    Some(c) -> if !is_key_component(resolve_type(self, c.ty)?) then return fail("Q6007", s"the change would break index '${x.name}'")
+                                    None -> ()
+
+                    x.predicate match
+                        Some(p) -> check_condition(self, t.columns, p).map_err(e -> broken(t, e))?
+                        None -> ()
+
+        Ok(())
+    end revalidate
+end MemCatalog
+
+private broken(t: CatTable, e: CodecError) -> CodecError =
+    CodecError("Q6007", s"the change would break a definition of table '${t.name}' (${e.code}: ${e.message})")
+
+contains_name(xs: Buf[QualName], x: QualName) -> bool
+    for y in xs
+        if y == x then return true
+
+    false

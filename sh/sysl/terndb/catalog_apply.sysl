@@ -1,0 +1,490 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Applying a DDL statement (`ddl.md` §3.2) to the catalog: the tree checks of §3.5 first, then every
+// rule of §2 and §3 that needs the catalog, each refused with its registry code. A statement applies
+// whole or not at all: it runs against a clone, which replaces the catalog only when it succeeds.
+
+impl MemCatalog
+    /** `env`, a DDL statement, applied as role `role`; the catalog is unchanged when it is refused. */
+    apply(*self, env: Envelope, role: string) -> Result[(), CodecError]
+        if !is_ddl(env.statement) then return fail("Q1002", "only a DDL statement changes the catalog")
+        type_envelope(env, *self)?
+
+        val who = self.role_at(role) match
+            Some(i) -> self.roles[i].oid
+            None -> return fail("Q6015", s"no role '$role'")
+
+        var w = self.clone()
+        w.statement(env.statement, who)?
+        w.version += 1
+        *self = w
+        Ok(())
+
+    /** Statement `s` applied as role `who`. */
+    statement(*self, s: Statement, who: u64) -> Result[(), CodecError] = s match
+        CreateNamespace(name, if_not_exists) -> self.create_namespace(name, if_not_exists, who)
+        DropNamespace(name, if_exists, cascade) -> self.drop_namespace(name, if_exists, cascade, who)
+        CreateTable(table, columns, primary_key, constraints, if_not_exists) ->
+            self.create_table(table, columns, primary_key, constraints, if_not_exists, who)
+        DropTable(table, if_exists, cascade) -> self.drop_table(table, if_exists, cascade, who)
+        AlterTable(table, actions) -> self.alter_table(table, actions, who)
+        CreateIndex(name, index, if_not_exists) -> self.create_index(name, index, if_not_exists, who)
+        DropIndex(index, if_exists) -> self.drop_index(index, if_exists, who)
+        CreateType(name, ty, if_not_exists) -> self.create_type(name, ty, if_not_exists, who)
+        AlterType(name, change) -> self.alter_type(name, change, who)
+        DropType(name, if_exists) -> self.drop_type(name, if_exists, who)
+        CreateSequence(name, options, if_not_exists) -> self.create_sequence(name, options, if_not_exists, who)
+        AlterSequence(name, options, restart) -> self.alter_sequence(name, options, restart, who)
+        DropSequence(name, if_exists) -> self.drop_sequence(name, if_exists, who)
+        CreateView(name, query, replace) -> self.create_view(name, query, replace, who)
+        DropView(name, if_exists, cascade) -> self.drop_view(name, if_exists, cascade, who)
+        CreateRole(name, role) -> self.create_role(name, role, who)
+        AlterRole(name, role, new_name) -> self.alter_role(name, role, new_name, who)
+        DropRole(name, if_exists) -> self.drop_role(name, if_exists, who)
+        Grant(privileges, target, grantee, grantable) -> self.grant(privileges, target, grantee, grantable, who)
+        Revoke(privileges, target, grantee) -> self.revoke(privileges, target, grantee, who)
+        AwaitJobs(_) -> Ok(())
+        CancelJob(job) -> fail("Q6003", s"no job $job")
+        _ -> fail("Q1002", "only a DDL statement changes the catalog")
+
+    // -- namespaces, §2.1 -------------------------------------------------------------------------
+
+    create_namespace(*self, name: string, if_not_exists: bool, who: u64) -> Result[(), CodecError]
+        if self.namespace_at(name).is_some()
+            return if if_not_exists then Ok(()) else fail("Q6002", s"namespace '$name' already exists")
+
+        self.need_superuser(who, "create a namespace")?
+        val oid = self.oid()
+        self.namespaces.push(CatNamespace(oid, name, who))
+        Ok(())
+
+    // -- tables, §2.2–§2.6 ------------------------------------------------------------------------
+
+    /** That `who` may use the named types `ty` refers to (`Q6004`, `Q6015`), and `ty` resolved. */
+    usable_type(self, ty: Type, who: u64) -> Result[Type, CodecError]
+        for q in type_refs(ty).types
+            self.need_usage(who, q.schema)?
+
+            self.type_at(q) match
+                Some(i) -> self.need(who, self.type_target(i), PrivUsage)?
+                None -> return fail("Q6004", s"type '${q.schema}.${q.name}' is not in the catalog")
+
+        val t = resolve_type(self, ty)?
+        well_formed(t)?
+        Ok(t)
+
+    /** That `who` may draw from every sequence definition `e` calls `next_value` on, each named by
+     * two text literals (`Q6006` otherwise), which must exist (`Q6003`).
+     */
+    usable_sequences(self, e: Expr, who: u64) -> Result[(), CodecError]
+        val refs = expr_refs(e)
+        if refs.dynamic_sequence then return fail("Q6006", "a stored next_value must name its sequence by two text literals")
+
+        for q in refs.sequences
+            self.need_usage(who, q.schema)?
+
+            self.sequence_at(q) match
+                Some(i) -> self.need(who, self.sequence_target(i), PrivUsage)?
+                None -> return fail("Q6003", s"no sequence '${q.schema}.${q.name}'")
+
+        Ok(())
+
+    /** Column `def` of table `table` with id `id`: its type, its default and its identity's sequence,
+     * which is created here as `<table>_<column>_seq` (`ddl.md` §2.7 rule 3). A generated expression is
+     * checked once every column is known (`check_generated`).
+     */
+    new_column(*self, table: QualName, ns: u64, oid: u64, def: ColumnDef, id: u32, who: u64) -> Result[CatColumn, CodecError]
+        self.usable_type(def.ty, who)?
+        var seq: u64 = 0
+
+        def.default match
+            Some(d) ->
+                check_default(*self, def.ty, d)?
+                self.usable_sequences(d, who)?
+            None -> ()
+
+        if def.identity != NoIdentity
+            val name = s"${table.name}_${def.name}_seq"
+            if !self.name_free(ns, name) then return fail("Q6002", s"'$name', the identity sequence of '${def.name}', is already used")
+
+            val options = def.sequence match
+                Some(s) -> s
+                None -> SequenceDef(def.ty, None, None, None, None, false, None)
+
+            seq = self.oid()
+            var s = filled_sequence(seq, ns, name, who, options)?
+            s.owner_table = oid
+            s.owner_column = id
+            self.sequences.push(s)
+
+        Ok(CatColumn(id, def.name, def.ty, def.default, def.generated, def.identity, seq, ColumnReady, None, None, None))
+    end new_column
+
+    /** Generated column `c` among `columns`: it coerces to its type and reads no generated column
+     * (§2.7 rule 2).
+     */
+    check_generated(self, columns: Buf[CatColumn], c: CatColumn) -> Result[(), CodecError]
+        val g = c.generated match
+            Some(x) -> x
+            None -> return Ok(())
+
+        check_definition_of(self, columns, g, c.ty, s"the generation expression of '${c.name}'")?
+
+        for r in expr_refs(g).cols
+            for other in columns
+                if other.name == r.name && other.generated.is_some()
+                    return fail("Q6006", s"generated column '${c.name}' reads generated column '${other.name}'")
+
+        Ok(())
+
+    /** The ids of columns `names` of table `ti` (`Q2003` for one it does not have). */
+    column_ids(self, ti: usize, names: Buf[string]) -> Result[Buf[u32], CodecError]
+        val t = self.tables[ti]
+        val out = buf[u32]()
+
+        for n in names
+            t.column_named(n) match
+                Some(c) -> out.push(c.id)
+                None -> return fail("Q2003", s"table '${t.name}' has no column '$n'")
+
+        Ok(out)
+
+    /** That every column `ids` of table `ti` may be a key component, and, for the primary key, is not
+     * nullable (`Q6005`).
+     */
+    check_key_columns(self, ti: usize, ids: Buf[u32], primary: bool) -> Result[(), CodecError]
+        val t = self.tables[ti]
+
+        for id in ids
+            val c = t.column_by_id(id).unwrap()
+            val ty = resolve_type(self, c.ty)?
+
+            if primary && ty.is_nullable() then return fail("Q6005", s"primary-key column '${c.name}' is nullable")
+            if !is_key_component(ty) then return fail("Q6005", s"column '${c.name}' cannot be a key component")
+
+        Ok(())
+
+    /** That table `ti`'s fixed area plus its widest key fits ([DISK] §4.7 rule 2, `ddl.md` §2.2 rule 3). */
+    check_width(self, ti: usize) -> Result[(), CodecError]
+        val t = self.tables[ti]
+        var fixed: usize = 0
+
+        for c in t.columns
+            val ty = resolve_type(self, c.ty)?
+            if contains_u32(t.primary_key, c.id) then fixed += key_width(ty) else fixed += ty.base().width()
+
+        if fixed > 3000 then return fail("Q6011", s"table '${t.name}' has a fixed area and key of $fixed octets, beyond 3,000")
+        Ok(())
+
+    create_table(*self, name: QualName, defs: Buf[ColumnDef], pk: Buf[string], cons: Buf[ConstraintDef], if_not_exists: bool, who: u64) -> Result[(), CodecError]
+        val nsi = self.namespace_of(name.schema)?
+        val ns = self.namespaces[nsi].oid
+        if !self.name_free(ns, name.name) then return if if_not_exists then Ok(()) else fail("Q6002", s"'${name.name}' is already used in '${name.schema}'")
+        self.need_create(who, name.schema)?
+        if defs.len() > 65535 then return fail("Q6011", "a table has at most 65,535 columns")
+
+        val oid = self.oid()
+        val columns = buf[CatColumn]()
+
+        for i in 0..<defs.len()
+            columns.push(self.new_column(name, ns, oid, defs[i], u32(i + 1), who)?)
+
+        for c in columns
+            self.check_generated(columns, c)?
+
+        self.tables.push(CatTable(oid, ns, name.name, who, columns, buf[u32](), u32(defs.len() + 1), items_of([SchemaVersion(1, columns.copy())])))
+        val ti = self.tables.len() - 1
+        val ids = self.column_ids(ti, pk)?
+        self.check_key_columns(ti, ids, true)?
+        self.tables[ti].primary_key = ids
+
+        val pkey = s"${name.name}_pkey"
+        if !self.name_free(ns, pkey) then return fail("Q6002", s"'$pkey', the primary key's name, is already used")
+        val coid = self.oid()
+        self.constraints.push(CatConstraint(coid, oid, pkey, ConPrimaryKey(ids), true, false, 0))
+
+        for c in cons
+            c.body match
+                ForeignKey(_, _, _, _, _, _) -> ()
+                _ -> self.add_constraint(ti, c, true, false, who)?
+
+        for c in cons
+            c.body match
+                ForeignKey(_, _, _, _, _, _) -> self.add_constraint(ti, c, true, false, who)?
+                _ -> ()
+
+        self.check_width(ti)
+    end create_table
+
+    /** Constraint `def` added to table `ti` (§2.6): validated when the table is being created, else
+     * not, with a validation job unless `defer` (§3.3 rule 5).
+     */
+    add_constraint(*self, ti: usize, def: ConstraintDef, created: bool, deferring: bool, who: u64) -> Result[(), CodecError]
+        val t = self.tables[ti]
+        if !self.name_free(t.ns, def.name) then return fail("Q6002", s"'${def.name}' is already used in '${self.namespace_by_oid(t.ns).name}'")
+
+        def.body match
+            Check(e) ->
+                check_condition(*self, t.columns, e)?
+                self.usable_sequences(e, who)?
+                val coid = self.oid()
+                self.constraints.push(CatConstraint(coid, t.oid, def.name, ConCheck(e), created, !created && !deferring, 0))
+            Unique(names) ->
+                val ids = self.column_ids(ti, names)?
+                self.check_key_columns(ti, ids, false)?
+                val coid = self.oid()
+                val ioid = self.oid()
+                val keys = buf[CatKey]()
+
+                for id in ids
+                    keys.push(CatKey(KeyOn(id), false))
+
+                self.indexes.push(CatIndex(ioid, t.oid, def.name, true, keys, None, if created then IndexReady else IndexBuilding, coid))
+                self.constraints.push(CatConstraint(coid, t.oid, def.name, ConUnique(ids), created, !created && !deferring, ioid))
+            ForeignKey(names, target, ref_names, on_delete, on_update, deferred) ->
+                val ids = self.column_ids(ti, names)?
+                val ri = self.referenced_table(ti, target, who)?
+                val ref_ids = self.column_ids(ri, ref_names)?
+                if !self.is_unique_key(self.tables[ri].oid, ref_ids) then return fail("Q6013", s"the referenced columns are not a unique key of '${target.name}'")
+
+                for i in 0..<ids.len()
+                    val a = self.tables[ti].column_by_id(ids[i]).unwrap()
+                    val b = self.tables[ri].column_by_id(ref_ids[i]).unwrap()
+
+                    if resolve_type(*self, a.ty)?.base() != resolve_type(*self, b.ty)?.base()
+                        return fail("Q6013", s"column '${a.name}' and referenced column '${b.name}' differ in type")
+
+                    if (on_delete == FkSetNull || on_update == FkSetNull) && !a.ty.is_nullable()
+                        return fail("Q6013", s"set_null on non-null column '${a.name}'")
+
+                val coid = self.oid()
+                val kind = ConForeignKey(ids, self.tables[ri].oid, ref_ids, on_delete, on_update, deferred)
+                self.constraints.push(CatConstraint(coid, t.oid, def.name, kind, created, !created && !deferring, 0))
+
+        Ok(())
+    end add_constraint
+
+    /** The table a foreign key of table `ti` references: `ti` itself, or another table `who` may
+     * name and holds `references` on (§2.10 rule 3). A view is `Q6013`.
+     */
+    referenced_table(self, ti: usize, target: QualName, who: u64) -> Result[usize, CodecError]
+        val t = self.tables[ti]
+        if target.name == t.name && self.ns_oid(target.schema) == Some(t.ns) then return Ok(ti)
+
+        if self.view_at(target).is_some() then return fail("Q6013", s"a foreign key cannot reference view '${target.name}'")
+
+        val ri = self.table_at(target) match
+            Some(i) -> i
+            None -> return fail("Q2001", s"no table '${target.schema}.${target.name}'")
+
+        self.need_usage(who, target.schema)?
+        self.need(who, self.table_target(ri), PrivReferences)?
+        Ok(ri)
+
+    /** Whether `ids` are exactly the columns, in order, of a primary-key or unique constraint of table
+     * `oid` (§2.6).
+     */
+    is_unique_key(self, oid: u64, ids: Buf[u32]) -> bool
+        for c in self.constraints
+            if c.table == oid
+                c.kind match
+                    ConPrimaryKey(cs) | ConUnique(cs) -> if same_ids(cs, ids) then return true
+                    _ -> ()
+
+        false
+
+    /** Table `name` (`Q2001` where there is none, or it is a view). */
+    table_named(self, name: QualName) -> Result[usize, CodecError] = self.table_at(name) match
+        Some(i) -> Ok(i)
+        None -> fail("Q2001", s"no table '${name.schema}.${name.name}'")
+
+    qual_name(self, ti: usize) -> QualName = QualName(self.namespace_by_oid(self.tables[ti].ns).name, self.tables[ti].name)
+
+    // -- indexes, §2.5 ----------------------------------------------------------------------------
+
+    create_index(*self, name: string, def: IndexDef, if_not_exists: bool, who: u64) -> Result[(), CodecError]
+        val ti = self.table_named(def.table)?
+        val t = self.tables[ti]
+        if !self.name_free(t.ns, name) then return if if_not_exists then Ok(()) else fail("Q6002", s"'$name' is already used in '${def.table.schema}'")
+        self.need_owner(who, self.table_target(ti))?
+
+        val keys = buf[CatKey]()
+
+        for k in def.keys
+            k.key match
+                KeyColumn(n) ->
+                    val ids = self.column_ids(ti, items_of([n]))?
+                    self.check_key_columns(ti, ids, false)?
+                    keys.push(CatKey(KeyOn(ids[0]), k.descending))
+                KeyExpr(e) ->
+                    if !is_key_component(definition_type(*self, t.columns, e)?) then return fail("Q6005", "an index expression's type cannot be a key component")
+                    keys.push(CatKey(KeyOver(e), k.descending))
+
+        def.predicate match
+            Some(p) -> check_condition(*self, t.columns, p)?
+            None -> ()
+
+        val oid = self.oid()
+        self.indexes.push(CatIndex(oid, t.oid, name, def.unique, keys, def.predicate, IndexBuilding, 0))
+        Ok(())
+    end create_index
+
+    // -- named types, §2.8 ------------------------------------------------------------------------
+
+    create_type(*self, name: QualName, ty: Type, if_not_exists: bool, who: u64) -> Result[(), CodecError]
+        val ns = self.namespaces[self.namespace_of(name.schema)?].oid
+        if !self.name_free(ns, name.name) then return if if_not_exists then Ok(()) else fail("Q6002", s"'${name.name}' is already used in '${name.schema}'")
+        self.need_create(who, name.schema)?
+        val t = self.usable_type(ty, who)?
+
+        t match
+            Record(_) | Union(_) -> ()
+            _ -> return fail("Q6005", "only a record or a union may be named")
+
+        val oid = self.oid()
+        self.types.push(CatType(oid, ns, name.name, who, ty))
+        Ok(())
+
+    // -- sequences, §2.7 --------------------------------------------------------------------------
+
+    create_sequence(*self, name: QualName, def: SequenceDef, if_not_exists: bool, who: u64) -> Result[(), CodecError]
+        val ns = self.namespaces[self.namespace_of(name.schema)?].oid
+        if !self.name_free(ns, name.name) then return if if_not_exists then Ok(()) else fail("Q6002", s"'${name.name}' is already used in '${name.schema}'")
+        self.need_create(who, name.schema)?
+        val oid = self.oid()
+        self.sequences.push(filled_sequence(oid, ns, name.name, who, def)?)
+        Ok(())
+
+    // -- views, §2.9 ------------------------------------------------------------------------------
+
+    /** Whether view query `r` reads view `target`, directly or through other views. */
+    view_reaches(self, r: Rel, target: QualName, depth: usize) -> bool
+        if depth > self.views.len() then return true
+
+        for s in rel_refs(r).scans
+            if s.table == target then return true
+
+            self.view_at(s.table) match
+                Some(i) -> if self.view_reaches(self.views[i].query, target, depth + 1) then return true
+                None -> ()
+
+        false
+
+    create_view(*self, name: QualName, query: Rel, replace: bool, who: u64) -> Result[(), CodecError]
+        val ns = self.namespaces[self.namespace_of(name.schema)?].oid
+        val existing = self.view_at(name)
+
+        if existing.is_none() && !self.name_free(ns, name.name) || existing.is_some() && !replace
+            return fail("Q6002", s"'${name.name}' is already used in '${name.schema}'")
+
+        self.need_create(who, name.schema)?
+
+        existing match
+            Some(i) -> self.need_owner(who, self.view_target(i))?
+            None -> ()
+
+        val refs = rel_refs(query)
+
+        for s in refs.scans
+            self.table_at(s.table) match
+                Some(i) ->
+                    self.need_usage(who, s.table.schema)?
+                    self.need(who, self.table_target(i), PrivSelect)?
+                None -> ()
+
+            self.view_at(s.table) match
+                Some(i) ->
+                    self.need_usage(who, s.table.schema)?
+                    self.need(who, self.view_target(i), PrivSelect)?
+                None -> ()
+
+        for q in refs.types
+            self.need_usage(who, q.schema)?
+
+            self.type_at(q) match
+                Some(i) -> self.need(who, self.type_target(i), PrivUsage)?
+                None -> ()
+
+        val columns = view_columns(*self, query)?
+
+        existing match
+            Some(i) ->
+                val old = self.views[i].columns
+
+                if columns.len() < old.len() then return fail("Q6007", s"the new query of '${name.name}' drops a column of the view")
+
+                for j in 0..<old.len()
+                    if columns[j] != old[j] then return fail("Q6007", s"the new query of '${name.name}' changes column '${old[j].name}'")
+
+                if self.view_reaches(query, name, 0) then return fail("Q6007", s"view '${name.name}' would read itself")
+
+                self.views[i].query = query
+                self.views[i].columns = columns
+            None ->
+                val oid = self.oid()
+                self.views.push(CatView(oid, ns, name.name, who, query, columns))
+
+        Ok(())
+    end create_view
+end MemCatalog
+
+/** The range of an identity or sequence type, `int16`, `int32` or `int64`. */
+private type_range(ty: Type) -> (i64, i64) = ty match
+    Int16 -> (-32768, 32767)
+    Int32 -> (-2147483648, 2147483647)
+    _ -> (-9223372036854775807 - 1, 9223372036854775807)
+
+/** Sequence `def` with its absent options filled in (§3.3 rule 1), checked for consistency (`Q6017`). */
+filled_sequence(oid: u64, ns: u64, name: string, owner: u64, def: SequenceDef) -> Result[CatSequence, CodecError]
+    val (lo, hi) = type_range(def.ty)
+    val increment = def.increment.unwrap_or(1)
+    val min = def.min.unwrap_or(if increment < 0 then lo else 1)
+    val max = def.max.unwrap_or(hi)
+    val start = def.start.unwrap_or(1)
+    val s = CatSequence(oid, ns, name, owner, def.ty, start, increment, min, max, def.cycle, def.cache.unwrap_or(32), start, 0, 0)
+    check_sequence(s)?
+    Ok(s)
+
+/** That sequence `s`'s options are consistent (§2.7 rule 4). */
+check_sequence(s: CatSequence) -> Result[(), CodecError]
+    val (lo, hi) = type_range(s.ty)
+    if s.increment == 0 || s.cache == 0 then return fail("Q6017", "a sequence's increment and cache must not be 0")
+    if s.min < lo || s.max > hi then return fail("Q6017", "a sequence's range lies outside its type")
+    if s.min > s.max then return fail("Q6017", "a sequence's min exceeds its max")
+    if s.start < s.min || s.start > s.max then return fail("Q6017", "a sequence's start lies outside min to max")
+    if s.next < s.min || s.next > s.max then return fail("Q6017", "a sequence's next value lies outside min to max")
+    Ok(())
+
+/** That every union payload in resolved `t` is a record (`query-tree.md` §2.4, `Q3014`). */
+well_formed(t: Type) -> Result[(), CodecError] = t match
+    Union(vs) ->
+        for v in vs
+            v.ty match
+                Record(_) -> well_formed(v.ty)?
+                _ -> return fail("Q3014", s"variant '${v.name}' has a payload that is not a record")
+
+        Ok(())
+    Record(fs) ->
+        for f in fs
+            well_formed(f.ty)?
+
+        Ok(())
+    Nullable(inner) -> well_formed(*inner)
+    Bag(e) | List(e) -> well_formed(*e)
+    _ -> Ok(())
+
+contains_u32(xs: Buf[u32], x: u32) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+same_ids(a: Buf[u32], b: Buf[u32]) -> bool
+    if a.len() != b.len() then return false
+
+    for i in 0..<a.len()
+        if a[i] != b[i] then return false
+
+    true

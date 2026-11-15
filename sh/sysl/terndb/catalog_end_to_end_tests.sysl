@@ -1,0 +1,60 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// From bytes to a typed query: `ddl.md` §3.4's worked encoding decoded, applied to a new catalog, and
+// a query typed against what it built, through `type_envelope` and the catalog's `Catalog`.
+
+private applied_bytes(c: MemCatalog, spaced: string) -> MemCatalog
+    var x = c
+    val env = decode_envelope(hex(spaced).view()).unwrap()
+
+    x.apply(env, BootstrapRole) match
+        Ok(_) -> ()
+        Err(e) -> assert(false, s"§3.4's statement is refused with ${e.code}: ${e.message}")
+
+    x
+
+private worked_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = applied_bytes(c, create_type_hex)
+    c = applied_bytes(c, create_table_hex)
+    applied_bytes(c, alter_table_hex)
+
+@test
+the_worked_example_decoded_and_applied_builds_the_users_table()
+    val c = worked_catalog()
+    assert_eq(c.version, 4)
+    val t = cat_table_of(c, "users")
+    assert_eq(t.schema_version(), 2)
+    assert_eq(cat_columns(cat_info(c, "users")), "id,email,status,addresses,created_at")
+    assert_eq(cat_keys(cat_info(c, "users")), "users_pkey,users_email_key")
+    assert(t.column_named("created_at").unwrap().state == ColumnReady)
+    assert(c.sequences[c.sequence_at(cat_q("users_id_seq")).unwrap()].owner_table == t.oid)
+
+    var check = false
+
+    for k in c.constraints
+        if k.name == "email_has_at"
+            check = true
+            assert(!k.validated && k.job)
+
+    assert(check)
+
+@test
+a_query_against_the_worked_catalog_is_typed_with_its_structures()
+    val c = worked_catalog()
+    val items = items_of([item("email", col("u", "email")), item("status", col("u", "status")), item("created_at", col("u", "created_at"))])
+    val q = envelope([], Query(Project(scan("app", "users", "u"), "r", items)))
+    val status = union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))])
+    val want = bag(record([Field("email", Text), Field("status", status), Field("created_at", nullable(Timestamp))]))
+    assert(type_envelope(q, c).unwrap().result == Some(want))
+
+    // The identity column is not an insert target, and the filling-free columns are.
+    val source = Values("v", items_of([Field("id", Int64)]), items_of([items_of([cat_int(1)])]))
+    val ins = envelope([], Insert(cat_q("users"), "n", None, items_of(["id"]), source, None, buf[Item]()))
+    assert_eq(type_envelope(ins, c).unwrap_err().code, "Q5003")
+
+    val bad = envelope([], Query(Project(scan("app", "users", "u"), "r", items_of([item("x", col("u", "nope"))]))))
+    assert_eq(type_envelope(bad, c).unwrap_err().code, "Q2003")

@@ -1,0 +1,459 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The catalog of `ddl.md` §2 held in memory: every object with its oid, its owner and the rules its
+// section states, the state DDL statements change (`catalog_apply.sysl`), and the `Catalog` the type
+// checker reads. Objects refer to each other by oid, and a table's constraints and indexes name its
+// columns by column id, so a rename touches one object; the stored expressions name columns as
+// `Col(row, c)` and are rewritten by a rename (§8.4).
+//
+// The catalog is a value whose buffers are shared by every copy of it, so a statement is applied to
+// `clone()`, which copies every buffer a statement changes in place, and the clone replaces the
+// catalog only when the whole statement succeeds.
+
+/** The kind of object an oid names (`ddl.md` §1 rule 1). */
+enum ObjKind
+    KindNamespace
+    KindTable
+    KindView
+    KindIndex
+    KindConstraint
+    KindSequence
+    KindType
+    KindRole
+
+/** An object, by kind and oid. */
+struct Obj derives Eq
+    kind: ObjKind
+    oid: u64
+
+/** A column's state (§2.3 rule 3); only a `ready` column is visible to statements. */
+enum ColumnState
+    ColumnReady
+    ColumnFilling
+    ColumnConverting
+
+/** A column (§2.3): its id, name and declared type (a named type reference is kept, §2.8 rule 3), its
+ * default, generation expression or identity, and the sequence an identity owns (0 for none). A column
+ * added after its table was created has a `fill` (§5.1 rule 3); a `converting` column keeps its type
+ * and records the type it is becoming and the expression that converts it (§8.5 rule 2).
+ */
+struct CatColumn derives Eq
+    id: u32
+    name: string
+    ty: Type
+    default: Option[Expr]
+    generated: Option[Expr]
+    identity: Identity
+    sequence: u64
+    state: ColumnState
+    fill: Option[Expr]
+    target: Option[Type]
+    using: Option[Expr]
+
+/** One schema version of a table (§5.1 rule 1): its number and its columns at that version. */
+struct SchemaVersion derives Eq
+    number: u64
+    columns: Buf[CatColumn]
+
+/** A table (§2.2): its columns in ordinal order, its primary key by column id, the next column id
+ * to hand out, and every schema version it has had, the current one last.
+ */
+struct CatTable
+    oid: u64
+    ns: u64
+    name: string
+    owner: u64
+    columns: Buf[CatColumn]
+    primary_key: Buf[u32]
+    next_column: u32
+    versions: Buf[SchemaVersion]
+
+    /** The current schema version (§1 rule 4). */
+    schema_version(self) -> u64 = self.versions[self.versions.len() - 1].number
+
+    column_named(self, name: string) -> Option[CatColumn]
+        for c in self.columns
+            if c.name == name then return Some(c)
+
+        None
+
+    column_at(self, name: string) -> Option[usize]
+        for i in 0..<self.columns.len()
+            if self.columns[i].name == name then return Some(i)
+
+        None
+
+    column_by_id(self, id: u32) -> Option[CatColumn]
+        for c in self.columns
+            if c.id == id then return Some(c)
+
+        None
+end CatTable
+
+/** What a constraint is (§2.6), its columns by id. */
+enum ConKind derives Eq
+    ConPrimaryKey(columns: Buf[u32])
+    ConCheck(expr: Expr)
+    ConUnique(columns: Buf[u32])
+    ConForeignKey(columns: Buf[u32], ref_table: u64, ref_columns: Buf[u32], on_delete: FkAction, on_update: FkAction, deferred: bool)
+
+/** A constraint of a table: whether it is validated (§2.6 rule 1), whether a validation job is due at
+ * commit (§8.7), and the unique index backing a `unique` constraint (0 for none).
+ */
+struct CatConstraint
+    oid: u64
+    table: u64
+    name: string
+    kind: ConKind
+    validated: bool
+    job: bool
+    index: u64
+
+/** An index key component: a column by id, or a definition expression over the row (§2.5 rule 4). */
+enum KeyRef derives Eq
+    KeyOn(column: u32)
+    KeyOver(expr: Expr)
+
+struct CatKey derives Eq
+    key: KeyRef
+    descending: bool
+
+/** An index's state (§2.5 rule 5). */
+enum IndexState
+    IndexBuilding
+    IndexReady
+    IndexFailed
+
+/** A secondary index (§2.5), and the `unique` constraint it backs (0 for none). */
+struct CatIndex
+    oid: u64
+    table: u64
+    name: string
+    unique: bool
+    keys: Buf[CatKey]
+    predicate: Option[Expr]
+    state: IndexState
+    constraint: u64
+
+/** A sequence (§2.7 rule 4) with every option filled in, the next value it hands out, and the
+ * identity column that owns it (`owner_table` 0 for a sequence of its own).
+ */
+struct CatSequence
+    oid: u64
+    ns: u64
+    name: string
+    owner: u64
+    ty: Type
+    start: i64
+    increment: i64
+    min: i64
+    max: i64
+    cycle: bool
+    cache: u64
+    next: i64
+    owner_table: u64
+    owner_column: u32
+
+/** A named type (§2.8): its definition as declared, named references inside it kept. */
+struct CatType
+    oid: u64
+    ns: u64
+    name: string
+    owner: u64
+    ty: Type
+
+/** A view (§2.9): its stored query and the columns of its result. */
+struct CatView
+    oid: u64
+    ns: u64
+    name: string
+    owner: u64
+    query: Rel
+    columns: Buf[Field]
+
+/** A role (§2.10 rule 1); `member_of` holds role oids. */
+struct CatRole
+    oid: u64
+    name: string
+    login: bool
+    superuser: bool
+    member_of: Buf[u64]
+
+/** One privilege on one object held by one role (§2.10 rule 3). */
+struct CatGrant
+    object: Obj
+    grantee: u64
+    privilege: Privilege
+    grantable: bool
+    grantor: u64
+
+struct CatNamespace
+    oid: u64
+    name: string
+    owner: u64
+
+/** The name of the superuser a new database is created with (`ddl.md` §2.10 rule 7). */
+const BootstrapRole = "terndb"
+
+/** The predefined role of the replication right (§2.10 rule 6). */
+const ReplicationRole = "terndb_replication"
+
+/** The catalog: every object of §2, the next oid to hand out, and the catalog version (§1 rule 3),
+ * which here counts the statements that changed it.
+ */
+struct MemCatalog
+    next_oid: u64
+    version: u64
+    namespaces: Buf[CatNamespace]
+    tables: Buf[CatTable]
+    views: Buf[CatView]
+    indexes: Buf[CatIndex]
+    constraints: Buf[CatConstraint]
+    sequences: Buf[CatSequence]
+    types: Buf[CatType]
+    roles: Buf[CatRole]
+    grants: Buf[CatGrant]
+
+    /** A fresh oid; oids are never reused (§1 rule 1). */
+    oid(*self) -> u64
+        val o = self.next_oid
+        self.next_oid += 1
+        o
+
+    /** A copy whose buffers are its own, down to every buffer a statement changes in place. */
+    clone(self) -> MemCatalog
+        val tables = buf[CatTable]()
+
+        for t in self.tables
+            tables.push(CatTable(t.oid, t.ns, t.name, t.owner, t.columns.copy(), t.primary_key.copy(), t.next_column, t.versions.copy()))
+
+        val roles = buf[CatRole]()
+
+        for r in self.roles
+            roles.push(CatRole(r.oid, r.name, r.login, r.superuser, r.member_of.copy()))
+
+        MemCatalog(self.next_oid, self.version, self.namespaces.copy(), tables, self.views.copy(), self.indexes.copy(),
+            self.constraints.copy(), self.sequences.copy(), self.types.copy(), roles, self.grants.copy())
+    end clone
+
+    // -- finding objects ------------------------------------------------------------------------
+
+    namespace_at(self, name: string) -> Option[usize]
+        for i in 0..<self.namespaces.len()
+            if self.namespaces[i].name == name then return Some(i)
+
+        None
+
+    namespace_by_oid(self, oid: u64) -> CatNamespace
+        for n in self.namespaces
+            if n.oid == oid then return n
+
+        self.namespaces[0]
+
+    ns_oid(self, name: string) -> Option[u64] = self.namespace_at(name).map(i -> self.namespaces[i].oid)
+
+    table_at(self, name: QualName) -> Option[usize]
+        val ns = self.ns_oid(name.schema)?
+
+        for i in 0..<self.tables.len()
+            if self.tables[i].ns == ns && self.tables[i].name == name.name then return Some(i)
+
+        None
+
+    table_by_oid(self, oid: u64) -> Option[usize]
+        for i in 0..<self.tables.len()
+            if self.tables[i].oid == oid then return Some(i)
+
+        None
+
+    view_at(self, name: QualName) -> Option[usize]
+        val ns = self.ns_oid(name.schema)?
+
+        for i in 0..<self.views.len()
+            if self.views[i].ns == ns && self.views[i].name == name.name then return Some(i)
+
+        None
+
+    type_at(self, name: QualName) -> Option[usize]
+        val ns = self.ns_oid(name.schema)?
+
+        for i in 0..<self.types.len()
+            if self.types[i].ns == ns && self.types[i].name == name.name then return Some(i)
+
+        None
+
+    sequence_at(self, name: QualName) -> Option[usize]
+        val ns = self.ns_oid(name.schema)?
+
+        for i in 0..<self.sequences.len()
+            if self.sequences[i].ns == ns && self.sequences[i].name == name.name then return Some(i)
+
+        None
+
+    index_at(self, name: QualName) -> Option[usize]
+        val ns = self.ns_oid(name.schema)?
+
+        for i in 0..<self.indexes.len()
+            if self.table_ns(self.indexes[i].table) == ns && self.indexes[i].name == name.name then return Some(i)
+
+        None
+
+    constraint_by_oid(self, oid: u64) -> Option[usize]
+        for i in 0..<self.constraints.len()
+            if self.constraints[i].oid == oid then return Some(i)
+
+        None
+
+    index_by_oid(self, oid: u64) -> Option[usize]
+        for i in 0..<self.indexes.len()
+            if self.indexes[i].oid == oid then return Some(i)
+
+        None
+
+    role_at(self, name: string) -> Option[usize]
+        for i in 0..<self.roles.len()
+            if self.roles[i].name == name then return Some(i)
+
+        None
+
+    role_by_oid(self, oid: u64) -> Option[usize]
+        for i in 0..<self.roles.len()
+            if self.roles[i].oid == oid then return Some(i)
+
+        None
+
+    /** The namespace of table `oid`. */
+    table_ns(self, oid: u64) -> u64 = self.table_by_oid(oid) match
+        Some(i) -> self.tables[i].ns
+        None -> 0
+
+    /** Whether `name` is free in namespace `ns` across every kind §1 rule 1 lists. */
+    name_free(self, ns: u64, name: string) -> bool
+        for t in self.tables
+            if t.ns == ns && t.name == name then return false
+
+        for v in self.views
+            if v.ns == ns && v.name == name then return false
+
+        for s in self.sequences
+            if s.ns == ns && s.name == name then return false
+
+        for t in self.types
+            if t.ns == ns && t.name == name then return false
+
+        for x in self.indexes
+            if self.table_ns(x.table) == ns && x.name == name then return false
+
+        for c in self.constraints
+            if self.table_ns(c.table) == ns && c.name == name then return false
+
+        true
+    end name_free
+
+    /** The constraints of table `oid`. */
+    constraints_of(self, oid: u64) -> Buf[CatConstraint]
+        val out = buf[CatConstraint]()
+
+        for c in self.constraints
+            if c.table == oid then out.push(c)
+
+        out
+
+    /** The primary-key constraint of table `oid`. */
+    primary_key_of(self, oid: u64) -> Option[CatConstraint]
+        for c in self.constraints
+            if c.table == oid
+                c.kind match
+                    ConPrimaryKey(_) -> return Some(c)
+                    _ -> ()
+
+        None
+
+    /** The names of columns `ids` of `t`. */
+    column_names(self, t: CatTable, ids: Buf[u32]) -> Buf[string]
+        val out = buf[string]()
+
+        for id in ids
+            t.column_by_id(id) match
+                Some(c) -> out.push(c.name)
+                None -> ()
+
+        out
+end MemCatalog
+
+/** A new database's catalog (`ddl.md` §2.10 rules 6–7): the superuser `terndb` with `login`, the role
+ * `terndb_replication`, and the reserved namespaces `sys` and `catalog`, owned by `terndb`.
+ */
+mem_catalog() -> MemCatalog
+    var c = MemCatalog(1, 0, buf[CatNamespace](), buf[CatTable](), buf[CatView](), buf[CatIndex](), buf[CatConstraint](),
+        buf[CatSequence](), buf[CatType](), buf[CatRole](), buf[CatGrant]())
+    val boot = c.oid()
+    c.roles.push(CatRole(boot, BootstrapRole, true, true, buf[u64]()))
+    c.roles.push(CatRole(c.oid(), ReplicationRole, false, false, buf[u64]()))
+    c.namespaces.push(CatNamespace(c.oid(), "sys", boot))
+    c.namespaces.push(CatNamespace(c.oid(), "catalog", boot))
+    c
+
+/** Whether `ns` is `sys` or `catalog` (§1 rule 2). */
+is_reserved_namespace(ns: string) -> bool = ns == "sys" || ns == "catalog"
+
+// -- the catalog as the type checker reads it ------------------------------------------------------
+
+impl Catalog for MemCatalog
+    table(self, name: QualName) -> Option[TableInfo]
+        self.table_at(name) match
+            Some(i) -> return Some(self.table_info(self.tables[i]))
+            None -> ()
+
+        self.view_at(name) match
+            Some(i) ->
+                val cs = buf[ColumnInfo]()
+
+                for f in self.views[i].columns
+                    cs.push(ColumnInfo(f.name, f.ty, false))
+
+                Some(TableInfo(cs, buf[UniqueKey](), true))
+            None -> None
+
+    named_type(self, name: QualName) -> Option[Type] = self.type_at(name).map(i -> self.types[i].ty)
+
+    /** The catalog defines no function beyond the core ones. */
+    functions(self, name: string) -> Buf[Signature] = buf[Signature]()
+
+impl MemCatalog
+    /** Table `t` as a statement sees it: its `ready` columns (§2.3 rule 3), each writable unless it is
+     * generated or an `always` identity, and its unique keys — the primary key, the unique constraints,
+     * and every other ready unique index over columns alone with no predicate.
+     */
+    table_info(self, t: CatTable) -> TableInfo
+        val cs = buf[ColumnInfo]()
+
+        for c in t.columns
+            if c.state == ColumnReady then
+                cs.push(ColumnInfo(c.name, c.ty, c.generated.is_none() && c.identity != Always))
+
+        val keys = buf[UniqueKey]()
+
+        for c in self.constraints
+            if c.table == t.oid
+                c.kind match
+                    ConPrimaryKey(ids) -> keys.insert(0, UniqueKey(c.name, self.column_names(t, ids)))
+                    ConUnique(ids) -> keys.push(UniqueKey(c.name, self.column_names(t, ids)))
+                    _ -> ()
+
+        for x in self.indexes
+            if x.table == t.oid && x.unique && x.constraint == 0 && x.state == IndexReady && x.predicate.is_none()
+                val ids = buf[u32]()
+                var plain = true
+
+                for k in x.keys
+                    k.key match
+                        KeyOn(id) -> ids.push(id)
+                        KeyOver(_) -> plain = false
+
+                if plain then keys.push(UniqueKey(x.name, self.column_names(t, ids)))
+
+        TableInfo(cs, keys, false)
+    end table_info

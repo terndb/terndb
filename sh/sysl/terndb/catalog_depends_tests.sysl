@@ -1,0 +1,179 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.contains
+
+// Dependencies (`ddl.md` §2.11) and the drops they govern: chains of views, foreign keys between
+// tables, named types and sequences in use, namespaces dropped whole, and `sys.depends` as rows.
+
+/** `cat_base()` with `v1` over `t` and `v2` over `v1`. */
+private chain() -> MemCatalog
+    val c = cat_ok(cat_base(), cat_view("v1", cat_pick("t", "x", "r1", ["id", "b"])))
+    cat_ok(c, cat_view("v2", cat_pick("v1", "y", "r2", ["b"])))
+
+@test
+a_view_on_a_view_on_a_table_holds_both_until_cascade()
+    val c = chain()
+    assert_eq(cat_columns(cat_info(c, "v2")), "b")
+    assert_eq(cat_code(c, DropTable(cat_q("t"), false, false)), "Q6007")
+    assert_eq(cat_code(c, DropView(cat_q("v1"), false, false)), "Q6007")
+
+    val d = cat_ok(c, DropTable(cat_q("t"), false, true))
+    assert(d.table_at(cat_q("t")).is_none() && d.view_at(cat_q("v1")).is_none() && d.view_at(cat_q("v2")).is_none())
+
+    val e = cat_ok(c, DropView(cat_q("v1"), false, true))
+    assert(e.view_at(cat_q("v2")).is_none() && e.table_at(cat_q("t")).is_some())
+
+    val f = cat_ok(c, DropView(cat_q("v2"), false, false))
+    assert(f.view_at(cat_q("v1")).is_some())
+
+@test
+a_drop_of_a_missing_object_is_refused_unless_if_exists()
+    val c = chain()
+    assert_eq(cat_code(c, DropTable(cat_q("nope"), false, false)), "Q2001")
+    assert_eq(cat_code(c, DropTable(cat_q("v1"), false, false)), "Q2001")
+    assert_eq(cat_code(c, DropTable(cat_q("nope"), true, false)), "ok")
+    assert_eq(cat_code(c, DropView(cat_q("t"), false, false)), "Q6003")
+    assert_eq(cat_code(c, DropView(cat_q("nope"), true, false)), "ok")
+    assert_eq(cat_code(c, DropIndex(cat_q("nope"), false)), "Q6003")
+    assert_eq(cat_code(c, DropIndex(cat_q("nope"), true)), "ok")
+    assert_eq(cat_code(c, DropType(cat_q("nope"), false)), "Q6004")
+    assert_eq(cat_code(c, DropType(cat_q("nope"), true)), "ok")
+    assert_eq(cat_code(c, DropSequence(cat_q("nope"), false)), "Q6003")
+    assert_eq(cat_code(c, DropSequence(cat_q("nope"), true)), "ok")
+    assert_eq(cat_code(c, DropNamespace("nope", false, false)), "Q6003")
+    assert_eq(cat_code(c, DropNamespace("nope", true, false)), "ok")
+
+@test
+dropping_a_referenced_table_with_cascade_drops_only_the_foreign_key()
+    val c = cat_ok(cat_base(), cat_table("child", [cat_col("id", Int64), cat_col("tid", Int64)], ["id"], [cat_fk("child_t", ["tid"], "t", ["id"])]))
+    assert_eq(cat_code(c, DropTable(cat_q("t"), false, false)), "Q6007")
+
+    val d = cat_ok(c, DropTable(cat_q("t"), false, true))
+    assert(d.table_at(cat_q("t")).is_none())
+    assert_eq(cat_columns(cat_info(d, "child")), "id,tid")
+    assert_eq(d.constraints_of(cat_table_of(d, "child").oid).len(), 1)
+
+    // The referencing table drops freely, its foreign key with it.
+    val e = cat_ok(c, DropTable(cat_q("child"), false, false))
+    assert_eq(e.constraints.len(), 1)
+
+@test
+a_table_referencing_itself_drops_without_cascade()
+    val tree = [cat_col("id", Int64), cat_col("parent", nullable(Int64))]
+    val c = cat_ok(cat_base(), cat_table("tree", tree, ["id"], [cat_fk("up", ["parent"], "tree", ["id"])]))
+    assert_eq(cat_code(c, DropTable(cat_q("tree"), false, false)), "ok")
+
+@test
+a_table_drops_with_its_indexes_constraints_sequences_and_grants()
+    var c = cat_ok(cat_base(), cat_table("u", [ColumnDef("id", Int64, None, None, Always, None), cat_col("e", Text)], ["id"], [cat_unique("u_e", ["e"])]))
+    c = cat_ok(c, cat_index("u_e2", "u", ["e"]))
+    c = cat_ok(c, cat_role("alice"))
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("u")), "alice", false))
+    c = cat_ok(c, Grant(items_of([PrivUsage]), OnSequence(cat_q("u_id_seq")), "alice", false))
+    val d = cat_ok(c, DropTable(cat_q("u"), false, false))
+    assert(d.index_at(cat_q("u_e")).is_none() && d.index_at(cat_q("u_e2")).is_none() && d.sequence_at(cat_q("u_id_seq")).is_none())
+    assert_eq(d.grants.len(), 0)
+    assert_eq(d.constraints.len(), 1)
+
+    // The names are free again.
+    assert_eq(cat_code(d, cat_table("u", [cat_col("id", Int64)], ["id"])), "ok")
+
+@test
+an_index_backing_a_constraint_is_dropped_only_with_it()
+    val c = cat_ok(cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), true)])), cat_index("t_a", "t", ["a"]))
+    assert_eq(cat_code(c, DropIndex(cat_q("t_b"), false)), "Q6007")
+    assert(cat_ok(c, DropIndex(cat_q("t_a"), false)).index_at(cat_q("t_a")).is_none())
+
+    val r = cat_ok(c, cat_role("alice"))
+    assert_eq(cat_code(r, DropIndex(cat_q("t_a"), false), "alice"), "Q6015")
+
+@test
+a_named_type_in_use_is_never_dropped()
+    var c = cat_ok(cat_base(), CreateType(cat_q("point"), record([Field("x", Int32)]), false))
+    assert_eq(cat_code(c, DropType(cat_q("point"), false)), "ok")
+
+    val by_column = cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("p", Named("app", "point"))], ["id"]))
+    assert_eq(cat_code(by_column, DropType(cat_q("point"), false)), "Q6007")
+    assert_eq(cat_code(cat_ok(by_column, DropTable(cat_q("u"), false, false)), DropType(cat_q("point"), false)), "ok")
+
+    val by_type = cat_ok(c, CreateType(cat_q("line"), record([Field("a", Named("app", "point"))]), false))
+    assert_eq(cat_code(by_type, DropType(cat_q("point"), false)), "Q6007")
+    assert_eq(cat_code(by_type, DropType(cat_q("line"), false)), "ok")
+
+    val typed_view = Project(scan("app", "t", "x"), "r", items_of([item("p", Null(Named("app", "point")))]))
+    val by_view = cat_ok(c, cat_view("vp", typed_view))
+    assert_eq(cat_code(by_view, DropType(cat_q("point"), false)), "Q6007")
+
+    val check = cat_check("ck", call("is_null", [Null(Named("app", "point"))]))
+    val by_check = cat_ok(c, cat_alter("t", [AddConstraint(check, false)]))
+    assert_eq(cat_code(by_check, DropType(cat_q("point"), false)), "Q6007")
+
+    val r = cat_ok(c, cat_role("alice"))
+    assert_eq(cat_code(r, DropType(cat_q("point"), false), "alice"), "Q6015")
+
+@test
+a_sequence_a_default_draws_from_is_never_dropped()
+    val c = cat_ok(cat_base(), CreateSequence(cat_q("s"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    val draw = Some(call("next_value", [cat_text("app"), cat_text("s")]))
+    val d = cat_ok(c, cat_alter("t", [AddColumn(ColumnDef("n", Int64, draw, None, NoIdentity, None))]))
+    assert_eq(cat_code(d, DropSequence(cat_q("s"), false)), "Q6007")
+    assert_eq(cat_code(c, DropSequence(cat_q("s"), false)), "ok")
+
+    // Nor is the table owning an identity sequence another table's default draws from.
+    var e = cat_ok(cat_base(), cat_table("u", [ColumnDef("id", Int64, None, None, Always, None)], ["id"]))
+    e = cat_ok(e, cat_alter("t", [AddColumn(ColumnDef("n", Int64, Some(call("next_value", [cat_text("app"), cat_text("u_id_seq")])), None, NoIdentity, None))]))
+    assert_eq(cat_code(e, DropTable(cat_q("u"), false, true)), "Q6007")
+
+@test
+a_namespace_drops_whole_with_cascade()
+    var c = chain()
+    c = cat_ok(c, CreateType(cat_q("a"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, CreateType(cat_q("b"), record([Field("a", Named("app", "a"))]), false))
+    c = cat_ok(c, CreateSequence(cat_q("s"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    c = cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("bb", Named("app", "b"))], ["id"], [cat_fk("u_t", ["id"], "t", ["id"])]))
+    assert_eq(cat_code(c, DropNamespace("app", false, false)), "Q6007")
+
+    val d = cat_ok(c, DropNamespace("app", false, true))
+    assert(d.namespace_at("app").is_none())
+    assert(d.tables.len() == 0 && d.views.len() == 0 && d.types.len() == 0 && d.sequences.len() == 0 && d.constraints.len() == 0)
+    assert_eq(cat_code(cat_ok(mem_catalog(), CreateNamespace("app", false)), DropNamespace("app", false, false)), "ok")
+
+@test
+a_namespace_whose_objects_are_used_outside_it_cannot_cascade()
+    var c = cat_ok(cat_base(), CreateNamespace("other", false))
+    c = cat_ok(c, CreateType(QualName("other", "p"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("p", Named("other", "p"))], ["id"]))
+    assert_eq(cat_code(c, DropNamespace("other", false, true)), "Q6007")
+
+    // A view outside it is a dependent, and cascades.
+    var d = cat_ok(cat_base(), CreateNamespace("other", false))
+    d = cat_ok(d, CreateTable(QualName("other", "o"), items_of([cat_col("id", Int64)]), items_of(["id"]), buf[ConstraintDef](), false))
+    d = cat_ok(d, cat_view("vo", Project(Scan(QualName("other", "o"), "x"), "r", items_of([item("id", col("x", "id"))]))))
+    val e = cat_ok(d, DropNamespace("other", false, true))
+    assert(e.view_at(cat_q("vo")).is_none() && e.table_at(cat_q("t")).is_some())
+
+    assert_eq(cat_code(d, DropNamespace("other", false, true), "nobody"), "Q6015")
+
+@test
+the_dependencies_are_the_rows_sys_depends_records()
+    var c = chain()
+    c = cat_ok(c, CreateType(cat_q("point"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, cat_table("u", [ColumnDef("id", Int64, None, None, Always, None), cat_col("p", Named("app", "point"))], ["id"], [cat_fk("u_t", ["id"], "t", ["id"])]))
+    val deps = c.depends()
+    val t = Obj(KindTable, cat_table_of(c, "t").oid)
+    val u = Obj(KindTable, cat_table_of(c, "u").oid)
+    val v1 = Obj(KindView, c.views[c.view_at(cat_q("v1")).unwrap()].oid)
+    val v2 = Obj(KindView, c.views[c.view_at(cat_q("v2")).unwrap()].oid)
+    val point = Obj(KindType, c.types[c.type_at(cat_q("point")).unwrap()].oid)
+    val seq = Obj(KindSequence, c.sequences[c.sequence_at(cat_q("u_id_seq")).unwrap()].oid)
+    var fk = Obj(KindConstraint, 0)
+
+    for k in c.constraints
+        if k.name == "u_t" then fk = Obj(KindConstraint, k.oid)
+
+    for d in [Depend(v1, t), Depend(v2, v1), Depend(u, point), Depend(seq, u), Depend(fk, u), Depend(fk, t)]
+        assert(contains(deps.view(), d))
+
+    assert(!contains(deps.view(), Depend(v2, t)))

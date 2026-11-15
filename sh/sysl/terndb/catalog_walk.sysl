@@ -1,0 +1,283 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.contains
+
+// Reading and rewriting the trees the catalog stores — view queries and definition expressions
+// (`ddl.md` §2.11, §2.12): what they scan, which columns of which binder they read, which named types
+// and sequences they name, and the same tree with a column, a table or a named type renamed (§8.4).
+
+/** A `Scan` in a stored tree: the relation it reads and the binder it reads it under. */
+struct ScanRef derives Eq
+    table: QualName
+    binder: string
+
+/** A column read through a binder, `Col(binder, name)`. */
+struct ColRef derives Eq
+    binder: string
+    name: string
+
+/** What a stored tree names. */
+struct TreeRefs
+    scans: Buf[ScanRef]
+    cols: Buf[ColRef]
+    /** Binders read whole, by `Row`. */
+    rows: Buf[string]
+    types: Buf[QualName]
+    /** The sequences `next_value` names with literal arguments. */
+    sequences: Buf[QualName]
+    /** Whether a `next_value` names its sequence other than by two text literals. */
+    dynamic_sequence: bool
+
+    /** Whether the tree reads column `name` through any of `binders`, by name or as a whole row. */
+    reads_column(self, binders: Buf[string], name: string) -> bool
+        for c in self.cols
+            if c.name == name && contains(binders.view(), c.binder) then return true
+
+        for r in self.rows
+            if contains(binders.view(), r) then return true
+
+        false
+
+    /** The binders the tree scans `table` under. */
+    binders_of(self, table: QualName) -> Buf[string]
+        val out = buf[string]()
+
+        for s in self.scans
+            if s.table == table then out.push(s.binder)
+
+        out
+
+    names_type(self, name: QualName) -> bool = contains(self.types.view(), name)
+end TreeRefs
+
+/** A rename to apply while walking. */
+enum Rename derives Eq
+    NoRename
+    /** Column `old` of the relation read through `binders` becomes `new`. */
+    RenameCol(binders: Buf[string], old_name: string, new_name: string)
+    RenameRel(old_name: QualName, new_name: QualName)
+    RenameTypeRef(old_name: QualName, new_name: QualName)
+
+private struct Walker
+    rename: Rename
+    refs: TreeRefs
+
+private walker(rename: Rename) -> Walker =
+    Walker(rename, TreeRefs(buf[ScanRef](), buf[ColRef](), buf[string](), buf[QualName](), buf[QualName](), false))
+
+/** What `r` names. */
+rel_refs(r: Rel) -> TreeRefs
+    var w = walker(NoRename)
+    w.rel(r)
+    w.refs
+
+/** What `e` names. */
+expr_refs(e: Expr) -> TreeRefs
+    var w = walker(NoRename)
+    w.expr(e)
+    w.refs
+
+/** What type `t` names. */
+type_refs(t: Type) -> TreeRefs
+    var w = walker(NoRename)
+    w.ty(t)
+    w.refs
+
+renamed_rel(r: Rel, rename: Rename) -> Rel
+    var w = walker(rename)
+    w.rel(r)
+
+renamed_expr(e: Expr, rename: Rename) -> Expr
+    var w = walker(rename)
+    w.expr(e)
+
+renamed_type(t: Type, rename: Rename) -> Type
+    var w = walker(rename)
+    w.ty(t)
+
+renamed_opt(e: Option[Expr], rename: Rename) -> Option[Expr] = e match
+    Some(x) -> Some(renamed_expr(x, rename))
+    None -> None
+
+impl Walker
+    ty(*self, t: Type) -> Type = t match
+        Named(schema, name) ->
+            val q = QualName(schema, name)
+            self.refs.types.push(q)
+
+            self.rename match
+                RenameTypeRef(old, new) -> if q == old then Named(new.schema, new.name) else t
+                _ -> t
+        Nullable(inner) -> nullable(self.ty(*inner))
+        Record(fs) -> Record(self.fields(fs))
+        Union(vs) -> Union(self.fields(vs))
+        Bag(e) -> Bag(self.ty(*e))
+        List(e) -> List(self.ty(*e))
+        _ -> t
+
+    fields(*self, fs: Buf[Field]) -> Buf[Field]
+        val out = buf[Field]()
+
+        for f in fs
+            out.push(Field(f.name, self.ty(f.ty)))
+
+        out
+
+    opt(*self, e: Option[Expr]) -> Option[Expr] = e match
+        Some(x) -> Some(self.expr(x))
+        None -> None
+
+    boxed(*self, e: Option[&Expr]) -> Option[&Expr] = e match
+        Some(x) -> Some(self.expr(*x))
+        None -> None
+
+    exprs(*self, es: Buf[Expr]) -> Buf[Expr]
+        val out = buf[Expr]()
+
+        for e in es
+            out.push(self.expr(e))
+
+        out
+
+    items(*self, is: Buf[Item]) -> Buf[Item]
+        val out = buf[Item]()
+
+        for i in is
+            out.push(Item(i.name, self.expr(i.expr)))
+
+        out
+
+    sort_keys(*self, ks: Buf[SortKey]) -> Buf[SortKey]
+        val out = buf[SortKey]()
+
+        for k in ks
+            out.push(SortKey(self.expr(k.expr), k.desc, k.nulls_first))
+
+        out
+
+    column(*self, binder: string, name: string) -> Expr
+        self.refs.cols.push(ColRef(binder, name))
+
+        self.rename match
+            RenameCol(binders, old, new) -> if name == old && contains(binders.view(), binder) then Col(binder, new) else Col(binder, name)
+            _ -> Col(binder, name)
+
+    call_of(*self, f: string, args: Buf[Expr]) -> Expr
+        if f == "next_value"
+            if args.len() == 2
+                (args[0], args[1]) match
+                    (Literal(_, Text(s)), Literal(_, Text(n))) -> self.refs.sequences.push(QualName(s, n))
+                    _ -> self.refs.dynamic_sequence = true
+            else
+                self.refs.dynamic_sequence = true
+
+        Call(f, self.exprs(args))
+
+    expr(*self, e: Expr) -> Expr = e match
+        Col(binder, name) -> self.column(binder, name)
+        Row(binder) ->
+            self.refs.rows.push(binder)
+            e
+        Param(_) | Action -> e
+        Null(t) -> Null(self.ty(t))
+        Call(f, args) -> self.call_of(f, args)
+        Cast(x, t, mode) -> Cast(self.expr(*x), self.ty(t), mode)
+        If(arms, otherwise) ->
+            val out = buf[IfArm]()
+
+            for a in arms
+                out.push(IfArm(self.expr(a.cond), self.expr(a.value)))
+
+            If(out, self.boxed(otherwise))
+        Match(x, arms, otherwise) ->
+            val scrutinee = self.expr(*x)
+            val out = buf[MatchArm]()
+
+            for a in arms
+                out.push(MatchArm(a.tag, a.binder, self.expr(a.expr)))
+
+            Match(scrutinee, out, self.boxed(otherwise))
+        Record(fs) -> Record(self.items(fs))
+        Field(x, name) -> Field(self.expr(*x), name)
+        Variant(t, tag, x) -> Variant(self.ty(t), tag, self.expr(*x))
+        Relation(r) -> Relation(self.rel(*r))
+        Scalar(r) -> Scalar(self.rel(*r))
+        Exists(r) -> Exists(self.rel(*r))
+        In(es, r) -> In(self.exprs(es), self.rel(*r))
+        Literal(t, v) -> Literal(self.ty(t), v)
+
+    agg(*self, a: AggCall) -> AggCall = AggCall(a.function, self.exprs(a.args), a.distinct, self.opt(a.filter), self.sort_keys(a.order))
+
+    bound(*self, b: Bound) -> Bound = Bound(b.kind, self.opt(b.offset))
+
+    win(*self, w: WinCall) -> WinCall
+        val frame = w.frame match
+            Some(f) -> Some(Frame(f.unit, self.bound(f.start), self.bound(f.end), f.exclude))
+            None -> None
+
+        WinCall(w.function, self.exprs(w.args), self.exprs(w.partition), self.sort_keys(w.order), frame)
+
+    rels(*self, rs: Buf[Rel]) -> Buf[Rel]
+        val out = buf[Rel]()
+
+        for r in rs
+            out.push(self.rel(r))
+
+        out
+
+    rel(*self, r: Rel) -> Rel = r match
+        Scan(table, binder) ->
+            self.refs.scans.push(ScanRef(table, binder))
+
+            self.rename match
+                RenameRel(old, new) -> if table == old then Scan(new, binder) else r
+                _ -> r
+        Values(binder, columns, rows) ->
+            val out = buf[Buf[Expr]]()
+
+            for row in rows
+                out.push(self.exprs(row))
+
+            Values(binder, self.fields(columns), out)
+        ParamScan(_, _) | CteRef(_, _) -> r
+        Filter(input, predicate) -> Filter(self.rel(*input), self.expr(predicate))
+        Project(input, binder, items) -> Project(self.rel(*input), binder, self.items(items))
+        Join(kind, left, right, on, mark, binder) -> Join(kind, self.rel(*left), self.rel(*right), self.opt(on), mark, binder)
+        Apply(kind, left, right, on, mark, binder) -> Apply(kind, self.rel(*left), self.rel(*right), self.opt(on), mark, binder)
+        Aggregate(input, binder, keys, aggs) ->
+            val inner = self.rel(*input)
+            val ks = self.items(keys)
+            val out = buf[NamedAgg]()
+
+            for a in aggs
+                out.push(NamedAgg(a.name, self.agg(a.call)))
+
+            Aggregate(inner, binder, ks, out)
+        Window(input, binder, items) ->
+            val inner = self.rel(*input)
+            val out = buf[NamedWin]()
+
+            for w in items
+                out.push(NamedWin(w.name, self.win(w.call)))
+
+            Window(inner, binder, out)
+        Sort(input, keys) -> Sort(self.rel(*input), self.sort_keys(keys))
+        Limit(input, count, offset, ties, arbitrary) -> Limit(self.rel(*input), self.opt(count), self.opt(offset), ties, arbitrary)
+        Distinct(input) -> Distinct(self.rel(*input))
+        SetOp(op, all, binder, inputs) -> SetOp(op, all, binder, self.rels(inputs))
+        With(recursive, ctes, body) ->
+            val out = buf[CteDef]()
+
+            for c in ctes
+                val columns = c.columns match
+                    Some(fs) -> Some(self.fields(fs))
+                    None -> None
+
+                out.push(CteDef(c.name, columns, self.rel(c.rel)))
+
+            With(recursive, out, self.rel(*body))
+        Nest(input, binder, keys, name, items, order) ->
+            Nest(self.rel(*input), binder, self.items(keys), name, self.items(items), self.sort_keys(order))
+        Unnest(input, binder, value, outer, ordinality) -> Unnest(self.rel(*input), binder, self.expr(value), outer, ordinality)
+        Tag(input, binder, t, tag) -> Tag(self.rel(*input), binder, self.ty(t), tag)

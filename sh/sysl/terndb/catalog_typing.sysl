@@ -1,0 +1,197 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The catalog's type rules: named types resolved to their structure (`ddl.md` §2.8), which types may
+// be a key component (§2.4 rule 1, [DISK] §4.6 rule 4), the lossless conversions (§5.3 rule 3), the
+// width limit of §2.2 rule 3, and definition expressions and view queries typed by the query-tree
+// type checker against this catalog (§2.12).
+
+/** `ty` with every named type replaced by its structure, `Q6004` where one is not in the catalog. */
+resolve_type(c: MemCatalog, ty: Type) -> Result[Type, CodecError] = resolve_depth(c, ty, 0)
+
+private resolve_depth(c: MemCatalog, ty: Type, depth: usize) -> Result[Type, CodecError] = ty match
+    Named(schema, name) ->
+        if depth > c.types.len() then return fail("Q6005", s"type '$schema.$name' refers to itself")
+
+        c.type_at(QualName(schema, name)) match
+            Some(i) -> resolve_depth(c, c.types[i].ty, depth + 1)
+            None -> fail("Q6004", s"type '$schema.$name' is not in the catalog")
+    Nullable(inner) -> Ok(nullable(resolve_depth(c, *inner, depth)?))
+    Record(fs) -> Ok(Record(resolve_fields(c, fs, depth)?))
+    Union(vs) -> Ok(Union(resolve_fields(c, vs, depth)?))
+    Bag(e) -> Ok(Bag(resolve_depth(c, *e, depth)?))
+    List(e) -> Ok(List(resolve_depth(c, *e, depth)?))
+    _ -> Ok(ty)
+
+private resolve_fields(c: MemCatalog, fs: Buf[Field], depth: usize) -> Result[Buf[Field], CodecError]
+    val out = buf[Field]()
+
+    for f in fs
+        out.push(Field(f.name, resolve_depth(c, f.ty, depth)?))
+
+    Ok(out)
+
+/** Whether a resolved union is an enum: every payload is the empty record (§2.8 rule 1). */
+is_enum(t: Type) -> bool = t match
+    Union(vs) ->
+        for v in vs
+            v.ty match
+                Record(fs) -> if fs.len() > 0 then return false
+                _ -> return false
+
+        true
+    _ -> false
+
+/** Whether resolved type `t`, its nullability taken off, may be a key component ([DISK] §4.6 rule 4):
+ * a scalar other than `json`, or an enum.
+ */
+is_key_component(t: Type) -> bool = t.base() match
+    Json | Record(_) | Bag(_) | List(_) | Nullable(_) | Named(_, _) -> false
+    Union(_) -> is_enum(t.base())
+    _ -> true
+
+/** The octets a key component of resolved type `t` takes at most in the key, counting a `text` or
+ * `bytes` component as 0, since its length is bounded per entry at write time (`ddl.md` §2.2 rule 3).
+ */
+key_width(t: Type) -> usize = if is_enum(t.base()) then 2 else t.base().width()
+
+/** The digits a `decimal(p, 0)` needs to hold every value of an integer type, or 0 for another type. */
+private integer_digits(t: Type) -> u8 = t match
+    Int8 -> 3
+    Int16 -> 5
+    Int32 -> 10
+    Int64 -> 19
+    UInt8 -> 3
+    UInt16 -> 5
+    UInt32 -> 10
+    UInt64 -> 20
+    _ -> 0
+
+private signed_bits(t: Type) -> u64 = t match
+    Int8 -> 8
+    Int16 -> 16
+    Int32 -> 32
+    Int64 -> 64
+    Int128 -> 128
+    _ -> 0
+
+private unsigned_bits(t: Type) -> u64 = t match
+    UInt8 -> 8
+    UInt16 -> 16
+    UInt32 -> 32
+    UInt64 -> 64
+    _ -> 0
+
+/** Whether converting resolved `from` to resolved `to` is lossless (`ddl.md` §5.3 rule 3). A record or
+ * union matches its members by position, so a renamed field or tag converts; the members appended to
+ * a record must be nullable.
+ */
+is_lossless(from: Type, to: Type) -> bool
+    if from == to then return true
+
+    (from, to) match
+        (Nullable(a), Nullable(b)) -> return is_lossless(*a, *b)
+        (_, Nullable(b)) -> return is_lossless(from, *b)
+        (Nullable(_), _) -> return false
+        (Json, Text) | (Float32, Float64) -> return true
+        (List(a), Bag(b)) | (List(a), List(b)) | (Bag(a), Bag(b)) -> return is_lossless(*a, *b)
+        (Decimal(p, s), Decimal(p2, s2)) -> return s2 >= s && p2 - s2 >= p - s
+        (Decimal(_, _), _) -> return false
+        (_, Decimal(p, s)) -> return s == 0 && integer_digits(from) > 0 && p >= integer_digits(from)
+        (Record(a), Record(b)) ->
+            if b.len() < a.len() then return false
+
+            for i in 0..<b.len()
+                if i < a.len()
+                    if !is_lossless(a[i].ty, b[i].ty) then return false
+                else if !b[i].ty.is_nullable()
+                    return false
+
+            return true
+        (Union(a), Union(b)) ->
+            if b.len() < a.len() then return false
+
+            for i in 0..<a.len()
+                if !is_lossless(a[i].ty, b[i].ty) then return false
+
+            return true
+        _ -> ()
+
+    val m = signed_bits(to)
+    val um = unsigned_bits(to)
+
+    if signed_bits(from) > 0 && m > 0 then return m > signed_bits(from)
+
+    if unsigned_bits(from) > 0 && (m > 0 || um > 0) then return um > unsigned_bits(from) || m > unsigned_bits(from)
+
+    (from, to) match
+        (Int8, Float32) | (Int16, Float32) | (UInt8, Float32) | (UInt16, Float32) -> true
+        (Int8, Float64) | (Int16, Float64) | (Int32, Float64) | (UInt8, Float64) | (UInt16, Float64) | (UInt32, Float64) -> true
+        _ -> false
+end is_lossless
+
+/** Whether the key encoding of resolved `from` and `to` is the same, so an index or the primary key
+ * over a column survives the retype unchanged (`ddl.md` §8.5 rule 1): the same type, or an enum that
+ * gains variants or renames tags.
+ */
+same_key_encoding(from: Type, to: Type) -> bool
+    if from.base() == to.base() then return true
+
+    is_enum(from.base()) && is_enum(to.base()) && is_lossless(from.base(), to.base())
+
+// -- definition expressions and view queries, typed --------------------------------------------------
+
+/** The columns a definition expression sees through `row` (§2.12 rule 1): the `ready` ones. */
+row_fields(columns: Buf[CatColumn]) -> Buf[Field]
+    val out = buf[Field]()
+
+    for c in columns
+        if c.state == ColumnReady then out.push(Field(c.name, c.ty))
+
+    out
+
+/** The element type of the records of relation type `t`, or `None`. */
+private record_fields(t: Option[Type]) -> Option[Buf[Field]] = t match
+    Some(Bag(e)) | Some(List(e)) -> (*e) match
+        Record(fs) -> Some(fs)
+        _ -> None
+    _ -> None
+
+/** The result of `rel` as a query of no parameters, typed against `c`. */
+private typed_query(c: MemCatalog, r: Rel) -> Result[Option[Type], CodecError]
+    val t = type_envelope(envelope([], Query(r)), c)?
+    Ok(t.result)
+
+/** The type of definition expression `e` over a row of `columns` (§2.12). */
+definition_type(c: MemCatalog, columns: Buf[CatColumn], e: Expr) -> Result[Type, CodecError]
+    val r = Project(Values("row", row_fields(columns), buf[Buf[Expr]]()), "definition", items_of([Item("value", e)]))
+
+    record_fields(typed_query(c, r)?) match
+        Some(fs) -> Ok(fs[0].ty)
+        None -> fail("Q3001", "the definition has no type")
+
+/** `e`, a definition over a row of `columns`, as a value that coerces to the declared type `ty`
+ * (`Q3001` otherwise): a generated column, a `using`.
+ */
+check_definition_of(c: MemCatalog, columns: Buf[CatColumn], e: Expr, ty: Type, what: string) -> Result[(), CodecError]
+    val got = definition_type(c, columns, e)?
+    if !coerces(got, resolve_type(c, ty)?) then return fail("Q3001", s"$what does not coerce to its column's type")
+    Ok(())
+
+/** `e`, a condition over a row of `columns`: a check or an index predicate, of type `bool` or `bool?`. */
+check_condition(c: MemCatalog, columns: Buf[CatColumn], e: Expr) -> Result[(), CodecError]
+    typed_query(c, Filter(Values("row", row_fields(columns), buf[Buf[Expr]]()), e))?
+    Ok(())
+
+/** `e`, a default of a column of type `ty`, which sees no row (§2.7 rule 1). */
+check_default(c: MemCatalog, ty: Type, e: Expr) -> Result[(), CodecError]
+    val rows = buf[Buf[Expr]]()
+    rows.push(items_of([e]))
+    typed_query(c, Values("default", items_of([Field("value", ty)]), rows))?
+    Ok(())
+
+/** The columns of view query `r` typed against `c`: its root relation's output (§2.9 rule 1). */
+view_columns(c: MemCatalog, r: Rel) -> Result[Buf[Field], CodecError] = record_fields(typed_query(c, r)?) match
+    Some(fs) -> Ok(fs)
+    None -> fail("Q6005", "a view's rows must be records")
