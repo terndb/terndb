@@ -1,0 +1,552 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The changes: `AlterTable`'s actions (`ddl.md` §3.3) in order, as one statement that adds at most one
+// schema version (§5.1 rule 2); `AlterType`'s lossless changes (§2.8 rule 5); and `AlterSequence`
+// (§3.2 rule 3). What a change leaves is checked against everything that depends on it.
+
+/** A schema version number is a `uint16` (§1 rule 4). */
+const MaxSchemaVersion: u64 = 65535
+
+/** Whether `e` calls a volatile function (§2.12 rule 3). */
+private is_volatile_expr(e: Expr) -> bool
+    val refs = expr_refs(e)
+    refs.sequences.len() > 0 || refs.dynamic_sequence || calls_named(e, "statement_timestamp")
+
+/** Whether `e` calls `f` anywhere. */
+private calls_named(e: Expr, f: string) -> bool = e match
+    Call(g, args) ->
+        if g == f then return true
+
+        for a in args
+            if calls_named(a, f) then return true
+
+        false
+    Cast(x, _, _) | Field(x, _) | Variant(_, _, x) -> calls_named(*x, f)
+    If(arms, otherwise) ->
+        for a in arms
+            if calls_named(a.cond, f) || calls_named(a.value, f) then return true
+
+        otherwise match
+            Some(o) -> calls_named(*o, f)
+            None -> false
+    Match(x, arms, otherwise) ->
+        if calls_named(*x, f) then return true
+
+        for a in arms
+            if calls_named(a.expr, f) then return true
+
+        otherwise match
+            Some(o) -> calls_named(*o, f)
+            None -> false
+    Record(fs) ->
+        for i in fs
+            if calls_named(i.expr, f) then return true
+
+        false
+    _ -> false
+
+impl MemCatalog
+    /** A new schema version of table `ti` holding its current columns (`Q6012` past 65,535). */
+    new_version(*self, ti: usize) -> Result[(), CodecError]
+        val next = self.tables[ti].schema_version() + 1
+        if next > MaxSchemaVersion then return fail("Q6012", s"table '${self.tables[ti].name}' has used every schema version; rewrite it")
+        self.tables[ti].versions.push(SchemaVersion(next, self.tables[ti].columns.copy()))
+        Ok(())
+
+    /** Every stored definition of table `ti` with `rename` applied. */
+    rename_definitions(*self, ti: usize, rename: Rename)
+        val oid = self.tables[ti].oid
+
+        for i in 0..<self.tables[ti].columns.len()
+            val c = self.tables[ti].columns[i]
+            self.tables[ti].columns[i].generated = renamed_opt(c.generated, rename)
+            self.tables[ti].columns[i].using = renamed_opt(c.using, rename)
+
+        for i in 0..<self.constraints.len()
+            if self.constraints[i].table == oid
+                self.constraints[i].kind match
+                    ConCheck(e) -> self.constraints[i].kind = ConCheck(renamed_expr(e, rename))
+                    _ -> ()
+
+        for i in 0..<self.indexes.len()
+            if self.indexes[i].table == oid
+                val keys = buf[CatKey]()
+
+                for k in self.indexes[i].keys
+                    k.key match
+                        KeyOver(e) -> keys.push(CatKey(KeyOver(renamed_expr(e, rename)), k.descending))
+                        KeyOn(_) -> keys.push(k)
+
+                self.indexes[i].keys = keys
+                self.indexes[i].predicate = renamed_opt(self.indexes[i].predicate, rename)
+
+    /** Whether column `name` of table `ti` is read by a definition of the table other than its own. */
+    definitions_read(self, ti: usize, name: string) -> bool
+        for e in self.definitions_of(self.tables[ti])
+            if expr_refs(e).reads_column(items_of(["row"]), name) then return true
+
+        false
+
+    /** The views that read column `name` of the table or view `table`. */
+    views_reading(self, table: QualName, name: string) -> Buf[Obj]
+        val out = buf[Obj]()
+
+        for v in self.views
+            val refs = rel_refs(v.query)
+            if refs.reads_column(refs.binders_of(table), name) then out.push(Obj(KindView, v.oid))
+
+        out
+
+    /** What uses column `id` (`name`) of table `ti` that `cascade` may drop: indexes, constraints
+     * (and the foreign keys of other tables that reference it, through its key), and views.
+     */
+    column_dependents(self, ti: usize, id: u32, name: string) -> Buf[Obj]
+        val t = self.tables[ti]
+        val out = self.views_reading(self.qual_name(ti), name)
+        val row = items_of(["row"])
+
+        for c in self.constraints
+            val uses = c.kind match
+                ConCheck(e) -> c.table == t.oid && expr_refs(e).reads_column(row, name)
+                ConUnique(ids) | ConPrimaryKey(ids) -> c.table == t.oid && contains_u32(ids, id)
+                ConForeignKey(ids, target, ref_ids, _, _, _) -> c.table == t.oid && contains_u32(ids, id) || target == t.oid && contains_u32(ref_ids, id)
+
+            if uses then out.push(Obj(KindConstraint, c.oid))
+
+        for x in self.indexes
+            if x.table == t.oid && x.constraint == 0
+                var uses = x.predicate match
+                    Some(p) -> expr_refs(p).reads_column(row, name)
+                    None -> false
+
+                for k in x.keys
+                    k.key match
+                        KeyOn(k_id) -> if k_id == id then uses = true
+                        KeyOver(e) -> if expr_refs(e).reads_column(row, name) then uses = true
+
+                if uses then out.push(Obj(KindIndex, x.oid))
+
+        out
+    end column_dependents
+
+    /** Whether column `id` (`name`) of table `ti` is in the primary key or an index's key or predicate. */
+    in_a_key(self, ti: usize, id: u32, name: string) -> bool
+        val t = self.tables[ti]
+        if contains_u32(t.primary_key, id) then return true
+        val row = items_of(["row"])
+
+        for x in self.indexes
+            if x.table == t.oid
+                x.predicate match
+                    Some(p) -> if expr_refs(p).reads_column(row, name) then return true
+                    None -> ()
+
+                for k in x.keys
+                    k.key match
+                        KeyOn(k_id) -> if k_id == id then return true
+                        KeyOver(e) -> if expr_refs(e).reads_column(row, name) then return true
+
+        false
+
+    /** The constraint of table `ti` named `name`. */
+    constraint_of(self, ti: usize, name: string) -> Option[usize]
+        for i in 0..<self.constraints.len()
+            if self.constraints[i].table == self.tables[ti].oid && self.constraints[i].name == name then return Some(i)
+
+        None
+
+    /** Column `name` of table `ti` (`Q2003`). */
+    column_of(self, ti: usize, name: string) -> Result[usize, CodecError] = self.tables[ti].column_at(name) match
+        Some(i) -> Ok(i)
+        None -> fail("Q2003", s"table '${self.tables[ti].name}' has no column '$name'")
+
+    alter_table(*self, name: QualName, actions: Buf[AlterAction], who: u64) -> Result[(), CodecError]
+        val ti = self.table_named(name)?
+        self.need_owner(who, self.table_target(ti))?
+        var changed = false
+
+        for a in actions
+            if self.alter_action(ti, a, who)? then changed = true
+
+        if changed then self.new_version(ti)?
+        self.check_width(ti)?
+        self.revalidate()
+
+    /** Action `a` applied to table `ti`; answers whether it changed the column list (§5.1 rule 2). */
+    alter_action(*self, ti: usize, a: AlterAction, who: u64) -> Result[bool, CodecError] = a match
+        AddColumn(def) -> self.add_column(ti, def, who)
+        DropColumn(name, cascade) -> self.drop_column(ti, name, cascade)
+        RenameColumn(name, new_name) -> self.rename_column(ti, name, new_name)
+        RetypeColumn(name, ty, using) -> self.retype_column(ti, name, ty, using, who)
+        SetColumnDefault(name, default) ->
+            val ci = self.column_of(ti, name)?
+            val c = self.tables[ti].columns[ci]
+
+            default match
+                Some(d) ->
+                    if c.generated.is_some() || c.identity != NoIdentity then return fail("Q6006", s"column '$name' is generated or an identity and takes no default")
+                    check_default(*self, c.ty, d)?
+                    self.usable_sequences(d, who)?
+                None -> ()
+
+            self.tables[ti].columns[ci].default = default
+            Ok(true)
+        SetNullable(name, allow) -> self.set_nullable(ti, name, allow)
+        AddConstraint(def, deferring) ->
+            self.add_constraint(ti, def, false, deferring, who)?
+            Ok(false)
+        DropConstraint(name, if_exists) ->
+            val ci = self.constraint_of(ti, name) match
+                Some(i) -> i
+                None -> return if if_exists then Ok(false) else fail("Q6003", s"table '${self.tables[ti].name}' has no constraint '$name'")
+
+            self.constraints[ci].kind match
+                ConPrimaryKey(_) -> return fail("Q6009", "the primary key cannot be dropped; set another with set_primary_key")
+                _ -> ()
+
+            self.drop_object(Obj(KindConstraint, self.constraints[ci].oid), false)?
+            Ok(false)
+        ValidateConstraint(name) ->
+            val ci = self.constraint_of(ti, name) match
+                Some(i) -> i
+                None -> return fail("Q6003", s"table '${self.tables[ti].name}' has no constraint '$name'")
+
+            if !self.constraints[ci].validated then self.constraints[ci].job = true
+            Ok(false)
+        RenameConstraint(name, new_name) ->
+            val ci = self.constraint_of(ti, name) match
+                Some(i) -> i
+                None -> return fail("Q6003", s"table '${self.tables[ti].name}' has no constraint '$name'")
+
+            if !self.name_free(self.tables[ti].ns, new_name) then return fail("Q6002", s"'$new_name' is already used")
+            self.constraints[ci].name = new_name
+
+            self.index_by_oid(self.constraints[ci].index) match
+                Some(x) -> self.indexes[x].name = new_name
+                None -> ()
+
+            Ok(false)
+        RenameTable(new_name) ->
+            val old = self.qual_name(ti)
+            if !self.name_free(self.tables[ti].ns, new_name) then return fail("Q6002", s"'$new_name' is already used in '${old.schema}'")
+            self.tables[ti].name = new_name
+            val rename = RenameRel(old, QualName(old.schema, new_name))
+
+            for i in 0..<self.views.len()
+                self.views[i].query = renamed_rel(self.views[i].query, rename)
+
+            Ok(false)
+        SetPrimaryKey(names) ->
+            val ids = self.column_ids(ti, names)?
+            self.check_key_columns(ti, ids, true)?
+            val pk = self.primary_key_of(self.tables[ti].oid).unwrap()
+            val deps = self.dependents(Obj(KindConstraint, pk.oid))
+            if deps.len() > 0 then return fail("Q6007", s"${self.describe(deps[0])} references the primary key")
+            self.constraints[self.constraint_by_oid(pk.oid).unwrap()].kind = ConPrimaryKey(ids)
+            self.tables[ti].primary_key = ids
+            Ok(false)
+        Rewrite -> Ok(false)
+        SetOwner(role) ->
+            val owner = self.roles[self.role_of(role)?].oid
+            self.tables[ti].owner = owner
+
+            for i in 0..<self.sequences.len()
+                if self.sequences[i].owner_table == self.tables[ti].oid then self.sequences[i].owner = owner
+
+            Ok(false)
+
+    /** `add_column` (§8.1, §8.2): ready with its default as its fill when the default is constant,
+     * else `filling` with no fill; a non-null column with neither is `Q3005`.
+     */
+    add_column(*self, ti: usize, def: ColumnDef, who: u64) -> Result[bool, CodecError]
+        val t = self.tables[ti]
+        if t.column_named(def.name).is_some() then return fail("Q6002", s"table '${t.name}' already has a column '${def.name}'")
+        if t.columns.len() >= 65535 then return fail("Q6011", "a table has at most 65,535 columns")
+
+        var c = self.new_column(self.qual_name(ti), t.ns, t.oid, def, t.next_column, who)?
+        val all = t.columns.copy()
+        all.push(c)
+        self.check_generated(all, c)?
+
+        if !c.ty.is_nullable() && c.default.is_none() && c.generated.is_none() && c.identity == NoIdentity
+            return fail("Q3005", s"non-null column '${c.name}' needs a default")
+
+        val volatile = c.default match
+            Some(d) -> is_volatile_expr(d)
+            None -> false
+
+        if volatile || c.generated.is_some() || c.identity != NoIdentity
+            c.state = ColumnFilling
+        else
+            c.fill = c.default
+
+        self.tables[ti].next_column += 1
+        self.tables[ti].columns.push(c)
+        Ok(true)
+    end add_column
+
+    /** `drop_column` (§8.3): never a primary-key column, nor one a generated column reads, since
+     * `cascade` never drops a column (§2.11); its indexes, constraints and views go with `cascade`.
+     */
+    drop_column(*self, ti: usize, name: string, cascade: bool) -> Result[bool, CodecError]
+        val ci = self.column_of(ti, name)?
+        val c = self.tables[ti].columns[ci]
+        if contains_u32(self.tables[ti].primary_key, c.id) then return fail("Q6007", s"column '$name' is in the primary key")
+
+        for other in self.tables[ti].columns
+            other.generated match
+                Some(g) -> if other.id != c.id && expr_refs(g).reads_column(items_of(["row"]), name) then return fail("Q6007", s"generated column '${other.name}' reads '$name'")
+                None -> ()
+
+        val deps = self.column_dependents(ti, c.id, name)
+        if deps.len() > 0 && !cascade then return fail("Q6007", s"${self.describe(deps[0])} uses column '$name'")
+
+        for d in deps
+            self.drop_object(d, true)?
+
+        self.check_owned_sequences(ti, c.id)?
+        var i = 0
+
+        while i < self.sequences.len()
+            if self.sequences[i].owner_table == self.tables[ti].oid && self.sequences[i].owner_column == c.id
+                self.forget_grants(Obj(KindSequence, self.sequences[i].oid))
+                self.sequences.remove(i)
+            else
+                i += 1
+
+        self.tables[ti].columns.remove(self.tables[ti].column_at(name).unwrap())
+        Ok(true)
+    end drop_column
+
+    /** `rename_column` (§8.4): every definition and view that names the column is rewritten; a view
+     * whose own columns would change with it is `Q6007`, which `revalidate` finds.
+     */
+    rename_column(*self, ti: usize, name: string, new_name: string) -> Result[bool, CodecError]
+        val ci = self.column_of(ti, name)?
+        if self.tables[ti].column_named(new_name).is_some() then return fail("Q6002", s"table '${self.tables[ti].name}' already has a column '$new_name'")
+        val table = self.qual_name(ti)
+        self.tables[ti].columns[ci].name = new_name
+        self.rename_definitions(ti, RenameCol(items_of(["row"]), name, new_name))
+
+        for i in 0..<self.views.len()
+            val binders = rel_refs(self.views[i].query).binders_of(table)
+            if binders.len() > 0 then self.views[i].query = renamed_rel(self.views[i].query, RenameCol(binders, name, new_name))
+
+        Ok(true)
+
+    /** `retype_column` (§8.5): metadata-only when the conversion is lossless and leaves every key
+     * encoding as it was, else the column becomes `converting` toward the new type. A conversion
+     * `query-tree.md` §7.6 does not permit and no `using` provides is `Q6008`; a column a view reads is
+     * `Q6007` (§2.9 rule 2).
+     */
+    retype_column(*self, ti: usize, name: string, ty: Type, using: Option[Expr], who: u64) -> Result[bool, CodecError]
+        val ci = self.column_of(ti, name)?
+        val c = self.tables[ti].columns[ci]
+        val to = self.usable_type(ty, who)?
+        val from = resolve_type(*self, c.ty)?
+        val columns = self.tables[ti].columns
+
+        val conversion = using match
+            Some(u) ->
+                check_definition_of(*self, columns, u, ty, s"the conversion of '$name'")?
+                u
+            None ->
+                val cast = Cast(Col("row", name), ty, Strict)
+                definition_type(*self, columns, cast).map_err(e -> CodecError("Q6008", s"no conversion of '$name' to its new type (${e.code})"))?
+                cast
+
+        val views = self.views_reading(self.qual_name(ti), name)
+        if views.len() > 0 then return fail("Q6007", s"${self.describe(views[0])} reads column '$name'")
+
+        val keyed = self.in_a_key(ti, c.id, name)
+        if contains_u32(self.tables[ti].primary_key, c.id) && (to.is_nullable() || !is_key_component(to)) then return fail("Q6005", s"primary-key column '$name' cannot be of the new type")
+        if keyed && !is_key_component(to) then return fail("Q6005", s"key column '$name' cannot be of the new type")
+
+        if using.is_none() && is_lossless(from, to) && (!keyed || same_key_encoding(from, to))
+            self.tables[ti].columns[ci].ty = ty
+        else
+            self.tables[ti].columns[ci].state = ColumnConverting
+            self.tables[ti].columns[ci].target = Some(ty)
+            self.tables[ti].columns[ci].using = Some(conversion)
+
+        Ok(true)
+    end retype_column
+
+    /** `set_nullable` (§8.6): dropping not null makes the type `T?` (never for a primary-key column,
+     * `Q6005`); setting it adds the check `<column>_not_null`, with a validation job, and the type
+     * changes when that job succeeds.
+     */
+    set_nullable(*self, ti: usize, name: string, allow: bool) -> Result[bool, CodecError]
+        val ci = self.column_of(ti, name)?
+        val c = self.tables[ti].columns[ci]
+
+        if allow
+            if c.ty.is_nullable() then return Ok(false)
+            if contains_u32(self.tables[ti].primary_key, c.id) then return fail("Q6005", s"primary-key column '$name' cannot be nullable")
+            self.tables[ti].columns[ci].ty = nullable(c.ty)
+            return Ok(true)
+
+        if !c.ty.is_nullable() then return Ok(false)
+        val check = s"${name}_not_null"
+        if !self.name_free(self.tables[ti].ns, check) then return fail("Q6002", s"'$check' is already used")
+        val oid = self.oid()
+        val e = Call("is_not_null", items_of([Col("row", name)]))
+        self.constraints.push(CatConstraint(oid, self.tables[ti].oid, check, ConCheck(e), false, true, 0))
+        Ok(false)
+
+    // -- named types, §2.8 rule 5 -----------------------------------------------------------------
+
+    /** Whether type `ty` refers to named type `target`, directly or through other named types. */
+    type_reaches(self, ty: Type, target: QualName, depth: usize) -> bool
+        if depth > self.types.len() then return true
+
+        for q in type_refs(ty).types
+            if q == target then return true
+
+            self.type_at(q) match
+                Some(i) -> if self.type_reaches(self.types[i].ty, target, depth + 1) then return true
+                None -> ()
+
+        false
+
+    alter_type(*self, name: QualName, change: TypeChange, who: u64) -> Result[(), CodecError]
+        val ti = self.type_at(name) match
+            Some(i) -> i
+            None -> return fail("Q6004", s"type '${name.schema}.${name.name}' is not in the catalog")
+
+        self.need_owner(who, self.type_target(ti))?
+        val old = self.types[ti].ty
+
+        val changed = change match
+            AppendVariants(variants) ->
+                val vs = old match
+                    Union(x) -> x
+                    _ -> return fail("Q6018", s"type '${name.name}' is not a union")
+
+                val out = vs.copy()
+
+                for v in variants
+                    if has_member(out, v.name) then return fail("Q6002", s"type '${name.name}' already has a variant '${v.name}'")
+                    self.usable_type(v.ty, who)?
+
+                    resolve_type(*self, v.ty)? match
+                        Record(_) -> ()
+                        _ -> return fail("Q3014", s"variant '${v.name}' has a payload that is not a record")
+
+                    out.push(v)
+
+                Type.Union(out)
+            AppendFields(fields) ->
+                val fs = old match
+                    Record(x) -> x
+                    _ -> return fail("Q6018", s"type '${name.name}' is not a record")
+
+                val out = fs.copy()
+
+                for f in fields
+                    if has_member(out, f.name) then return fail("Q6002", s"type '${name.name}' already has a field '${f.name}'")
+                    val to = self.usable_type(f.ty, who)?
+
+                    f.fill match
+                        Some(Literal(lt, _)) -> if !coerces(resolve_type(*self, lt)?, to) then return fail("Q3001", s"the fill of '${f.name}' does not coerce to its type")
+                        _ -> ()
+
+                    out.push(Field(f.name, f.ty))
+
+                Type.Record(out)
+            RenameMember(old_name, new_name) ->
+                val ms = old match
+                    Record(x) | Union(x) -> x
+                    _ -> return fail("Q6018", s"type '${name.name}' is not a record or a union")
+
+                if !has_member(ms, old_name) then return fail("Q6003", s"type '${name.name}' has no member '$old_name'")
+                if has_member(ms, new_name) then return fail("Q6002", s"type '${name.name}' already has a member '$new_name'")
+                val out = buf[Field]()
+
+                for m in ms
+                    out.push(if m.name == old_name then Field(new_name, m.ty) else m)
+
+                old match
+                    Union(_) -> Type.Union(out)
+                    _ -> Type.Record(out)
+            RenameType(new_name) ->
+                if !self.name_free(self.types[ti].ns, new_name) then return fail("Q6002", s"'$new_name' is already used in '${name.schema}'")
+                self.rename_type_refs(name, QualName(name.schema, new_name))
+                self.types[ti].name = new_name
+                return self.revalidate()
+
+        if self.type_reaches(changed, name, 0) then return fail("Q6005", s"type '${name.name}' would refer to itself")
+        self.types[ti].ty = changed
+
+        for i in 0..<self.tables.len()
+            var uses = false
+
+            for c in self.tables[i].columns
+                if self.type_reaches(c.ty, name, 0) then uses = true
+
+            if uses then self.new_version(i)?
+
+        self.revalidate()
+    end alter_type
+
+    /** Every reference to named type `old` made a reference to `new`: in columns, types, definitions
+     * and views.
+     */
+    rename_type_refs(*self, old: QualName, new: QualName)
+        val rename = RenameTypeRef(old, new)
+
+        for i in 0..<self.tables.len()
+            for j in 0..<self.tables[i].columns.len()
+                val c = self.tables[i].columns[j]
+                self.tables[i].columns[j].ty = renamed_type(c.ty, rename)
+                self.tables[i].columns[j].default = renamed_opt(c.default, rename)
+                self.tables[i].columns[j].fill = renamed_opt(c.fill, rename)
+                self.tables[i].columns[j].target = c.target.map(t -> renamed_type(t, rename))
+
+            self.rename_definitions(i, rename)
+
+        for i in 0..<self.types.len()
+            self.types[i].ty = renamed_type(self.types[i].ty, rename)
+
+        for i in 0..<self.views.len()
+            self.views[i].query = renamed_rel(self.views[i].query, rename)
+
+    // -- sequences, §3.2 rule 3 -------------------------------------------------------------------
+
+    alter_sequence(*self, name: QualName, def: SequenceDef, restart: Option[i64], who: u64) -> Result[(), CodecError]
+        val si = self.sequence_at(name) match
+            Some(i) -> i
+            None -> return fail("Q6003", s"no sequence '${name.schema}.${name.name}'")
+
+        self.need_owner(who, self.sequence_target(si))?
+        var s = self.sequences[si]
+
+        if def.ty != s.ty && s.owner_table != 0 then return fail("Q6017", "an identity sequence keeps its column's type")
+
+        s.ty = def.ty
+        s.start = def.start.unwrap_or(s.start)
+        s.increment = def.increment.unwrap_or(s.increment)
+        s.min = def.min.unwrap_or(s.min)
+        s.max = def.max.unwrap_or(s.max)
+        s.cache = def.cache.unwrap_or(s.cache)
+        if def.cycle then s.cycle = true
+        s.next = restart.unwrap_or(s.next)
+
+        if s.next < s.min || s.next > s.max
+            // A sequence whose range moves past its next value starts again from its start.
+            if restart.is_some() then return fail("Q6017", "restart lies outside min to max")
+            s.next = s.start
+
+        check_sequence(s)?
+        self.sequences[si] = s
+        Ok(())
+    end alter_sequence
+end MemCatalog
+
+private has_member(ms: Buf[Field], name: string) -> bool
+    for m in ms
+        if m.name == name then return true
+
+    false

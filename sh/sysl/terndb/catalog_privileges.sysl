@@ -1,0 +1,289 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Roles and privileges (`ddl.md` §2.10): membership, ownership, the privilege checks every statement
+// makes at validation (`Q6015`), and the role and grant statements.
+
+private priv_name(p: Privilege) -> string = p match
+    PrivSelect -> "select"
+    PrivInsert -> "insert"
+    PrivUpdate -> "update"
+    PrivDelete -> "delete"
+    PrivReferences -> "references"
+    PrivUsage -> "usage"
+    PrivCreate -> "create"
+
+/** Whether privilege `p` applies to an object of kind `k` (§2.10 rule 3). */
+privilege_applies(p: Privilege, k: ObjKind) -> bool = k match
+    KindTable | KindView -> p == PrivSelect || p == PrivInsert || p == PrivUpdate || p == PrivDelete || p == PrivReferences
+    KindNamespace -> p == PrivUsage || p == PrivCreate
+    KindSequence | KindType -> p == PrivUsage
+    _ -> false
+
+/** An object a statement names, with its owner. */
+struct Target
+    object: Obj
+    owner: u64
+    what: string
+
+impl MemCatalog
+    is_superuser(self, who: u64) -> bool = self.role_by_oid(who) match
+        Some(i) -> self.roles[i].superuser
+        None -> false
+
+    /** Whether `who` is `role` or a member of it, transitively (§2.10 rule 1). */
+    is_member(self, who: u64, role: u64) -> bool
+        val seen = buf[u64]()
+        val todo = buf[u64]()
+        todo.push(who)
+
+        loop
+            val r = todo.pop() match
+                Some(x) -> x
+                None -> return false
+
+            if r == role then return true
+
+            if !contains_oid(seen, r)
+                seen.push(r)
+
+                self.role_by_oid(r) match
+                    Some(i) -> todo.extend(self.roles[i].member_of.view())
+                    None -> ()
+
+    /** Whether `who` may alter or drop an object owned by `owner` (§2.10 rule 2). */
+    owns(self, who: u64, owner: u64) -> bool = self.is_superuser(who) || self.is_member(who, owner)
+
+    /** Whether `who` holds `p` on `t`: as its owner, or through a grant to a role it is a member of. */
+    holds(self, who: u64, t: Target, p: Privilege, grantable: bool) -> bool
+        if self.owns(who, t.owner) then return true
+
+        for g in self.grants
+            if g.object == t.object && g.privilege == p && (g.grantable || !grantable) && self.is_member(who, g.grantee) then return true
+
+        false
+
+    need_owner(self, who: u64, t: Target) -> Result[(), CodecError] =
+        if self.owns(who, t.owner) then Ok(()) else fail("Q6015", s"only the owner of ${t.what} may change it")
+
+    need(self, who: u64, t: Target, p: Privilege) -> Result[(), CodecError] =
+        if self.holds(who, t, p, false) then Ok(()) else fail("Q6015", s"${priv_name(p)} on ${t.what} is required")
+
+    namespace_target(self, i: usize) -> Target =
+        Target(Obj(KindNamespace, self.namespaces[i].oid), self.namespaces[i].owner, s"namespace '${self.namespaces[i].name}'")
+
+    /** Namespace `name`, which must exist (`Q6003`). */
+    namespace_of(self, name: string) -> Result[usize, CodecError] = self.namespace_at(name) match
+        Some(i) -> Ok(i)
+        None -> fail("Q6003", s"no namespace '$name'")
+
+    /** That `who` may name an object of namespace `name`: `usage` on it (§2.10 rule 3). Every role may
+     * name the reserved namespaces, whose relations every role may read (§2.10 rule 5).
+     */
+    need_usage(self, who: u64, name: string) -> Result[(), CodecError]
+        if is_reserved_namespace(name) then return Ok(())
+        val i = self.namespace_of(name)?
+        self.need(who, self.namespace_target(i), PrivUsage)
+
+    /** That `who` may create an object in namespace `name` (`create`), the namespace's index. */
+    need_create(self, who: u64, name: string) -> Result[usize, CodecError]
+        val i = self.namespace_of(name)?
+        self.need(who, self.namespace_target(i), PrivCreate)?
+        Ok(i)
+
+    table_target(self, i: usize) -> Target
+        val t = self.tables[i]
+        Target(Obj(KindTable, t.oid), t.owner, s"table '${self.namespace_by_oid(t.ns).name}.${t.name}'")
+
+    view_target(self, i: usize) -> Target
+        val v = self.views[i]
+        Target(Obj(KindView, v.oid), v.owner, s"view '${self.namespace_by_oid(v.ns).name}.${v.name}'")
+
+    type_target(self, i: usize) -> Target
+        val t = self.types[i]
+        Target(Obj(KindType, t.oid), t.owner, s"type '${self.namespace_by_oid(t.ns).name}.${t.name}'")
+
+    sequence_target(self, i: usize) -> Target
+        val s = self.sequences[i]
+        Target(Obj(KindSequence, s.oid), s.owner, s"sequence '${self.namespace_by_oid(s.ns).name}.${s.name}'")
+
+    /** The object of a `Grant` or `Revoke`: a table or view (`Q2001`), a namespace or sequence
+     * (`Q6003`), or a named type (`Q6004`).
+     */
+    grant_target(self, r: ObjectRef) -> Result[Target, CodecError] = r match
+        OnTable(name) ->
+            self.table_at(name) match
+                Some(i) -> return Ok(self.table_target(i))
+                None -> ()
+
+            self.view_at(name) match
+                Some(i) -> Ok(self.view_target(i))
+                None -> fail("Q2001", s"no table or view '${name.schema}.${name.name}'")
+        OnNamespace(name) -> Ok(self.namespace_target(self.namespace_of(name)?))
+        OnSequence(name) -> self.sequence_at(name) match
+            Some(i) -> Ok(self.sequence_target(i))
+            None -> fail("Q6003", s"no sequence '${name.schema}.${name.name}'")
+        OnType(name) -> self.type_at(name) match
+            Some(i) -> Ok(self.type_target(i))
+            None -> fail("Q6004", s"type '${name.schema}.${name.name}' is not in the catalog")
+
+    /** The role named `name` (`Q6003`). */
+    role_of(self, name: string) -> Result[usize, CodecError] = self.role_at(name) match
+        Some(i) -> Ok(i)
+        None -> fail("Q6003", s"no role '$name'")
+
+    // -- the statements ---------------------------------------------------------------------------
+
+    /** The roles `names` by oid (`Q6003` for one that is not a role). */
+    member_oids(self, names: Buf[string]) -> Result[Buf[u64], CodecError]
+        val out = buf[u64]()
+
+        for n in names
+            out.push(self.roles[self.role_of(n)?].oid)
+
+        Ok(out)
+
+    need_superuser(self, who: u64, what: string) -> Result[(), CodecError] =
+        if self.is_superuser(who) then Ok(()) else fail("Q6015", s"only a superuser may $what")
+
+    create_role(*self, name: string, def: RoleDef, who: u64) -> Result[(), CodecError]
+        if self.role_at(name).is_some() then return fail("Q6002", s"role '$name' already exists")
+        val members = self.member_oids(def.member_of)?
+        self.need_superuser(who, "create a role")?
+        val oid = self.oid()
+        self.roles.push(CatRole(oid, name, def.login, def.superuser, members))
+        Ok(())
+
+    alter_role(*self, name: string, def: RoleDef, new_name: Option[string], who: u64) -> Result[(), CodecError]
+        val i = self.role_of(name)?
+        val members = self.member_oids(def.member_of)?
+
+        new_name match
+            Some(n) -> if n != name && self.role_at(n).is_some() then return fail("Q6002", s"role '$n' already exists")
+            None -> ()
+
+        self.need_superuser(who, "alter a role")?
+
+        if name == ReplicationRole && (new_name.is_some() && new_name != Some(name) || def.login)
+            return fail("Q6014", s"'$ReplicationRole' cannot be renamed or given login")
+
+        val oid = self.roles[i].oid
+
+        for m in members
+            if self.is_member(m, oid) then return fail("Q6020", s"role '$name' would be a member of itself")
+
+        self.roles[i].login = def.login
+        self.roles[i].superuser = def.superuser
+        self.roles[i].member_of = members
+
+        new_name match
+            Some(n) -> self.roles[i].name = n
+            None -> ()
+
+        Ok(())
+    end alter_role
+
+    /** Whether anything refers to role `oid`: an object it owns, a grant, or a role that is its member. */
+    role_in_use(self, oid: u64) -> bool
+        for n in self.namespaces
+            if n.owner == oid then return true
+
+        for t in self.tables
+            if t.owner == oid then return true
+
+        for v in self.views
+            if v.owner == oid then return true
+
+        for s in self.sequences
+            if s.owner == oid then return true
+
+        for t in self.types
+            if t.owner == oid then return true
+
+        for g in self.grants
+            if g.grantee == oid || g.grantor == oid then return true
+
+        for r in self.roles
+            if contains_oid(r.member_of, oid) then return true
+
+        false
+    end role_in_use
+
+    drop_role(*self, name: string, if_exists: bool, who: u64) -> Result[(), CodecError]
+        val i = self.role_at(name) match
+            Some(x) -> x
+            None -> return if if_exists then Ok(()) else fail("Q6003", s"no role '$name'")
+
+        self.need_superuser(who, "drop a role")?
+        if name == ReplicationRole then return fail("Q6014", s"'$ReplicationRole' cannot be dropped")
+        if self.role_in_use(self.roles[i].oid) then return fail("Q6007", s"role '$name' owns objects, holds privileges or has members")
+        self.roles.remove(i)
+        Ok(())
+
+    grant(*self, privileges: Buf[Privilege], on: ObjectRef, grantee: string, grantable: bool, who: u64) -> Result[(), CodecError]
+        val t = self.grant_target(on)?
+        val to = self.roles[self.role_of(grantee)?].oid
+
+        for p in privileges
+            if !privilege_applies(p, t.object.kind) then return fail("Q6021", s"${priv_name(p)} does not apply to ${t.what}")
+            if !self.holds(who, t, p, true) then return fail("Q6015", s"${priv_name(p)} on ${t.what} is not yours to grant")
+
+        for p in privileges
+            var found = false
+
+            for i in 0..<self.grants.len()
+                val g = self.grants[i]
+
+                if g.object == t.object && g.grantee == to && g.privilege == p
+                    found = true
+                    if grantable then self.grants[i].grantable = true
+
+            if !found then self.grants.push(CatGrant(t.object, to, p, grantable, who))
+
+        Ok(())
+    end grant
+
+    /** Revokes `privileges` from `grantee`; who may revoke is who may grant. A privilege not held is
+     * no change.
+     */
+    revoke(*self, privileges: Buf[Privilege], on: ObjectRef, grantee: string, who: u64) -> Result[(), CodecError]
+        val t = self.grant_target(on)?
+        val from = self.roles[self.role_of(grantee)?].oid
+
+        for p in privileges
+            if !privilege_applies(p, t.object.kind) then return fail("Q6021", s"${priv_name(p)} does not apply to ${t.what}")
+            if !self.holds(who, t, p, true) then return fail("Q6015", s"${priv_name(p)} on ${t.what} is not yours to revoke")
+
+        var i = 0
+
+        while i < self.grants.len()
+            val g = self.grants[i]
+
+            if g.object == t.object && g.grantee == from && contains_privilege(privileges, g.privilege)
+                self.grants.remove(i)
+            else
+                i += 1
+
+        Ok(())
+    end revoke
+
+    /** Removes every grant on `o`, which is being dropped. */
+    forget_grants(*self, o: Obj)
+        var i = 0
+
+        while i < self.grants.len()
+            if self.grants[i].object == o then self.grants.remove(i) else i += 1
+end MemCatalog
+
+contains_oid(xs: Buf[u64], x: u64) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+private contains_privilege(xs: Buf[Privilege], x: Privilege) -> bool
+    for y in xs
+        if y == x then return true
+
+    false

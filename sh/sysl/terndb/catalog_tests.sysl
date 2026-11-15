@@ -1,0 +1,583 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The in-memory catalog: a new database's objects, every create statement applied and refused for
+// each catalog rule of `ddl.md` §2, name collisions across the kinds that share a namespace, roles,
+// privileges, and the all-or-nothing application of a statement. The changes are in
+// `catalog_alter_tests.sysl`, the drops and dependencies in `catalog_depends_tests.sysl`.
+
+// -- applying statements ---------------------------------------------------------------------------
+
+/** `c` with `s` applied as `role`, which must succeed. */
+cat_ok(c: MemCatalog, s: Statement, role: string = BootstrapRole, file: string = __FILE__, line: long = __LINE__) -> MemCatalog
+    var x = c
+
+    x.apply(envelope([], s), role) match
+        Ok(_) -> ()
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+    x
+
+/** The code `s` is refused with in `c` as `role`, or "ok"; `c` is left as it was. */
+cat_code(c: MemCatalog, s: Statement, role: string = BootstrapRole) -> string
+    var x = c
+
+    x.apply(envelope([], s), role) match
+        Ok(_) -> "ok"
+        Err(e) -> e.code
+
+cat_q(name: string) -> QualName = QualName("app", name)
+
+cat_col(name: string, ty: Type) -> ColumnDef = ColumnDef(name, ty, None, None, NoIdentity, None)
+
+cat_table(name: string, columns: []const ColumnDef, pk: []const string, cons: []const ConstraintDef = []) -> Statement =
+    CreateTable(cat_q(name), items_of(columns), items_of(pk), items_of(cons), false)
+
+cat_alter(name: string, actions: []const AlterAction) -> Statement = AlterTable(cat_q(name), items_of(actions))
+
+cat_check(name: string, e: Expr) -> ConstraintDef = ConstraintDef(name, Check(e))
+
+cat_unique(name: string, columns: []const string) -> ConstraintDef = ConstraintDef(name, Unique(items_of(columns)))
+
+cat_fk(name: string, columns: []const string, target: string, ref_columns: []const string) -> ConstraintDef =
+    ConstraintDef(name, ForeignKey(items_of(columns), cat_q(target), items_of(ref_columns), FkNoAction, FkNoAction, false))
+
+cat_index(name: string, table: string, columns: []const string) -> Statement
+    val keys = buf[IndexKey]()
+
+    for c in columns
+        keys.push(IndexKey(KeyColumn(c), false))
+
+    CreateIndex(name, IndexDef(cat_q(table), false, keys, None), false)
+
+cat_view(name: string, r: Rel) -> Statement = CreateView(cat_q(name), r, false)
+
+/** `columns` of `table` read under binder `b` and projected under `out`. */
+cat_pick(table: string, b: string, out: string, columns: []const string) -> Rel
+    val items = buf[Item]()
+
+    for c in columns
+        items.push(item(c, col(b, c)))
+
+    Project(scan("app", table, b), out, items)
+
+cat_row(name: string) -> Expr = col("row", name)
+
+cat_int(n: i128) -> Expr = Literal(Int64, Int(n))
+
+cat_text(s: string) -> Expr = Literal(Text, Text(s))
+
+cat_role(name: string, login: bool = true) -> Statement = CreateRole(name, RoleDef(login, false, buf[string]()))
+
+/** A catalog with namespace `app` and table `app.t(id int64, a int32?, b text)` keyed on `id`. */
+cat_base() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("a", nullable(Int32)), cat_col("b", Text)], ["id"]))
+
+/** Table `name` as the type checker sees it. */
+cat_info(c: MemCatalog, name: string, file: string = __FILE__, line: long = __LINE__) -> TableInfo = c.table(cat_q(name)) match
+    Some(t) -> t
+    None ->
+        assert(false, s"no table '$name'", file, line)
+        TableInfo(buf[ColumnInfo](), buf[UniqueKey](), false)
+
+/** The names of `t`'s columns, joined with commas. */
+cat_columns(t: TableInfo) -> string
+    var s = ""
+
+    for c in t.columns
+        s = if s == "" then c.name else s"$s,${c.name}"
+
+    s
+
+/** The names of `t`'s unique keys, joined with commas. */
+cat_keys(t: TableInfo) -> string
+    var s = ""
+
+    for k in t.unique
+        s = if s == "" then k.name else s"$s,${k.name}"
+
+    s
+
+cat_table_of(c: MemCatalog, name: string) -> CatTable = c.tables[c.table_at(cat_q(name)).unwrap()]
+
+// -- a new database --------------------------------------------------------------------------------
+
+@test
+a_new_catalog_holds_the_bootstrap_superuser_the_replication_role_and_the_reserved_namespaces()
+    val c = mem_catalog()
+    val boot = c.roles[c.role_at("terndb").unwrap()]
+    assert(boot.superuser && boot.login)
+    val repl = c.roles[c.role_at("terndb_replication").unwrap()]
+    assert(!repl.superuser && !repl.login)
+    assert(c.namespace_at("sys").is_some() && c.namespace_at("catalog").is_some())
+    assert_eq(c.version, 0)
+
+// -- namespaces ------------------------------------------------------------------------------------
+
+@test
+a_namespace_is_created_once_and_only_by_a_superuser()
+    val c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    assert_eq(c.version, 1)
+    assert_eq(cat_code(c, CreateNamespace("app", false)), "Q6002")
+    assert_eq(cat_code(c, CreateNamespace("app", true)), "ok")
+    assert_eq(cat_code(c, CreateNamespace("sys", false)), "Q6014")
+
+    val r = cat_ok(c, cat_role("alice"))
+    assert_eq(cat_code(r, CreateNamespace("hers", false), "alice"), "Q6015")
+    assert_eq(cat_code(r, CreateNamespace("hers", false), "nobody"), "Q6015")
+
+// -- tables ----------------------------------------------------------------------------------------
+
+@test
+a_created_table_shows_its_columns_keys_and_first_schema_version()
+    val c = cat_ok(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("email", Text)], ["id"], [cat_unique("u_email", ["email"])]))
+    val info = cat_info(c, "u")
+    assert_eq(cat_columns(info), "id,email")
+    assert_eq(cat_keys(info), "u_pkey,u_email")
+    assert(!info.is_view)
+    assert_eq(cat_table_of(c, "u").schema_version(), 1)
+    assert(info.columns[1].ty == Text && info.columns[1].writable)
+
+    val x = c.indexes[c.index_at(cat_q("u_email")).unwrap()]
+    assert(x.unique && x.state == IndexReady && x.constraint != 0)
+
+@test
+a_table_needs_an_existing_namespace_and_a_free_name()
+    val c = cat_base()
+    val s = CreateTable(QualName("nope", "t"), items_of([cat_col("id", Int64)]), items_of(["id"]), buf[ConstraintDef](), false)
+    assert_eq(cat_code(c, s), "Q6003")
+    assert_eq(cat_code(c, cat_table("t", [cat_col("id", Int64)], ["id"])), "Q6002")
+    assert_eq(cat_code(c, CreateTable(cat_q("t"), items_of([cat_col("x", Text)]), items_of(["x"]), buf[ConstraintDef](), true)), "ok")
+
+    // `if_not_exists` changes nothing.
+    var after = cat_ok(c, CreateTable(cat_q("t"), items_of([cat_col("x", Text)]), items_of(["x"]), buf[ConstraintDef](), true))
+    assert_eq(cat_columns(cat_info(after, "t")), "id,a,b")
+
+@test
+every_kind_that_shares_a_namespace_collides_with_every_other()
+    var c = cat_base()
+    c = cat_ok(c, cat_view("v", cat_pick("t", "x", "r", ["id"])))
+    c = cat_ok(c, CreateType(cat_q("ty"), record([Field("f", Int32)]), false))
+    c = cat_ok(c, CreateSequence(cat_q("seq"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    c = cat_ok(c, cat_index("ix", "t", ["a"]))
+    c = cat_ok(c, cat_alter("t", [AddConstraint(cat_check("ck", call("gt", [cat_row("id"), cat_int(0)])), false)]))
+
+    for name in ["t", "v", "ty", "seq", "ix", "ck", "t_pkey"]
+        assert_eq(cat_code(c, cat_table(name, [cat_col("id", Int64)], ["id"])), "Q6002")
+        assert_eq(cat_code(c, cat_view(name, cat_pick("t", "x", "r", ["id"]))), "Q6002")
+        assert_eq(cat_code(c, CreateType(cat_q(name), record([]), false)), "Q6002")
+        assert_eq(cat_code(c, CreateSequence(cat_q(name), SequenceDef(Int64, None, None, None, None, false, None), false)), "Q6002")
+        assert_eq(cat_code(c, cat_index(name, "t", ["b"])), "Q6002")
+        assert_eq(cat_code(c, cat_alter("t", [AddConstraint(cat_check(name, call("gt", [cat_row("id"), cat_int(1)])), false)])), "Q6002")
+
+    // The same names are free in another namespace.
+    val other = cat_ok(c, CreateNamespace("other", false))
+    assert_eq(cat_code(other, CreateTable(QualName("other", "t"), items_of([cat_col("id", Int64)]), items_of(["id"]), buf[ConstraintDef](), false)), "ok")
+
+@test
+a_primary_key_constraint_and_an_identity_sequence_take_names_that_must_be_free()
+    val c = cat_ok(cat_base(), CreateSequence(cat_q("u_pkey"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64)], ["id"])), "Q6002")
+
+    val d = cat_ok(cat_base(), CreateSequence(cat_q("w_id_seq"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    assert_eq(cat_code(d, cat_table("w", [ColumnDef("id", Int64, None, None, Always, None)], ["id"])), "Q6002")
+
+@test
+a_primary_key_column_is_a_named_non_null_key_component()
+    val c = cat_ok(cat_base(), CreateType(cat_q("mood"), union_of([Field("up", record([])), Field("down", record([]))]), false))
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64)], ["nope"])), "Q2003")
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", nullable(Int64))], ["id"])), "Q6005")
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Json)], ["id"])), "Q6005")
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", record([Field("x", Int32)]))], ["id"])), "Q6005")
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", list(Int32))], ["id"])), "Q6005")
+
+    // An enum is a key component; a union with a payload is not.
+    assert_eq(cat_code(c, cat_table("u", [cat_col("m", Named("app", "mood"))], ["m"])), "ok")
+    val d = cat_ok(c, CreateType(cat_q("shape"), union_of([Field("dot", record([])), Field("disc", record([Field("r", Float64)]))]), false))
+    assert_eq(cat_code(d, cat_table("u", [cat_col("s", Named("app", "shape"))], ["s"])), "Q6005")
+
+@test
+a_table_whose_fixed_area_and_key_pass_three_thousand_octets_is_refused()
+    val narrow = buf[ColumnDef]()
+    val wide = buf[ColumnDef]()
+
+    for i in 0..<187
+        narrow.push(cat_col(s"c$i", Uuid))
+
+    for i in 0..<188
+        wide.push(cat_col(s"c$i", Uuid))
+
+    // 187 × 16 = 2,992 octets fit; 188 × 16 = 3,008 do not. Text adds nothing to the fixed area.
+    narrow.push(cat_col("t", Text))
+    assert_eq(cat_code(cat_base(), CreateTable(cat_q("n"), narrow, items_of(["c0"]), buf[ConstraintDef](), false)), "ok")
+    assert_eq(cat_code(cat_base(), CreateTable(cat_q("w"), wide, items_of(["c0"]), buf[ConstraintDef](), false)), "Q6011")
+
+@test
+a_column_of_an_unknown_named_type_is_refused()
+    assert_eq(cat_code(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("p", Named("app", "point"))], ["id"])), "Q6004")
+    assert_eq(cat_code(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("p", union_of([Field("x", Int32)]))], ["id"])), "Q3014")
+
+// -- defaults, generated columns, identity ---------------------------------------------------------
+
+@test
+a_default_is_typed_against_its_column_and_names_its_sequence()
+    val c = cat_base()
+    val ok = ColumnDef("n", Int64, Some(cat_int(7)), None, NoIdentity, None)
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64), ok], ["id"])), "ok")
+
+    val bad = ColumnDef("n", Int64, Some(cat_text("seven")), None, NoIdentity, None)
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64), bad], ["id"])), "Q3001")
+
+    val draw = ColumnDef("n", Int64, Some(call("next_value", [cat_text("app"), cat_text("s")])), None, NoIdentity, None)
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64), draw], ["id"])), "Q6003")
+    val d = cat_ok(c, CreateSequence(cat_q("s"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    assert_eq(cat_code(d, cat_table("u", [cat_col("id", Int64), draw], ["id"])), "ok")
+
+    val dynamic = ColumnDef("n", Int64, Some(call("next_value", [cat_text("app"), call("lower", [cat_text("S")])])), None, NoIdentity, None)
+    assert_eq(cat_code(d, cat_table("u", [cat_col("id", Int64), dynamic], ["id"])), "Q6006")
+
+@test
+a_generated_column_reads_ordinary_columns_only_and_is_not_writable()
+    val c = cat_base()
+    val g = ColumnDef("g", Int64, None, Some(call("add", [cat_row("id"), cat_int(1)])), NoIdentity, None)
+    val made = cat_ok(c, cat_table("u", [cat_col("id", Int64), g], ["id"]))
+    assert(!cat_info(made, "u").columns[1].writable)
+
+    val g2 = ColumnDef("g2", Int64, None, Some(call("add", [cat_row("g"), cat_int(1)])), NoIdentity, None)
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64), g, g2], ["id"])), "Q6006")
+
+    val wrong = ColumnDef("g", Int64, None, Some(cat_text("x")), NoIdentity, None)
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64), wrong], ["id"])), "Q3001")
+
+    val unknown = ColumnDef("g", Int64, None, Some(cat_row("nope")), NoIdentity, None)
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64), unknown], ["id"])), "Q2003")
+
+@test
+an_identity_column_owns_a_sequence_and_always_makes_it_unwritable()
+    val always = ColumnDef("id", Int64, None, None, Always, None)
+    val by_default = ColumnDef("n", Int32, None, None, ByDefault, Some(SequenceDef(Int32, Some(5), Some(2), None, None, false, Some(4))))
+    val c = cat_ok(cat_base(), cat_table("u", [always, by_default], ["id"]))
+    val info = cat_info(c, "u")
+    assert(!info.columns[0].writable && info.columns[1].writable)
+
+    val s = c.sequences[c.sequence_at(cat_q("u_id_seq")).unwrap()]
+    assert(s.owner_table == cat_table_of(c, "u").oid && s.owner_column == 1)
+    assert(s.start == 1 && s.increment == 1 && s.min == 1 && s.max == 9223372036854775807 && s.cache == 32)
+
+    val n = c.sequences[c.sequence_at(cat_q("u_n_seq")).unwrap()]
+    assert(n.start == 5 && n.increment == 2 && n.max == 2147483647 && n.cache == 4)
+
+// -- constraints -----------------------------------------------------------------------------------
+
+@test
+a_check_is_a_boolean_condition_over_the_row()
+    val c = cat_base()
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64)], ["id"], [cat_check("pos", call("gt", [cat_row("id"), cat_int(0)]))])), "ok")
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64)], ["id"], [cat_check("pos", call("add", [cat_row("id"), cat_int(0)]))])), "Q3004")
+    assert_eq(cat_code(c, cat_table("u", [cat_col("id", Int64)], ["id"], [cat_check("pos", cat_row("nope"))])), "Q2003")
+
+@test
+a_unique_constraint_is_over_key_components()
+    assert_eq(cat_code(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("j", Json)], ["id"], [cat_unique("uj", ["j"])])), "Q6005")
+    assert_eq(cat_code(cat_base(), cat_table("u", [cat_col("id", Int64)], ["id"], [cat_unique("uj", ["nope"])])), "Q2003")
+
+    // Nullable columns may be unique.
+    assert_eq(cat_code(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("n", nullable(Text))], ["id"], [cat_unique("un", ["n"])])), "ok")
+
+@test
+a_foreign_key_references_exactly_a_unique_key_of_a_table()
+    val c = cat_ok(cat_base(), cat_view("v", cat_pick("t", "x", "r", ["id"])))
+    val child = [cat_col("id", Int64), cat_col("t_id", nullable(Int64)), cat_col("label", Text)]
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [cat_fk("fk", ["t_id"], "t", ["id"])])), "ok")
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [cat_fk("fk", ["t_id"], "missing", ["id"])])), "Q2001")
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [cat_fk("fk", ["t_id"], "v", ["id"])])), "Q6013")
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [cat_fk("fk", ["label"], "t", ["b"])])), "Q6013")
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [cat_fk("fk", ["label"], "t", ["id"])])), "Q6013")
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [cat_fk("fk", ["t_id"], "t", ["nope"])])), "Q2003")
+
+    val null_on_non_null = ConstraintDef("fk", ForeignKey(items_of(["id"]), cat_q("t"), items_of(["id"]), FkSetNull, FkNoAction, false))
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [null_on_non_null])), "Q6013")
+    val null_on_nullable = ConstraintDef("fk", ForeignKey(items_of(["t_id"]), cat_q("t"), items_of(["id"]), FkNoAction, FkSetNull, false))
+    assert_eq(cat_code(c, cat_table("child", child, ["id"], [null_on_nullable])), "ok")
+
+    // A key made unique by a constraint of the same statement, on the table itself.
+    val tree = [cat_col("id", Int64), cat_col("code", Text), cat_col("parent", nullable(Text))]
+    assert_eq(cat_code(c, cat_table("tree", tree, ["id"], [cat_fk("up", ["parent"], "tree", ["code"]), cat_unique("tree_code", ["code"])])), "ok")
+
+// -- indexes ---------------------------------------------------------------------------------------
+
+@test
+an_index_is_created_building_on_a_table_its_creator_owns()
+    val c = cat_ok(cat_base(), cat_index("t_a", "t", ["a"]))
+    val x = c.indexes[c.index_at(cat_q("t_a")).unwrap()]
+    assert(x.state == IndexBuilding && !x.unique && x.keys[0].key == KeyOn(2))
+
+    assert_eq(cat_code(c, cat_index("t_a", "t", ["b"])), "Q6002")
+    assert_eq(cat_code(c, CreateIndex("t_a", IndexDef(cat_q("t"), false, items_of([IndexKey(KeyColumn("b"), false)]), None), true)), "ok")
+    assert_eq(cat_code(c, cat_index("i2", "missing", ["a"])), "Q2001")
+    assert_eq(cat_code(c, cat_index("i2", "t", ["nope"])), "Q2003")
+
+    val v = cat_ok(c, cat_view("v", cat_pick("t", "x", "r", ["id"])))
+    assert_eq(cat_code(v, cat_index("i2", "v", ["id"])), "Q2001")
+
+    val j = cat_ok(c, cat_alter("t", [AddColumn(cat_col("doc", nullable(Json)))]))
+    assert_eq(cat_code(j, cat_index("i2", "t", ["doc"])), "Q6005")
+
+    val r = cat_ok(c, cat_role("alice"))
+    assert_eq(cat_code(r, cat_index("i2", "t", ["b"]), "alice"), "Q6015")
+
+@test
+an_index_may_have_expression_keys_and_a_predicate()
+    val keys = items_of([IndexKey(KeyExpr(call("lower", [cat_row("b")])), true)])
+    val partial = IndexDef(cat_q("t"), true, keys, Some(call("gt", [cat_row("id"), cat_int(0)])))
+    assert_eq(cat_code(cat_base(), CreateIndex("t_lower_b", partial, false)), "ok")
+
+    val bad_key = items_of([IndexKey(KeyExpr(Record(items_of([item("x", cat_row("b"))]))), false)])
+    assert_eq(cat_code(cat_base(), CreateIndex("i", IndexDef(cat_q("t"), false, bad_key, None), false)), "Q6005")
+
+    val bad_predicate = IndexDef(cat_q("t"), false, items_of([IndexKey(KeyColumn("b"), false)]), Some(cat_row("b")))
+    assert_eq(cat_code(cat_base(), CreateIndex("i", bad_predicate, false)), "Q3004")
+
+    // A unique index over columns alone is an upsert target once it is ready; a partial one never is.
+    val c = cat_ok(cat_base(), CreateIndex("t_b", IndexDef(cat_q("t"), true, items_of([IndexKey(KeyColumn("b"), false)]), None), false))
+    assert_eq(cat_keys(cat_info(c, "t")), "t_pkey")
+    var ready = c.clone()
+    ready.indexes[ready.index_at(cat_q("t_b")).unwrap()].state = IndexReady
+    assert_eq(cat_keys(cat_info(ready, "t")), "t_pkey,t_b")
+
+// -- named types -----------------------------------------------------------------------------------
+
+@test
+a_named_type_is_a_record_or_union_whose_references_exist()
+    var c = cat_ok(cat_base(), CreateType(cat_q("point"), record([Field("x", Int32), Field("y", Int32)]), false))
+    assert(c.named_type(cat_q("point")) == Some(record([Field("x", Int32), Field("y", Int32)])))
+    assert_eq(cat_code(c, CreateType(cat_q("point"), record([]), false)), "Q6002")
+    assert_eq(cat_code(c, CreateType(cat_q("point"), record([]), true)), "ok")
+    assert_eq(cat_code(c, CreateType(cat_q("line"), record([Field("a", Named("app", "nope"))]), false)), "Q6004")
+    assert_eq(cat_code(c, CreateType(cat_q("line"), record([Field("a", Named("app", "point")), Field("b", Named("app", "point"))]), false)), "ok")
+    assert_eq(cat_code(c, CreateType(cat_q("alias"), Named("app", "point"), false)), "ok")
+    assert_eq(cat_code(c, CreateType(QualName("nope", "x"), record([]), false)), "Q6003")
+
+    // A column of a named type reports the type's name, and the checker reads its structure.
+    c = cat_ok(c, cat_table("shapes", [cat_col("id", Int64), cat_col("at", Named("app", "point"))], ["id"]))
+    assert(cat_info(c, "shapes").columns[1].ty == Named("app", "point"))
+
+// -- sequences -------------------------------------------------------------------------------------
+
+@test
+a_sequence_is_created_with_its_defaults_and_altered_consistently()
+    val down = SequenceDef(Int16, None, Some(-1), None, None, true, None)
+    var c = cat_ok(cat_base(), CreateSequence(cat_q("s"), down, false))
+    val s = c.sequences[c.sequence_at(cat_q("s")).unwrap()]
+    assert(s.min == -32768 && s.max == 32767 && s.start == 1 && s.cycle)
+
+    val none = SequenceDef(Int16, None, None, None, None, false, None)
+    c = cat_ok(c, AlterSequence(cat_q("s"), SequenceDef(Int16, None, None, Some(-10), Some(10), false, None), Some(3)))
+    val t = c.sequences[c.sequence_at(cat_q("s")).unwrap()]
+    assert(t.min == -10 && t.max == 10 && t.next == 3 && t.increment == -1 && t.cycle)
+
+    assert_eq(cat_code(c, AlterSequence(cat_q("s"), none, Some(11))), "Q6017")
+    assert_eq(cat_code(c, AlterSequence(cat_q("s"), SequenceDef(Int16, None, None, Some(5), None, false, None), None)), "Q6017")
+    assert_eq(cat_code(c, AlterSequence(cat_q("missing"), none, None)), "Q6003")
+    assert_eq(cat_code(c, CreateSequence(cat_q("s"), none, false)), "Q6002")
+
+    val r = cat_ok(c, cat_role("alice"))
+    assert_eq(cat_code(r, AlterSequence(cat_q("s"), none, None), "alice"), "Q6015")
+
+    val id = cat_ok(cat_base(), cat_table("u", [ColumnDef("id", Int64, None, None, Always, None)], ["id"]))
+    assert_eq(cat_code(id, AlterSequence(cat_q("u_id_seq"), SequenceDef(Int32, None, None, None, None, false, None), None)), "Q6017")
+    assert_eq(cat_code(id, AlterSequence(cat_q("u_id_seq"), SequenceDef(Int64, None, Some(5), None, None, false, None), None)), "ok")
+
+// -- views -----------------------------------------------------------------------------------------
+
+@test
+a_view_takes_its_columns_from_its_query()
+    val c = cat_ok(cat_base(), cat_view("v", cat_pick("t", "x", "r", ["id", "b"])))
+    val info = cat_info(c, "v")
+    assert(info.is_view)
+    assert_eq(cat_columns(info), "id,b")
+    assert(info.columns[0].ty == Int64 && !info.columns[0].writable)
+
+    assert_eq(cat_code(c, cat_view("v2", cat_pick("missing", "x", "r", ["id"]))), "Q2001")
+    assert_eq(cat_code(c, cat_view("v2", cat_pick("t", "x", "r", ["nope"]))), "Q2003")
+    assert_eq(cat_code(c, cat_view("v", cat_pick("t", "x", "r", ["id"]))), "Q6002")
+    assert_eq(cat_code(c, CreateView(cat_q("t"), cat_pick("t", "x", "r", ["id"]), true)), "Q6002")
+
+@test
+a_replacing_view_keeps_the_old_columns_as_a_prefix_and_never_reads_itself()
+    var c = cat_ok(cat_base(), cat_view("v", cat_pick("t", "x", "r", ["id", "b"])))
+    c = cat_ok(c, cat_view("w", cat_pick("v", "y", "r2", ["id"])))
+    c = cat_ok(c, CreateView(cat_q("v"), cat_pick("t", "x", "r", ["id", "b", "a"]), true))
+    assert_eq(cat_columns(cat_info(c, "v")), "id,b,a")
+
+    assert_eq(cat_code(c, CreateView(cat_q("v"), cat_pick("t", "x", "r", ["id"]), true)), "Q6007")
+    assert_eq(cat_code(c, CreateView(cat_q("v"), cat_pick("t", "x", "r", ["b", "id", "a"]), true)), "Q6007")
+    assert_eq(cat_code(c, CreateView(cat_q("v"), cat_pick("w", "z", "r", ["id", "id"]), true)), "Q2005")
+
+    val cycle = Project(scan("app", "w", "z"), "r", items_of([item("id", col("z", "id")), item("b", cat_text("")), item("a", Null(Int32))]))
+    assert_eq(cat_code(c, CreateView(cat_q("v"), cycle, true)), "Q6007")
+
+// -- roles -----------------------------------------------------------------------------------------
+
+@test
+roles_are_unique_their_memberships_exist_and_never_loop()
+    var c = cat_ok(cat_base(), cat_role("alice"))
+    assert_eq(cat_code(c, cat_role("alice")), "Q6002")
+    assert_eq(cat_code(c, CreateRole("bob", RoleDef(true, false, items_of(["nobody"])))), "Q6003")
+    assert_eq(cat_code(c, cat_role("bob"), "alice"), "Q6015")
+
+    c = cat_ok(c, CreateRole("staff", RoleDef(false, false, buf[string]())))
+    c = cat_ok(c, CreateRole("bob", RoleDef(true, false, items_of(["staff"]))))
+    assert_eq(cat_code(c, AlterRole("staff", RoleDef(false, false, items_of(["bob"])), None)), "Q6020")
+    assert_eq(cat_code(c, AlterRole("staff", RoleDef(false, false, items_of(["staff"])), None)), "Q6020")
+    assert_eq(cat_code(c, AlterRole("alice", RoleDef(true, false, buf[string]()), Some("bob"))), "Q6002")
+    assert_eq(cat_code(c, AlterRole("nobody", RoleDef(true, false, buf[string]()), None)), "Q6003")
+
+    c = cat_ok(c, AlterRole("alice", RoleDef(false, true, buf[string]()), Some("carol")))
+    val carol = c.roles[c.role_at("carol").unwrap()]
+    assert(carol.superuser && !carol.login && c.role_at("alice").is_none())
+
+@test
+the_replication_role_is_never_dropped_renamed_or_given_login()
+    val c = cat_base()
+    assert_eq(cat_code(c, DropRole("terndb_replication", false)), "Q6014")
+    assert_eq(cat_code(c, AlterRole("terndb_replication", RoleDef(false, false, buf[string]()), Some("r"))), "Q6014")
+    assert_eq(cat_code(c, AlterRole("terndb_replication", RoleDef(true, false, buf[string]()), None)), "Q6014")
+    assert_eq(cat_code(c, AlterRole("terndb_replication", RoleDef(false, false, buf[string]()), None)), "ok")
+
+@test
+a_role_is_dropped_only_when_nothing_refers_to_it()
+    var c = cat_ok(cat_base(), cat_role("alice"))
+    c = cat_ok(c, cat_role("bob"))
+    assert_eq(cat_code(c, DropRole("nobody", false)), "Q6003")
+    assert_eq(cat_code(c, DropRole("nobody", true)), "ok")
+    assert_eq(cat_code(c, DropRole("alice", false), "bob"), "Q6015")
+
+    c = cat_ok(c, cat_alter("t", [SetOwner("alice")]))
+    assert_eq(cat_code(c, DropRole("alice", false)), "Q6007")
+    c = cat_ok(c, cat_alter("t", [SetOwner("terndb")]))
+
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "alice", false))
+    assert_eq(cat_code(c, DropRole("alice", false)), "Q6007")
+    c = cat_ok(c, Revoke(items_of([PrivSelect]), OnTable(cat_q("t")), "alice"))
+
+    c = cat_ok(c, AlterRole("bob", RoleDef(true, false, items_of(["alice"])), None))
+    assert_eq(cat_code(c, DropRole("alice", false)), "Q6007")
+    c = cat_ok(c, AlterRole("bob", RoleDef(true, false, buf[string]()), None))
+
+    c = cat_ok(c, DropRole("alice", false))
+    assert(c.role_at("alice").is_none())
+
+// -- privileges ------------------------------------------------------------------------------------
+
+@test
+creating_in_a_namespace_needs_create_and_reading_a_table_needs_select()
+    var c = cat_ok(cat_base(), cat_role("alice"))
+    val mine = cat_table("mine", [cat_col("id", Int64)], ["id"])
+    assert_eq(cat_code(c, mine, "alice"), "Q6015")
+
+    c = cat_ok(c, Grant(items_of([PrivCreate]), OnNamespace("app"), "alice", false))
+    c = cat_ok(c, mine, "alice")
+    assert(cat_table_of(c, "mine").owner == c.roles[c.role_at("alice").unwrap()].oid)
+
+    // A view over another role's table needs select on it, through the namespace's usage.
+    val v = cat_view("v", cat_pick("t", "x", "r", ["id"]))
+    assert_eq(cat_code(c, v, "alice"), "Q6015")
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "alice", false))
+    assert_eq(cat_code(c, v, "alice"), "Q6015")
+    c = cat_ok(c, Grant(items_of([PrivUsage]), OnNamespace("app"), "alice", false))
+    assert_eq(cat_code(c, v, "alice"), "ok")
+
+    // Revoking takes it away again.
+    c = cat_ok(c, Revoke(items_of([PrivSelect]), OnTable(cat_q("t")), "alice"))
+    assert_eq(cat_code(c, v, "alice"), "Q6015")
+
+    // Her own table is hers to change, the other is not.
+    assert_eq(cat_code(c, cat_alter("mine", [AddColumn(cat_col("n", nullable(Int32)))]), "alice"), "ok")
+    assert_eq(cat_code(c, cat_alter("t", [AddColumn(cat_col("n", nullable(Int32)))]), "alice"), "Q6015")
+    assert_eq(cat_code(c, DropTable(cat_q("t"), false, false), "alice"), "Q6015")
+
+@test
+a_privilege_is_granted_on_only_by_its_owner_or_a_grantable_holder()
+    var c = cat_ok(cat_base(), cat_role("alice"))
+    c = cat_ok(c, cat_role("bob"))
+    assert_eq(cat_code(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "bob", false), "alice"), "Q6015")
+
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "alice", false))
+    assert_eq(cat_code(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "bob", false), "alice"), "Q6015")
+
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "alice", true))
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "bob", false), "alice")
+    assert_eq(c.grants.len(), 2)
+
+    // A member holds what its roles hold.
+    c = cat_ok(c, cat_role("carol"))
+    c = cat_ok(c, AlterRole("carol", RoleDef(true, false, items_of(["alice"])), None))
+    assert_eq(cat_code(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "carol", false), "carol"), "ok")
+
+@test
+a_grant_names_an_existing_object_and_a_privilege_that_applies_to_it()
+    val c = cat_ok(cat_ok(cat_base(), cat_role("alice")), CreateSequence(cat_q("s"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    assert_eq(cat_code(c, Grant(items_of([PrivCreate]), OnTable(cat_q("t")), "alice", false)), "Q6021")
+    assert_eq(cat_code(c, Grant(items_of([PrivSelect]), OnNamespace("app"), "alice", false)), "Q6021")
+    assert_eq(cat_code(c, Grant(items_of([PrivInsert]), OnSequence(cat_q("s")), "alice", false)), "Q6021")
+    assert_eq(cat_code(c, Grant(items_of([PrivUsage]), OnSequence(cat_q("s")), "alice", false)), "ok")
+    assert_eq(cat_code(c, Grant(items_of([PrivSelect]), OnTable(cat_q("missing")), "alice", false)), "Q2001")
+    assert_eq(cat_code(c, Grant(items_of([PrivUsage]), OnNamespace("missing"), "alice", false)), "Q6003")
+    assert_eq(cat_code(c, Grant(items_of([PrivUsage]), OnSequence(cat_q("missing")), "alice", false)), "Q6003")
+    assert_eq(cat_code(c, Grant(items_of([PrivUsage]), OnType(cat_q("missing")), "alice", false)), "Q6004")
+    assert_eq(cat_code(c, Grant(items_of([PrivSelect]), OnTable(cat_q("t")), "nobody", false)), "Q6003")
+    assert_eq(cat_code(c, Revoke(items_of([PrivSelect]), OnTable(cat_q("t")), "nobody")), "Q6003")
+
+@test
+a_column_of_another_roles_type_needs_usage_on_it()
+    var c = cat_ok(cat_base(), CreateType(cat_q("point"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, cat_role("alice"))
+    c = cat_ok(c, Grant(items_of([PrivCreate, PrivUsage]), OnNamespace("app"), "alice", false))
+    val s = cat_table("mine", [cat_col("id", Int64), cat_col("p", Named("app", "point"))], ["id"])
+    assert_eq(cat_code(c, s, "alice"), "Q6015")
+    c = cat_ok(c, Grant(items_of([PrivUsage]), OnType(cat_q("point")), "alice", false))
+    assert_eq(cat_code(c, s, "alice"), "ok")
+
+@test
+a_foreign_key_to_another_roles_table_needs_references()
+    var c = cat_ok(cat_base(), cat_role("alice"))
+    c = cat_ok(c, Grant(items_of([PrivCreate, PrivUsage]), OnNamespace("app"), "alice", false))
+    val s = cat_table("mine", [cat_col("id", Int64)], ["id"], [cat_fk("to_t", ["id"], "t", ["id"])])
+    assert_eq(cat_code(c, s, "alice"), "Q6015")
+    c = cat_ok(c, Grant(items_of([PrivReferences]), OnTable(cat_q("t")), "alice", false))
+    assert_eq(cat_code(c, s, "alice"), "ok")
+
+// -- jobs and atomicity ----------------------------------------------------------------------------
+
+@test
+await_jobs_finds_none_and_cancel_job_knows_no_job()
+    assert_eq(cat_code(cat_base(), AwaitJobs(7)), "ok")
+    assert_eq(cat_code(cat_base(), CancelJob(7)), "Q6003")
+
+@test
+a_refused_statement_changes_nothing()
+    val c = cat_base()
+    val s = cat_alter("t", [AddColumn(cat_col("n", nullable(Int32))), DropColumn("missing", false)])
+    assert_eq(cat_code(c, s), "Q2003")
+    assert_eq(c.version, 2)
+    assert_eq(cat_columns(cat_info(c, "t")), "id,a,b")
+    assert_eq(cat_table_of(c, "t").schema_version(), 1)
+
+    var d = c
+    assert(d.apply(envelope([], s), BootstrapRole).is_err())
+    assert_eq(d.version, 2)
+    assert_eq(cat_columns(cat_info(d, "t")), "id,a,b")
+
+@test
+a_statement_refused_by_the_tree_checks_never_reaches_the_catalog()
+    assert_eq(cat_code(cat_base(), cat_table("u", [cat_col("id", Int64)], [])), "Q6009")
+    assert_eq(cat_code(cat_base(), DropTable(QualName("sys", "x"), false, false)), "Q6014")
+
+    var c = cat_base()
+    val with_param = Envelope(TreeMajor, TreeMinor, items_of([ParamDecl(None, Int64)]), CreateNamespace("x", false), None)
+    assert_eq(c.apply(with_param, BootstrapRole).unwrap_err().code, "Q6001")
+    assert_eq(c.apply(envelope([], Query(scan("app", "t", "x"))), BootstrapRole).unwrap_err().code, "Q1002")

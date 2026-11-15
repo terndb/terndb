@@ -210,6 +210,23 @@ Every constraint has a name unique in the table's namespace, and is one of:
 6. Every database has a predefined role `terndb_replication`, without `login`, which cannot be dropped or
    renamed. A role has the **replication right** — it may stream the WAL, take a base backup, rewind or fence
    (`replication.md` §2.2) — iff it is a superuser or a member of `terndb_replication`.
+7. **A new database**, embedded or served, holds the superuser `terndb` with `login` (`c-api.md` §4.2 rule 2),
+   the role `terndb_replication`, and the namespaces `sys` and `catalog`, both owned by `terndb`. Dropping,
+   renaming or giving `login` to `terndb_replication` is `Q6014`.
+8. **What each statement needs** (`Q6015` when the statement's role lacks it):
+   - `CreateNamespace`, `CreateRole`, `AlterRole` and `DropRole`: a superuser.
+   - creating a table, view, sequence or named type: `create` on its namespace. `CreateIndex`, every `AlterTable`
+     action and every `Alter…` or `Drop…` of an object: ownership of the object (of the table, for an index),
+     rule 2. `CreateView` with `replace` also needs ownership of the view it replaces.
+   - naming an existing object of a namespace — a column's named type, a foreign key's `ref_table`, a view
+     query's scans, the sequence a stored `next_value` names — needs `usage` on that namespace and the object's
+     own privilege: `usage` on the type or sequence, `references` on the referenced table, `select` on each table
+     or view a view scans. Every role may name objects of `sys` and `catalog` (rule 5).
+   - `Grant` and `Revoke` of a privilege: ownership of the object, or that privilege held `grantable`. Revoking a
+     privilege the grantee does not hold changes nothing.
+9. A privilege that does not apply to its object's kind (rule 3) is `Q6021`. A `member_of` naming no role is
+   `Q6003`, and a membership that would make a role a member of itself, directly or through others, is `Q6020`. A
+   role that owns an object, holds or granted a privilege, or has members cannot be dropped (`Q6007`).
 
 ### 2.11 Dependencies
 
@@ -234,6 +251,54 @@ index component or a partial-index predicate.
    MUST be deterministic (`Q6006`).
 4. It is stored in the canonical encoding ([QT] §12) of the expression, with `row` as its binder, and reported in
    `catalog.*` in the text form ([QT] §15).
+5. A stored `next_value` names its sequence by two text `Literal`s, so that the dependency can be recorded
+   (§2.11); any other argument is `Q6006`, and a sequence that does not exist is `Q6003`.
+6. It is typed as [QT] types an expression: a default against its column's type, a generated column or a `using`
+   coercing to its column's type (`Q3001`), a check or predicate as a condition (`Q3004`), naming only the ready
+   columns of the table through `row` (`Q2003` for any other).
+
+### 2.13 Rules the catalog applies
+
+These settle what §2 leaves to the catalog; each is checked when the statement executes (§3.5).
+
+1. **A table where a table is required.** `AlterTable`, `DropTable` and `IndexDef.table` naming a view, or
+   nothing, are `Q2001`; `DropView` naming a table is `Q6003`; a foreign key whose `ref_table` is a view is
+   `Q6013`. A column a statement names that its table does not have is `Q2003`, and a column added under a name
+   the table already has is `Q6002`.
+2. **The width limit** (§2.2 rule 3) counts each fixed-width column ([DISK] §4.4) that is not in the key at its
+   width, and each primary-key column at its key width ([DISK] §4.6: an enum takes 2 octets, `text` and `bytes`
+   0, since their length is bounded per entry when a row is written). A `CreateTable` or `AlterTable` whose
+   table would pass 3,000 octets is `Q6011`.
+3. **The names a table takes.** The primary key is the constraint `<table>_pkey` (§2.4 rule 3) and an identity
+   column's sequence is `<table>_<column>_seq`, both in the table's namespace, and each name must be free
+   (`Q6002`). A unique constraint and its index share one name. Renaming a table renames neither.
+4. **Dependencies the definitions add** (§2.11): a definition that calls `next_value` depends on that sequence, so
+   a sequence a definition draws from cannot be dropped, nor the table owning an identity sequence another
+   table's definition draws from (`Q6007`). An identity's sequence is dropped with its column, and `DropSequence`
+   of it is `Q6007`.
+5. **`drop_column`** of a column that a generated column reads is `Q6007` even with `cascade`, since `cascade`
+   never drops a column (§2.11, §8.3). With `cascade`, an index that uses the column is dropped, and a constraint
+   that uses it (with its index, and the foreign keys that reference its key). An index backing a constraint is
+   dropped only with the constraint (`DropIndex` of it is `Q6007`).
+6. **What a change leaves.** After an `AlterTable` or `AlterType`, every view is typed again and must have exactly
+   the columns it had, and every definition expression of every table must still type, its index key components
+   still key components; anything else is `Q6007`. So a column rename or a dropped `not null` whose column a view
+   outputs as one of its own columns is `Q6007`, as is an `AlterType` change that a definition or view depends on
+   (a renamed field a check reads, a payload added to an enum an index keys on).
+7. **`AlterType`** on a type whose definition is not of the kind the change needs (a union for `append_variants`,
+   a record for `append_fields`, either for `rename_member`) is `Q6018`. A member added under a name the type
+   already has is `Q6002`, a variant payload that is not a record `Q3014`, a fill that does not coerce to its
+   field `Q3001`, and a `rename_member` of a member the type lacks `Q6003`. A change that would make the type
+   refer to itself, directly or through others, is `Q6005`. The structural changes give every table with a column
+   whose type reaches the type a new schema version; `rename` changes only names, which no row encoding holds,
+   and adds none.
+8. **`AlterSequence`** may change a sequence's `type` unless an identity owns it (`Q6017`). A `restart` outside the
+   resulting range is `Q6017`; a next value the new range excludes restarts from `start`.
+9. **`retype_column`** of a column a view reads through a scan of its table is `Q6007`, whether or not the view
+   outputs it (§2.9 rule 2). A conversion that is lossless (§5.3 rule 3), has no `using` and leaves the encoding of
+   every key the column is in unchanged gives the column its new type at once; any other makes it `converting`
+   (§8.5 rule 2), keeping its type and recording the target and the conversion. Either adds a schema version, the
+   column's type or state being part of it (§5.1 rule 1).
 
 ## 3. DDL statement trees
 

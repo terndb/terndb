@@ -95,12 +95,14 @@ during the handshake.
 | `Q6011` | `table_too_wide` | More than 65,535 columns or record fields, or a fixed area plus key beyond the on-disk limit. |
 | `Q6012` | `schema_versions_exhausted` | The table's next schema version would exceed 65,535; rewrite the table. |
 | `Q6013` | `foreign_key_mismatch` | Foreign-key columns do not match a unique key of the referenced table, or `set_null` on a non-null column. |
-| `Q6014` | `reserved_namespace` | DDL on an object in `sys` or `catalog`. |
+| `Q6014` | `reserved_namespace` | DDL on an object in `sys` or `catalog`, or dropping, renaming or giving `login` to the predefined role `terndb_replication` (`ddl.md` §2.10 rule 7). |
 | `Q6015` | `insufficient_privilege` | The role lacks a privilege the statement needs, or does not own the object (`ddl.md` §2.10). Raised for every statement kind. |
 | `Q6016` | `conflicting_alter_actions` | Two actions of one `AlterTable` change the same column. |
 | `Q6017` | `invalid_sequence_options` | Sequence options that are inconsistent (zero increment, `min > max`, start outside the range). |
 | `Q6018` | `type_change_not_permitted` | An `AlterType` change other than appending or renaming members. |
 | `Q6019` | `invalid_name` | A name that is empty, longer than 255 octets or not UTF-8. |
+| `Q6020` | `circular_membership` | A role membership that would make a role a member of itself, directly or through others (`ddl.md` §2.10 rule 9). |
+| `Q6021` | `privilege_not_applicable` | A `Grant` or `Revoke` of a privilege that does not apply to the object's kind (`ddl.md` §2.10 rules 3, 9). |
 | `Q7001` | `substrait_relation_unsupported` | Substrait relation not supported. |
 | `Q7002` | `substrait_type_unsupported` | Substrait type not supported. |
 | `Q7003` | `substrait_function_unmapped` | Substrait function not in the mapping. |

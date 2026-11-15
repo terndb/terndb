@@ -1,0 +1,374 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `AlterTable`, `AlterType` and the conversions they rest on, against the in-memory catalog: every
+// action applied and refused for each catalog rule, the schema versions they add (`ddl.md` §5.1), and
+// the rewriting of the definitions and views a rename touches (§8.4).
+
+private version_of(c: MemCatalog, name: string) -> u64 = cat_table_of(c, name).schema_version()
+
+private column_of(c: MemCatalog, table: string, name: string) -> CatColumn = cat_table_of(c, table).column_named(name).unwrap()
+
+private constraint_named(c: MemCatalog, name: string) -> Option[CatConstraint]
+    for k in c.constraints
+        if k.name == name then return Some(k)
+
+    None
+
+/** `cat_base()` with a check `a_pos` on `a`, an index `t_a` on `a`, and a view `va` reading `a`. */
+private with_dependents() -> MemCatalog
+    var c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_check("a_pos", call("gt", [cat_row("a"), Literal(Int32, Int(0))])), false)]))
+    c = cat_ok(c, cat_index("t_a", "t", ["a"]))
+    cat_ok(c, cat_view("va", cat_pick("t", "x", "r", ["id", "a"])))
+
+// -- add_column --------------------------------------------------------------------------------------
+
+@test
+an_added_column_with_a_constant_default_is_ready_with_that_fill()
+    val d = ColumnDef("n", Int64, Some(cat_int(5)), None, NoIdentity, None)
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(d), AddColumn(cat_col("m", nullable(Text)))]))
+    assert_eq(version_of(c, "t"), 2)
+    assert_eq(cat_columns(cat_info(c, "t")), "id,a,b,n,m")
+    val n = column_of(c, "t", "n")
+    assert(n.state == ColumnReady && n.fill == Some(cat_int(5)) && n.id == 4)
+    assert(column_of(c, "t", "m").fill.is_none())
+
+    // The old version keeps the old column list.
+    assert_eq(cat_table_of(c, "t").versions[0].columns.len(), 3)
+    assert_eq(cat_table_of(c, "t").versions[1].columns.len(), 5)
+
+@test
+an_added_column_that_needs_a_job_is_filling_and_invisible()
+    val volatile = ColumnDef("at", Timestamp, Some(call("statement_timestamp", [])), None, NoIdentity, None)
+    val ident = ColumnDef("seq", Int64, None, None, ByDefault, None)
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(volatile), AddColumn(ident)]))
+    assert(column_of(c, "t", "at").state == ColumnFilling && column_of(c, "t", "at").fill.is_none())
+    assert(column_of(c, "t", "seq").state == ColumnFilling)
+    assert_eq(cat_columns(cat_info(c, "t")), "id,a,b")
+    assert(c.sequences[c.sequence_at(cat_q("t_seq_seq")).unwrap()].owner_column == 5)
+
+@test
+an_added_column_is_new_non_null_only_with_a_default()
+    assert_eq(cat_code(cat_base(), cat_alter("t", [AddColumn(cat_col("n", Int64))])), "Q3005")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [AddColumn(cat_col("b", nullable(Text)))])), "Q6002")
+    assert_eq(cat_code(cat_base(), cat_alter("missing", [AddColumn(cat_col("n", nullable(Int64)))])), "Q2001")
+
+@test
+a_statement_that_changes_only_constraints_keeps_the_schema_version()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), false), RenameConstraint("t_b", "t_b_key")]))
+    assert_eq(version_of(c, "t"), 1)
+    assert(c.indexes[c.index_at(cat_q("t_b_key")).unwrap()].state == IndexBuilding)
+
+@test
+the_sixty_five_thousand_five_hundred_thirty_sixth_version_is_refused()
+    var c = cat_base()
+    c.tables[c.table_at(cat_q("t")).unwrap()].versions.push(SchemaVersion(65535, cat_table_of(c, "t").columns.copy()))
+    assert_eq(cat_code(c, cat_alter("t", [AddColumn(cat_col("n", nullable(Int64)))])), "Q6012")
+    assert_eq(cat_code(c, cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), false)])), "ok")
+
+// -- drop_column -------------------------------------------------------------------------------------
+
+@test
+a_dropped_column_leaves_the_current_version_only()
+    val c = cat_ok(cat_base(), cat_alter("t", [DropColumn("b", false)]))
+    assert_eq(cat_columns(cat_info(c, "t")), "id,a")
+    assert_eq(version_of(c, "t"), 2)
+    assert_eq(cat_code(cat_base(), cat_alter("t", [DropColumn("id", true)])), "Q6007")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [DropColumn("nope", false)])), "Q2003")
+
+@test
+a_column_that_an_index_check_or_view_uses_drops_only_with_cascade()
+    val c = with_dependents()
+    assert_eq(cat_code(c, cat_alter("t", [DropColumn("a", false)])), "Q6007")
+
+    val d = cat_ok(c, cat_alter("t", [DropColumn("a", true)]))
+    assert(d.index_at(cat_q("t_a")).is_none())
+    assert(constraint_named(d, "a_pos").is_none())
+    assert(d.view_at(cat_q("va")).is_none())
+    assert_eq(cat_columns(cat_info(d, "t")), "id,b")
+
+    // Each dependent alone is enough to refuse it.
+    val only_index = cat_ok(cat_base(), cat_index("t_a", "t", ["a"]))
+    assert_eq(cat_code(only_index, cat_alter("t", [DropColumn("a", false)])), "Q6007")
+    val only_check = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_check("a_pos", call("gt", [cat_row("a"), Literal(Int32, Int(0))])), false)]))
+    assert_eq(cat_code(only_check, cat_alter("t", [DropColumn("a", false)])), "Q6007")
+    val only_view = cat_ok(cat_base(), cat_view("va", cat_pick("t", "x", "r", ["a"])))
+    assert_eq(cat_code(only_view, cat_alter("t", [DropColumn("a", false)])), "Q6007")
+    val whole_row = cat_ok(cat_base(), cat_view("vr", Project(scan("app", "t", "x"), "r", items_of([item("all", Row("x"))]))))
+    assert_eq(cat_code(whole_row, cat_alter("t", [DropColumn("b", false)])), "Q6007")
+
+    // A view of another table that happens to name a column `a` is not a dependent.
+    var other = cat_ok(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("a", Int32)], ["id"]))
+    other = cat_ok(other, cat_view("ua", cat_pick("u", "x", "r", ["a"])))
+    assert_eq(cat_code(other, cat_alter("t", [DropColumn("a", false)])), "ok")
+
+@test
+a_column_a_generated_column_reads_never_drops_even_with_cascade()
+    val g = ColumnDef("g", nullable(Int32), None, Some(call("add", [cat_row("a"), Literal(Int32, Int(1))])), NoIdentity, None)
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(g)]))
+    assert_eq(cat_code(c, cat_alter("t", [DropColumn("a", true)])), "Q6007")
+    assert_eq(cat_code(c, cat_alter("t", [DropColumn("g", false)])), "ok")
+
+@test
+a_column_a_foreign_key_references_drops_with_the_key_and_its_foreign_keys()
+    var c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), true)]))
+    c = cat_ok(c, cat_table("child", [cat_col("id", Int64), cat_col("tb", Text)], ["id"], [cat_fk("child_tb", ["tb"], "t", ["b"])]))
+    assert_eq(cat_code(c, cat_alter("t", [DropColumn("b", false)])), "Q6007")
+
+    val d = cat_ok(c, cat_alter("t", [DropColumn("b", true)]))
+    assert(constraint_named(d, "t_b").is_none() && constraint_named(d, "child_tb").is_none())
+    assert(d.index_at(cat_q("t_b")).is_none())
+    assert_eq(cat_columns(cat_info(d, "child")), "id,tb")
+
+    // The referencing column goes with its foreign key.
+    val e = cat_ok(c, cat_alter("child", [DropColumn("tb", true)]))
+    assert(constraint_named(e, "child_tb").is_none() && constraint_named(e, "t_b").is_some())
+    assert_eq(cat_code(c, cat_alter("child", [DropColumn("tb", false)])), "Q6007")
+
+@test
+an_identity_column_takes_its_sequence_when_it_drops()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(ColumnDef("n", Int64, None, None, ByDefault, None))]))
+    assert(c.sequence_at(cat_q("t_n_seq")).is_some())
+    val d = cat_ok(c, cat_alter("t", [DropColumn("n", false)]))
+    assert(d.sequence_at(cat_q("t_n_seq")).is_none())
+    assert_eq(cat_code(c, DropSequence(cat_q("t_n_seq"), false)), "Q6007")
+
+// -- rename_column -----------------------------------------------------------------------------------
+
+@test
+a_renamed_column_is_renamed_in_every_definition_and_view_that_reads_it()
+    val c = cat_ok(with_dependents(), cat_alter("t", [RenameColumn("a", "alpha")]))
+    assert_eq(cat_columns(cat_info(c, "t")), "id,alpha,b")
+    assert_eq(version_of(c, "t"), 2)
+
+    constraint_named(c, "a_pos").unwrap().kind match
+        ConCheck(e) -> assert(e == call("gt", [cat_row("alpha"), Literal(Int32, Int(0))]))
+        _ -> assert(false)
+
+    // The index names the column by id and is untouched; the view reads the new name and keeps its own.
+    assert(c.indexes[c.index_at(cat_q("t_a")).unwrap()].keys[0].key == KeyOn(2))
+    val v = c.views[c.view_at(cat_q("va")).unwrap()]
+    assert(v.query == Project(scan("app", "t", "x"), "r", items_of([item("id", col("x", "id")), item("a", col("x", "alpha"))])))
+    assert_eq(cat_columns(cat_info(c, "va")), "id,a")
+
+    assert_eq(cat_code(with_dependents(), cat_alter("t", [RenameColumn("a", "b")])), "Q6002")
+    assert_eq(cat_code(with_dependents(), cat_alter("t", [RenameColumn("nope", "x")])), "Q2003")
+
+@test
+a_rename_that_would_change_a_views_own_columns_is_refused()
+    val c = cat_ok(cat_base(), cat_view("whole", scan("app", "t", "x")))
+    assert_eq(cat_code(c, cat_alter("t", [RenameColumn("a", "alpha")])), "Q6007")
+
+@test
+a_renamed_table_is_renamed_in_the_views_that_scan_it()
+    val c = cat_ok(with_dependents(), cat_alter("t", [RenameTable("t2")]))
+    assert(c.table_at(cat_q("t")).is_none())
+    assert_eq(cat_columns(cat_info(c, "t2")), "id,a,b")
+    assert(rel_refs(c.views[c.view_at(cat_q("va")).unwrap()].query).scans[0].table == cat_q("t2"))
+    assert_eq(version_of(c, "t2"), 1)
+    assert_eq(cat_code(with_dependents(), cat_alter("t", [RenameTable("va")])), "Q6002")
+
+// -- retype_column -----------------------------------------------------------------------------------
+
+@test
+a_lossless_retype_is_metadata_only_and_another_converts()
+    val c = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Int64), None)]))
+    assert(column_of(c, "t", "a").ty == nullable(Int64) && column_of(c, "t", "a").state == ColumnReady)
+    assert_eq(version_of(c, "t"), 2)
+
+    val d = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]))
+    val a = column_of(d, "t", "a")
+    assert(a.state == ColumnConverting && a.ty == nullable(Int32) && a.target == Some(nullable(Int16)))
+    assert(a.using == Some(Cast(cat_row("a"), nullable(Int16), Strict)))
+    assert_eq(cat_columns(cat_info(d, "t")), "id,b")
+
+    val using = call("length", [cat_row("b")])
+    val e = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("b", Int64, Some(using))]))
+    assert(column_of(e, "t", "b").state == ColumnConverting)
+
+@test
+a_retype_with_no_conversion_or_under_a_view_is_refused()
+    assert_eq(cat_code(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Date), None)])), "Q6008")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [RetypeColumn("a", Int64, None)])), "Q6008")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [RetypeColumn("b", Int64, Some(cat_text("x")))])), "Q3001")
+    assert_eq(cat_code(with_dependents(), cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "Q6007")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [RetypeColumn("id", nullable(Int64), None)])), "Q6005")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [RetypeColumn("id", Json, Some(Literal(Json, Text("1"))))])), "Q6005")
+
+    // A view that reads the column only in a filter still holds it.
+    val filtered = Project(Filter(scan("app", "t", "x"), call("gt", [col("x", "a"), Literal(Int32, Int(0))])), "r", items_of([item("id", col("x", "id"))]))
+    val c = cat_ok(cat_base(), cat_view("vf", filtered))
+    assert_eq(cat_code(c, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "Q6007")
+
+@test
+lossless_conversions_are_exactly_those_of_section_five_point_three()
+    assert(is_lossless(Int16, Int32) && !is_lossless(Int32, Int16) && !is_lossless(Int32, UInt64))
+    assert(is_lossless(UInt16, Int32) && !is_lossless(UInt32, Int32) && is_lossless(UInt8, UInt16))
+    assert(is_lossless(Int32, Decimal(10, 0)) && !is_lossless(Int32, Decimal(9, 0)) && is_lossless(UInt64, Decimal(20, 0)))
+    assert(is_lossless(Decimal(5, 2), Decimal(7, 3)) && !is_lossless(Decimal(5, 2), Decimal(5, 3)))
+    assert(is_lossless(Float32, Float64) && is_lossless(Int16, Float32) && !is_lossless(Int32, Float32) && is_lossless(Int32, Float64))
+    assert(!is_lossless(Int64, Float64) && is_lossless(Json, Text) && !is_lossless(Text, Json))
+    assert(is_lossless(Int32, nullable(Int32)) && !is_lossless(nullable(Int32), Int32))
+    assert(is_lossless(list(Int16), bag(Int32)) && !is_lossless(bag(Int16), list(Int16)))
+    assert(is_lossless(record([Field("x", Int16)]), record([Field("y", Int32), Field("z", nullable(Text))])))
+    assert(!is_lossless(record([Field("x", Int16)]), record([Field("x", Int16), Field("z", Text)])))
+    assert(is_lossless(union_of([Field("a", record([]))]), union_of([Field("b", record([])), Field("c", record([]))])))
+    assert(!is_lossless(union_of([Field("a", record([])), Field("b", record([]))]), union_of([Field("a", record([]))])))
+
+// -- defaults and nullability ------------------------------------------------------------------------
+
+@test
+a_default_is_set_and_dropped_on_an_ordinary_column_only()
+    val c = cat_ok(cat_base(), cat_alter("t", [SetColumnDefault("b", Some(cat_text("none")))]))
+    assert(column_of(c, "t", "b").default == Some(cat_text("none")))
+    assert_eq(version_of(c, "t"), 2)
+    val d = cat_ok(c, cat_alter("t", [SetColumnDefault("b", None)]))
+    assert(column_of(d, "t", "b").default.is_none())
+
+    assert_eq(cat_code(cat_base(), cat_alter("t", [SetColumnDefault("b", Some(cat_int(1)))])), "Q3001")
+    val g = cat_ok(cat_base(), cat_alter("t", [AddColumn(ColumnDef("g", Int64, None, Some(cat_row("id")), NoIdentity, None))]))
+    assert_eq(cat_code(g, cat_alter("t", [SetColumnDefault("g", Some(cat_int(1)))])), "Q6006")
+
+@test
+not_null_is_dropped_at_once_and_set_through_a_check()
+    val c = cat_ok(cat_base(), cat_alter("t", [SetNullable("b", true)]))
+    assert(column_of(c, "t", "b").ty == nullable(Text))
+    assert_eq(version_of(c, "t"), 2)
+    assert_eq(cat_code(cat_base(), cat_alter("t", [SetNullable("id", true)])), "Q6005")
+
+    val d = cat_ok(cat_base(), cat_alter("t", [SetNullable("a", false)]))
+    val k = constraint_named(d, "a_not_null").unwrap()
+    assert(!k.validated && k.job)
+    assert(column_of(d, "t", "a").ty == nullable(Int32))
+    assert_eq(version_of(d, "t"), 1)
+
+    // Dropping not null under a view that outputs the column would change the view.
+    assert_eq(cat_code(with_dependents(), cat_alter("t", [SetNullable("b", true)])), "ok")
+    val v = cat_ok(cat_base(), cat_view("vb", cat_pick("t", "x", "r", ["b"])))
+    assert_eq(cat_code(v, cat_alter("t", [SetNullable("b", true)])), "Q6007")
+
+// -- constraints ---------------------------------------------------------------------------------------
+
+@test
+an_added_constraint_is_not_validated_and_validation_is_a_job()
+    val check = cat_check("b_long", call("gt", [call("length", [cat_row("b")]), cat_int(3)]))
+    val c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(check, false)]))
+    val k = constraint_named(c, "b_long").unwrap()
+    assert(!k.validated && k.job)
+
+    val d = cat_ok(cat_base(), cat_alter("t", [AddConstraint(check, true)]))
+    assert(!constraint_named(d, "b_long").unwrap().job)
+    val e = cat_ok(d, cat_alter("t", [ValidateConstraint("b_long")]))
+    assert(constraint_named(e, "b_long").unwrap().job)
+    assert_eq(cat_code(d, cat_alter("t", [ValidateConstraint("nope")])), "Q6003")
+
+@test
+a_constraint_is_dropped_unless_it_is_the_primary_key_or_referenced()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), true)]))
+    val d = cat_ok(c, cat_alter("t", [DropConstraint("t_b", false)]))
+    assert(constraint_named(d, "t_b").is_none() && d.index_at(cat_q("t_b")).is_none())
+
+    assert_eq(cat_code(c, cat_alter("t", [DropConstraint("t_pkey", false)])), "Q6009")
+    assert_eq(cat_code(c, cat_alter("t", [DropConstraint("nope", false)])), "Q6003")
+    assert_eq(cat_code(c, cat_alter("t", [DropConstraint("nope", true)])), "ok")
+
+    val f = cat_ok(c, cat_table("child", [cat_col("id", Int64), cat_col("tb", Text)], ["id"], [cat_fk("child_tb", ["tb"], "t", ["b"])]))
+    assert_eq(cat_code(f, cat_alter("t", [DropConstraint("t_b", false)])), "Q6007")
+    assert_eq(cat_code(f, cat_alter("child", [DropConstraint("child_tb", false)])), "ok")
+
+@test
+a_renamed_constraint_renames_its_index_and_needs_a_free_name()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), true), RenameConstraint("t_b", "t_b2")]))
+    assert(c.index_at(cat_q("t_b2")).is_some() && c.index_at(cat_q("t_b")).is_none())
+    assert_eq(cat_code(c, cat_alter("t", [RenameConstraint("t_b2", "t")])), "Q6002")
+    assert_eq(cat_code(c, cat_alter("t", [RenameConstraint("nope", "x")])), "Q6003")
+
+@test
+a_new_primary_key_is_non_null_and_unreferenced()
+    val c = cat_ok(cat_base(), cat_alter("t", [SetPrimaryKey(items_of(["b", "id"]))]))
+    assert_eq(cat_info(c, "t").unique[0].columns.len(), 2)
+    assert_eq(cat_code(cat_base(), cat_alter("t", [SetPrimaryKey(items_of(["a"]))])), "Q6005")
+    assert_eq(cat_code(cat_base(), cat_alter("t", [SetPrimaryKey(items_of(["nope"]))])), "Q2003")
+
+    val f = cat_ok(cat_base(), cat_table("child", [cat_col("id", Int64), cat_col("tid", Int64)], ["id"], [cat_fk("child_t", ["tid"], "t", ["id"])]))
+    assert_eq(cat_code(f, cat_alter("t", [SetPrimaryKey(items_of(["b"]))])), "Q6007")
+
+@test
+a_new_owner_is_a_role_and_takes_the_identity_sequences_too()
+    var c = cat_ok(cat_base(), cat_role("alice"))
+    c = cat_ok(c, cat_alter("t", [AddColumn(ColumnDef("n", Int64, None, None, ByDefault, None)), SetOwner("alice")]))
+    val alice = c.roles[c.role_at("alice").unwrap()].oid
+    assert(cat_table_of(c, "t").owner == alice)
+    assert(c.sequences[c.sequence_at(cat_q("t_n_seq")).unwrap()].owner == alice)
+    assert_eq(cat_code(c, cat_alter("t", [SetOwner("nobody")])), "Q6003")
+    assert_eq(cat_code(c, cat_alter("t", [Rewrite])), "ok")
+
+// -- AlterType ---------------------------------------------------------------------------------------
+
+private with_status() -> MemCatalog
+    var c = cat_ok(cat_base(), CreateType(cat_q("status"), union_of([Field("active", record([])), Field("banned", record([]))]), false))
+    c = cat_ok(c, CreateType(cat_q("point"), record([Field("x", Int32), Field("y", Int32)]), false))
+    cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("s", Named("app", "status")), cat_col("p", nullable(Named("app", "point")))], ["id"]))
+
+@test
+appending_to_a_named_type_gives_each_table_using_it_a_new_version()
+    val c = cat_ok(with_status(), AlterType(cat_q("status"), AppendVariants(items_of([Field("gone", record([]))]))))
+    assert(c.named_type(cat_q("status")) == Some(union_of([Field("active", record([])), Field("banned", record([])), Field("gone", record([]))])))
+    assert_eq(version_of(c, "u"), 2)
+    assert_eq(version_of(c, "t"), 1)
+    assert(cat_info(c, "u").columns[1].ty == Named("app", "status"))
+
+    val fill = FieldFill("z", Int32, Some(Literal(Int32, Int(0))))
+    val d = cat_ok(with_status(), AlterType(cat_q("point"), AppendFields(items_of([fill, FieldFill("w", nullable(Text), None)]))))
+    assert(d.named_type(cat_q("point")) == Some(record([Field("x", Int32), Field("y", Int32), Field("z", Int32), Field("w", nullable(Text))])))
+
+    // An enum that gains a variant stays a key component.
+    val e = cat_ok(with_status(), cat_index("u_s", "u", ["s"]))
+    assert_eq(cat_code(e, AlterType(cat_q("status"), AppendVariants(items_of([Field("gone", record([]))])))), "ok")
+
+@test
+only_the_lossless_changes_apply_to_a_named_type()
+    val c = with_status()
+    assert_eq(cat_code(c, AlterType(cat_q("status"), AppendFields(items_of([FieldFill("z", nullable(Int32), None)])))), "Q6018")
+    assert_eq(cat_code(c, AlterType(cat_q("point"), AppendVariants(items_of([Field("z", record([]))])))), "Q6018")
+    assert_eq(cat_code(c, AlterType(cat_q("status"), AppendVariants(items_of([Field("active", record([]))])))), "Q6002")
+    assert_eq(cat_code(c, AlterType(cat_q("status"), AppendVariants(items_of([Field("odd", Int32)])))), "Q3014")
+    assert_eq(cat_code(c, AlterType(cat_q("point"), AppendFields(items_of([FieldFill("z", Int32, Some(cat_text("0")))])))), "Q3001")
+    assert_eq(cat_code(c, AlterType(cat_q("nope"), RenameType("x"))), "Q6004")
+
+    // An enum index over a type that gains a payload variant no longer is one.
+    val e = cat_ok(c, cat_index("u_s", "u", ["s"]))
+    assert_eq(cat_code(e, AlterType(cat_q("status"), AppendVariants(items_of([Field("why", record([Field("r", Text)]))])))), "Q6007")
+
+@test
+a_type_change_that_would_make_a_type_refer_to_itself_is_refused()
+    var c = cat_ok(cat_base(), CreateType(cat_q("a"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, CreateType(cat_q("b"), record([Field("a", nullable(Named("app", "a")))]), false))
+    assert_eq(cat_code(c, AlterType(cat_q("a"), AppendFields(items_of([FieldFill("b", nullable(Named("app", "b")), None)])))), "Q6005")
+    assert_eq(cat_code(c, AlterType(cat_q("a"), AppendFields(items_of([FieldFill("a", nullable(Named("app", "a")), None)])))), "Q6005")
+
+@test
+a_renamed_type_is_renamed_in_every_column_type_and_definition()
+    var c = cat_ok(with_status(), CreateType(cat_q("holder"), record([Field("s", Named("app", "status"))]), false))
+    val dflt: Expr = Variant(Named("app", "status"), "active", Record(buf[Item]()))
+    c = cat_ok(c, cat_alter("u", [SetColumnDefault("s", Some(dflt))]))
+    c = cat_ok(c, AlterType(cat_q("status"), RenameType("state")))
+    assert(c.type_at(cat_q("status")).is_none())
+    assert(cat_info(c, "u").columns[1].ty == Named("app", "state"))
+    assert(column_of(c, "u", "s").default == Some(Variant(Named("app", "state"), "active", Record(buf[Item]()))))
+    assert(c.named_type(cat_q("holder")) == Some(record([Field("s", Named("app", "state"))])))
+    assert_eq(cat_code(c, AlterType(cat_q("state"), RenameType("u"))), "Q6002")
+
+@test
+a_renamed_member_applies_unless_a_definition_reads_the_old_name()
+    val c = cat_ok(with_status(), AlterType(cat_q("point"), RenameMember("x", "east")))
+    assert(c.named_type(cat_q("point")) == Some(record([Field("east", Int32), Field("y", Int32)])))
+    assert_eq(version_of(c, "u"), 2)
+    assert_eq(cat_code(c, AlterType(cat_q("point"), RenameMember("x", "z"))), "Q6003")
+    assert_eq(cat_code(c, AlterType(cat_q("point"), RenameMember("east", "y"))), "Q6002")
+
+    val check = cat_check("p_east", call("gt", [Field(cat_row("p"), "x"), Literal(Int32, Int(0))]))
+    val d = cat_ok(with_status(), cat_alter("u", [AddConstraint(check, false)]))
+    assert_eq(cat_code(d, AlterType(cat_q("point"), RenameMember("x", "east"))), "Q6007")
