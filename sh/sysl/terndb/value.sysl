@@ -1,0 +1,49 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+/** A value of some query-tree type, held as an ordinary tree: what the encoder takes and what a
+ * decoded batch materializes as.
+ *
+ * **The type gives a value its meaning**, so a variant stands for every type encoded the same way:
+ * `Int` is every signed integer type, a `decimal`'s unscaled value, a `date`'s days and the
+ * microseconds of `time`, `datetime` and `timestamp`; `UInt` is every unsigned integer type; `Float`
+ * is both float widths; `Text` is `text` and `json`. `Uuid` holds the 128 bits with RFC 9562's first
+ * octet highest. A union value is its variant's ordinal and its payload record.
+ */
+enum Value derives Eq
+    Null
+    Bool(b: bool)
+    Int(n: i128)
+    UInt(n: u64)
+    Float(x: real)
+    Text(s: string)
+    Bytes(octets: Buf[u8])
+    Interval(months: i32, days: i32, micros: i64)
+    Uuid(bits: u128)
+    Record(fields: Buf[Value])
+    Variant(tag: usize, payload: &Value)
+    Relation(elems: Buf[Value])
+
+    is_null(self) -> bool = self match
+        Null -> true
+        _ -> false
+end Value
+
+rec(fields: []const Value) -> Value
+    val b = buf[Value]()
+    b.extend(fields)
+    Record(b)
+
+rel(elems: []const Value) -> Value
+    val b = buf[Value]()
+    b.extend(elems)
+    Relation(b)
+
+/** The union value of variant `tag` carrying `payload`, which is a record. */
+variant(tag: usize, payload: Value) -> Value = Variant(tag, payload)
+
+bytes_value(octets: []const u8) -> Value
+    val b = buf[u8]()
+    b.extend(octets)
+    Bytes(b)

@@ -64,8 +64,8 @@ during the handshake.
 | `Q3012` | `cast_not_permitted` | Cast not permitted. |
 | `Q3013` | `misplaced_aggregate` | Aggregate or window function outside `Aggregate`/`Window`. |
 | `Q3014` | `invalid_member_type` | Union payload not a record, or relation element not a record, union or scalar. |
-| `Q3015` | `duplicate_member_name` | Duplicate field or tag name in a type. |
-| `Q3016` | `union_too_wide` | A union with more than 65,536 variants (`query-tree.md` §2.4). |
+| `Q3015` | `duplicate_member_name` | Duplicate or empty field or tag name in a type (`query-tree.md` §2.3, §2.4). |
+| `Q3016` | `union_too_wide` | A union with no variants or more than 65,536 (`query-tree.md` §2.4: `1 ≤ k ≤ 65,536`). |
 | `Q3017` | `invalid_literal` | A `Literal` whose type is not a non-null scalar (`query-tree.md` §7.3). |
 | `Q4001` | `param_index_out_of_range` | Parameter index out of range. |
 | `Q4002` | `param_unused` | Declared parameter never referenced. |
@@ -152,7 +152,7 @@ Raised under the rules of `wire-protocol.md`. Section references below are to th
 | `W1005` | `no_common_wire_version` | No common wire protocol major version | yes | |
 | `W1006` | `bad_request_id` | Request id zero, or not greater than every earlier one | yes | |
 | `W1007` | `fragmentation_error` | Empty `MORE` frame, type change within a message | yes | |
-| `W1008` | `bad_batch` | (client-side) The server sent a batch inconsistent with §6 | yes | |
+| `W1008` | `bad_batch` | (client-side) The server sent a batch or a result type inconsistent with §6, including a truncated or non-canonical batch | yes | |
 | `W2001` | `unknown_transaction` | Unknown transaction handle | | |
 | `W2002` | `transaction_already_open` | Transaction handle already open | | |
 | `W2003` | `transaction_aborted` | Transaction is aborted; only `Rollback`, `RollbackToSavepoint`, `Commit` accepted | | |

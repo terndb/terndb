@@ -1,0 +1,84 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+/** What a column node is, by `Col(T)` of `wire-protocol.md` §6.2. */
+enum NodeKind derives Eq
+    Fixed(width: usize)
+    VarBin
+    Fields
+    Tagged(width: usize)
+    Nested
+
+    /** How many buffers the kind has after validity, in §6.2's table. */
+    own_buffers(self) -> usize = self match
+        Fixed(_) | Nested -> 1
+        VarBin | Tagged(_) -> 2
+        Fields -> 0
+
+/** One node of a column tree. `ty` is the node's type with nullability taken off; `first_buffer`
+ * is the number of its first buffer (its validity, where it is nullable); `children` are node
+ * numbers, in order.
+ */
+struct ColumnNode
+    kind: NodeKind
+    ty: Type
+    nullable: bool
+    first_buffer: usize
+    children: Buf[usize]
+
+    buffer_count(self) -> usize = self.kind.own_buffers() + (if self.nullable then 1 else 0)
+
+    /** The buffer number of the node's first buffer after validity. */
+    main_buffer(self) -> usize = self.first_buffer + (if self.nullable then 1 else 0)
+
+/** The column tree of a result: `Col(E)` for its element type `E`, numbered in pre-order, with its
+ * buffers numbered in the same walk (§6.2 rule 4).
+ */
+struct ColumnTree
+    result_type: Type
+    nodes: Buf[ColumnNode]
+    buffers: usize
+
+/** The column tree of `result_type`, which must be a `bag` or a `list`. */
+column_tree(result_type: Type) -> Result[ColumnTree, CodecError]
+    val elem = result_type match
+        Bag(e) | List(e) -> *e
+        _ -> return fail("Q3001", "a result type must be a bag or a list")
+
+    val nodes = buf[ColumnNode]()
+    var next_buffer: usize = 0
+
+    add_node(nodes, elem, &next_buffer)
+    Ok(ColumnTree(result_type, nodes, next_buffer))
+
+private add_node(nodes: Buf[ColumnNode], t: Type, next_buffer: *usize) -> usize
+    val base = t.base()
+    val kids = buf[Type]()
+
+    val kind = base match
+        Text | Bytes | Json -> VarBin
+        Record(fields) ->
+            for f in fields
+                kids.push(f.ty)
+            Fields
+        Union(variants) ->
+            for v in variants
+                kids.push(v.ty)
+            Tagged(if variants.len() <= 256 then 1 else 2)
+        Bag(e) | List(e) ->
+            kids.push(*e)
+            Nested
+        _ -> Fixed(base.width())
+
+    val at = nodes.len()
+    val node = ColumnNode(kind, base, t.is_nullable(), *next_buffer, buf())
+
+    nodes.push(node)
+    *next_buffer += node.buffer_count()
+
+    for k in kids
+        node.children.push(add_node(nodes, k, next_buffer))
+
+    at
+end add_node

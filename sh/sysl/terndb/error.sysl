@@ -1,0 +1,19 @@
+module sh.sysl.terndb
+
+/** A refusal: the `errors.md` code a caller matches on, and a sentence a person reads.
+ *
+ * The code is the contract (`errors.md` §1 rule 3); the message is for the log and may change.
+ */
+struct CodecError derives Eq
+    code: string
+    message: string
+
+private[terndb] fail[T](code: string, message: string) -> Result[T, CodecError] =
+    Err(CodecError(code, message))
+
+/** The same refusal reported under `W1008`, which is what every inconsistency in a batch is
+ * (`wire-protocol.md` §6.4 rule 2), whatever primitive it was found in.
+ */
+private[terndb] as_bad_batch[T](r: Result[T, CodecError]) -> Result[T, CodecError] = r match
+    Ok(v) -> Ok(v)
+    Err(e) -> fail("W1008", e.message)

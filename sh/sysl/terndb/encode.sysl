@@ -1,0 +1,239 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{push_u32_le, push_u64_le}
+
+/** One node's buffers while a batch is being built. `main` is `values`, `offsets` or
+ * `discriminants` and `aux` is `data` or a union's `offsets`, in the order of §6.2's table.
+ */
+private struct Lane
+    n: usize
+    nulls: usize
+    validity: Buf[u8]
+    main: Buf[u8]
+    aux: Buf[u8]
+
+/** The `Batch` payload (`wire-protocol.md` §6.4) holding `rows`, the top-level elements of a result
+ * of type `result_type`, for parameter tuple `tuple`.
+ *
+ * Every value is checked against the type, and one that does not fit it is `Q3001`. A batch holds at
+ * least one row (§6.4 rule 1), so an empty `rows` is refused with `W1008`, and a batch that would
+ * pass one of §6.3 rule 8's limits with `W2014`.
+ */
+encode_batch(result_type: Type, rows: []const Value, tuple: u64) -> Result[Buf[u8], CodecError]
+    if rows.len == 0 then return fail("W1008", "a batch holds at least one row")
+
+    val tree = column_tree(result_type)?
+    val lanes = buf[&Lane]()
+
+    for node in tree.nodes
+        val lane: &Lane = Lane(0, 0, buf(), buf(), buf())
+
+        // An offsets buffer starts with `offsets[0] = 0`, so it is one entry long before any slot.
+        if node.kind == VarBin || node.kind == Nested then push_u32_le(lane.main, 0)
+
+        lanes.push(lane)
+
+    val e = Encoder(tree, lanes)
+
+    for row in rows
+        e.put(0, row)?
+
+    e.finish(tuple)
+
+private struct Encoder
+    tree: ColumnTree
+    lanes: Buf[&Lane]
+
+    // A slot counted at node `k`, valid or null.
+    mark(self, k: usize, valid: bool)
+        val lane = self.lanes[k]
+
+        if lane.n % 8 == 0 then lane.validity.push(0)
+        if valid then
+            val last = lane.validity.len() - 1
+            lane.validity[last] = lane.validity[last] | u8(1) << (lane.n % 8)
+        else
+            lane.nulls += 1
+
+        lane.n += 1
+
+    put(self, k: usize, v: Value) -> Result[unit, CodecError]
+        val node = self.tree.nodes[k]
+        val lane = self.lanes[k]
+
+        if v.is_null()
+            if !node.nullable then return mismatch(k, "null in a column that is not nullable")
+            self.blank(k, true)
+            return Ok(())
+
+        self.mark(k, true)
+
+        node.kind match
+            Fixed(w) -> push_scalar(lane.main, node.ty, v, w, k)?
+            VarBin ->
+                lane.aux.extend(octets_of(node.ty, v, k)?)
+                push_u32_le(lane.main, u32.wrap(lane.aux.len()))
+            Fields ->
+                val fields = v match
+                    Record(fs) -> fs
+                    _ -> return mismatch(k, "a record was expected")
+
+                if fields.len() != node.children.len() then
+                    return mismatch(k, "the record has the wrong number of fields")
+
+                for j in 0..<fields.len()
+                    self.put(node.children[j], fields[j])?
+            Tagged(w) ->
+                val (tag, payload) = v match
+                    Variant(t, p) -> (t, *p)
+                    _ -> return mismatch(k, "a union value was expected")
+
+                if tag >= node.children.len() then return mismatch(k, "the variant ordinal is out of range")
+
+                val child = node.children[tag]
+                push_le(lane.main, u128(tag), w)
+                push_u32_le(lane.aux, u32.wrap(self.lanes[child].n))
+                self.put(child, payload)?
+            Nested ->
+                val elems = v match
+                    Relation(es) -> es
+                    _ -> return mismatch(k, "a relation was expected")
+
+                val child = node.children[0]
+
+                for x in elems
+                    self.put(child, x)?
+
+                push_u32_le(lane.main, u32.wrap(self.lanes[child].n))
+
+        Ok(())
+    end put
+
+    // A slot holding its placeholder (§6.5): `void` where the slot is itself null, or a slot of a
+    // node that is not nullable lying under a null ancestor.
+    blank(self, k: usize, void: bool)
+        val node = self.tree.nodes[k]
+        val lane = self.lanes[k]
+
+        self.mark(k, !void)
+
+        node.kind match
+            Fixed(w) -> push_le(lane.main, 0, w)
+            VarBin -> push_u32_le(lane.main, u32.wrap(lane.aux.len()))
+            Fields ->
+                for c in node.children
+                    self.under_null(c)
+            Tagged(w) ->
+                val first = node.children[0]
+                push_le(lane.main, 0, w)
+                push_u32_le(lane.aux, u32.wrap(self.lanes[first].n))
+                if !void then self.under_null(first)
+            Nested -> push_u32_le(lane.main, u32.wrap(self.lanes[node.children[0]].n))
+    end blank
+
+    under_null(self, k: usize) = self.blank(k, self.tree.nodes[k].nullable)
+
+    finish(self, tuple: u64) -> Result[Buf[u8], CodecError]
+        val bufs = buf[Buf[u8]]()
+        val empty = buf[u8]()
+
+        for k in 0..<self.tree.nodes.len()
+            val node = self.tree.nodes[k]
+            val lane = self.lanes[k]
+
+            if node.nullable then bufs.push(if lane.nulls == 0 then empty else lane.validity)
+            if lane.n >= Limit then return fail("W2014", "a column holds too many slots")
+
+            node.kind match
+                Fixed(_) | Nested -> bufs.push(lane.main)
+                VarBin | Tagged(_) ->
+                    bufs.push(lane.main)
+                    bufs.push(lane.aux)
+                Fields -> ()
+
+        val out = buf[u8]()
+
+        push_uvar(out, tuple)
+        push_uvar(out, u64(self.lanes.len()))
+
+        for lane in self.lanes
+            push_uvar(out, u64(lane.n))
+            push_uvar(out, u64(lane.nulls))
+
+        push_uvar(out, u64(bufs.len()))
+
+        for b in bufs
+            if b.len() >= Limit then return fail("W2014", "a buffer is too long")
+            push_uvar(out, u64(b.len()))
+
+        pad_to_8(out)
+
+        for b in bufs
+            out.extend(b.view())
+            pad_to_8(out)
+
+        Ok(out)
+    end finish
+end Encoder
+
+/** Every slot count, offset and buffer length is below 2³¹ (`wire-protocol.md` §6.3 rule 8). */
+private[terndb] const Limit: usize = 1 << 31
+
+private mismatch[T](k: usize, what: string) -> Result[T, CodecError] =
+    fail("Q3001", s"column node $k: $what")
+
+/** The low `w` octets of `v`, little-endian. */
+private[terndb] push_le(out: Buf[u8], v: u128, w: usize)
+    for i in 0..<w
+        out.push(u8.wrap(v >> (8 * i)))
+
+private fits_signed(n: i128, w: usize) -> bool
+    if w >= 16 then return true
+
+    val half = i128(1) << (8 * w - 1)
+    n >= -half && n < half
+
+private push_scalar(out: Buf[u8], ty: Type, v: Value, w: usize, k: usize) -> Result[unit, CodecError]
+    ty match
+        Bool -> v match
+            Bool(b) -> out.push(if b then 1 else 0)
+            _ -> return mismatch(k, "a bool was expected")
+        UInt8 | UInt16 | UInt32 | UInt64 -> v match
+            UInt(n) ->
+                if w < 8 && n >= u64(1) << (8 * w) then return mismatch(k, "the value is out of range")
+                push_le(out, u128(n), w)
+            _ -> return mismatch(k, "an unsigned integer was expected")
+        Float32 -> v match
+            Float(x) -> push_u32_le(out, f32(x).bits())
+            _ -> return mismatch(k, "a float was expected")
+        Float64 -> v match
+            Float(x) -> push_u64_le(out, x.bits())
+            _ -> return mismatch(k, "a float was expected")
+        Interval -> v match
+            Interval(months, days, micros) ->
+                push_u32_le(out, u32.wrap(months))
+                push_u32_le(out, u32.wrap(days))
+                push_u64_le(out, u64.wrap(micros))
+            _ -> return mismatch(k, "an interval was expected")
+        Uuid -> v match
+            Uuid(bits) ->
+                for i in 0..<16
+                    out.push(u8.wrap(bits >> (8 * (15 - i))))
+            _ -> return mismatch(k, "a uuid was expected")
+        _ -> v match
+            Int(n) ->
+                if !fits_signed(n, w) then return mismatch(k, "the value is out of range")
+                push_le(out, u128.wrap(n), w)
+            _ -> return mismatch(k, "an integer was expected")
+
+    Ok(())
+end push_scalar
+
+private octets_of(ty: Type, v: Value, k: usize) -> Result[[]const u8, CodecError] = ty match
+    Bytes -> v match
+        Bytes(b) -> Ok(b.view())
+        _ -> mismatch(k, "bytes were expected")
+    _ -> v match
+        Text(s) -> Ok(s.bytes)
+        _ -> mismatch(k, "text was expected")

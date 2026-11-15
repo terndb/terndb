@@ -1,0 +1,63 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.encoding.{hex_decode, hex_string}
+
+// What every test file of the codec shares: bytes written as spaced hex, and comparisons that say
+// what differed.
+
+/** The octets a spaced, possibly multi-line hex text spells. */
+hex(spaced: string) -> Buf[u8]
+    val digits = buf[u8]()
+
+    for c in spaced.bytes
+        if c != u8(' ') && c != u8('\n') then digits.push(c)
+
+    var out = buf_filled(digits.len() / 2, u8(0))
+    hex_decode(digits.view(), out.view_mut()).unwrap()
+    out
+
+same_bytes(got: Buf[u8], want: Buf[u8], what: string, file: string = __FILE__, line: long = __LINE__)
+    if got != want
+        print("\n", what, "\nwanted:", hex_string(want.view()), "\ngot:   ", hex_string(got.view()), "\n")
+
+    assert(got == want, what, file, line)
+
+rows_of(rows: []const Value) -> Buf[Value]
+    val out = buf[Value]()
+    out.extend(rows)
+    out
+
+type_bytes(t: Type) -> Buf[u8]
+    val out = buf[u8]()
+    encode_type(t, out)
+    out
+
+/** `rows` encoded as a batch of `t`, which must succeed. */
+encoded(t: Type, rows: []const Value) -> Buf[u8] = encode_batch(t, rows, 0).unwrap()
+
+/** `payload` decoded as a batch of `t`. */
+decoded(t: Type, payload: []const u8) -> Result[Batch, CodecError] = decode_batch(column_tree(t).unwrap(), payload)
+
+/** The code `payload` is refused with as a batch of `t`, or "ok". */
+refusal(t: Type, payload: []const u8) -> string = decoded(t, payload) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** Encode, decode, and check that the rows come back as they went in and re-encode to the same bytes. */
+round_trip(t: Type, rows: []const Value, file: string = __FILE__, line: long = __LINE__) -> Buf[u8]
+    val bytes = encoded(t, rows)
+    val batch = decoded(t, bytes.view()).unwrap()
+    val back = batch.rows()
+
+    assert(back.view() == rows, "the rows decode as they were encoded", file, line)
+    same_bytes(encoded(t, back.view()), bytes, "the decoded rows re-encode to the same bytes", file, line)
+    bytes
+
+/** A copy of `b` with octet `at` replaced by `v`. */
+with_octet(b: Buf[u8], at: usize, v: u8) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(b.view())
+    out[at] = v
+    out

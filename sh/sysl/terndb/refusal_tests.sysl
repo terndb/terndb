@@ -1,0 +1,211 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Malformed batches and types, each refused with its `errors.md` code. The batch cases start from
+// the §6.6 and §6.7 payloads and break one thing; the offsets named are §6.6's own listing.
+
+private users() -> Buf[u8] = hex(users_batch_hex)
+
+private users_refusal(b: Buf[u8]) -> string = refusal(users_type(), b.view())
+
+private nulls_refusal(b: Buf[u8]) -> string = refusal(nullable_type(), b.view())
+
+/** `b` with `n` octets removed at `at`. */
+private without(b: Buf[u8], at: usize, n: usize) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(b.view()[0..<at])
+    out.extend(b.view()[at + n..])
+    out
+
+private type_refusal(spaced: string) -> string = decode_type(hex(spaced).view()) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+@test
+the_unbroken_payloads_are_accepted()
+    assert_eq(users_refusal(users()), "ok")
+    assert_eq(nulls_refusal(hex(nullable_batch_hex)), "ok")
+
+@test
+every_truncation_is_refused()
+    val whole = users()
+
+    for n in 0..<whole.len()
+        assert_eq(refusal(users_type(), whole.view()[0..<n]), "W1008")
+
+    val nulls = hex(nullable_batch_hex)
+
+    for n in 0..<nulls.len()
+        assert_eq(refusal(nullable_type(), nulls.view()[0..<n]), "W1008")
+
+@test
+trailing_octets_are_refused()
+    val longer = users()
+    longer.extend([0, 0, 0, 0, 0, 0, 0, 0])
+
+    assert_eq(users_refusal(longer), "W1008")
+
+@test
+an_offset_past_the_data_is_refused()
+    // b1, the name offsets 0, 3, 5 at 0x48: the last one past "annbo".
+    assert_eq(users_refusal(with_octet(users(), 0x50, 6)), "W1008")
+    // b8, the posts offsets 0, 2, 2 at 0x90: the last one past the two posts.
+    assert_eq(users_refusal(with_octet(users(), 0x98, 3)), "W1008")
+    // The first offset is not 0.
+    assert_eq(users_refusal(with_octet(users(), 0x48, 1)), "W1008")
+
+@test
+offsets_that_decrease_are_refused()
+    // Name offsets 0, 6, 5: they end at the data's length, but decrease.
+    assert_eq(users_refusal(with_octet(users(), 0x4C, 6)), "W1008")
+    // Comment offsets 0, 1, 1 at 0xC8 become 0, 2, 1.
+    assert_eq(users_refusal(with_octet(users(), 0xCC, 2)), "W1008")
+
+@test
+a_bad_discriminant_is_refused()
+    // b4 at 0x70: user 2's status, 01 (banned), made 02 of a two-variant union.
+    assert_eq(users_refusal(with_octet(users(), 0x71, 2)), "W1008")
+    // Both users `banned`: then node 6 would need two slots and has one.
+    assert_eq(users_refusal(with_octet(users(), 0x70, 1)), "W1008")
+
+@test
+a_union_offset_that_is_not_canonical_is_refused()
+    // b5 at 0x78: user 2's offset into `banned` made 1.
+    assert_eq(users_refusal(with_octet(users(), 0x7C, 1)), "W1008")
+
+@test
+a_misaligned_buffer_is_refused()
+    // The five padding octets after the byte lengths removed, so b0 starts at 0x33.
+    assert_eq(users_refusal(without(users(), 0x33, 5)), "W1008")
+    // b2's padding removed, so b3 starts at 0x5D.
+    assert_eq(users_refusal(without(users(), 0x5D, 3)), "W1008")
+
+@test
+padding_that_is_not_zero_is_refused()
+    assert_eq(users_refusal(with_octet(users(), 0x33, 1)), "W1008")
+    assert_eq(users_refusal(with_octet(users(), 0x54, 1)), "W1008")
+    assert_eq(users_refusal(with_octet(users(), 0xEF, 1)), "W1008")
+
+@test
+counts_that_disagree_with_the_tree_are_refused()
+    // column_count 15 for a 16-node tree.
+    assert_eq(users_refusal(with_octet(users(), 0x01, 0x0F)), "W1008")
+    // buffer_count 15.
+    assert_eq(users_refusal(with_octet(users(), 0x22, 0x0F)), "W1008")
+    // Node 1 (`id`) claims 3 slots under a 2-slot record.
+    assert_eq(users_refusal(with_octet(users(), 0x04, 3)), "W1008")
+    // A null_count on a node that is not nullable.
+    assert_eq(users_refusal(with_octet(users(), 0x05, 1)), "W1008")
+    // b0's byte length 15 for two int64 slots.
+    assert_eq(users_refusal(with_octet(users(), 0x23, 0x0F)), "W1008")
+
+@test
+a_non_minimal_uvar_is_refused()
+    // tuple 0 written as 80 00, with one padding octet fewer so every buffer stays where it was.
+    val bytes = buf[u8]()
+    bytes.extend([0x80])
+    bytes.extend(without(users(), 0x33, 1).view())
+
+    assert_eq(users_refusal(bytes), "W1008")
+
+@test
+invalid_text_is_refused()
+    assert_eq(users_refusal(with_octet(users(), 0x58, 0xFF)), "W1008")
+
+@test
+a_batch_of_no_rows_is_refused()
+    assert_eq(nulls_refusal(hex("00 02 00 00 00 00 02 00 00  00 00 00 00 00 00 00")), "W1008")
+
+@test
+validity_that_disagrees_is_refused()
+    val nulls = hex(nullable_batch_hex)
+
+    // All three valid, against a null_count of 1.
+    assert_eq(nulls_refusal(with_octet(nulls, 0x10, 0x07)), "W1008")
+    // An unused bit of the last octet set.
+    assert_eq(nulls_refusal(with_octet(nulls, 0x10, 0x0D)), "W1008")
+    // The null slot's placeholder is not zero.
+    assert_eq(nulls_refusal(with_octet(nulls, 0x1C, 0x01)), "W1008")
+    // A null_count above the length.
+    assert_eq(nulls_refusal(with_octet(nulls, 0x05, 0x04)), "W1008")
+
+@test
+a_bool_other_than_0_or_1_is_refused()
+    val t = list(record([Field("b", Bool)]))
+    val good = hex("00 02 01 00 01 00 01 01  01 00 00 00 00 00 00 00")
+
+    assert_eq(refusal(t, good.view()), "ok")
+    assert_eq(refusal(t, with_octet(good, 8, 2).view()), "W1008")
+
+@test
+a_placeholder_under_a_null_record_must_be_one()
+    // `{r: {n: int64}?}` with r null: the n slot under it must be zero.
+    val t = bag(record([Field("r", nullable(record([Field("n", Int64)])))]))
+    val good = encoded(t, [rec([Null])])
+    val at = good.len() - 8
+
+    assert_eq(refusal(t, good.view()), "ok")
+    assert_eq(refusal(t, with_octet(good, at, 1).view()), "W1008")
+
+// -- the type encoding -----------------------------------------------------------------------------
+
+@test
+every_truncation_of_a_type_is_refused()
+    val whole = hex(users_type_hex)
+
+    for n in 0..<whole.len()
+        assert_eq(decode_type(whole.view()[0..<n]).unwrap_err().code, "Q1001")
+
+@test
+malformed_types_are_refused()
+    assert_eq(type_refusal("03 00"), "ok")
+    assert_eq(type_refusal("03 00 00"), "Q1001")
+    assert_eq(type_refusal("03 01 00"), "Q1001")
+    assert_eq(type_refusal("1B 00"), "Q1002")
+    assert_eq(type_refusal("40 00"), "Q1002")
+    assert_eq(type_refusal("83 00 00"), "Q1003")
+    assert_eq(type_refusal("14 04 14 02 03 00"), "Q1003")
+    assert_eq(type_refusal("10 05 01 01 FF 03 00"), "Q1004")
+    assert_eq(type_refusal("07 02 26 02"), "ok")
+    assert_eq(type_refusal("07 02 27 00"), "Q3011")
+    assert_eq(type_refusal("07 02 00 00"), "Q3011")
+    assert_eq(type_refusal("07 02 05 06"), "Q3011")
+    assert_eq(type_refusal("11 05 01 01 61 03 00"), "Q3014")
+    assert_eq(type_refusal("13 04 13 02 03 00"), "Q3014")
+    assert_eq(type_refusal("13 06 14 04 12 02 03 00"), "Q3014")
+    assert_eq(type_refusal("10 09 02 01 61 03 00 01 61 03 00"), "Q3015")
+    assert_eq(type_refusal("10 04 01 00 03 00"), "Q3015")
+    assert_eq(type_refusal("11 01 00"), "Q3016")
+    assert_eq(type_refusal("20 02 00 00"), "W1008")
+
+@test
+a_result_type_must_be_a_relation()
+    assert_eq(decode_result_type(hex("03 00").view()).unwrap_err().code, "W1008")
+    assert_eq(decode_result_type(hex("14 04 13 02 03 00").view()).unwrap_err().code, "W1008")
+    assert(decode_result_type(hex("13 02 03 00").view()).unwrap() == list(Int64), "list<int64> is a result type")
+
+@test
+a_type_nested_too_deeply_is_refused()
+    var t = Int64
+
+    for _ in 0..<300
+        t = record([Field("a", t)])
+
+    assert_eq(decode_type(type_bytes(t).view()).unwrap_err().code, "Q1006")
+
+@test
+every_type_kind_round_trips()
+    val t = list(nullable(record([
+        Field("b", Bool), Field("i8", Int8), Field("i16", Int16), Field("i32", Int32), Field("i64", Int64),
+        Field("i128", Int128), Field("u8", UInt8), Field("u16", UInt16), Field("u32", UInt32),
+        Field("u64", UInt64), Field("f32", Float32), Field("f64", Float64), Field("d", Decimal(10, 3)),
+        Field("t", Text), Field("by", Bytes), Field("j", Json), Field("date", Date), Field("time", Time),
+        Field("dt", DateTime), Field("ts", Timestamp), Field("iv", Interval), Field("id", Uuid),
+        Field("n", nullable(Int64)), Field("bag", bag(nullable(Text)))
+    ])))
+    val bytes = type_bytes(t)
+
+    assert(decode_result_type(bytes.view()).unwrap() == t, "every kind decodes to itself")
+    same_bytes(type_bytes(decode_type(bytes.view()).unwrap()), bytes, "and re-encodes to the same bytes")

@@ -1,0 +1,398 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.encoding.{get_u32_le, get_u64_le}
+import sysl.text.from_utf8
+
+/** A decoded batch: the slot counts and buffers of every node of `tree`, the buffers being views of
+ * the payload it was read from rather than copies.
+ *
+ * A `Batch` exists only once the payload has passed every check of `wire-protocol.md` §6.3–6.5, so
+ * reading through `root()` never meets an out-of-range offset or discriminant.
+ */
+struct Batch
+    tuple: u64
+    tree: ColumnTree
+    lengths: Buf[usize]
+    null_counts: Buf[usize]
+    buffers: Buf[[]const u8]
+
+    /** The top-level rows: the root column, one slot per row. */
+    root(self) -> Column = Column(self, 0)
+
+    /** Every row, materialized. */
+    rows(self) -> Buf[Value]
+        val out = buf[Value]()
+        val c = self.root()
+
+        for i in 0..<c.len()
+            out.push(c.value(i))
+
+        out
+
+/** One column node of one batch, walked by slot. */
+struct Column
+    batch: Batch
+    node: usize
+
+    private info(self) -> ColumnNode = self.batch.tree.nodes[self.node]
+
+    private main(self) -> []const u8 = self.batch.buffers[self.info().main_buffer()]
+
+    private aux(self) -> []const u8 = self.batch.buffers[self.info().main_buffer() + 1]
+
+    private child(self, j: usize) -> Column = Column(self.batch, self.info().children[j])
+
+    /** The column's type, with nullability taken off. */
+    ty(self) -> Type = self.info().ty
+
+    len(self) -> usize = self.batch.lengths[self.node]
+
+    null_count(self) -> usize = self.batch.null_counts[self.node]
+
+    is_null(self, i: usize) -> bool
+        if self.null_count() == 0 then return false
+
+        val validity = self.batch.buffers[self.info().first_buffer]
+        validity[i / 8] & u8(1) << (i % 8) == 0
+
+    /** A fixed-width slot's octets, as a view of the payload. */
+    fixed_at(self, i: usize) -> []const u8
+        val w = self.ty().width()
+        self.main()[i * w..<(i + 1) * w]
+
+    bool_at(self, i: usize) -> bool = self.fixed_at(i)[0] == 1
+
+    /** A signed slot: any signed integer, a decimal's unscaled value, or a date or time count. */
+    int_at(self, i: usize) -> i128 = signed_le(self.fixed_at(i))
+
+    uint_at(self, i: usize) -> u64 = u64(unsigned_le(self.fixed_at(i)))
+
+    float_at(self, i: usize) -> real
+        val b = self.fixed_at(i)
+
+        if b.len == 4 then real(f32.from_bits(get_u32_le(b).unwrap())) else real.from_bits(get_u64_le(b).unwrap())
+
+    uuid_at(self, i: usize) -> u128
+        var v: u128 = 0
+
+        for x in self.fixed_at(i)
+            v = v << 8 | u128(x)
+
+        v
+
+    interval_at(self, i: usize) -> Value
+        val b = self.fixed_at(i)
+        Interval(i32.wrap(get_u32_le(b).unwrap()), i32.wrap(get_u32_le(b[4..]).unwrap()), i64.wrap(get_u64_le(b[8..]).unwrap()))
+
+    /** A varbin slot's octets, as a view of the payload. */
+    bytes_at(self, i: usize) -> []const u8 = self.aux()[offset_at(self.main(), i)..<offset_at(self.main(), i + 1)]
+
+    /** A `text` or `json` slot as a `string`, which copies it. */
+    text_at(self, i: usize) -> string = from_utf8(self.bytes_at(i)).unwrap()
+
+    /** A record's field `j`, as a column with one slot per slot of the record. */
+    field(self, j: usize) -> Column = self.child(j)
+
+    field_named(self, name: string) -> Option[Column]
+        val fields = self.ty() match
+            Record(fs) -> fs
+            _ -> return None
+
+        for j in 0..<fields.len()
+            if fields[j].name == name then return Some(self.child(j))
+
+        None
+
+    /** A relation's element column; slot `i`'s elements are its slots `start(i) ..< end(i)`. */
+    elems(self) -> Column = self.child(0)
+
+    start(self, i: usize) -> usize = offset_at(self.main(), i)
+
+    end(self, i: usize) -> usize = offset_at(self.main(), i + 1)
+
+    /** A union slot's variant ordinal. */
+    tag(self, i: usize) -> usize = usize(unsigned_le(self.main()[i * self.tag_width()..<(i + 1) * self.tag_width()]))
+
+    /** Where a union slot's payload is, in the column of its variant. */
+    payload_at(self, i: usize) -> usize = offset_at(self.aux(), i)
+
+    /** Variant `j`'s payload column. */
+    variant(self, j: usize) -> Column = self.child(j)
+
+    private tag_width(self) -> usize = self.info().kind match
+        Tagged(w) -> w
+        _ -> 0
+
+    /** Slot `i`, materialized as a `Value`. */
+    value(self, i: usize) -> Value
+        if self.is_null(i) then return Null
+
+        val ty = self.ty()
+
+        self.info().kind match
+            Fixed(_) -> ty match
+                Bool -> Bool(self.bool_at(i))
+                UInt8 | UInt16 | UInt32 | UInt64 -> UInt(self.uint_at(i))
+                Float32 | Float64 -> Float(self.float_at(i))
+                Interval -> self.interval_at(i)
+                Uuid -> Uuid(self.uuid_at(i))
+                _ -> Int(self.int_at(i))
+            VarBin -> ty match
+                Bytes -> bytes_value(self.bytes_at(i))
+                _ -> Text(self.text_at(i))
+            Fields ->
+                val fields = buf[Value]()
+
+                for j in 0..<self.info().children.len()
+                    fields.push(self.field(j).value(i))
+
+                Record(fields)
+            Tagged(_) ->
+                val tag = self.tag(i)
+                Variant(tag, self.variant(tag).value(self.payload_at(i)))
+            Nested ->
+                val elems = buf[Value]()
+                val e = self.elems()
+
+                for j in self.start(i)..<self.end(i)
+                    elems.push(e.value(j))
+
+                Relation(elems)
+    end value
+end Column
+
+private offset_at(b: []const u8, i: usize) -> usize = usize(get_u32_le(b[4 * i..]).unwrap())
+
+private unsigned_le(b: []const u8) -> u128
+    var v: u128 = 0
+
+    for i in 0..<b.len
+        v = v | u128(b[i]) << (8 * i)
+
+    v
+
+private signed_le(b: []const u8) -> i128
+    val u = unsigned_le(b)
+
+    if b.len >= 16 then return i128.wrap(u)
+
+    val bits = 8 * b.len
+
+    if u >> (bits - 1) == 0 then i128(u) else i128(u) - (i128(1) << bits)
+
+// -- reading and checking ------------------------------------------------------------------------
+
+/** The `Batch` payload `payload`, of a result whose column tree is `tree`, checked against every rule
+ * of `wire-protocol.md` §6.3–6.5. Any inconsistency is `W1008`.
+ */
+decode_batch(tree: ColumnTree, payload: []const u8) -> Result[Batch, CodecError]
+    var r = Reader(payload, 0)
+    val tuple = as_bad_batch(r.uvar())?
+    val nodes = tree.nodes.len()
+
+    if as_bad_batch(r.uvar())? != u64(nodes) then return bad("column_count is not the column tree's node count")
+
+    val lengths = buf[usize]()
+    val null_counts = buf[usize]()
+
+    for _ in 0..<nodes
+        lengths.push(below_limit(as_bad_batch(r.uvar())?)?)
+        null_counts.push(below_limit(as_bad_batch(r.uvar())?)?)
+
+    if as_bad_batch(r.uvar())? != u64(tree.buffers) then return bad("buffer_count is not the column tree's buffer count")
+
+    val byte_lengths = buf[usize]()
+
+    for _ in 0..<tree.buffers
+        byte_lengths.push(below_limit(as_bad_batch(r.uvar())?)?)
+
+    skip_padding(&r)?
+
+    val buffers = buf[[]const u8]()
+
+    for n in byte_lengths
+        buffers.push(as_bad_batch(r.take(u64(n)))?)
+        skip_padding(&r)?
+
+    if r.left() != 0 then return bad("octets follow the last buffer")
+
+    val batch = Batch(tuple, tree, lengths, null_counts, buffers)
+
+    check_batch(batch)?
+    Ok(batch)
+end decode_batch
+
+private bad[T](what: string) -> Result[T, CodecError] = fail("W1008", what)
+
+private below_limit(v: u64) -> Result[usize, CodecError]
+    if v >= u64(Limit) then return bad("a length or count is not below 2^31")
+    Ok(usize(v))
+
+// Padding to the next multiple of 8 from the start of the payload, which must be zero.
+private skip_padding(r: *Reader) -> Result[unit, CodecError]
+    while r.at % 8 != 0
+        if as_bad_batch(r.byte())? != 0 then return bad("a padding octet is not zero")
+
+    Ok(())
+
+// Every node in pre-order, so that a parent has fixed its children's lengths and placeholder slots
+// before they are checked. `under[k][i]` is whether slot `i` of node `k` lies under a null slot of an
+// ancestor, and so must hold its placeholder (§6.5).
+private check_batch(b: Batch) -> Result[unit, CodecError]
+    if b.lengths[0] == 0 then return bad("a batch holds at least one row")
+
+    val under = buf[Buf[bool]]()
+
+    for k in 0..<b.lengths.len()
+        under.push(buf_filled(b.lengths[k], false))
+
+    for k in 0..<b.lengths.len()
+        check_node(b, k, under)?
+
+    Ok(())
+
+private check_node(b: Batch, k: usize, under: Buf[Buf[bool]]) -> Result[unit, CodecError]
+    val node = b.tree.nodes[k]
+    val col = Column(b, k)
+    val n = b.lengths[k]
+    val nulls = b.null_counts[k]
+    val mine = under[k]
+
+    check_validity(b, node, n, nulls)?
+
+    for i in 0..<n
+        if mine[i] && node.nullable && !col.is_null(i) then
+            return bad("a slot under a null slot is not null")
+
+    // A record has no buffer past its validity, so this is read only by the kinds that have one.
+    val main = if node.kind == Fields then [] else b.buffers[node.main_buffer()]
+
+    node.kind match
+        Fixed(w) ->
+            expect_length(main, n * w, "values")?
+
+            for i in 0..<n
+                val slot = col.fixed_at(i)
+
+                if (mine[i] || col.is_null(i)) && !all_zero(slot) then
+                    return bad("a placeholder fixed slot is not zero")
+
+                if node.ty == Type.Bool && slot[0] > 1 then return bad("a bool is neither 00 nor 01")
+        VarBin ->
+            val data = b.buffers[node.main_buffer() + 1]
+
+            check_offsets(main, n, data.len, "varbin")?
+
+            for i in 0..<n
+                if (mine[i] || col.is_null(i)) && col.start(i) != col.end(i) then
+                    return bad("a placeholder varbin slot is not empty")
+
+                if node.ty == Type.Text && from_utf8(col.bytes_at(i)).is_err() then
+                    return bad("a text slot is not valid UTF-8")
+        Fields ->
+            for c in node.children
+                if b.lengths[c] != n then return bad("a record field's length is not the record's")
+
+                val theirs = under[c]
+
+                for i in 0..<n
+                    if mine[i] || col.is_null(i) then theirs[i] = true
+        Tagged(w) -> check_union(b, node, col, w, mine, under)?
+        Nested ->
+            val child = node.children[0]
+
+            check_offsets(main, n, b.lengths[child], "relation")?
+
+            for i in 0..<n
+                if (mine[i] || col.is_null(i)) && col.start(i) != col.end(i) then
+                    return bad("a placeholder relation slot is not empty")
+
+    Ok(())
+end check_node
+
+private check_validity(b: Batch, node: ColumnNode, n: usize, nulls: usize) -> Result[unit, CodecError]
+    if !node.nullable
+        if nulls != 0 then return bad("a column that is not nullable has nulls")
+        return Ok(())
+
+    if nulls > n then return bad("null_count exceeds length")
+
+    val validity = b.buffers[node.first_buffer]
+
+    if nulls == 0
+        expect_length(validity, 0, "validity")?
+        return Ok(())
+
+    expect_length(validity, (n + 7) / 8, "validity")?
+
+    var zeros: usize = 0
+
+    for i in 0..<validity.len * 8
+        val set = validity[i / 8] & u8(1) << (i % 8) != 0
+
+        if i >= n && set then return bad("an unused validity bit is set")
+        if i < n && !set then zeros += 1
+
+    if zeros != nulls then return bad("null_count does not match the validity bitmap")
+
+    Ok(())
+end check_validity
+
+private check_union(b: Batch, node: ColumnNode, col: Column, w: usize, mine: Buf[bool], under: Buf[Buf[bool]]) -> Result[unit, CodecError]
+    val n = col.len()
+    val k = node.children.len()
+
+    expect_length(b.buffers[node.main_buffer()], n * w, "discriminants")?
+    expect_length(b.buffers[node.main_buffer() + 1], n * 4, "union offsets")?
+
+    val counts = buf_filled(k, usize(0))
+
+    for i in 0..<n
+        val d = col.tag(i)
+        val void = col.is_null(i)
+
+        if d >= k then return bad("a discriminant is not below the variant count")
+        if (void || mine[i]) && d != 0 then return bad("a placeholder union slot's discriminant is not 0")
+        if col.payload_at(i) != counts[d] then return bad("a union offset is not canonical")
+
+        if !void
+            if mine[i]
+                val theirs = under[node.children[0]]
+
+                if counts[0] >= theirs.len() then return bad("a variant column is shorter than its count of slots")
+
+                theirs[counts[0]] = true
+
+            counts[d] = counts[d] + 1
+
+    for j in 0..<k
+        if b.lengths[node.children[j]] != counts[j] then
+            return bad("a variant column's length is not its count of slots")
+
+    Ok(())
+end check_union
+
+// Offsets of `n` slots: `(n + 1) × 4` octets, starting at 0, non-decreasing, ending at `last`.
+private check_offsets(offsets: []const u8, n: usize, last: usize, what: string) -> Result[unit, CodecError]
+    expect_length(offsets, (n + 1) * 4, what)?
+
+    if offset_at(offsets, 0) != 0 then return bad(s"$what offsets do not start at 0")
+
+    for i in 0..<n
+        if offset_at(offsets, i + 1) < offset_at(offsets, i) then
+            return bad(s"$what offsets decrease")
+
+    if offset_at(offsets, n) != last then return bad(s"$what offsets do not end at the length of what they index")
+
+    Ok(())
+
+private expect_length(buffer: []const u8, want: usize, what: string) -> Result[unit, CodecError]
+    if buffer.len != want then return bad(s"the $what buffer's byte_length is not what its node implies")
+    Ok(())
+
+private all_zero(b: []const u8) -> bool
+    for x in b
+        if x != 0 then return false
+
+    true

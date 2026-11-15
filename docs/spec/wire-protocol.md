@@ -623,7 +623,9 @@ hands the same octets to its caller (§9). One decoder serves both.
 3. Nested relations are offsets into a child column, unions are a discriminant and an offset into a child per
    variant, and nullability is a validity bitmap — in each case Arrow's layout (§6.8).
 4. The result type MUST be **structural**: a server MUST NOT send a named catalog type (kinds 32–63 of [QT] §12.3);
-   it sends the structure that name denotes.
+   it sends the structure that name denotes. A client refuses a result type that is not a relation, or that holds
+   a named type, with `W1008`; any other defect of the `Type` encoding is the [QT] §12 code for it (`Q1001`–`Q1006`,
+   `Q3011`, `Q3014`–`Q3016`).
 
 ### 6.2 The column tree
 
@@ -704,7 +706,9 @@ Batch := uvar tuple                                (parameter tuple this batch b
 2. Every `length`, `null_count` and `byte_length` MUST agree with §6.3: a decoder MUST check that each buffer's
    `byte_length` equals the length §6.3 implies, that child lengths equal what the parent's offsets and
    discriminants imply, and that padding octets are zero. A server sending otherwise is a protocol violation; a
-   client SHOULD close the connection with `W1008`.
+   client SHOULD close the connection with `W1008`. **Every** defect of a batch payload is `W1008`, including one
+   found in a primitive: a payload that ends early, a non-minimal `uvar`, octets after the last buffer's padding,
+   and a break of §6.3 or §6.5 (offsets, discriminants, validity, placeholders, UTF-8).
 3. The payload length is therefore a multiple of 8, and each buffer starts at a payload offset that is a multiple
    of 8. A payload received into an 8-aligned buffer (the frame header is 16 octets) can be read in place as typed
    arrays on a little-endian host.

@@ -1,0 +1,79 @@
+module sh.sysl.terndb
+
+import sysl.buf.Buf
+import sysl.text.from_utf8
+
+// The encoding primitives of `query-tree.md` §12.1 that the type and the batch are made of.
+
+/** `v` as a minimal unsigned LEB128. */
+push_uvar(out: Buf[u8], v: u64)
+    var rest = v
+
+    loop
+        val low = u8.wrap(rest & 0x7f)
+        rest = rest >> 7
+
+        if rest == 0
+            out.push(low)
+            return
+
+        out.push(low | 0x80)
+
+/** Zero octets until `out`'s length is a multiple of 8. */
+pad_to_8(out: Buf[u8])
+    while out.len() % 8 != 0
+        out.push(0)
+
+/** A position in bytes being read, refusing to run off their end.
+ *
+ * Truncation is `Q1001` and a non-minimal `uvar` is `Q1003`, the type encoding's codes; a batch
+ * reads through `as_bad_batch`, which reports both as `W1008`.
+ */
+struct Reader
+    bytes: []const u8
+    at: usize
+
+    left(self) -> usize = self.bytes.len - self.at
+
+    byte(*self) -> Result[u8, CodecError]
+        if self.at >= self.bytes.len then return fail("Q1001", "the input ends early")
+
+        val b = self.bytes[self.at]
+        self.at += 1
+        Ok(b)
+
+    /** The next `n` octets, as a view of the input rather than a copy. */
+    take(*self, n: u64) -> Result[[]const u8, CodecError]
+        if n > u64(self.left()) then return fail("Q1001", "the input ends early")
+
+        val from = self.at
+        self.at += usize(n)
+        Ok(self.bytes[from..<self.at])
+
+    uvar(*self) -> Result[u64, CodecError]
+        var v: u64 = 0
+        var shift: u64 = 0
+
+        loop
+            val b = self.byte()?
+
+            if shift == 63 && b > 1 then return fail("Q1001", "a uvar overflows 64 bits")
+
+            v = v | u64(b & 0x7f) << shift
+
+            if b & 0x80 == 0
+                if b == 0 && shift > 0 then return fail("Q1003", "a uvar is not minimal")
+                return Ok(v)
+
+            shift += 7
+    end uvar
+
+    /** A `str`: a `uvar` length, then that many octets of UTF-8 (`Q1004` otherwise). */
+    str(*self) -> Result[string, CodecError]
+        val n = self.uvar()?
+        val raw = self.take(n)?
+
+        from_utf8(raw) match
+            Ok(s) -> Ok(s)
+            Err(_) -> fail("Q1004", "a name is not valid UTF-8")
+end Reader

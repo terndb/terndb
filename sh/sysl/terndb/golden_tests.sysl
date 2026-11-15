@@ -1,0 +1,196 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.Buf
+
+// The worked examples of `wire-protocol.md` §6.6 and §6.7, octet for octet.
+
+users_type() -> Type
+    val comment = record([Field("id", Int64), Field("body", Text)])
+    val post = record([Field("id", Int64), Field("title", Text), Field("comments", bag(comment))])
+    val status = union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))])
+
+    list(record([
+        Field("id", Int64),
+        Field("name", Text),
+        Field("post_count", Int64),
+        Field("status", status),
+        Field("posts", list(post))
+    ]))
+
+users_rows() -> Buf[Value]
+    val ann = rec([
+        Int(1),
+        Text("ann"),
+        Int(2),
+        variant(0, rec([])),
+        rel([
+            rec([Int(10), Text("hi"), rel([rec([Int(100), Text("ok")])])]),
+            rec([Int(11), Text("yo"), rel([])])
+        ])
+    ])
+    val bo = rec([Int(2), Text("bo"), Int(0), variant(1, rec([Text("spam")])), rel([])])
+
+    rows_of([ann, bo])
+
+const users_type_hex = """
+    13 75
+      10 73 05
+        02 69 64                 03 00
+        04 6E 61 6D 65           08 00
+        0A 70 6F 73 74 5F 63 6F 75 6E 74
+                                 03 00
+        06 73 74 61 74 75 73
+          11 1E 02
+            06 61 63 74 69 76 65 10 01 00
+            06 62 61 6E 6E 65 64 10 0A 01 06 72 65 61 73 6F 6E 08 00
+        05 70 6F 73 74 73
+          13 2A
+            10 28 03
+              02 69 64           03 00
+              05 74 69 74 6C 65  08 00
+              08 63 6F 6D 6D 65 6E 74 73
+                12 0F
+                  10 0D 02 02 69 64 03 00 04 62 6F 64 79 08 00
+    """
+
+const users_batch_hex = """
+    00
+    10
+    02 00  02 00  02 00  02 00  02 00
+    01 00  01 00  01 00
+    02 00  02 00  02 00  02 00  02 00
+    01 00  01 00  01 00
+    10
+    10 0C 05 10 02 08 08 04 0C 10 0C 04 0C 08 08 02
+    00 00 00 00 00
+    01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00
+    00 00 00 00 03 00 00 00 05 00 00 00  00 00 00 00
+    61 6E 6E 62 6F  00 00 00
+    02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    00 01  00 00 00 00 00 00
+    00 00 00 00 00 00 00 00
+    00 00 00 00 04 00 00 00
+    73 70 61 6D  00 00 00 00
+    00 00 00 00 02 00 00 00 02 00 00 00  00 00 00 00
+    0A 00 00 00 00 00 00 00 0B 00 00 00 00 00 00 00
+    00 00 00 00 02 00 00 00 04 00 00 00  00 00 00 00
+    68 69 79 6F  00 00 00 00
+    00 00 00 00 01 00 00 00 01 00 00 00  00 00 00 00
+    64 00 00 00 00 00 00 00
+    00 00 00 00 02 00 00 00
+    6F 6B  00 00 00 00 00 00
+    """
+
+nullable_type() -> Type = bag(record([Field("x", nullable(Int32))]))
+
+nullable_rows() -> Buf[Value] = rows_of([rec([Int(7)]), rec([Null]), rec([Int(9)])])
+
+const nullable_batch_hex = """
+    00  02  03 00  03 01  02  01 0C
+    00 00 00 00 00 00 00
+    05  00 00 00 00 00 00 00
+    07 00 00 00 00 00 00 00 09 00 00 00  00 00 00 00
+    """
+
+@test
+users_type_encodes_as_the_spec_writes_it()
+    val bytes = type_bytes(users_type())
+
+    assert_eq(bytes.len(), 119)
+    same_bytes(bytes, hex(users_type_hex), "§6.6 result_type")
+
+@test
+users_type_decodes_back()
+    val t = decode_result_type(hex(users_type_hex).view()).unwrap()
+
+    assert(t == users_type(), "the §6.6 type decodes to the type it encodes")
+
+@test
+users_batch_encodes_as_the_spec_writes_it()
+    val bytes = encoded(users_type(), users_rows().view())
+
+    assert_eq(bytes.len(), 240)
+    same_bytes(bytes, hex(users_batch_hex), "§6.6 batch payload")
+
+@test
+users_batch_decodes_to_its_rows()
+    val batch = decoded(users_type(), hex(users_batch_hex).view()).unwrap()
+
+    assert_eq(batch.tuple, 0u64)
+    assert(batch.rows() == users_rows(), "the §6.6 payload decodes to the §6.6 rows")
+
+@test
+users_batch_is_walkable()
+    val batch = decoded(users_type(), hex(users_batch_hex).view()).unwrap()
+    val users = batch.root()
+
+    assert_eq(users.len(), 2)
+    assert_eq(users.field_named("name").unwrap().text_at(1), "bo")
+
+    val posts = users.field(4)
+    assert_eq(posts.start(0), 0)
+    assert_eq(posts.end(0), 2)
+    assert_eq(posts.start(1), posts.end(1))
+
+    val post = posts.elems()
+    assert_eq(post.field(0).int_at(1), 11)
+
+    val comments = post.field(2)
+    assert_eq(comments.end(0) - comments.start(0), 1)
+    assert_eq(comments.end(1) - comments.start(1), 0)
+    assert_eq(comments.elems().field_named("body").unwrap().text_at(0), "ok")
+
+    val status = users.field(3)
+    assert_eq(status.tag(0), 0)
+    assert_eq(status.tag(1), 1)
+    assert_eq(status.payload_at(1), 0)
+    assert_eq(status.variant(1).field(0).text_at(status.payload_at(1)), "spam")
+
+@test
+users_bytes_are_views_of_the_payload()
+    val payload = hex(users_batch_hex)
+    val batch = decoded(users_type(), payload.view()).unwrap()
+    val name = batch.root().field(1).bytes_at(0)
+
+    // The view lies at offset 0x58 of the payload: b2, "annbo".
+    assert(&name[0] == &payload.view()[0x58], "a varbin slot is read in place")
+    assert_eq(name.len, 3)
+
+@test
+users_round_trip()
+    round_trip(users_type(), users_rows().view())
+
+@test
+nullable_batch_encodes_as_the_spec_writes_it()
+    val bytes = encoded(nullable_type(), nullable_rows().view())
+
+    assert_eq(bytes.len(), 40)
+    same_bytes(bytes, hex(nullable_batch_hex), "§6.7 batch payload")
+
+@test
+nullable_batch_decodes_to_its_rows()
+    val batch = decoded(nullable_type(), hex(nullable_batch_hex).view()).unwrap()
+    val x = batch.root().field(0)
+
+    assert(batch.rows() == nullable_rows(), "the §6.7 payload decodes to the §6.7 rows")
+    assert_eq(x.null_count(), 1)
+    assert(x.is_null(1) && !x.is_null(0) && !x.is_null(2), "slot 1 alone is null")
+    assert_eq(x.int_at(2), 9)
+
+@test
+nullable_round_trip()
+    round_trip(nullable_type(), nullable_rows().view())
+
+@test
+nullable_with_no_null_sends_an_empty_validity_buffer()
+    val rows = rows_of([rec([Int(7)]), rec([Int(8)]), rec([Int(9)])])
+    val bytes = encoded(nullable_type(), rows.view())
+
+    // (3,0) for node 1, and validity byte length 0 (§6.7's last sentence).
+    same_bytes(bytes, hex("""
+        00  02  03 00  03 00  02  00 0C
+        00 00 00 00 00 00 00
+        07 00 00 00 08 00 00 00 09 00 00 00  00 00 00 00
+        """), "§6.7 without a null")
+    round_trip(nullable_type(), rows.view())

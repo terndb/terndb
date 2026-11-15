@@ -1,0 +1,272 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The shapes the worked examples do not reach: empty relations, columns that are all null, unions at
+// both discriminant widths, padding of every length, deep nesting, and placeholders under nulls.
+
+private batch_of(t: Type, rows: []const Value) -> Batch = decoded(t, encoded(t, rows).view()).unwrap()
+
+/** The byte length of buffer `b` in a batch. */
+private buffer_len(batch: Batch, b: usize) -> usize = batch.buffers[b].len
+
+@test
+an_empty_relation_has_one_zero_offset_and_an_empty_child()
+    val t = list(record([Field("id", Int64), Field("tags", list(Int64))]))
+    val rows = rows_of([rec([Int(1), rel([])]), rec([Int(2), rel([])])])
+    val batch = batch_of(t, rows.view())
+
+    round_trip(t, rows.view())
+    assert_eq(batch.lengths[3], 0)
+    assert_eq(buffer_len(batch, 1), 12)
+    assert_eq(buffer_len(batch, 2), 0)
+
+@test
+an_all_null_column_sends_a_zero_bitmap()
+    val t = bag(record([Field("x", nullable(Int32))]))
+    val rows = rows_of([rec([Null]), rec([Null]), rec([Null])])
+
+    same_bytes(encoded(t, rows.view()), hex("""
+        00  02  03 00  03 03  02  01 0C
+        00 00 00 00 00 00 00
+        00  00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 00 00  00 00 00 00
+        """), "three nulls")
+    round_trip(t, rows.view())
+
+@test
+a_nested_child_may_be_empty_under_a_full_parent()
+    val comment = record([Field("id", Int64)])
+    val t = list(record([Field("posts", list(record([Field("comments", bag(comment))])))]))
+    val rows = rows_of([
+        rec([rel([rec([rel([])]), rec([rel([])])])]),
+        rec([rel([])]),
+        rec([rel([rec([rel([])])])])
+    ])
+    val batch = batch_of(t, rows.view())
+
+    round_trip(t, rows.view())
+    assert_eq(batch.lengths[2], 3)
+    assert_eq(batch.lengths[4], 0)
+
+@test
+a_union_with_one_variant()
+    val t = bag(record([Field("u", union_of([Field("only", record([Field("v", Int64)]))]))]))
+    val rows = rows_of([rec([variant(0, rec([Int(5)]))]), rec([variant(0, rec([Int(6)]))])])
+    val batch = batch_of(t, rows.view())
+
+    round_trip(t, rows.view())
+    assert_eq(buffer_len(batch, 0), 2)
+    assert_eq(batch.root().field(0).payload_at(1), 1)
+
+private wide_union(k: usize) -> Type
+    val variants = buf[Field]()
+
+    for i in 0..<k
+        variants.push(Field(s"v$i", record([])))
+
+    Union(variants)
+
+@test
+a_union_of_more_than_256_variants_has_a_two_octet_discriminant()
+    val t = bag(record([Field("u", wide_union(300))]))
+    val rows = rows_of([rec([variant(299, rec([]))]), rec([variant(0, rec([]))]), rec([variant(256, rec([]))])])
+    val bytes = round_trip(t, rows.view())
+    val batch = decoded(t, bytes.view()).unwrap()
+    val discriminants = batch.buffers[0]
+
+    assert_eq(discriminants.len, 6)
+    assert_eq(discriminants[0], 0x2B)
+    assert_eq(discriminants[1], 0x01)
+    assert_eq(discriminants[5], 0x01)
+    assert_eq(batch.root().field(0).tag(2), 256)
+    assert(decode_type(type_bytes(t).view()).unwrap() == t, "a 300-variant type round-trips")
+
+@test
+a_union_of_exactly_256_variants_keeps_one_octet()
+    val t = bag(record([Field("u", wide_union(256))]))
+    val rows = rows_of([rec([variant(255, rec([]))])])
+    val batch = decoded(t, round_trip(t, rows.view()).view()).unwrap()
+
+    assert_eq(batch.buffers[0].len, 1)
+    assert_eq(batch.buffers[0][0], 0xFF)
+
+@test
+a_one_octet_buffer_is_padded_to_eight()
+    val t = list(record([Field("b", Bool)]))
+    val rows = rows_of([rec([Bool(true)])])
+
+    same_bytes(encoded(t, rows.view()), hex("00 02 01 00 01 00 01 01  01 00 00 00 00 00 00 00"), "one bool")
+    round_trip(t, rows.view())
+
+@test
+every_buffer_starts_on_a_multiple_of_eight()
+    val t = list(record([Field("s", Text), Field("n", Int16)]))
+
+    for len in 0..<17
+        val text = "abcdefghijklmnopq"[0..<len]
+        val rows = rows_of([rec([Text(text), Int(i128(len))])])
+        val bytes = round_trip(t, rows.view())
+        val batch = decoded(t, bytes.view()).unwrap()
+
+        assert_eq(bytes.len() % 8, 0)
+
+        for b in batch.buffers
+            if b.len > 0 then assert_eq((usize(&b[0]) - usize(&bytes.view()[0])) % 8, 0)
+
+@test
+five_levels_of_nesting()
+    val leaf = list(Int64)
+    val t = list(record([Field("a", list(record([Field("b", list(record([Field("c", list(record([Field("d", leaf)])))])))])))]))
+    val rows = rows_of([
+        rec([rel([rec([rel([rec([rel([rec([rel([Int(1), Int(2)])]), rec([rel([])])])])])])])]),
+        rec([rel([])]),
+        rec([rel([rec([rel([])])])])
+    ])
+    val batch = decoded(t, round_trip(t, rows.view()).view()).unwrap()
+
+    assert_eq(batch.tree.nodes.len(), 9)
+    assert_eq(batch.lengths[8], 2)
+    assert_eq(batch.root().field(0).elems().field(0).elems().field(0).elems().field(0).elems().int_at(1), 2)
+
+private holder_type() -> Type
+    val inner = record([
+        Field("a", Int64),
+        Field("s", Text),
+        Field("l", list(Int64)),
+        Field("u", union_of([Field("x", record([Field("n", Int64)])), Field("y", record([]))])),
+        Field("o", nullable(Int32))
+    ])
+
+    bag(record([Field("r", nullable(inner))]))
+
+@test
+a_null_record_holds_placeholders_in_every_child()
+    val t = holder_type()
+    val rows = rows_of([
+        rec([Null]),
+        rec([rec([Int(7), Text("hey"), rel([Int(1)]), variant(1, rec([])), Int(3)])])
+    ])
+    val batch = decoded(t, round_trip(t, rows.view()).view()).unwrap()
+    val r = batch.root().field(0)
+
+    assert(r.is_null(0) && !r.is_null(1), "only the first record is null")
+    assert_eq(r.field(0).int_at(0), 0)
+    assert_eq(r.field(1).start(0), r.field(1).end(0))
+    assert_eq(r.field(2).start(0), r.field(2).end(0))
+    assert_eq(r.field(3).tag(0), 0)
+    assert_eq(r.field(3).variant(0).len(), 1)
+    assert(r.field(4).is_null(0), "a nullable field under a null record is null")
+    assert_eq(r.field(4).null_count(), 1)
+
+@test
+a_null_union_occupies_no_variant_slot()
+    val u = nullable(union_of([Field("x", record([Field("n", Int64)])), Field("y", record([]))]))
+    val t = bag(record([Field("u", u)]))
+    val rows = rows_of([rec([Null]), rec([variant(0, rec([Int(4)]))]), rec([Null])])
+    val batch = decoded(t, round_trip(t, rows.view()).view()).unwrap()
+    val col = batch.root().field(0)
+
+    assert_eq(col.variant(0).len(), 1)
+    assert_eq(col.payload_at(0), 0)
+    assert_eq(col.payload_at(2), 1)
+
+@test
+nullable_elements_and_a_nullable_relation()
+    val t = list(record([Field("xs", list(nullable(Int64))), Field("maybe", nullable(bag(Text)))]))
+    val rows = rows_of([
+        rec([rel([Int(1), Null, Int(3)]), Null]),
+        rec([rel([]), rel([Text("a"), Text("")])])
+    ])
+
+    round_trip(t, rows.view())
+
+@test
+a_scalar_relation_at_the_top()
+    val t = list(Int64)
+
+    round_trip(t, rows_of([Int(-1), Int(0), Int(9223372036854775807)]).view())
+    round_trip(bag(nullable(Text)), rows_of([Null, Text("x")]).view())
+
+@test
+every_scalar_type_round_trips()
+    val t = list(record([
+        Field("b", Bool),
+        Field("i8", Int8),
+        Field("i16", Int16),
+        Field("i32", Int32),
+        Field("i64", Int64),
+        Field("i128", Int128),
+        Field("u8", UInt8),
+        Field("u16", UInt16),
+        Field("u32", UInt32),
+        Field("u64", UInt64),
+        Field("f32", Float32),
+        Field("f64", Float64),
+        Field("d", Decimal(38, 2)),
+        Field("t", Text),
+        Field("by", Bytes),
+        Field("j", Json),
+        Field("date", Date),
+        Field("time", Time),
+        Field("dt", DateTime),
+        Field("ts", Timestamp),
+        Field("iv", Interval),
+        Field("id", Uuid)
+    ]))
+    val big = i128(1) << 126
+    val rows = rows_of([
+        rec([
+            Bool(false), Int(-128), Int(-32768), Int(-2147483648), Int(-1), Int(-big),
+            UInt(255), UInt(65535), UInt(4294967295), UInt(18446744073709551615),
+            Float(1.5), Float(-0.25), Int(-12345), Text("héllo"), bytes_value([0, 255]), Text("{}"),
+            Int(-1), Int(86399999999), Int(0), Int(1700000000000000),
+            Interval(-1, 2, -3), Uuid(0x0123456789ABCDEF0123456789ABCDEFu128)
+        ]),
+        rec([
+            Bool(true), Int(127), Int(32767), Int(2147483647), Int(9223372036854775807), Int(big),
+            UInt(0), UInt(0), UInt(0), UInt(0),
+            Float(0), Float(1e300), Int(0), Text(""), bytes_value([]), Text("[1]"),
+            Int(0), Int(0), Int(-1), Int(-1),
+            Interval(0, 0, 0), Uuid(0)
+        ])
+    ])
+    val batch = decoded(t, round_trip(t, rows.view()).view()).unwrap()
+    val id = batch.root().field(21).fixed_at(0)
+
+    // RFC 9562 order: the first octet is the most significant.
+    assert_eq(id[0], 0x01)
+    assert_eq(id[15], 0xEF)
+    assert_eq(batch.root().field(5).int_at(0), -big)
+    assert_eq(batch.root().field(10).fixed_at(0)[3], 0x3F)
+
+// -- what the encoder refuses ----------------------------------------------------------------------
+
+private encode_refusal(t: Type, rows: []const Value) -> string = encode_batch(t, rows, 0) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+@test
+the_encoder_refuses_a_value_that_does_not_fit_its_type()
+    val t = list(record([Field("n", Int8), Field("u", UInt16), Field("s", Text)]))
+
+    assert_eq(encode_refusal(t, [rec([Int(127), UInt(1), Text("")])]), "ok")
+    assert_eq(encode_refusal(t, [rec([Int(128), UInt(1), Text("")])]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([Int(-129), UInt(1), Text("")])]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([Int(1), UInt(65536), Text("")])]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([Null, UInt(1), Text("")])]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([Int(1), UInt(1)])]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([Int(1), Int(1), Text("")])]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([Int(1), UInt(1), bytes_value([])])]), "Q3001")
+    assert_eq(encode_refusal(t, [Int(1)]), "Q3001")
+
+@test
+the_encoder_refuses_a_bad_variant_and_an_empty_batch()
+    val t = bag(union_of([Field("a", record([])), Field("b", record([]))]))
+
+    assert_eq(encode_refusal(t, [variant(1, rec([]))]), "ok")
+    assert_eq(encode_refusal(t, [variant(2, rec([]))]), "Q3001")
+    assert_eq(encode_refusal(t, [rec([])]), "Q3001")
+    assert_eq(encode_refusal(t, []), "W1008")
+    assert_eq(encode_refusal(Int64, [Int(1)]), "Q3001")

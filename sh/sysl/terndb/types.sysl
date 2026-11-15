@@ -1,0 +1,265 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.set
+
+/** A named member of a record (a field) or of a union (a variant, whose type is its payload). */
+struct Field derives Eq
+    name: string
+    ty: Type
+
+/** A query-tree type (`query-tree.md` §2), structural only: a named catalog type never reaches a
+ * result (`wire-protocol.md` §6.1 rule 4), so there is no variant for one.
+ *
+ * `Nullable` never wraps a `Nullable` (§2.2); `nullable()` is the constructor that keeps the rule,
+ * and the decoder refuses the doubled form with `Q1003`.
+ */
+enum Type derives Eq
+    Bool
+    Int8
+    Int16
+    Int32
+    Int64
+    Int128
+    UInt8
+    UInt16
+    UInt32
+    UInt64
+    Float32
+    Float64
+    Decimal(precision: u8, scale: u8)
+    Text
+    Bytes
+    Json
+    Date
+    Time
+    DateTime
+    Timestamp
+    Interval
+    Uuid
+    Nullable(inner: &Type)
+    Record(fields: Buf[Field])
+    Union(variants: Buf[Field])
+    Bag(elem: &Type)
+    List(elem: &Type)
+
+    /** The node kind this type is encoded under (`query-tree.md` §12.3). */
+    kind(self) -> u64 = self match
+        Bool -> 0
+        Int16 -> 1
+        Int32 -> 2
+        Int64 -> 3
+        Int128 -> 4
+        Float32 -> 5
+        Float64 -> 6
+        Decimal(_, _) -> 7
+        Text -> 8
+        Bytes -> 9
+        Date -> 10
+        Time -> 11
+        DateTime -> 12
+        Timestamp -> 13
+        Interval -> 14
+        Uuid -> 15
+        Record(_) -> 16
+        Union(_) -> 17
+        Bag(_) -> 18
+        List(_) -> 19
+        Nullable(_) -> 20
+        Int8 -> 21
+        UInt8 -> 22
+        UInt16 -> 23
+        UInt32 -> 24
+        UInt64 -> 25
+        Json -> 26
+    end kind
+
+    /** The octets one value occupies in a result column, or 0 where the type is not fixed-width
+     * (`wire-protocol.md` §6.2).
+     */
+    width(self) -> usize = self match
+        Bool | Int8 | UInt8 -> 1
+        Int16 | UInt16 -> 2
+        Int32 | UInt32 | Float32 | Date -> 4
+        Int64 | UInt64 | Float64 | Time | DateTime | Timestamp -> 8
+        Int128 | Decimal(_, _) | Interval | Uuid -> 16
+        _ -> 0
+
+    is_nullable(self) -> bool = self match
+        Nullable(_) -> true
+        _ -> false
+
+    /** The type with its nullability taken off; a non-nullable type is itself. */
+    base(self) -> Type = self match
+        Nullable(inner) -> *inner
+        _ -> self
+
+    is_relation(self) -> bool = self match
+        Bag(_) | List(_) -> true
+        _ -> false
+end Type
+
+/** `t?`, which is `t` itself when `t` is already nullable (`query-tree.md` §2.2 rule 1). */
+nullable(t: Type) -> Type = if t.is_nullable() then t else Nullable(t)
+
+record(fields: []const Field) -> Type
+    val b = buf[Field]()
+    b.extend(fields)
+    Record(b)
+
+union_of(variants: []const Field) -> Type
+    val b = buf[Field]()
+    b.extend(variants)
+    Union(b)
+
+bag(elem: Type) -> Type = Bag(elem)
+
+list(elem: Type) -> Type = List(elem)
+
+// -- the canonical encoding, query-tree.md §12.3 -------------------------------------------------
+
+/** `t` as a `Type` node, appended to `out`. */
+encode_type(t: Type, out: Buf[u8])
+    val body = buf[u8]()
+
+    t match
+        Decimal(p, s) ->
+            push_uvar(body, u64(p))
+            push_uvar(body, u64(s))
+        Nullable(inner) -> encode_type(*inner, body)
+        Record(fields) -> encode_members(fields, body)
+        Union(variants) -> encode_members(variants, body)
+        Bag(elem) -> encode_type(*elem, body)
+        List(elem) -> encode_type(*elem, body)
+        _ -> ()
+
+    push_uvar(out, t.kind())
+    push_uvar(out, u64(body.len()))
+    out.extend(body.view())
+end encode_type
+
+private encode_members(members: Buf[Field], out: Buf[u8])
+    push_uvar(out, u64(members.len()))
+
+    for m in members
+        push_uvar(out, u64(m.name.len))
+        out.extend(m.name.bytes)
+        encode_type(m.ty, out)
+
+/** How deep a type may nest before it is refused with `Q1006` (`errors.md`: at least 256). */
+const MaxTypeDepth: usize = 256
+
+/** The `Type` node that is the whole of `bytes`, validated as `query-tree.md` §2 and §12 require. */
+decode_type(bytes: []const u8) -> Result[Type, CodecError]
+    var r = Reader(bytes, 0)
+    val t = read_type(&r, 0)?
+
+    if r.at != bytes.len then return fail("Q1001", "octets follow the type")
+
+    Ok(t)
+
+/** A `ResultHeader.result_type`: a type that is also a relation, as `wire-protocol.md` §6.1 rule 1
+ * requires of a result. Anything else is `W1008`.
+ */
+decode_result_type(bytes: []const u8) -> Result[Type, CodecError]
+    val t = decode_type(bytes)?
+
+    if !t.is_relation() then return fail("W1008", "a result type must be a bag or a list")
+
+    Ok(t)
+
+private read_type(r: *Reader, depth: usize) -> Result[Type, CodecError]
+    if depth >= MaxTypeDepth then return fail("Q1006", "the type nests too deeply")
+
+    val kind = r.uvar()?
+    val len = r.uvar()?
+    var body = Reader(r.take(len)?, 0)
+    val t = read_body(&body, kind, depth)?
+
+    if body.left() != 0 then return fail("Q1001", "a type node's payload length does not match its contents")
+
+    Ok(t)
+
+private read_body(r: *Reader, kind: u64, depth: usize) -> Result[Type, CodecError] = kind match
+    0 -> Ok(Bool)
+    1 -> Ok(Int16)
+    2 -> Ok(Int32)
+    3 -> Ok(Int64)
+    4 -> Ok(Int128)
+    5 -> Ok(Float32)
+    6 -> Ok(Float64)
+    7 -> read_decimal(r)
+    8 -> Ok(Text)
+    9 -> Ok(Bytes)
+    10 -> Ok(Date)
+    11 -> Ok(Time)
+    12 -> Ok(DateTime)
+    13 -> Ok(Timestamp)
+    14 -> Ok(Interval)
+    15 -> Ok(Uuid)
+    16 -> Ok(Record(read_members(r, depth, false)?))
+    17 -> Ok(Union(read_members(r, depth, true)?))
+    18 -> Ok(Bag(read_elem(r, depth)?))
+    19 -> Ok(List(read_elem(r, depth)?))
+    20 -> read_nullable(r, depth)
+    21 -> Ok(Int8)
+    22 -> Ok(UInt8)
+    23 -> Ok(UInt16)
+    24 -> Ok(UInt32)
+    25 -> Ok(UInt64)
+    26 -> Ok(Json)
+    32..63 -> fail("W1008", "a result type is structural and may not name a catalog type")
+    _ -> fail("Q1002", "unknown or reserved type kind")
+end read_body
+
+private read_decimal(r: *Reader) -> Result[Type, CodecError]
+    val p = r.uvar()?
+    val s = r.uvar()?
+
+    if p < 1 || p > 38 || s > p then return fail("Q3011", "decimal precision or scale out of range")
+
+    Ok(Decimal(u8(p), u8(s)))
+
+private read_nullable(r: *Reader, depth: usize) -> Result[Type, CodecError]
+    val inner = read_type(r, depth + 1)?
+
+    if inner.is_nullable() then return fail("Q1003", "a nullable type wraps a nullable type")
+
+    Ok(Nullable(inner))
+
+private read_elem(r: *Reader, depth: usize) -> Result[Type, CodecError]
+    val elem = read_type(r, depth + 1)?
+
+    if elem.base().is_relation() then
+        return fail("Q3014", "a relation's element may not be a relation")
+
+    Ok(elem)
+
+// A record's fields or a union's variants. Names are non-empty and unique (`Q3015`); a union has 1
+// to 65,536 variants (`Q3016`), each payload a record (`Q3014`).
+private read_members(r: *Reader, depth: usize, variants: bool) -> Result[Buf[Field], CodecError]
+    val count = r.uvar()?
+
+    if variants && (count == 0 || count > 65536) then
+        return fail("Q3016", "a union has from 1 to 65,536 variants")
+
+    val members = buf[Field]()
+    val seen = set[string]()
+
+    for _ in 0..<count
+        val name = r.str()?
+
+        if name.len == 0 || !seen.add(name) then
+            return fail("Q3015", "a member name is empty or repeated")
+
+        val ty = read_type(r, depth + 1)?
+
+        if variants then
+            ty match
+                Record(_) -> ()
+                _ -> return fail("Q3014", "a union variant's payload must be a record")
+
+        members.push(Field(name, ty))
+
+    Ok(members)
+end read_members
