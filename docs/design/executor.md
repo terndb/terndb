@@ -8,9 +8,9 @@ written into `query-tree.md` itself, and this note points at it.
 
 The code is `sh/sysl/terndb/exec_*.sysl`. This first slice covers what does not depend on storage:
 column vectors, expression evaluation, and the operators `Values`, `ParamScan`, `Filter`,
-`Project`, `Sort`, `Limit`, `Distinct`, `Tag` and `Join` (§4.1), a source over in-memory batches
-standing in for `Scan`, and the conversion of an operator's output into result batches. Aggregates,
-windows, `Nest`/`Unnest`, `Apply`, set operations, DML, storage, MVCC and the planner come later.
+`Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Tag` and `Join` (§4.1), a source over in-memory
+batches standing in for `Scan`, and the conversion of an operator's output into result batches.
+Windows, `Nest`/`Unnest`, `Apply`, set operations, DML, storage, MVCC and the planner come later.
 
 ## 1. Column vectors
 
@@ -175,6 +175,19 @@ correct and slow, and are the first candidates for kernels when a benchmark asks
 - **Distinct** (§6.11): sorts every row by `cmp` over its fields (stable) and keeps the first of each
   run of rows that compare equal, which is `same` by §3.3. It is blocking; a hash-based, streaming
   Distinct waits on a fast hash (the survey's gap).
+- **Aggregate** (§6.7, `exec_agg.sysl`): sort-based. It drains its input, evaluates the grouping
+  keys over every row, orders the rows by them with `Sort`'s stable comparator (`cmp`, nulls first),
+  and takes each run of rows that compare equal as a group, which is `same` by §3.3; with no keys every
+  row is one group, empty or not. A call's `filter` becomes a row list and its arguments and `order`
+  keys are evaluated on those rows only (§6.7 rule 5); each group is then a list of positions in the
+  call's own vectors, sorted by the call's `order` and thinned by `distinct` (a stable sort of the
+  group by its arguments, keeping the first of each run). `count`, `sum` and `bool_and`/`bool_or`
+  run on the typed lanes; integer and decimal `sum` accumulates in `i256` and checks the result type's
+  bound once per group (`R0001`, §6.7 rule 7), so the error does not depend on the rows' order; `min`
+  and `max` choose a row per group with `slot_order` and gather it with `take`; `collect` is one
+  `take` and the group bounds as offsets; `string_agg` concatenates the `Bins` directly. Hash
+  aggregation, which streams and needs no sort, is intended once sysl has a fast seeded hash (the
+  survey's gap, as for `Distinct`).
 - **Tag** (§6.15): the rows coerced to the payload, wrapped as variant `tag`.
 - **MemSource**: a list of batches, standing in for `Scan`.
 
@@ -244,11 +257,13 @@ join would block on the build side only.
 ## 5. What this note relies on in `query-tree.md`
 
 §3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
-the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.5, §6.9–§6.11 and §6.15 for the
-operators; §7.1–§7.8 and §7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and its
-output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
+the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.5, §6.7, §6.9–§6.11 and §6.15 for
+the operators; §7.1–§7.8 and §7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
+its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
 `and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the calendar `add`
-(all in §7.12); when a join's `on` is evaluated and `single`'s `R0003` (§6.5 rules 8 and 9).
+(all in §7.12); when a join's `on` is evaluated and `single`'s `R0003` (§6.5 rules 8 and 9); a
+group's key, `filter`, `distinct`, and the values of `sum`, `min`, `max` and `string_agg` (§6.7 rules
+5–7).
 
 ## 6. Where the survey's sysl gaps cost speed
 

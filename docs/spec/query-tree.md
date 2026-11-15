@@ -451,6 +451,21 @@ conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as
    with `cmp`); `bool_and`, `bool_or`; `collect(x)` where `x` is a record, union or scalar (§2.5) → `bag<X>`, or
    `list<X>` when `order` is non-empty. Over an empty set every core aggregate except `count` and
    `collect` (empty relation) yields null, so its result type is nullable.
+5. A group's key is the value of its first row in input order (it matters where `same` values differ:
+   `−0.0` and `+0.0`, two NaN payloads). `filter` is evaluated on every row; the call sees a row on
+   which it is `true` and drops one on which it is `false` or null. The call's arguments and `order`
+   keys are evaluated only on the rows it sees, so a runtime error in them does not occur on a dropped
+   row. A call reads its rows in its `order` (stably), or in input order without one.
+6. `distinct` drops every row whose arguments are all `same` (§3.1) as those of a row read before it,
+   keeping the first; `count()` with `distinct` is therefore 1 over a non-empty set.
+7. Every core aggregate but `count()` and `collect` ignores a null argument; `collect` keeps nulls.
+   `sum` of integers or decimals is exact and is `R0001` exactly when the sum lies outside the result
+   type (`int128`, or an unscaled value beyond `10³⁸ − 1` in magnitude), whatever the order of the
+   rows. `sum` of floats is the IEEE sum in `float64`, taken in reading order **starting from the first
+   value** (so the sum of `−0.0` alone is `−0.0`); a NaN makes it NaN, and `+∞` with `−∞` is NaN.
+   `min` and `max` keep the first of values equal under `cmp`. `string_agg(v, sep)` joins the non-null
+   values in reading order, each after the first preceded by its own row's `sep` (nothing where `sep`
+   is null), and is null where there is no non-null value.
 
 ### 6.8 Window
 
