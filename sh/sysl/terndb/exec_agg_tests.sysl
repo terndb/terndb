@@ -1,0 +1,636 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{infinity, nan}
+
+// `Aggregate` (`query-tree.md` §6.7), pulled through the type checker and the planner over a table
+// `app.t` held as batches of chosen sizes: every core aggregate over nulls, all-null and empty
+// input, grouped and global, with DISTINCT, FILTER and `order`; and the whole of it against a
+// value-at-a-time reference built on `compare.sysl` over generated rows.
+
+/** `rows` cut into batches of the sizes in `sizes`, as far as the rows reach, the rest in one more. */
+private xg_batches(elem: Type, rows: []const Value, sizes: []const usize) -> Buf[ColumnVector]
+    val out = buf[ColumnVector]()
+    var at: usize = 0
+
+    for s in sizes
+        val end = if at + s < rows.len then at + s else rows.len
+        out.push(vector_of(elem, rows[at..<end]))
+        at = end
+
+    if at < rows.len then out.push(vector_of(elem, rows[at..]))
+
+    out
+
+/** The `Aggregate` of `keys` and `aggs` over `app.t` of `cols` holding `rows` in batches of `sizes`:
+ * the binder's element type and every row handed up.
+ */
+private xg_run_sized(cols: []const Field, rows: []const Value, sizes: []const usize, keys: []const Item, aggs: []const NamedAgg) -> Result[(Type, Buf[Value]), CodecError]
+    val q = envelope([], Query(Aggregate(scan("app", "t", "t"), "a", items_of(keys), items_of(aggs))))
+    val typing = type_envelope(q, xe_catalog(cols))?
+    val table = MemTable(QualName("app", "t"), xg_batches(record(cols), rows, sizes))
+    val root = plan_query(q, typing, xe_ctx([]), items_of([table]))
+    val out = buf[Value]()
+
+    for b in drain(root.op)?
+        assert(b.len > 0 && b.len <= BatchSize)
+        assert(b.ty == root.elem)
+        out.extend(values_of(b).view())
+
+    Ok((root.elem, out))
+
+private xg_run(cols: []const Field, rows: []const Value, keys: []const Item, aggs: []const NamedAgg) -> Result[(Type, Buf[Value]), CodecError] =
+    xg_run_sized(cols, rows, [], keys, aggs)
+
+private xg_rows(cols: []const Field, rows: []const Value, keys: []const Item, aggs: []const NamedAgg) -> Buf[Value] =
+    xg_run(cols, rows, keys, aggs).unwrap().1
+
+private xg_code(r: Result[(Type, Buf[Value]), CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+private xg_call(f: string, args: []const Expr) -> AggCall = AggCall(f, items_of(args), false, None, buf[SortKey]())
+
+private xg_distinct(f: string, args: []const Expr) -> AggCall = AggCall(f, items_of(args), true, None, buf[SortKey]())
+
+private xg_filtered(f: string, args: []const Expr, filter: Expr) -> AggCall = AggCall(f, items_of(args), false, Some(filter), buf[SortKey]())
+
+private xg_ordered(f: string, args: []const Expr, distinct: bool, order: []const SortKey) -> AggCall = AggCall(f, items_of(args), distinct, None, items_of(order))
+
+private xg_t(name: string) -> Expr = col("t", name)
+
+private xg_f(x: real) -> Value = Float(x)
+
+/** Whether `v` is a float that is −0. */
+private xg_negative_zero(v: Value) -> bool = v match
+    Float(x) -> x == 0.0 && 1.0 / x < 0.0
+    _ -> false
+
+private xg_is_nan(v: Value) -> bool = v match
+    Float(x) -> x.is_nan()
+    _ -> false
+
+// -- empty input ----------------------------------------------------------------------------------
+
+private xg_every_call() -> [10]NamedAgg = [
+    NamedAgg("n", xg_call("count", [])),
+    NamedAgg("nv", xg_call("count", [xg_t("v")])),
+    NamedAgg("s", xg_call("sum", [xg_t("v")])),
+    NamedAgg("lo", xg_call("min", [xg_t("v")])),
+    NamedAgg("hi", xg_call("max", [xg_t("v")])),
+    NamedAgg("all", xg_call("bool_and", [xg_t("b")])),
+    NamedAgg("any", xg_call("bool_or", [xg_t("b")])),
+    NamedAgg("vs", xg_call("collect", [xg_t("v")])),
+    NamedAgg("ol", xg_ordered("collect", [xg_t("v")], false, [SortKey(xg_t("v"), false, false)])),
+    NamedAgg("gs", xg_call("string_agg", [xg_t("g"), Literal(Text, Text(","))])),
+]
+
+private xg_small_cols() -> [4]Field = [Field("k", nullable(Int64)), Field("v", nullable(Int64)), Field("b", nullable(Bool)), Field("g", nullable(Text))]
+
+@test
+a_global_aggregate_of_empty_input_is_one_row()
+    val (elem, rows) = xg_run(xg_small_cols(), [], [], xg_every_call()).unwrap()
+    assert_eq(rows.len(), 1)
+    // count is never null; collect is the empty relation; every other aggregate is null (§6.7 rule 4).
+    val want = rec([Int(0), Int(0), Null, Null, Null, Null, Null, rel([]), rel([]), Null])
+    assert(same(elem, rows[0], want), s"${rows[0]}")
+
+@test
+the_result_types_are_the_type_checkers()
+    val (elem, _) = xg_run(xg_small_cols(), [], [item("k", xg_t("k"))], xg_every_call()).unwrap()
+    val want = record([
+        Field("k", nullable(Int64)), Field("n", Int64), Field("nv", Int64), Field("s", nullable(Int128)),
+        Field("lo", nullable(Int64)), Field("hi", nullable(Int64)), Field("all", nullable(Bool)),
+        Field("any", nullable(Bool)), Field("vs", bag(nullable(Int64))), Field("ol", list(nullable(Int64))),
+        Field("gs", nullable(Text))])
+    assert(elem == want)
+
+@test
+a_grouped_aggregate_of_empty_input_has_no_rows()
+    assert_eq(xg_rows(xg_small_cols(), [], [item("k", xg_t("k"))], xg_every_call()).len(), 0)
+
+@test
+an_input_of_only_nulls_aggregates_to_nulls_and_zero_counts()
+    val rows = buf[Value]()
+
+    for _ in 0..<5
+        rows.push(rec([Int(1), Null, Null, Null]))
+
+    val (elem, got) = xg_run(xg_small_cols(), rows.view(), [item("k", xg_t("k"))], xg_every_call()).unwrap()
+    assert_eq(got.len(), 1)
+    val nulls = rel([Null, Null, Null, Null, Null])
+    val want = rec([Int(1), Int(5), Int(0), Null, Null, Null, Null, Null, nulls, nulls, Null])
+    assert(same(elem, got[0], want), s"${got[0]}")
+
+@test
+every_aggregate_skips_nulls_but_count_and_collect()
+    val rows = [
+        rec([Int(1), Int(4), Bool(true), Text("x")]),
+        rec([Int(1), Null, Null, Null]),
+        rec([Int(1), Int(-2), Bool(false), Text("y")]),
+        rec([Int(1), Int(7), Null, Text("z")])]
+    val (elem, got) = xg_run(xg_small_cols(), rows, [], xg_every_call()).unwrap()
+    val want = rec([Int(4), Int(3), Int(9), Int(-2), Int(7), Bool(false), Bool(true), rel([Int(4), Null, Int(-2), Int(7)]),
+        rel([Int(-2), Int(4), Int(7), Null]), Text("x,y,z")])
+    assert(same(elem, got[0], want), s"${got[0]}")
+    // The ordered collect is a list, nulls last as its key says.
+    xe_field(got[0], 8) match
+        Relation(es) -> assert(es[3] == Null && es[0] == Int(-2))
+        _ -> assert(false)
+
+// -- grouping ---------------------------------------------------------------------------------------
+
+@test
+a_null_grouping_key_is_one_group_and_sorts_first()
+    val rows = [rec([Null, Int(1), Null, Null]), rec([Int(2), Int(10), Null, Null]), rec([Null, Int(3), Null, Null]), rec([Int(2), Int(20), Null, Null])]
+    val got = xg_rows(xg_small_cols(), rows, [item("k", xg_t("k"))], [NamedAgg("s", xg_call("sum", [xg_t("v")]))])
+    assert_eq(got.len(), 2)
+    assert(got[0] == rec([Null, Int(4)]))
+    assert(got[1] == rec([Int(2), Int(30)]))
+
+@test
+groups_span_batch_boundaries_and_the_output_is_cut_into_batches()
+    // Key i % 3 puts every group in every batch; key i makes more groups than one batch holds.
+    for n in [1, BatchSize - 1, BatchSize, BatchSize + 1, 3 * BatchSize + 7]
+        val rows = buf[Value]()
+
+        for i in 0..<n
+            rows.push(rec([Int(i128(i)), Int(1), Null, Null]))
+
+        for sizes in [[1, 2, BatchSize - 3], [BatchSize, 0, BatchSize], [7, 7, 7]]
+            val (_, by3) = xg_run_sized(xg_small_cols(), rows.view(), sizes, [item("m", call("mod", [xg_t("k"), xe_lit(3)]))], [NamedAgg("n", xg_call("count", []))]).unwrap()
+            var total: i128 = 0
+
+            for r in by3
+                xe_field(r, 1) match
+                    Int(c) -> total += c
+                    _ -> assert(false)
+
+            assert_eq(by3.len(), if n < 3 then n else 3)
+            assert_eq(total, i128(n))
+
+            val (_, each) = xg_run_sized(xg_small_cols(), rows.view(), sizes, [item("k", xg_t("k"))], [NamedAgg("n", xg_call("count", []))]).unwrap()
+            assert_eq(each.len(), n)
+
+            for i in 0..<n
+                assert(each[i] == rec([Int(i128(i)), Int(1)]))
+
+@test
+record_and_nested_record_keys_group_by_same()
+    val key: Expr = Record(items_of([item("a", xg_t("k")), item("in", Record(items_of([item("c", xg_t("g"))])))]))
+    val rows = [
+        rec([Int(1), Int(1), Null, Text("x")]),
+        rec([Int(1), Int(2), Null, Null]),
+        rec([Null, Int(4), Null, Text("x")]),
+        rec([Int(1), Int(8), Null, Text("x")]),
+        rec([Int(1), Int(16), Null, Null]),
+        rec([Null, Int(32), Null, Text("x")]),
+        rec([Int(2), Int(64), Null, Text("x")])]
+    val (elem, got) = xg_run(xg_small_cols(), rows, [item("r", key)], [NamedAgg("s", xg_call("sum", [xg_t("v")]))]).unwrap()
+    // Records order field by field with null below every value (§3.3), and null fields group together.
+    assert_eq(got.len(), 4)
+    val inner = record([Field("c", nullable(Text))])
+    assert(elem == record([Field("r", record([Field("a", nullable(Int64)), Field("in", inner)])), Field("s", nullable(Int128))]))
+    assert(same(elem, got[0], rec([rec([Null, rec([Text("x")])]), Int(36)])))
+    assert(same(elem, got[1], rec([rec([Int(1), rec([Null])]), Int(18)])))
+    assert(same(elem, got[2], rec([rec([Int(1), rec([Text("x")])]), Int(9)])))
+    assert(same(elem, got[3], rec([rec([Int(2), rec([Text("x")])]), Int(64)])))
+
+@test
+float_keys_group_both_zeros_and_every_nan_together()
+    val cols = [Field("f", nullable(Float64))]
+    val rows = [rec([xg_f(-0.0)]), rec([xg_f(nan())]), rec([xg_f(0.0)]), rec([xg_f(-nan())]), rec([Null])]
+    val got = xg_rows(cols, rows, [item("f", xg_t("f"))], [NamedAgg("n", xg_call("count", []))])
+    assert_eq(got.len(), 3)
+    assert(got[0] == rec([Null, Int(1)]))
+    // A group's key is its first row's: −0 here.
+    assert(xg_negative_zero(xe_field(got[1], 0)))
+    assert(xe_field(got[1], 1) == Int(2))
+    assert(xg_is_nan(xe_field(got[2], 0)) && xe_field(got[2], 1) == Int(2))
+
+// -- sum ----------------------------------------------------------------------------------------------
+
+@test
+an_integer_sum_widens_to_int128()
+    val cols = [Field("v", Int64)]
+    val max = Int(9223372036854775807)
+    val got = xg_rows(cols, [rec([max]), rec([max]), rec([max])], [], [NamedAgg("s", xg_call("sum", [xg_t("v")]))])
+    assert(got[0] == rec([Int(3 * i128(9223372036854775807))]))
+
+@test
+a_sum_outside_its_type_is_r0001_and_the_order_of_rows_does_not_matter()
+    val cols = [Field("v", Int128)]
+    val max: i128 = 170141183460469231731687303715884105727
+    val s = [NamedAgg("s", xg_call("sum", [xg_t("v")]))]
+    assert_eq(xg_code(xg_run(cols, [rec([Int(max)]), rec([Int(1)])], [], s)), "R0001")
+    assert_eq(xg_code(xg_run(cols, [rec([Int(-max)]), rec([Int(-2)])], [], s)), "R0001")
+    // The running sum passes the bound, but the sum does not.
+    assert(xg_rows(cols, [rec([Int(max)]), rec([Int(1)]), rec([Int(-1)])], [], s)[0] == rec([Int(max)]))
+    // A group of its own overflows too, and the rows across batches count.
+    val many = buf[Value]()
+
+    for i in 0..<BatchSize + 3
+        many.push(rec([Int(if i % 2 == 0 then max / 400 else 1)]))
+
+    assert_eq(xg_code(xg_run_sized(cols, many.view(), [5, BatchSize], [], s)), "R0001")
+    // A filter that drops the rows that would overflow avoids the error.
+    val f = [NamedAgg("s", xg_filtered("sum", [xg_t("v")], call("lt", [xg_t("v"), Literal(Int128, Int(2))])))]
+    assert(xg_rows(cols, many.view(), [], f)[0] == rec([Int(i128((BatchSize + 3) / 2))]))
+
+@test
+a_decimal_sum_is_decimal_38_at_the_inputs_scale_and_overflows_at_ten_to_the_38()
+    val cols = [Field("d", nullable(Decimal(5, 2)))]
+    val (elem, got) = xg_run(cols, [rec([Int(123)]), rec([Null]), rec([Int(-456)]), rec([Int(99999)])], [], [NamedAgg("s", xg_call("sum", [xg_t("d")]))]).unwrap()
+    assert(elem == record([Field("s", nullable(Decimal(38, 2)))]))
+    assert(got[0] == rec([Int(99666)]))
+
+    val wide = [Field("d", Decimal(38, 4))]
+    val big = 6 * pow10(37)
+    val s = [NamedAgg("s", xg_call("sum", [xg_t("d")]))]
+    assert_eq(xg_code(xg_run(wide, [rec([Int(big)]), rec([Int(big)])], [], s)), "R0001")
+    assert_eq(xg_code(xg_run(wide, [rec([Int(-big)]), rec([Int(-big)])], [], s)), "R0001")
+    // 10³⁸ − 1 is the greatest unscaled decimal(38, s).
+    val top = pow10(38) - 1
+    assert(xg_rows(wide, [rec([Int(top - 1)]), rec([Int(1)])], [], s)[0] == rec([Int(top)]))
+    assert_eq(xg_code(xg_run(wide, [rec([Int(top)]), rec([Int(1)])], [], s)), "R0001")
+
+private xg_float_sum(xs: []const Value) -> Value
+    val rows = buf[Value]()
+
+    for x in xs
+        rows.push(rec([x]))
+
+    xe_field(xg_rows([Field("f", nullable(Float64))], rows.view(), [], [NamedAgg("s", xg_call("sum", [xg_t("f")]))])[0], 0)
+
+@test
+a_float_sum_propagates_nan_and_keeps_the_sign_of_zero()
+    assert(xg_is_nan(xg_float_sum([xg_f(1.0), xg_f(nan()), xg_f(2.0)])))
+    assert(xg_is_nan(xg_float_sum([xg_f(infinity()), xg_f(-infinity())])))
+    assert(xg_float_sum([xg_f(infinity()), xg_f(1.0)]) == xg_f(infinity()))
+    assert(xg_negative_zero(xg_float_sum([xg_f(-0.0)])))
+    assert(xg_negative_zero(xg_float_sum([xg_f(-0.0), Null, xg_f(-0.0)])))
+    val mixed = xg_float_sum([xg_f(-0.0), xg_f(0.0)])
+    assert(mixed == xg_f(0.0) && !xg_negative_zero(mixed))
+    assert(xg_float_sum([Null, Null]) == Null)
+    assert(xg_float_sum([xg_f(0.5), Null, xg_f(-2.25)]) == xg_f(-1.75))
+
+@test
+a_float32_sum_is_float64()
+    val (elem, got) = xg_run([Field("f", Float32)], [rec([xg_f(1.5)]), rec([xg_f(2.25)])], [], [NamedAgg("s", xg_call("sum", [xg_t("f")]))]).unwrap()
+    assert(elem == record([Field("s", nullable(Float64))]))
+    assert(got[0] == rec([xg_f(3.75)]))
+
+// -- min and max ---------------------------------------------------------------------------------------
+
+@test
+min_and_max_order_by_cmp_and_keep_the_first_of_equals()
+    val fs = [Field("f", nullable(Float64))]
+    val mm = [NamedAgg("lo", xg_call("min", [xg_t("f")])), NamedAgg("hi", xg_call("max", [xg_t("f")]))]
+    val got = xg_rows(fs, [rec([xg_f(1.0)]), rec([xg_f(nan())]), rec([Null]), rec([xg_f(infinity())]), rec([xg_f(-infinity())])], [], mm)
+    assert(xe_field(got[0], 0) == xg_f(-infinity()))
+    assert(xg_is_nan(xe_field(got[0], 1)))
+    // −0 and +0 are equal under cmp, so the first of them is kept.
+    val zeros = xg_rows(fs, [rec([xg_f(0.0)]), rec([xg_f(-0.0)])], [], mm)
+    assert(!xg_negative_zero(xe_field(zeros[0], 0)) && !xg_negative_zero(xe_field(zeros[0], 1)))
+    val zeros2 = xg_rows(fs, [rec([xg_f(-0.0)]), rec([xg_f(0.0)])], [], mm)
+    assert(xg_negative_zero(xe_field(zeros2[0], 0)) && xg_negative_zero(xe_field(zeros2[0], 1)))
+
+@test
+min_and_max_of_text_and_of_records()
+    val cols = [Field("k", Int64), Field("g", nullable(Text))]
+    val rows = [rec([Int(2), Text("pear")]), rec([Int(1), Text("apple")]), rec([Int(1), Null]), rec([Int(2), Text("apples")])]
+    val r: Expr = Record(items_of([item("k", xg_t("k")), item("g", xg_t("g"))]))
+    val aggs = [NamedAgg("lo", xg_call("min", [xg_t("g")])), NamedAgg("hi", xg_call("max", [xg_t("g")])),
+        NamedAgg("rlo", xg_call("min", [r])), NamedAgg("rhi", xg_call("max", [r]))]
+    val (elem, got) = xg_run(cols, rows, [], aggs).unwrap()
+    // A record's null field sorts below every value (§3.3), so (1, null) is the least.
+    val want = rec([Text("apple"), Text("pear"), rec([Int(1), Null]), rec([Int(2), Text("pear")])])
+    assert(same(elem, got[0], want), s"${got[0]}")
+
+// -- DISTINCT, FILTER and order ------------------------------------------------------------------------
+
+@test
+distinct_keeps_one_of_each_same_argument()
+    val cols = [Field("k", Int64), Field("v", nullable(Int64)), Field("f", Float64)]
+    val rows = [
+        rec([Int(1), Int(1), xg_f(-0.0)]), rec([Int(1), Int(1), xg_f(0.0)]), rec([Int(1), Int(2), xg_f(nan())]),
+        rec([Int(1), Null, xg_f(nan())]), rec([Int(1), Int(2), xg_f(1.0)]), rec([Int(1), Int(3), xg_f(1.0)]), rec([Int(1), Null, xg_f(1.0)])]
+    // count takes at most one argument, so a pair of them is a record.
+    val pair: Expr = Record(items_of([item("v", xg_t("v")), item("f", xg_t("f"))]))
+    val aggs = [
+        NamedAgg("n", xg_distinct("count", [xg_t("v")])),
+        NamedAgg("s", xg_distinct("sum", [xg_t("v")])),
+        NamedAgg("vs", xg_distinct("collect", [xg_t("v")])),
+        NamedAgg("fs", xg_distinct("count", [xg_t("f")])),
+        NamedAgg("rows", xg_distinct("count", [])),
+        NamedAgg("ol", xg_ordered("collect", [xg_t("v")], true, [SortKey(xg_t("v"), true, false)])),
+        NamedAgg("pairs", xg_distinct("count", [pair]))]
+    val (elem, got) = xg_run(cols, rows, [], aggs).unwrap()
+    // −0 and +0 are one value, and every NaN is one value (§3.1).
+    val want = rec([Int(3), Int(6), rel([Int(1), Int(2), Null, Int(3)]), Int(3), Int(1), rel([Int(3), Int(2), Int(1), Null]), Int(6)])
+    assert(same(elem, got[0], want), s"${got[0]}")
+    xe_field(got[0], 5) match
+        Relation(es) -> assert(es[0] == Int(3) && es[3] == Null)
+        _ -> assert(false)
+
+    val none = xg_rows(cols, [], [], [NamedAgg("n", xg_distinct("count", [xg_t("v")])), NamedAgg("rows", xg_distinct("count", []))])
+    assert(none[0] == rec([Int(0), Int(0)]))
+
+@test
+filter_restricts_the_rows_a_call_sees()
+    val cols = [Field("k", Int64), Field("v", nullable(Int64))]
+    val rows = [rec([Int(1), Int(5)]), rec([Int(1), Int(0)]), rec([Int(1), Null]), rec([Int(2), Int(0)]), rec([Int(1), Int(-3)])]
+    val pos = call("gt", [xg_t("v"), xe_lit(0)])
+    val aggs = [
+        NamedAgg("n", xg_filtered("count", [], pos)),
+        NamedAgg("s", xg_filtered("sum", [xg_t("v")], pos)),
+        // The filter is null on the null row, which it drops as it drops a false one.
+        NamedAgg("vs", xg_filtered("collect", [xg_t("v")], call("ne", [xg_t("v"), xe_lit(5)]))),
+        // Division by zero would be R0002 on the rows the filter drops; it is never evaluated there.
+        NamedAgg("q", xg_filtered("sum", [call("div", [xe_lit(10), xg_t("v")])], call("ne", [xg_t("v"), xe_lit(0)])))]
+    val (elem, got) = xg_run(cols, rows, [item("k", xg_t("k"))], aggs).unwrap()
+    assert_eq(got.len(), 2)
+    assert(same(elem, got[0], rec([Int(1), Int(1), Int(5), rel([Int(0), Int(-3)]), Int(2 + -3)])), s"${got[0]}")
+    // A group the filter empties: count 0, sum null, collect empty.
+    assert(same(elem, got[1], rec([Int(2), Int(0), Null, rel([Int(0)]), Null])), s"${got[1]}")
+    val unfiltered = [NamedAgg("q", xg_call("sum", [call("div", [xe_lit(10), xg_t("v")])]))]
+    assert_eq(xg_code(xg_run(cols, rows, [], unfiltered)), "R0002")
+
+@test
+order_sorts_each_group_for_collect_and_string_agg()
+    val cols = [Field("k", Int64), Field("g", nullable(Text)), Field("s", nullable(Text)), Field("n", Int64)]
+    val rows = [
+        rec([Int(1), Text("c"), Text("/"), Int(4)]),
+        rec([Int(1), Text("a"), Text("-"), Int(1)]),
+        rec([Int(2), Null, Text("+"), Int(9)]),
+        rec([Int(1), Null, Text("+"), Int(2)]),
+        rec([Int(1), Text("b"), Null, Int(3)])]
+    val by_n = [SortKey(xg_t("n"), false, false)]
+    val aggs = [
+        NamedAgg("j", xg_ordered("string_agg", [xg_t("g"), xg_t("s")], false, by_n)),
+        NamedAgg("back", xg_ordered("collect", [xg_t("n")], false, [SortKey(xg_t("n"), true, false)])),
+        NamedAgg("plain", xg_call("string_agg", [xg_t("g"), Literal(Text, Text(""))]))]
+    val (elem, got) = xg_run(cols, rows, [item("k", xg_t("k"))], aggs).unwrap()
+    // Each value after the first is preceded by its own row's separator, and by none where that is null.
+    assert(same(elem, got[0], rec([Int(1), Text("ab/c"), rel([Int(4), Int(3), Int(2), Int(1)]), Text("cab")])), s"${got[0]}")
+    xe_field(got[0], 2) match
+        Relation(es) -> assert(es[0] == Int(4) && es[3] == Int(1))
+        _ -> assert(false)
+    // Only null values: null.
+    assert(same(elem, got[1], rec([Int(2), Null, rel([Int(9)]), Null])), s"${got[1]}")
+
+// -- agreement with a value-at-a-time reference -------------------------------------------------------
+
+private xg_cols() -> [6]Field = [
+    Field("k", nullable(Int64)), Field("g", nullable(Text)), Field("v", nullable(Int64)),
+    Field("f", nullable(Float64)), Field("b", nullable(Bool)), Field("d", nullable(Decimal(10, 2)))]
+
+/** Row `i`: nulls in every column but `k` per `pattern` (0 none, 1 some, 2 all), and in `k` on every
+ * eleventh row.
+ */
+private xg_row(i: usize, pattern: int) -> Value
+    val blank = pattern == 2 || (pattern == 1 && i % 3 == 1)
+    val k = if i % 11 == 0 then Null else Int(i128((i * 7) % 5))
+    val f = if i % 23 == 7 then nan() elif i % 29 == 3 then -0.0 else real(i128((i * 13) % 41) - 20) / 4.0
+
+    if blank then return rec([k, Null, Null, Null, Null, Null])
+
+    rec([k, Text(s"s${i % 4}"), Int(i128((i * 13) % 41) - 20), Float(f), Bool(i % 3 != 0), Int(i128((i * 37) % 1000))])
+
+private xg_agree_calls() -> [14]NamedAgg = [
+    NamedAgg("n", xg_call("count", [])),
+    NamedAgg("nv", xg_call("count", [xg_t("v")])),
+    NamedAgg("sv", xg_call("sum", [xg_t("v")])),
+    NamedAgg("sf", xg_call("sum", [xg_t("f")])),
+    NamedAgg("sd", xg_call("sum", [xg_t("d")])),
+    NamedAgg("lo", xg_call("min", [xg_t("v")])),
+    NamedAgg("hi", xg_call("max", [xg_t("f")])),
+    NamedAgg("lg", xg_call("min", [xg_t("g")])),
+    NamedAgg("all", xg_call("bool_and", [xg_t("b")])),
+    NamedAgg("any", xg_call("bool_or", [xg_t("b")])),
+    NamedAgg("vs", xg_call("collect", [xg_t("v")])),
+    NamedAgg("gs", xg_call("string_agg", [xg_t("g"), Literal(Text, Text(","))])),
+    NamedAgg("dv", xg_distinct("count", [xg_t("v")])),
+    NamedAgg("fv", xg_filtered("sum", [xg_t("v")], xg_t("b")))]
+
+/** Column `j` of `rows`, in order. */
+private xg_column(rows: Buf[Value], j: usize) -> Buf[Value]
+    val out = buf[Value]()
+
+    for r in rows
+        out.push(xe_field(r, j))
+
+    out
+
+private xg_r_count(xs: Buf[Value]) -> Value
+    var n: i128 = 0
+
+    for x in xs
+        if x != Null then n += 1
+
+    Int(n)
+
+private xg_r_sum(xs: Buf[Value]) -> Value
+    var acc: Value = Null
+
+    for x in xs
+        acc = (acc, x) match
+            (_, Null) -> acc
+            (Null, _) -> x
+            (Int(a), Int(b)) -> Int(a + b)
+            (Float(a), Float(b)) -> Float(a + b)
+            _ -> panic("xg_r_sum")
+
+    acc
+
+private xg_r_pick(t: Type, xs: Buf[Value], want: int) -> Value
+    var best: Value = Null
+
+    for x in xs
+        if x != Null && (best == Null || cmp(t, x, best) == want) then best = x
+
+    best
+
+private xg_r_bool(xs: Buf[Value], disjunct: bool) -> Value
+    var acc: Value = Null
+
+    for x in xs
+        acc = (acc, x) match
+            (_, Null) -> acc
+            (Null, _) -> x
+            (Bool(a), Bool(b)) -> Bool(if disjunct then a || b else a && b)
+            _ -> panic("xg_r_bool")
+
+    acc
+
+private xg_r_join(xs: Buf[Value], sep: string) -> Value
+    var acc: Value = Null
+
+    for x in xs
+        acc = (acc, x) match
+            (_, Null) -> acc
+            (Null, _) -> x
+            (Text(a), Text(b)) -> Text(a + sep + b)
+            _ -> panic("xg_r_join")
+
+    acc
+
+private xg_r_distinct(t: Type, xs: Buf[Value]) -> Buf[Value]
+    val out = buf[Value]()
+
+    for x in xs
+        var seen = false
+
+        for y in out
+            if same(t, x, y) then seen = true
+
+        if !seen then out.push(x)
+
+    out
+
+/** The reference: groups found by `same` on `k`, ordered by `cmp`, each aggregated value by value. */
+private xg_expected(rows: Buf[Value]) -> Buf[Value]
+    val kt = nullable(Int64)
+    val keys = buf[Value]()
+    val members = buf[Buf[Value]]()
+
+    for r in rows
+        val k = xe_field(r, 0)
+        var found = false
+
+        for j in 0..<keys.len()
+            if !found && same(kt, keys[j], k)
+                members[j].push(r)
+                found = true
+
+        if !found
+            keys.push(k)
+            val m = buf[Value]()
+            m.push(r)
+            members.push(m)
+
+    // Insertion sort of the groups by key.
+    for a in 1..<keys.len()
+        var b = a
+
+        while b > 0 && cmp(kt, keys[b - 1], keys[b]) > 0
+            val (k, m) = (keys[b - 1], members[b - 1])
+            keys[b - 1] = keys[b]
+            members[b - 1] = members[b]
+            keys[b] = k
+            members[b] = m
+            b -= 1
+
+    val out = buf[Value]()
+
+    for j in 0..<keys.len()
+        val m = members[j]
+        val (g, v, f, b, d) = (xg_column(m, 1), xg_column(m, 2), xg_column(m, 3), xg_column(m, 4), xg_column(m, 5))
+        val kept = buf[Value]()
+
+        for r in m
+            if xe_field(r, 4) == Bool(true) then kept.push(xe_field(r, 2))
+
+        out.push(rec([keys[j], Int(i128(m.len())), xg_r_count(v), xg_r_sum(v), xg_r_sum(f), xg_r_sum(d),
+            xg_r_pick(nullable(Int64), v, -1), xg_r_pick(nullable(Float64), f, 1), xg_r_pick(nullable(Text), g, -1),
+            xg_r_bool(b, false), xg_r_bool(b, true), Relation(v), xg_r_join(g, ","),
+            xg_r_count(xg_r_distinct(nullable(Int64), v)), xg_r_sum(kept)]))
+
+    out
+
+@test
+grouped_aggregates_agree_with_the_value_at_a_time_reference()
+    for n in [0, 1, 12, BatchSize, BatchSize + 1, 2 * BatchSize + 9]
+        for pattern in [0, 1, 2]
+            val rows = buf[Value]()
+
+            for i in 0..<n
+                rows.push(xg_row(i, pattern))
+
+            val want = xg_expected(rows)
+
+            for sizes in [[3, BatchSize - 1, 5], [BatchSize, 0, BatchSize]]
+                val (elem, got) = xg_run_sized(xg_cols(), rows.view(), sizes, [item("k", xg_t("k"))], xg_agree_calls()).unwrap()
+                assert_eq(got.len(), want.len())
+
+                for j in 0..<want.len()
+                    assert(same(elem, got[j], want[j]), s"n $n pattern $pattern group $j: ${got[j]} is not ${want[j]}")
+
+@test
+a_global_aggregate_agrees_with_the_reference()
+    for n in [0, 5, BatchSize + 1]
+        val rows = buf[Value]()
+
+        for i in 0..<n
+            rows.push(xg_row(i, 1))
+
+        // Every row in one group: the reference grouped by a constant key.
+        val keyed = buf[Value]()
+
+        for r in rows
+            r match
+                Record(fs) ->
+                    val c = buf[Value]()
+                    c.push(Int(0))
+                    c.extend(fs.view()[1..])
+                    keyed.push(Record(c))
+                _ -> ()
+
+        val (elem, got) = xg_run_sized(xg_cols(), rows.view(), [7], [], xg_agree_calls()).unwrap()
+        assert_eq(got.len(), 1)
+        val want = xg_expected(keyed)
+
+        if n == 0
+            assert(xe_field(got[0], 0) == Int(0) && xe_field(got[0], 2) == Null)
+        else
+            // The reference's key is its first field; the global row has none.
+            want[0] match
+                Record(fs) ->
+                    val rest = buf[Value]()
+                    rest.extend(fs.view()[1..])
+                    assert(same(elem, got[0], Record(rest)), s"${got[0]}")
+                _ -> assert(false)
+
+// -- end to end -----------------------------------------------------------------------------------------
+
+@test
+an_aggregate_tree_runs_and_its_result_decodes()
+    val rows = buf[Buf[Expr]]()
+    val n = BatchSize + 40
+
+    for i in 0..<n
+        val score: Expr = if i % 9 == 4 then Null(Decimal(5, 2)) else Literal(Decimal(5, 2), Int(i128((i * 37) % 1000)))
+        rows.push(items_of([Literal(Text, Text(s"t${i % 3}")), score]))
+
+    val values = Values("v", items_of([Field("team", Text), Field("score", nullable(Decimal(5, 2)))]), rows)
+    val aggs = [NamedAgg("n", xg_call("count", [])), NamedAgg("total", xg_call("sum", [col("v", "score")])), NamedAgg("best", xg_call("max", [col("v", "score")]))]
+    val agg = Aggregate(values, "a", items_of([item("team", col("v", "team"))]), items_of(aggs))
+    val q = envelope([], Query(Filter(agg, call("gt", [col("a", "n"), xe_lit(0)]))))
+    val (result, batches) = run_query(q, FakeCatalog(buf[FakeTable](), buf[FakeType](), buf[FakeFunction]()), xe_ctx([]), buf[MemTable]()).unwrap()
+    val elem = record([Field("team", Text), Field("n", Int64), Field("total", nullable(Decimal(38, 2))), Field("best", nullable(Decimal(5, 2)))])
+    assert(result == bag(elem))
+
+    val tree = column_tree(result).unwrap()
+    val got = buf[Value]()
+
+    for payload in batches
+        got.extend(decode_batch(tree, payload.view()).unwrap().rows().view())
+
+    assert_eq(got.len(), 3)
+
+    for t in 0..<3
+        var count: i128 = 0
+        var total: i128 = 0
+        var best: i128 = -1
+
+        for i in 0..<n
+            if i % 3 == t
+                count += 1
+
+                if i % 9 != 4
+                    val s = i128((i * 37) % 1000)
+                    total += s
+                    if s > best then best = s
+
+        assert(same(elem, got[t], rec([Text(s"t$t"), Int(count), Int(total), Int(best)])), s"${got[t]}")

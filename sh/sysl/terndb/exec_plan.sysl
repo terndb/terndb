@@ -135,6 +135,31 @@ private struct Planner
             Tag(input, binder, _, tag) ->
                 val inner = self.rel(*input)
                 Lowered(TagOp(inner.op, elem, member_index(fields_of_type(elem), tag)), binder, elem, none)
+            Aggregate(input, binder, keys, aggs) ->
+                val inner = self.rel(*input)
+                val ks = buf[TExpr]()
+
+                for k in keys
+                    ks.push(self.expr(k.expr))
+
+                val cs = buf[TAgg]()
+
+                for a in aggs
+                    val c = a.call
+                    val args = buf[TExpr]()
+
+                    for x in c.args
+                        args.push(self.expr(x))
+
+                    val filter = self.opt_expr(c.filter)
+                    val order = buf[TKey]()
+
+                    for k in c.order
+                        order.push(TKey(self.expr(k.expr), k.desc, k.nulls_first))
+
+                    cs.push(TAgg(c.function, args, c.distinct, filter, order))
+
+                Lowered(AggregateOp(inner.op, inner.binder, inner.elem, elem, ks, cs, self.ctx, None), binder, elem, none)
             _ -> panic("the executor does not run this relational node")
     end rel
 end Planner

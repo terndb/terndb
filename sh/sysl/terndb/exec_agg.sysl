@@ -1,0 +1,391 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort_stable_by
+
+// `Aggregate` (`query-tree.md` §6.7, `docs/design/executor.md` §4), sort-based. The input is read
+// whole, its rows ordered by the grouping keys with `cmp` (§3.3), and each run of rows that compare
+// equal on every key is one group; `cmp` is zero exactly where `same` holds (§3.1), so nulls group
+// together and so do every NaN and both zeros. The sort is stable, so a group's rows stay in input
+// order, which is the order an aggregate reads them in when its call has no `order`.
+
+/** An aggregate call with its expressions typed (§6.7 rule 2). */
+struct TAgg
+    function: string
+    args: Buf[TExpr]
+    distinct: bool
+    filter: Option[TExpr]
+    order: Buf[TKey]
+
+/** The input's groups: `rows` is every input row in key order, and group `g` is
+ * `rows[starts[g]..<starts[g + 1]]`.
+ */
+private struct Groups
+    rows: Buf[usize]
+    starts: Buf[usize]
+
+    count(self) -> usize = self.starts.len() - 1
+
+/** What one call reads of each group: positions in the call's own vectors, group `g`'s being
+ * `at[bounds[g]..<bounds[g + 1]]`, in the order the call reads them.
+ */
+private struct Seen
+    at: Buf[usize]
+    bounds: Buf[usize]
+
+    groups(self) -> usize = self.bounds.len() - 1
+
+    of(self, g: usize) -> []const usize = self.at.view()[self.bounds[g]..<self.bounds[g + 1]]
+
+/** The rows `0..<n` grouped by `keys`. With no keys every row is in one group, also when there are
+ * none (§6.7 rule 1); with keys, no rows make no groups.
+ */
+private groups_of(keys: Buf[ColumnVector], n: usize) -> Groups
+    val starts = buf[usize]()
+
+    if keys.len() == 0
+        starts.push(0)
+        starts.push(n)
+        return Groups(all_rows(n), starts)
+
+    val orders = buf[KeyOrder]()
+
+    for k in keys
+        orders.push(key_order(k, false, true))
+
+    val rows = sorted_rows(orders, n)
+
+    for i in 0..<n
+        if i == 0 || compare_rows(orders, rows[i - 1], rows[i]) != 0 then starts.push(i)
+
+    starts.push(n)
+    Groups(rows, starts)
+
+/** One row per group of the input: the keys, each the value of the group's first row in input
+ * order, then the aggregates, as the record `elem`. It reads its whole input on the first call.
+ */
+struct AggregateOp
+    input: &Operator
+    binder: string
+    input_elem: Type
+    elem: Type
+    keys: Buf[TExpr]
+    aggs: Buf[TAgg]
+    ctx: Ctx
+    out: Option[&Operator]
+
+impl Operator for AggregateOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if self.out.is_none()
+            val env = env_of(self.ctx, self.binder, drain_rows(self.input, self.input_elem)?)
+            self.out = Some(mem_source(batches_of(aggregate_rows(self.elem, self.keys, self.aggs, env)?)))
+
+        self.out.unwrap().next_batch()
+
+private aggregate_rows(elem: Type, keys: Buf[TExpr], aggs: Buf[TAgg], env: Env) -> Result[ColumnVector, CodecError]
+    val fs = fields_of_type(elem)
+    val kvs = buf[ColumnVector]()
+
+    for j in 0..<keys.len()
+        kvs.push(eval(keys[j], env)?.as_type(fs[j].ty))
+
+    val groups = groups_of(kvs, env.n)
+    val firsts = buf[usize]()
+
+    // With keys every group has a row; the one group of a keyless aggregate may have none.
+    if kvs.len() > 0
+        for g in 0..<groups.count()
+            firsts.push(groups.rows[groups.starts[g]])
+
+    val cs = buf[ColumnVector]()
+
+    for kv in kvs
+        cs.push(take(kv, firsts.view()))
+
+    for j in 0..<aggs.len()
+        cs.push(call_column(aggs[j], fs[keys.len() + j].ty, groups, env)?)
+
+    Ok(ColumnVector(elem, groups.count(), buf[u8](), Members(cs)))
+
+// -- one call over every group --------------------------------------------------------------------
+
+/** The column of call `a`, of type `ty`, one slot per group. The filter is evaluated on every input
+ * row; the arguments and the `order` keys only on the rows it keeps (§6.7 rule 5).
+ */
+private call_column(a: TAgg, ty: Type, groups: Groups, env: Env) -> Result[ColumnVector, CodecError]
+    val n = env.n
+    // Each input row's position among the rows the call sees, or `n` where the filter drops it.
+    val pos = buf[usize]()
+    var sub = env
+
+    a.filter match
+        Some(f) ->
+            val p = eval(f, env)?
+            val kept = buf[usize]()
+
+            p.lanes match
+                Bools(x) ->
+                    for i in 0..<n
+                        if p.is_valid(i) && x[i]
+                            pos.push(kept.len())
+                            kept.push(i)
+                        else
+                            pos.push(n)
+                _ -> panic("an aggregate's filter is a bool")
+
+            sub = env.take(kept.view())
+        None ->
+            for i in 0..<n
+                pos.push(i)
+
+    val args = buf[ColumnVector]()
+
+    for x in a.args
+        args.push(eval(x, sub)?)
+
+    val at = buf[usize]()
+    val bounds = buf[usize]()
+    bounds.push(0)
+
+    for g in 0..<groups.count()
+        for k in groups.starts[g]..<groups.starts[g + 1]
+            val p = pos[groups.rows[k]]
+
+            if p < n then at.push(p)
+
+        bounds.push(at.len())
+
+    var seen = Seen(at, bounds)
+
+    if a.order.len() > 0
+        val orders = buf[KeyOrder]()
+
+        for k in a.order
+            orders.push(key_order(eval(k.expr, sub)?, k.desc, k.nulls_first))
+
+        sort_groups(seen, orders)
+
+    if a.distinct then seen = distinct_of(seen, args, sub.n)
+
+    aggregate_column(a.function, ty, args, seen)
+
+/** Each group of `seen` sorted by `orders`, stably. */
+private sort_groups(seen: Seen, orders: Buf[KeyOrder])
+    var scratch = all_rows(seen.at.len())
+
+    for g in 0..<seen.groups()
+        val (lo, hi) = (seen.bounds[g], seen.bounds[g + 1])
+
+        if !sort_stable_by(seen.at.view_mut()[lo..<hi], scratch.view_mut()[lo..<hi], (p, q) -> compare_rows(orders, p, q) < 0) then
+            panic("sort_groups: the scratch is too short")
+
+/** `seen` keeping, in each group, the first of every set of positions whose arguments are all
+ * `same` (§6.7 rule 6); `n` is the number of positions.
+ */
+private distinct_of(seen: Seen, args: Buf[ColumnVector], n: usize) -> Seen
+    val orders = buf[KeyOrder]()
+
+    for x in args
+        orders.push(key_order(x, false, true))
+
+    val keep = buf[bool]()
+
+    for _ in 0..<n
+        keep.push(false)
+
+    var by_value = buf[usize]()
+    by_value.extend(seen.at.view())
+    var scratch = all_rows(seen.at.len())
+    val at = buf[usize]()
+    val bounds = buf[usize]()
+    bounds.push(0)
+
+    for g in 0..<seen.groups()
+        val (lo, hi) = (seen.bounds[g], seen.bounds[g + 1])
+
+        if !sort_stable_by(by_value.view_mut()[lo..<hi], scratch.view_mut()[lo..<hi], (p, q) -> compare_rows(orders, p, q) < 0) then
+            panic("distinct_of: the scratch is too short")
+
+        for k in lo..<hi
+            if k == lo || compare_rows(orders, by_value[k - 1], by_value[k]) != 0 then keep[by_value[k]] = true
+
+        for p in seen.of(g)
+            if keep[p] then at.push(p)
+
+        bounds.push(at.len())
+
+    Seen(at, bounds)
+
+/** The aggregate `f` of `args` over each group of `seen`, as a column of `ty` (§6.7 rule 4). */
+private aggregate_column(f: string, ty: Type, args: Buf[ColumnVector], seen: Seen) -> Result[ColumnVector, CodecError] = f match
+    "count" -> Ok(count_column(if args.len() == 0 then None else Some(args[0]), seen))
+    "sum" -> sum_column(args[0], ty, seen)
+    "min" -> Ok(pick_column(args[0], ty, seen, -1))
+    "max" -> Ok(pick_column(args[0], ty, seen, 1))
+    "bool_and" -> Ok(bool_column(args[0], ty, seen, false))
+    "bool_or" -> Ok(bool_column(args[0], ty, seen, true))
+    "collect" -> Ok(collect_column(args[0], ty, seen))
+    "string_agg" -> Ok(string_agg_column(args[0], args[1], ty, seen))
+    _ -> panic(s"the executor does not run the aggregate '$f'")
+
+// -- the aggregates --------------------------------------------------------------------------------
+
+/** `count()`, the rows of each group, or `count(x)`, its non-null `x`; never null. */
+private count_column(x: Option[ColumnVector], seen: Seen) -> ColumnVector
+    val out = buf[i64]()
+
+    for g in 0..<seen.groups()
+        x match
+            None -> out.push(i64(seen.of(g).len))
+            Some(v) ->
+                var c: i64 = 0
+
+                for p in seen.of(g)
+                    if v.is_valid(p) then c += 1
+
+                out.push(c)
+
+    ColumnVector(Int64, seen.groups(), buf[u8](), I64s(out))
+
+/** `sum` of each group's non-null values, null where there are none. An integer or a decimal sums
+ * exactly and is `R0001` where the sum lies outside the result type, whatever the order of the rows;
+ * a float sums in the group's order from its first value (§6.7 rule 7).
+ */
+private sum_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector, CodecError]
+    val valid = buf[bool]()
+
+    if ty.base() == Float64
+        val v = reals_of(x.lanes)
+        val out = buf[real]()
+
+        for g in 0..<seen.groups()
+            var acc = 0.0
+            var any = false
+
+            for p in seen.of(g)
+                if x.is_valid(p)
+                    acc = if any then acc + v[p] else v[p]
+                    any = true
+
+            out.push(acc)
+            valid.push(any)
+
+        return Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), F64s(out)))
+
+    // The result type's bounds: `int128`'s, or a `decimal(38, s)`'s unscaled `10³⁸ − 1`.
+    val (lo, hi) = ty.base() match
+        Decimal(_, _) -> (1 - pow10(38), pow10(38) - 1)
+        _ -> int_range(Int128)
+
+    val v = wide_of(x.lanes)
+    val out = buf[i128]()
+
+    for g in 0..<seen.groups()
+        var acc: i256 = 0
+        var any = false
+
+        for p in seen.of(g)
+            if x.is_valid(p)
+                acc += i256(v[p])
+                any = true
+
+        if acc < i256(lo) || acc > i256(hi) then return overflow()
+
+        out.push(i128.wrap(acc))
+        valid.push(any)
+
+    Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), I128s(out)))
+
+/** `min` (`want` −1) or `max` (`want` 1) of each group's non-null values by `cmp` (§3.3), the first
+ * of equal ones in the group's order; null where there are none.
+ */
+private pick_column(x: ColumnVector, ty: Type, seen: Seen, want: i8) -> ColumnVector
+    val order = slot_order(x)
+    // Slot `x.len` of the padded vector below is null: the pick of a group with no value.
+    val none = x.len
+    val picks = buf[usize]()
+
+    for g in 0..<seen.groups()
+        var best = none
+
+        for p in seen.of(g)
+            if x.is_valid(p) && (best == none || order(p, best) == want) then best = p
+
+        picks.push(best)
+
+    val parts = buf[ColumnVector]()
+    parts.push(x.as_type(ty))
+    parts.push(vector_of(ty, [Null]))
+    take(concat(ty, parts.view()), picks.view())
+
+/** `bool_and` (`disjunct` false) or `bool_or` (`disjunct` true) of each group's non-null values; null
+ * where there are none.
+ */
+private bool_column(x: ColumnVector, ty: Type, seen: Seen, disjunct: bool) -> ColumnVector
+    val v = x.lanes match
+        Bools(b) -> b
+        _ -> panic("bool_and and bool_or take a bool")
+
+    val out = buf[bool]()
+    val valid = buf[bool]()
+
+    for g in 0..<seen.groups()
+        var acc = !disjunct
+        var any = false
+
+        for p in seen.of(g)
+            if x.is_valid(p)
+                acc = if disjunct then acc || v[p] else acc && v[p]
+                any = true
+
+        out.push(acc)
+        valid.push(any)
+
+    ColumnVector(ty, seen.groups(), bits_of(valid.view()), Bools(out))
+
+/** `collect`: each group's values, nulls included, as a bag, or as a list in the call's `order`; a
+ * group with no rows collects the empty relation.
+ */
+private collect_column(x: ColumnVector, ty: Type, seen: Seen) -> ColumnVector
+    val e = ty.base() match
+        Bag(t) | List(t) -> *t
+        _ -> panic("collect is a bag or a list")
+
+    val offsets = buf[u32]()
+
+    for b in seen.bounds
+        offsets.push(u32(b))
+
+    ColumnVector(ty, seen.groups(), buf[u8](), Elems(offsets, take(x, seen.at.view()).as_type(e)))
+
+/** `string_agg(value, separator)`: each group's non-null values joined, every value after the first
+ * preceded by its own row's separator (none where that is null); null where there are no values.
+ */
+private string_agg_column(x: ColumnVector, sep: ColumnVector, ty: Type, seen: Seen) -> ColumnVector
+    val (xo, xd) = x.lanes match
+        Bins(o, d) -> (o, d)
+        _ -> panic("string_agg takes text")
+
+    val (so, sd) = sep.lanes match
+        Bins(o, d) -> (o, d)
+        _ -> panic("string_agg takes text")
+
+    val offsets = buf[u32]()
+    val data = buf[u8]()
+    val valid = buf[bool]()
+    offsets.push(0)
+
+    for g in 0..<seen.groups()
+        var any = false
+
+        for p in seen.of(g)
+            if x.is_valid(p)
+                if any && sep.is_valid(p) then data.extend(sd.view()[usize(so[p])..<usize(so[p + 1])])
+
+                data.extend(xd.view()[usize(xo[p])..<usize(xo[p + 1])])
+                any = true
+
+        offsets.push(u32(data.len()))
+        valid.push(any)
+
+    ColumnVector(ty, seen.groups(), bits_of(valid.view()), Bins(offsets, data))

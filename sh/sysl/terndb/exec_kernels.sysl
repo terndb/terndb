@@ -12,7 +12,7 @@ import sysl.math.Float
 private[terndb] bit(validity: Buf[u8], i: usize) -> bool =
     validity.len() == 0 || (validity[i / 8] >> u8(i % 8)) & 1 == 1
 
-private overflow[T]() -> Result[T, CodecError] = fail("R0001", "arithmetic overflow")
+private[terndb] overflow[T]() -> Result[T, CodecError] = fail("R0001", "arithmetic overflow")
 
 private by_zero[T]() -> Result[T, CodecError] = fail("R0002", "division by zero")
 
