@@ -4,15 +4,16 @@ import sysl.buf.{Buf, buf}
 import sysl.container.{Set, set}
 
 // The structural checks of `query-tree.md` §11 that need no catalog and no types: binders and their
-// scope (§8), parameter references (§10.1), and the required and forbidden fields of §6, §7 and §9.
-// They run in the phases of §11.2: every name error (`Q2…`) before any parameter or structure error
-// (`Q4…`, `Q5…`), and within a phase the one that comes first in pre-order.
+// scope (§8), parameter references (§10.1), the required and forbidden fields of §6, §7 and §9, and
+// those of a DDL statement that `ddl.md` §3.5 lists. They run in the phases of §11.2: every name
+// error (`Q2…`, `Q6002`) before any type error (`Q6005`), and those before any parameter or structure
+// error (`Q4…`, `Q5…`, the other `Q6…`), and within a phase the one that comes first in pre-order.
 
 /** `env` checked as above; the first error of the first phase that has one. */
 check_envelope(env: Envelope) -> Result[unit, CodecError]
     // The first walk only learns which binders the statement introduces anywhere, so the second can
     // tell a binder that is not visible (`Q2006`) from one that does not exist (`Q2002`).
-    var gather = Checker(true, set[string](), set[string](), buf[bool](), buf[string](), false, None, None)
+    var gather = Checker(true, set[string](), set[string](), buf[bool](), buf[string](), false, Unrestricted, None, None, None)
     gather.statement(env.statement)
 
     val used = buf[bool]()
@@ -20,14 +21,21 @@ check_envelope(env: Envelope) -> Result[unit, CodecError]
     for _ in 0..<env.params.len()
         used.push(false)
 
-    var c = Checker(false, gather.all, set[string](), used, buf[string](), false, None, None)
+    var c = Checker(false, gather.all, set[string](), used, buf[string](), false, Unrestricted, None, None, None)
     c.statement(env.statement)
 
     c.names_error match
         Some(e) -> return Err(e)
         None -> ()
 
+    c.types_error match
+        Some(e) -> return Err(e)
+        None -> ()
+
     // `/params/<i>` comes before `/statement` in pre-order.
+    if is_ddl(env.statement) && env.params.len() > 0 then
+        return fail("Q6001", "a DDL statement declares parameters")
+
     for i in 0..<used.len()
         if !used[i] then return fail("Q4002", s"parameter $i is declared and never referenced")
 
@@ -43,18 +51,23 @@ private struct Checker
     used: Buf[bool]
     ctes: Buf[string]
     in_returning: bool
+    rules: DefnRules
     names_error: Option[CodecError]
+    types_error: Option[CodecError]
     structure_error: Option[CodecError]
 
     // -- recording ----------------------------------------------------------------------------
 
+    /** `code` recorded in its phase (§11.2, `ddl.md` §3.1 rule 4), unless that phase has one. */
     report(*self, code: string, message: string)
         if self.gathering then return
 
         val e = CodecError(code, message)
 
-        if code.starts_with("Q2")
+        if code.starts_with("Q2") || code == "Q6002"
             if self.names_error == None then self.names_error = Some(e)
+        else if code.starts_with("Q3") || code == "Q6005"
+            if self.types_error == None then self.types_error = Some(e)
         else if self.structure_error == None
             self.structure_error = Some(e)
 
@@ -150,6 +163,7 @@ private struct Checker
 
                 self.opt_expr(filter, both([binder], joined), none)
                 self.returning(returning, both(with_old([binder], old).view(), joined))
+            _ -> self.ddl(s)
     end statement
 
     opt_rel(*self, r: Option[Rel]) -> Buf[string] = r match
@@ -350,11 +364,22 @@ private struct Checker
         None -> ()
 
     expr(*self, e: Expr, sees: Buf[string], hidden: Buf[string]) -> unit = e match
-        Col(binder, _) -> self.refer(binder, sees, hidden)
-        Row(binder) -> self.refer(binder, sees, hidden)
-        Param(index) -> self.param(index)
+        Col(binder, _) ->
+            self.reads(binder)
+            self.refer(binder, sees, hidden)
+        Row(binder) ->
+            self.reads(binder)
+            self.refer(binder, sees, hidden)
+        Param(index) ->
+            if self.rules != Unrestricted then return self.report("Q6006", "a definition expression holds a parameter")
+
+            self.param(index)
         Null(_) | Literal(_, _) -> ()
-        Call(_, args) -> self.exprs(args, sees, hidden)
+        Call(function, args) ->
+            if self.rules == Deterministic && is_volatile(function) then
+                self.report("Q6006", s"'$function' is volatile, and this definition expression must be deterministic")
+
+            self.exprs(args, sees, hidden)
         Cast(inner, _, _) -> self.expr(*inner, sees, hidden)
         If(arms, otherwise) ->
             for a in arms
@@ -375,14 +400,318 @@ private struct Checker
             self.items(fields, sees, hidden)
         Field(inner, _) -> self.expr(*inner, sees, hidden)
         Variant(_, _, inner) -> self.expr(*inner, sees, hidden)
-        Relation(rel) -> ignore(self.rel(*rel, sees, hidden))
-        Scalar(rel) -> ignore(self.rel(*rel, sees, hidden))
-        Exists(rel) -> ignore(self.rel(*rel, sees, hidden))
+        Relation(rel) -> self.subquery(*rel, sees, hidden)
+        Scalar(rel) -> self.subquery(*rel, sees, hidden)
+        Exists(rel) -> self.subquery(*rel, sees, hidden)
         In(es, rel) ->
             self.exprs(es, sees, hidden)
-            ignore(self.rel(*rel, sees, hidden))
+            self.subquery(*rel, sees, hidden)
         Action ->
-            if !self.in_returning then self.report("Q5002", "Action() is valid only in a returning list")
+            if self.rules != Unrestricted
+                self.report("Q6006", "a definition expression holds Action()")
+            else if !self.in_returning
+                self.report("Q5002", "Action() is valid only in a returning list")
+    end expr
+
+    /** A relation inside an expression, which no definition expression may hold (`ddl.md` §2.12
+     * rule 2).
+     */
+    subquery(*self, rel: Rel, sees: Buf[string], hidden: Buf[string])
+        if self.rules != Unrestricted then return self.report("Q6006", "a definition expression holds a relation")
+
+        ignore(self.rel(rel, sees, hidden))
+
+    /** A read through `binder`, which a default may not make of the row (`ddl.md` §2.7 rule 1). */
+    reads(*self, binder: string)
+        if self.rules == AsDefault && binder == DefnRow then self.report("Q6006", "a default reads a column")
+
+    // -- DDL, `ddl.md` §3 ------------------------------------------------------------------------
+
+    /** `e`, a definition expression under `rules`, which sees the row as `row` and nothing else. */
+    definition(*self, e: Expr, rules: DefnRules)
+        val was = self.rules
+        self.rules = rules
+        self.expr(e, one(DefnRow), buf[string]())
+        self.rules = was
+
+    opt_definition(*self, e: Option[Expr], rules: DefnRules) = e match
+        Some(x) -> self.definition(x, rules)
+        None -> ()
+
+    /** A name a DDL statement gives or refers to: 1–255 octets (`ddl.md` §1 rule 2). */
+    name(*self, n: string)
+        if n.len == 0 || n.len > MaxNameOctets then
+            self.report("Q6019", s"a name is ${n.len} octets; a name is 1 to $MaxNameOctets")
+
+    names(*self, ns: Buf[string])
+        for n in ns
+            self.name(n)
+
+    qual_name(*self, q: QualName)
+        self.name(q.schema)
+        self.name(q.name)
+
+    /** The object a statement creates, changes or drops, which may not be in a reserved namespace
+     * (`ddl.md` §1 rule 2).
+     */
+    target(*self, q: QualName)
+        self.qual_name(q)
+        self.namespace(q.schema)
+
+    namespace(*self, n: string)
+        if n == "sys" || n == "catalog" then self.report("Q6014", s"namespace '$n' is reserved")
+
+    /** A list of columns of one table, which names none twice (`Q5005`) and, unless it may be
+     * empty, names at least one (`Q5009`).
+     */
+    column_list(*self, columns: Buf[string], what: string)
+        if columns.len() == 0 then self.report("Q5009", s"$what names no column")
+
+        val seen = set[string]()
+
+        for c in columns
+            self.name(c)
+
+            if !seen.add(c) then self.report("Q5005", s"column '$c' is listed twice in $what")
+
+    ddl(*self, s: Statement) = s match
+        CreateNamespace(name, _) ->
+            self.name(name)
+            self.namespace(name)
+        DropNamespace(name, _, _) ->
+            self.name(name)
+            self.namespace(name)
+        CreateTable(table, columns, primary_key, constraints, _) ->
+            self.target(table)
+
+            val seen = set[string]()
+
+            for c in columns
+                if !seen.add(c.name) then self.report("Q6002", s"column '${c.name}' is defined twice")
+
+                self.column_def(c)
+
+            if primary_key.len() == 0 then self.report("Q6009", "a table has no primary key")
+            else self.column_list(primary_key, "the primary key")
+
+            val named = set[string]()
+
+            for c in constraints
+                if !named.add(c.name) then self.report("Q6002", s"constraint '${c.name}' is defined twice")
+
+                self.constraint_def(c)
+        DropTable(table, _, _) | DropIndex(table, _) | DropType(table, _) | DropSequence(table, _) | DropView(table, _, _) ->
+            self.target(table)
+        AlterTable(table, actions) ->
+            self.target(table)
+
+            if actions.len() == 0 then self.report("Q5009", "an alter_table has no action")
+
+            self.alter_actions(actions)
+        CreateIndex(name, index, _) ->
+            self.name(name)
+            self.target(index.table)
+
+            if index.keys.len() == 0 then self.report("Q5009", "an index has no key")
+
+            for k in index.keys
+                k.key match
+                    KeyColumn(c) -> self.name(c)
+                    KeyExpr(e) -> self.definition(e, Deterministic)
+
+            self.opt_definition(index.predicate, Deterministic)
+        CreateType(type_name, ty, _) ->
+            self.target(type_name)
+
+            ty match
+                Record(_) | Union(_) | Named(_, _) -> ()
+                _ -> self.report("Q6005", "only a record or a union type may be named")
+
+            if mentions(ty, type_name) then self.report("Q6005", s"type '${type_name.name}' refers to itself")
+        AlterType(type_name, change) ->
+            self.target(type_name)
+            self.type_change(change)
+        CreateSequence(sequence, options, _) ->
+            self.target(sequence)
+            self.sequence(options, false, None)
+        AlterSequence(sequence, options, restart) ->
+            self.target(sequence)
+            self.sequence(options, true, restart)
+        CreateView(view, query, _) ->
+            self.target(view)
+            ignore(self.rel(query, buf[string](), buf[string]()))
+        CreateRole(name, role) -> self.role(name, role)
+        AlterRole(name, role, new_name) ->
+            self.role(name, role)
+
+            new_name match
+                Some(n) -> self.name(n)
+                None -> ()
+        DropRole(name, _) -> self.name(name)
+        Grant(privileges, target, grantee, _) | Revoke(privileges, target, grantee) ->
+            if privileges.len() == 0 then self.report("Q5009", "a grant or revoke names no privilege")
+
+            target match
+                OnTable(q) | OnSequence(q) | OnType(q) -> self.qual_name(q)
+                OnNamespace(n) -> self.name(n)
+
+            self.name(grantee)
+        _ -> ()
+    end ddl
+
+    role(*self, name: string, role: RoleDef)
+        self.name(name)
+        self.names(role.member_of)
+
+    /** A column definition (`ddl.md` §2.7, §3.3 rule 1). */
+    column_def(*self, c: ColumnDef)
+        self.name(c.name)
+
+        if c.identity != NoIdentity && !is_sequence_type(c.ty) then
+            self.report("Q6005", s"identity column '${c.name}' is not int16, int32 or int64")
+
+        self.opt_definition(c.default, AsDefault)
+        self.opt_definition(c.generated, Deterministic)
+
+        val given = (if c.default != None then 1 else 0) + (if c.generated != None then 1 else 0) + (if c.identity != NoIdentity then 1 else 0)
+
+        if given > 1 then
+            self.report("Q6006", s"column '${c.name}' has more than one of a default, a generation and an identity")
+
+        c.sequence match
+            Some(d) ->
+                if c.identity == NoIdentity then self.report("Q6006", s"column '${c.name}' has a sequence and no identity")
+                if d.ty != c.ty then self.report("Q6017", s"the sequence of column '${c.name}' is not of the column's type")
+
+                self.sequence(d, false, None)
+            None -> ()
+    end column_def
+
+    constraint_def(*self, c: ConstraintDef)
+        self.name(c.name)
+
+        c.body match
+            Check(e) -> self.definition(e, Deterministic)
+            Unique(columns) -> self.column_list(columns, "a unique constraint")
+            ForeignKey(columns, ref_table, ref_columns, _, _, _) ->
+                self.column_list(columns, "a foreign key")
+                self.qual_name(ref_table)
+                self.column_list(ref_columns, "a foreign key's referenced columns")
+
+                if columns.len() != ref_columns.len() then
+                    self.report("Q6013", "a foreign key's columns and referenced columns differ in number")
+
+    /** A sequence's options (`ddl.md` §2.7 rule 4). Those of a create are checked with their
+     * defaults filled in; those of an alter, which keep the sequence's other options, only against
+     * each other.
+     */
+    sequence(*self, d: SequenceDef, alter: bool, restart: Option[i64])
+        val (lowest, highest) = sequence_range(d.ty) match
+            Some(r) -> r
+            None -> return self.report("Q6005", "a sequence is not int16, int32 or int64")
+
+        for v in [d.start, d.min, d.max, restart]
+            v match
+                Some(x) -> if x < lowest || x > highest then self.report("Q6017", s"sequence option $x is outside its type")
+                None -> ()
+
+        val step = d.increment.unwrap_or(1)
+
+        if step == 0 then self.report("Q6017", "a sequence's increment is 0")
+        if d.cache == Some(0) then self.report("Q6017", "a sequence's cache is 0")
+
+        if alter
+            (d.min, d.max) match
+                (Some(lo), Some(hi)) ->
+                    if lo > hi then self.report("Q6017", "a sequence's min is above its max")
+
+                    for v in [d.start, restart]
+                        v match
+                            Some(x) -> if x < lo || x > hi then self.report("Q6017", "a sequence starts outside its range")
+                            None -> ()
+                _ -> ()
+
+            return
+
+        val lo = d.min.unwrap_or(if step < 0 then lowest else 1)
+        val hi = d.max.unwrap_or(highest)
+        val first = d.start.unwrap_or(1)
+
+        if lo > hi then self.report("Q6017", "a sequence's min is above its max")
+        if first < lo || first > hi then self.report("Q6017", "a sequence starts outside its range")
+    end sequence
+
+    type_change(*self, change: TypeChange) = change match
+        AppendVariants(variants) ->
+            for v in variants
+                self.name(v.name)
+        AppendFields(fs) ->
+            for f in fs
+                self.name(f.name)
+
+                f.fill match
+                    Some(Literal(_, _)) -> ()
+                    Some(_) -> self.report("Q6006", s"the fill of field '${f.name}' is not a constant literal")
+                    None ->
+                        if !f.ty.is_nullable() then
+                            self.report("Q6006", s"field '${f.name}' is not nullable and has no fill")
+        RenameMember(old_name, new_name) ->
+            self.name(old_name)
+            self.name(new_name)
+        RenameType(new_name) -> self.name(new_name)
+
+    /** An `AlterTable`'s actions (`ddl.md` §3.3 rule 3). Every action on a column touches its name,
+     * and a name touched twice is `Q6016`; a `rename_column` touches its old name and leaves the new
+     * one free for the actions after it.
+     */
+    alter_actions(*self, actions: Buf[AlterAction])
+        val touched = set[string]()
+
+        for a in actions
+            val subject = a match
+                AddColumn(c) ->
+                    self.column_def(c)
+                    Some(c.name)
+                DropColumn(name, _) | SetNullable(name, _) ->
+                    self.name(name)
+                    Some(name)
+                RenameColumn(name, new_name) ->
+                    self.name(name)
+                    self.name(new_name)
+
+                    if touched.has(new_name) then self.report("Q6016", s"column '$new_name' is renamed onto a name another action uses")
+
+                    Some(name)
+                RetypeColumn(name, _, using) ->
+                    self.name(name)
+                    self.opt_definition(using, AsDefinition)
+                    Some(name)
+                SetColumnDefault(name, default) ->
+                    self.name(name)
+                    self.opt_definition(default, AsDefault)
+                    Some(name)
+                AddConstraint(c, _) ->
+                    self.constraint_def(c)
+                    None
+                DropConstraint(name, _) | ValidateConstraint(name) | SetOwner(name) ->
+                    self.name(name)
+                    None
+                RenameConstraint(name, new_name) ->
+                    self.name(name)
+                    self.name(new_name)
+                    None
+                RenameTable(new_name) ->
+                    self.name(new_name)
+                    None
+                SetPrimaryKey(columns) ->
+                    self.column_list(columns, "the primary key")
+                    None
+                Rewrite -> None
+
+            subject match
+                Some(c) -> if !touched.add(c) then self.report("Q6016", s"two actions change column '$c'")
+                None -> ()
+    end alter_actions
 end Checker
 
 // -- binder lists -------------------------------------------------------------------------------
@@ -417,3 +746,46 @@ private with_old(a: []const string, extra: Option[string]) -> Buf[string]
     out
 
 private ignore[T](value: T) = ()
+
+// -- DDL ----------------------------------------------------------------------------------------
+
+/** Which rules of `ddl.md` §2.12 an expression is held to. */
+private enum DefnRules
+    /** A query's or a DML statement's own expression: none. */
+    Unrestricted
+    /** A default: rule 2, and it reads no column (§2.7 rule 1). */
+    AsDefault
+    /** A check, a generated column, an index component or predicate: rule 2, and deterministic. */
+    Deterministic
+    /** Any other definition expression, a retype's `using`: rule 2. */
+    AsDefinition
+
+/** The binder through which a definition expression sees the row (`ddl.md` §2.12 rule 1). */
+private const DefnRow = "row"
+
+/** The longest name, in octets (`ddl.md` §1 rule 2). */
+private const MaxNameOctets: usize = 255
+
+/** Whether the function catalog marks `function` volatile (`query-tree.md` §7.12). */
+private is_volatile(function: string) -> bool = function == "statement_timestamp" || function == "next_value"
+
+/** The types a sequence, and so an identity column, may have (`ddl.md` §2.7 rules 3 and 4). */
+private is_sequence_type(t: Type) -> bool = sequence_range(t) != None
+
+/** The smallest and largest value of a sequence of type `t`, if it may be one. */
+private sequence_range(t: Type) -> Option[(i64, i64)] = t match
+    Int16 -> Some((-32768, 32767))
+    Int32 -> Some((-2147483648, 2147483647))
+    Int64 -> Some((i64::Min, i64::Max))
+    _ -> None
+
+/** Whether `t` refers to the named type `q` anywhere inside it. */
+private mentions(t: Type, q: QualName) -> bool = t match
+    Named(schema, name) -> schema == q.schema && name == q.name
+    Nullable(inner) | Bag(inner) | List(inner) -> mentions(*inner, q)
+    Record(members) | Union(members) ->
+        for m in members
+            if mentions(m.ty, q) then return true
+
+        false
+    _ -> false

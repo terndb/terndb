@@ -3,7 +3,8 @@ module sh.sysl.terndb
 import sysl.buf.{Buf, buf}
 
 // The query tree of `query-tree.md` §5–§9: the envelope, its statement, and the relational and
-// expression nodes the statement is made of. Field order is the spec's, which is also the order the
+// expression nodes the statement is made of, and the DDL statements of `ddl.md` §3 with their
+// auxiliary records. Field order is the spec's, which is also the order the
 // canonical encoding (§12) writes them in. The spec's `as` field, the binder a node introduces, is
 // `binder` here.
 
@@ -44,12 +45,172 @@ enum Statement derives Eq
     Update(table: QualName, binder: string, old: Option[string], from: Option[Rel], filter: Option[Expr], set: Buf[Item], returning: Buf[Item])
     Delete(table: QualName, binder: string, old: Option[string], using: Option[Rel], filter: Option[Expr], returning: Buf[Item])
 
-/** The node kind a statement is encoded under (§12.5). */
+    // The DDL statements of `ddl.md` §3.2. The spec's `type` field is `ty`, its `def` is named for
+    // what it defines, and `Grant`'s and `Revoke`'s `object` is `target`.
+    CreateNamespace(name: string, if_not_exists: bool)
+    DropNamespace(name: string, if_exists: bool, cascade: bool)
+    CreateTable(table: QualName, columns: Buf[ColumnDef], primary_key: Buf[string], constraints: Buf[ConstraintDef], if_not_exists: bool)
+    DropTable(table: QualName, if_exists: bool, cascade: bool)
+    AlterTable(table: QualName, actions: Buf[AlterAction])
+    CreateIndex(name: string, index: IndexDef, if_not_exists: bool)
+    DropIndex(index: QualName, if_exists: bool)
+    CreateType(type_name: QualName, ty: Type, if_not_exists: bool)
+    AlterType(type_name: QualName, change: TypeChange)
+    DropType(type_name: QualName, if_exists: bool)
+    CreateSequence(sequence: QualName, options: SequenceDef, if_not_exists: bool)
+    AlterSequence(sequence: QualName, options: SequenceDef, restart: Option[i64])
+    DropSequence(sequence: QualName, if_exists: bool)
+    CreateView(view: QualName, query: Rel, replace: bool)
+    DropView(view: QualName, if_exists: bool, cascade: bool)
+    CreateRole(name: string, role: RoleDef)
+    AlterRole(name: string, role: RoleDef, new_name: Option[string])
+    DropRole(name: string, if_exists: bool)
+    Grant(privileges: Buf[Privilege], target: ObjectRef, grantee: string, grantable: bool)
+    Revoke(privileges: Buf[Privilege], target: ObjectRef, grantee: string)
+    AwaitJobs(txid: u64)
+    CancelJob(job: u64)
+
+/** The node kind a statement is encoded under (§12.5, `ddl.md` §3.2). */
 statement_kind(s: Statement) -> u64 = s match
     Query(_) -> 1
     Insert(_, _, _, _, _, _, _) -> 2
     Update(_, _, _, _, _, _, _) -> 3
     Delete(_, _, _, _, _, _) -> 4
+    CreateNamespace(_, _) -> 32
+    DropNamespace(_, _, _) -> 33
+    CreateTable(_, _, _, _, _) -> 34
+    DropTable(_, _, _) -> 35
+    AlterTable(_, _) -> 36
+    CreateIndex(_, _, _) -> 37
+    DropIndex(_, _) -> 38
+    CreateType(_, _, _) -> 39
+    AlterType(_, _) -> 40
+    DropType(_, _) -> 41
+    CreateSequence(_, _, _) -> 42
+    AlterSequence(_, _, _) -> 43
+    DropSequence(_, _) -> 44
+    CreateView(_, _, _) -> 45
+    DropView(_, _, _) -> 46
+    CreateRole(_, _) -> 47
+    AlterRole(_, _, _) -> 48
+    DropRole(_, _) -> 49
+    Grant(_, _, _, _) -> 50
+    Revoke(_, _, _) -> 51
+    AwaitJobs(_) -> 52
+    CancelJob(_) -> 53
+
+/** Whether `s` is a DDL statement (kinds 32–63). */
+is_ddl(s: Statement) -> bool = statement_kind(s) >= 32
+
+// -- the auxiliary records of DDL, `ddl.md` §3.3, encoded inline ----------------------------------
+
+/** `ColumnDef.identity` (`ddl.md` §2.7 rule 3). */
+enum Identity
+    NoIdentity
+    Always
+    ByDefault
+
+struct ColumnDef derives Eq
+    name: string
+    ty: Type
+    default: Option[Expr]
+    generated: Option[Expr]
+    identity: Identity
+    sequence: Option[SequenceDef]
+
+/** A foreign key's `on_delete` and `on_update` (`ddl.md` §2.6 rule 2). */
+enum FkAction
+    FkNoAction
+    FkRestrict
+    FkCascade
+    FkSetNull
+    FkSetDefault
+
+/** `ConstraintDef.body`. */
+enum ConstraintBody derives Eq
+    Check(expr: Expr)
+    Unique(columns: Buf[string])
+    ForeignKey(columns: Buf[string], ref_table: QualName, ref_columns: Buf[string], on_delete: FkAction, on_update: FkAction, deferred: bool)
+
+struct ConstraintDef derives Eq
+    name: string
+    body: ConstraintBody
+
+/** `IndexKey.key`: a column, or an expression over the row. */
+enum KeyPart derives Eq
+    KeyColumn(name: string)
+    KeyExpr(expr: Expr)
+
+struct IndexKey derives Eq
+    key: KeyPart
+    descending: bool
+
+struct IndexDef derives Eq
+    table: QualName
+    unique: bool
+    keys: Buf[IndexKey]
+    predicate: Option[Expr]
+
+/** A sequence's options; an absent one takes its default (`ddl.md` §3.3 rule 1). */
+struct SequenceDef derives Eq
+    ty: Type
+    start: Option[i64]
+    increment: Option[i64]
+    min: Option[i64]
+    max: Option[i64]
+    cycle: bool
+    cache: Option[u64]
+
+/** A field `append_fields` adds: its name, its type, and the fill of existing values. */
+struct FieldFill derives Eq
+    name: string
+    ty: Type
+    fill: Option[Expr]
+
+/** `AlterType.change`: the lossless changes of `ddl.md` §2.8 rule 5. */
+enum TypeChange derives Eq
+    AppendVariants(variants: Buf[Field])
+    AppendFields(fields: Buf[FieldFill])
+    RenameMember(old_name: string, new_name: string)
+    RenameType(new_name: string)
+
+struct RoleDef derives Eq
+    login: bool
+    superuser: bool
+    member_of: Buf[string]
+
+enum Privilege
+    PrivSelect
+    PrivInsert
+    PrivUpdate
+    PrivDelete
+    PrivReferences
+    PrivUsage
+    PrivCreate
+
+/** The object a `Grant` or `Revoke` is on. */
+enum ObjectRef derives Eq
+    OnTable(name: QualName)
+    OnNamespace(name: string)
+    OnSequence(name: QualName)
+    OnType(name: QualName)
+
+/** One action of an `AlterTable`; its ordinal is its position here (`ddl.md` §3.3). */
+enum AlterAction derives Eq
+    AddColumn(column: ColumnDef)
+    DropColumn(name: string, cascade: bool)
+    RenameColumn(name: string, new_name: string)
+    RetypeColumn(name: string, ty: Type, using: Option[Expr])
+    SetColumnDefault(name: string, default: Option[Expr])
+    SetNullable(name: string, nullable: bool)
+    AddConstraint(constraint: ConstraintDef, defer_validation: bool)
+    DropConstraint(name: string, if_exists: bool)
+    ValidateConstraint(name: string)
+    RenameConstraint(name: string, new_name: string)
+    RenameTable(new_name: string)
+    SetPrimaryKey(columns: Buf[string])
+    Rewrite
+    SetOwner(role: string)
 
 // -- the enumerations, each encoded as its ordinal in the spec's order --------------------------
 

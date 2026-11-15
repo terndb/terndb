@@ -2,7 +2,7 @@ module sh.sysl.terndb
 
 import sysl.buf.{Buf, buf}
 
-// Reading a query tree's canonical encoding (`query-tree.md` §12) back into the tree of §5–§9. The
+// Reading a query tree's canonical encoding (`query-tree.md` §12) back into the tree of §5–§9 or a DDL statement of `ddl.md` §3. The
 // decoder refuses every input that is not the one encoding of some tree: truncation, a payload
 // length that disagrees with its contents and trailing octets are `Q1001`; an unknown or reserved
 // kind or enum ordinal `Q1002`; a non-minimal `uvar`, a `bool` or `opt` tag other than 0 or 1, a
@@ -115,12 +115,245 @@ private read_statement(r: *Reader, nodes: *u64) -> Result[Statement, CodecError]
             val using = opt_rel(b, nodes, 1)?
             val filter = opt_expr(b, nodes, 1)?
             Delete(table, binder, old, using, filter, read_items(b, nodes, 1)?)
-        32..63 -> return fail("Q1002", "a DDL statement is decoded by the DDL codec (ddl.md §3)")
+        32..53 -> read_ddl(kind, b, nodes)?
         _ -> return fail("Q1002", "unknown or reserved statement kind")
 
     close_node(body)?
     Ok(s)
 end read_statement
+
+// -- DDL, `ddl.md` §3 --------------------------------------------------------------------------
+
+/** The payload of a DDL statement of `kind`, one of 32–53; its contents are at depth 1. */
+private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecError]
+    val s = kind match
+        32 ->
+            val name = b.str()?
+            CreateNamespace(name, b.flag()?)
+        33 ->
+            val name = b.str()?
+            val if_exists = b.flag()?
+            DropNamespace(name, if_exists, b.flag()?)
+        34 ->
+            val table = qual_name(b)?
+            val columns = buf[ColumnDef]()
+
+            for _ in 0..<b.uvar()?
+                columns.push(read_column_def(b, nodes)?)
+
+            val primary_key = read_strs(b)?
+            val constraints = buf[ConstraintDef]()
+
+            for _ in 0..<b.uvar()?
+                constraints.push(read_constraint_def(b, nodes)?)
+
+            CreateTable(table, columns, primary_key, constraints, b.flag()?)
+        35 ->
+            val table = qual_name(b)?
+            val if_exists = b.flag()?
+            DropTable(table, if_exists, b.flag()?)
+        36 ->
+            val table = qual_name(b)?
+            val actions = buf[AlterAction]()
+
+            for _ in 0..<b.uvar()?
+                actions.push(read_alter_action(b, nodes)?)
+
+            AlterTable(table, actions)
+        37 ->
+            val name = b.str()?
+            val index = read_index_def(b, nodes)?
+            CreateIndex(name, index, b.flag()?)
+        38 ->
+            val index = qual_name(b)?
+            DropIndex(index, b.flag()?)
+        39 ->
+            val type_name = qual_name(b)?
+            val ty = read_tree_type(b, 1)?
+            CreateType(type_name, ty, b.flag()?)
+        40 ->
+            val type_name = qual_name(b)?
+            AlterType(type_name, read_type_change(b, nodes)?)
+        41 ->
+            val type_name = qual_name(b)?
+            DropType(type_name, b.flag()?)
+        42 ->
+            val sequence = qual_name(b)?
+            val options = read_sequence_def(b)?
+            CreateSequence(sequence, options, b.flag()?)
+        43 ->
+            val sequence = qual_name(b)?
+            val options = read_sequence_def(b)?
+            AlterSequence(sequence, options, opt_svar(b)?)
+        44 ->
+            val sequence = qual_name(b)?
+            DropSequence(sequence, b.flag()?)
+        45 ->
+            val view = qual_name(b)?
+
+            // `query` is a `node Query`, which counts as a node of its own.
+            var (inner, q) = open_node(b, nodes, 1)?
+
+            if inner != 1 then return fail("Q1002", "a view's query is not a Query node")
+
+            val query = read_rel(&q, nodes, 2)?
+            close_node(q)?
+            CreateView(view, query, b.flag()?)
+        46 ->
+            val view = qual_name(b)?
+            val if_exists = b.flag()?
+            DropView(view, if_exists, b.flag()?)
+        47 ->
+            val name = b.str()?
+            CreateRole(name, read_role_def(b)?)
+        48 ->
+            val name = b.str()?
+            val role = read_role_def(b)?
+            AlterRole(name, role, opt_name(b)?)
+        49 ->
+            val name = b.str()?
+            DropRole(name, b.flag()?)
+        50 ->
+            val privileges = read_privileges(b)?
+            val target = read_object_ref(b)?
+            val grantee = b.str()?
+            Grant(privileges, target, grantee, b.flag()?)
+        51 ->
+            val privileges = read_privileges(b)?
+            val target = read_object_ref(b)?
+            Revoke(privileges, target, b.str()?)
+        52 -> AwaitJobs(b.uvar()?)
+        _ -> CancelJob(b.uvar()?)
+
+    Ok(s)
+end read_ddl
+
+private read_column_def(r: *Reader, nodes: *u64) -> Result[ColumnDef, CodecError]
+    val name = r.str()?
+    val ty = read_tree_type(r, 1)?
+    val default = opt_expr(r, nodes, 1)?
+    val generated = opt_expr(r, nodes, 1)?
+    val identity = identity_kind(ordinal(r, 3)?)
+    val sequence = if r.flag()? then Some(read_sequence_def(r)?) else None
+    Ok(ColumnDef(name, ty, default, generated, identity, sequence))
+
+private read_constraint_def(r: *Reader, nodes: *u64) -> Result[ConstraintDef, CodecError]
+    val name = r.str()?
+
+    val body = ordinal(r, 3)? match
+        0 -> Check(read_expr(r, nodes, 1)?)
+        1 -> Unique(read_strs(r)?)
+        _ ->
+            val columns = read_strs(r)?
+            val ref_table = qual_name(r)?
+            val ref_columns = read_strs(r)?
+            val on_delete = fk_action(ordinal(r, 5)?)
+            val on_update = fk_action(ordinal(r, 5)?)
+            ForeignKey(columns, ref_table, ref_columns, on_delete, on_update, r.flag()?)
+
+    Ok(ConstraintDef(name, body))
+
+private read_index_def(r: *Reader, nodes: *u64) -> Result[IndexDef, CodecError]
+    val table = qual_name(r)?
+    val unique = r.flag()?
+    val keys = buf[IndexKey]()
+
+    for _ in 0..<r.uvar()?
+        val key = ordinal(r, 2)? match
+            0 -> KeyColumn(r.str()?)
+            _ -> KeyExpr(read_expr(r, nodes, 1)?)
+
+        keys.push(IndexKey(key, r.flag()?))
+
+    Ok(IndexDef(table, unique, keys, opt_expr(r, nodes, 1)?))
+
+private read_sequence_def(r: *Reader) -> Result[SequenceDef, CodecError]
+    val ty = read_tree_type(r, 1)?
+    val start = opt_svar(r)?
+    val increment = opt_svar(r)?
+    val min = opt_svar(r)?
+    val max = opt_svar(r)?
+    val cycle = r.flag()?
+    val cache = if r.flag()? then Some(r.uvar()?) else None
+    Ok(SequenceDef(ty, start, increment, min, max, cycle, cache))
+
+private read_type_change(r: *Reader, nodes: *u64) -> Result[TypeChange, CodecError]
+    val change = ordinal(r, 4)? match
+        0 -> AppendVariants(read_fields(r, 1)?)
+        1 ->
+            val fs = buf[FieldFill]()
+
+            for _ in 0..<r.uvar()?
+                val name = r.str()?
+                val ty = read_tree_type(r, 1)?
+                fs.push(FieldFill(name, ty, opt_expr(r, nodes, 1)?))
+
+            AppendFields(fs)
+        2 ->
+            val old_name = r.str()?
+            RenameMember(old_name, r.str()?)
+        _ -> RenameType(r.str()?)
+
+    Ok(change)
+
+private read_role_def(r: *Reader) -> Result[RoleDef, CodecError]
+    val login = r.flag()?
+    val superuser = r.flag()?
+    Ok(RoleDef(login, superuser, read_strs(r)?))
+
+private read_privileges(r: *Reader) -> Result[Buf[Privilege], CodecError]
+    val ps = buf[Privilege]()
+
+    for _ in 0..<r.uvar()?
+        ps.push(privilege(ordinal(r, 7)?))
+
+    Ok(ps)
+
+private read_object_ref(r: *Reader) -> Result[ObjectRef, CodecError]
+    val o = ordinal(r, 4)? match
+        0 -> OnTable(qual_name(r)?)
+        1 -> OnNamespace(r.str()?)
+        2 -> OnSequence(qual_name(r)?)
+        _ -> OnType(qual_name(r)?)
+
+    Ok(o)
+
+private read_alter_action(r: *Reader, nodes: *u64) -> Result[AlterAction, CodecError]
+    val a = ordinal(r, 14)? match
+        0 -> AddColumn(read_column_def(r, nodes)?)
+        1 ->
+            val name = r.str()?
+            DropColumn(name, r.flag()?)
+        2 ->
+            val name = r.str()?
+            RenameColumn(name, r.str()?)
+        3 ->
+            val name = r.str()?
+            val ty = read_tree_type(r, 1)?
+            RetypeColumn(name, ty, opt_expr(r, nodes, 1)?)
+        4 ->
+            val name = r.str()?
+            SetColumnDefault(name, opt_expr(r, nodes, 1)?)
+        5 ->
+            val name = r.str()?
+            SetNullable(name, r.flag()?)
+        6 ->
+            val c = read_constraint_def(r, nodes)?
+            AddConstraint(c, r.flag()?)
+        7 ->
+            val name = r.str()?
+            DropConstraint(name, r.flag()?)
+        8 -> ValidateConstraint(r.str()?)
+        9 ->
+            val name = r.str()?
+            RenameConstraint(name, r.str()?)
+        10 -> RenameTable(r.str()?)
+        11 -> SetPrimaryKey(read_strs(r)?)
+        12 -> Rewrite
+        _ -> SetOwner(r.str()?)
+
+    Ok(a)
+end read_alter_action
 
 private read_on_conflict(r: *Reader, nodes: *u64, depth: usize) -> Result[OnConflict, CodecError]
     val target = ordinal(r, 2)? match
@@ -476,3 +709,35 @@ private frame_exclude(v: u64) -> FrameExclude = v match
     1 -> ExcludeCurrent
     2 -> ExcludeGroup
     _ -> ExcludeTies
+
+private read_strs(r: *Reader) -> Result[Buf[string], CodecError]
+    val names = buf[string]()
+
+    for _ in 0..<r.uvar()?
+        names.push(r.str()?)
+
+    Ok(names)
+
+private opt_svar(r: *Reader) -> Result[Option[i64], CodecError] =
+    if r.flag()? then Ok(Some(r.svar()?)) else Ok(None)
+
+private identity_kind(v: u64) -> Identity = v match
+    0 -> NoIdentity
+    1 -> Always
+    _ -> ByDefault
+
+private fk_action(v: u64) -> FkAction = v match
+    0 -> FkNoAction
+    1 -> FkRestrict
+    2 -> FkCascade
+    3 -> FkSetNull
+    _ -> FkSetDefault
+
+private privilege(v: u64) -> Privilege = v match
+    0 -> PrivSelect
+    1 -> PrivInsert
+    2 -> PrivUpdate
+    3 -> PrivDelete
+    4 -> PrivReferences
+    5 -> PrivUsage
+    _ -> PrivCreate

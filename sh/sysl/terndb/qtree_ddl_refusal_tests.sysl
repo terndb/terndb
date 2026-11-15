@@ -1,0 +1,316 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// DDL inputs the decoder and the structural checks of `ddl.md` §3.5 refuse, each with its
+// `errors.md` code. A byte case names the octet it breaks and first asserts what that octet was.
+
+private ddl_refusal(s: Statement) -> string = check_refusal(ddl(s))
+
+/** `env` encoded with octet `at`, which must be `was`, replaced by `v`: the code it is refused with. */
+private ddl_broken(env: Envelope, at: usize, was: u8, v: u8, file: string = __FILE__, line: long = __LINE__) -> string
+    val bytes = tree_bytes(env)
+    assert_eq(bytes[at], was, "the octet being broken", file, line)
+    tree_refusal(with_octet(bytes, at, v).view())
+
+private lit_i64(n: i128) -> Expr = Literal(Int64, Int(n))
+
+private sequence_of(ty: Type, start: Option[i64], increment: Option[i64], min: Option[i64], max: Option[i64]) -> Statement =
+    CreateSequence(qn("app", "s"), SequenceDef(ty, start, increment, min, max, false, None), false)
+
+private altered_sequence(min: Option[i64], max: Option[i64], start: Option[i64], restart: Option[i64]) -> Statement =
+    AlterSequence(qn("app", "s"), SequenceDef(Int64, start, None, min, max, false, None), restart)
+
+// -- decoding -----------------------------------------------------------------------------------
+
+@test
+every_truncation_of_a_ddl_statement_is_refused()
+    val wholes = buf[Buf[u8]]()
+
+    for spaced in [create_type_hex, create_table_hex, alter_table_hex]
+        wholes.push(hex(spaced))
+
+    for env in every_ddl()
+        wholes.push(tree_bytes(env))
+
+    for whole in wholes
+        for n in 0..<whole.len()
+            assert_eq(tree_refusal(whole.view()[0..<n]), "Q1001")
+
+@test
+a_ddl_payload_that_disagrees_with_its_length_is_refused()
+    assert_eq(refused_hex("01 00 00 20 03 01 61 00 00"), "ok")
+    assert_eq(refused_hex("01 00 00 20 04 01 61 00 00 00"), "Q1001")
+    assert_eq(refused_hex("01 00 00 20 02 01 61 00 00"), "Q1001")
+
+private refused_hex(spaced: string) -> string = tree_refusal(hex(spaced).view())
+
+@test
+non_canonical_ddl_encodings_are_refused()
+    // `CreateSequence a.s` of int64 with `start` 0 and every other option absent.
+    val seq = ddl(CreateSequence(qn("a", "s"), SequenceDef(Int64, Some(0), None, None, None, false, None), false))
+    same_bytes(tree_bytes(seq), hex("01 00 00 2a 0e 01 61 01 73 03 00 01 00 00 00 00 00 00 00 00"), "the sequence")
+    assert_eq(refused_hex("01 00 00 2a 0f 01 61 01 73 03 00 01 80 00 00 00 00 00 00 00 00"), "Q1003")
+    assert_eq(ddl_broken(seq, 16, 0, 2), "Q1003")
+    assert_eq(ddl_broken(seq, 13, 0, 2), "Q1003")
+    assert_eq(ddl_broken(ddl(CreateNamespace("a", false)), 7, 0, 2), "Q1003")
+
+    // `AwaitJobs 1`, with a redundant continuation octet in its `txid` and then in its length.
+    assert_eq(refused_hex("01 00 00 34 01 01 00"), "ok")
+    assert_eq(refused_hex("01 00 00 34 02 81 00 00"), "Q1003")
+    assert_eq(refused_hex("01 00 00 34 81 00 01 00"), "Q1003")
+
+@test
+invalid_utf8_in_a_ddl_name_is_refused()
+    assert_eq(ddl_broken(ddl(CreateNamespace("a", false)), 6, 0x61, 0xff), "Q1004")
+
+@test
+ddl_ordinals_past_their_last_value_are_refused()
+    // Each tree is on `a.t`, so its payload starts `01 61 01 74` at octet 5.
+    val identity = ddl(AlterTable(qn("a", "t"), items_of([AddColumn(ColumnDef("c", Int64, None, None, ByDefault, None))])))
+    assert_eq(ddl_broken(identity, 17, 2, 3), "Q1002")
+    assert_eq(ddl_broken(identity, 10, 0, 14), "Q1002")
+
+    val unique = ddl(AlterTable(qn("a", "t"), items_of([AddConstraint(ConstraintDef("k", Unique(items_of(["c"]))), false)])))
+    assert_eq(ddl_broken(unique, 13, 1, 3), "Q1002")
+
+    val fk = ConstraintDef("k", ForeignKey(items_of(["c"]), qn("a", "u"), items_of(["c"]), FkSetDefault, FkSetDefault, false))
+    val foreign = ddl(AlterTable(qn("a", "t"), items_of([AddConstraint(fk, false)])))
+    assert_eq(ddl_broken(foreign, 24, 4, 5), "Q1002")
+    assert_eq(ddl_broken(foreign, 25, 4, 5), "Q1002")
+
+    val index = ddl(CreateIndex("i", IndexDef(qn("a", "t"), false, items_of([IndexKey(KeyColumn("c"), false)]), None), false))
+    assert_eq(ddl_broken(index, 13, 0, 2), "Q1002")
+
+    assert_eq(ddl_broken(ddl(AlterType(qn("a", "t"), RenameType("u"))), 9, 3, 4), "Q1002")
+
+    val grant = ddl(Grant(items_of([PrivCreate]), OnNamespace("a"), "r", false))
+    assert_eq(ddl_broken(grant, 6, 6, 7), "Q1002")
+    assert_eq(ddl_broken(grant, 7, 1, 4), "Q1002")
+
+@test
+a_view_s_query_must_be_a_query_node()
+    val view = ddl(CreateView(qn("a", "v"), scan("a", "t", "t"), false))
+    assert_eq(tree_refusal(tree_bytes(view).view()), "ok")
+    assert_eq(ddl_broken(view, 9, 1, 2), "Q1002")
+    assert_eq(ddl_broken(view, 9, 1, 0), "Q1002")
+
+// -- §3.5: names and types ----------------------------------------------------------------------
+
+@test
+a_ddl_definition_sees_only_row()
+    assert_eq(ddl_refusal(alter([AddConstraint(ConstraintDef("k", Check(eq(col("t", "a"), lit_i64(1)))), false)])), "Q2002")
+    assert_eq(ddl_refusal(alter([AddConstraint(ConstraintDef("k", Check(eq(row_col("a"), lit_i64(1)))), false)])), "ok")
+
+@test
+a_name_defined_twice_in_one_create_table_is_refused()
+    assert_eq(ddl_refusal(table_of([column("a", Int64), column("a", Text)], ["a"])), "Q6002")
+
+    val twice = [ConstraintDef("k", Unique(items_of(["a"]))), ConstraintDef("k", Unique(items_of(["b"])))]
+    assert_eq(ddl_refusal(CreateTable(qn("app", "t"), items_of([column("a", Int64), column("b", Int64)]), items_of(["a"]), items_of(twice), false)), "Q6002")
+
+@test
+a_type_ddl_cannot_hold_is_refused()
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", Text, None, None, Always, None)], ["a"])), "Q6005")
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", nullable(Int64), None, None, ByDefault, None)], ["a"])), "Q6005")
+    assert_eq(ddl_refusal(sequence_of(Text, None, None, None, None)), "Q6005")
+
+    for ty in [Int64, list(record([])), nullable(record([])), bag(Text)]
+        assert_eq(ddl_refusal(CreateType(qn("app", "n"), ty, false)), "Q6005")
+
+    val itself = union_of([Field("leaf", record([])), Field("pair", record([Field("next", list(Named("app", "node")))]))])
+    assert_eq(ddl_refusal(CreateType(qn("app", "node"), itself, false)), "Q6005")
+    assert_eq(ddl_refusal(CreateType(qn("app", "tree"), itself, false)), "ok")
+    assert_eq(ddl_refusal(CreateType(qn("app", "alias"), Named("app", "node"), false)), "ok")
+
+// -- §3.5: parameters and structure -------------------------------------------------------------
+
+@test
+a_ddl_envelope_with_parameters_is_refused()
+    assert_eq(check_refusal(envelope([param("x", Int64)], CreateNamespace("a", false))), "Q6001")
+
+    val reads = filter(scan("app", "t", "t"), eq(col("t", "a"), Param(0)))
+    assert_eq(check_refusal(envelope([param("x", Int64)], CreateView(qn("app", "v"), reads, false))), "Q6001")
+    assert_eq(check_refusal(envelope([], CreateView(qn("app", "v"), reads, false))), "Q4001")
+
+@test
+ddl_names_are_1_to_255_octets()
+    val long = "n".repeat(256)
+    assert_eq(ddl_refusal(CreateNamespace("", false)), "Q6019")
+    assert_eq(ddl_refusal(CreateNamespace(long, false)), "Q6019")
+    assert_eq(ddl_refusal(DropTable(qn("", "t"), false, false)), "Q6019")
+    assert_eq(ddl_refusal(DropTable(qn("app", long), false, false)), "Q6019")
+    assert_eq(ddl_refusal(table_of([column("", Int64)], ["a"])), "Q6019")
+    assert_eq(ddl_refusal(table_of([column("a", Int64)], [""])), "Q6019")
+    assert_eq(ddl_refusal(alter([RenameColumn("a", "")])), "Q6019")
+    assert_eq(ddl_refusal(alter([SetOwner("")])), "Q6019")
+    assert_eq(ddl_refusal(CreateRole("r", RoleDef(false, false, items_of([""])))), "Q6019")
+    assert_eq(ddl_refusal(Grant(items_of([PrivUsage]), OnNamespace("app"), "", false)), "Q6019")
+    assert_eq(ddl_refusal(AlterType(qn("app", "e"), AppendVariants(items_of([Field("", record([]))])))), "Q6019")
+    assert_eq(ddl_refusal(AlterType(qn("app", "e"), RenameMember("a", long))), "Q6019")
+
+    val index = IndexDef(qn("app", "t"), false, items_of([IndexKey(KeyColumn(""), false)]), None)
+    assert_eq(ddl_refusal(CreateIndex("i", index, false)), "Q6019")
+
+@test
+ddl_on_a_reserved_namespace_is_refused()
+    assert_eq(ddl_refusal(CreateNamespace("sys", false)), "Q6014")
+    assert_eq(ddl_refusal(DropNamespace("catalog", true, false)), "Q6014")
+    assert_eq(ddl_refusal(CreateTable(qn("sys", "t"), items_of([column("a", Int64)]), items_of(["a"]), buf[ConstraintDef](), false)), "Q6014")
+    assert_eq(ddl_refusal(DropIndex(qn("catalog", "i"), false)), "Q6014")
+    assert_eq(ddl_refusal(AlterSequence(qn("sys", "s"), plain_sequence(Int64), None)), "Q6014")
+    assert_eq(ddl_refusal(CreateView(qn("catalog", "v"), scan("app", "t", "t"), false)), "Q6014")
+
+    val index = IndexDef(qn("sys", "t"), false, items_of([IndexKey(KeyColumn("a"), false)]), None)
+    assert_eq(ddl_refusal(CreateIndex("i", index, false)), "Q6014")
+
+    // Naming a system object without changing it is not refused.
+    assert_eq(ddl_refusal(Grant(items_of([PrivSelect]), OnTable(qn("catalog", "tables")), "r", false)), "ok")
+    val fk = ConstraintDef("k", ForeignKey(items_of(["a"]), qn("sys", "u"), items_of(["k"]), FkNoAction, FkNoAction, false))
+    assert_eq(ddl_refusal(alter([AddConstraint(fk, false)])), "ok")
+
+private check_of(e: Expr) -> Statement = alter([AddConstraint(ConstraintDef("k", Check(e)), false)])
+
+private default_of(e: Expr) -> Statement = table_of([column("k", Int64), ColumnDef("a", Int64, Some(e), None, NoIdentity, None)], ["k"])
+
+private generated_of(e: Expr) -> Statement = table_of([column("k", Int64), ColumnDef("a", Int64, None, Some(e), NoIdentity, None)], ["k"])
+
+private index_on(key: Expr, predicate: Option[Expr]) -> Statement =
+    CreateIndex("i", IndexDef(qn("app", "t"), false, items_of([IndexKey(KeyExpr(key), false)]), predicate), false)
+
+@test
+definition_expressions_hold_no_parameter_relation_or_action()
+    val sub = scan("app", "u", "u")
+    assert_eq(ddl_refusal(check_of(Exists(sub))), "Q6006")
+    assert_eq(ddl_refusal(check_of(Scalar(sub))), "Q6006")
+    assert_eq(ddl_refusal(check_of(Relation(sub))), "Q6006")
+    assert_eq(ddl_refusal(check_of(In(items_of([row_col("a")]), sub))), "Q6006")
+    assert_eq(ddl_refusal(default_of(Param(0))), "Q6006")
+    assert_eq(ddl_refusal(generated_of(Action)), "Q6006")
+    assert_eq(ddl_refusal(alter([RetypeColumn("a", Text, Some(Scalar(sub)))])), "Q6006")
+    assert_eq(ddl_refusal(index_on(row_col("a"), Some(Exists(sub)))), "Q6006")
+
+@test
+checks_generated_columns_and_index_keys_are_deterministic()
+    val now = call("statement_timestamp", [])
+    val drawn = call("next_value", [text_lit("app"), text_lit("s")])
+    assert_eq(ddl_refusal(check_of(eq(row_col("a"), drawn))), "Q6006")
+    assert_eq(ddl_refusal(generated_of(now)), "Q6006")
+    assert_eq(ddl_refusal(index_on(now, None)), "Q6006")
+    assert_eq(ddl_refusal(index_on(row_col("a"), Some(eq(row_col("a"), drawn)))), "Q6006")
+
+    // A default and a retype's `using` may be volatile.
+    assert_eq(ddl_refusal(default_of(drawn)), "ok")
+    assert_eq(ddl_refusal(alter([RetypeColumn("a", Timestamp, Some(now))])), "ok")
+    assert_eq(ddl_refusal(index_on(call("lower", [row_col("a")]), Some(eq(row_col("a"), lit_i64(1))))), "ok")
+
+@test
+a_default_reads_no_column()
+    assert_eq(ddl_refusal(default_of(row_col("k"))), "Q6006")
+    assert_eq(ddl_refusal(default_of(Row("row"))), "Q6006")
+    assert_eq(ddl_refusal(alter([SetColumnDefault("a", Some(call("add", [row_col("b"), lit_i64(1)])))])), "Q6006")
+    assert_eq(ddl_refusal(alter([SetColumnDefault("a", Some(lit_i64(1)))])), "ok")
+    assert_eq(ddl_refusal(generated_of(row_col("k"))), "ok")
+
+@test
+a_column_has_one_of_default_generated_and_identity()
+    val one = lit_i64(1)
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", Int64, Some(one), None, Always, None)], ["a"])), "Q6006")
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", Int64, Some(one), Some(one), NoIdentity, None)], ["a"])), "Q6006")
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", Int64, None, Some(one), ByDefault, None)], ["a"])), "Q6006")
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", Int64, None, None, NoIdentity, Some(plain_sequence(Int64)))], ["a"])), "Q6006")
+    assert_eq(ddl_refusal(alter([AddColumn(ColumnDef("a", Int64, Some(one), None, Always, None))])), "Q6006")
+
+@test
+an_appended_field_s_fill_is_a_literal_or_null()
+    assert_eq(ddl_refusal(appended(FieldFill("a", Int64, Some(lit_i64(0))))), "ok")
+    assert_eq(ddl_refusal(appended(FieldFill("a", nullable(Int64), None))), "ok")
+    assert_eq(ddl_refusal(appended(FieldFill("a", Int64, None))), "Q6006")
+    assert_eq(ddl_refusal(appended(FieldFill("a", Int64, Some(call("add", [lit_i64(1), lit_i64(1)]))))), "Q6006")
+    assert_eq(ddl_refusal(appended(FieldFill("a", nullable(Int64), Some(Null(nullable(Int64)))))), "Q6006")
+
+private appended(f: FieldFill) -> Statement = AlterType(qn("app", "p"), AppendFields(items_of([f])))
+
+@test
+a_table_s_key_and_column_lists_are_checked()
+    assert_eq(ddl_refusal(table_of([column("a", Int64)], [])), "Q6009")
+    assert_eq(ddl_refusal(table_of([column("a", Int64)], ["a", "a"])), "Q5005")
+    assert_eq(ddl_refusal(alter([SetPrimaryKey(no_strs())])), "Q5009")
+    assert_eq(ddl_refusal(alter([SetPrimaryKey(items_of(["a", "a"]))])), "Q5005")
+
+    assert_eq(ddl_refusal(unique_on([])), "Q5009")
+    assert_eq(ddl_refusal(unique_on(["a", "b", "a"])), "Q5005")
+    assert_eq(ddl_refusal(foreign_key(["a"], ["k", "j"])), "Q6013")
+    assert_eq(ddl_refusal(foreign_key([], [])), "Q5009")
+    assert_eq(ddl_refusal(foreign_key(["a", "a"], ["k", "j"])), "Q5005")
+    assert_eq(ddl_refusal(foreign_key(["a", "b"], ["k", "j"])), "ok")
+
+private unique_on(columns: []const string) -> Statement = alter([AddConstraint(ConstraintDef("k", Unique(items_of(columns))), false)])
+
+private foreign_key(columns: []const string, refs: []const string) -> Statement =
+    alter([AddConstraint(ConstraintDef("k", ForeignKey(items_of(columns), qn("app", "u"), items_of(refs), FkNoAction, FkRestrict, false)), false)])
+
+@test
+a_ddl_list_that_must_not_be_empty_is_refused_empty()
+    assert_eq(ddl_refusal(alter([])), "Q5009")
+    assert_eq(ddl_refusal(CreateIndex("i", IndexDef(qn("app", "t"), false, buf[IndexKey](), None), false)), "Q5009")
+    assert_eq(ddl_refusal(Grant(buf[Privilege](), OnNamespace("app"), "r", false)), "Q5009")
+    assert_eq(ddl_refusal(Revoke(buf[Privilege](), OnNamespace("app"), "r")), "Q5009")
+
+@test
+two_alter_actions_on_one_column_conflict()
+    assert_eq(ddl_refusal(alter([DropColumn("a", false), SetNullable("a", true)])), "Q6016")
+    assert_eq(ddl_refusal(alter([AddColumn(column("a", Int64)), SetColumnDefault("a", None)])), "Q6016")
+    assert_eq(ddl_refusal(alter([RetypeColumn("a", Text, None), RetypeColumn("a", Int64, None)])), "Q6016")
+    assert_eq(ddl_refusal(alter([RenameColumn("a", "b"), RetypeColumn("b", Text, None), SetNullable("b", true)])), "Q6016")
+    assert_eq(ddl_refusal(alter([SetNullable("b", true), RenameColumn("a", "b")])), "Q6016")
+    assert_eq(ddl_refusal(alter([RenameColumn("a", "b"), SetNullable("a", true)])), "Q6016")
+
+    // A rename leaves its new name for one more action, and a chain of renames is one column.
+    assert_eq(ddl_refusal(alter([RenameColumn("a", "b"), RetypeColumn("b", Text, None)])), "ok")
+    assert_eq(ddl_refusal(alter([RenameColumn("a", "b"), RenameColumn("b", "c"), SetNullable("c", true)])), "ok")
+    assert_eq(ddl_refusal(alter([DropConstraint("k", false), ValidateConstraint("k"), SetPrimaryKey(items_of(["a"])), DropColumn("a", false)])), "ok")
+
+@test
+inconsistent_sequence_options_are_refused()
+    assert_eq(ddl_refusal(sequence_of(Int64, None, Some(0), None, None)), "Q6017")
+    assert_eq(ddl_refusal(CreateSequence(qn("app", "s"), SequenceDef(Int64, None, None, None, None, false, Some(0)), false)), "Q6017")
+    assert_eq(ddl_refusal(sequence_of(Int64, Some(3), None, Some(5), Some(1))), "Q6017")
+    assert_eq(ddl_refusal(sequence_of(Int64, Some(0), None, None, None)), "Q6017")
+    assert_eq(ddl_refusal(sequence_of(Int64, None, None, Some(10), None)), "Q6017")
+    assert_eq(ddl_refusal(sequence_of(Int16, None, None, None, Some(40000))), "Q6017")
+    assert_eq(ddl_refusal(sequence_of(Int32, Some(-2147483649), Some(-1), None, None)), "Q6017")
+
+    // A descending sequence's `min` defaults to its type's minimum.
+    assert_eq(ddl_refusal(sequence_of(Int64, Some(-5), Some(-1), None, None)), "ok")
+    assert_eq(ddl_refusal(sequence_of(Int16, Some(-32768), Some(-1), None, Some(32767))), "ok")
+    assert_eq(ddl_refusal(sequence_of(Int64, Some(10), None, Some(10), Some(10))), "ok")
+
+    val column_seq = ColumnDef("a", Int64, None, None, Always, Some(plain_sequence(Int32)))
+    assert_eq(ddl_refusal(table_of([column_seq], ["a"])), "Q6017")
+
+@test
+an_altered_sequence_s_options_are_checked_against_each_other()
+    assert_eq(ddl_refusal(altered_sequence(Some(5), Some(1), None, None)), "Q6017")
+    assert_eq(ddl_refusal(altered_sequence(Some(1), Some(5), None, Some(9))), "Q6017")
+    assert_eq(ddl_refusal(altered_sequence(Some(1), Some(5), Some(0), None)), "Q6017")
+    assert_eq(ddl_refusal(AlterSequence(qn("app", "s"), SequenceDef(Int64, None, Some(0), None, None, false, None), None)), "Q6017")
+    assert_eq(ddl_refusal(AlterSequence(qn("app", "s"), SequenceDef(Int16, None, None, None, None, false, None), Some(40000))), "Q6017")
+
+    // Without both bounds the sequence's own fill in the rest, so nothing else is refused.
+    assert_eq(ddl_refusal(altered_sequence(Some(10), None, None, Some(0))), "ok")
+    assert_eq(ddl_refusal(altered_sequence(None, None, None, Some(-7))), "ok")
+
+@test
+ddl_errors_are_reported_phase_by_phase()
+    // A name error before a type error, a type error before a parameter or structure error.
+    val identity_text = ColumnDef("a", Text, Some(lit_i64(1)), None, Always, None)
+    assert_eq(ddl_refusal(table_of([column("a", Int64), identity_text], ["a"])), "Q6002")
+    assert_eq(ddl_refusal(table_of([identity_text], ["a"])), "Q6005")
+    assert_eq(check_refusal(envelope([param("x", Int64)], CreateType(qn("app", "n"), Int64, false))), "Q6005")
+    assert_eq(check_refusal(envelope([param("x", Int64)], default_of(row_col("k")))), "Q6001")
+
+    // Within the structure phase, the first in pre-order.
+    assert_eq(ddl_refusal(CreateTable(qn("app", ""), items_of([ColumnDef("a", Int64, Some(lit_i64(1)), None, Always, None)]), no_strs(), buf[ConstraintDef](), false)), "Q6019")
+    assert_eq(ddl_refusal(table_of([ColumnDef("a", Int64, Some(lit_i64(1)), None, Always, None)], [])), "Q6006")

@@ -243,7 +243,8 @@ index component or a partial-index predicate.
    are encoded in the order listed, with the conventions of [QT] §12.4: a name is `str`, a `QualName` is `str
    schema, str name`, a `[X]` is `list<X>`, an `X?` is `opt<X>`, a `bool` is one octet, an enum is a `uvar`
    ordinal in the order listed, and a choice is an enum followed by the chosen alternative's fields. Types are
-   [QT] §12.3 `Type` nodes and expressions are [QT] `Expr` nodes.
+   [QT] §12.3 `Type` nodes and expressions are [QT] `Expr` nodes. An `svar` holds an `int64` and a `uvar` a
+   `uint64`; the statement node is at depth 0 and everything it holds directly at depth 1 ([QT] §12, `Q1006`).
 2. A DDL envelope MUST declare no parameters, and its execution MUST bind exactly one empty tuple (`Q6001`).
    Constants are `Literal` nodes ([QT] §7.3). *Rationale: a definition is stored, so a value that varies between
    executions has no meaning in it.*
@@ -256,7 +257,12 @@ index component or a partial-index predicate.
    transaction's own earlier DDL (§9).
 5. `if_exists` makes a drop of a missing object succeed with no effect; `if_not_exists` makes a create of an
    existing name succeed with no effect, whatever the existing object is. Neither suppresses any other error.
-6. A DDL statement is shape-keyed like any statement ([QT] §10.2), but a server SHOULD NOT cache its plan.
+6. A DDL statement is shape-keyed like any statement ([QT] §10.2), but a server SHOULD NOT cache its plan. Its
+   shape form renames only the binders that nodes inside it introduce (a view query's, a `Match` arm's) and the
+   CTE names of a view query. The binder `row` of a definition expression (§2.12) is introduced by no node, so it
+   is kept; object, column, constraint, role and member names, every option and every literal are kept too. Two
+   DDL statements therefore share a shape only when they differ in nothing but those binders and CTE names, and
+   a DDL statement with no such binder has its encoding as its shape form.
 
 ### 3.2 Statement kinds
 
@@ -298,6 +304,9 @@ index component or a partial-index predicate.
    run inside an explicit transaction (`Q6010`), since it would hold a snapshot for the length of a job. It is
    cancellable ([WIRE] §7.3) without affecting the jobs.
 5. `CancelJob` cancels a queued or running job (§7 rule 6); a finished or unknown job is `Q6003`.
+6. `CreateView.query` is a [QT] §12.5 statement node of kind 1 (`Query`) whose payload is the view's relation; it
+   counts as a node for span indexes ([QT] §12.2), its relation is at depth 2, and any other kind there is
+   `Q1002`.
 
 ### 3.3 Auxiliary records
 
@@ -349,7 +358,11 @@ AlterAction   = choice {
    requires a nullable field type). A non-constant fill is `Q6006`.
 3. `AlterTable` applies its actions in order, as one statement: one new schema version if any action changes the
    column list, and one job per action that needs one (§7). Two actions on the same column, other than a rename
-   followed by others naming the new name, are `Q6016`.
+   followed by others naming the new name, are `Q6016`. Precisely: each of `add_column`, `drop_column`,
+   `rename_column`, `retype_column`, `set_default` and `set_nullable` **touches** the column name it names (for
+   `add_column`, `def.name`; for `rename_column`, the old `name`), and a name touched by two actions is `Q6016`.
+   `rename_column` leaves its `new_name` untouched, so one later action may name it; a `rename_column` whose
+   `new_name` an earlier action touched is `Q6016` too.
 4. `retype_column.using` is a definition expression of the new type that reads the old column; absent, it is
    `Cast(strict, Col(row, name), type)` ([QT] §7.6).
 5. `add_constraint.defer_validation` adds the constraint not validated and starts no job; the owner validates it
@@ -381,6 +394,111 @@ changes in one statement.
 
 The `alter_table` is metadata-only for `created_at` (§8.1), and adds `email_has_at` not validated, enforced at once,
 with a validation job that starts when the statement commits (§8.7).
+
+**Worked encoding.** Each statement is its own envelope, with no parameters and no spans. Every field the text form
+leaves out takes its empty value: an absent `opt`, `false`, the ordinal 0 (`none` for `identity`), and
+`defer_validation` false. Names are shown as their octets; `61 70 70` is `app`.
+
+The `create_type` is these 50 octets:
+
+```
+01 00 00                   major 1, minor 0, no parameters
+27 2c                      CreateType (39), 44-octet payload
+  03 61 70 70  06 73 74 61 74 75 73        type_name app.status
+  11 1e 02                                 Type union, two variants
+    06 61 63 74 69 76 65  10 01 00         active: record {} (kind 16, no fields)
+    06 62 61 6e 6e 65 64  10 0a 01         banned: record, one field
+      06 72 65 61 73 6f 6e  08 00          reason: text
+  00                                       if_not_exists false
+00                         no spans
+```
+
+The `create_table` is these 152 octets; its payload length, 145, is the two-octet `uvar` `91 01`:
+
+```
+01 00 00
+22 91 01                   CreateTable (34), 145-octet payload
+  03 61 70 70  05 75 73 65 72 73           table app.users
+  04                                       four columns
+    02 69 64  03 00  00 00 01 00           id int64, no default, not generated, identity always, no sequence
+    05 65 6d 61 69 6c  08 00  00 00 00 00  email text
+    06 73 74 61 74 75 73                   status
+      20 0b 03 61 70 70 06 73 74 61 74 75 73             Type: named reference app.status (kind 32)
+      01 0b 17                                           default: Variant, 23 octets
+        20 0b 03 61 70 70 06 73 74 61 74 75 73           its type, app.status
+        06 61 63 74 69 76 65  09 01 00                   tag active, value Record with no fields
+      00 00 00                                           not generated, no identity, no sequence
+    09 61 64 64 72 65 73 73 65 73          addresses
+      13 12 10 10 02                                     Type list of a record of two fields
+        04 63 69 74 79  08 00                            city: text
+        03 7a 69 70  14 02 08 00                         zip: text? (nullable, kind 20)
+      00 00 00 00
+  01 02 69 64                              primary_key [id]
+  01                                       one constraint
+    0f 75 73 65 72 73 5f 65 6d 61 69 6c 5f 6b 65 79      users_email_key
+    01  01 05 65 6d 61 69 6c                             unique (1), columns [email]
+  00                                       if_not_exists false
+00
+```
+
+The `alter_table` is these 83 octets:
+
+```
+01 00 00
+24 4d                      AlterTable (36), 77-octet payload
+  03 61 70 70  05 75 73 65 72 73           table app.users
+  02                                       two actions
+    00                                     add_column (0)
+      0a 63 72 65 61 74 65 64 5f 61 74  14 02 0d 00  00 00 00 00   created_at timestamp?
+    06                                     add_constraint (6)
+      0c 65 6d 61 69 6c 5f 68 61 73 5f 61 74             email_has_at
+      00                                                 check (0)
+      05 1c 08 63 6f 6e 74 61 69 6e 73 02                Call "contains", two arguments
+        01 0a 03 72 6f 77 05 65 6d 61 69 6c              Col row email
+        11 04 08 00 01 40                                Literal text '@'
+      00                                                 defer_validation false
+00
+```
+
+None of the three introduces a binder (`row` is introduced by no node, §2.12), so each one's shape form ([QT]
+§10.2) is its encoding, and its shape digest is the SHA-256 of these octets (§3.1 rule 6).
+
+### 3.5 Checks on the tree
+
+A server runs these checks on a decoded DDL statement before it reads the catalog, in the phases of §3.1 rule 4,
+each phase in pre-order. They need nothing but the tree, so a client library MAY run them too. Every other rule of
+§2 and §3 needs the catalog and is checked when the statement executes.
+
+1. **Names** (`Q2…`, `Q6002`). The binders of a view query and of each definition expression follow [QT] §8, a
+   definition expression seeing only `row` (§2.12 rule 1); two `ColumnDef`s, or two `ConstraintDef`s, of one
+   `CreateTable` with the same name are `Q6002`.
+2. **Types** (`Q6005`). A `CreateType` whose type is not a record, a union or a named reference, or whose type
+   refers to the name it creates; an identity column (§2.7 rule 3), or a `SequenceDef`, whose type is not
+   `int16`, `int32` or `int64`.
+3. **Parameters** (`Q6001`). A DDL envelope that declares any parameter.
+4. **Structure**:
+   - `Q6019`: every name the statement's own fields hold — each part of a `QualName`, a column, constraint, index,
+     role, member, field or variant name, a `grantee` — that is empty or longer than 255 octets. Names inside a
+     `Type` or an `Expr` follow [QT].
+   - `Q6014`: a `CreateNamespace` or `DropNamespace` of `sys` or `catalog`, or a statement whose created, changed or
+     dropped object (`table`, `def.table`, `index`, `type_name`, `sequence`, `view`) is in one. `Grant`, `Revoke`
+     and a foreign key's `ref_table` name an object without changing it, and are not checked.
+   - `Q6006`: §2.12 rule 2 in every definition expression (`default`, `generated`, a check, an index key or
+     `predicate`, `retype_column.using`, `set_default.default`); rule 3 for checks, generated columns, index keys
+     and predicates, a call of `statement_timestamp` or `next_value` being the volatile case; a default with a
+     `Col` or `Row` of `row` (§2.7 rule 1); §3.3 rule 1's one-of rule and a `sequence` without an identity; an
+     `append_fields` fill that is present and not a `Literal`, or absent for a field type that is not nullable.
+   - `Q6009`: a `CreateTable` with an empty `primary_key`.
+   - `Q5005`: a column listed twice in a primary key, a `unique` or `foreign_key` column list, or `set_primary_key`.
+   - `Q5009`: an empty `unique` or `foreign_key` column list, `set_primary_key`, index `keys`, `AlterTable.actions`,
+     or `Grant`/`Revoke.privileges`.
+   - `Q6013`: a foreign key whose `columns` and `ref_columns` differ in number.
+   - `Q6016`: §3.3 rule 3.
+   - `Q6017`: a `SequenceDef` whose `increment` is 0 or `cache` is 0; whose given `start`, `min` or `max`, or
+     `AlterSequence.restart`, is outside its type's range; a `ColumnDef.sequence` whose type is not the column's.
+     For a `CreateSequence` or a column's sequence, the options with their defaults (§3.3 rule 1) filled in must
+     have `min` ≤ `max` and `min` ≤ `start` ≤ `max`; for an `AlterSequence`, which keeps the options it does not
+     give, only when `min` and `max` are both given, and then `start` and `restart` must lie between them.
 
 ## 4. The catalog as relations
 

@@ -162,9 +162,218 @@ private struct TreeWriter
                 self.opt_rel(using, body)
                 self.opt_expr(filter, body)
                 self.items(returning, body)
+            _ -> self.ddl(s, body)
 
         node(statement_kind(s), body, out)
     end statement
+
+    // -- DDL, `ddl.md` §3 ------------------------------------------------------------------------
+
+    /** A DDL statement's payload: its §3.2 fields in order. */
+    ddl(*self, s: Statement, out: Buf[u8])
+        s match
+            CreateNamespace(name, if_not_exists) ->
+                push_str(out, name)
+                flag(if_not_exists, out)
+            DropNamespace(name, if_exists, cascade) ->
+                push_str(out, name)
+                flag(if_exists, out)
+                flag(cascade, out)
+            CreateTable(table, columns, primary_key, constraints, if_not_exists) ->
+                qual(table, out)
+                push_uvar(out, u64(columns.len()))
+
+                for c in columns
+                    self.column_def(c, out)
+
+                strs(primary_key, out)
+                push_uvar(out, u64(constraints.len()))
+
+                for c in constraints
+                    self.constraint_def(c, out)
+
+                flag(if_not_exists, out)
+            DropTable(table, if_exists, cascade) ->
+                qual(table, out)
+                flag(if_exists, out)
+                flag(cascade, out)
+            AlterTable(table, actions) ->
+                qual(table, out)
+                push_uvar(out, u64(actions.len()))
+
+                for a in actions
+                    self.alter_action(a, out)
+            CreateIndex(name, index, if_not_exists) ->
+                push_str(out, name)
+                self.index_def(index, out)
+                flag(if_not_exists, out)
+            DropIndex(index, if_exists) ->
+                qual(index, out)
+                flag(if_exists, out)
+            CreateType(type_name, ty, if_not_exists) ->
+                qual(type_name, out)
+                encode_type(ty, out)
+                flag(if_not_exists, out)
+            AlterType(type_name, change) ->
+                qual(type_name, out)
+                self.type_change(change, out)
+            DropType(type_name, if_exists) ->
+                qual(type_name, out)
+                flag(if_exists, out)
+            CreateSequence(sequence, options, if_not_exists) ->
+                qual(sequence, out)
+                sequence_def(options, out)
+                flag(if_not_exists, out)
+            AlterSequence(sequence, options, restart) ->
+                qual(sequence, out)
+                sequence_def(options, out)
+                opt_svar(restart, out)
+            DropSequence(sequence, if_exists) ->
+                qual(sequence, out)
+                flag(if_exists, out)
+            CreateView(view, query, replace) ->
+                qual(view, out)
+
+                // `query` is a `node Query`: the relation wrapped in a statement node of kind 1.
+                val q = buf[u8]()
+                self.rel(query, q)
+                node(1, q, out)
+                flag(replace, out)
+            DropView(view, if_exists, cascade) ->
+                qual(view, out)
+                flag(if_exists, out)
+                flag(cascade, out)
+            CreateRole(name, role) ->
+                push_str(out, name)
+                role_def(role, out)
+            AlterRole(name, role, new_name) ->
+                push_str(out, name)
+                role_def(role, out)
+                opt_str(new_name, out)
+            DropRole(name, if_exists) ->
+                push_str(out, name)
+                flag(if_exists, out)
+            Grant(privileges, target, grantee, grantable) ->
+                privilege_list(privileges, out)
+                object_ref(target, out)
+                push_str(out, grantee)
+                flag(grantable, out)
+            Revoke(privileges, target, grantee) ->
+                privilege_list(privileges, out)
+                object_ref(target, out)
+                push_str(out, grantee)
+            AwaitJobs(txid) -> push_uvar(out, txid)
+            CancelJob(job) -> push_uvar(out, job)
+            _ -> ()
+    end ddl
+
+    column_def(*self, c: ColumnDef, out: Buf[u8])
+        push_str(out, c.name)
+        encode_type(c.ty, out)
+        self.opt_expr(c.default, out)
+        self.opt_expr(c.generated, out)
+        push_uvar(out, identity_ordinal(c.identity))
+
+        c.sequence match
+            Some(d) ->
+                out.push(1)
+                sequence_def(d, out)
+            None -> out.push(0)
+
+    constraint_def(*self, c: ConstraintDef, out: Buf[u8])
+        push_str(out, c.name)
+
+        c.body match
+            Check(e) ->
+                push_uvar(out, 0)
+                self.expr(e, out)
+            Unique(columns) ->
+                push_uvar(out, 1)
+                strs(columns, out)
+            ForeignKey(columns, ref_table, ref_columns, on_delete, on_update, deferred) ->
+                push_uvar(out, 2)
+                strs(columns, out)
+                qual(ref_table, out)
+                strs(ref_columns, out)
+                push_uvar(out, fk_ordinal(on_delete))
+                push_uvar(out, fk_ordinal(on_update))
+                flag(deferred, out)
+
+    index_def(*self, d: IndexDef, out: Buf[u8])
+        qual(d.table, out)
+        flag(d.unique, out)
+        push_uvar(out, u64(d.keys.len()))
+
+        for k in d.keys
+            k.key match
+                KeyColumn(name) ->
+                    push_uvar(out, 0)
+                    push_str(out, name)
+                KeyExpr(e) ->
+                    push_uvar(out, 1)
+                    self.expr(e, out)
+
+            flag(k.descending, out)
+
+        self.opt_expr(d.predicate, out)
+
+    type_change(*self, change: TypeChange, out: Buf[u8])
+        change match
+            AppendVariants(variants) ->
+                push_uvar(out, 0)
+                fields(variants, out)
+            AppendFields(fs) ->
+                push_uvar(out, 1)
+                push_uvar(out, u64(fs.len()))
+
+                for f in fs
+                    push_str(out, f.name)
+                    encode_type(f.ty, out)
+                    self.opt_expr(f.fill, out)
+            RenameMember(old_name, new_name) ->
+                push_uvar(out, 2)
+                push_str(out, old_name)
+                push_str(out, new_name)
+            RenameType(new_name) ->
+                push_uvar(out, 3)
+                push_str(out, new_name)
+
+    alter_action(*self, a: AlterAction, out: Buf[u8])
+        push_uvar(out, alter_ordinal(a))
+
+        a match
+            AddColumn(c) -> self.column_def(c, out)
+            DropColumn(name, cascade) ->
+                push_str(out, name)
+                flag(cascade, out)
+            RenameColumn(name, new_name) ->
+                push_str(out, name)
+                push_str(out, new_name)
+            RetypeColumn(name, ty, using) ->
+                push_str(out, name)
+                encode_type(ty, out)
+                self.opt_expr(using, out)
+            SetColumnDefault(name, default) ->
+                push_str(out, name)
+                self.opt_expr(default, out)
+            SetNullable(name, nullable) ->
+                push_str(out, name)
+                flag(nullable, out)
+            AddConstraint(c, defer_validation) ->
+                self.constraint_def(c, out)
+                flag(defer_validation, out)
+            DropConstraint(name, if_exists) ->
+                push_str(out, name)
+                flag(if_exists, out)
+            ValidateConstraint(name) -> push_str(out, name)
+            RenameConstraint(name, new_name) ->
+                push_str(out, name)
+                push_str(out, new_name)
+            RenameTable(new_name) -> push_str(out, new_name)
+            SetPrimaryKey(columns) -> strs(columns, out)
+            Rewrite -> ()
+            SetOwner(role) -> push_str(out, role)
+    end alter_action
 
     on_conflict(*self, oc: OnConflict, out: Buf[u8])
         oc.target match
@@ -532,3 +741,93 @@ private exclude_ordinal(x: FrameExclude) -> u64 = x match
     ExcludeCurrent -> 1
     ExcludeGroup -> 2
     ExcludeTies -> 3
+
+// -- the DDL records that hold no expression ----------------------------------------------------
+
+private strs(names: Buf[string], out: Buf[u8])
+    push_uvar(out, u64(names.len()))
+
+    for n in names
+        push_str(out, n)
+
+private opt_svar(v: Option[i64], out: Buf[u8]) = v match
+    Some(x) ->
+        out.push(1)
+        push_svar(out, x)
+    None -> out.push(0)
+
+private sequence_def(d: SequenceDef, out: Buf[u8])
+    encode_type(d.ty, out)
+    opt_svar(d.start, out)
+    opt_svar(d.increment, out)
+    opt_svar(d.min, out)
+    opt_svar(d.max, out)
+    flag(d.cycle, out)
+
+    d.cache match
+        Some(n) ->
+            out.push(1)
+            push_uvar(out, n)
+        None -> out.push(0)
+
+private role_def(d: RoleDef, out: Buf[u8])
+    flag(d.login, out)
+    flag(d.superuser, out)
+    strs(d.member_of, out)
+
+private privilege_list(ps: Buf[Privilege], out: Buf[u8])
+    push_uvar(out, u64(ps.len()))
+
+    for p in ps
+        push_uvar(out, privilege_ordinal(p))
+
+private object_ref(o: ObjectRef, out: Buf[u8]) = o match
+    OnTable(name) ->
+        push_uvar(out, 0)
+        qual(name, out)
+    OnNamespace(name) ->
+        push_uvar(out, 1)
+        push_str(out, name)
+    OnSequence(name) ->
+        push_uvar(out, 2)
+        qual(name, out)
+    OnType(name) ->
+        push_uvar(out, 3)
+        qual(name, out)
+
+private identity_ordinal(i: Identity) -> u64 = i match
+    NoIdentity -> 0
+    Always -> 1
+    ByDefault -> 2
+
+private fk_ordinal(a: FkAction) -> u64 = a match
+    FkNoAction -> 0
+    FkRestrict -> 1
+    FkCascade -> 2
+    FkSetNull -> 3
+    FkSetDefault -> 4
+
+private privilege_ordinal(p: Privilege) -> u64 = p match
+    PrivSelect -> 0
+    PrivInsert -> 1
+    PrivUpdate -> 2
+    PrivDelete -> 3
+    PrivReferences -> 4
+    PrivUsage -> 5
+    PrivCreate -> 6
+
+private alter_ordinal(a: AlterAction) -> u64 = a match
+    AddColumn(_) -> 0
+    DropColumn(_, _) -> 1
+    RenameColumn(_, _) -> 2
+    RetypeColumn(_, _, _) -> 3
+    SetColumnDefault(_, _) -> 4
+    SetNullable(_, _) -> 5
+    AddConstraint(_, _) -> 6
+    DropConstraint(_, _) -> 7
+    ValidateConstraint(_) -> 8
+    RenameConstraint(_, _) -> 9
+    RenameTable(_) -> 10
+    SetPrimaryKey(_) -> 11
+    Rewrite -> 12
+    SetOwner(_) -> 13

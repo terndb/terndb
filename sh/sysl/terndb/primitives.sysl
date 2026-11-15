@@ -19,6 +19,11 @@ push_uvar(out: Buf[u8], v: u64)
 
         out.push(low | 0x80)
 
+/** `v` as an `svar`: zigzag, so small magnitudes of either sign are short, then a `uvar`. */
+push_svar(out: Buf[u8], v: i64)
+    val doubled = u64.wrap(v) << 1
+    push_uvar(out, if v < 0 then ~doubled else doubled)
+
 /** `s` as a `str`: its byte length as a `uvar`, then its UTF-8. */
 push_str(out: Buf[u8], s: string)
     push_uvar(out, u64(s.len))
@@ -72,6 +77,12 @@ struct Reader
 
             shift += 7
     end uvar
+
+    /** An `svar`: a `uvar`, then undone zigzag. */
+    svar(*self) -> Result[i64, CodecError]
+        val z = self.uvar()?
+        val half = z >> 1
+        Ok(i64.wrap(if z & 1 == 0 then half else ~half))
 
     /** A `bool`, or the tag of an `opt`: `0x00` or `0x01`, and any other octet is `Q1003`. */
     flag(*self) -> Result[bool, CodecError]

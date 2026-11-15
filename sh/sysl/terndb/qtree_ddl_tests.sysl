@@ -1,0 +1,320 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.set
+import sysl.crypto.sha256
+import sysl.encoding.hex_string
+
+// The DDL statements of `ddl.md` §3: the worked encoding of §3.4 byte for byte, every statement kind
+// and every auxiliary record through encode, decode and re-encode, the edges of their fields, and
+// what their shape form keeps.
+
+// -- building DDL trees -------------------------------------------------------------------------
+
+ddl(s: Statement) -> Envelope = envelope([], s)
+
+qn(schema: string, name: string) -> QualName = QualName(schema, name)
+
+column(name: string, ty: Type) -> ColumnDef = ColumnDef(name, ty, None, None, NoIdentity, None)
+
+/** A sequence of type `ty` with every option absent. */
+plain_sequence(ty: Type) -> SequenceDef = SequenceDef(ty, None, None, None, None, false, None)
+
+no_strs() -> Buf[string] = buf[string]()
+
+/** `columns` as a `CreateTable` of `app.t` keyed on `pk`, with no constraint. */
+table_of(columns: []const ColumnDef, pk: []const string) -> Statement =
+    CreateTable(qn("app", "t"), items_of(columns), items_of(pk), buf[ConstraintDef](), false)
+
+/** `actions` as an `AlterTable` of `app.t`. */
+alter(actions: []const AlterAction) -> Statement = AlterTable(qn("app", "t"), items_of(actions))
+
+row_col(name: string) -> Expr = col("row", name)
+
+text_lit(s: string) -> Expr = Literal(Text, Text(s))
+
+// -- the worked encoding, ddl.md §3.4 ---------------------------------------------------------
+
+private app_status() -> Type = Named("app", "status")
+
+example_create_type() -> Envelope =
+    ddl(CreateType(qn("app", "status"), union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))]), false))
+
+example_create_table() -> Envelope
+    val status = ColumnDef("status", app_status(), Some(Variant(app_status(), "active", Record(no_items()))), None, NoIdentity, None)
+    val addresses = column("addresses", list(record([Field("city", Text), Field("zip", nullable(Text))])))
+    val columns = [ColumnDef("id", Int64, None, None, Always, None), column("email", Text), status, addresses]
+    val unique = ConstraintDef("users_email_key", Unique(items_of(["email"])))
+    ddl(CreateTable(qn("app", "users"), items_of(columns), items_of(["id"]), items_of([unique]), false))
+
+example_alter_table() -> Envelope
+    val check = ConstraintDef("email_has_at", Check(call("contains", [row_col("email"), text_lit("@")])))
+    val actions = [AddColumn(column("created_at", nullable(Timestamp))), AddConstraint(check, false)]
+    ddl(AlterTable(qn("app", "users"), items_of(actions)))
+
+const create_type_hex = """
+    01 00 00
+    27 2c
+    03 61 70 70 06 73 74 61 74 75 73
+    11 1e 02
+    06 61 63 74 69 76 65 10 01 00
+    06 62 61 6e 6e 65 64 10 0a 01 06 72 65 61 73 6f 6e 08 00
+    00
+    00
+    """
+
+const create_table_hex = """
+    01 00 00
+    22 91 01
+    03 61 70 70 05 75 73 65 72 73
+    04
+    02 69 64 03 00 00 00 01 00
+    05 65 6d 61 69 6c 08 00 00 00 00 00
+    06 73 74 61 74 75 73
+    20 0b 03 61 70 70 06 73 74 61 74 75 73
+    01 0b 17 20 0b 03 61 70 70 06 73 74 61 74 75 73 06 61 63 74 69 76 65 09 01 00
+    00 00 00
+    09 61 64 64 72 65 73 73 65 73
+    13 12 10 10 02 04 63 69 74 79 08 00 03 7a 69 70 14 02 08 00
+    00 00 00 00
+    01 02 69 64
+    01 0f 75 73 65 72 73 5f 65 6d 61 69 6c 5f 6b 65 79 01 01 05 65 6d 61 69 6c
+    00
+    00
+    """
+
+const alter_table_hex = """
+    01 00 00
+    24 4d
+    03 61 70 70 05 75 73 65 72 73
+    02
+    00 0a 63 72 65 61 74 65 64 5f 61 74 14 02 0d 00 00 00 00 00
+    06 0c 65 6d 61 69 6c 5f 68 61 73 5f 61 74 00
+    05 1c 08 63 6f 6e 74 61 69 6e 73 02
+    01 0a 03 72 6f 77 05 65 6d 61 69 6c
+    11 04 08 00 01 40
+    00
+    00
+    """
+
+private check_example(env: Envelope, spaced: string, octets: usize)
+    val want = hex(spaced)
+    assert_eq(want.len(), octets)
+    same_bytes(tree_round_trip(env), want, "ddl.md §3.4's bytes")
+    assert(decode_envelope(want.view()).unwrap() == env)
+
+    // No binder: the shape form is the encoding itself.
+    same_bytes(shape_form(env).unwrap(), want, "ddl.md §3.4's shape form")
+    assert_eq(hex_string(shape_digest(env).unwrap()), hex_string(sha256(want.view())))
+
+@test
+the_ddl_worked_example_encodes_as_the_spec_writes_it()
+    check_example(example_create_type(), create_type_hex, 50)
+    check_example(example_create_table(), create_table_hex, 152)
+    check_example(example_alter_table(), alter_table_hex, 83)
+
+// -- every statement kind and every auxiliary record ------------------------------------------
+
+/** A sequence with every option given. */
+private full_sequence() -> SequenceDef = SequenceDef(Int64, Some(10), Some(-2), Some(-100), Some(100), true, Some(8))
+
+/** A `CreateTable` using every column form and every constraint body. */
+private every_column_and_constraint() -> Statement
+    val columns = [
+        ColumnDef("id", Int64, None, None, Always, Some(full_sequence())),
+        ColumnDef("n", Int32, None, None, ByDefault, None),
+        ColumnDef("at", Timestamp, Some(call("statement_timestamp", [])), None, NoIdentity, None),
+        ColumnDef("upper", Text, None, Some(call("upper", [row_col("name")])), NoIdentity, None),
+        column("name", nullable(Text))]
+    val constraints = [
+        ConstraintDef("t_named", Check(call("ne", [row_col("name"), text_lit("")]))),
+        ConstraintDef("t_upper_key", Unique(items_of(["upper", "n"]))),
+        ConstraintDef("t_n_fkey", ForeignKey(items_of(["n"]), qn("app", "u"), items_of(["k"]), FkCascade, FkSetNull, true))]
+    CreateTable(qn("app", "t"), items_of(columns), items_of(["id"]), items_of(constraints), true)
+
+/** An `AlterTable` with every action, each on a column of its own. */
+private every_action() -> Statement
+    val check = ConstraintDef("t_c", Check(call("gt", [row_col("a"), Literal(Int64, Int(0))])))
+    alter([
+        AddColumn(ColumnDef("a", Int64, Some(Literal(Int64, Int(1))), None, NoIdentity, None)),
+        DropColumn("b", true),
+        RenameColumn("c", "c2"),
+        RetypeColumn("d", Int64, Some(Cast(row_col("d"), Int64, Try))),
+        SetColumnDefault("e", None),
+        SetNullable("f", true),
+        AddConstraint(check, true),
+        DropConstraint("t_old", true),
+        ValidateConstraint("t_c"),
+        RenameConstraint("t_x", "t_y"),
+        RenameTable("t2"),
+        SetPrimaryKey(items_of(["a", "g"])),
+        Rewrite,
+        SetOwner("owner")])
+
+/** One envelope of every DDL statement kind, between them holding every auxiliary record. */
+every_ddl() -> Buf[Envelope]
+    val index = IndexDef(qn("app", "t"), true, items_of([IndexKey(KeyColumn("a"), false), IndexKey(KeyExpr(call("lower", [row_col("b")])), true)]),
+        Some(call("gt", [row_col("a"), Literal(Int64, Int(0))])))
+    val fills = [FieldFill("note", nullable(Text), None), FieldFill("rank", Int32, Some(Literal(Int32, Int(7))))]
+    val view = project(scan("app", "t", "t"), "p", [item("a", col("t", "a"))])
+    val role = RoleDef(true, false, items_of(["readers", "writers"]))
+    val all = items_of([PrivSelect, PrivInsert, PrivUpdate, PrivDelete, PrivReferences, PrivUsage, PrivCreate])
+
+    items_of([
+        ddl(CreateNamespace("app", true)),
+        ddl(DropNamespace("app", true, true)),
+        ddl(every_column_and_constraint()),
+        ddl(DropTable(qn("app", "t"), true, false)),
+        ddl(every_action()),
+        ddl(CreateIndex("t_lower_b", index, true)),
+        ddl(DropIndex(qn("app", "t_lower_b"), true)),
+        ddl(CreateType(qn("app", "shape"), union_of([Field("circle", record([Field("r", Float64)]))]), true)),
+        ddl(AlterType(qn("app", "shape"), AppendVariants(items_of([Field("square", record([Field("side", Float64)]))])))),
+        ddl(AlterType(qn("app", "point"), AppendFields(items_of(fills)))),
+        ddl(AlterType(qn("app", "shape"), RenameMember("circle", "disc"))),
+        ddl(AlterType(qn("app", "shape"), RenameType("figure"))),
+        ddl(DropType(qn("app", "shape"), false)),
+        ddl(CreateSequence(qn("app", "s"), full_sequence(), true)),
+        ddl(AlterSequence(qn("app", "s"), plain_sequence(Int64), Some(5))),
+        ddl(DropSequence(qn("app", "s"), true)),
+        ddl(CreateView(qn("app", "v"), view, true)),
+        ddl(DropView(qn("app", "v"), true, true)),
+        ddl(CreateRole("alice", role)),
+        ddl(AlterRole("alice", role, Some("alicia"))),
+        ddl(DropRole("alicia", true)),
+        ddl(Grant(all, OnTable(qn("app", "t")), "alice", true)),
+        ddl(Grant(items_of([PrivUsage]), OnNamespace("app"), "alice", false)),
+        ddl(Grant(items_of([PrivUsage]), OnSequence(qn("app", "s")), "alice", false)),
+        ddl(Revoke(items_of([PrivUsage]), OnType(qn("app", "shape")), "alice")),
+        ddl(AwaitJobs(42)),
+        ddl(CancelJob(7))])
+end every_ddl
+
+@test
+every_ddl_statement_kind_round_trips_and_checks()
+    val kinds = set[u64]()
+    var distinct = 0
+
+    for env in every_ddl()
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+        if kinds.add(statement_kind(env.statement)) then distinct += 1
+
+    assert_eq(distinct, 22)
+
+@test
+every_ddl_enum_value_round_trips()
+    for identity in [NoIdentity, Always, ByDefault]
+        val seq = if identity == NoIdentity then None else Some(plain_sequence(Int16))
+        val env = ddl(table_of([ColumnDef("k", Int16, None, None, identity, seq)], ["k"]))
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+    for action in [FkNoAction, FkRestrict, FkCascade, FkSetNull, FkSetDefault]
+        val fk = ConstraintDef("fk", ForeignKey(items_of(["k"]), qn("app", "u"), items_of(["k"]), action, action, false))
+        assert_eq(tree_refusal(tree_round_trip(ddl(alter([AddConstraint(fk, false)]))).view()), "ok")
+
+    for p in [PrivSelect, PrivInsert, PrivUpdate, PrivDelete, PrivReferences, PrivUsage, PrivCreate]
+        ignore_ddl(tree_round_trip(ddl(Revoke(items_of([p]), OnTable(qn("app", "t")), "bob"))))
+
+private ignore_ddl(bytes: Buf[u8]) = ()
+
+// -- edges --------------------------------------------------------------------------------------
+
+@test
+empty_ddl_lists_round_trip()
+    val bare = [
+        ddl(CreateTable(qn("app", "t"), buf[ColumnDef](), items_of(["id"]), buf[ConstraintDef](), false)),
+        ddl(CreateRole("r", RoleDef(false, false, no_strs()))),
+        ddl(AlterType(qn("app", "e"), AppendVariants(buf[Field]()))),
+        ddl(AlterType(qn("app", "e"), AppendFields(buf[FieldFill]()))),
+        ddl(CreateType(qn("app", "e"), record([]), false))]
+
+    for env in bare
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+    // Lists the checks require to be non-empty still have an encoding.
+    for s in [alter([]), Grant(buf[Privilege](), OnNamespace("app"), "r", false), table_of([], [])]
+        ignore_ddl(tree_round_trip(ddl(s)))
+
+@test
+optional_ddl_fields_round_trip_present_and_absent()
+    val envs = [
+        ddl(AlterSequence(qn("app", "s"), full_sequence(), None)),
+        ddl(AlterSequence(qn("app", "s"), full_sequence(), Some(0))),
+        ddl(AlterRole("a", RoleDef(true, true, no_strs()), None)),
+        ddl(AlterRole("a", RoleDef(true, true, no_strs()), Some("b"))),
+        ddl(CreateIndex("i", IndexDef(qn("app", "t"), false, items_of([IndexKey(KeyColumn("a"), false)]), None), false)),
+        ddl(CreateIndex("i", IndexDef(qn("app", "t"), false, items_of([IndexKey(KeyColumn("a"), false)]), Some(Literal(Bool, Bool(true)))), false)),
+        ddl(alter([RetypeColumn("a", Text, None)])),
+        ddl(alter([RetypeColumn("a", Text, Some(row_col("a")))])),
+        ddl(alter([SetColumnDefault("a", Some(text_lit("x")))])),
+        ddl(CreateSequence(qn("app", "s"), plain_sequence(Int64), false))]
+
+    for env in envs
+        assert_eq(tree_refusal(tree_round_trip(env).view()), "ok")
+
+@test
+the_largest_ddl_values_round_trip()
+    val widest = SequenceDef(Int64, Some(i64::Max), Some(i64::Min), Some(i64::Min), Some(i64::Max), true, Some(u64::Max))
+    assert_eq(tree_refusal(tree_round_trip(ddl(CreateSequence(qn("app", "s"), widest, false))).view()), "ok")
+    assert_eq(tree_refusal(tree_round_trip(ddl(AlterSequence(qn("app", "s"), widest, Some(i64::Min)))).view()), "ok")
+
+    for n in [0, u64::Max]
+        assert_eq(tree_refusal(tree_round_trip(ddl(AwaitJobs(n))).view()), "ok")
+        assert_eq(tree_refusal(tree_round_trip(ddl(CancelJob(n))).view()), "ok")
+
+    val longest = "n".repeat(255)
+    assert_eq(tree_refusal(tree_round_trip(ddl(CreateNamespace(longest, false))).view()), "ok")
+    assert_eq(tree_refusal(tree_round_trip(ddl(CreateTable(qn(longest, longest), items_of([column(longest, Int64)]), items_of([longest]), buf[ConstraintDef](), false))).view()), "ok")
+
+private svar_spells(v: i64, spelled: string, file: string = __FILE__, line: long = __LINE__)
+    val out = buf[u8]()
+    push_svar(out, v)
+    assert_eq(hex_string(out.view()), spelled, "the svar's octets", file, line)
+
+    var r = Reader(out.view(), 0)
+    assert_eq(r.svar().unwrap(), v, "the svar read back", file, line)
+
+@test
+an_svar_is_zigzag_then_a_uvar()
+    svar_spells(0, "00")
+    svar_spells(-1, "01")
+    svar_spells(1, "02")
+    svar_spells(-64, "7f")
+    svar_spells(64, "8001")
+    svar_spells(i64::Max, "feffffffffffffffff01")
+    svar_spells(i64::Min, "ffffffffffffffffff01")
+
+// -- shape --------------------------------------------------------------------------------------
+
+private digest_of(s: Statement) -> string = hex_string(shape_digest(ddl(s)).unwrap())
+
+@test
+a_ddl_statement_s_names_and_literals_are_part_of_its_shape()
+    assert(digest_of(table_of([column("a", Int64)], ["a"])) != digest_of(CreateTable(qn("app", "u"), items_of([column("a", Int64)]), items_of(["a"]), buf[ConstraintDef](), false)))
+    assert(digest_of(table_of([column("a", Int64)], ["a"])) != digest_of(table_of([column("b", Int64)], ["b"])))
+
+    val one = ColumnDef("a", Int64, Some(Literal(Int64, Int(1))), None, NoIdentity, None)
+    val two = ColumnDef("a", Int64, Some(Literal(Int64, Int(2))), None, NoIdentity, None)
+    assert(digest_of(table_of([one], ["a"])) != digest_of(table_of([two], ["a"])))
+    assert(digest_of(CreateRole("a", RoleDef(true, false, no_strs()))) != digest_of(CreateRole("b", RoleDef(true, false, no_strs()))))
+    assert(digest_of(AwaitJobs(1)) != digest_of(AwaitJobs(2)))
+
+@test
+a_view_query_s_binders_are_renamed_and_row_is_kept()
+    val t = CreateView(qn("app", "v"), project(scan("app", "t", "t"), "p", [item("a", col("t", "a"))]), false)
+    val u = CreateView(qn("app", "v"), project(scan("app", "t", "u"), "q", [item("a", col("u", "a"))]), false)
+    assert(tree_bytes(ddl(t)) != tree_bytes(ddl(u)))
+    assert_eq(digest_of(t), digest_of(u))
+
+    // A `Match` arm's binder inside a check is renamed; `row` is not.
+    assert_eq(digest_of(check_matching("x")), digest_of(check_matching("y")))
+
+    val spelled = hex_string(shape_form(ddl(check_matching("x"))).unwrap().view())
+    assert(spelled.contains("03726f77"), "row stays row")
+    assert(spelled.contains("026230"), "the arm's binder is b0")
+
+/** A check whose `Match` arm introduces `binder`. */
+private check_matching(binder: string) -> Statement =
+    alter([AddConstraint(ConstraintDef("k", Check(Match(row_col("s"), items_of([MatchArm("active", binder, Literal(Bool, Bool(true)))]), None))), false)])
