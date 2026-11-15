@@ -1,0 +1,8 @@
+package {
+  name = terndb
+  version = "0.1.0"
+}
+allocator {
+  alloc = "terndb_alloc_hook"
+  free  = "terndb_free_hook"
+}

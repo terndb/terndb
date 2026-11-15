@@ -1,0 +1,21 @@
+module terndb
+
+@export("terndb_count")
+count(n: usize, d: isize) -> usize = n + usize(d)
+
+@export("terndb_ok")
+ok(b: bool) -> bool = !b
+
+@export("terndb_mix")
+mix(a: f32, b: f64) -> f64 = f64(a) + b
+
+@export("terndb_sum4")
+sum4(a: *[4]i32) -> i32 = a[0] + a[1] + a[2] + a[3]
+
+@export("terndb_first")
+first(p: *u8) -> u8 = *p
+
+@export("terndb_put")
+put(key: *u8, len: usize, out: *u8)
+    *out = *key
+

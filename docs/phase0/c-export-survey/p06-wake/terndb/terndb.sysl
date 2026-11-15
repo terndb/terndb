@@ -1,0 +1,27 @@
+module terndb
+@requires(posix)
+
+import sysl.io.poll.{Event, Poller}
+import sysl.time.millis
+
+var engine: Option[Poller] = None
+
+@export("terndb_open")
+open() -> bool
+    engine = Poller.open().ok()
+    engine.is_some()
+
+// Blocks until woken or `ms` passes; answers how many events (a wake is none).
+@export("terndb_run_once")
+run_once(ms: long) -> i64
+    var got = [Event.none; 4]
+
+    engine match
+        Some(p) -> i64(p.wait(got[..], Some(millis(ms))).unwrap())
+        None -> -1
+
+@export("terndb_wake")
+wake() -> bool
+    engine match
+        Some(p) -> p.waker().wake().is_ok()
+        None -> false

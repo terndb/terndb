@@ -1,0 +1,10 @@
+module terndb
+
+@export("terndb_stats")
+struct Stats
+    hist: [4]u32
+    ratio: f32
+    live: bool
+
+@export("terndb_get")
+get(s: *Stats) -> u32 = s.hist[1]

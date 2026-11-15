@@ -1,0 +1,11 @@
+module terndb
+
+val table = [10, 20, 30, 40]
+
+@export("terndb_at")
+at(i: usize) -> i32 = table[i]
+
+@export("terndb_fail")
+fail(code: i32) -> i32
+    if code != 0 then panic("terndb: bad code $code")
+    0

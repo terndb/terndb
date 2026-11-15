@@ -1,0 +1,14 @@
+module terndb
+
+@export("TERNDB_VERSION_MAJOR")
+val version_major: u32 = 1
+
+const max_key: usize = 4096
+
+enum Code: i32
+    ok = 0
+    not_found = 1
+    busy = 2
+
+@export("terndb_code")
+code(n: i32) -> Code = if n == 0 then .ok else .busy
