@@ -214,7 +214,9 @@ the primary's WAL in order and MUST satisfy:
 - **R3 causal token.** Every commit acknowledgement returns `commit`; every begin returns `snapshot`. A begin MAY
   carry `after = n`; the replica MUST then wait until it has applied `c ≥ n` before taking the snapshot, or fail
   with `replica_lag_timeout` after `replica_wait_timeout`. A client that passes its session's highest observed
-  `commit`/`snapshot` gets read-your-writes and monotonic reads across the primary and every replica.
+  `commit`/`snapshot` gets read-your-writes and monotonic reads across the primary and every replica. A token
+  that names a commit absent from the server's history (one lost by a failover) MUST fail with
+  `token_not_in_history` rather than be satisfied (`replication.md` §8.3).
 - **R3a bounded staleness (optional).** A begin MAY instead, or as well, carry `max_lag = t`; the replica MUST
   then take a snapshot that includes every commit the primary had made durable at least `t` before the begin,
   waiting for it, or fail with `replica_lag_timeout` after `replica_wait_timeout`. Without `max_lag` a replica
@@ -232,7 +234,9 @@ of the commit order is serializable (§5.5). A replica transaction never aborts 
 - **Transaction ids** are 64-bit, assigned at begin, and MUST NOT be reused or wrap. An uncommitted version
   carries its writer's id in the row header; there is no wraparound maintenance.
 - **Commit sequence numbers** `c` are 64-bit, drawn from one counter, and MUST be assigned in the order of the
-  transactions' WAL commit records. `c` is the serialization order of §3.
+  transactions' WAL commit records. `c` is the serialization order of §3. Both a transaction id and `c` carry
+  the failover term in their high 16 bits (`replication.md` §1.4), so each stays strictly increasing across a
+  promotion.
 - **Publication.** A commit is *published* when its versions become visible to new snapshots. Commits MUST be
   published in `c` order: the **visible horizon** `h` is the largest `c` such that every commit `≤ c` is
   published.
@@ -477,12 +481,13 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
   scans at a snapshot taken after the DDL committed (`ddl.md` §7). Every row committed later was written either by
   a transaction that saw the DDL, and so enforced it, or by one that reconciled with it, so no concurrent commit
   can slip a row past the check, at any level.
-- On a replica, replay of a DDL that drops or rewrites a structure a replica transaction is using MUST wait up to
-  `max_replay_delay` and then abort that transaction with `replica_conflict`. Replay of row changes never
-  conflicts with replica readers, because replay rebuilds the primary's undo chains (`on-disk-format.md` §6.11).
-  Replay of an `UNDO_TRUNCATE` that removes undo a replica snapshot still needs is treated like such a DDL,
-  unless the replica feeds its oldest snapshot back to the primary, which is opt-in and off by default
-  (`on-disk-format.md` §5.5).
+- On a replica, the only replay that can remove what a replica transaction reads is purge and undo truncation,
+  which free ghost rows, old overflow chains and the trees of dropped or rewritten structures. Each is announced
+  by a `PURGE_HORIZON(h)` record; replay of it MUST wait up to `max_replay_delay` for every replica transaction
+  with snapshot `s < h` and then abort those still live with `replica_conflict` (`replication.md` §7.5). Replay
+  of row changes, and of DDL itself, never conflicts with replica readers, because replay rebuilds the primary's
+  undo chains (`on-disk-format.md` §6.11). A replica that feeds its oldest snapshot back to the primary (opt-in,
+  off by default, `on-disk-format.md` §5.5) makes such conflicts rarer.
 - The operations, their phases and their interaction with each level are specified in `ddl.md` §8.
 
 ## 6. Commit and replication
@@ -500,9 +505,11 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
 - An fsync error MUST be treated as a crash of the WAL: the server stops accepting commits and recovers from the
   last durable state. It MUST NOT retry the fsync and continue.
 - Replication streams WAL that is durable on the primary (R4), in WAL order.
-- **`synchronous = remote`** (acknowledge only once a replica also has the WAL durable through the commit record,
-  so that acknowledged commits survive failover) comes in Phase 3, with `replication.md`. Until then a server
-  MUST refuse it as an invalid option.
+- **`synchronous = remote`** acknowledges only once a quorum of synchronous replicas also has the WAL durable
+  through the commit record, so that acknowledged commits survive failover; **`synchronous = remote_apply`**
+  waits until they have applied it. Both, the synchronous set and their interaction with group commit are
+  `replication.md` §6. The same argument as for `on` holds: a read-only transaction at a remote level waits for
+  its snapshot to reach the level, so no acknowledged transaction depends on a commit the level does not protect.
 
 ## 7. Checkable properties
 
@@ -631,10 +638,10 @@ satisfies:
 A replica crash loses nothing the primary has; on restart the replica resumes applying from its last durable
 position, and its first snapshot after restart MAY be older than one it served before the crash (R2 is per
 connection). Failover to a replica (promotion) yields the replica's applied prefix: commits acknowledged on the
-primary but not yet applied on the promoted replica are lost, at every `synchronous` setting until
-`synchronous = remote` exists (§6). The old primary is **fenced** by a term number carried in the WAL: a
-promotion starts a higher term, and a primary that learns of a higher term MUST stop acknowledging commits. The
-details are `replication.md`'s.
+primary but not yet flushed on the promoted replica are lost at `on` and `off`; commits acknowledged at `remote`
+or `remote_apply` are not lost by a promotion that fenced the synchronous set (§6). The old primary is
+**fenced** by a term number carried in the WAL: a promotion starts a higher term, and a primary that learns of a
+higher term MUST stop acknowledging commits. The details are `replication.md` §10.
 
 ## Open questions
 

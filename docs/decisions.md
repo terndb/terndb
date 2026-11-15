@@ -7,6 +7,8 @@ in that spec's "Open questions". Abbreviations: QT `query-tree.md`, ISO `isolati
 WIRE `wire-protocol.md`, ERR `errors.md`, DDL `ddl.md`, CAPI `c-api.md`. Rows Q30 onward were decided while
 writing `ddl.md`; to revert one, restore its sections and add its question to `ddl.md` §11. Rows C1 onward were
 decided while writing `c-api.md`; to revert one, rewrite its sections and add its question to `c-api.md` §16.
+Rows P1 onward were decided while writing `replication.md` (REPL); to revert one, rewrite its sections and mark its
+question in `replication.md` §16 open again.
 
 ## Query tree, types and values
 
@@ -107,3 +109,22 @@ decided while writing `c-api.md`; to revert one, rewrite its sections and add it
 | C10 | Text across the ABI: `uint8_t` or `char`? | Text is `(const char *, size_t)` UTF-8, bytes `(const uint8_t *, size_t)`, neither NUL-terminated. | WIRE §9.1 rule 1; CAPI §1 rule 3 |
 | C11 | Role of an embedded session? | A new database gets a superuser login role `terndb`, which an embedded session takes by default; no authentication in-process. | CAPI §4.2 rule 2, §5.1 rule 1 (and see CAPI §16 question 7) |
 | C12 | Flow control for a pull API? | `prefetch_bytes` (default 4 MiB) bounds unpulled batches, mapped to wire credit in network mode. | CAPI §5.2 rule 3; §15.1 property 18 |
+
+## Replication
+
+| Id | Question | Decision | Sections changed |
+|---|---|---|---|
+| P1 | Where does the replication stream run? | Messages of the native protocol in its reserved ranges (`0x60–0x65`, `0xE0–0xE8`), as wire 1.1, on dedicated replication connections; `WalData`, `PrimaryStatus` and `ReplicaStatus` have fixed-width headers. | REPL §2, §3, §4.1, §5.1–§5.4, §11.1; WIRE §0 rule 3, §3.2 closing paragraph |
+| P2 | Cascading replication? | None in v1: every replica streams from the primary; `max_replicas` default 16, at most 64. | REPL §1.1 rule 5, §12 |
+| P3 | Timeline and term: one number or two? | One: the timeline id is the term, every timeline switch takes a term above every one known, each term has a random `promotion_id`, and history files record the lineage. | REPL §1.2; DISK §2 file set, §6.4 (`TIMELINE_SWITCH` payload), §6.6 (`term` = `timeline`) |
+| P4 | Telling a causal token from a commit lost by failover? | Transaction ids and commit sequence numbers carry the term in their high 16 bits (48-bit counter per term); the WAL carries every `c`; a token absent from the history is `T2003`. | REPL §1.4, §8.3, §10.6 rule 2; ISO §3.6 R3, §4.1; DISK §6.4 (`TXN_COMMIT.commit_seq`, `CHECKPOINT_END.last_commit_seq`), D19; ERR `T2003` |
+| P5 | Which synchronous levels? | `off`, `on`, `remote`, `remote_apply`; a quorum `k` of at most 16 named replicas; `synchronous` is an enum on the wire (byte-identical to the bool for `off`/`on`) and an `int32_t` level in the C ABI. No receive-only level. | REPL §6.1–§6.3; ISO §6, §8; WIRE §3.4, §3.5 (`Synchronous`), §5.2 rules 2 and 5, §5.4 rule 1; CAPI §12 header (`TERNDB_SYNC_*`, `terndb_txn_options_set_synchronous`) |
+| P6 | A remote commit with no reachable quorum? | Waits without limit by default; optional `synchronous_commit_timeout` reports `T2002` for a transaction that is committed on the primary. | REPL §6.4; ERR `T2002` |
+| P7 | Preventing split brain without a consensus service? | Promotion fences `n − k + 1` members of the synchronous set at the new term and must be the most advanced of them; fence term persisted in CONTROL; configuration changes carried by `SYNC_CONFIG` with joint quorums; optional `fence_command`; no primary lease, so a partitioned old primary's `on`/`off` commits are lost. | REPL §6.2 rules 3–4, §10; DISK §2.2 (`fence_term`, `fence_promotion_id`), §6.4 (`SYNC_CONFIG`); ISO §8; ERR `S1008`, `S3001`–`S3004` |
+| P8 | What may conflict with replica readers? | Only purge and undo truncation, announced by a new `PURGE_HORIZON` record; DDL replay itself never conflicts. | REPL §7.5, §9 rule 5; ISO §5.6; DISK §5.5, §5.6, §6.4 (kind 44), §6.11 rule 3 |
+| P9 | Replica feedback on by default? | Stays opt-in (Q24), and is bounded: clamped by `replica_feedback_undo_limit` and `max_snapshot_age`, dropped on disconnect, O(`max_replicas`) per status at a bounded rate. | REPL §7.6, §12; DISK §5.5 |
+| P10 | Seeding a replica? | Base backup over the protocol after a completed checkpoint, pages from files or the buffer pool, torn copies repaired by FPIs, CONTROL synthesized on the replica. | REPL §4 |
+| P11 | Rejoining an old primary? | Built-in rewind: fetch from the new primary only the pages the old primary's divergent WAL touched (`StartBackup` mode `pages`), then redo from the last common checkpoint. | REPL §10.5 |
+| P12 | Who may replicate? | Superusers and members of a predefined role `terndb_replication`; no new role attribute. | REPL §2.2; DDL §2.10 rule 6; ERR `S1006` |
+| P13 | Slots and their bound? | Persistent named slots on the primary (`slots/<name>.tslot`), invalidated past `max_slot_wal_keep` (default 64 GiB). | REPL §5.8; DISK §2 file set; ERR `S2001`–`S2003` |
+| P14 | Measuring `max_lag` across nodes? | Echoed probes timed on the replica's own monotonic clock; no clock comparison between nodes. | REPL §5.3, §5.4, §8.4 |

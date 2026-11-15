@@ -31,6 +31,7 @@ TernDB is in design. Nothing here runs yet.
 | [Isolation](docs/spec/isolation.md) | What each isolation level guarantees, written as a checkable history model |
 | [C ABI](docs/spec/c-api.md) | `libterndb`'s header: handles, threads, sync and async execution, results as bytes or walked, errors, versioning |
 | [DDL and the catalog](docs/spec/ddl.md) | Catalog objects, DDL statement trees, the catalog as relations, schema versions and online schema change |
+| [Replication](docs/spec/replication.md) | One primary and streaming read replicas: base backup, the WAL stream, synchronous commit, replica reads, failover with fencing, rewind |
 | [Error codes](docs/spec/errors.md) | The one registry of every error code and its name, across all the specs |
 | [Decisions](docs/decisions.md) | The answers applied to the specs' open questions, each with what to revert |
 

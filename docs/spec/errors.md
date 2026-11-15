@@ -17,7 +17,8 @@ from.*
    the `Q6…` group is DDL validation, `ddl.md`),
    `R` runtime (evaluation, `query-tree.md`), `T` transactions and isolation (`isolation.md`), `W` wire
    (`wire-protocol.md`), `D` storage (`on-disk-format.md`; the `D4…` group is opening a database, `c-api.md` §4),
-   `C` the C ABI (`c-api.md`). The first digit groups related codes within an area.
+   `C` the C ABI (`c-api.md`), `S` replication, backup and failover (`replication.md`). The first digit groups
+   related codes within an area.
 2. Every code has a **name**, unique across the registry, in `snake_case`. The name is an alias: specs, client
    libraries and server messages MAY use either, and they mean the same thing.
 3. On the wire and across the C ABI, `ErrorEntry.code` carries the **code**, never the name (`wire-protocol.md`
@@ -135,6 +136,8 @@ Raised under the rules of `isolation.md` §5. Levels: SER serializable, SI snaps
 | `T1007` | `cancelled` | the client, an administrator or a shutdown cancelled it before commit | all | yes |
 | `T1008` | `resource_exhausted` | memory, undo space or disk full, or a snapshot past `max_snapshot_age` or `undo_retention_limit` (§5.5); the transaction is aborted | all | yes, after back-off |
 | `T2001` | `commit_unknown` | the server cannot say whether the commit happened (e.g. it lost the WAL device mid-commit) | all | **no**: resolve first (§5.4) |
+| `T2002` | `commit_not_confirmed` | a commit at `remote` or `remote_apply` waited `synchronous_commit_timeout` for its quorum; the transaction **is committed** on the primary (`replication.md` §6.4) | all | no |
+| `T2003` | `token_not_in_history` | `after` names a commit this server's history does not contain, because a failover lost it (§3.6 R3, `replication.md` §8.3) | all | no |
 | `T3001` | `unique_violation` | a unique constraint fails on data visible to the transaction | all | no |
 | `T3002` | `check_violation` | a check constraint fails | all | no |
 | `T3003` | `foreign_key_violation` | a foreign-key constraint fails | all | no |
@@ -208,3 +211,28 @@ Raised by `libterndb` itself under the rules of `c-api.md`, never sent on the wi
 | `C1008` | `not_initialized` | A call before `terndb_init`. |
 | `C1009` | `abi_mismatch` | The caller's header is of another ABI major, or a newer minor, than the library. |
 | `C2001` | `out_of_memory` | The allocator returned NULL outside any transaction. |
+
+## 8. Replication (`S`)
+
+Raised under the rules of `replication.md`, on replication connections (§2.1 there) and by the administrative
+promotion of a replica. A request that fails with one of them ends its stream; none is fatal to the connection.
+Section references below are to `replication.md`.
+
+| Code | Name | Meaning | R |
+|---|---|---|---|
+| `S1001` | `not_primary` | The node is not the primary of its term, or is a fenced old primary; on a fenced primary every new transaction gets it (§5.1, §10.4) | yes, on another node |
+| `S1002` | `database_mismatch` | The peer's `db_uuid` is not this database's (§3, §5.1) | |
+| `S1003` | `history_diverged` | The replica's history does not agree with the primary's at `start_lsn`, or a requested history file is unknown; rewind or re-seed (§1.2, §5.1, §10.6) | |
+| `S1004` | `wal_unavailable` | The WAL at `start_lsn` is in neither `wal/` nor `archive/` (§5.1, §5.7) | |
+| `S1005` | `wal_format_unsupported` | The primary's WAL format is above what the replica can apply (§5.1, §11) | |
+| `S1006` | `replication_not_permitted` | The role is neither a superuser nor a member of `terndb_replication` (§2.2) | |
+| `S1007` | `too_many_replicas` | `max_replicas` streams are already open (§5.1) | yes |
+| `S1008` | `stale_term` | A `Fence` whose term does not exceed the node's fence term (§10.2); `details.fence_term` | |
+| `S1009` | `connection_in_replication_mode` | A non-replication request on a replication connection, a replication request on another connection, or a second replication stream (§2.1) | |
+| `S2001` | `unknown_slot` | The named slot does not exist and `create_slot` is false (§5.1) | |
+| `S2002` | `slot_in_use` | The slot, or the synchronous replica name, is held by another stream (§4.2, §5.1, §6.2) | |
+| `S2003` | `slot_invalidated` | The slot fell more than `max_slot_wal_keep` behind and no longer retains WAL (§5.8) | |
+| `S3001` | `fence_quorum_unreached` | Promotion could not fence `n − k + 1` members of the synchronous set within `promotion_timeout`, or `fence_command` failed (§10.2) | |
+| `S3002` | `not_most_advanced` | A fenced member has flushed more WAL than the candidate; `details.member` names it (§10.2) | |
+| `S3003` | `term_exhausted` | A new term would exceed 65,535 (§1.2) | |
+| `S3004` | `not_a_replica` | Promotion asked of a node that is not a replica (§10.2) | |

@@ -24,8 +24,8 @@ RFC 9266 (TLS channel binding `tls-exporter`), RFC 8446 (TLS 1.3), RFC 7301 (ALP
    front end, which parses SQL text in TernDB's dialect, builds query trees, and runs them through the same
    validator and executor. It shares nothing with this protocol on the wire, and nothing in this document depends
    on it. A result delivered through it is flattened to Postgres rows by that layer; this protocol never flattens.
-3. **Replication** (the WAL stream from a primary to its replicas) is deferred to its own specification,
-   `replication.md`. This document reserves message types for it (§3.2) and says nothing else about it.
+3. **Replication** (the WAL stream from a primary to its replicas) is specified in `replication.md`, as messages
+   of this protocol in the type ranges this document reserves for it (§3.2), from wire version 1.1.
 4. **DDL** arrives as trees, like every other statement: an `Execute` or `Prepare` whose envelope's root is a DDL
    statement kind of `ddl.md` §3. There is no request that carries SQL text; the SQL front end is not part of this
    protocol.
@@ -258,7 +258,8 @@ The high bit of `type` is the direction: `0x00–0x7F` client to server, `0x80�
 
 Types `0x40–0x4F` and `0xD0–0xDF` are reserved for server-pushed notifications (LISTEN/NOTIFY, change feeds),
 which a later version adds; `0x60–0x6F` and
-`0xE0–0xEF` are reserved for `replication.md`. Every other unlisted type is reserved. In 1.0 all are `W1001`.
+`0xE0–0xEF` are reserved for `replication.md`, which assigns some of them in wire 1.1 (its §2.3). Every other
+unlisted type is reserved. In 1.0 all are `W1001`.
 
 ### 3.3 Responses per request
 
@@ -293,7 +294,7 @@ ClientHello   := list<(uvar major, uvar max_minor)> wire_versions     (non-empty
                  list<str> compression                               (codecs the client accepts; §6.4.7)
 
 SessionDefaults := opt<Isolation> isolation
-                   opt<bool> synchronous
+                   opt<Synchronous> synchronous
                    opt<uvar> lock_timeout_ms
                    opt<uvar> statement_timeout_ms
                    opt<uvar> replica_wait_timeout_ms
@@ -375,7 +376,7 @@ ReleaseSavepoint    := uvar txn, str name
 TransactionStatus   := uvar txid
 
 TxnOptions      := opt<Isolation> isolation
-                   opt<bool> synchronous
+                   opt<Synchronous> synchronous
                    opt<bool> read_only
                    opt<uvar> after                                    ([ISO] §3.6 R3 causal token)
                    opt<uvar> lock_timeout_ms
@@ -383,6 +384,7 @@ TxnOptions      := opt<Isolation> isolation
                    opt<uvar> max_lag_ms                               ([ISO] §3.6 R3a bounded staleness)
 
 Isolation       := enum { serializable, snapshot, read_committed }
+Synchronous     := enum { off, on, remote, remote_apply }                ([ISO] §6; remote levels from wire 1.1)
 ```
 
 ### 3.6 Response messages
@@ -551,14 +553,16 @@ params := uvar tuple_count                    (≥ 1)
    `snapshot` ([ISO] §3.6 R3: "every begin returns `snapshot`"; at read committed, the horizon at begin), and the
    `effective` isolation level.
 2. Each `TxnOptions` field absent takes the connection's `SessionDefaults` value, and failing that the server's
-   default. The defaults are `serializable` and `synchronous = true` ([ISO] §1, §6).
+   default. The defaults are `serializable` and `synchronous = on` ([ISO] §1, §6).
 3. On a replica every transaction is read-only and serializable: `effective` MUST be `serializable` whatever was
    asked ([ISO] §3.6), and `read_only = false` explicitly requested is `read_only_transaction`.
 4. `after = n`: the server MUST NOT take the snapshot until its horizon is at least `n`, and MUST fail the `Begin`
    with `replica_lag_timeout` after `replica_wait_timeout_ms` ([ISO] §3.6 R3). On a primary the horizon already
    includes every acknowledged commit, so `after` never waits there for a value the client obtained from that
    primary.
-5. `synchronous` selects [ISO] §6's `on` (`true`) or `off` (`false`) for this transaction.
+5. `synchronous` selects [ISO] §6's level for this transaction: `off`, `on`, or, from wire 1.1, `remote` or
+   `remote_apply` (`replication.md` §6). The encoding of `off` and `on` is the octet `00` or `01`, as a `bool`
+   was. A remote level on a connection that negotiated wire 1.0 is `W1001`.
 6. `read_only = true` declares the transaction `READ ONLY` ([ISO] §5.5): a write in it is `read_only_transaction`.
 7. The same rules apply to an implicit transaction's `TxnOptions`.
 
@@ -576,8 +580,8 @@ params := uvar tuple_count                    (≥ 1)
 
 ### 5.4 Commit and Rollback
 
-1. `Commit` answers `TxnCommitted` only after the commit is published and, at `synchronous = true`, durable
-   ([ISO] §4.1, §6). `commit` is the commit sequence number; it is absent for a transaction whose write set is
+1. `Commit` answers `TxnCommitted` only after the commit is published and, at `synchronous = on`, durable, and
+   at a remote level confirmed by the synchronous quorum ([ISO] §4.1, §6; `replication.md` §6.3). `commit` is the commit sequence number; it is absent for a transaction whose write set is
    empty, which is serialized at its snapshot ([ISO] §5.5).
 2. A `Commit` whose outcome the server cannot determine fails with `commit_unknown` (not retryable) and closes the
    handle; the client resolves it as in §5.6.
@@ -973,8 +977,8 @@ ErrorEntry := str code
 3. A validation error MUST carry, as `entries`, every error [QT] §11.2 requires: the first phase's errors sorted by
    path, the pre-order-first one first.
 4. `span` is present when the envelope carried `spans` and one covers the node at `path` ([QT] §5.4).
-5. `retryable` is true iff `entries[0].code` is marked retryable in `errors.md` (the `T1…` codes, `W2004`, `W2008`
-   and `W4001`). A retryable error MUST guarantee that the request had no effect,
+5. `retryable` is true iff `entries[0].code` is marked retryable in `errors.md` (the `T1…` codes, `W2004`, `W2008`,
+   `W4001`, `S1001` and `S1007`). A retryable error MUST guarantee that the request had no effect,
    and for a transaction-aborting code that the transaction had no effect ([ISO] §5.2).
 6. `txn_state` says what became of the request's transaction: `unaffected` (an implicit transaction rolled back,
    or a request outside any transaction), `aborted` (an explicit transaction that now accepts only `Rollback`,
@@ -994,7 +998,8 @@ connection.
 ### 8.3 Which code a failure gets
 
 1. A failure inside the tree envelope or the parameter block is a [QT] code (`Q…`), never a `W` code.
-2. A runtime error during execution is an `R…` code, a `T…` code ([ISO] §5.2) or a `D…` code (storage).
+2. A runtime error during execution is an `R…` code, a `T…` code ([ISO] §5.2) or a `D…` code (storage). A
+   failure of replication, backup or failover (`replication.md` §13) is an `S…` code.
 3. An abort is reported with exactly one [ISO] §5.2 code (a `T…` code, or `D1001`) as `entries[0].code`
    ([ISO] §5.1).
 4. Everything about framing, sessions, handles and authentication is a `W` code.

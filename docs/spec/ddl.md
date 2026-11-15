@@ -207,6 +207,9 @@ Every constraint has a name unique in the table's namespace, and is one of:
    `Revoke` does not abort a running transaction.
 5. Every role may read every `catalog` relation (§4). Not in v1: column privileges, row-level security, default
    privileges.
+6. Every database has a predefined role `terndb_replication`, without `login`, which cannot be dropped or
+   renamed. A role has the **replication right** — it may stream the WAL, take a base backup, rewind or fence
+   (`replication.md` §2.2) — iff it is a superuser or a member of `terndb_replication`.
 
 ### 2.11 Dependencies
 

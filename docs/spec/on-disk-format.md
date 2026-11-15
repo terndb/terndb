@@ -47,7 +47,10 @@ A database is a directory. Its contents:
     000000000000.tund  …                undo segments, 64 MiB each
   wal/
     <timeline>-<first lsn>.twal  …      WAL segments, 64 MiB each (§6.6)
+    <timeline>.thist  …                 timeline history files (`replication.md` §1.2)
   archive/                              optional: WAL kept for backup and PITR
+  slots/                                replication slots (`replication.md` §5.8)
+    <name>.tslot  …
 ```
 
 1. File names are lowercase hexadecimal, zero-padded to the widths shown: data segment number 8 digits, undo
@@ -106,7 +109,9 @@ one with the higher `sequence`. If neither is valid, the open MUST fail.
 | 112 | 1  | `state` | 0 = shut down cleanly, 1 = open, 2 = in recovery, 3 = replica |
 | 113 | 7  | reserved | |
 | 120 | 8  | `feature_flags` | bit 0 = columnar projections present (reserved, §3.10); bit 1 = encryption at rest (reserved, §3.1); others reserved |
-| 128 | 3968 | reserved | |
+| 128 | 4  | `fence_term` | the highest term this node has accepted to exist (`replication.md` §10.1); at least `timeline` |
+| 132 | 16 | `fence_promotion_id` | the `promotion_id` of the term in `fence_term` |
+| 148 | 3948 | reserved | |
 
 *Rationale:* the two alternating slots give an atomic control update without a rename, as in InnoDB's doublewritten
 header and SQLite's two-step journal header.
@@ -661,9 +666,10 @@ Reconstruction reads the undo log only. It never writes, and it never latches th
 live snapshot sees everything. The engine MAY advance `undo_low` to address A only when every record below A
 belongs to a committed transaction that every live snapshot sees, and, on a primary with replica feedback enabled,
 every replica snapshot. **Replica feedback is opt-in** (`replica_feedback`, default off): with it a replica reports
-its oldest snapshot and may hold back the primary's `undo_low`; without it the primary truncates regardless, and a
-replica transaction whose undo an `UNDO_TRUNCATE` removes is aborted with `replica_conflict` (§6.11,
-`isolation.md` §5.6).
+its oldest snapshot and may hold back the primary's horizon and `undo_low`, within the bounds of `replication.md`
+§7.6; without it the primary purges and truncates regardless, and a replica transaction whose versions that removes
+is aborted with `replica_conflict` at the `PURGE_HORIZON` record that announced it (§5.6, §6.11,
+`replication.md` §7.5).
 
 1. Truncation deletes whole undo segment files below `undo_low`. It is logged as `UNDO_TRUNCATE` and recorded in
    CONTROL at the next checkpoint.
@@ -694,6 +700,11 @@ for each one:
   `PAGE_FREE` after its children, one mini-transaction per page. Because an oid is never reused, a walk restarted
   after a crash skips what it already freed. No snapshot can still read the tree, because the record is below the
   horizon.
+
+Before purge or truncation acts on any record of a transaction whose commit sequence number exceeds the
+`horizon` of the last `PURGE_HORIZON` record, it MUST log a new `PURGE_HORIZON` whose `horizon` covers that
+transaction and does not exceed the current horizon. `horizon` never decreases. A replica treats the record as the
+point at which its older snapshots conflict (`replication.md` §7.5); one record per purge round suffices.
 
 Purge then advances `undo_low` past the records it has finished. Purge touches only the rows the log names: it is
 work proportional to writes, never a table scan.
@@ -766,18 +777,20 @@ Other records (no page):
 | kind | name | payload |
 |-----:|------|---------|
 | 0  | `PAD` | zeros |
-| 32 | `TXN_COMMIT` | `commit_time` i64 (µs since epoch, wall clock), `last_undo` u64 |
+| 32 | `TXN_COMMIT` | `commit_time` i64 (µs since epoch, wall clock), `last_undo` u64, `commit_seq` u64 (the commit sequence number `c`, `isolation.md` §4.1), `commit_flags` u64 (bit 0 `CATALOG`: the transaction wrote a catalog tree; others zero) |
 | 33 | `TXN_ABORT` | none; written after a rollback completes |
 | 34 | `CHECKPOINT_BEGIN` | none |
-| 35 | `CHECKPOINT_END` | `begin_lsn` u64, `redo_lsn` u64, `next_txn_id` u64, `next_oid` u64, `undo_low` u64, `undo_high` u64, `n_txn` u32, n_txn × (`txn` u64, `last_undo` u64, `undo_next` u64) |
+| 35 | `CHECKPOINT_END` | `begin_lsn` u64, `redo_lsn` u64, `next_txn_id` u64, `next_oid` u64, `undo_low` u64, `undo_high` u64, `last_commit_seq` u64, `n_txn` u32, n_txn × (`txn` u64, `last_undo` u64, `undo_next` u64) |
 | 36 | `FILE_CREATE` | `space` u8, `segment_no` u64 |
 | 37 | `FILE_EXTEND` | `space` u8, `segment_no` u64, `new_page_count` u32 |
 | 38 | `FILE_DELETE` | `space` u8, `segment_no` u64 |
 | 39 | `UNDO_TRUNCATE` | `new_undo_low` u64 |
 | 40 | `FORMAT_UPGRADE` | `from` u16, `to` u16 |
 | 41 | `FORMAT_MIN` | `new_min` u16 |
-| 42 | `TIMELINE_SWITCH` | `old_timeline` u32, `new_timeline` u32, `switch_lsn` u64 |
+| 42 | `TIMELINE_SWITCH` | `old_timeline` u32, `new_timeline` u32, `switch_lsn` u64 (this record's own LSN), `last_commit_seq` u64 (of the old timeline in this history), `promotion_id` 16 bytes (`replication.md` §1.2) |
 | 43 | `RESTORE_POINT` | `name_len` u16, name |
+| 44 | `PURGE_HORIZON` | `horizon` u64: the commit sequence number below or at which purge and truncation may now act (§5.6) |
+| 45 | `SYNC_CONFIG` | `quorum` u8, `n` u8, n × (`name_len` u8, name): the synchronous configuration (`replication.md` §6.2) |
 
 Kinds 0x40–0x4F are reserved for projections. A COMPENSATION record carries, after its normal payload, `undo_next`
 u64: the rollback chain position still to be undone.
@@ -810,7 +823,7 @@ Segment files are named `<timeline:08x>-<first lsn:016x>.twal` and are exactly 6
 | 14 | 2  | `key_version`: reserved for encryption at rest (§3.1); v1 writes 0 |
 | 16 | 16 | `db_uuid` |
 | 32 | 4  | `timeline` |
-| 36 | 4  | `term`: reserved for failover fencing (`isolation.md` §8); its rules are `replication.md`'s. v1 writes 0 |
+| 36 | 4  | `term`: the failover term, which equals `timeline` (`replication.md` §1.2); a reader MUST treat a segment whose `term` differs from its `timeline` as missing |
 | 40 | 8  | `first_lsn` |
 | 48 | 8  | `prev_segment_crc`: the CRC of the previous segment's header (0 for the first) |
 | 56 | 4040 | reserved |
@@ -899,9 +912,10 @@ All three consume the WAL defined above, with no second format.
    timeline with `TIMELINE_SWITCH`, so the abandoned future and the new history cannot be confused.
 3. **A replica** receives the WAL byte for byte, applies redo continuously and never runs the undo phase. A
    replica's snapshots read undo pages that redo produced, so a replica serves the same versions the primary did.
-   `UNDO_TRUNCATE` arrives in the stream. By default a replica that must keep a snapshot past it waits up to
-   `max_replay_delay` and then aborts that snapshot's transaction with `replica_conflict`; only with opt-in
-   feedback (§5.5) does its horizon hold back the primary's undo.
+   Purge and `UNDO_TRUNCATE` arrive in the stream behind a `PURGE_HORIZON` record. A replica with a snapshot older
+   than its `horizon` waits up to `max_replay_delay` and then aborts that snapshot's transaction with
+   `replica_conflict`; only with opt-in feedback (§5.5) does its horizon hold back the primary's purge. The
+   protocol, base backup, promotion and rewind are `replication.md`'s.
 
 ---
 
@@ -1085,7 +1099,7 @@ sync, and reorder writes issued before one sync. "Recover" means run §6.9 (or �
 - **D17.** No live snapshot ever needs an undo address below `undo_low`.
 - **D18.** After recovery, no row's `txn` names a transaction that is neither committed, nor active, nor a loser
   being rolled back.
-- **D19.** Undo addresses, LSNs, transaction ids and object ids are strictly increasing, and survive every crash
+- **D19.** Undo addresses, LSNs, transaction ids, commit sequence numbers and object ids are strictly increasing, and survive every crash
   without reuse. (Recovery raises each counter above every value it sees.)
 
 **Structure**

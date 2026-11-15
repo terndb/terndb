@@ -584,6 +584,11 @@ typedef struct terndb_log_record   terndb_log_record;
 #define TERNDB_ISOLATION_SNAPSHOT       1
 #define TERNDB_ISOLATION_READ_COMMITTED 2
 
+#define TERNDB_SYNC_OFF          0        /* isolation.md §6, replication.md §6.1 */
+#define TERNDB_SYNC_ON           1
+#define TERNDB_SYNC_REMOTE       2
+#define TERNDB_SYNC_REMOTE_APPLY 3
+
 #define TERNDB_TXN_PENDING  0
 #define TERNDB_TXN_OPEN     1
 #define TERNDB_TXN_ABORTED  2
@@ -704,7 +709,7 @@ uint64_t   terndb_conn_catalog_version(const terndb_conn *conn);
 /* ---- options (§5.2) ---- */
 int  terndb_txn_options_new(terndb_txn_options **out, terndb_error **err);
 int  terndb_txn_options_set_isolation(terndb_txn_options *o, int32_t isolation, terndb_error **err);
-int  terndb_txn_options_set_synchronous(terndb_txn_options *o, bool on, terndb_error **err);
+int  terndb_txn_options_set_synchronous(terndb_txn_options *o, int32_t level, terndb_error **err);
 int  terndb_txn_options_set_read_only(terndb_txn_options *o, bool on, terndb_error **err);
 int  terndb_txn_options_set_after(terndb_txn_options *o, uint64_t commit_seq, terndb_error **err);
 int  terndb_txn_options_set_lock_timeout_ms(terndb_txn_options *o, uint64_t ms, terndb_error **err);
