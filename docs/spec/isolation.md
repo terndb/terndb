@@ -462,23 +462,28 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
 
 - The catalog is versioned under MVCC like data. Every statement reads the catalog at its snapshot, and every
   access to table `t` logs a point read of `t`'s catalog entry (§4.4).
-- A DDL statement on `t` writes `t`'s catalog entry and MUST take its write lock, waiting for every live
-  transaction that has written `t` (DML holds a shared lock on the catalog entry of every table it writes until
-  it ends). DDL never waits for readers.
-- A transaction at any level that accessed `t` under a catalog version replaced by a DDL committed during its
-  lifetime MUST abort with `schema_changed` at commit (at read committed: at its next statement on `t` if that
-  statement would plan against the dropped or changed definition, else at commit). This is validation of the
-  catalog read, applied at every level.
-- A DDL statement that checks existing data (adding a constraint, building a unique index) MUST validate its
-  scan as a serializable read whatever the transaction's level, so that no concurrent commit can slip a row past
-  the check.
+- A DDL statement on `t` writes `t`'s catalog entry and takes that entry's row write lock (§4.2), so two DDL
+  statements on one object are ordered. DDL waits for neither readers nor writers of `t` (`ddl.md` §6.1).
+- The catalog read of a statement is **column-precise**, like its data reads (§4.4): it records the parts of
+  `t`'s definition the statement depended on (`ddl.md` §6.2). A transaction at any level whose catalog read is
+  changed by a DDL committed during its lifetime MUST abort with `schema_changed` at commit (at read committed:
+  at its next statement on `t` if that statement would plan against the dropped or changed definition, else at
+  commit). This is validation of the catalog read, applied at every level. A DDL that changes nothing the
+  transaction read (an added column it never named, a new index) does not abort it.
+- A transaction that wrote `t` and commits after a DDL on `t` that it did not see **reconciles** its writes with
+  that DDL before its commit record (`ddl.md` §6.4): it maintains the new indexes, checks the new constraints and
+  fills the new columns for the rows it wrote, and aborts if that fails.
+- A DDL that checks existing data (adding a constraint, building a unique index) does so in a background job that
+  scans at a snapshot taken after the DDL committed (`ddl.md` §7). Every row committed later was written either by
+  a transaction that saw the DDL, and so enforced it, or by one that reconciled with it, so no concurrent commit
+  can slip a row past the check, at any level.
 - On a replica, replay of a DDL that drops or rewrites a structure a replica transaction is using MUST wait up to
   `max_replay_delay` and then abort that transaction with `replica_conflict`. Replay of row changes never
   conflicts with replica readers, because replay rebuilds the primary's undo chains (`on-disk-format.md` §6.11).
   Replay of an `UNDO_TRUNCATE` that removes undo a replica snapshot still needs is treated like such a DDL,
   unless the replica feeds its oldest snapshot back to the primary, which is opt-in and off by default
   (`on-disk-format.md` §5.5).
-- Online DDL (DDL that does not wait for the table's writers) is the subject of `ddl.md`.
+- The operations, their phases and their interaction with each level are specified in `ddl.md` §8.
 
 ## 6. Commit and replication
 

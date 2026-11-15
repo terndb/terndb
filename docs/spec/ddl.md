@@ -1,0 +1,892 @@
+# TernDB data definition, the catalog and online schema change
+
+**Status:** normative, draft. **Tree schema version:** 1.0 (statement kinds 32–63, type kind 32).
+
+This document defines TernDB's schema: the objects the catalog holds, the DDL statements that create and change
+them, the catalog as ordinary relations, how a table's rows survive a change of its columns, and how every change
+runs online. DDL is sent as a tree, like every other statement: there is no SQL on the native protocol
+(`docs/decisions.md` W11), so this document is the whole of DDL for a native client. TernDB's SQL dialect has its
+own DDL syntax, defined with the SQL front end; it MUST produce the trees defined here and nothing else
+(`query-tree.md` §1 rule 3).
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119. Every MUST is meant to be
+checkable by a test that sends trees, reads the catalog relations of §4 and inspects results, error codes, or the
+deterministic simulation (`isolation.md` §7.3). *Rationale* text explains a choice and is not a rule.
+
+Abbreviations: [QT] `query-tree.md`, [DISK] `on-disk-format.md`, [ISO] `isolation.md`, [WIRE] `wire-protocol.md`,
+[ERR] `errors.md`. The errors this document raises are registered in [ERR]; new ones are the `Q6…` group of §2 there.
+
+## 0. Principles
+
+1. **A schema change never takes the table away.** No DDL statement waits for the table's readers or writers, and
+   no operation in §8 blocks them. Work proportional to the table's size runs in a background job (§7) while the
+   table stays readable and writable.
+2. **Schema versions are metadata.** Every row records the schema version it was written in, and a row of an old
+   version is translated when it is read (§5). Adding, dropping, renaming and widening a column rewrite nothing.
+3. **DDL is transactional.** Catalog rows are MVCC rows ([DISK] §3.9), so DDL commits and rolls back with its
+   transaction, and every snapshot sees one consistent catalog (§9).
+4. **The catalog is data.** Every object is a row of a relation in the `catalog` namespace (§4), readable by an
+   ordinary `Query`. A typed-client generator reads the schema the way any client reads a table.
+5. **Types are structural.** A named type is an alias for a structure ([QT] §2.6); a result type never names one
+   ([QT] §12.3).
+
+## 1. Model
+
+1. Every catalog object has an **oid**, a `uint64` below 2⁴⁸, never reused ([DISK] §3.9). Names are in
+   **namespaces**; a table, view, index, constraint, sequence and named type is named by a `QualName` (namespace,
+   name), unique within the namespace across all those kinds (`Q6002`). Roles and namespaces have unqualified
+   names, unique among their kind.
+2. A name is 1–255 octets of UTF-8 and compares byte-for-byte ([QT] §8.1); anything else is `Q6019`. The
+   namespaces `sys` and `catalog` are **reserved**: they hold the system objects, and every DDL statement that
+   would create, change or drop an object in them is `Q6014`.
+3. The **catalog version** is the commit sequence number ([ISO] §4.1) of the newest committed transaction that
+   changed the catalog. It is what [WIRE] §3.6 `Prepared.catalog_version` reports and what a plan cache keys on
+   ([QT] §10.2).
+4. Every table has a **schema version**, a `uint16` that starts at 1 when the table is created and increases by
+   exactly one with each committed statement that changes its column list (§5.1). Changes to a table's indexes and
+   constraints do not change its schema version.
+
+## 2. Catalog objects
+
+### 2.1 Namespaces
+
+A namespace has a name and an owner. It is created by `CreateNamespace` and dropped by `DropNamespace`, which is
+`Q6007` while the namespace holds any object, unless `cascade` is set, in which case every object in it is dropped
+in the same statement, in dependency order (§2.11).
+
+### 2.2 Tables
+
+1. A table is a B+tree clustered on its primary key ([DISK] §3.3). It has an ordered list of columns, a primary key,
+   and any number of secondary indexes and constraints.
+2. **Every table MUST have a primary key** (`Q6009`). *Rationale: the table is clustered on it and every secondary
+   index points at it ([DISK] §4.9), so a hidden key would be a key nobody can name; a generated client also needs a
+   row identity, and an `identity` column (§2.7) costs one line.*
+3. A table has at most 65,535 columns (`Q6011`), and its fixed area plus its widest key MUST fit the limit of [DISK]
+   §4.7 rule 2 (`Q6011`).
+
+### 2.3 Columns
+
+1. A column has a **column id** (a `uint32`, unique within the table for its whole life, never reused, and stable
+   across renames and retypes), a name, a type, and optionally a default, a generation expression or an identity.
+   The order of columns is their **ordinal** in the current schema version; `Scan` outputs them in that order
+   ([QT] §6.1).
+2. The type is any type of [QT] §2, including records, unions, relation types and `json`, or a named type reference
+   ([QT] §12.3 kind 32). Nullability is part of it ([QT] §2.2): a column of type `T` is `NOT NULL`, and one of type
+   `T?` is not. A column's stored descriptor is the structure ([DISK] §4.3 rule 2).
+3. A column is in one of three **states**: `ready`, `filling` (being backfilled, §8.2) or `converting` (being
+   retyped, §8.5). Only a `ready` column is visible to statements: a `Scan` does not output a column in another
+   state, and naming one is `Q2003`. A writer still writes every column of its schema version, whatever its state
+   (§5.4).
+
+### 2.4 The primary key
+
+1. The primary key is a non-empty list of distinct columns of the table. Each MUST have a non-null type that may be
+   a key component ([DISK] §4.6 rule 4): a scalar other than `json`, or an enum (§2.8). Anything else is `Q6005`.
+2. Primary-key columns are stored in the key only ([DISK] §4). Changing the primary key, or the type of a key
+   column, rebuilds the table (§8.11).
+3. The primary key is also a constraint named `<table>_pkey`, listed in `catalog.constraints`, and it is the
+   table's conflict target for an upsert ([QT] §9.3) like any unique constraint.
+
+### 2.5 Secondary indexes
+
+1. An index belongs to one table and has an ordered list of **key components**, each a column or an expression
+   over the row, and each ascending or descending. A component's type MUST be a possible key component ([DISK]
+   §4.6 rule 4), else `Q6005`. A nullable component is allowed; its nulls sort first ascending and last descending.
+2. **Unique** indexes are allowed. Two rows conflict when every component is non-null and the components are equal
+   by `same` ([QT] §3.1); a row with a null component never conflicts. A unique index is an upsert target.
+3. **Partial** indexes are allowed: a `predicate` over the row; only rows for which it is `true` have entries. A
+   query uses a partial index only when its own filter implies the predicate; the planner MAY decide implication
+   conservatively. A partial unique index enforces uniqueness among the rows it covers.
+4. **Expression** components are allowed. An expression is a **definition expression** (§2.12) and MUST be
+   deterministic. An index on a field of a record column is an expression index (`Field(Col(row, c), f)`).
+5. An index has a **state**: `building` while its job runs (§8.9), `ready` once complete, and `failed` when its
+   job failed. Only a `ready` index answers queries or enforces uniqueness against committed data.
+6. Not in v1: indexes over the elements of a nested relation, a scalar list or a `json` document (multi-valued
+   indexes), covering columns, and per-index storage options.
+
+### 2.6 Constraints
+
+Every constraint has a name unique in the table's namespace, and is one of:
+
+| Kind | Definition | Enforced when |
+|---|---|---|
+| not null | the column's type is non-null (§2.3); not a separate object, but listed in `catalog.constraints` | every write of the column |
+| check | a deterministic boolean definition expression over the row (§2.12); a row satisfies it unless the expression is `false` (null passes, as in SQL) | every insert, and every update of a column the expression reads |
+| unique | a list of columns; backed by a unique index of the same name, created with it | every write of a key column, through the index |
+| primary key | §2.4 | as unique |
+| foreign key | `columns` of this table referencing `ref_columns` of `ref_table`, which MUST be exactly the columns of a unique or primary-key constraint of `ref_table`, in order, with types identical apart from nullability (`Q6013`) | see below |
+
+1. **Validity.** A constraint is either **validated** (every committed row satisfies it) or **not validated**
+   (every write since the constraint was added satisfies it, and older rows have not yet been checked). A not
+   validated constraint is enforced on every write exactly as a validated one is. It becomes validated through the
+   job of §8.7. The planner MUST NOT rely on a not-validated constraint (for example to prove a predicate empty).
+2. **Foreign keys** use simple matching: a row whose referencing columns include a null is not checked. Each foreign
+   key has an `on_delete` and an `on_update` action, one of `no_action`, `restrict`, `cascade`, `set_null` and
+   `set_default`, with SQL's meanings; `set_null` requires every referencing column to be nullable (`Q6013`). A
+   foreign key is **immediate** (checked at the end of each statement) unless declared **deferred** (checked at
+   commit). `restrict` is always checked at the end of the statement, even when deferred.
+3. **Foreign keys under isolation.** A check that a referenced row exists MUST hold at commit against concurrent
+   deletes. At serializable the check is a point read, logged and validated ([ISO] §4.3). At snapshot and read
+   committed the check MUST take the referenced row's write lock as `LOCK_ONLY` ([DISK] §4.1), held to the end of the
+   transaction, so a concurrent delete or key update of that row waits or fails under [ISO] §4.2. A delete or key
+   update of a referenced row checks for referencing rows by a scan of the referencing table that is validated at
+   serializable and, at the other levels, sees the newest committed versions as a read committed write does ([ISO]
+   §4.2 rule 3), so that a referencing row committed after the snapshot is not missed.
+4. Constraint violations are the `T3…` codes ([ERR] §4): `T3001` unique, `T3002` check, `T3003` foreign key,
+   `T3004` not null.
+
+### 2.7 Defaults, generated columns, identity and sequences
+
+1. A **default** is a definition expression (§2.12) of the column's type, evaluated once per inserted row that does
+   not name the column ([QT] §9.2 rule 2). It MAY call the volatile functions `statement_timestamp()` and
+   `next_value` ([QT] §7.12); it MUST NOT read any column. A column with no default defaults to null, and an
+   insert that leaves a non-null column without a default unset is `Q3005`.
+2. A **generated** column is **stored**: its value is computed from the row's other columns at every insert and at
+   every update of a column it reads, and written like any other value. Its expression is a deterministic
+   definition expression and MUST NOT read another generated column (`Q6006`). A generated column MUST NOT be named
+   in an `Insert` or set in an `Update` (`Q5003`). Virtual (computed-on-read) columns are not in v1.
+3. An **identity** column is an `int16`, `int32` or `int64` non-null column whose default draws from a sequence the
+   column owns, created and dropped with it. `always` forbids naming the column in an `Insert` (`Q5003`);
+   `by_default` lets an `Insert` supply a value instead.
+4. A **sequence** has `start`, `increment` (non-zero), `min`, `max` (as `int64`), `cycle` and `cache` (≥ 1)
+   (`Q6017` for an inconsistent set). `next_value(schema, name)` returns the next value. When the next value would
+   pass `min` or `max`, it wraps if `cycle` is set and is otherwise `R0008`.
+5. **Sequences are not transactional.** A value drawn is never drawn again, whether its transaction commits or
+   rolls back, so identity values have gaps. `sys.sequence_state` ([DISK] §3.9) is updated by redo-only
+   `NODE_PATCH` mini-transactions with no undo: before handing out a value at or beyond the logged `cached_to`, the
+   engine MUST log a new `cached_to` = value + `cache` × `increment`. After recovery, drawing resumes at `cached_to`.
+   Because a transaction's commit record follows in the WAL every reservation whose values it used, a value seen by
+   a committed transaction is never reissued, even after a crash.
+   *Rationale: a transactional sequence serialises every inserter on one row; every database that ships sequences
+   makes them non-transactional for that reason.*
+
+### 2.8 Named types
+
+1. `CreateType` gives a name to a **record** or **union** type ([QT] §2.3–2.4). An **enum** is a named union whose
+   payloads are all `{}`; there is no separate enum type ([QT] §2.4 rule 1), and the catalog reports the kind
+   `enum` for such a union (§4.2). Scalars, relation types and nullable types cannot be named (`Q6005`).
+2. A named type is an **alias**: a reference to it ([QT] §12.3 kind 32) denotes its structure, and type identity
+   compares structures. A value of the named type and a value of the same structure written out are the same
+   type. *Rationale: [QT] keeps every type structural so that results need no catalog to decode; a nominal type
+   would make two clients with the same structure disagree about identity.*
+3. A column declared with a named type records it (`sys.columns.type_oid`, `catalog.columns.type_name`), so a
+   client generator can emit one named class per catalog type. A column declared with the structure written out
+   has no type name, even if a named type with that structure exists.
+4. A named type MAY contain references to other named types, but not to itself, directly or through others
+   (`Q6005`).
+5. **Changing a named type** (`AlterType`, §3.2) changes every column declared with it. The permitted changes are
+   the lossless ones of §5.3 rule 3 — append variants to a union, append nullable fields (or fields with a constant
+   fill) to a record, rename a tag or field — and they run as a metadata-only retype (§8.5) of every such column, in
+   one transaction, giving each affected table a new schema version. Any other change is `Q6018`: define a new
+   type and retype the columns. A name or tag rename conflicts with every running transaction that resolved the
+   old name (§6.3).
+6. Dropping a named type that a column, another type or a view uses is `Q6007`.
+
+### 2.9 Views
+
+1. A view is a named `Query` statement ([QT] §5) with no parameters. Its result type is the view's row type, and
+   its columns are the root `Rel`'s output columns. A `Scan` of a view reads the stored query in its place, with the
+   scan's binder bound to its output ([QT] §6.1).
+2. Views are read-only: a DML target that is a view is `Q5003`. A view's stored tree names columns as
+   `Col(binder, name)`, so renaming a column a view reads rewrites the view's stored tree in the same transaction
+   (§8.4). Dropping or retyping a column a view reads is `Q6007` unless `cascade` drops the view.
+3. A view is checked with the privileges of its owner; reading it needs `select` on the view only.
+
+### 2.10 Roles and privileges
+
+1. A **role** has a name, `login` (whether a connection may authenticate as it, [WIRE] §2.4), `superuser`, and a
+   list of roles it is a member of; a member has every privilege of the roles it belongs to, transitively.
+   Credentials are not part of the catalog defined here; the wire's authentication methods map a credential to a
+   role.
+2. Every object has an **owner** role, initially the role that created it. The owner, a member of the owner, and a
+   superuser may alter or drop the object and grant privileges on it.
+3. The privileges are: on a table or view, `select`, `insert`, `update`, `delete`, `references` (needed to create a
+   foreign key to it); on a namespace, `usage` (to name objects in it) and `create`; on a sequence, `usage` (to call
+   `next_value`); on a named type, `usage`. `Grant` and `Revoke` change them; `grantable` lets the grantee grant on.
+4. Privileges are checked at validation, against the statement's catalog snapshot: a missing one is `Q6015`. A
+   `Revoke` does not abort a running transaction.
+5. Every role may read every `catalog` relation (§4). Not in v1: column privileges, row-level security, default
+   privileges.
+
+### 2.11 Dependencies
+
+`sys.depends` ([DISK] §3.9) records that one object's definition refers to another: an index or constraint to its
+table, a foreign key to its referenced table, a view to each object it reads, a column's named type, a type to the
+types it refers to, an identity sequence to its column's table. Column-level dependencies are read from the
+definitions themselves, which name columns. A `Drop…` or `drop_column` whose target has dependents is `Q6007`
+unless `cascade` is set, in which case the dependents are dropped first, in the same statement. `cascade` never
+drops a table or a column: a dependent table (through a foreign key) loses only the foreign key.
+
+### 2.12 Definition expressions
+
+A **definition expression** is an [QT] expression stored in the catalog: a default, a check, a generated column, an
+index component or a partial-index predicate.
+
+1. The row is visible through the one binder `row`, which no node introduces; `Col(row, c)` names column `c` of the
+   table (a `ready` column). Nothing else is visible.
+2. It MUST NOT contain `Param`, `Relation`, `Scalar`, `Exists`, `In` over a relation, `Action`, an aggregate or a
+   window call (`Q6006`). Literals and named type references are allowed.
+3. **Deterministic** means calling only functions that the function catalog does not mark volatile; in [QT] §7.12,
+   `statement_timestamp` and `next_value` are the volatile ones. Checks, generated columns and index components
+   MUST be deterministic (`Q6006`).
+4. It is stored in the canonical encoding ([QT] §12) of the expression, with `row` as its binder, and reported in
+   `catalog.*` in the text form ([QT] §15).
+
+## 3. DDL statement trees
+
+### 3.1 Common rules
+
+1. A DDL statement is the `statement` of an [QT] §12.2 envelope, encoded as a `node` whose kind is in §3.2. Fields
+   are encoded in the order listed, with the conventions of [QT] §12.4: a name is `str`, a `QualName` is `str
+   schema, str name`, a `[X]` is `list<X>`, an `X?` is `opt<X>`, a `bool` is one octet, an enum is a `uvar`
+   ordinal in the order listed, and a choice is an enum followed by the chosen alternative's fields. Types are
+   [QT] §12.3 `Type` nodes and expressions are [QT] `Expr` nodes.
+2. A DDL envelope MUST declare no parameters, and its execution MUST bind exactly one empty tuple (`Q6001`).
+   Constants are `Literal` nodes ([QT] §7.3). *Rationale: a definition is stored, so a value that varies between
+   executions has no meaning in it.*
+3. A DDL statement returns **no value** ([QT] §5 rule 2): it has no result type, sends no `Batch`, and its row count
+   in `Complete.counts` is 0 ([WIRE] §4.3). The exceptions are `AwaitJobs`, which returns a relation (§3.2), and
+   `CancelJob`, which returns none.
+4. Validation runs in the phases of [QT] §11.2: decode, then names (unknown objects `Q2001`, `Q6003`, `Q6004`;
+   existing names `Q6002`; privileges `Q6015`), then types (`Q3…`, `Q6005`, `Q6008`), then structure (`Q6006`,
+   `Q6007`, `Q6009`–`Q6019`). Names are resolved against the statement's catalog snapshot, which includes the
+   transaction's own earlier DDL (§9).
+5. `if_exists` makes a drop of a missing object succeed with no effect; `if_not_exists` makes a create of an
+   existing name succeed with no effect, whatever the existing object is. Neither suppresses any other error.
+6. A DDL statement is shape-keyed like any statement ([QT] §10.2), but a server SHOULD NOT cache its plan.
+
+### 3.2 Statement kinds
+
+| Kind | Statement | Fields |
+|---:|---|---|
+| 32 | `CreateNamespace` | `name: str, if_not_exists: bool` |
+| 33 | `DropNamespace` | `name: str, if_exists: bool, cascade: bool` |
+| 34 | `CreateTable` | `table: QualName, columns: [ColumnDef], primary_key: [str], constraints: [ConstraintDef], if_not_exists: bool` |
+| 35 | `DropTable` | `table: QualName, if_exists: bool, cascade: bool` |
+| 36 | `AlterTable` | `table: QualName, actions: [AlterAction]` |
+| 37 | `CreateIndex` | `name: str, def: IndexDef, if_not_exists: bool` |
+| 38 | `DropIndex` | `index: QualName, if_exists: bool` |
+| 39 | `CreateType` | `type_name: QualName, type: Type, if_not_exists: bool` |
+| 40 | `AlterType` | `type_name: QualName, change: TypeChange` |
+| 41 | `DropType` | `type_name: QualName, if_exists: bool` |
+| 42 | `CreateSequence` | `sequence: QualName, def: SequenceDef, if_not_exists: bool` |
+| 43 | `AlterSequence` | `sequence: QualName, def: SequenceDef, restart: opt<svar>` |
+| 44 | `DropSequence` | `sequence: QualName, if_exists: bool` |
+| 45 | `CreateView` | `view: QualName, query: node Query, replace: bool` |
+| 46 | `DropView` | `view: QualName, if_exists: bool, cascade: bool` |
+| 47 | `CreateRole` | `name: str, def: RoleDef` |
+| 48 | `AlterRole` | `name: str, def: RoleDef, new_name: opt<str>` |
+| 49 | `DropRole` | `name: str, if_exists: bool` |
+| 50 | `Grant` | `privileges: [Privilege], object: ObjectRef, grantee: str, grantable: bool` |
+| 51 | `Revoke` | `privileges: [Privilege], object: ObjectRef, grantee: str` |
+| 52 | `AwaitJobs` | `txid: uvar` |
+| 53 | `CancelJob` | `job: uvar` |
+| 54–63 | reserved | |
+
+1. `CreateIndex.name` is in the namespace of `def.table`. A `CreateTable` creates the table with every constraint
+   validated (the table is empty) and every index ready.
+2. `CreateView` with `replace` replaces an existing view of that name only if the new result type's columns begin
+   with the old view's columns, by name and identical type (`Q6007` otherwise); a dependent view stays valid.
+3. `AlterSequence` changes the options given in `def` that differ from the defaults of `SequenceDef`; `restart`,
+   when present, sets the next value.
+4. `AwaitJobs` waits until every job started by the committed transaction `txid` (§7) has finished, then returns
+   `bag<{job: uint64, kind: text, object: uint64, state: union<succeeded: {}, failed: {code: text, message: text},
+   cancelled: {}>}>`, one row per job; an unknown `txid` or one with no jobs returns the empty relation. It MUST NOT
+   run inside an explicit transaction (`Q6010`), since it would hold a snapshot for the length of a job. It is
+   cancellable ([WIRE] §7.3) without affecting the jobs.
+5. `CancelJob` cancels a queued or running job (§7 rule 6); a finished or unknown job is `Q6003`.
+
+### 3.3 Auxiliary records
+
+Auxiliary records are encoded inline, as their fields in order ([QT] §12.4).
+
+```
+ColumnDef     = { name: str, type: Type, default: Expr?, generated: Expr?,
+                  identity: enum { none, always, by_default }, sequence: SequenceDef? }
+ConstraintDef = { name: str, body: choice {
+                    check { expr: Expr },
+                    unique { columns: [str] },
+                    foreign_key { columns: [str], ref_table: QualName, ref_columns: [str],
+                                  on_delete: FkAction, on_update: FkAction, deferred: bool } } }
+FkAction      = enum { no_action, restrict, cascade, set_null, set_default }
+IndexDef      = { table: QualName, unique: bool, keys: [IndexKey], predicate: Expr? }
+IndexKey      = { key: choice { column { name: str }, expr { expr: Expr } }, descending: bool }
+SequenceDef   = { type: Type, start: opt<svar>, increment: opt<svar>, min: opt<svar>, max: opt<svar>,
+                  cycle: bool, cache: opt<uvar> }
+TypeChange    = choice { append_variants { variants: [(str, Type)] },
+                         append_fields { fields: [(str, Type, Expr?)] },
+                         rename_member { old: str, new: str },
+                         rename { new_name: str } }
+RoleDef       = { login: bool, superuser: bool, member_of: [str] }
+Privilege     = enum { select, insert, update, delete, references, usage, create }
+ObjectRef     = choice { table { name: QualName }, namespace { name: str },
+                         sequence { name: QualName }, type { name: QualName } }
+AlterAction   = choice {
+    add_column { def: ColumnDef },                                      (0)
+    drop_column { name: str, cascade: bool },                           (1)
+    rename_column { name: str, new_name: str },                         (2)
+    retype_column { name: str, type: Type, using: Expr? },              (3)
+    set_default { name: str, default: Expr? },                          (4)  absent: drop the default
+    set_nullable { name: str, nullable: bool },                         (5)
+    add_constraint { def: ConstraintDef, defer_validation: bool },      (6)
+    drop_constraint { name: str, if_exists: bool },                     (7)
+    validate_constraint { name: str },                                  (8)
+    rename_constraint { name: str, new_name: str },                     (9)
+    rename_table { new_name: str },                                     (10)
+    set_primary_key { columns: [str] },                                 (11)
+    rewrite { },                                                        (12)
+    set_owner { role: str } }                                           (13)
+```
+
+1. `ColumnDef`: at most one of `default`, `generated` and a non-`none` `identity` (`Q6006`); `sequence` only with
+   an identity (its `type` MUST equal the column's), and defaulted when absent. Absent `SequenceDef` options take
+   `start` 1, `increment` 1, `min` 1 (or the type's minimum when `increment` < 0), `max` the type's maximum, and
+   `cache` 32.
+2. In `append_fields`, the `Expr?` is the fill of existing values: a constant `Literal` (or absent for null, which
+   requires a nullable field type). A non-constant fill is `Q6006`.
+3. `AlterTable` applies its actions in order, as one statement: one new schema version if any action changes the
+   column list, and one job per action that needs one (§7). Two actions on the same column, other than a rename
+   followed by others naming the new name, are `Q6016`.
+4. `retype_column.using` is a definition expression of the new type that reads the old column; absent, it is
+   `Cast(strict, Col(row, name), type)` ([QT] §7.6).
+5. `add_constraint.defer_validation` adds the constraint not validated and starts no job; the owner validates it
+   later with `validate_constraint`. Without it, a validation job starts at commit (§8.7).
+
+### 3.4 Example
+
+Text form ([QT] §15). A table of users with an enum status and a nested list of addresses, then two online
+changes in one statement.
+
+```
+(create_type :type_name app.status
+  :type union<active: {}, banned: {reason: text}>)
+
+(create_table :table app.users
+  :columns [(column :name id :type int64 :identity always)
+            (column :name email :type text)
+            (column :name status :type app.status
+                    :default (variant :type app.status :tag active :value (record)))
+            (column :name addresses :type list<{city: text, zip: text?}>)]
+  :primary_key [id]
+  :constraints [(constraint :name users_email_key :unique [email])])
+
+(alter_table :table app.users
+  :actions [(add_column :def (column :name created_at :type timestamp?))
+            (add_constraint :def (constraint :name email_has_at
+               :check (call contains row.email '@'::text)))])
+```
+
+The `alter_table` is metadata-only for `created_at` (§8.1), and adds `email_has_at` not validated, enforced at once,
+with a validation job that starts when the statement commits (§8.7).
+
+## 4. The catalog as relations
+
+### 4.1 Rules
+
+1. The relations below are system views in the reserved namespace `catalog`. They are read with an ordinary `Scan`
+   ([QT] §6.1), at the statement's snapshot, like any relation, and every role may read them (§2.10 rule 5). They
+   are read-only (`Q5003`).
+2. They are the **stable** interface to the catalog. The stored system trees (`sys.*`, [DISK] §3.9) are an internal
+   format, may change with the on-disk format, and MUST NOT be scanned by name (`Q2001`).
+3. Their column lists are versioned with the tree schema ([QT] §13): a minor version MAY append columns and MAY add
+   relations, a variant to a union column, or a field to a record column at its end; anything else is a major
+   change. A generator SHOULD name the columns it reads rather than read whole rows.
+4. A type is reported twice: `type` is its canonical [QT] §12.3 encoding (structural, with the nullable wrapper,
+   never a named reference), which a client decodes with the decoder it already has; `type_text` is its [QT] §15
+   text form. An expression is reported as its [QT] §15 text form.
+5. Objects not yet visible to the reader's snapshot are absent; objects in a non-`ready` state are present with
+   their state, so a tool can watch a change in progress. A generator SHOULD use only `ready` columns.
+
+### 4.2 The relations
+
+Every `oid` is `uint64`. `QualName` in a column is `{namespace: text, name: text}`.
+
+**`catalog.version`** — one row: `catalog_version: uint64` (§1 rule 3), `tree_schema: {major: uint32, minor:
+uint32}`.
+
+**`catalog.namespaces`** — `oid`, `name: text`, `owner: text`.
+
+**`catalog.tables`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `schema_version: uint16`,
+`primary_key: list<text>` (column names, in key order), `state: union<ready: {}, rebuilding: {job: uint64}>`.
+
+**`catalog.columns`** — `table_oid`, `column_id: uint32`, `ordinal: uint16`, `name: text`, `type: bytes`,
+`type_text: text`, `type_name: QualName?`, `nullable: bool`, `in_primary_key: bool`, `default: text?`,
+`generated: text?`, `identity: union<always: {}, by_default: {}>?`, `state: union<ready: {}, filling: {job:
+uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`. One row per column of the table's current
+schema version, including the columns of views (`table_oid` the view's oid, no key, no default).
+
+**`catalog.indexes`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `unique: bool`, `keys:
+list<{column: text?, expr: text, descending: bool}>` (`column` set when the component is a plain column),
+`predicate: text?`, `state: union<building: {job: uint64}, ready: {}, failed: {job: uint64}>`.
+
+**`catalog.constraints`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `validated: bool`, `kind:
+union<primary_key: {columns: list<text>}, unique: {columns: list<text>, index_oid: uint64}, not_null: {column:
+text}, check: {expr: text}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
+on_delete: FkAction, on_update: FkAction, deferred: bool}>`, where `FkAction` is `union<no_action: {}, restrict:
+{}, cascade: {}, set_null: {}, set_default: {}>`.
+
+**`catalog.types`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `kind: union<record: {}, union: {},
+enum: {}>` (`enum` for a union whose payloads are all `{}`), `type: bytes`, `type_text: text`, `members:
+list<{name: text, type: bytes, type_text: text, type_name: QualName?}>` (the fields of a record or the variants of
+a union, with each variant's payload record as its type, in declared order; `type_name` set where the member was
+declared with a named type).
+
+**`catalog.sequences`** — `oid`, `namespace: text`, `name: text`, `type: bytes`, `start: int64`, `increment:
+int64`, `min: int64`, `max: int64`, `cycle: bool`, `cache: uint32`, `owned_by: {table_oid: uint64, column_id:
+uint32}?`. The current value is not reported, since it is not transactional.
+
+**`catalog.views`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `query: text` (its [QT] §15 form),
+`query_tree: bytes` (the canonical encoding of its `Query` node).
+
+**`catalog.roles`** — `name: text`, `login: bool`, `superuser: bool`, `member_of: list<text>`.
+
+**`catalog.grants`** — `object_oid`, `object_kind: union<table: {}, view: {}, namespace: {}, sequence: {}, type:
+{}>`, `grantee: text`, `privilege: text`, `grantable: bool`.
+
+**`catalog.depends`** — `oid`, `ref_oid` (§2.11).
+
+**`catalog.jobs`** — `job: uint64`, `txid: uint64` (the transaction whose DDL started it), `kind: text` (one of
+`build_index`, `validate_constraint`, `fill_column`, `convert_column`, `rebuild_table`), `object_oid`, `table_oid`,
+`state: union<queued: {}, running: {}, succeeded: {}, failed: {code: text, message: text}, cancelled: {}>`,
+`progress: {done: uint64, total: uint64?}` (rows), `started: timestamp?`, `finished: timestamp?`. A finished job's
+row is kept for at least 7 days (`job_retention`).
+
+**`catalog.schema_versions`** — `table_oid`, `schema_version: uint16`, `committed: uint64` (the commit sequence
+number that created it), `live: bool` (whether any stored row or undo record may still carry it, §5.5), `columns:
+list<{column_id: uint32, name: text, type: bytes, type_text: text}>`.
+
+## 5. Schema versions
+
+### 5.1 What a version is
+
+1. A schema version of a table is its list of columns at that version: for each, column id, ordinal, name, type,
+   nullability, default, fill, generation expression, identity and state ([DISK] §3.9 `sys.columns`).
+2. Every committed statement that changes any of those for a table adds exactly one new version; one that changes
+   only indexes, constraints, names of indexes or constraints, owner or privileges adds none.
+3. A **fill** is recorded for every column added after the table was created: the value a row of an older version
+   reads for it. It is the column's default evaluated once when the column is added, if the default is a constant
+   (deterministic and reading no column), else null and the column starts `filling` (§8.2).
+
+### 5.2 What a row carries
+
+Every stored row carries the schema version it was encoded in ([DISK] §4.1 `schema_version`), and every undo
+record carries the version of the old image it restores ([DISK] §5.2 `old_schema_version`). Nested values carry
+no version of their own: the descriptors of every nested record, union and relation are those of the row's
+version. Secondary index entries carry none: an index's key is computed by its own definition, and an index whose
+key encoding would change is rebuilt (§8.5).
+
+**Invariant V1.** A version visible to a snapshot was encoded in a schema version visible to that snapshot.
+(A version committed at `c ≤ s` was written by a transaction whose catalog was read at or before `c`; and §5.4
+rule 3 forbids a writer to install a version older than the one it replaces.) Translation therefore only ever runs
+forward.
+
+### 5.3 Reading a row of an older version
+
+A reader whose statement planned against version `v` reads a stored version encoded in `r ≤ v` as follows, for
+each column of `v` that the statement reads, matched by **column id**:
+
+1. A column present in `r`: decode it with `r`'s descriptor, then convert it to `v`'s type by the composition of
+   the conversions of every retype between `r` and `v`. Each is lossless (rule 3) or was proven to succeed for
+   every value by its job before it committed (§8.5), so translation MUST NOT fail; a failure is `D1001`
+   (`data_corrupted`).
+2. A column absent from `r` (added after `r`): its fill.
+3. The **lossless conversions** are: `intN → intM` and `uintN → uintM` for M > N; `uintN → intM` for M > N;
+   `intN`, `uintN` → `decimal(p, 0)` when `p` holds every value (3, 5, 10, 19 digits for 8–64 bits signed; 3, 5,
+   10, 20 unsigned); `decimal(p, s) → decimal(p', s')` when `s' ≥ s` and `p' − s' ≥ p − s`; `float32 → float64`;
+   `int8`, `int16`, `uint8`, `uint16` → `float32`; `int8` … `int32`, `uint8` … `uint32` → `float64`; `json → text`;
+   `T → T?`; `list<E> → bag<E>`; and, recursively, a record whose fields convert losslessly, with fields appended
+   that are nullable or have a constant fill; a union whose payloads convert losslessly, with variants appended at
+   the end; a relation whose element converts losslessly; renames of fields and tags (by position, which the
+   encoding keys on). Nothing else is lossless.
+4. Columns dropped between `r` and `v` are skipped; their bytes are never decoded.
+
+*Rationale: a row stores positions and the catalog keeps every version's column list, so translation is a
+per-version column map computed once per (table, `r`, `v`) and cached, not a per-row search.*
+
+### 5.4 Writing
+
+1. A write encodes the row in the writer's schema version: the version its statement planned against. A row
+   written by an update is re-encoded whole in that version, whatever version it had; the undo record then holds
+   every column of the old version ([DISK] §5.2).
+2. A writer writes every column of its version, including `filling` and `converting` ones: a `filling` column
+   gets its default (evaluated per row), and a `converting` column its value in its current (old) type.
+3. **No writer replaces a newer encoding.** A writer whose version is `v` that would install a version over a
+   newest committed version encoded in a version later than `v` MUST abort with `schema_changed` (`T1004`). This
+   can happen only at read committed, where a write applies to the newest committed version ([ISO] §4.2 rule 3);
+   at snapshot and serializable such a version is outside the writer's snapshot and the write already fails with
+   `serialization_failure`. *Rationale: re-encoding a newer row in an older version would drop its newer columns.*
+
+### 5.5 Retiring versions
+
+1. A version is **live** while some stored row or undo record carries it. A version that is not live and is not
+   current MAY be deleted from `sys.columns` by purge.
+2. Rows of old versions stay as they are; a later update re-encodes them (§5.4 rule 1). `AlterTable rewrite` (§8.11)
+   re-encodes every row in the current version, after which old versions retire as their undo is purged.
+3. A table whose next schema version would exceed 65,535 refuses the statement with `Q6012`; `rewrite` rebuilds
+   the table under a new oid with versions starting again at 1 (§8.11).
+
+## 6. Locks, catalog reads and running transactions
+
+### 6.1 Locks
+
+1. A DDL statement takes the row write lock ([DISK] §4.1, [ISO] §4.2) of every `sys.objects` row it changes. Every
+   DDL that changes a table's definition — its columns, indexes, constraints, name or owner — changes the table's
+   `sys.objects` row, so DDL statements on one table are ordered by that lock, with the waiting, timeout and
+   deadlock rules of [ISO] §4.2. A foreign key locks both tables' rows.
+2. DML takes **no** catalog lock, and DDL waits for no reader and no writer of the table. Readers of an object that
+   is dropped keep reading it at their snapshot: its storage is freed only by purge, after the horizon passes the
+   drop ([DISK] §5.6).
+3. **The commit latch.** Each table has a short latch. A transaction that wrote the table holds it shared from the
+   start of its reconciliation (§6.4) to the moment its commit record is in the WAL buffer; a DDL transaction on
+   the table holds it exclusive while it writes its commit record. So no DDL on a table commits between a writer's
+   reconciliation and that writer's commit. The latch is never held while waiting for a lock or for I/O other than
+   the WAL buffer.
+4. At snapshot and serializable, a DDL whose catalog row was changed by a commit after its snapshot fails with
+   `serialization_failure` ([ISO] §4.2 rule 2). At read committed, the DDL statement is validated again against
+   the newest committed catalog, and its error, if any, is reported.
+
+### 6.2 The catalog read of a statement
+
+Every statement logs a **catalog read** of each object it uses, as [ISO] §5.6 requires, and the read is
+column-precise ([ISO] §4.4, decision Q15). The catalog read of a statement is the set of:
+
+1. the identity (oid) and kind of every object it names: table, view, named type, sequence, index or constraint
+   named as a conflict target;
+2. for every column it resolves, by `Col` or by a name in `Insert.columns`, `Update.set` or a conflict target: the
+   column's id, name, type and nullability;
+3. the **whole column list** (ids, names, order, types) of a table or view when all of a `Scan`'s columns reach the
+   statement's result or a value it builds: a `Scan` whose binder reaches the root output, a `Relation` or an
+   `Insert` source without a `Project` naming its columns, or `Row(b)` of a `Scan` binder `b`;
+4. for an `Insert`: the defaults, identities and generation expressions of the columns it does not name, and the
+   generation expressions of every generated column for an `Update`.
+
+The constraints and indexes a write enforced or maintained are not part of the read; a write is brought up to date
+with those added later by reconciliation (§6.4).
+
+### 6.3 Which changes abort a running transaction
+
+1. A transaction **conflicts** with a committed DDL `D` that it did not see if `D` changed any element of the
+   catalog read of any of its statements. Then it MUST abort with `schema_changed` (`T1004`), at commit or, at read
+   committed, at its next statement on the table if that statement would plan against the changed definition
+   ([ISO] §5.6). A transaction that does not conflict commits.
+2. Hence, for a transaction `T` that used table `t` under the definition before `D`:
+
+| `D` | conflicts with `T` when |
+|---|---|
+| add a column, add an index, add a constraint, drop an index, drop a constraint, validate a constraint, set a default `T` did not read | never (an added column conflicts only through §6.2 rule 3) |
+| drop, rename or retype a column; change its nullability | `T` resolved that column, or read the whole column list |
+| set or drop a default, generation expression or identity | `T` inserted without naming that column |
+| rename or drop the table; change its primary key; rewrite it (a new oid) | `T` used `t` at all |
+| change a named type | `T` resolved a column declared with it, or the type by name |
+
+3. *Rationale (serializability).* If `D` changed nothing `T` read, then `T`'s reads and its result types are the
+   same under the definition after `D` as before it, and its writes are made equal to what `T` would have written
+   after `D` by translation (§5.3) and reconciliation (§6.4). So `T` may be serialized after `D`, in commit order,
+   as [ISO] §3 requires. If `D` changed something `T` read, there is an rw edge from `T` to `D` with `T` committing
+   later, which validation refuses at every level.
+
+### 6.4 Reconciliation
+
+A transaction `T` that wrote table `t` and commits after a DDL `D` on `t` that its catalog read did not include
+MUST, after taking the commit latch (§6.1 rule 3) and before writing its commit record, bring every row version it
+wrote in `t` up to the newest committed definition of `t`:
+
+1. **Indexes.** For each index added or rebuilt by `D` (in state `building` or `ready`), insert the entries of each
+   row `T` wrote and delete-mark those of each row it removed or changed ([DISK] §4.9 rule 2). A unique index is
+   checked as an insert by an aware writer would be, and fails with `unique_violation` or, for a conflict with a
+   version committed after `T`'s snapshot, `serialization_failure`.
+2. **Constraints.** For each check constraint and each not-null change added by `D` (including the guard of a
+   retype, §8.5), check every row `T` inserted or updated; for each foreign key in which `t` is the referencing
+   table, check and lock the referenced rows as §2.6 rule 3 requires. A failure aborts `T` with the constraint's
+   code.
+3. **Referenced side.** If `D` added a foreign key that references `t`, and `T` deleted a row of `t` or changed its
+   referenced columns, `T` MUST abort with `schema_changed`. *Rationale: running a new key's cascade at commit is a
+   statement `T` never planned.*
+4. **Columns.** For each row `T` inserted at a version older than the current one, if a column absent from `T`'s
+   version has a current default other than its fill, or is generated, `T` rewrites the row in the current
+   version, with that column computed (its default, or its generation expression). A `filling` column is computed
+   the same way.
+5. **Shadows.** If `D` started a table rebuild (§8.11), apply each of `T`'s writes of `t` to the shadow table as a
+   dual writer would.
+
+Reconciliation is work proportional to `T`'s writes of `t`, and is needed only when a DDL on `t` committed during
+`T`'s lifetime. It is logged as ordinary writes of `T` (secondary inserts with `SECONDARY` undo records, row
+updates with `UPDATE` undo records), so a crash before `T`'s commit record undoes it with `T`.
+
+## 7. Background jobs
+
+1. An operation that must visit existing rows runs as a **job**, recorded as a row of `sys.jobs` ([DISK] §3.9) and
+   shown in `catalog.jobs`. The DDL statement creates the job row in state `queued` in its own transaction; the job
+   starts after that transaction commits, and does not exist if it rolls back. `AwaitJobs` waits for the jobs of a
+   transaction (§3.2).
+2. **Snapshot.** A job's scan reads at a snapshot taken after the commit of the DDL that started it. Every row
+   version committed after that snapshot was written by a transaction that saw the DDL, and so obeyed it (§5.4,
+   §2.6), or by one that did not, and so reconciled with it (§6.4). Therefore the job need not wait for any
+   transaction, at any isolation level, and no row escapes it (property L3, §10).
+3. **Batches.** A job works in key order, in batches. Each batch is an internal transaction at read committed that
+   does the batch's writes and updates the job row's `resume_key` and `progress`, and commits. Index entries a job
+   inserts are logged as redo-only `NODE_INSERT`/`NODE_BULK` mini-transactions with no undo, since inserting an
+   entry for a row that exists is idempotent and harmless if the batch is lost; row writes are ordinary writes with
+   undo.
+4. **Crash safety.** A job's state is its `sys.jobs` row, which is an ordinary versioned row: after a crash,
+   recovery ([DISK] §6.9) restores it as of the last committed batch, and the job resumes from `resume_key`,
+   repeating at most one batch. No WAL record kind is specific to DDL.
+5. **Failure.** A job fails on a constraint or uniqueness violation found in existing data, or on a conversion that
+   fails (§8.5). A failed job records the code in its row and undoes its operation as §8 says for each kind, in one
+   internal transaction; a conflict or timeout in a batch is retried, and is not a failure.
+6. **Cancellation.** `CancelJob`, or a `Drop` of the job's object, stops the job after its current batch and undoes
+   its operation as for a failure, with state `cancelled`. A DDL on the job's table that conflicts with the job's
+   operation (dropping the column being filled) cancels it in the same transaction.
+7. **Priority.** Jobs run at a priority below user work, and a server SHOULD bound their I/O (`job_io_limit`).
+   Several jobs may run at once, on different tables or on one.
+8. On a replica, jobs do not run: their effects arrive by WAL replay, like all writes.
+
+## 8. Online operations
+
+Each operation below gives: its **kind** (metadata-only, or a job); the **locks** it takes beyond §6.1 rule 1 (none
+of them waits for DML); how it meets **running transactions** at each level; its **crash safety**; and how an
+**old row** reads afterwards. Unless an entry says otherwise, the interaction is the same at serializable, snapshot
+and read committed, and is given by §6.3 (which transactions abort) and §6.4 (what the others do at commit).
+Every catalog change is logged as ordinary row changes of the system trees (`NODE_INSERT`, `NODE_PATCH`,
+`ROW_HEADER` with `UNDO_APPEND`, [DISK] §6.4) and is durable with its transaction's `TXN_COMMIT`; a crash before
+that record rolls it back like any write.
+
+### 8.1 Add a column with a constant default or none
+
+- **Kind:** metadata-only. One new schema version with the column `ready` and its fill (§5.1 rule 3). A non-null
+  column needs a constant default (else `Q3005`).
+- **Running transactions:** none conflicts unless it read the whole column list (§6.2 rule 3). A transaction that
+  inserts at the old version and commits later produces rows that read the fill, which is what an insert after the
+  change would have written; if the default has since changed, reconciliation rewrites them (§6.4 rule 4).
+- **Crash:** the catalog rows only.
+- **Old rows:** read the fill. Nothing is written to the table.
+
+### 8.2 Add a column whose default is volatile, or a generated or identity column
+
+- **Kind:** a `fill_column` job. The statement adds the column in state `filling` with a null fill. Writers of the
+  new version write its value (§5.4 rule 2). The job updates every row of an older version, in key order, into the
+  current version with the column computed: its default evaluated per row, its generation expression, or the next
+  identity value. When it reaches the end, it sets the column `ready` in its last batch.
+- **Running transactions:** as §8.1; an old-version writer computes the column for its inserted rows at
+  reconciliation (§6.4 rule 4). The job's batches are ordinary writers: they wait for a row's lock, and they skip a
+  row whose newest committed version is already in a version that has the column. The column is invisible to all
+  statements, including the adding transaction's own, until it is `ready`.
+- **Crash:** the job row and its committed batches; it resumes from `resume_key`.
+- **Failure or cancellation:** a new schema version drops the column. Rows already filled keep its bytes, which are
+  never read (§5.3 rule 4).
+- **Old rows:** after the job, none remain without the column, other than in undo, which old snapshots read in their
+  own version.
+
+### 8.3 Drop a column
+
+- **Kind:** metadata-only. A new schema version without the column. A primary-key column cannot be dropped
+  (`Q6007`); nor can a column an index, constraint, generated column or view uses, unless `cascade` drops those.
+- **Running transactions:** a transaction that resolved the column, or read the whole column list, conflicts. One
+  that never named it commits; its writes at the old version still carry the column's bytes, which no later
+  version reads.
+- **Crash:** the catalog rows only.
+- **Old rows:** keep the bytes until they are next updated or the table is rewritten (§8.11); they are skipped on
+  read. Out-of-line values of a dropped column are freed when the row's old version is purged ([DISK] §5.6) after
+  such an update.
+
+### 8.4 Rename a column, table, index, constraint or named type
+
+- **Kind:** metadata-only. Renaming a column adds a schema version (the name is part of it); the column id is
+  unchanged, so no row is touched. Every stored definition that names the column (checks, index expressions,
+  generated columns, defaults, views) is rewritten to the new name in the same transaction. Renaming a table also
+  rewrites the views that scan it.
+- **Running transactions:** a transaction that resolved the old name conflicts; others do not notice.
+- **Crash:** the catalog rows only.
+- **Old rows:** unchanged; they are matched by column id.
+
+### 8.5 Retype a column
+
+1. **Lossless** (§5.3 rule 3, with no `using`), and either not used by any index key, index predicate or the
+   primary key, or one that leaves the key encoding unchanged ([DISK] §4.6): appending variants to an enum, or
+   renaming a tag:
+   - **Kind:** metadata-only. A new schema version with the new type.
+   - **Running transactions:** a transaction that resolved the column, or read the whole column list, conflicts.
+   - **Crash:** the catalog rows only.
+   - **Old rows:** converted on read (§5.3 rule 1).
+2. **Otherwise** (a conversion that can fail, a `using` expression, or a column in an index):
+   - **Kind:** a `convert_column` job, in two committed steps. **Step 1** (the statement): the column becomes
+     `converting`, keeping its old type; a **guard** — the constraint that `using` succeeds on the column's value —
+     is enforced on every write from now on, as a not-validated check; and for each index that uses the column, a
+     replacement index on the converted value is created `building`. **Step 2** (the job): verify the guard on
+     every existing row and build the replacement indexes, as §8.7 and §8.9 do; then, in its final transaction,
+     add a schema version with the new type and the column `ready`, drop the guard, and swap each replacement
+     index in for the one it replaces (the old index is dropped and freed by purge).
+   - **Running transactions:** step 1 conflicts with no transaction (the column's type is unchanged); an
+     old-version writer that commits later checks the guard on its rows and maintains the replacement indexes
+     (§6.4 rules 1–2). Step 2 conflicts with transactions that resolved the column, as rule 1. A query never sees a
+     half-converted column: before step 2 every reader sees the old type, after it every reader sees the new type.
+   - **Crash:** step 1 and every committed batch are durable; the job resumes. Step 2 is one transaction.
+   - **Failure:** a value the guard refuses fails the job with the conversion's code (`R0006`, or `R0001`), and
+     its details name the row's key. The guard and the replacement indexes are dropped; the column is `ready` in
+     its old type again.
+   - **Old rows:** after step 2, converted on read by `using`, which the job has proved succeeds on every row
+     version a snapshot after step 2 can see. Rows are not rewritten; `rewrite` does that when wanted.
+3. Any other retype of a primary-key column is a table rebuild (§8.11). A conversion that [QT] §7.6 does not permit and no
+   `using` provides is `Q6008`.
+
+### 8.6 Set or drop a default; drop or set not null
+
+- **Set or drop a default:** metadata-only, a new schema version. The fill of existing columns does not change.
+  Transactions that inserted without naming the column conflict (§6.3).
+- **Drop not null** (`set_nullable` true): metadata-only, a new schema version, lossless (`T → T?`). Transactions
+  that resolved the column conflict, since its type changed.
+- **Set not null** (`set_nullable` false): runs as an added check `c IS NOT NULL` (§8.7) named `<column>_not_null`;
+  when its validation succeeds, its final transaction adds a schema version with the column's type non-null and
+  drops the check. The same transactions conflict at that point as for drop not null. On failure the column stays
+  nullable and the check is dropped.
+
+### 8.7 Add a check, unique or foreign-key constraint
+
+- **Kind:** a `validate_constraint` job, unless `defer_validation` is set. The statement adds the constraint **not validated**:
+  from its commit it is enforced on every write by aware transactions (§2.6 rule 1) and by reconciliation for the
+  others (§6.4 rule 2). A unique constraint creates its index `building` (§8.9); its job is the index build. The
+  job scans every row at its snapshot (§7 rule 2) and checks it; for a foreign key, it looks up each referenced
+  row at the same snapshot. When it finishes, it marks the constraint validated.
+- **Locks:** a foreign key locks both tables' catalog rows (§6.1); the job takes no row locks, since a referenced
+  row deleted after its snapshot is deleted by a transaction that checked the new foreign key.
+- **Running transactions:** none conflicts (§6.3); every one that wrote the table and commits after the statement
+  reconciles with the new constraint, and fails with its code if one of its rows violates it. A transaction that
+  deleted a row the new foreign key references aborts with `schema_changed` (§6.4 rule 3).
+- **Crash:** the not-validated constraint and the job row are durable; the job resumes.
+- **Failure:** a violating row fails the job with the constraint's `T3…` code and the row's key in its details.
+  The constraint **stays**, not validated and still enforced on writes; the owner fixes the data and runs
+  `validate_constraint`, or drops it. A unique constraint's failed index is dropped with the constraint, since an
+  incomplete unique index enforces nothing.
+- **Old rows:** unchanged.
+
+`validate_constraint` starts the same job for a not-validated constraint, and does nothing for a validated one.
+
+### 8.8 Drop a constraint
+
+Metadata-only. A unique or primary-key constraint's index is dropped with it, but a primary key cannot be dropped,
+only changed (§8.11). No transaction conflicts: a transaction that still enforces the dropped constraint does more
+checking than it must, which cannot produce a history the new definition forbids. A running job validating the
+constraint is cancelled.
+
+### 8.9 Create an index
+
+- **Kind:** always a `build_index` job; there is no blocking form. *Rationale: Postgres needs `CONCURRENTLY`
+  because its default blocks writers; with reconciliation the online build costs no more than a blocking one.*
+  The statement creates the index `building`, with an empty tree. From its commit, aware writers maintain it like
+  a ready index, and unaware writers maintain it at reconciliation (§6.4 rule 1). The job scans the table at its
+  snapshot (§7 rule 2) and inserts each visible row's entry if absent. When it finishes, it sets the index `ready`
+  in its final transaction.
+- **Unique indexes:** while `building`, aware writers check uniqueness against the entries present and the job
+  checks each entry it inserts against them, waiting for the writer of an entry whose row is uncommitted, so two committed rows with equal keys are found by whichever of the
+  two arrives second, which fails: a writer with `unique_violation`, or the job, which then fails. Each candidate
+  conflict is confirmed against the clustered row's version visible at the newest snapshot ([DISK] §4.9 rule 2), so
+  a stale or delete-marked entry is never a conflict.
+- **Running transactions:** none conflicts. The planner uses only `ready` indexes, so no query reads a partial
+  index.
+- **Crash:** the `building` index, its entries so far and the job row are durable (entries by their redo-only
+  records, §7 rule 3); the job resumes and re-inserts idempotently.
+- **Failure or cancellation:** the index is set `failed` and dropped in one transaction; purge frees its tree
+  ([DISK] §5.6).
+- **Old rows:** indexed by their translated values (§5.3), so an index over a column added later indexes the fill
+  for rows that predate it.
+
+### 8.10 Drop an index
+
+Metadata-only. The `sys.objects` row is deleted; readers whose snapshot sees the index may still use it, and purge
+frees the tree after the horizon passes the drop ([DISK] §5.6). No transaction conflicts: a writer that maintains a
+dropped index writes entries that no later reader looks at. An index that backs a constraint is dropped only with
+the constraint (`Q6007`).
+
+### 8.11 Change the primary key; retype a key column; rewrite
+
+All three **rebuild** the table into a new clustered tree under a new oid.
+
+- **Kind:** a `rebuild_table` job in two committed steps. **Step 1** (the statement): create the **shadow** table —
+  a new oid, state `building`, the new primary key (for `rewrite`, the same), the table's columns with the same
+  column ids in the current version, and a shadow copy of every secondary index, keyed by the new primary key. The
+  table's `catalog.tables.state` becomes `rebuilding`. From step 1's commit every writer of the table also applies
+  each write to the shadow (**dual writing**): an insert inserts there too; an update or delete of a key absent
+  from the shadow first inserts the version it replaces there, then applies the change, so a rollback restores
+  that version. A delete leaves a ghost ([DISK] §4.1 `DELETED`) in the shadow. Writers unaware of step 1 dual-write
+  at reconciliation (§6.4 rule 5). The job then copies every row, in the old key order: for each key, it takes the
+  old row's lock as `LOCK_ONLY`, reads the newest committed version, and inserts it into the shadow (and its
+  indexes) only if the shadow has no entry for that key, live or ghost; it waits for a locked shadow entry's writer
+  to finish before deciding. A duplicate of the new primary key fails the job. **Step 2** (the job's final
+  transaction): the shadow takes the table's name, grants, constraints, dependents and foreign keys referencing it
+  (repointed to the new oid), its state becomes `ready`, and the old table's `sys.objects` row is deleted.
+- **Locks:** the table's catalog row in both steps. Step 2 also locks the catalog rows of tables whose foreign
+  keys it repoints.
+- **Running transactions:** step 1 conflicts with none. Step 2 replaces the table's oid, so every transaction that
+  used the table under the old definition and has not committed conflicts (§6.3); readers with older snapshots
+  keep reading the old tree. Transactions planned after step 2 see only the new table.
+- **Crash:** step 1, the shadow's pages and the job's batches are durable through ordinary records; the job
+  resumes. Step 2 is one transaction.
+- **Failure or cancellation:** the shadow's `sys.objects` row is deleted, and purge frees its trees.
+- **Old rows:** every row of the new table is encoded in its first schema version; old versions of the old table
+  remain only in the old tree, for old snapshots, until purge frees it.
+
+### 8.12 Create and drop tables, namespaces, sequences, types and views
+
+- Creating any object is metadata-only, plus an empty tree for a table. A new object is invisible to transactions
+  whose snapshot predates its commit, which therefore cannot conflict with it.
+- Dropping any object is metadata-only: the `sys.objects` row is deleted and its storage is freed by purge after
+  the horizon ([DISK] §5.6), so a reader with an older snapshot finishes its read. A transaction that used the
+  object conflicts (§6.3). A transaction that wrote a dropped table aborts with `schema_changed` at commit.
+- Changing a named type: §2.8 rule 5, applied per affected table as §8.5 rule 1.
+
+## 9. Transactional DDL
+
+1. DDL statements MAY appear in an explicit transaction, any number of them and mixed with DML, at every isolation
+   level. They commit or roll back with it, including to a savepoint. A DDL statement in an implicit transaction
+   commits by itself ([WIRE] §4.5).
+2. A transaction sees its own catalog changes in its later statements, at every level: a table it created can be
+   written, a column it added can be named. A job it started does not run until it commits (§7 rule 1), so an index
+   it created stays `building`, and a column it added as `filling` stays invisible, for the rest of the transaction.
+3. Catalog reads follow [ISO] §5.6: at snapshot and serializable, at the transaction's snapshot; at read
+   committed, at each statement's snapshot. A transaction's DDL is itself a write of catalog rows and obeys
+   first-updater-wins ([ISO] §4.2), so two transactions that change one object cannot both commit at snapshot or
+   serializable.
+4. A serializable transaction that reads a table's data and then changes its definition is serialized at its
+   commit like any other; its earlier reads are validated against commits during its lifetime ([ISO] §4.3).
+5. DDL in a read-only transaction, or on a replica, is `read_only_transaction` (`T4001`).
+6. A DDL statement that fails rolls back to the start of the statement, and aborts the transaction under [ISO] §5.1.
+7. After a DDL commits, a prepared statement whose result type it changed is released on its next execution
+   (`W2007`, [WIRE] §4.4); one whose shape is still valid is re-validated against the new catalog and keeps running.
+
+## 10. Checkable properties
+
+The simulation of [ISO] §7.3 runs workload W9 (DML traffic at every level while other sessions run every operation
+of §8, with crashes injected at every WAL record) and checks:
+
+| Id | Property |
+|---|---|
+| L1 | Every row version visible to every snapshot decodes, and translates to the snapshot's current version without error (§5.3; V1). |
+| L2 | After any crash and recovery, the catalog relations equal those of the committed prefix, every job is in its last committed state, and resuming it gives the same final catalog and data as an uncrashed run. |
+| L3 | When a `validate_constraint` or `build_index` job succeeds, every committed row satisfies the constraint or has its entry (D22), whatever transactions overlapped it. |
+| L4 | No operation of §8 makes a DML statement wait on a catalog lock; the only waits are row-lock waits on rows the job writes. |
+| L5 | A transaction that did not conflict with a DDL (§6.3) is never aborted with `schema_changed`; one that did is never committed. |
+| L6 | A row inserted by a transaction straddling an added column reads, after commit, exactly what a serial execution in commit order would give. |
+| L7 | The final state of every W9 history equals that of some serial execution of its committed transactions and DDL in commit order (with [ISO] I1–I26). |
+| L8 | `catalog.columns.type` decodes with the [QT] §12.3 decoder to the type a `Scan` of the table reports in its result type. |
+| L9 | A failed or cancelled job leaves the definition it started from (§8.2, §8.5, §8.7, §8.9, §8.11), and purge eventually frees every page it allocated (D21). |
+
+## 11. Open questions
+
+1. **Width-independent key encoding.** Widening an integer column that is part of a key rebuilds its index or the
+   table (§8.5, §8.11), because [DISK] §4.6 encodes each width differently. An order-preserving encoding shared by
+   every integer width (a length-prefixed magnitude) would make that widening metadata-only for keys as well, at a
+   byte or two per key. Should keys use it?
+2. **Shared row locks for foreign keys.** At snapshot and read committed, a foreign-key check locks the referenced
+   row exclusively as `LOCK_ONLY` (§2.6 rule 3), so concurrent inserts of children of one parent serialize on it.
+   Should v1 add a shared lock mode to the row header, or accept the contention?
+3. **Multi-valued indexes.** Indexing the elements of a nested relation or a scalar list (the GIN-shaped index of
+   §2.5 rule 6) is likely the first index users of nested values ask for. Is it a v1.x item, and should it share the
+   job machinery of §8.9?
+4. **Catalog visibility.** Every role can read every `catalog` relation (§2.10 rule 5). Should a role see only the
+   objects it has some privilege on, as Postgres's `information_schema` does?
+5. **Virtual generated columns.** Only stored generated columns exist (§2.7 rule 2). Are computed-on-read columns
+   wanted, given that a view does the same?
+6. **Moving objects between namespaces** and **renaming a namespace** are not defined. Are they needed in v1?
+7. **Strictness of the catalog read.** §6.3 aborts a transaction that inserted without naming a column whose
+   default then changed, and one that resolved a column whose nullability was dropped, although neither result
+   could differ. Is the simple rule worth those rare retries, or should the conflict table be refined?

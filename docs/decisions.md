@@ -4,7 +4,8 @@ These are the answers applied to the open questions of the four specs in `docs/s
 recommendation, applied so the specs could move on; **the user may overrule any of them**. Every row names exactly
 the spec sections it changed, so a decision is reverted by restoring those sections and putting its question back
 in that spec's "Open questions". Abbreviations: QT `query-tree.md`, ISO `isolation.md`, DISK `on-disk-format.md`,
-WIRE `wire-protocol.md`, ERR `errors.md`.
+WIRE `wire-protocol.md`, ERR `errors.md`, DDL `ddl.md`. Rows Q30 onward were decided while writing `ddl.md`; to
+revert one, restore its sections and add its question to `ddl.md` §11.
 
 ## Query tree, types and values
 
@@ -68,3 +69,23 @@ WIRE `wire-protocol.md`, ERR `errors.md`.
 | W12 | Arrow C Data Interface? | Export comes later. | WIRE §6.8 rule 3 |
 | W13 | Union discriminant width? | Keep 1 or 2 octets by arity; unions capped at 65,536 variants. | WIRE §6.2 rule 5; QT §2.4 rule 1; ERR `Q3016`, `W2017` withdrawn |
 | W14 | Error-code style? | One style everywhere: area letter (`Q R T W D`) and four digits, with a `snake_case` name as alias, registered in the new `docs/spec/errors.md`. | ERR (new); QT §11.3; ISO §5.2; WIRE §8.1 rules 1, 5, 8, §8.2, §8.3; DISK §1 rule 9 and the sites that now name `D` codes (§3.1, §3.6, §3.10, §4.7, §7.2, §8.4) |
+| W15 | What does DML without `returning` return? QT said an `int64` count; WIRE sent no result type and the count in `Complete`. | No value: the statement has no result type; its row count is an execution outcome in `Complete.counts` (and `terndb_result_counts`), one per parameter tuple, 0 for DDL. Every value is then a relation read by one decoder, and a batch gets a count per tuple. | QT §5 rules 2–3; WIRE §0 rule 4, §3.6 (`Prepared`, `ResultHeader` comments), §4.3 rules 3–4, §11 |
+
+## DDL and the catalog
+
+| Id | Question | Decision | Sections changed |
+|---|---|---|---|
+| Q30 | Make DISK §4.3 match the QT types exactly? | Yes: descriptors are one-to-one with QT §2 and use its names (`datetime`, `timestamp`, `int8`…); a record descriptor (0x23); one relation descriptor (0x20) whose element is a record, union or scalar, with an element `nullable` octet; nullability lives in `sys.columns.nullable`, record-field and element octets, so the nullable wrapper needs no tag; union arity is a `u32`; tags 0x12 and 0x22 stay unassigned. Format 1 is unreleased, so no format bump. | DISK §4.2 (closing sentence), §4.3, §4.4, §4.5, §4.6, §10 |
+| Q31 | Is enum a type? | No: an enum is a union whose payloads are all `{}`, nameable in the catalog; it is stored as a union (a 2-octet discriminant), and may be a key component, encoded as its big-endian discriminant. | QT §2.4 rule 1; DISK §4.3 rule 2, §4.5, §4.6 (table, rule 4); DDL §2.8 |
+| Q32 | Named catalog types: nominal or aliases? | Aliases for a structure (type kind 32, `QualName` payload, resolved at validation, kept in the shape); results stay structural; a column remembers the name it was declared with for generators; changing a named type retypes its columns losslessly. | QT §12.3 (kind 32 and the paragraph after it), §15; DDL §2.8; ERR `Q6004`, `Q6018` |
+| Q33 | Tables without a primary key? | Not allowed; an `identity` column is the cheap key. | DDL §2.2 rule 2; ERR `Q6009` |
+| Q34 | How does online DDL meet running transactions? | DDL waits for no reader or writer (the shared catalog lock of ISO §5.6 is gone); the catalog read is column-precise, and only a DDL that changed something a transaction read aborts it with `schema_changed`; a writer that straddles a DDL reconciles its own writes at commit (new indexes, constraints, columns, shadows) under a per-table commit latch; background scans need no wait for old transactions. | ISO §5.6 (bullets 2–4, last); DDL §6, §7 rule 2; ERR `T1004` |
+| Q35 | Index kinds in v1? | Unique, partial and expression indexes; every build is online (no blocking form); no multi-valued indexes over nested values, no covering columns. | DDL §2.5, §8.9; DISK §3.9 (`key_spec` 0xFFFF), §4.6 rule 5, D22 |
+| Q36 | Adding constraints online? | Added not validated and enforced at once, then validated by a background job; a failed validation leaves the constraint not validated rather than removing it; foreign keys have the five SQL actions, simple matching and an optional deferred check; at SI/RC a check locks the parent row `LOCK_ONLY`. | DDL §2.6, §8.7 |
+| Q37 | Sequences or identity? | Both: identity columns own a sequence; sequences are non-transactional (gaps), with a logged `cached_to` so no value is ever reissued; `next_value(schema, name)` is volatile. | DDL §2.7; QT §7.12; DISK §3.9 (`sys.sequence_state`); ERR `R0008` |
+| Q38 | Roles and privileges in v1? | Minimal: roles with login, superuser and membership; owners; table/view, namespace, sequence and type privileges; checked at validation; all catalog relations readable by all roles; no column privileges or row security. | DDL §2.10; ERR `Q6015` |
+| Q39 | Shape of a DDL statement? | One statement kind per object verb (32–53); `AlterTable` carries a list of actions applied as one schema version; DDL declares no parameters and returns no value; jobs are awaited by `AwaitJobs(txid)`, which returns a relation, rather than by an option on the DDL. | DDL §3; QT §1 rule 5, §5, §12.5; WIRE §0 rule 4; ERR `Q6001`, `Q6010` |
+| Q40 | Changing the primary key, and running out of schema versions? | A rebuild into a shadow table under a new oid, filled by dual writes and a copy job, swapped in one transaction; `rewrite` uses the same path and restarts schema versions at 1. | DDL §5.5, §8.11; DISK §5.6 (freeing a dropped tree); ERR `Q6012` |
+| Q41 | How is the catalog queried? | Read-only system views in the namespace `catalog`, a stable versioned contract; the `sys.*` trees are internal and cannot be scanned; types are reported as QT §12.3 bytes plus text. | DDL §4; DISK §3.9 |
+| Q42 | Generated columns and volatile defaults? | Generated columns are stored only; adding a column with a volatile default, a generated column or an identity column is a background fill, invisible until done. | DDL §2.7 rule 2, §8.2 |
+| Q43 | Catalog storage for the new objects? | `sys.objects` gains kinds 6–8, `definition` (replacing the empty `options`), `state` and `owner_oid`; `sys.columns` gains `column_id`, `type_oid`, `fill`, `generated`, `identity`, `state` and loses `dropped`; trees 4–7 are `sys.depends`, `sys.grants`, `sys.jobs`, `sys.sequence_state`; an update that changes a row's schema version logs the whole old row in its undo. | DISK §3.9, §5.2 (UPDATE payload) |

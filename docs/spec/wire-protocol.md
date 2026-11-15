@@ -26,8 +26,9 @@ RFC 9266 (TLS channel binding `tls-exporter`), RFC 8446 (TLS 1.3), RFC 7301 (ALP
    on it. A result delivered through it is flattened to Postgres rows by that layer; this protocol never flattens.
 3. **Replication** (the WAL stream from a primary to its replicas) is deferred to its own specification,
    `replication.md`. This document reserves message types for it (§3.2) and says nothing else about it.
-4. **DDL** reaches the server only as SQL text until `ddl.md` exists ([QT] §1.5). The SQL front end is not part of
-   this protocol: there is no request that carries SQL text, and DDL trees arrive with `ddl.md`.
+4. **DDL** arrives as trees, like every other statement: an `Execute` or `Prepare` whose envelope's root is a DDL
+   statement kind of `ddl.md` §3. There is no request that carries SQL text; the SQL front end is not part of this
+   protocol.
 
 ## 1. Transport and framing
 
@@ -389,12 +390,12 @@ Isolation       := enum { serializable, snapshot, read_committed }
 ```
 Prepared      := digest shape
                  uvar catalog_version
-                 opt<node Type> result_type                          (absent: the statement returns a count)
+                 opt<node Type> result_type                          (absent: the statement returns no value)
 
 ResultHeader  := uvar txid
                  uvar snapshot
                  digest shape
-                 opt<node Type> result_type                          (absent: the statement returns a count)
+                 opt<node Type> result_type                          (absent: the statement returns no value)
 
 Batch         := §6.4
 
@@ -463,10 +464,13 @@ params := uvar tuple_count                    (≥ 1)
    *Rationale: a client that loses the connection during an implicit commit already holds the txid it needs for
    `TransactionStatus` (§5.6).*
 3. `ResultHeader.result_type` is the statement's result type ([QT] §5.3), which is always a relation type for a
-   `Query` or a DML statement with `returning`. It is absent for a DML statement without `returning`, whose
-   per-tuple affected-row count is reported in `Complete.counts` and which sends no `Batch`.
-4. `Complete.counts[i]` is the number of top-level rows returned for tuple `i`, or for a DML statement without
-   `returning` the number of rows it affected.
+   `Query` or a DML statement with `returning`. It is absent for a statement that returns no value ([QT] §5
+   rule 2): a DML statement without `returning`, and every DDL statement (`ddl.md` §3.1). Such a statement sends
+   no `Batch`. *Rationale: every value on the wire is a relation, so one decoder reads every result; the count is
+   an outcome of the execution and is carried, like the commit, in `Complete`.*
+4. `Complete.counts[i]` is the statement's row count for tuple `i`, as [QT] §5 rule 2 defines it: the number of
+   top-level rows returned; for a DML statement without `returning`, the number of rows it affected; for a DDL
+   statement, 0.
 5. `ResultHeader.shape` is the SHA-256 digest of the statement's shape form ([QT] §10.2). It MUST equal the digest
    `EXPLAIN` reports for the same statement.
 6. `prepare_as`, when present and non-zero, registers the statement under that handle exactly as `Prepare` would
@@ -1142,10 +1146,7 @@ query and data, and compare `terndb_batch_bytes` to the vector.
 ## 11. Open questions
 
 The questions this section listed have been answered; the answers, and what to revert for each, are in
-`docs/decisions.md` (W1–W14). Two remain:
+`docs/decisions.md` (W1–W15). One remains:
 
 1. **Registering the port.** The default port is 7365 (§1.1), unassigned by IANA at the time of writing. Should it
    be registered?
-2. **DDL before `ddl.md`.** With no SQL text over this protocol (§0.4) and the Postgres wire layer in Phase 2, a
-   client of this protocol alone has no way to run DDL until `ddl.md` adds DDL trees. Is that acceptable for
-   Phase 1, with DDL run through the C ABI or a tool?

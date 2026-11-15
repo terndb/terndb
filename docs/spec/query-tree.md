@@ -32,9 +32,10 @@ rule. Text marked *Informative* has no force.
    as an argument. The only exceptions are the statement-time functions (`statement_timestamp()` and
    kin), which read the clock, and the snapshot the statement runs against.
    *Rationale: one tree, one meaning, which is what makes shape-keyed plan caching sound.*
-5. **DDL is deferred** to a separate specification (`ddl.md`). This spec reserves statement kinds
-   32–63 for it (§12.5). Until that spec exists, DDL is reachable only through the SQL front end, and a
-   tree whose root kind is in the reserved range is refused with `Q1002`.
+5. **DDL** is specified in `ddl.md`, which defines statement kinds 32–63 (§12.5) and the named type
+   reference, type kind 32 (§12.3), in this document's framing and encoding. A DDL statement is a
+   statement root like any other and is validated, encoded and versioned by the rules here. A root kind
+   in 32–63 that `ddl.md` leaves unassigned is refused with `Q1002`.
 
 ## 2. Types
 
@@ -87,7 +88,8 @@ rule. Text marked *Informative* has no force.
 1. `union<t₁: R₁, …, tₖ: Rₖ>` holds exactly one variant, identified by its **tag**. `1 ≤ k ≤ 65,536`
    (`Q3016`; the bound is what a 2-octet discriminant holds, `wire-protocol.md` §6.2). Tags are
    unique (`Q3015`). Each payload `Rᵢ` MUST be a record type (`Q3014`); a variant with no data has
-   payload `{}`, so an enum is a union whose payloads are all `{}`.
+   payload `{}`, so an enum is a union whose payloads are all `{}`. There is no separate enum type; a
+   catalog may give an enum, like any union or record, a name (`ddl.md` §2.8).
 2. The **discriminant** of a variant is its tag's ordinal in the declaration (0-based). The encoding
    carries the discriminant; the tag name appears only in the type.
 3. Union types are structural: identical iff the same tags in the same order with identical payloads.
@@ -275,14 +277,23 @@ A tree on the wire or across the C ABI is an **envelope**:
 ```
 Envelope  = { version: (major, minor), params: [ParamDecl], statement: Statement, spans: Spans? }
 ParamDecl = { name: text?, type: Type }
-Statement = Query | Insert | Update | Delete
+Statement = Query | Insert | Update | Delete | DDL statement (ddl.md §3)
 ```
 
 1. `Query { rel: Rel }` returns `rel`'s value. Its result type is `rel`'s relation type.
 2. `Insert`, `Update`, `Delete` are defined in §9. With a `returning` list they return a `bag` of
-   records; without one they return the affected row count as `int64`.
-3. The **result type** of a statement is determined by validation alone. A server MUST be able to
-   return it without executing the statement (the wire spec's describe step).
+   records. Without one they return **no value**: the statement has no result type. Every statement
+   also reports its **row count** as an outcome of execution, not as a value: for a `Query` or a DML
+   statement with `returning`, the number of top-level rows of the result; for a DML statement without
+   `returning`, the number of rows it inserted, updated or deleted (skipped upsert rows are not
+   counted, §9.3); for a DDL statement, 0. The count is unsigned. The wire carries it in `Complete`
+   (`wire-protocol.md` §4.3) and the C ABI in `terndb_result_counts`, one count per parameter tuple.
+   *Rationale: every value a statement returns is then a relation, decoded by the one result decoder;
+   a count is a fact about an execution, like its commit sequence number, and a batch has one per
+   tuple, which a single `int64` value could not express.*
+3. The **result type** of a statement is determined by validation alone, and so is whether it has
+   one. A server MUST be able to return it without executing the statement (the wire spec's describe
+   step).
 4. `spans`, when present, maps nodes (by pre-order index) to byte ranges in a front end's source text.
    It is metadata: it changes neither meaning nor shape, and it lets errors point at source.
 5. The output columns of the root `Rel`, of every `Relation`/`Scalar` subquery and of every `SetOp`
@@ -319,8 +330,8 @@ rules below. "Exposes" refers to the binders a node makes visible to the express
 ### 6.1 Scan
 
 Reads every row of a table or view visible in the statement's snapshot. Output columns are the
-table's columns in catalog order, with catalog types. An unknown table is `Q2001`. (View expansion is
-defined by `ddl.md`.)
+table's columns in catalog order, with catalog types. An unknown table is `Q2001`. A `Scan` of a view
+reads the view's stored query in its place (`ddl.md` §2.9).
 
 ### 6.2 Values
 
@@ -581,7 +592,9 @@ the core operators' names and typing:
 - text: `concat length lower upper contains starts_with like` (`like` takes its escape character as an
   argument);
 - time: `add(timestamp, interval)` computes calendar parts in UTC; `add(datetime, interval)` and
-  `add(date, interval) → datetime` compute in civil time; `statement_timestamp() → timestamp`.
+  `add(date, interval) → datetime` compute in civil time; `statement_timestamp() → timestamp`;
+- sequences: `next_value(schema: text, name: text) → int64`, which draws the next value of a sequence
+  (`ddl.md` §2.7). It is **volatile**: each call draws a new value, and it is never folded.
 
 ## 8. Names, binders and scoping
 
@@ -647,7 +660,8 @@ statement, with every column nullable (null for a newly inserted row).
    `columns` by position; their counts MUST match (`Q3001`) and each MUST coerce to the target column
    (`Q3001`). A nullable source column into a non-null target is `Q3005`.
    *Rationale: a NOT NULL violation that can be found statically is found statically.*
-2. Columns not named take their defaults (defined in `ddl.md`).
+2. Columns not named take their defaults, identity values or generated values (`ddl.md` §2.7). A
+   generated column, or an identity column declared `always`, MUST NOT be named (`Q5003`).
 
 ### 9.3 Upsert
 
@@ -798,10 +812,17 @@ Spans     := list<(uvar node_preorder_index, uvar start, uvar end)>   ordered by
 | 22–25 | `uint8`, `uint16`, `uint32`, `uint64` | — |
 | 26 | `json` | — |
 | 27–31 | reserved (scalar types) | |
-| 32–63 | reserved (named catalog types, `ddl.md`) | |
+| 32 | named type reference (`ddl.md` §2.8) | `str schema, str name` |
+| 33–63 | reserved (named catalog types, `ddl.md`) | |
 
-A result type is always **structural**: a server MUST NOT send a named catalog type (kinds 32–63) in a
-statement's result type, and sends the structure the name denotes (`wire-protocol.md` §6.1).
+A named type reference denotes the structure its catalog type defines, resolved at validation against
+the statement's catalog snapshot (an unknown name is `Q6004`); it is an alias, so type identity (§2.6)
+compares the structures. It MAY appear wherever a statement declares a type: a `ParamDecl`, `Values`
+columns, `Cast`, `Tag`, `Variant`, inside another type, and in DDL statements. A named type is always
+a record or a union, never nullable, so a nullable wrapper around a reference is canonical. Because
+the reference is kept in the encoding, it is part of the statement's shape (§10.2). A result type is always **structural**: a server MUST NOT send a named catalog
+type (kinds 32–63) in a statement's result type, and sends the structure the name denotes
+(`wire-protocol.md` §6.1).
 
 ### 12.4 Relational and expression kinds
 
@@ -820,7 +841,7 @@ kinds 64 and above in every family are reserved.
 
 ### 12.5 Statement kinds
 
-1 `Query`, 2 `Insert`, 3 `Update`, 4 `Delete`; 32–63 reserved for DDL.
+1 `Query`, 2 `Insert`, 3 `Update`, 4 `Delete`; 32–63 DDL, assigned and encoded by `ddl.md` §3.
 
 ### 12.6 Parameter and literal values
 
@@ -942,7 +963,8 @@ item    = value | name ":" value
 A `Col(b, c)` prints as `b.c`; a `Param(i)` as `$i`; a `Literal` as its §3.5 text form quoted, with
 `'` doubled inside, then `::` and its type (`'3'::int64`); a pair list as `[name: value …]`; `SortKey` as
 `(asc|desc expr nulls_first|nulls_last)`; types as `int64`, `text?`, `{a: int64}`, `bag<…>`,
-`list<…>`, `union<T: {…}, …>`. A field holding its default is omitted.
+`list<…>`, `union<T: {…}, …>`, and a named type reference (§12.3 kind 32) as its qualified name,
+`app.status`. A field holding its default is omitted.
 
 ## 16. Worked examples
 

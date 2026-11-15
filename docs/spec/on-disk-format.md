@@ -297,31 +297,43 @@ The catalog is a set of ordinary B+trees whose roots have fixed PIDs in data seg
 | 1 | `sys.objects` | `oid` (u64) |
 | 2 | `sys.columns` | (`table_oid` u64, `schema_version` u16, `ordinal` u16) |
 | 3 | `sys.names` | (`namespace_oid` u64, `name` text) → `oid`. This is a unique secondary index of `sys.objects` |
-| 4–15 | reserved for later system trees |
+| 4 | `sys.depends` | (`oid` u64, `ref_oid` u64): `oid`'s definition refers to `ref_oid` (`ddl.md` §2.11) |
+| 5 | `sys.grants` | (`object_oid` u64, `grantee_oid` u64, `privilege` u8) (`ddl.md` §2.10) |
+| 6 | `sys.jobs` | `job_id` u64 (`ddl.md` §7) |
+| 7 | `sys.sequence_state` | `oid` u64 → `next` i64, `cached_to` i64 (`ddl.md` §2.7; not versioned, see there) |
+| 8–15 | reserved for later system trees |
 
 Catalog rows use the row format of §4 and are versioned by the undo log like any table, so DDL is transactional.
 Object ids 1–1023 are reserved for system objects. Every object id is below 2⁴⁸, so that it fits the page
-header's `owner` (§3.1).
+header's `owner` (§3.1). Object ids are never reused.
 
 `sys.objects` non-key columns, in order:
 
 | column | type | meaning |
 |--------|------|---------|
-| `kind` | i8 | 1 table, 2 secondary index, 3 sequence, 4 named type, 5 namespace; 0x40–0x4F reserved for projections |
-| `namespace_oid` | i64 | |
+| `kind` | i8 | 1 table, 2 secondary index, 3 sequence, 4 named type, 5 namespace, 6 constraint, 7 view, 8 role; 0x40–0x4F reserved for projections |
+| `namespace_oid` | i64 | 0 for a namespace or a role |
 | `name` | text | |
-| `parent_oid` | i64 | for an index, its table; else 0 |
+| `parent_oid` | i64 | for an index or a constraint, its table; else 0 |
 | `root_pid` | i64 | the tree's root PID; 0 when there is no tree |
 | `schema_version` | i16 | the current version of a table's columns |
-| `key_spec` | bytes | for a table or index: n × (`ordinal` u16, `flags` u8: bit 0 = descending, bit 1 = unique, bit 2 = collated, reserved: v1 writes 0, §4.6) |
-| `options` | bytes | reserved, empty in v1 |
+| `key_spec` | bytes | for a table or index: n × (`ordinal` u16, `flags` u8: bit 0 = descending, bit 1 = unique, bit 2 = collated, reserved: v1 writes 0, §4.6); an expression key component has `ordinal` 0xFFFF and its expression in `definition` |
+| `definition` | bytes | the canonical encoding (`ddl.md` §3) of the object's definition record: `IndexDef`, `ConstraintDef`, `TypeDef`, `SequenceDef`, `ViewDef` or `RoleDef`; empty for a table and a namespace |
+| `state` | i8 | 0 ready; 1 building; 2 not validated; 3 failed (`ddl.md` §2) |
+| `owner_oid` | i64 | the owning role; 0 for system objects |
 
-`sys.columns` non-key columns: `name` text, `type` bytes (a type descriptor, §4.3), `nullable` bool, `default`
-bytes (an encoded `query-tree.md` expression, or empty), `dropped` bool.
+`sys.columns` non-key columns, in order: `column_id` u32 (stable across versions and renames, never reused within
+the table), `name` text, `type` bytes (a type descriptor, §4.3, of the non-null type), `nullable` bool,
+`type_oid` i64 (the named type the column was declared with, `ddl.md` §2.8, or 0), `default` bytes (an encoded
+`query-tree.md` expression, or empty), `fill` bytes (the value a row of an older version reads for this column,
+in the `query-tree.md` §12.6 encoding of the column's type; empty means null), `generated` bytes (an encoded
+expression, or empty), `identity` i8 (0 none, 1 always, 2 by default), `state` i8 (0 ready, 1 filling,
+2 converting; `ddl.md` §2.3).
 
-Every column list (old versions included) stays in `sys.columns` while any stored row still carries that
-`schema_version` (§4.1), so a row is always decodable by the version it was written in. This is what makes
-`ADD COLUMN` and `DROP COLUMN` instant, as in InnoDB's instant DDL.
+A column dropped in a version is absent from that version's list. Every column list (old versions included) stays
+in `sys.columns` while any stored row or undo record still carries that `schema_version` (§4.1), so a row is always
+decodable by the version it was written in. This is what makes `ADD COLUMN` and `DROP COLUMN` instant, as in
+InnoDB's instant DDL. How a row of one version is read under a later one is `ddl.md` §5.
 
 ### 3.10 The columnar hook
 
@@ -380,44 +392,59 @@ After the header, in order:
 5. **Variable area**: the bytes of the variable columns, concatenated.
 
 The same layout, with the header omitted and `u32` variable offsets in place of `u16`, is a **record**. Records
-are the elements of nested relations (§4.5).
+are the values of record type, the payloads of unions and the elements of relations of records (§4.5).
 
 ### 4.3 Type descriptors
 
-A column type is stored in `sys.columns.type` as a descriptor, a tag byte followed by its parameters:
+A column type is stored in `sys.columns.type` as a descriptor, a tag byte followed by its parameters. The type set
+is owned by `query-tree.md` §2, and the descriptors correspond to it **one to one**: every type there has exactly
+one descriptor, every descriptor denotes exactly one type, and the type column below uses `query-tree.md`'s names.
 
-| tag | type | parameters |
+| tag | type (`query-tree.md` §2) | parameters |
 |----:|------|------------|
 | 0x01 | `bool` | |
-| 0x02–0x06 | `i8`, `i16`, `i32`, `i64`, `i128` | |
-| 0x07, 0x08 | `f32`, `f64` | |
-| 0x09 | `decimal` | `precision` u8 (1–38), `scale` u8 |
+| 0x02–0x06 | `int8`, `int16`, `int32`, `int64`, `int128` | |
+| 0x07, 0x08 | `float32`, `float64` | |
+| 0x09 | `decimal(p, s)` | `p` u8 (1–38), `s` u8 (0–`p`) |
 | 0x0A | `text` | |
 | 0x0B | `bytes` | |
 | 0x0C | `date` | |
 | 0x0D | `time` | |
-| 0x0E | `timestamp` | |
-| 0x0F | `timestamptz` | |
+| 0x0E | `datetime` (civil, no zone) | |
+| 0x0F | `timestamp` (an instant) | |
 | 0x10 | `interval` | |
 | 0x11 | `uuid` | |
-| 0x12 | `enum` | `type_oid` u64 |
-| 0x13–0x16 | `u8`, `u16`, `u32`, `u64` | |
+| 0x12 | reserved; never assigned | |
+| 0x13–0x16 | `uint8`, `uint16`, `uint32`, `uint64` | |
 | 0x17 | `json` | |
-| 0x20 | `relation` | `ordered` u8 (0 = bag, 1 = list), `n` u16, then n × (`name_len` u16, name UTF-8, `nullable` u8, descriptor) |
-| 0x22 | `scalar relation` | `ordered` u8, `nullable` u8 (the element's), then the element's scalar descriptor |
-| 0x21 | `union` | `n` u16, then n × (`name_len` u16, name UTF-8, descriptor) |
+| 0x18–0x1F | reserved for scalar types | |
+| 0x20 | relation, `bag<E>` or `list<E>` | `ordered` u8 (0 = bag, 1 = list), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor: a record (0x23), a union (0x21) or a scalar |
+| 0x21 | union `union<t₁: R₁, …>` | `n` u32 (1–65,536), then n × (`name_len` u16, tag UTF-8, the payload's record descriptor, tag 0x23) |
+| 0x22 | reserved; never assigned | |
+| 0x23 | record `{n₁: T₁, …}` | `n` u16 (0–65,535), then n × (`name_len` u16, name UTF-8, `nullable` u8, the field's descriptor) |
 
-The type set is owned by `query-tree.md`. A type it gains MUST get a tag and an encoding here before a value of
-that type is stored.
+1. **Nullability.** A column's own nullability is `sys.columns.nullable`, and its descriptor is of the non-null
+   type. Inside a descriptor, nullability is the `nullable` octet of a record field or of a relation element.
+   These are every place a type can occur in a stored type, because a union payload is a non-null record
+   (`query-tree.md` §2.4) and a relation's element is not a relation (§2.5). The nullable wrapper (kind 20 of
+   `query-tree.md` §12.3) therefore has no tag of its own.
+2. **Structural.** A descriptor never names a catalog object. A column declared with a named type (`ddl.md`
+   §2.8) stores the structure the name denotes, and the name is kept beside it in `sys.columns.type_oid`.
+   An enum is a union whose payloads are all `{}` and is stored as one.
+3. **Canonical.** Names are non-empty and unique within their record or union, and a `nullable` or `ordered` octet
+   is 0 or 1. A reader MUST treat an unknown or reserved tag, or a descriptor that breaks these rules, as
+   `data_corrupted`.
+4. A record type with more than 65,535 fields cannot be stored; `ddl.md` refuses it at definition.
+5. A type that `query-tree.md` gains MUST get a tag and an encoding here before a value of that type is stored.
 
 ### 4.4 Scalar encodings (in the row value)
 
 | type | width | encoding |
 |------|------:|----------|
 | `bool` | 1 | 0 or 1; any other byte is corruption |
-| `iN` | N/8 | two's complement |
-| `uN` | N/8 | unsigned |
-| `f32`, `f64` | 4, 8 | IEEE 754 binary32 / binary64 bits |
+| `int8` … `int128` | N/8 | two's complement |
+| `uint8` … `uint64` | N/8 | unsigned |
+| `float32`, `float64` | 4, 8 | IEEE 754 binary32 / binary64 bits |
 | `decimal` p ≤ 18 | 8 | `i64` unscaled value |
 | `decimal` 19 ≤ p ≤ 38 | 16 | `i128` unscaled value |
 | `text` | variable | UTF-8. A writer MUST store valid UTF-8 and a reader MAY verify it |
@@ -425,12 +452,16 @@ that type is stored.
 | `bytes` | variable | raw |
 | `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian) |
 | `time` | 8 | `i64` microseconds since midnight |
-| `timestamp`, `timestamptz` | 8 | `i64` microseconds since 1970-01-01T00:00:00 (UTC for `timestamptz`) |
+| `datetime` | 8 | `i64` microseconds since 1970-01-01T00:00:00 civil time, with no zone |
+| `timestamp` | 8 | `i64` microseconds since the Unix epoch, 1970-01-01T00:00:00Z |
 | `interval` | 16 | `i32` months, `i32` days, `i64` microseconds |
 | `uuid` | 16 | the 16 bytes in RFC 9562 order |
-| `enum` | 4 | `u32` label index in the type's declaration order |
-| `relation`, `scalar relation` | variable | §4.5 |
-| `union` | variable | §4.5 |
+| record | variable | §4.5 |
+| relation | variable | §4.5 |
+| union | variable | §4.5 |
+
+Every fixed-width encoding above is the one `query-tree.md` §12.6 gives the same scalar, so a value moves between a
+row, a parameter and a result column without conversion.
 
 ### 4.5 Nested relations and unions
 
@@ -442,7 +473,7 @@ A **relation value** (a column of type `relation`, at any depth):
 | 1 | 3 | reserved |
 | 4 | 4 | `count` (u32) |
 | 8 | 4 × count | end offset of each element (u32), relative to the first element |
-| … | … | the elements, each a **record** (§4.2) of the element type; in a `scalar relation`, each the scalar's §4.4 encoding, preceded by one byte (0 = null, 1 = value) when the element is nullable |
+| … | … | the elements, each the encoding of the element type: a **record** (§4.2) for a record element, a union value (below) for a union element, the §4.4 encoding for a scalar element. When the element type is nullable, each element is preceded by one byte, 0 = null or 1 = value, and a null element has nothing after that byte |
 
 1. A `list` relation keeps its elements in order. A `bag` relation stores them in insertion order and promises no
    order.
@@ -451,9 +482,13 @@ A **relation value** (a column of type `relation`, at any depth):
 3. Nesting is recursive: an element column of type `relation` is a relation value inside that record's variable
    area.
 
-A **union value**: a `u16` tag (the variant's index in the descriptor), then the variant's encoding. A fixed-width
-variant takes exactly its width; a variable variant takes the remaining bytes of the enclosing slot. A union column
-is always variable-width. A relation whose element type is a union is how tagged-union elements are stored.
+A **record value** (a column, field or element of record type) is a record (§4.2) over the type's fields, in
+declared order. A record column is always variable-width, even when all its fields are fixed-width.
+
+A **union value**: a `u16` discriminant (the variant's 0-based index in the descriptor, `query-tree.md` §2.4), then
+the payload, a record value of the variant's payload type. A payload of type `{}` is zero bytes, so an enum's
+value is its two-byte discriminant. A union column is always variable-width. A relation whose element type is a
+union is how tagged-union elements are stored.
 
 ### 4.6 Key encoding (order-preserving)
 
@@ -461,9 +496,10 @@ Keys MUST compare correctly with `memcmp`, so that prefix compression, `head` an
 
 | type | encoding |
 |------|----------|
-| `iN`, `date`, `time`, `timestamp*`, `decimal` | big-endian with the sign bit inverted |
-| `bool`, `enum`, `uN` | big-endian unsigned |
-| `f32`, `f64` | big-endian bits; when the sign is 1 invert all bits, else invert the sign bit. −0 MUST be stored as +0, and every NaN as the one canonical quiet NaN, which sorts last |
+| `intN`, `date`, `time`, `datetime`, `timestamp`, `decimal` | big-endian with the sign bit inverted |
+| `bool`, `uintN` | big-endian unsigned |
+| an enum: a union whose payloads are all `{}` | its discriminant as a big-endian `u16`, so keys order by declaration order (`query-tree.md` §3.3) |
+| `float32`, `float64` | big-endian bits; when the sign is 1 invert all bits, else invert the sign bit. −0 MUST be stored as +0, and every NaN as the one canonical quiet NaN, which sorts last |
 | `uuid` | the 16 bytes |
 | `interval` | months, days, microseconds, each as `iN` above |
 | `text`, `bytes` | the bytes with each 0x00 escaped as 0x00 0xFF, then the terminator 0x00 0x00 |
@@ -474,7 +510,9 @@ Keys MUST compare correctly with `memcmp`, so that prefix compression, `head` an
 3. A composite key is the concatenation of its components.
 4. `text` compares by binary UTF-8 in v1; there are no collations. When collations come (`query-tree.md` §3.1),
    a collated key component stores its ICU sort key in the `text` encoding above and sets `key_spec` flag bit 2.
-   `relation`, `scalar relation`, `union` and `json` columns MUST NOT be key columns.
+   Relation, record and `json` values, and unions other than enums, MUST NOT be key components.
+5. A key component that is an expression (`ddl.md` §2.5) is encoded by its result type, as a column of that type
+   would be.
 
 ### 4.7 In-place versus out-of-line
 
@@ -588,7 +626,9 @@ Payloads:
 - **INSERT**: none. The previous version is "absent".
 - **DELETE**, **LOCK**: none. The old row's contents are unchanged in the leaf; only its header changed.
 - **UPDATE**: `n` u16, then n × (`ordinal` u16, `is_null` u8, `len` u32, the old encoded bytes). An out-of-line
-  old value is recorded as its 32-byte stub, never copied.
+  old value is recorded as its 32-byte stub, never copied. Ordinals are those of `old_schema_version`. An update
+  that writes the row in a different schema version from the one it replaces MUST list every non-key column of
+  `old_schema_version`, so that applying the record backward rebuilds the old version whole (`ddl.md` §5.4).
 - **SECONDARY**: `index_oid` u64, then the index entry's key. It records a secondary insert, so a rollback can
   remove the entry and purge can remove a delete-marked one.
 
@@ -648,6 +688,12 @@ for each one:
   (else a later writer has reused the key and the ghost is gone).
 - **UPDATE** with an out-of-line old value: frees that value's old overflow chain.
 - **SECONDARY** whose entry is delete-marked: removes the entry.
+- **DELETE** of a `sys.objects` row whose object has a tree (a dropped table or index, or the discarded tree of a
+  failed or superseded rebuild, `ddl.md` §8.11): frees the tree's pages before it removes the ghost. The walk
+  descends only into pages that are allocated and whose `owner` is the dropped oid, and frees each page with
+  `PAGE_FREE` after its children, one mini-transaction per page. Because an oid is never reused, a walk restarted
+  after a crash skips what it already freed. No snapshot can still read the tree, because the record is below the
+  horizon.
 
 Purge then advances `undo_low` past the records it has finished. Purge touches only the rows the log names: it is
 work proportional to writes, never a table scan.
@@ -1051,7 +1097,8 @@ sync, and reorder writes issued before one sync. "Recover" means run §6.9 (or �
   segment, or a bitmap page itself), and every reachable page is allocated. A page lost by a crash between
   allocation and use is a leak that the check MUST report.
 - **D22.** Every secondary index entry that is not delete-marked corresponds to a row whose visible version, for
-  some live snapshot, has those index columns; and every visible row has its entries.
+  some live snapshot, has those index columns; and every visible row has its entries in every index whose `state`
+  is ready (an index still building is completed by `ddl.md` §8.9).
 
 **Modes and versions**
 
@@ -1067,10 +1114,4 @@ sync, and reorder writes issued before one sync. "Recover" means run §6.9 (or �
 ## 10. Open questions
 
 The questions this section listed have been answered; the answers, and what to revert for each, are in
-`docs/decisions.md` (Q6, Q14, Q23–Q29). One remains:
-
-1. **The descriptor set against `query-tree.md`'s types.** §4.3 still differs from `query-tree.md` §2: it names
-   the two time types `timestamp`/`timestamptz` where the type system says `datetime`/`timestamp`, it has an
-   `enum` the type system lacks, and it has no record descriptor, so a record column, a union payload record and a
-   nullable record element of a relation (`query-tree.md` §2.2) have no stored form. Should §4.3 be rebuilt on the
-   `query-tree.md` §12.3 type kinds?
+`docs/decisions.md` (Q6, Q14, Q23–Q31). None remains open.

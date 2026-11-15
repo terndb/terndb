@@ -13,7 +13,8 @@ from.*
 
 ## 1. Form
 
-1. A **code** is one letter naming the area, then four decimal digits: `Q` query tree (validation, `query-tree.md`),
+1. A **code** is one letter naming the area, then four decimal digits: `Q` query tree (validation, `query-tree.md`;
+   the `Q6…` group is DDL validation, `ddl.md`),
    `R` runtime (evaluation, `query-tree.md`), `T` transactions and isolation (`isolation.md`), `W` wire
    (`wire-protocol.md`), `D` storage (`on-disk-format.md`). The first digit groups related codes within an area.
 2. Every code has a **name**, unique across the registry, in `snake_case`. The name is an alias: specs, client
@@ -79,6 +80,25 @@ during the handshake.
 | `Q5006` | `correlated_join` | `Join` right input references the left input; use `Apply`. |
 | `Q5008` | `invalid_window_frame` | Invalid window frame. |
 | `Q5009` | `arity_violation` | Arity or required-field violation (empty items, missing `mark`, row width, `Scalar` width). |
+| `Q6001` | `ddl_parameters` | A DDL envelope declares parameters, or binds other than one empty tuple (`ddl.md` §3.1). |
+| `Q6002` | `object_exists` | The name is already used in its namespace, or by another role or namespace. |
+| `Q6003` | `unknown_object` | Unknown namespace, index, constraint, sequence, view, role or job. |
+| `Q6004` | `unknown_type` | A named type reference names no catalog type (`query-tree.md` §12.3 kind 32). |
+| `Q6005` | `invalid_stored_type` | A type that cannot be used where it is: a key component that is not orderable or encodable, a nullable primary-key column, a named type that is not a record or union, a recursive named type. |
+| `Q6006` | `invalid_definition_expression` | A default, check, generated, index or fill expression that breaks `ddl.md` §2.12 or §3.3 (volatile where deterministic is required, a subquery, a parameter, more than one of default, generated and identity). |
+| `Q6007` | `dependent_objects` | A drop or change would break dependent objects and `cascade` is not set, or cannot be cascaded. |
+| `Q6008` | `retype_not_permitted` | No permitted conversion from the column's type to the new one, and no `using`. |
+| `Q6009` | `missing_primary_key` | A table without a primary key. |
+| `Q6010` | `not_in_transaction` | A statement that may not run inside an explicit transaction (`AwaitJobs`). |
+| `Q6011` | `table_too_wide` | More than 65,535 columns or record fields, or a fixed area plus key beyond the on-disk limit. |
+| `Q6012` | `schema_versions_exhausted` | The table's next schema version would exceed 65,535; rewrite the table. |
+| `Q6013` | `foreign_key_mismatch` | Foreign-key columns do not match a unique key of the referenced table, or `set_null` on a non-null column. |
+| `Q6014` | `reserved_namespace` | DDL on an object in `sys` or `catalog`. |
+| `Q6015` | `insufficient_privilege` | The role lacks a privilege the statement needs, or does not own the object (`ddl.md` §2.10). Raised for every statement kind. |
+| `Q6016` | `conflicting_alter_actions` | Two actions of one `AlterTable` change the same column. |
+| `Q6017` | `invalid_sequence_options` | Sequence options that are inconsistent (zero increment, `min > max`, start outside the range). |
+| `Q6018` | `type_change_not_permitted` | An `AlterType` change other than appending or renaming members. |
+| `Q6019` | `invalid_name` | A name that is empty, longer than 255 octets or not UTF-8. |
 | `Q7001` | `substrait_relation_unsupported` | Substrait relation not supported. |
 | `Q7002` | `substrait_type_unsupported` | Substrait type not supported. |
 | `Q7003` | `substrait_function_unmapped` | Substrait function not in the mapping. |
@@ -97,6 +117,7 @@ Raised during evaluation. None is retryable or fatal.
 | `R0005` | `recursion_limit` | Recursion bound exceeded. |
 | `R0006` | `invalid_value` | A value does not convert (cast failure), or is out of a node's domain (negative limit). |
 | `R0007` | `row_affected_twice` | A target row affected twice by one statement. |
+| `R0008` | `sequence_exhausted` | `next_value` would pass a non-cycling sequence's bound (`ddl.md` §2.7). |
 
 ## 4. Transactions and isolation (`T`)
 
@@ -107,7 +128,7 @@ Raised under the rules of `isolation.md` §5. Levels: SER serializable, SI snaps
 | `T1001` | `serialization_failure` | first-updater-wins conflict (`isolation.md` §4.2 rule 2 or 4); validation failure (§4.3) | SI, SER | yes |
 | `T1002` | `deadlock_detected` | the wait-for graph of row locks has a cycle; the victim aborts | all | yes |
 | `T1003` | `lock_timeout` | a row-lock wait exceeded `lock_timeout` | all | yes |
-| `T1004` | `schema_changed` | a DDL on a table this transaction used committed during its lifetime (§5.6) | all | yes |
+| `T1004` | `schema_changed` | a DDL committed during its lifetime changed a part of a definition this transaction read (§5.6, `ddl.md` §6.3), or a write would re-encode a row in an older schema version (`ddl.md` §5.4) | all | yes |
 | `T1005` | `replica_lag_timeout` | `after` or `max_lag` not satisfied within `replica_wait_timeout` (§3.6) | replica | yes |
 | `T1006` | `replica_conflict` | WAL replay needed to remove a structure or undo this replica transaction uses (§5.6) | replica | yes |
 | `T1007` | `cancelled` | the client, an administrator or a shutdown cancelled it before commit | all | yes |

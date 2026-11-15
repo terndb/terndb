@@ -29,7 +29,8 @@ TernDB is in design. Nothing here runs yet.
 | [Wire protocol and result format](docs/spec/wire-protocol.md) | The native protocol, and the one nested result encoding used by both the C ABI and the wire |
 | [On-disk format](docs/spec/on-disk-format.md) | Pages, the WAL, undo records, format versioning |
 | [Isolation](docs/spec/isolation.md) | What each isolation level guarantees, written as a checkable history model |
-| [Error codes](docs/spec/errors.md) | The one registry of every error code and its name, across all four specs |
+| [DDL and the catalog](docs/spec/ddl.md) | Catalog objects, DDL statement trees, the catalog as relations, schema versions and online schema change |
+| [Error codes](docs/spec/errors.md) | The one registry of every error code and its name, across all the specs |
 | [Decisions](docs/decisions.md) | The answers applied to the specs' open questions, each with what to revert |
 
 ## Why "TernDB"?
