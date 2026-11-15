@@ -1,0 +1,432 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, to_lower, to_upper}
+import sysl.math.Float
+
+// The scalar functions of `query-tree.md` §7.12 that are not comparison, logic or arithmetic: the
+// text functions, the calendar `add`, and the casts of §7.6. All are strict: a slot is null where an
+// argument is, and a null slot is never computed on.
+
+// -- text -------------------------------------------------------------------------------------
+
+private bins_of(v: ColumnVector) -> (Buf[u32], Buf[u8]) = v.lanes match
+    Bins(o, d) -> (o, d)
+    _ -> panic("an octet-string vector was expected")
+
+private octets(v: ColumnVector, i: usize) -> []const u8
+    val (o, d) = bins_of(v)
+    d.view()[usize(o[i])..<usize(o[i + 1])]
+
+private text_at(v: ColumnVector, i: usize) -> string = from_utf8(octets(v, i)).unwrap()
+
+/** The validity where every one of `args` is valid. */
+private all_valid(args: []const ColumnVector) -> Buf[u8]
+    var v = args[0].validity
+
+    for k in 1..<args.len
+        v = and_validity(ColumnVector(args[0].ty, args[0].len, v, args[0].lanes), args[k])
+
+    v
+
+/** The code points of a valid UTF-8 octet string: the octets that do not continue one. */
+private code_points(b: []const u8) -> usize
+    var n: usize = 0
+
+    for x in b
+        if x & 0xC0 != 0x80 then n += 1
+
+    n
+
+private starts(b: []const u8, prefix: []const u8) -> bool
+    if prefix.len > b.len then return false
+
+    for i in 0..<prefix.len
+        if b[i] != prefix[i] then return false
+
+    true
+
+private found_in(b: []const u8, part: []const u8) -> bool
+    if part.len > b.len then return false
+
+    for at in 0..(b.len - part.len)
+        if starts(b[at..], part) then return true
+
+    false
+
+/** The text function `f` (§7.12) of `args`, typed `result`. */
+text_function(f: string, args: []const ColumnVector, result: Type) -> Result[ColumnVector, CodecError]
+    val n = args[0].len
+    val validity = all_valid(args)
+
+    val lanes = f match
+        "length" ->
+            val out = buf[i64]()
+
+            for i in 0..<n
+                out.push(if bit(validity, i) then i64(code_points(octets(args[0], i))) else 0)
+
+            I64s(out)
+        "contains" | "starts_with" ->
+            val out = buf[bool]()
+
+            for i in 0..<n
+                out.push(bit(validity, i) && (if f == "contains" then found_in(octets(args[0], i), octets(args[1], i)) else starts(octets(args[0], i), octets(args[1], i))))
+
+            Bools(out)
+        "like" ->
+            val out = buf[bool]()
+
+            for i in 0..<n
+                if bit(validity, i)
+                    out.push(like(text_at(args[0], i), text_at(args[1], i), text_at(args[2], i))?)
+                else
+                    out.push(false)
+
+            Bools(out)
+        _ ->
+            val o = buf[u32]()
+            val d = buf[u8]()
+            o.push(0)
+
+            for i in 0..<n
+                if bit(validity, i)
+                    f match
+                        "concat" ->
+                            d.extend(octets(args[0], i))
+                            d.extend(octets(args[1], i))
+                        "lower" -> d.extend(to_lower(text_at(args[0], i)).bytes)
+                        _ -> d.extend(to_upper(text_at(args[0], i)).bytes)
+
+                o.push(u32(d.len()))
+
+            Bins(o, d)
+
+    Ok(ColumnVector(result, n, validity, lanes))
+end text_function
+
+/** One element of a `like` pattern: a literal code point, `_`, or `%`. */
+private enum LikePart derives Eq
+    Exact(c: char)
+    One
+    Any
+
+/** Whether `s` matches the `like` pattern `pattern` with escape `escape` (§7.12): `%` matches any
+ * run of code points, `_` exactly one, the escape (empty for none, else one code point) makes the
+ * character after it literal. An escape that is longer than one code point, or that ends the pattern
+ * or precedes anything other than `%`, `_` or itself, is `R0006`.
+ */
+private like(s: string, pattern: string, escape: string) -> Result[bool, CodecError]
+    val esc = buf[char]()
+
+    for c in escape.chars
+        esc.push(c)
+
+    if esc.len() > 1 then return fail("R0006", "a like escape is one character")
+
+    val parts = buf[LikePart]()
+    var escaped = false
+
+    for c in pattern.chars
+        if escaped
+            if c != '%' && c != '_' && c != esc[0] then return fail("R0006", "the like escape precedes an ordinary character")
+
+            parts.push(Exact(c))
+            escaped = false
+        else if esc.len() == 1 && c == esc[0]
+            escaped = true
+        else if c == '%'
+            parts.push(Any)
+        else if c == '_'
+            parts.push(One)
+        else
+            parts.push(Exact(c))
+
+    if escaped then return fail("R0006", "the like pattern ends with its escape")
+
+    val text = buf[char]()
+
+    for c in s.chars
+        text.push(c)
+
+    // The classic two-pointer match: on a mismatch, return to the last `%` and let it take one more
+    // code point.
+    var i: usize = 0
+    var p: usize = 0
+    var star: Option[usize] = None
+    var mark: usize = 0
+
+    while i < text.len()
+        if p < parts.len() && (parts[p] == One || parts[p] == Exact(text[i]))
+            i += 1
+            p += 1
+        else if p < parts.len() && parts[p] == Any
+            star = Some(p)
+            mark = i
+            p += 1
+        else if star.is_some()
+            p = star.unwrap() + 1
+            mark += 1
+            i = mark
+        else
+            return Ok(false)
+
+    while p < parts.len() && parts[p] == Any
+        p += 1
+
+    Ok(p == parts.len())
+end like
+
+// -- the calendar `add`, §7.12 ------------------------------------------------------------------
+
+private const DayMicros: i64 = 86400000000
+
+private floor_div(a: i64, b: i64) -> i64 = if a % b < 0 then a / b - 1 else a / b
+
+private floor_mod(a: i64, b: i64) -> i64 = a - floor_div(a, b) * b
+
+// Days since 1970-01-01 of a proleptic Gregorian date, and back (H. Hinnant's algorithms).
+private days_from_civil(y: i64, m: i64, d: i64) -> i64
+    val yy = if m <= 2 then y - 1 else y
+    val era = floor_div(yy, 400)
+    val yoe = yy - era * 400
+    val doy = (153 * (if m > 2 then m - 3 else m + 9) + 2) / 5 + d - 1
+    val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+
+private civil_from_days(z: i64) -> (i64, i64, i64)
+    val zz = z + 719468
+    val era = floor_div(zz, 146097)
+    val doe = zz - era * 146097
+    val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    val mp = (5 * doy + 2) / 153
+    val d = doy - (153 * mp + 2) / 5 + 1
+    val m = if mp < 10 then mp + 3 else mp - 9
+    (yoe + era * 400 + (if m <= 2 then 1 else 0), m, d)
+
+private days_in_month(y: i64, m: i64) -> i64 = m match
+    2 -> if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 then 29 else 28
+    4 | 6 | 9 | 11 -> 30
+    _ -> 31
+
+/** `micros` (from the epoch of its type) plus `iv`: the months first, keeping the day of the month
+ * but clamping it to the last day of the month reached, then the days, then the microseconds
+ * (§7.12). Past the range of `int64` is `R0001`.
+ */
+private[terndb] add_interval(micros: i64, iv: Ival) -> Result[i64, CodecError]
+    val day = floor_div(micros, DayMicros)
+    val clock = floor_mod(micros, DayMicros)
+    val (y, m, d) = civil_from_days(day)
+    val months = y * 12 + (m - 1) + i64(iv.months)
+    val y2 = floor_div(months, 12)
+    val m2 = floor_mod(months, 12) + 1
+    val d2 = if d > days_in_month(y2, m2) then days_in_month(y2, m2) else d
+    val days = days_from_civil(y2, m2, d2) + i64(iv.days)
+
+    val r = days.checked_mul(DayMicros).and_then(x -> x.checked_add(clock)).and_then(x -> x.checked_add(iv.micros))
+
+    r match
+        Some(x) -> Ok(x)
+        None -> fail("R0001", "the date is out of range")
+
+/** `add(t, interval)` for a `timestamp`, `datetime` or `date` vector `a`. */
+private[terndb] calendar_add(a: ColumnVector, b: ColumnVector, result: Type, validity: Buf[u8]) -> Result[ColumnVector, CodecError]
+    val ivs = b.lanes match
+        Intervals(x) -> x
+        _ -> panic("calendar_add: an interval lane was expected")
+
+    val base = a.lanes match
+        I32s(days) ->
+            val out = buf[i64]()
+
+            for d in days
+                out.push(i64(d) * DayMicros)
+
+            out
+        I64s(x) -> x
+        _ -> panic("calendar_add: a date or time lane was expected")
+
+    val out = buf[i64]()
+
+    for i in 0..<a.len
+        out.push(if bit(validity, i) then add_interval(base[i], ivs[i])? else 0)
+
+    Ok(ColumnVector(result, a.len, validity, I64s(out)))
+end calendar_add
+
+// -- Cast, §7.6 ---------------------------------------------------------------------------------
+
+private bad_cast[T]() -> Result[T, CodecError] = fail("R0006", "the value does not convert")
+
+private is_exact(t: Type) -> bool = exact_shape(t).is_some()
+
+/** `v` rounded from scale `from` to scale `to`, half away from zero. */
+private rescale(v: i128, from: int, to: int) -> Option[i128]
+    if to >= from then return v.checked_mul(pow10(to - from))
+
+    val d = pow10(from - to)
+    val q = v / d
+    val r = v % d
+    val twice = if r < 0 then -2 * r else 2 * r
+
+    Some(if twice >= d then (if v < 0 then q - 1 else q + 1) else q)
+
+/** Whether `v` has at most `p` digits. */
+private fits_digits(v: i128, p: int) -> bool = p >= 39 || (v < pow10(p) && v > -pow10(p))
+
+private exact_of(v: Value) -> i128 = v match
+    Int(n) -> n
+    UInt(n) -> i128(n)
+    _ -> panic("an exact number was expected")
+
+private real_of(v: Value) -> real = v match
+    Float(x) -> x
+    _ -> panic("a float was expected")
+
+/** A non-null value `v` of type `from` cast to `to` (§7.6), `R0006` where it does not convert. */
+private[terndb] cast_value(v: Value, from: Type, to: Type) -> Result[Value, CodecError]
+    if v.is_null() then return Ok(v)
+
+    val f = from.base()
+    val t = to.base()
+
+    if f == t then return Ok(v)
+
+    if t == Text then return Ok(Text(to_text(f, v)?))
+
+    if f == Text
+        val s = v match
+            Text(x) -> x
+            _ -> panic("cast_value: text was expected")
+
+        return from_text(t, s) match
+            Ok(x) -> Ok(x)
+            Err(_) -> bad_cast()
+
+    (f, t) match
+        (Bytes, Uuid) ->
+            val b = v match
+                Bytes(x) -> x
+                _ -> panic("cast_value: bytes were expected")
+
+            if b.len() != 16 then return bad_cast()
+
+            var bits: u128 = 0
+
+            for x in b
+                bits = bits << 8 | u128(x)
+
+            return Ok(Uuid(bits))
+        (Uuid, Bytes) ->
+            val bits = v match
+                Uuid(x) -> x
+                _ -> panic("cast_value: a uuid was expected")
+            val out = buf[u8]()
+
+            for i in 0..<16
+                out.push(u8.wrap(bits >> (8 * (15 - i))))
+
+            return Ok(Bytes(out))
+        (Record(ff), Record(tf)) ->
+            val xs = v match
+                Record(x) -> x
+                _ -> panic("cast_value: a record was expected")
+            val out = buf[Value]()
+
+            for j in 0..<tf.len()
+                out.push(cast_value(xs[j], ff[j].ty, tf[j].ty)?)
+
+            return Ok(Record(out))
+        (Union(fv), Union(tv)) ->
+            return v match
+                Variant(tag, p) -> Ok(Variant(tag, cast_value(*p, fv[tag].ty, tv[tag].ty)?))
+                _ -> panic("cast_value: a union value was expected")
+        (Bag(fe), Bag(te)) | (List(fe), List(te)) | (List(fe), Bag(te)) ->
+            val xs = v match
+                Relation(x) -> x
+                _ -> panic("cast_value: a relation was expected")
+            val out = buf[Value]()
+
+            for x in xs
+                out.push(cast_value(x, *fe, *te)?)
+
+            return Ok(Relation(out))
+        _ -> ()
+
+    // Numeric to numeric: range-checked, rounding half away from zero into an exact target.
+    if t == Float32 || t == Float64
+        val x = if is_exact(f) then real(exact_of(v)) / real(pow10(exact_shape(f).unwrap().1)) else real_of(v)
+
+        if t == Float32
+            val narrowed = f32(x)
+
+            if narrowed.is_infinite() && !x.is_infinite() then return bad_cast()
+
+            return Ok(Float(real(narrowed)))
+
+        return Ok(Float(x))
+
+    val (whole, scale) = exact_shape(t).unwrap()
+
+    val unscaled = if is_exact(f)
+        rescale(exact_of(v), exact_shape(f).unwrap().1, scale) match
+            Some(x) -> x
+            None -> return bad_cast()
+    else
+        val x = real_of(v) * real(pow10(scale))
+
+        if x.is_nan() || x.is_infinite() || x >= 1.7e38 || x <= -1.7e38 then return bad_cast()
+
+        i128(x.round())
+
+    t match
+        Decimal(_, _) ->
+            if !fits_digits(unscaled, whole + scale) then return bad_cast()
+
+            Ok(Int(unscaled))
+        _ ->
+            val (lo, hi) = int_range(t)
+
+            if unscaled < lo || unscaled > hi then return bad_cast()
+
+            if lo == 0 then Ok(UInt(u64(unscaled))) else Ok(Int(unscaled))
+end cast_value
+
+/** `v` cast to `to` (§7.6). A `strict` cast fails with `R0006` at the first slot that does not
+ * convert; a `try` cast makes that slot null (its `to` is already nullable).
+ */
+cast_vector(v: ColumnVector, to: Type, strict: bool) -> Result[ColumnVector, CodecError]
+    val f = v.ty.base()
+    val t = to.base()
+
+    if f == t then return Ok(v.as_type(to))
+
+    // Integer to integer: one range check per slot over the widened lane.
+    if is_int_type(f) && is_int_type(t)
+        val wide = wide_of(v.lanes)
+        val (lo, hi) = int_range(t)
+        val keep = buf[bool]()
+
+        for i in 0..<v.len
+            val fits = !v.is_valid(i) || (wide[i] >= lo && wide[i] <= hi)
+
+            if !fits && strict then return bad_cast()
+
+            keep.push(v.is_valid(i) && fits)
+
+        // A slot that does not fit is null now, so the value its lane wraps to is never read.
+        return Ok(ColumnVector(to, v.len, bits_of(keep.view()), lane_from_wide(t, wide)))
+
+    val out = buf[Value]()
+
+    for i in 0..<v.len
+        cast_value(value_at(v, i), f, t) match
+            Ok(x) -> out.push(x)
+            Err(e) ->
+                if strict || e.code != "R0006" then return Err(e)
+
+                out.push(Null)
+
+    Ok(vector_of(to, out.view()))
+end cast_vector

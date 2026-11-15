@@ -1,0 +1,160 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// From a typed query tree to a tree of operators. The type checker gives every `Rel` and `Expr` node
+// its type in pre-order (`Typing.nodes`, `qtree_types.sysl`); this walk visits the nodes in the same
+// order and takes each one's type as it goes, so that no type is derived twice.
+//
+// The executor runs the nodes `docs/design/executor.md` lists; handing it any other is a caller's
+// error and stops the program, as handing `compare.sysl` a value of the wrong shape does.
+
+/** A table's rows held in memory, which a `Scan` of `name` reads (a stand-in for storage). */
+struct MemTable
+    name: QualName
+    batches: Buf[ColumnVector]
+
+/** A lowered relation: its operator, the binder it exposes and that binder's element type, and, for
+ * a `Sort`, its keys (which a `Limit` with ties above it compares by).
+ */
+struct Lowered
+    op: &Operator
+    binder: string
+    elem: Type
+    keys: Buf[TKey]
+
+private struct Planner
+    types: Buf[Type]
+    at: usize
+    ctx: Ctx
+    tables: Buf[MemTable]
+
+    take_type(*self) -> Type
+        val t = self.types[self.at]
+        self.at += 1
+        t
+
+    expr(*self, e: Expr) -> TExpr
+        val ty = self.take_type()
+        val kids = buf[TExpr]()
+
+        e match
+            Col(_, _) | Row(_) | Param(_) | Null(_) | Literal(_, _) -> ()
+            Call(f, args) ->
+                f match
+                    "at_zone" | "from_zone" | "next_value" -> panic(s"the executor does not run '$f'")
+                    _ -> ()
+
+                for a in args
+                    kids.push(self.expr(a))
+            Cast(inner, _, _) | Field(inner, _) | Variant(_, _, inner) -> kids.push(self.expr(*inner))
+            If(arms, otherwise) ->
+                for a in arms
+                    kids.push(self.expr(a.cond))
+                    kids.push(self.expr(a.value))
+
+                otherwise match
+                    Some(x) -> kids.push(self.expr(*x))
+                    None -> ()
+            Match(scrutinee, arms, otherwise) ->
+                kids.push(self.expr(*scrutinee))
+
+                for a in arms
+                    kids.push(self.expr(a.expr))
+
+                otherwise match
+                    Some(x) -> kids.push(self.expr(*x))
+                    None -> ()
+            Record(fields) ->
+                for f in fields
+                    kids.push(self.expr(f.expr))
+            _ -> panic("the executor does not run Relation, Scalar, Exists, In or Action")
+
+        TExpr(e, ty, kids)
+    end expr
+
+    opt_expr(*self, e: Option[Expr]) -> Option[TExpr] = e match
+        Some(x) -> Some(self.expr(x))
+        None -> None
+
+    rel(*self, r: Rel) -> Lowered
+        val elem = self.take_type() match
+            Bag(e) | List(e) -> *e
+            _ -> panic("a relation's type is a bag or a list")
+
+        val none = buf[TKey]()
+
+        r match
+            Scan(table, binder) ->
+                for t in self.tables
+                    if t.name == table then return Lowered(mem_source(t.batches), binder, elem, none)
+
+                panic(s"no table '${table.schema}.${table.name}' is in memory")
+            Values(binder, _, rows) ->
+                val cells = buf[Buf[TExpr]]()
+
+                for row in rows
+                    val out = buf[TExpr]()
+
+                    for e in row
+                        out.push(self.expr(e))
+
+                    cells.push(out)
+
+                Lowered(ValuesOp(elem, cells, self.ctx, 0), binder, elem, none)
+            ParamScan(binder, param) -> Lowered(param_scan(elem, self.ctx.params[usize(param)]), binder, elem, none)
+            Filter(input, predicate) ->
+                val inner = self.rel(*input)
+                val p = self.expr(predicate)
+                Lowered(FilterOp(inner.op, inner.binder, p, self.ctx), inner.binder, elem, none)
+            Project(input, binder, items) ->
+                val inner = self.rel(*input)
+                val xs = buf[TExpr]()
+
+                for it in items
+                    xs.push(self.expr(it.expr))
+
+                Lowered(ProjectOp(inner.op, inner.binder, elem, xs, self.ctx), binder, elem, none)
+            Sort(input, keys) ->
+                val inner = self.rel(*input)
+                val ks = buf[TKey]()
+
+                for k in keys
+                    ks.push(TKey(self.expr(k.expr), k.desc, k.nulls_first))
+
+                Lowered(SortOp(inner.op, inner.binder, elem, ks, self.ctx, None), inner.binder, elem, ks)
+            Limit(input, count, offset, ties, _) ->
+                val inner = self.rel(*input)
+                val c = self.opt_expr(count)
+                val o = self.opt_expr(offset)
+                val op = LimitOp(inner.op, inner.binder, c, o, ties, inner.keys, self.ctx, false, 0, false, 0, None, false)
+                Lowered(op, inner.binder, elem, none)
+            Distinct(input) ->
+                val inner = self.rel(*input)
+                Lowered(DistinctOp(inner.op, elem, None), inner.binder, elem, none)
+            Tag(input, binder, _, tag) ->
+                val inner = self.rel(*input)
+                Lowered(TagOp(inner.op, elem, member_index(fields_of_type(elem), tag)), binder, elem, none)
+            _ -> panic("the executor does not run this relational node")
+    end rel
+end Planner
+
+/** The operator tree of `env`, a `Query` that `typing` is the type checker's answer for, run with
+ * `ctx` against the in-memory `tables`.
+ */
+plan_query(env: Envelope, typing: Typing, ctx: Ctx, tables: Buf[MemTable]) -> Lowered
+    val rel = env.statement match
+        Query(r) -> r
+        _ -> panic("plan_query: the statement is not a query")
+
+    var p = Planner(typing.nodes, 0, ctx, tables)
+    p.rel(rel)
+
+/** `env` type-checked against `catalog`, run with `ctx` over `tables`, and its output as the result
+ * format's batches for parameter tuple 0: what an `Execute` of the query sends after its header.
+ */
+run_query(env: Envelope, catalog: &Catalog, ctx: Ctx, tables: Buf[MemTable]) -> Result[(Type, Buf[Buf[u8]]), CodecError]
+    val typing = type_envelope(env, catalog)?
+    val result = typing.result.unwrap()
+    val root = plan_query(env, typing, ctx, tables)
+    Ok((result, result_batches(result, root.op, 0)?))

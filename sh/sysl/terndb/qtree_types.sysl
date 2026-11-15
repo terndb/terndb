@@ -244,6 +244,15 @@ private any_nullable(ts: Buf[Type]) -> bool
 
     false
 
+/** Whether a field of a record or a payload's field of a union in `t`, at any depth, is nullable. */
+private holds_nullable(t: Type) -> bool = t.base() match
+    Record(fs) | Union(fs) ->
+        for f in fs
+            if f.ty.is_nullable() || holds_nullable(f.ty) then return true
+
+        false
+    _ -> false
+
 private min_int(a: int, b: int) -> int = if a < b then a else b
 
 private max_int(a: int, b: int) -> int = if a > b then a else b
@@ -1253,8 +1262,9 @@ private struct Typer
 
                 val check = if f == "eq" || f == "ne" then check_equatable(t) else check_orderable(t)
 
+                // A record or union comparison is null where a field pair is (§3.2 rules 2 and 3).
                 check match
-                    Ok(()) -> Some(null_if(nulls, Bool))
+                    Ok(()) -> Some(null_if(nulls || holds_nullable(t), Bool))
                     Err(e) -> self.refuse(e.code, e.message)
             "is_null" | "is_not_null" ->
                 if args.len() != 1 then self.refuse("Q3002", s"'$f' takes one argument") else Some(Bool)

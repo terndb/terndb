@@ -1,0 +1,102 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Column vectors: every type's lanes round-trip through `vector_of` and `value_at`, and `take`,
+// `concat` and `slice` keep every slot, null or not, of every kind of lane.
+
+/** One value of every type the result format has, with a null and a placeholder-worthy record. */
+private ev_cases() -> Buf[(Type, Buf[Value])]
+    val out = buf[(Type, Buf[Value])]()
+    val status = union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))])
+    val point = record([Field("x", Int32), Field("y", nullable(Text))])
+
+    out.push((nullable(Bool), items_of([Bool(true), Null, Bool(false)])))
+    out.push((nullable(Int8), items_of([Int(-128), Null, Int(127)])))
+    out.push((Int16, items_of([Int(-3), Int(0), Int(32767)])))
+    out.push((nullable(Int32), items_of([Null, Null, Int(7)])))
+    out.push((Int64, items_of([Int(-1), Int(1), Int(9223372036854775807)])))
+    out.push((nullable(Int128), items_of([Int(-170141183460469231731687303715884105728), Null, Int(1)])))
+    out.push((UInt8, items_of([UInt(255), UInt(0), UInt(1)])))
+    out.push((nullable(UInt16), items_of([UInt(65535), Null, UInt(1)])))
+    out.push((UInt32, items_of([UInt(4294967295), UInt(0), UInt(1)])))
+    out.push((nullable(UInt64), items_of([UInt(18446744073709551615), Null, UInt(1)])))
+    out.push((Float32, items_of([Float(1.5), Float(-0.0), Float(3.0)])))
+    out.push((nullable(Float64), items_of([Float(0.1), Null, Float(-2.5)])))
+    out.push((nullable(Decimal(10, 2)), items_of([Int(12345), Null, Int(-1)])))
+    out.push((nullable(Text), items_of([Text("héllo"), Null, Text("")])))
+    out.push((Bytes, items_of([bytes_value([1, 2]), bytes_value([]), bytes_value([255])])))
+    out.push((Date, items_of([Int(0), Int(-1), Int(19000)])))
+    out.push((nullable(Timestamp), items_of([Int(1), Null, Int(-1)])))
+    out.push((nullable(Interval), items_of([Interval(1, 2, 3), Null, Interval(-1, 0, 0)])))
+    out.push((Uuid, items_of([Uuid(1), Uuid(340282366920938463463374607431768211455), Uuid(0)])))
+    out.push((nullable(point), items_of([rec([Int(1), Text("a")]), Null, rec([Int(2), Null])])))
+    out.push((nullable(status), items_of([variant(1, rec([Text("spam")])), Null, variant(0, rec([]))])))
+    out.push((nullable(list(nullable(Int64))), items_of([rel([Int(1), Null]), Null, rel([])])))
+    out.push((bag(point), items_of([rel([rec([Int(1), Null])]), rel([]), rel([rec([Int(3), Text("z")]), rec([Int(4), Text("w")])])])))
+    out
+end ev_cases
+
+private ev_same_values(t: Type, got: Buf[Value], want: []const Value) -> bool
+    if got.len() != want.len then return false
+
+    for i in 0..<want.len
+        if !same(t, got[i], want[i]) then return false
+
+    true
+
+@test
+every_type_round_trips_through_a_vector()
+    for (t, vs) in ev_cases()
+        val v = vector_of(t, vs.view())
+        assert_eq(v.len, vs.len())
+        assert(ev_same_values(t, values_of(v), vs.view()), type_text(t))
+        var nulls = false
+
+        for x in vs
+            if x.is_null() then nulls = true
+
+        assert_eq(v.has_nulls(), nulls)
+
+@test
+take_concat_and_slice_keep_every_slot()
+    for (t, vs) in ev_cases()
+        val v = vector_of(t, vs.view())
+        val picked = take(v, [2, 0, 0, 1])
+        assert(ev_same_values(t, values_of(picked), [vs[2], vs[0], vs[0], vs[1]]), type_text(t))
+
+        val joined = concat(t, [v, picked, empty_vector(t), v])
+        val want = buf[Value]()
+        want.extend(vs.view())
+        want.extend(values_of(picked).view())
+        want.extend(vs.view())
+        assert(ev_same_values(t, values_of(joined), want.view()), type_text(t))
+
+        assert(ev_same_values(t, values_of(slice(joined, 2, 5)), [vs[2], vs[2], vs[0]]), type_text(t))
+        assert_eq(take(v, []).len, 0)
+
+@test
+a_vector_with_no_nulls_has_an_empty_validity()
+    val v = vector_of(nullable(Int64), [Int(1), Int(2)])
+    assert(!v.has_nulls())
+    assert_eq(v.validity.len(), 0)
+    assert_eq(take(vector_of(nullable(Int64), [Int(1), Null]), [0, 0]).validity.len(), 0)
+
+@test
+batches_of_cuts_at_the_batch_size()
+    for n in [0, 1, BatchSize, BatchSize + 1]
+        val vs = buf[Value]()
+
+        for i in 0..<n
+            vs.push(Int(i128(i)))
+
+        val parts = batches_of(vector_of(Int64, vs.view()))
+        var total: usize = 0
+
+        for p in parts
+            assert(p.len > 0 && p.len <= BatchSize)
+            total += p.len
+
+        assert_eq(total, n)
+        assert_eq(parts.len(), (n + BatchSize - 1) / BatchSize)

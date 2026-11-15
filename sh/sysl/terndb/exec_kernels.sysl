@@ -1,0 +1,544 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+
+// The kernels over whole vectors (`docs/design/executor.md` §3): coercion (`query-tree.md` §4.1),
+// arithmetic (§4.4), comparison (§3.1–§3.3) and three-valued logic (§7.12). Each is one generic
+// function over the lane's element type, chosen by one `match` per batch; the loop inside is plain
+// code over a `Buf[T]`.
+
+/** Whether slot `i` of a validity bitmap is set; an empty bitmap has every slot set. */
+private[terndb] bit(validity: Buf[u8], i: usize) -> bool =
+    validity.len() == 0 || (validity[i / 8] >> u8(i % 8)) & 1 == 1
+
+private overflow[T]() -> Result[T, CodecError] = fail("R0001", "arithmetic overflow")
+
+private by_zero[T]() -> Result[T, CodecError] = fail("R0002", "division by zero")
+
+// -- integer lanes, widened and narrowed --------------------------------------------------------
+
+private widen_lane[T: Integer](x: Buf[T]) -> Buf[i128]
+    val out = buf[i128]()
+
+    for v in x
+        out.push(i128(v))
+
+    out
+
+private narrow_lane[T: Integer](x: Buf[i128]) -> Buf[T]
+    val out = buf[T]()
+
+    for v in x
+        out.push(T.wrap(v))
+
+    out
+
+/** An integer or decimal lane as `i128`s: a signed or unsigned integer, or a decimal's unscaled value. */
+private[terndb] wide_of(l: Lanes) -> Buf[i128] = l match
+    I8s(x) -> widen_lane(x)
+    I16s(x) -> widen_lane(x)
+    I32s(x) -> widen_lane(x)
+    I64s(x) -> widen_lane(x)
+    I128s(x) -> x
+    U8s(x) -> widen_lane(x)
+    U16s(x) -> widen_lane(x)
+    U32s(x) -> widen_lane(x)
+    U64s(x) -> widen_lane(x)
+    _ -> panic("wide_of: an integer lane was expected")
+
+/** `x`, values already known to fit, as the lane of the integer or decimal type `t`. */
+private[terndb] lane_from_wide(t: Type, x: Buf[i128]) -> Lanes = t match
+    Int8 -> I8s(narrow_lane(x))
+    Int16 -> I16s(narrow_lane(x))
+    Int32 | Date -> I32s(narrow_lane(x))
+    Int64 | Time | DateTime | Timestamp -> I64s(narrow_lane(x))
+    Int128 | Decimal(_, _) -> I128s(x)
+    UInt8 -> U8s(narrow_lane(x))
+    UInt16 -> U16s(narrow_lane(x))
+    UInt32 -> U32s(narrow_lane(x))
+    UInt64 -> U64s(narrow_lane(x))
+    _ -> panic("lane_from_wide: an integer type was expected")
+
+/** The least and greatest value of the integer type `t`. */
+private[terndb] int_range(t: Type) -> (i128, i128) = t match
+    Int8 -> (-128, 127)
+    Int16 -> (-32768, 32767)
+    Int32 -> (-2147483648, 2147483647)
+    Int64 -> (-9223372036854775808, 9223372036854775807)
+    UInt8 -> (0, 255)
+    UInt16 -> (0, 65535)
+    UInt32 -> (0, 4294967295)
+    UInt64 -> (0, 18446744073709551615)
+    _ -> (-170141183460469231731687303715884105728, 170141183460469231731687303715884105727)
+
+private[terndb] is_int_type(t: Type) -> bool = t match
+    Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 -> true
+    _ -> false
+
+private is_float_type(t: Type) -> bool = t == Float32 || t == Float64
+
+/** A float lane as `real`s. */
+private[terndb] reals_of(l: Lanes) -> Buf[real] = l match
+    F64s(x) -> x
+    F32s(x) ->
+        val out = buf[real]()
+
+        for v in x
+            out.push(real(v))
+
+        out
+    _ -> panic("reals_of: a float lane was expected")
+
+// -- coercion, §4.1 -----------------------------------------------------------------------------
+
+/** `v` as a vector of `to`, a type `v`'s type coerces to (§4.1), agreeing with `compare.coerce` slot
+ * by slot: integers widen, an exact number rescales into a decimal (`R0001` where the unscaled value
+ * passes `int128`), `float32` widens, and records, unions and relations coerce componentwise.
+ */
+coerce_vector(v: ColumnVector, to: Type) -> Result[ColumnVector, CodecError]
+    val f = v.ty.base()
+    val t = to.base()
+
+    if f == t then return Ok(v.as_type(to))
+
+    val lanes = (f, t) match
+        (_, Decimal(_, s)) ->
+            val k = int(s) - exact_shape(f).unwrap().1
+            val m = pow10(k)
+            val out = buf[i128]()
+            val wide = wide_of(v.lanes)
+
+            for i in 0..<v.len
+                if !v.is_valid(i)
+                    out.push(0)
+                    continue
+
+                wide[i].checked_mul(m) match
+                    Some(x) -> out.push(x)
+                    None -> return fail("R0001", "the value does not fit the decimal")
+
+            I128s(out)
+        (Float32, Float64) -> F64s(reals_of(v.lanes))
+        (Record(_), Record(tf)) ->
+            val out = buf[ColumnVector]()
+
+            for j in 0..<tf.len()
+                out.push(coerce_vector(v.member(j), tf[j].ty)?)
+
+            Members(out)
+        (Union(_), Union(tv)) ->
+            v.lanes match
+                Tags(tags, offsets, cs) ->
+                    val out = buf[ColumnVector]()
+
+                    for j in 0..<tv.len()
+                        out.push(coerce_vector(cs[j], tv[j].ty)?)
+
+                    Tags(tags, offsets, out)
+                _ -> panic("coerce_vector: a union lane was expected")
+        (_, Bag(e)) | (_, List(e)) ->
+            v.lanes match
+                Elems(offsets, c) -> Elems(offsets, coerce_vector(*c, *e)?)
+                _ -> panic("coerce_vector: a relation lane was expected")
+        _ ->
+            if !is_int_type(t) then panic("coerce_vector: the types do not coerce")
+
+            lane_from_wide(t, wide_of(v.lanes))
+
+    Ok(ColumnVector(to, v.len, v.validity, lanes))
+end coerce_vector
+
+// -- integer arithmetic, §4.4 rule 1 ------------------------------------------------------------
+
+/** The arithmetic functions of §7.12. */
+enum Arith
+    Add
+    Sub
+    Mul
+    Div
+    Mod
+
+private arith_of(f: string) -> Arith = f match
+    "add" -> Add
+    "sub" -> Sub
+    "mul" -> Mul
+    "div" -> Div
+    _ -> Mod
+
+private int_binary[T: Integer + Checked](op: Arith, x: Buf[T], y: Buf[T], validity: Buf[u8]) -> Result[Buf[T], CodecError]
+    val n = x.len()
+    val out = buf[T]()
+
+    if op == Div || op == Mod
+        for i in 0..<n
+            if bit(validity, i) && y[i] == T(0) then return by_zero()
+
+    for i in 0..<n
+        if !bit(validity, i)
+            out.push(T(0))
+            continue
+
+        val r = op match
+            Add -> x[i].checked_add(y[i])
+            Sub -> x[i].checked_sub(y[i])
+            Mul -> x[i].checked_mul(y[i])
+            Div -> x[i].checked_div(y[i])
+            // The one remainder that overflows is MIN mod -1, which is 0.
+            Mod -> Some(x[i].checked_rem(y[i]).unwrap_or(T(0)))
+
+        r match
+            Some(z) -> out.push(z)
+            None -> return overflow()
+
+    Ok(out)
+end int_binary
+
+private int_lanes(op: Arith, a: Lanes, b: Lanes, validity: Buf[u8]) -> Result[Lanes, CodecError] = (a, b) match
+    (I8s(x), I8s(y)) -> Ok(I8s(int_binary(op, x, y, validity)?))
+    (I16s(x), I16s(y)) -> Ok(I16s(int_binary(op, x, y, validity)?))
+    (I32s(x), I32s(y)) -> Ok(I32s(int_binary(op, x, y, validity)?))
+    (I64s(x), I64s(y)) -> Ok(I64s(int_binary(op, x, y, validity)?))
+    (I128s(x), I128s(y)) -> Ok(I128s(int_binary(op, x, y, validity)?))
+    (U8s(x), U8s(y)) -> Ok(U8s(int_binary(op, x, y, validity)?))
+    (U16s(x), U16s(y)) -> Ok(U16s(int_binary(op, x, y, validity)?))
+    (U32s(x), U32s(y)) -> Ok(U32s(int_binary(op, x, y, validity)?))
+    (U64s(x), U64s(y)) -> Ok(U64s(int_binary(op, x, y, validity)?))
+    _ -> panic("int_lanes: two lanes of one integer type were expected")
+
+private int_unary[T: Integer + Checked](neg: bool, x: Buf[T], validity: Buf[u8]) -> Result[Buf[T], CodecError]
+    val out = buf[T]()
+
+    for i in 0..<x.len()
+        if !bit(validity, i)
+            out.push(T(0))
+            continue
+
+        if neg || x[i] < T(0)
+            x[i].checked_neg() match
+                Some(z) -> out.push(z)
+                None -> return overflow()
+        else
+            out.push(x[i])
+
+    Ok(out)
+
+private int_unary_lanes(neg: bool, a: Lanes, validity: Buf[u8]) -> Result[Lanes, CodecError] = a match
+    I8s(x) -> Ok(I8s(int_unary(neg, x, validity)?))
+    I16s(x) -> Ok(I16s(int_unary(neg, x, validity)?))
+    I32s(x) -> Ok(I32s(int_unary(neg, x, validity)?))
+    I64s(x) -> Ok(I64s(int_unary(neg, x, validity)?))
+    I128s(x) -> Ok(I128s(int_unary(neg, x, validity)?))
+    U8s(x) -> Ok(U8s(int_unary(neg, x, validity)?))
+    U16s(x) -> Ok(U16s(int_unary(neg, x, validity)?))
+    U32s(x) -> Ok(U32s(int_unary(neg, x, validity)?))
+    U64s(x) -> Ok(U64s(int_unary(neg, x, validity)?))
+    _ -> panic("int_unary_lanes: an integer lane was expected")
+
+// -- decimal arithmetic, §4.4 rule 2 ------------------------------------------------------------
+
+private pow10_wide(k: int) -> i512
+    var p: i512 = 1
+
+    for _ in 0..<k
+        p *= 10
+
+    p
+
+/** The scale of an exact type: a decimal's own, an integer's 0 (§4.1 rule 2). */
+private scale_of(t: Type) -> int = exact_shape(t).unwrap().1
+
+private decimal_binary(op: Arith, a: ColumnVector, b: ColumnVector, result: Type, validity: Buf[u8]) -> Result[Lanes, CodecError]
+    val (p, s) = exact_shape(result).unwrap()
+    val digits = p + s
+    val bound = pow10_wide(digits)
+    val s1 = scale_of(a.ty.base())
+    val s2 = scale_of(b.ty.base())
+    val x = wide_of(a.lanes)
+    val y = wide_of(b.lanes)
+    val out = buf[i128]()
+
+    if op == Div || op == Mod
+        for i in 0..<a.len
+            if bit(validity, i) && y[i] == 0 then return by_zero()
+
+    for i in 0..<a.len
+        if !bit(validity, i)
+            out.push(0)
+            continue
+
+        val u = i512(x[i])
+        val w = i512(y[i])
+        val r: i512 = op match
+            Add -> u * pow10_wide(s - s1) + w * pow10_wide(s - s2)
+            Sub -> u * pow10_wide(s - s1) - w * pow10_wide(s - s2)
+            Mul -> u * w
+            Div ->
+                val num = u * pow10_wide(s - s1 + s2)
+                val q = num / w
+                val rem = num % w
+                val twice = if rem < 0 then -2 * rem else 2 * rem
+                val mag = if w < 0 then -w else w
+
+                // Half away from zero: the quotient moves away from zero when the remainder is at
+                // least half the divisor.
+                if twice >= mag then (if (num < 0) != (w < 0) then q - 1 else q + 1) else q
+            Mod -> (u * pow10_wide(s - s1)) % (w * pow10_wide(s - s2))
+
+        if r >= bound || r <= -bound then return overflow()
+
+        out.push(i128.wrap(r))
+
+    Ok(I128s(out))
+end decimal_binary
+
+// -- float arithmetic, §4.4 rule 3 --------------------------------------------------------------
+
+private float_binary[T: Float](op: Arith, x: Buf[T], y: Buf[T]) -> Buf[T]
+    val out = buf[T]()
+
+    for i in 0..<x.len()
+        out.push(op match
+            Add -> x[i] + y[i]
+            Sub -> x[i] - y[i]
+            Mul -> x[i] * y[i]
+            Div -> x[i] / y[i]
+            Mod -> x[i].fmod(y[i]))
+
+    out
+
+// -- the arithmetic entry points ----------------------------------------------------------------
+
+/** `add`, `sub`, `mul`, `div` or `mod` (`f`) of `a` and `b` as `result`, the type the type checker
+ * gave the call (§4.4), nullable where an operand is.
+ */
+arith_vectors(f: string, a: ColumnVector, b: ColumnVector, result: Type) -> Result[ColumnVector, CodecError]
+    val op = arith_of(f)
+    val t = result.base()
+    val validity = and_validity(a, b)
+
+    if b.ty.base() == Interval then return calendar_add(a, b, result, validity)
+
+    val lanes = t match
+        Decimal(_, _) -> decimal_binary(op, a, b, t, validity)?
+        Float32 | Float64 ->
+            val x = coerce_vector(a, t)?
+            val y = coerce_vector(b, t)?
+
+            (x.lanes, y.lanes) match
+                (F32s(u), F32s(w)) -> F32s(float_binary(op, u, w))
+                (F64s(u), F64s(w)) -> F64s(float_binary(op, u, w))
+                _ -> panic("arith_vectors: float lanes were expected")
+        _ -> int_lanes(op, coerce_vector(a, t)?.lanes, coerce_vector(b, t)?.lanes, validity)?
+
+    Ok(ColumnVector(result, a.len, validity, lanes))
+end arith_vectors
+
+/** `neg` or `abs` of `a`, whose type is the result's (§7.12). */
+unary_vector(f: string, a: ColumnVector) -> Result[ColumnVector, CodecError]
+    val neg = f == "neg"
+
+    val lanes = a.lanes match
+        F32s(x) ->
+            val out = buf[f32]()
+
+            for v in x
+                out.push(if neg then -v else v.abs())
+
+            F32s(out)
+        F64s(x) ->
+            val out = buf[real]()
+
+            for v in x
+                out.push(if neg then -v else v.abs())
+
+            F64s(out)
+        _ -> int_unary_lanes(neg, a.lanes, a.validity)?
+
+    Ok(ColumnVector(a.ty, a.len, a.validity, lanes))
+
+// -- comparison, §3.1–§3.3 ----------------------------------------------------------------------
+
+private[terndb] sign[T: Ord](a: T, b: T) -> i8 = if a < b then -1 elif b < a then 1 else 0
+
+private cmp_lane[T: Ord](x: Buf[T], y: Buf[T]) -> Buf[i8]
+    val out = buf[i8]()
+
+    for i in 0..<x.len()
+        out.push(sign(x[i], y[i]))
+
+    out
+
+// −∞ < negative < −0 = +0 < positive < +∞ < NaN, every NaN alike (§3.3 rule 3).
+private[terndb] float_order(x: real, y: real) -> i8
+    if x.is_nan() || y.is_nan() then return sign(u8(x.is_nan()), u8(y.is_nan()))
+
+    if x < y then -1 elif y < x then 1 else 0
+
+private[terndb] octet_order(x: []const u8, y: []const u8) -> i8
+    val n = if x.len < y.len then x.len else y.len
+
+    for i in 0..<n
+        if x[i] != y[i] then return sign(x[i], y[i])
+
+    sign(x.len, y.len)
+
+private[terndb] ival_order(x: Ival, y: Ival) -> i8 =
+    if x.months != y.months then sign(x.months, y.months) elif x.days != y.days then sign(x.days, y.days) else sign(x.micros, y.micros)
+
+/** Whether `cmp_scalars` has a kernel for vectors of type `t`. */
+private[terndb] is_scalar_type(t: Type) -> bool = t.base() match
+    Record(_) | Union(_) | Bag(_) | List(_) | Named(_, _) -> false
+    _ -> true
+
+/** `cmp` (§3.3) of slot `i` of `x` with slot `i` of `y`, two scalar vectors of one type, for every
+ * slot; a null slot's entry is unspecified.
+ */
+private[terndb] cmp_scalars(x: ColumnVector, y: ColumnVector) -> Buf[i8] = (x.lanes, y.lanes) match
+    (Bools(a), Bools(b)) ->
+        val out = buf[i8]()
+
+        for i in 0..<a.len()
+            out.push(sign(u8(a[i]), u8(b[i])))
+
+        out
+    (I8s(a), I8s(b)) -> cmp_lane(a, b)
+    (I16s(a), I16s(b)) -> cmp_lane(a, b)
+    (I32s(a), I32s(b)) -> cmp_lane(a, b)
+    (I64s(a), I64s(b)) -> cmp_lane(a, b)
+    (I128s(a), I128s(b)) -> cmp_lane(a, b)
+    (U8s(a), U8s(b)) -> cmp_lane(a, b)
+    (U16s(a), U16s(b)) -> cmp_lane(a, b)
+    (U32s(a), U32s(b)) -> cmp_lane(a, b)
+    (U64s(a), U64s(b)) -> cmp_lane(a, b)
+    (Uuids(a), Uuids(b)) -> cmp_lane(a, b)
+    (F32s(_), F32s(_)) | (F64s(_), F64s(_)) ->
+        val a = reals_of(x.lanes)
+        val b = reals_of(y.lanes)
+        val out = buf[i8]()
+
+        for i in 0..<a.len()
+            out.push(float_order(a[i], b[i]))
+
+        out
+    (Intervals(a), Intervals(b)) ->
+        val out = buf[i8]()
+
+        for i in 0..<a.len()
+            out.push(ival_order(a[i], b[i]))
+
+        out
+    (Bins(oa, da), Bins(ob, db)) ->
+        val out = buf[i8]()
+
+        for i in 0..<x.len
+            out.push(octet_order(da.view()[usize(oa[i])..<usize(oa[i + 1])], db.view()[usize(ob[i])..<usize(ob[i + 1])]))
+
+        out
+    _ -> panic("cmp_scalars: two scalar lanes of one type were expected")
+end cmp_scalars
+
+/** The comparison `f` (`eq ne lt le gt ge same`, §7.12) of `a` and `b`, of types that meet at a
+ * common type (§4.2). The orderings and `eq`/`ne` are null where an operand is; `same` is never null.
+ * Scalars are compared by kernel; records, unions and relations by `compare.sysl`, slot by slot.
+ */
+compare_vectors(f: string, a: ColumnVector, b: ColumnVector) -> Result[ColumnVector, CodecError]
+    val t = common_type(a.ty, b.ty)?
+    val x = coerce_vector(a, t)?
+    val y = coerce_vector(b, t)?
+    val n = x.len
+    val out = buf[bool]()
+
+    if f == "same"
+        if is_scalar_type(t)
+            val c = cmp_scalars(x, y)
+
+            for i in 0..<n
+                val (u, w) = (x.is_valid(i), y.is_valid(i))
+                out.push(if u && w then c[i] == 0 else u == w)
+        else
+            for i in 0..<n
+                out.push(same(t, value_at(x, i), value_at(y, i)))
+
+        return Ok(ColumnVector(Bool, n, buf[u8](), Bools(out)))
+
+    val validity = and_validity(x, y)
+    val nulls = buf[bool]()
+
+    if is_scalar_type(t)
+        val c = cmp_scalars(x, y)
+
+        for i in 0..<n
+            out.push(holds(f, c[i]))
+    else
+        for i in 0..<n
+            val r = f match
+                "eq" -> eq(t, value_at(x, i), value_at(y, i))?
+                "ne" -> ne(t, value_at(x, i), value_at(y, i))?
+                "lt" -> lt(t, value_at(x, i), value_at(y, i))?
+                "le" -> le(t, value_at(x, i), value_at(y, i))?
+                "gt" -> gt(t, value_at(x, i), value_at(y, i))?
+                _ -> ge(t, value_at(x, i), value_at(y, i))?
+
+            out.push(r == Some(true))
+            nulls.push(r.is_some())
+
+    // A record's comparison may be null where neither operand is (§3.2 rule 2).
+    val v = if nulls.len() > 0 then bits_of(nulls.view()) else validity
+    val ty = if v.len() > 0 || x.ty.is_nullable() || y.ty.is_nullable() then nullable(Bool) else Bool
+
+    Ok(ColumnVector(ty, n, v, Bools(out)))
+end compare_vectors
+
+private holds(f: string, c: i8) -> bool = f match
+    "eq" -> c == 0
+    "ne" -> c != 0
+    "lt" -> c < 0
+    "le" -> c <= 0
+    "gt" -> c > 0
+    _ -> c >= 0
+
+// -- three-valued logic, §7.12 ------------------------------------------------------------------
+
+private bools_of(v: ColumnVector) -> Buf[bool] = v.lanes match
+    Bools(x) -> x
+    _ -> panic("a bool vector was expected")
+
+/** `and` or `or` (`f`) of two `bool`/`bool?` vectors, Kleene's tables: `and` is `false` where either
+ * side is `false`, else null where either is null, else `true`; `or` the dual.
+ */
+logic_vectors(f: string, a: ColumnVector, b: ColumnVector, result: Type) -> ColumnVector
+    val x = bools_of(a)
+    val y = bools_of(b)
+    val n = a.len
+    val out = buf[bool]()
+    val known = buf[bool]()
+    val conj = f == "and"
+
+    for i in 0..<n
+        val (u, w) = (a.is_valid(i), b.is_valid(i))
+        // The value that decides alone: `false` for `and`, `true` for `or`.
+        val decided = (u && x[i] != conj) || (w && y[i] != conj)
+
+        out.push(if decided then !conj else conj)
+        known.push(decided || (u && w))
+
+    ColumnVector(result, n, bits_of(known.view()), Bools(out))
+
+/** `not` of a `bool`/`bool?` vector; null stays null. */
+not_vector(a: ColumnVector) -> ColumnVector
+    val out = buf[bool]()
+
+    for v in bools_of(a)
+        out.push(!v)
+
+    ColumnVector(a.ty, a.len, a.validity, Bools(out))
+
+/** `is_null` (or `is_not_null` when `negated`), never null. */
+null_test_vector(a: ColumnVector, negated: bool) -> ColumnVector
+    val out = buf[bool]()
+
+    for i in 0..<a.len
+        out.push(a.is_valid(i) == negated)
+
+    ColumnVector(Bool, a.len, buf[u8](), Bools(out))

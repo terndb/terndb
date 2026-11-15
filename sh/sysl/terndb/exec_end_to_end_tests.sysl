@@ -1,0 +1,111 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// A query tree built by hand — Values → Filter → Project → Sort → Limit — type-checked, planned and
+// executed, its output encoded as the result format's batches and decoded again with `decode_batch`,
+// and the decoded rows compared with the rows the query means.
+
+private xx_catalog() -> FakeCatalog = FakeCatalog(buf[FakeTable](), buf[FakeType](), buf[FakeFunction]())
+
+/** A `Values` of `n` rows `{id: int64, name: text, score: decimal(5, 2)?}`, the score null on every
+ * seventh row.
+ */
+private xx_values(n: usize) -> Rel
+    val rows = buf[Buf[Expr]]()
+
+    for i in 0..<n
+        val score: Expr = if i % 7 == 3 then Null(Decimal(5, 2)) else Literal(Decimal(5, 2), Int(i128((i * 37) % 1000)))
+        rows.push(items_of([Literal(Int64, Int(i128(i))), Literal(Text, Text(s"n$i")), score]))
+
+    Values("v", items_of([Field("id", Int64), Field("name", Text), Field("score", nullable(Decimal(5, 2)))]), rows)
+
+/** The query: rows with a score and an id above 1, as `{id, shout: upper(name), twice: score * 2}`,
+ * by score descending then id, from the `offset`-th, `count` of them.
+ */
+private xx_query(n: usize, count: i128, offset: i128) -> Envelope
+    val keep = call("and", [call("is_not_null", [col("v", "score")]), call("gt", [col("v", "id"), Literal(Int64, Int(1))])])
+    val items = items_of([item("id", col("v", "id")), item("shout", call("upper", [col("v", "name")])), item("twice", call("mul", [col("v", "score"), Literal(Int32, Int(2))]))])
+    val sorted = Sort(Project(Filter(xx_values(n), keep), "p", items), items_of([SortKey(col("p", "twice"), true, false), SortKey(col("p", "id"), false, false)]))
+    envelope([], Query(Limit(sorted, Some(Literal(Int64, Int(count))), Some(Literal(Int64, Int(offset))), false, false)))
+
+/** The rows the query means, computed directly. */
+private xx_expected(n: usize, count: i128, offset: i128) -> Buf[Value]
+    val kept = buf[(i128, i128)]()
+
+    for i in 0..<n
+        if i % 7 != 3 && i > 1 then kept.push((i128(i), i128((i * 37) % 1000) * 2))
+
+    // Score descending, then id ascending: an insertion sort is enough for a test.
+    for a in 1..<kept.len()
+        var b = a
+
+        while b > 0 && (kept[b - 1].1 < kept[b].1 || (kept[b - 1].1 == kept[b].1 && kept[b - 1].0 > kept[b].0))
+            val x = kept[b - 1]
+            kept[b - 1] = kept[b]
+            kept[b] = x
+            b -= 1
+
+    val out = buf[Value]()
+
+    for k in 0..<kept.len()
+        if i128(k) >= offset && i128(k) < offset + count
+            val (id, twice) = kept[k]
+            out.push(rec([Int(id), Text(s"N$id"), Int(twice)]))
+
+    out
+
+/** The rows of the encoded batches of the query, decoded. */
+private xx_decoded(env: Envelope) -> (Type, Buf[Value], usize)
+    val (result, batches) = run_query(env, xx_catalog(), xe_ctx([]), buf[MemTable]()).unwrap()
+    val tree = column_tree(result).unwrap()
+    val rows = buf[Value]()
+
+    for payload in batches
+        rows.extend(decode_batch(tree, payload.view()).unwrap().rows().view())
+
+    (result, rows, batches.len())
+
+@test
+a_hand_built_tree_runs_and_its_result_decodes()
+    val (result, rows, batches) = xx_decoded(xx_query(20, 5, 2))
+    // decimal(5, 2) times an int32, decimal(10, 0), is decimal(15, 2) (§4.4 rule 2).
+    val elem = record([Field("id", Int64), Field("shout", Text), Field("twice", nullable(Decimal(15, 2)))])
+    assert(result == list(elem))
+    assert_eq(batches, 1)
+
+    val want = xx_expected(20, 5, 2)
+    assert_eq(rows.len(), 5)
+
+    for i in 0..<want.len()
+        assert(same(elem, rows[i], want[i]), s"row $i")
+
+@test
+an_output_of_several_batches_decodes_batch_by_batch()
+    val n = 3 * BatchSize
+    val count = i128(BatchSize) + 10
+    val (result, rows, batches) = xx_decoded(xx_query(n, count, 7))
+    // decimal(5, 2) times an int32, decimal(10, 0), is decimal(15, 2) (§4.4 rule 2).
+    val elem = record([Field("id", Int64), Field("shout", Text), Field("twice", nullable(Decimal(15, 2)))])
+    assert(result == list(elem))
+    assert_eq(batches, 2)
+
+    val want = xx_expected(n, count, 7)
+    assert_eq(rows.len(), want.len())
+
+    for i in 0..<want.len()
+        assert(same(elem, rows[i], want[i]), s"row $i")
+
+@test
+a_query_with_no_rows_sends_no_batch()
+    val (_, rows, batches) = xx_decoded(xx_query(20, 5, 100))
+    assert_eq(batches, 0)
+    assert_eq(rows.len(), 0)
+
+@test
+a_runtime_error_stops_the_query_with_its_code()
+    // 100 / (id - 3) divides by zero on the row with id 3.
+    val e = call("div", [Literal(Int64, Int(100)), call("sub", [col("v", "id"), Literal(Int64, Int(3))])])
+    val env = envelope([], Query(Project(xx_values(5), "p", items_of([item("q", e)]))))
+    assert_eq(run_query(env, xx_catalog(), xe_ctx([]), buf[MemTable]()).unwrap_err().code, "R0002")

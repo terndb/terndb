@@ -1,0 +1,333 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Expression evaluation over a batch (`query-tree.md` §7, `docs/design/executor.md` §2–§3): every
+// expression node, given the binders visible at it, answers a vector with one slot per row.
+
+/** An expression with the type the type checker gave it, and its subexpressions in the pre-order the
+ * checker walks them (`Typing.nodes`): a call's arguments; a cast's, a field's or a variant's operand;
+ * an `If`'s conditions and values in turn, then its `else`; a `Match`'s scrutinee, its arms, then its
+ * `else`; a record's fields.
+ */
+struct TExpr
+    e: Expr
+    ty: Type
+    kids: Buf[TExpr]
+
+/** What every expression of one execution reads: the parameter values (§10.1), each of its declared
+ * type, and the statement's timestamp (§7.12), in microseconds since the Unix epoch.
+ */
+struct Ctx
+    params: Buf[Value]
+    now: i64
+
+/** A binder visible to an expression, with its rows: a vector of the binder's element type. */
+struct Binder
+    name: string
+    rows: ColumnVector
+
+/** The rows an expression is evaluated over: `n` of them, and the binders that see them (§8.3). */
+struct Env
+    n: usize
+    binders: Buf[Binder]
+    ctx: Ctx
+
+    /** The same binders, over rows `rows` of these. */
+    take(self, rows: []const usize) -> Env
+        val bs = buf[Binder]()
+
+        for b in self.binders
+            bs.push(Binder(b.name, take(b.rows, rows)))
+
+        Env(rows.len, bs, self.ctx)
+
+    /** These rows with `name` bound to `rows` as well, ahead of the binders already here. */
+    with(self, name: string, rows: ColumnVector) -> Env
+        val bs = buf[Binder]()
+        bs.push(Binder(name, rows))
+        bs.extend(self.binders.view())
+        Env(self.n, bs, self.ctx)
+
+    binder(self, name: string) -> ColumnVector
+        for b in self.binders
+            if b.name == name then return b.rows
+
+        panic(s"no binder '$name' is visible")
+
+/** The environment of one binder `name` over `rows`. */
+env_of(ctx: Ctx, name: string, rows: ColumnVector) -> Env
+    val bs = buf[Binder]()
+    bs.push(Binder(name, rows))
+    Env(rows.len, bs, ctx)
+
+/** An environment of `n` rows and no binders: what a `Values` row and a `Limit` count see. */
+rows_env(ctx: Ctx, n: usize) -> Env = Env(n, buf[Binder](), ctx)
+
+/** `x` over the rows of `env`. */
+eval(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
+    val n = env.n
+
+    x.e match
+        Col(b, name) -> Ok(column(env.binder(b), name, x.ty))
+        Row(b) -> Ok(env.binder(b).as_type(x.ty))
+        Param(i) -> Ok(repeated(x.ty, env.ctx.params[usize(i)], n))
+        Null(_) -> Ok(repeated(x.ty, Null, n))
+        Literal(t, v) -> Ok(repeated(t, v, n))
+        Call(f, _) -> call_vector(f, x, env)
+        Cast(_, _, mode) -> cast_vector(eval(x.kids[0], env)?, x.ty, mode == Strict)
+        If(_, otherwise) -> eval_if(x, otherwise.is_some(), env)
+        Match(_, arms, otherwise) -> eval_match(x, arms, otherwise.is_some(), env)
+        Record(_) ->
+            val fs = fields_of_type(x.ty)
+            val cs = buf[ColumnVector]()
+
+            for j in 0..<x.kids.len()
+                cs.push(eval(x.kids[j], env)?.as_type(fs[j].ty))
+
+            Ok(ColumnVector(x.ty, n, buf[u8](), Members(cs)))
+        Field(_, name) -> Ok(column(eval(x.kids[0], env)?, name, x.ty))
+        Variant(_, tag, _) ->
+            val vs = fields_of_type(x.ty.base())
+            val j = member_index(vs, tag)
+            val payload = coerce_vector(eval(x.kids[0], env)?, vs[j].ty)?
+            val tags = buf[u16]()
+            val offsets = buf[u32]()
+            val cs = buf[ColumnVector]()
+
+            for i in 0..<n
+                tags.push(u16(j))
+                offsets.push(u32(i))
+
+            for k in 0..<vs.len()
+                cs.push(if k == j then payload else empty_vector(vs[k].ty))
+
+            Ok(ColumnVector(x.ty, n, buf[u8](), Tags(tags, offsets, cs)))
+        _ -> panic("eval: the executor does not evaluate this expression")
+end eval
+
+private[terndb] fields_of_type(t: Type) -> Buf[Field] = t.base() match
+    Record(fs) | Union(fs) -> fs
+    _ -> panic("a record or union type was expected")
+
+private[terndb] member_index(fs: Buf[Field], name: string) -> usize
+    for j in 0..<fs.len()
+        if fs[j].name == name then return j
+
+    panic(s"no member '$name'")
+
+/** Column `name` of `rows`, a binder's or a record's vector, as `ty` (§7.1, §7.8): a record's field,
+ * a union's shared column (§2.4 rule 4), or a scalar element's one column `value`. A null row reads
+ * as null.
+ */
+private column(rows: ColumnVector, name: string, ty: Type) -> ColumnVector = rows.ty.base() match
+    Record(fs) ->
+        val c = rows.member(member_index(fs, name))
+
+        if rows.has_nulls() then masked(c, valid_flags(rows).view()).as_type(ty) else c.as_type(ty)
+    Union(vs) ->
+        val (tags, offsets, cs) = rows.lanes match
+            Tags(t, o, c) -> (t, o, c)
+            _ -> panic("column: a union lane was expected")
+        val out = buf[Value]()
+
+        for i in 0..<rows.len
+            if !rows.is_valid(i)
+                out.push(Null)
+                continue
+
+            val payload = cs[usize(tags[i])]
+            val j = member_index(fields_of_type(payload.ty), name)
+            out.push(value_at(payload.member(j), usize(offsets[i])))
+
+        vector_of(ty, out.view())
+    _ -> rows.as_type(ty)
+
+// -- evaluation on a subset of rows --------------------------------------------------------------
+
+/** The rows `0..<n`. */
+private[terndb] all_rows(n: usize) -> Buf[usize]
+    val out = buf[usize]()
+
+    for i in 0..<n
+        out.push(i)
+
+    out
+
+/** The vector of `ty` whose slot `rows[k][m]` is slot `m` of `pieces[k]`, where the `rows` together
+ * name each of `0..<n` once: the pieces an `If`, a `Match` or a `coalesce` computed on subsets of the
+ * rows, put back in row order.
+ */
+private assemble(ty: Type, pieces: Buf[ColumnVector], rows: Buf[Buf[usize]], n: usize) -> ColumnVector
+    val at = buf[usize]()
+
+    for _ in 0..<n
+        at.push(0)
+
+    var base: usize = 0
+
+    for k in 0..<pieces.len()
+        for m in 0..<rows[k].len()
+            at[rows[k][m]] = base + m
+
+        base += pieces[k].len
+
+    take(concat(ty, pieces.view()), at.view())
+
+/** The rows of `among` where the `bool` vector `c` (one slot per entry of `among`) is `true`, and
+ * those where it is `false` or null.
+ */
+private split(c: ColumnVector, among: []const usize) -> (Buf[usize], Buf[usize])
+    val yes = buf[usize]()
+    val no = buf[usize]()
+    val b = c.lanes match
+        Bools(x) -> x
+        _ -> panic("split: a bool vector was expected")
+
+    for k in 0..<among.len
+        if c.is_valid(k) && b[k] then yes.push(among[k]) else no.push(among[k])
+
+    (yes, no)
+
+/** `If` (§7.5): each condition on the rows no earlier one selected, each value only on the rows its
+ * condition selected, so an unselected arm's runtime error does not occur.
+ */
+private eval_if(x: TExpr, has_else: bool, env: Env) -> Result[ColumnVector, CodecError]
+    val pieces = buf[ColumnVector]()
+    val rows = buf[Buf[usize]]()
+    var left = all_rows(env.n)
+    val arms = (x.kids.len() - (if has_else then 1 else 0)) / 2
+
+    for k in 0..<arms
+        if left.len() == 0 then break
+
+        val c = eval(x.kids[2 * k], env.take(left.view()))?
+        val (yes, no) = split(c, left.view())
+
+        if yes.len() > 0
+            pieces.push(coerce_vector(eval(x.kids[2 * k + 1], env.take(yes.view()))?, x.ty)?)
+            rows.push(yes)
+
+        left = no
+
+    if left.len() > 0
+        val rest = if has_else then coerce_vector(eval(x.kids[x.kids.len() - 1], env.take(left.view()))?, x.ty)? else repeated(x.ty, Null, left.len())
+        pieces.push(rest)
+        rows.push(left)
+
+    Ok(assemble(x.ty, pieces, rows, env.n))
+end eval_if
+
+/** `Match` (§7.7): each arm over the rows of its variant, with its binder reading the payload, which
+ * is the variant's child vector itself, since a union's rows of variant `j` are exactly child `j`'s
+ * slots in order; `else` over the rest; a null scrutinee yields null.
+ */
+private eval_match(x: TExpr, arms: Buf[MatchArm], has_else: bool, env: Env) -> Result[ColumnVector, CodecError]
+    val s = eval(x.kids[0], env)?
+    val vs = fields_of_type(s.ty)
+    val (tags, cs) = s.lanes match
+        Tags(t, _, c) -> (t, c)
+        _ -> panic("eval_match: a union lane was expected")
+
+    val pieces = buf[ColumnVector]()
+    val rows = buf[Buf[usize]]()
+    val covered = buf[bool]()
+
+    for _ in vs
+        covered.push(false)
+
+    for k in 0..<arms.len()
+        val j = member_index(vs, arms[k].tag)
+        covered[j] = true
+
+        val mine = buf[usize]()
+
+        for i in 0..<env.n
+            if s.is_valid(i) && usize(tags[i]) == j then mine.push(i)
+
+        if mine.len() == 0 then continue
+
+        val arm_env = env.take(mine.view()).with(arms[k].binder, cs[j])
+        pieces.push(coerce_vector(eval(x.kids[k + 1], arm_env)?, x.ty)?)
+        rows.push(mine)
+
+    val rest = buf[usize]()
+    val nulls = buf[usize]()
+
+    for i in 0..<env.n
+        if !s.is_valid(i) then nulls.push(i) elif !covered[usize(tags[i])] then rest.push(i)
+
+    if rest.len() > 0
+        if !has_else then panic("eval_match: a variant has no arm and there is no else")
+
+        pieces.push(coerce_vector(eval(x.kids[x.kids.len() - 1], env.take(rest.view()))?, x.ty)?)
+        rows.push(rest)
+
+    if nulls.len() > 0
+        pieces.push(repeated(x.ty, Null, nulls.len()))
+        rows.push(nulls)
+
+    Ok(assemble(x.ty, pieces, rows, env.n))
+end eval_match
+
+// -- calls, §7.12 -------------------------------------------------------------------------------
+
+private call_vector(f: string, x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
+    if f == "coalesce" then return eval_coalesce(x, env)
+    if f == "statement_timestamp" then return Ok(repeated(Timestamp, Int(i128(env.ctx.now)), env.n))
+
+    val args = buf[ColumnVector]()
+
+    for k in x.kids
+        args.push(eval(k, env)?)
+
+    f match
+        "and" | "or" -> Ok(logic_vectors(f, args[0], args[1], x.ty))
+        "not" -> Ok(not_vector(args[0]).as_type(x.ty))
+        "is_null" -> Ok(null_test_vector(args[0], false))
+        "is_not_null" -> Ok(null_test_vector(args[0], true))
+        "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "same" -> Ok(compare_vectors(f, args[0], args[1])?.as_type(x.ty))
+        "add" | "sub" | "mul" | "div" | "mod" -> arith_vectors(f, args[0], args[1], x.ty)
+        "neg" | "abs" -> unary_vector(f, args[0])
+        "assert_not_null" ->
+            if args[0].has_nulls() then return fail("R0004", "assert_not_null of null")
+
+            Ok(args[0].as_type(x.ty))
+        "concat" | "length" | "lower" | "upper" | "contains" | "starts_with" | "like" -> text_function(f, args.view(), x.ty)
+        _ -> panic(s"call_vector: the executor does not run '$f'")
+end call_vector
+
+/** `coalesce` (§7.12): each argument only on the rows every earlier one left null. */
+private eval_coalesce(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
+    val ty = nullable(x.ty)
+    val pieces = buf[ColumnVector]()
+    val rows = buf[Buf[usize]]()
+    var left = all_rows(env.n)
+
+    for k in x.kids
+        if left.len() == 0 then break
+
+        val v = coerce_vector(eval(k, env.take(left.view()))?, ty)?
+        val got = buf[usize]()
+        val at = buf[usize]()
+        val still = buf[usize]()
+
+        for m in 0..<left.len()
+            if v.is_valid(m)
+                got.push(left[m])
+                at.push(m)
+            else
+                still.push(left[m])
+
+        if got.len() > 0
+            pieces.push(take(v, at.view()))
+            rows.push(got)
+
+        left = still
+
+    if left.len() > 0
+        pieces.push(repeated(ty, Null, left.len()))
+        rows.push(left)
+
+    Ok(assemble(ty, pieces, rows, env.n).as_type(x.ty))
+end eval_coalesce

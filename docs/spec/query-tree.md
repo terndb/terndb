@@ -652,7 +652,30 @@ the core operators' names and typing:
 
 The operands of the comparisons, `same` and `coalesce` meet at their common type (§4.2, `Q3001`);
 `eq`/`ne` then refuse a relation type anywhere in it (`Q3006`) and the orderings an unorderable one
-(`Q3007`). `and`, `or` and `not` take `bool`/`bool?` (`Q3002`) and are `bool?` when an argument is.
+(`Q3007`). A comparison other than `same` is `bool?` when an operand is nullable **or when the common
+type holds a nullable type in a record field or a union payload at any depth**, since §3.2 rules 2
+and 3 make it null where a field pair is; otherwise it is `bool`. `and`, `or` and `not` take
+`bool`/`bool?` (`Q3002`) and are `bool?` when an argument is.
+
+How the functions evaluate, where the tables above leave it open:
+
+1. `and` and `or` are non-strict in their **values**, not lazy in their **evaluation**: both operands
+   are evaluated for every row, so a runtime error in either occurs whatever the other's value.
+   `coalesce` evaluates an argument only on the rows on which every earlier argument was null, as the
+   `If` it abbreviates would (§7.5), so a later argument's runtime error does not occur on a row an
+   earlier one decided.
+2. `length` counts code points (Unicode scalar values), not octets. `lower` and `upper` apply the
+   Unicode simple case mappings, one code point to one, with no locale. `contains` and `starts_with`
+   compare octets.
+3. `like(s, pattern, escape)`: in `pattern`, `%` matches any run of zero or more code points, `_`
+   exactly one, and every other code point itself, case-sensitively. `escape` is the empty text (no
+   escape) or one code point, and makes the `%`, `_` or escape that follows it literal. An escape of
+   more than one code point, an escape followed by any other code point, and an escape that ends the
+   pattern are `R0006`.
+4. The calendar `add(t, interval)` adds the months first, keeping the day of the month but clamping
+   it to the last day of the month reached (`2024-01-31` plus one month is `2024-02-29`), then the
+   days, then the microseconds. A `date` is midnight of its day. A result beyond `int64`
+   microseconds is `R0001`.
 The core functions resolve before a catalog's own; a name no catalog has is `Q2007`. A function the
 catalog has that is not an aggregate, written as an `AggCall`, is `Q3002`.
 

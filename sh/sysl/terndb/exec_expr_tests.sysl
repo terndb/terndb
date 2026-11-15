@@ -1,0 +1,475 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{infinity, nan}
+
+// Expressions over batches (`query-tree.md` §7): each kind, through the type checker and the
+// executor, over a table `app.t` whose rows are generated, at 0, 1, a batch and a batch and one rows,
+// with no nulls, some, and only nulls; each slot checked against a value-at-a-time oracle.
+
+/** A catalog with one table `app.t` of `cols`. */
+xe_catalog(cols: []const Field) -> FakeCatalog
+    val cs = buf[ColumnInfo]()
+
+    for f in cols
+        cs.push(cat_column(f.name, f.ty))
+
+    FakeCatalog(items_of([fake_table("t", cs.view(), [])]), buf[FakeType](), buf[FakeFunction]())
+
+xe_ctx(params: []const Value) -> Ctx = Ctx(items_of(params), 1700000000000000)
+
+/** `items` of a `Project` over `app.t` holding `rows`, executed; each output row's values. */
+private xe_run(cols: []const Field, rows: []const Value, decls: []const ParamDecl, params: []const Value, items: []const Item) -> Result[Buf[Value], CodecError]
+    val q = envelope(decls, Query(Project(scan("app", "t", "t"), "r", items_of(items))))
+    val typing = type_envelope(q, xe_catalog(cols))?
+    val table = MemTable(QualName("app", "t"), batches_of(vector_of(record(cols), rows)))
+    val root = plan_query(q, typing, xe_ctx(params), items_of([table]))
+    Ok(values_of(drain_rows(root.op, root.elem)?))
+
+/** The one item `e` over `rows`: each row's value of `e`. */
+private xe_values(cols: []const Field, rows: []const Value, e: Expr) -> Result[Buf[Value], CodecError]
+    val out = buf[Value]()
+
+    for r in xe_run(cols, rows, [], [], [item("x", e)])?
+        out.push(r match
+            Record(fs) -> fs[0]
+            _ -> Null)
+
+    Ok(out)
+
+/** The type the checker gives `e` over `cols`. */
+private xe_type(cols: []const Field, e: Expr) -> Type
+    val q = envelope([], Query(Project(scan("app", "t", "t"), "r", items_of([item("x", e)]))))
+    type_envelope(q, xe_catalog(cols)).unwrap().result.unwrap() match
+        Bag(r) -> fields_of_type(*r)[0].ty
+        _ -> panic("a bag was expected")
+
+/** The code `e` fails with over `rows`, or "" where it does not. */
+private xe_code(cols: []const Field, rows: []const Value, e: Expr) -> string = xe_values(cols, rows, e) match
+    Ok(_) -> ""
+    Err(err) -> err.code
+
+xe_counts() -> [4]usize = [0, 1, BatchSize, BatchSize + 1]
+
+/** Whether slot `i` is null under `pattern`: 0 never, 1 every third row, 2 always. */
+private xe_null(pattern: int, i: usize) -> bool = pattern == 2 || (pattern == 1 && i % 3 == 1)
+
+private xe_int(i: usize, k: usize) -> Value = Int(i128((i * (k + 3)) % 17) - 8)
+
+/** `n` rows of `{a: int64?, b: int64?, p: bool?, q: bool?, s: text?, d: decimal(10, 2)?}`, nulls by
+ * `pattern`, `b` staying off zero.
+ */
+private xe_rows(n: usize, pattern: int) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<n
+        val nul = xe_null(pattern, i)
+        val a = if nul then Null else xe_int(i, 0)
+        val b = if nul && i % 2 == 1 then Null else (xe_int(i, 1) match
+            Int(0) -> Int(5)
+            x -> x)
+        val p: Value = if nul then Null else Bool(i % 2 == 0)
+        val q: Value = if i % 5 == 0 then Null else Bool(i % 3 == 0)
+        val s: Value = if nul then Null else Text(["", "a", "héllo", "Zz"][i % 4])
+        val d = if nul then Null else Int(i128(i % 9) * 125 - 500)
+        out.push(rec([a, b, p, q, s, d]))
+
+    out
+
+private xe_cols() -> [6]Field = [
+    Field("a", nullable(Int64)), Field("b", nullable(Int64)), Field("p", nullable(Bool)), Field("q", nullable(Bool)),
+    Field("s", nullable(Text)), Field("d", nullable(Decimal(10, 2)))]
+
+xe_field(row: Value, j: usize) -> Value = row match
+    Record(fs) -> fs[j]
+    _ -> Null
+
+/** `e` checked against `oracle` (row → value) at every count and null pattern. */
+private xe_check(e: Expr, oracle: (Value) -> Value)
+    val cols = xe_cols()
+    val t = xe_type(cols, e)
+
+    for n in xe_counts()
+        for pattern in [0, 1, 2]
+            val rows = xe_rows(n, pattern)
+            val got = xe_values(cols, rows.view(), e).unwrap()
+            assert_eq(got.len(), n)
+
+            for i in 0..<n
+                val want = oracle(rows[i])
+
+                if !same(t, got[i], want) then
+                    assert(false, s"row $i of $n (nulls $pattern): ${debug(got[i])} where ${debug(want)} was expected")
+
+private debug(v: Value) -> string = s"$v"
+
+xe_lit(n: i128) -> Expr = Literal(Int64, Int(n))
+
+// -- leaves ---------------------------------------------------------------------------------------
+
+@test
+col_param_null_and_literal_over_every_size()
+    xe_check(col("t", "a"), r -> xe_field(r, 0))
+    xe_check(col("t", "s"), r -> xe_field(r, 4))
+    val null_e: Expr = Null(Int32)
+    xe_check(null_e, _ -> Value.Null)
+    xe_check(xe_lit(42), _ -> Int(42))
+
+    for n in xe_counts()
+        val rows = xe_rows(n, 1)
+        val got = xe_run(xe_cols(), rows.view(), [ParamDecl(None, nullable(Text))], [Text("pv")], [item("x", Param(0))]).unwrap()
+        assert_eq(got.len(), n)
+
+        for r in got
+            assert(xe_field(r, 0) == Text("pv"))
+
+@test
+row_and_field_read_the_whole_row_and_one_field()
+    xe_check(Field(Row("t"), "b"), r -> xe_field(r, 1))
+    xe_check(Row("t"), r -> r)
+    val rec_e: Expr = Record(items_of([item("u", col("t", "a")), item("v", col("t", "s"))]))
+    xe_check(rec_e, r -> rec([xe_field(r, 0), xe_field(r, 4)]))
+    xe_check(Field(rec_e, "v"), r -> xe_field(r, 4))
+
+// -- arithmetic -----------------------------------------------------------------------------------
+
+private xe_strict2(r: Value, j: usize, k: usize, f: (i128, i128) -> i128) -> Value = (xe_field(r, j), xe_field(r, k)) match
+    (Int(x), Int(y)) -> Int(f(x, y))
+    _ -> Null
+
+@test
+integer_arithmetic_over_every_size()
+    xe_check(call("add", [col("t", "a"), col("t", "b")]), r -> xe_strict2(r, 0, 1, (x, y) -> x + y))
+    xe_check(call("sub", [col("t", "a"), col("t", "b")]), r -> xe_strict2(r, 0, 1, (x, y) -> x - y))
+    xe_check(call("mul", [col("t", "a"), col("t", "b")]), r -> xe_strict2(r, 0, 1, (x, y) -> x * y))
+    xe_check(call("div", [col("t", "a"), col("t", "b")]), r -> xe_strict2(r, 0, 1, (x, y) -> x / y))
+    xe_check(call("mod", [col("t", "a"), col("t", "b")]), r -> xe_strict2(r, 0, 1, (x, y) -> x % y))
+    xe_check(call("neg", [col("t", "a")]), r -> xe_strict2(r, 0, 0, (x, _) -> -x))
+    xe_check(call("abs", [col("t", "a")]), r -> xe_strict2(r, 0, 0, (x, _) -> if x < 0 then -x else x))
+
+@test
+decimal_arithmetic_rescales_the_integer_operand()
+    // decimal(10, 2) + int64 is decimal(22, 2); the integer is scaled by 100.
+    xe_check(call("add", [col("t", "d"), col("t", "a")]), r -> xe_strict2(r, 5, 0, (x, y) -> x + y * 100))
+    xe_check(call("mul", [col("t", "d"), col("t", "d")]), r -> xe_strict2(r, 5, 5, (x, y) -> x * y))
+    // div has scale max(6, 2, 0) = 6: d / b scales d by 10^4 and rounds half away from zero.
+    xe_check(call("div", [col("t", "d"), col("t", "b")]), r -> xe_strict2(r, 5, 1, (x, y) -> xe_round_div(x * 10000, y)))
+
+private xe_round_div(n: i128, d: i128) -> i128
+    val q = n / d
+    val r = n % d
+    val twice = if r < 0 then -2 * r else 2 * r
+    val mag = if d < 0 then -d else d
+
+    if twice >= mag then (if (n < 0) != (d < 0) then q - 1 else q + 1) else q
+
+private xe_one(ty: Type, v: Value, e: Expr) -> Result[Value, CodecError]
+    val got = xe_values([Field("v", ty)], [rec([v])], e)?
+    Ok(got[0])
+
+private xe_one_code(ty: Type, v: Value, e: Expr) -> string = xe_one(ty, v, e) match
+    Ok(_) -> ""
+    Err(e) -> e.code
+
+@test
+overflow_is_r0001_and_division_by_zero_r0002()
+    val v = col("t", "v")
+
+    assert_eq(xe_one_code(Int8, Int(100), call("add", [v, v])), "R0001")
+    assert_eq(xe_one_code(Int8, Int(-128), call("neg", [v])), "R0001")
+    assert_eq(xe_one_code(Int8, Int(-128), call("abs", [v])), "R0001")
+    assert_eq(xe_one_code(Int8, Int(-128), call("div", [v, Literal(Int8, Int(-1))])), "R0001")
+    assert(xe_one(Int8, Int(-128), call("mod", [v, Literal(Int8, Int(-1))])).unwrap() == Int(0))
+    assert_eq(xe_one_code(Int64, Int(9223372036854775807), call("add", [v, xe_lit(1)])), "R0001")
+    assert_eq(xe_one_code(Int64, Int(-9223372036854775808), call("sub", [v, xe_lit(1)])), "R0001")
+    assert_eq(xe_one_code(Int64, Int(4294967296), call("mul", [v, v])), "R0001")
+    assert_eq(xe_one_code(UInt8, UInt(0), call("sub", [v, Literal(UInt8, UInt(1))])), "R0001")
+    assert_eq(xe_one_code(UInt64, UInt(18446744073709551615), call("add", [v, Literal(UInt64, UInt(1))])), "R0001")
+    assert_eq(xe_one_code(Int64, Int(7), call("div", [v, xe_lit(0)])), "R0002")
+    assert_eq(xe_one_code(Int64, Int(7), call("mod", [v, xe_lit(0)])), "R0002")
+    assert_eq(xe_one_code(Decimal(10, 2), Int(700), call("div", [v, Literal(Decimal(3, 1), Int(0))])), "R0002")
+    assert_eq(xe_one_code(Decimal(10, 2), Int(700), call("mod", [v, Literal(Decimal(3, 1), Int(0))])), "R0002")
+
+    // decimal(38, 0) * decimal(38, 0) is decimal(38, 0): 10^20 squared has 41 digits.
+    assert_eq(xe_one_code(Decimal(38, 0), Int(100000000000000000000), call("mul", [v, v])), "R0001")
+
+    // A null operand is never computed on: null / 0 is null, not an error.
+    assert(xe_one(nullable(Int64), Null, call("div", [v, xe_lit(0)])).unwrap() == Null)
+    // Float division by zero is IEEE, never an error.
+    assert(xe_one(Float64, Float(1.0), call("div", [v, Literal(Float64, Float(0.0))])).unwrap() == Float(infinity()))
+
+@test
+decimal_division_rounds_half_away_from_zero()
+    val v = col("t", "v")
+    // 1 / 3 at scale 6, and -2 / 3.
+    assert(xe_one(Decimal(5, 0), Int(1), call("div", [v, Literal(Decimal(5, 0), Int(3))])).unwrap() == Int(333333))
+    assert(xe_one(Decimal(5, 0), Int(-2), call("div", [v, Literal(Decimal(5, 0), Int(3))])).unwrap() == Int(-666667))
+    // 0.05 / 2 = 0.025 at scale 6 is exact: 25000.
+    assert(xe_one(Decimal(5, 2), Int(5), call("div", [v, Literal(Decimal(5, 0), Int(2))])).unwrap() == Int(25000))
+
+@test
+float_arithmetic_is_ieee_in_the_common_type()
+    val v = col("t", "v")
+    assert(xe_one(Float64, Float(-7.5), call("mod", [v, Literal(Float64, Float(2.0))])).unwrap() == Float(-1.5))
+    // float32 arithmetic rounds to float32: 0.1f32 + 0.2f32 is not the float64 sum.
+    val sum = xe_one(Float32, Float(real(f32(0.1))), call("add", [v, Literal(Float32, Float(real(f32(0.2))))])).unwrap()
+    assert(sum == Float(real(f32(0.1) + f32(0.2))))
+    // A float32 and a float64 meet at float64.
+    assert(xe_one(Float32, Float(1.5), call("mul", [v, Literal(Float64, Float(2.0))])).unwrap() == Float(3.0))
+    assert(xe_one(Float64, Float(2.0), call("neg", [v])).unwrap() == Float(-2.0))
+    assert(xe_one(Float64, Float(-2.0), call("abs", [v])).unwrap() == Float(2.0))
+    assert(xe_one(Float64, Float(0.0), call("mod", [v, Literal(Float64, Float(0.0))])).unwrap() != Float(0.0))
+
+// -- comparison and logic -------------------------------------------------------------------------
+
+private xe_cmp(r: Value, f: string) -> Value
+    val (a, b) = (xe_field(r, 0), xe_field(r, 1))
+    val got = f match
+        "eq" -> eq(nullable(Int64), a, b).unwrap()
+        "lt" -> lt(nullable(Int64), a, b).unwrap()
+        _ -> ge(nullable(Int64), a, b).unwrap()
+
+    got match
+        Some(x) -> Bool(x)
+        None -> Null
+
+@test
+comparisons_over_every_size()
+    for f in ["eq", "lt", "ge"]
+        xe_check(call(f, [col("t", "a"), col("t", "b")]), r -> xe_cmp(r, f))
+
+    xe_check(call("same", [col("t", "a"), col("t", "b")]), r -> Bool(same(nullable(Int64), xe_field(r, 0), xe_field(r, 1))))
+    xe_check(call("is_null", [col("t", "a")]), r -> Bool(xe_field(r, 0).is_null()))
+    xe_check(call("is_not_null", [col("t", "s")]), r -> Bool(!xe_field(r, 4).is_null()))
+    // An integer against a decimal meets at decimal(21, 2).
+    xe_check(call("lt", [col("t", "d"), col("t", "a")]), r -> (xe_field(r, 5), xe_field(r, 0)) match
+        (Int(x), Int(y)) -> Bool(x < y * 100)
+        _ -> Null)
+
+private xe_kleene_and(a: Value, b: Value) -> Value
+    if a == Bool(false) || b == Bool(false) then return Bool(false)
+    if a.is_null() || b.is_null() then return Null
+    Bool(true)
+
+private xe_kleene_or(a: Value, b: Value) -> Value
+    if a == Bool(true) || b == Bool(true) then return Bool(true)
+    if a.is_null() || b.is_null() then return Null
+    Bool(false)
+
+@test
+logic_over_every_size()
+    xe_check(call("and", [col("t", "p"), col("t", "q")]), r -> xe_kleene_and(xe_field(r, 2), xe_field(r, 3)))
+    xe_check(call("or", [col("t", "p"), col("t", "q")]), r -> xe_kleene_or(xe_field(r, 2), xe_field(r, 3)))
+    xe_check(call("not", [col("t", "q")]), r -> xe_field(r, 3) match
+        Bool(x) -> Bool(!x)
+        _ -> Null)
+
+@test
+three_valued_and_or_not_truth_tables()
+    val tv: [3]Value = [Bool(true), Bool(false), Null]
+    val rows = buf[Value]()
+
+    for a in tv
+        for b in tv
+            rows.push(rec([a, b]))
+
+    val cols = [Field("a", nullable(Bool)), Field("b", nullable(Bool))]
+    val got = xe_run(cols, rows.view(), [], [], [item("and", call("and", [col("t", "a"), col("t", "b")])), item("or", call("or", [col("t", "a"), col("t", "b")])), item("not", call("not", [col("t", "a")]))]).unwrap()
+
+    // Kleene's tables, row by row for (a, b) = TT TF TN FT FF FN NT NF NN.
+    val and_t: [9]Value = [Bool(true), Bool(false), Null, Bool(false), Bool(false), Bool(false), Null, Bool(false), Null]
+    val or_t: [9]Value = [Bool(true), Bool(true), Bool(true), Bool(true), Bool(false), Null, Bool(true), Null, Null]
+    val not_t: [9]Value = [Bool(false), Bool(false), Bool(false), Bool(true), Bool(true), Bool(true), Null, Null, Null]
+
+    for i in 0..<9
+        assert(xe_field(got[i], 0) == and_t[i], s"and row $i")
+        assert(xe_field(got[i], 1) == or_t[i], s"or row $i")
+        assert(xe_field(got[i], 2) == not_t[i], s"not row $i")
+
+@test
+a_record_comparison_with_a_null_field_is_null()
+    val cols = [Field("a", nullable(Int64))]
+    val pair: Expr = Record(items_of([item("x", xe_lit(1)), item("y", col("t", "a"))]))
+    val other: Expr = Record(items_of([item("x", xe_lit(1)), item("y", xe_lit(3))]))
+    val bigger: Expr = Record(items_of([item("x", xe_lit(2)), item("y", xe_lit(0))]))
+    assert(xe_type(cols, call("eq", [pair, other])) == nullable(Bool))
+    assert(xe_type(cols, call("lt", [pair, other])) == nullable(Bool))
+    assert(xe_type(cols, call("eq", [other, bigger])) == Bool)
+    assert(xe_type(cols, call("same", [pair, other])) == Bool)
+    // A union whose payload holds a nullable field compares to null as well.
+    val u = union_of([Field("x", record([Field("n", nullable(Int64))]))])
+    val ue: Expr = Variant(u, "x", Record(items_of([item("n", col("t", "a"))])))
+    assert(xe_type(cols, call("eq", [ue, ue])) == nullable(Bool))
+    assert(xe_values(cols, [rec([Null])], call("eq", [ue, ue])).unwrap()[0] == Null)
+
+    val got = xe_values(cols, [rec([Null]), rec([Int(3)])], call("lt", [pair, other])).unwrap()
+    assert(got[0] == Null && got[1] == Bool(false))
+    // (1, null) < (2, 0) is decided by the first pair.
+    assert(xe_values(cols, [rec([Null])], call("lt", [pair, bigger])).unwrap()[0] == Bool(true))
+
+// -- If, coalesce, Cast -----------------------------------------------------------------------------
+
+@test
+if_selects_the_first_true_arm_and_else_over_every_size()
+    val e = If(items_of([IfArm(call("gt", [col("t", "a"), xe_lit(0)]), col("t", "a")), IfArm(col("t", "p"), xe_lit(100))]), Some(xe_lit(-1)))
+    xe_check(e, r -> xe_field(r, 0) match
+        Int(x) -> if x > 0 then Int(x) elif xe_field(r, 2) == Bool(true) then Int(100) else Int(-1)
+        _ -> if xe_field(r, 2) == Bool(true) then Int(100) else Int(-1))
+
+    val no_else = If(items_of([IfArm(col("t", "q"), col("t", "s"))]), None)
+    xe_check(no_else, r -> if xe_field(r, 3) == Bool(true) then xe_field(r, 4) else Null)
+
+@test
+an_unselected_arm_is_not_evaluated()
+    val cols = [Field("a", Int64), Field("b", Int64)]
+    val e = If(items_of([IfArm(call("ne", [col("t", "b"), xe_lit(0)]), call("div", [col("t", "a"), col("t", "b")]))]), Some(xe_lit(0)))
+    val got = xe_values(cols, [rec([Int(6), Int(0)]), rec([Int(6), Int(3)])], e).unwrap()
+    assert(got[0] == Int(0) && got[1] == Int(2))
+
+    // coalesce stops at the first non-null argument, so a later one is not evaluated on that row.
+    val c = call("coalesce", [col("t", "a"), call("div", [col("t", "a"), col("t", "b")])])
+    assert(xe_values(cols, [rec([Int(6), Int(0)])], c).unwrap()[0] == Int(6))
+
+@test
+coalesce_over_every_size()
+    xe_check(call("coalesce", [col("t", "a"), col("t", "b"), xe_lit(9)]), r ->
+        if !xe_field(r, 0).is_null() then xe_field(r, 0) elif !xe_field(r, 1).is_null() then xe_field(r, 1) else Int(9))
+    xe_check(call("coalesce", [col("t", "a"), col("t", "b")]), r -> if !xe_field(r, 0).is_null() then xe_field(r, 0) else xe_field(r, 1))
+
+@test
+cast_over_every_size()
+    xe_check(Cast(col("t", "a"), nullable(Text), Strict), r -> xe_field(r, 0) match
+        Int(x) -> Text(s"$x")
+        _ -> Null)
+    xe_check(Cast(col("t", "a"), nullable(Int8), Strict), r -> xe_field(r, 0))
+    xe_check(Cast(col("t", "d"), nullable(Int64), Strict), r -> xe_field(r, 5) match
+        Int(x) -> Int(xe_round_div(x, 100))
+        _ -> Null)
+    xe_check(Cast(col("t", "s"), Int64, Try), r -> xe_field(r, 4) match
+        _ -> Null)
+
+@test
+a_cast_that_does_not_convert_is_r0006_or_null_when_tried()
+    val v = col("t", "v")
+    assert_eq(xe_one_code(Text, Text("abc"), Cast(v, Int64, Strict)), "R0006")
+    assert(xe_one(Text, Text("abc"), Cast(v, Int64, Try)).unwrap() == Null)
+    assert(xe_one(Text, Text("-12"), Cast(v, Int64, Strict)).unwrap() == Int(-12))
+    assert_eq(xe_one_code(Int64, Int(300), Cast(v, Int8, Strict)), "R0006")
+    assert(xe_one(Int64, Int(300), Cast(v, Int8, Try)).unwrap() == Null)
+    assert_eq(xe_one_code(Int64, Int(-1), Cast(v, UInt8, Strict)), "R0006")
+    assert_eq(xe_one_code(Decimal(5, 0), Int(12345), Cast(v, Decimal(4, 0), Strict)), "R0006")
+    assert_eq(xe_one_code(Float64, Float(nan()), Cast(v, Int64, Strict)), "R0006")
+    assert_eq(xe_one_code(Bytes, bytes_value([1, 2]), Cast(v, Uuid, Strict)), "R0006")
+
+    // Rounding half away from zero into integer and decimal targets.
+    assert(xe_one(Decimal(3, 1), Int(25), Cast(v, Int64, Strict)).unwrap() == Int(3))
+    assert(xe_one(Decimal(3, 1), Int(-25), Cast(v, Int64, Strict)).unwrap() == Int(-3))
+    assert(xe_one(Float64, Float(2.5), Cast(v, Int32, Strict)).unwrap() == Int(3))
+    assert(xe_one(Float64, Float(-0.125), Cast(v, Decimal(5, 2), Strict)).unwrap() == Int(-13))
+    assert(xe_one(Int32, Int(7), Cast(v, Decimal(5, 2), Strict)).unwrap() == Int(700))
+    assert(xe_one(Decimal(5, 2), Int(-150), Cast(v, Float64, Strict)).unwrap() == Float(-1.5))
+
+    val octets = buf[u8]()
+
+    for i in 0..<16
+        octets.push(u8(i))
+
+    val u = xe_one(Bytes, Bytes(octets), Cast(v, Uuid, Strict)).unwrap()
+    assert(xe_one(Uuid, u, Cast(v, Bytes, Strict)).unwrap() == Bytes(octets))
+
+@test
+assert_not_null_is_r0004_on_null()
+    val v = col("t", "v")
+    assert_eq(xe_one_code(nullable(Int64), Null, call("assert_not_null", [v])), "R0004")
+    assert(xe_one(nullable(Int64), Int(3), call("assert_not_null", [v])).unwrap() == Int(3))
+
+// -- the text functions -----------------------------------------------------------------------------
+
+@test
+text_functions_over_every_size()
+    xe_check(call("length", [col("t", "s")]), r -> xe_field(r, 4) match
+        Text(x) -> Int(i128([0, 1, 5, 2][if x == "" then 0 elif x == "a" then 1 elif x == "Zz" then 3 else 2]))
+        _ -> Null)
+    xe_check(call("upper", [col("t", "s")]), r -> xe_field(r, 4) match
+        Text(x) -> Text(if x == "héllo" then "HÉLLO" elif x == "Zz" then "ZZ" else (if x == "a" then "A" else ""))
+        _ -> Null)
+    xe_check(call("concat", [col("t", "s"), col("t", "s")]), r -> xe_field(r, 4) match
+        Text(x) -> Text(x + x)
+        _ -> Null)
+    xe_check(call("starts_with", [col("t", "s"), Literal(Text, Text("h"))]), r -> xe_field(r, 4) match
+        Text(x) -> Bool(x == "héllo")
+        _ -> Null)
+    xe_check(call("contains", [col("t", "s"), Literal(Text, Text("z"))]), r -> xe_field(r, 4) match
+        Text(x) -> Bool(x == "Zz")
+        _ -> Null)
+
+private xe_like(s: string, p: string, esc: string) -> Value =
+    xe_one(Text, Text(s), call("like", [col("t", "v"), Literal(Text, Text(p)), Literal(Text, Text(esc))])).unwrap()
+
+@test
+like_matches_by_code_point_with_an_escape()
+    assert(xe_like("héllo", "h_llo", "") == Bool(true))
+    assert(xe_like("héllo", "h%", "") == Bool(true))
+    assert(xe_like("héllo", "%l_", "") == Bool(true))
+    assert(xe_like("héllo", "%x%", "") == Bool(false))
+    assert(xe_like("", "%", "") == Bool(true))
+    assert(xe_like("", "_", "") == Bool(false))
+    assert(xe_like("a%b", "a!%b", "!") == Bool(true))
+    assert(xe_like("axb", "a!%b", "!") == Bool(false))
+    assert(xe_like("a_b", "a!_b", "!") == Bool(true))
+    assert(xe_like("a!b", "a!!b", "!") == Bool(true))
+    assert(xe_like("abcabd", "%abd", "") == Bool(true))
+    assert(xe_like("Abc", "abc", "") == Bool(false))
+
+    val v = col("t", "v")
+    assert_eq(xe_one_code(Text, Text("x"), call("like", [v, Literal(Text, Text("x!")), Literal(Text, Text("!"))])), "R0006")
+    assert_eq(xe_one_code(Text, Text("x"), call("like", [v, Literal(Text, Text("!x")), Literal(Text, Text("!"))])), "R0006")
+    assert_eq(xe_one_code(Text, Text("x"), call("like", [v, Literal(Text, Text("x")), Literal(Text, Text("!!"))])), "R0006")
+
+// -- the calendar add -------------------------------------------------------------------------------
+
+@test
+calendar_add_clamps_the_day_then_adds_days_and_micros()
+    val v = col("t", "v")
+    // 2024-01-31 is day 19753; plus one month is 2024-02-29 (leap), day 19782.
+    val plus = call("add", [v, Literal(Interval, Interval(1, 0, 0))])
+    assert(xe_one(Date, Int(19753), plus).unwrap() == Int(19782 * 86400000000))
+    // 2023-01-31 plus one month is 2023-02-28, day 19416.
+    assert(xe_one(Date, Int(19388), plus).unwrap() == Int(19416 * 86400000000))
+    // A timestamp keeps its time of day; one month, one day and one hour on 1970-01-31T12:00.
+    val t0: i128 = 30 * 86400000000 + 12 * 3600000000
+    val later = call("add", [v, Literal(Interval, Interval(1, 1, 3600000000))])
+    assert(xe_one(Timestamp, Int(t0), later).unwrap() == Int((58 + 1) * 86400000000 + 13 * 3600000000))
+    // Before the epoch: 1969-12-31 (day -1) minus a month is 1969-11-30 (day -32).
+    assert(xe_one(Date, Int(-1), call("add", [v, Literal(Interval, Interval(-1, 0, 0))])).unwrap() == Int(-32 * 86400000000))
+    assert_eq(xe_one_code(Timestamp, Int(9223372036854775807), call("add", [v, Literal(Interval, Interval(0, 1, 0))])), "R0001")
+
+@test
+statement_timestamp_is_the_contexts()
+    assert(xe_one(Int64, Int(0), call("statement_timestamp", [])).unwrap() == Int(1700000000000000))
+
+// -- unions: Variant and Match ----------------------------------------------------------------------
+
+private xe_shape() -> Type = union_of([Field("pos", record([Field("v", Int64)])), Field("neg", record([Field("v", Int64), Field("why", Text)])), Field("zero", record([]))])
+
+@test
+variant_and_match_over_every_size()
+    // A union built per row by If, then taken apart by Match.
+    // A payload field is not nullable, so `b` is read through coalesce where a condition knows it is set.
+    val bb = call("coalesce", [col("t", "b"), xe_lit(0)])
+    val pos: Expr = Variant(xe_shape(), "pos", Record(items_of([item("v", bb)])))
+    val neg: Expr = Variant(xe_shape(), "neg", Record(items_of([item("v", bb), item("why", Literal(Text, Text("n")))])))
+    val zero: Expr = Variant(xe_shape(), "zero", Record(buf[Item]()))
+    val built = If(items_of([IfArm(call("gt", [col("t", "b"), xe_lit(0)]), pos), IfArm(call("lt", [col("t", "b"), xe_lit(0)]), neg)]), Some(zero))
+    val arms = items_of([MatchArm("pos", "p", call("mul", [col("p", "v"), xe_lit(10)])), MatchArm("neg", "q", call("neg", [col("q", "v")]))])
+    val m = Match(built, arms, Some(xe_lit(0)))
+
+    xe_check(m, r -> xe_field(r, 1) match
+        Int(x) -> Int(if x > 0 then 10 * x else -x)
+        _ -> Int(0))
+
+    // A null scrutinee yields null, and an arm need not cover every row.
+    val maybe = If(items_of([IfArm(col("t", "p"), pos)]), None)
+    xe_check(Match(maybe, items_of([MatchArm("pos", "p", col("p", "v"))]), Some(xe_lit(-7))), r ->
+        if xe_field(r, 2) == Bool(true) then xe_field(r, 1) else Null)

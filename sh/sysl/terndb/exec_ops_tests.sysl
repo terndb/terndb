@@ -1,0 +1,415 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{infinity, nan}
+
+// The operators (`query-tree.md` §6), each pulled through the type checker and the planner over a
+// table `app.t` held as batches of chosen sizes, so that every boundary a batch can have is crossed.
+
+private xo_cols() -> [2]Field = [Field("k", nullable(Int64)), Field("v", Text)]
+
+private xo_row(k: Value, v: string) -> Value = rec([k, Text(v)])
+
+/** `rows` cut into batches of the sizes in `sizes`, as far as the rows reach, the rest in one more. */
+private xo_batches(elem: Type, rows: []const Value, sizes: []const usize) -> Buf[ColumnVector]
+    val out = buf[ColumnVector]()
+    var at: usize = 0
+
+    for s in sizes
+        val end = if at + s < rows.len then at + s else rows.len
+        out.push(vector_of(elem, rows[at..<end]))
+        at = end
+
+    if at < rows.len then out.push(vector_of(elem, rows[at..]))
+
+    out
+
+/** The batches `r` hands up, run over `app.t` holding `batches` with parameters `params`. */
+private xo_run_batches(cols: []const Field, batches: Buf[ColumnVector], r: Rel, decls: []const ParamDecl, params: []const Value) -> Result[Buf[ColumnVector], CodecError]
+    val q = envelope(decls, Query(r))
+    val typing = type_envelope(q, xe_catalog(cols))?
+    val root = plan_query(q, typing, xe_ctx(params), items_of([MemTable(QualName("app", "t"), batches)]))
+    drain(root.op)
+
+/** The rows `r` hands up over `app.t` holding `rows` in batches of `sizes`. */
+private xo_run(rows: []const Value, sizes: []const usize, r: Rel) -> Result[Buf[Value], CodecError]
+    val out = buf[Value]()
+
+    for b in xo_run_batches(xo_cols(), xo_batches(record(xo_cols()), rows, sizes), r, [], [])?
+        assert(b.len > 0 && b.len <= BatchSize)
+        out.extend(values_of(b).view())
+
+    Ok(out)
+
+private xo_t() -> Rel = scan("app", "t", "t")
+
+/** `n` rows `{k: i, v: "r<i>"}`. */
+private xo_seq(n: usize) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<n
+        out.push(xo_row(Int(i128(i)), s"r$i"))
+
+    out
+
+private xo_k(row: Value) -> Value = xe_field(row, 0)
+
+private xo_v(row: Value) -> Value = xe_field(row, 1)
+
+private xo_ints(rows: Buf[Value]) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in rows
+        out.push(xo_k(r) match
+            Int(x) -> x
+            _ -> -1)
+
+    out
+
+/** Whether the `k` of `rows` are `want`, in order. */
+private xo_keys_are(rows: Buf[Value], want: []const i128) -> bool
+    val got = xo_ints(rows)
+
+    if got.len() != want.len then return false
+
+    for i in 0..<want.len
+        if got[i] != want[i] then return false
+
+    true
+
+/** Whether the `v` of `rows` are `want`, in order. */
+private xo_texts_are(rows: Buf[Value], want: []const string) -> bool
+    if rows.len() != want.len then return false
+
+    for i in 0..<want.len
+        if xo_v(rows[i]) != Text(want[i]) then return false
+
+    true
+
+// -- sources ----------------------------------------------------------------------------------------
+
+@test
+the_memory_source_skips_empty_batches_and_keeps_order()
+    val rows = xo_seq(5)
+    val got = xo_run(rows.view(), [0, 2, 0, 3, 0], xo_t()).unwrap()
+    assert_eq(got.len(), 5)
+
+    for i in 0..<5
+        assert(got[i] == rows[i])
+
+@test
+values_builds_its_rows_in_batches_and_coerces_them()
+    for n in xe_counts()
+        val rows = buf[Buf[Expr]]()
+
+        for i in 0..<n
+            // An int32 literal coerces to the int64 column.
+            rows.push(items_of([Literal(Int32, Int(i128(i))), if i % 2 == 0 then Null(Text) else Literal(Text, Text("x"))]))
+
+        val r = Values("w", items_of([Field("a", Int64), Field("b", nullable(Text))]), rows)
+        val batches = xo_run_batches(xo_cols(), buf[ColumnVector](), r, [], []).unwrap()
+        var total: usize = 0
+
+        for b in batches
+            assert(b.ty == record([Field("a", Int64), Field("b", nullable(Text))]))
+
+            for i in 0..<b.len
+                val row = value_at(b, i)
+                assert(xe_field(row, 0) == Int(i128(total + i)))
+                val want: Value = if (total + i) % 2 == 0 then Null else Text("x")
+                assert(xe_field(row, 1) == want)
+
+            total += b.len
+
+        assert_eq(total, n)
+        assert_eq(batches.len(), (n + BatchSize - 1) / BatchSize)
+
+@test
+param_scan_reads_a_relation_parameter_in_batches()
+    val elem = record([Field("a", Int64)])
+
+    for n in xe_counts()
+        val elems = buf[Value]()
+
+        for i in 0..<n
+            elems.push(rec([Int(i128(i) * 2)]))
+
+        val batches = xo_run_batches(xo_cols(), buf[ColumnVector](), ParamScan("p", 0), [ParamDecl(None, list(elem))], [Relation(elems)]).unwrap()
+        var all = buf[Value]()
+
+        for b in batches
+            all.extend(values_of(b).view())
+
+        assert_eq(all.len(), n)
+
+        for i in 0..<n
+            assert(all[i] == elems[i])
+
+// -- Filter and Project -------------------------------------------------------------------------------
+
+@test
+filter_keeps_true_rows_and_drops_false_and_null()
+    for n in xe_counts()
+        val rows = buf[Value]()
+
+        for i in 0..<n
+            rows.push(xo_row(if i % 4 == 3 then Null else Int(i128(i % 7)), s"r$i"))
+
+        val pred = call("lt", [col("t", "k"), xe_lit(3)])
+        val got = xo_run(rows.view(), [n / 2], Filter(xo_t(), pred)).unwrap()
+        val want = buf[Value]()
+
+        for r in rows
+            xo_k(r) match
+                Int(x) -> if x < 3 then want.push(r)
+                _ -> ()
+
+        assert_eq(got.len(), want.len())
+
+        for i in 0..<want.len()
+            assert(got[i] == want[i])
+
+    // A predicate false on every row of a batch hands up nothing from it; the next batch follows.
+    val got = xo_run(xo_seq(10).view(), [3, 3, 3], Filter(xo_t(), call("ge", [col("t", "k"), xe_lit(7)]))).unwrap()
+    assert(xo_keys_are(got, [7, 8, 9]))
+
+@test
+project_evaluates_each_item_once_per_row()
+    val items = items_of([item("double", call("mul", [col("t", "k"), xe_lit(2)])), item("v", col("t", "v"))])
+
+    for n in xe_counts()
+        val got = xo_run(xo_seq(n).view(), [1], Project(xo_t(), "p", items)).unwrap()
+        assert_eq(got.len(), n)
+
+        for i in 0..<n
+            assert(got[i] == rec([Int(2 * i128(i)), Text(s"r$i")]))
+
+// -- Limit, §6.10 -------------------------------------------------------------------------------------
+
+private xo_sorted() -> Rel = Sort(xo_t(), items_of([SortKey(col("t", "k"), false, false)]))
+
+private xo_opt_lit(x: Option[i128]) -> Option[Expr] = x match
+    Some(n) -> Some(xe_lit(n))
+    None -> None
+
+/** A `Limit` straight over the scan, whose batches are the table's own, so its boundaries are the
+ * ones the test chose.
+ */
+private xo_limit(count: Option[i128], offset: Option[i128]) -> Rel = Limit(xo_t(), xo_opt_lit(count), xo_opt_lit(offset), false, true)
+
+private xo_ties(count: Option[i128], offset: Option[i128]) -> Rel = Limit(xo_sorted(), xo_opt_lit(count), xo_opt_lit(offset), true, false)
+
+@test
+limit_and_offset_cross_batch_boundaries()
+    val rows = xo_seq(10)
+    val sizes: [3]usize = [3, 5, 2]
+
+    assert(xo_keys_are(xo_run(rows.view(), sizes, xo_limit(Some(4), Some(4))).unwrap(), [4, 5, 6, 7]))
+    assert(xo_keys_are(xo_run(rows.view(), sizes, xo_limit(Some(3), Some(2))).unwrap(), [2, 3, 4]))
+    assert(xo_keys_are(xo_run(rows.view(), sizes, xo_limit(Some(1), Some(3))).unwrap(), [3]))
+    assert(xo_keys_are(xo_run(rows.view(), sizes, xo_limit(Some(6), Some(2))).unwrap(), [2, 3, 4, 5, 6, 7]))
+    assert(xo_keys_are(xo_run(rows.view(), sizes, xo_limit(None, Some(8))).unwrap(), [8, 9]))
+    assert(xo_keys_are(xo_run(rows.view(), sizes, xo_limit(Some(2), None)).unwrap(), [0, 1]))
+    assert_eq(xo_run(rows.view(), sizes, xo_limit(Some(0), None)).unwrap().len(), 0)
+    assert_eq(xo_run(rows.view(), sizes, xo_limit(Some(5), Some(10))).unwrap().len(), 0)
+    assert_eq(xo_run(rows.view(), sizes, xo_limit(Some(100), Some(0))).unwrap().len(), 10)
+
+    // Over a sorted list too, whose batches the sort makes.
+    assert(xo_keys_are(xo_run(rows.view(), sizes, Limit(xo_sorted(), Some(xe_lit(2)), Some(xe_lit(7)), false, false)).unwrap(), [7, 8]))
+
+    for n in xe_counts()
+        val big = xo_seq(n)
+        val r = Limit(xo_t(), Some(xe_lit(i128(BatchSize))), Some(xe_lit(1)), false, true)
+        val got = xo_ints(xo_run(big.view(), [BatchSize / 2, 7], r).unwrap())
+        val want = if n == 0 then 0 else (if n - 1 < BatchSize then n - 1 else BatchSize)
+        assert_eq(got.len(), want)
+
+        for i in 0..<got.len()
+            assert_eq(got[i], i128(i) + 1)
+
+@test
+a_negative_count_or_offset_is_r0006()
+    assert_eq(xo_run(xo_seq(3).view(), [], xo_limit(Some(-1), None)).unwrap_err().code, "R0006")
+    assert_eq(xo_run(xo_seq(3).view(), [], xo_limit(Some(1), Some(-1))).unwrap_err().code, "R0006")
+
+@test
+limit_with_ties_keeps_every_row_equal_to_the_last_kept()
+    val rows = buf[Value]()
+
+    for k in [1, 2, 2, 2, 2, 3, 3]
+        rows.push(xo_row(Int(k), "x"))
+
+    assert(xo_keys_are(xo_run(rows.view(), [2, 2], xo_ties(Some(2), None)).unwrap(), [1, 2, 2, 2, 2]))
+    assert(xo_keys_are(xo_run(rows.view(), [1, 1, 1], xo_ties(Some(6), None)).unwrap(), [1, 2, 2, 2, 2, 3, 3]))
+    assert(xo_keys_are(xo_run(rows.view(), [3], xo_ties(Some(1), Some(1))).unwrap(), [2, 2, 2, 2]))
+    assert(xo_keys_are(xo_run(rows.view(), [3], xo_ties(Some(5), None)).unwrap(), [1, 2, 2, 2, 2]))
+    assert_eq(xo_run(rows.view(), [3], xo_ties(Some(0), None)).unwrap().len(), 0)
+
+    // A run of ties longer than a batch: the sort hands it up across a batch boundary.
+    val long = buf[Value]()
+    long.push(xo_row(Int(0), "x"))
+
+    for _ in 0..<BatchSize + 2
+        long.push(xo_row(Int(1), "x"))
+
+    long.push(xo_row(Int(2), "x"))
+    assert_eq(xo_run(long.view(), [], xo_ties(Some(2), None)).unwrap().len(), BatchSize + 3)
+    assert_eq(xo_run(long.view(), [], xo_ties(Some(1), None)).unwrap().len(), 1)
+    assert_eq(xo_run(long.view(), [], xo_ties(Some(BatchSize + 3), None)).unwrap().len(), BatchSize + 3)
+    assert_eq(xo_run(long.view(), [], xo_ties(Some(BatchSize + 4), None)).unwrap().len(), BatchSize + 4)
+
+// -- Sort, §6.9 ---------------------------------------------------------------------------------------
+
+private xo_sort(keys: []const SortKey) -> Rel = Sort(xo_t(), items_of(keys))
+
+@test
+sort_is_stable_and_places_nulls_per_key()
+    val rows = buf[Value]()
+    val ks: [7]Value = [Int(2), Null, Int(1), Int(2), Null, Int(1), Int(3)]
+
+    for i in 0..<ks.len
+        rows.push(xo_row(ks[i], s"$i"))
+
+    val k = col("t", "k")
+    val sorted = (keys: []const SortKey) -> xo_run(rows.view(), [2, 2], xo_sort(keys)).unwrap()
+
+    assert(xo_texts_are(sorted([SortKey(k, false, false)]), ["2", "5", "0", "3", "6", "1", "4"]))
+    assert(xo_texts_are(sorted([SortKey(k, false, true)]), ["1", "4", "2", "5", "0", "3", "6"]))
+    assert(xo_texts_are(sorted([SortKey(k, true, false)]), ["6", "0", "3", "2", "5", "1", "4"]))
+    assert(xo_texts_are(sorted([SortKey(k, true, true)]), ["1", "4", "6", "0", "3", "2", "5"]))
+    // A second key breaks the ties; the first decides first.
+    assert(xo_texts_are(sorted([SortKey(k, false, false), SortKey(col("t", "v"), true, false)]), ["5", "2", "3", "0", "6", "4", "1"]))
+
+/** `rows` of `app.t` with `cols`, in three-row batches, sorted ascending by `key`, nulls last. */
+private xo_sorted_by(cols: []const Field, rows: Buf[Value], key: Expr) -> Buf[Value]
+    val out = buf[Value]()
+    val r = Sort(xo_t(), items_of([SortKey(key, false, false)]))
+
+    for b in xo_run_batches(cols, xo_batches(record(cols), rows.view(), [3]), r, [], []).unwrap()
+        out.extend(values_of(b).view())
+
+    out
+
+@test
+sort_orders_floats_text_and_records_by_cmp()
+    val cols = [Field("x", nullable(Float64)), Field("s", Text)]
+    val xs: [8]Value = [Float(nan()), Float(1.0), Float(-0.0), Float(infinity()), Null, Float(0.0), Float(-infinity()), Float(-2.0)]
+    val rows = buf[Value]()
+
+    for i in 0..<xs.len
+        rows.push(rec([xs[i], Text(["b", "a", "ab", "", "é", "B", "aa", "a"][i])]))
+
+    val by = (key: Expr) -> xo_sorted_by(cols, rows, key)
+
+    // −∞ < −2 < −0 = +0 (stable) < 1 < +∞ < NaN, then null last.
+    val floats = by(col("t", "x"))
+    val want: [8]Value = [Float(-infinity()), Float(-2.0), Float(-0.0), Float(0.0), Float(1.0), Float(infinity()), Float(nan()), Null]
+
+    for i in 0..<want.len
+        assert(same(nullable(Float64), xe_field(floats[i], 0), want[i]), s"float slot $i")
+
+    // Text by octets: "" < "B" < "a" < "a" < "aa" < "ab" < "b" < "é".
+    val texts = by(col("t", "s"))
+    val tw = ["", "B", "a", "a", "aa", "ab", "b", "é"]
+
+    for i in 0..<tw.len
+        assert(xe_field(texts[i], 1) == Text(tw[i]))
+
+    // A record key orders lexicographically by cmp, a null field first within it.
+    val pair: Expr = Record(items_of([item("s", col("t", "s")), item("x", col("t", "x"))]))
+    val recs = by(pair)
+
+    for i in 1..<recs.len()
+        val prev = rec([xe_field(recs[i - 1], 1), xe_field(recs[i - 1], 0)])
+        val here = rec([xe_field(recs[i], 1), xe_field(recs[i], 0)])
+        assert(cmp(record([Field("s", Text), Field("x", nullable(Float64))]), prev, here) <= 0)
+
+@test
+sort_over_every_size_matches_a_value_sort()
+    for n in xe_counts()
+        val rows = buf[Value]()
+
+        for i in 0..<n
+            rows.push(xo_row(if i % 5 == 0 then Null else Int(i128((i * 7919) % 101)), s"$i"))
+
+        val got = xo_run(rows.view(), [n / 3, 1], xo_sort([SortKey(col("t", "k"), true, true)])).unwrap()
+        assert_eq(got.len(), n)
+
+        for i in 1..<n
+            val (a, b) = (xo_k(got[i - 1]), xo_k(got[i]))
+
+            if b.is_null() then assert(a.is_null())
+            if !a.is_null() && !b.is_null() then assert(cmp(Int64, a, b) >= 0)
+
+// -- Distinct, §6.11 ----------------------------------------------------------------------------------
+
+private xo_count_same(t: Type, rows: Buf[Value], v: Value) -> usize
+    var n: usize = 0
+
+    for r in rows
+        if same(t, r, v) then n += 1
+
+    n
+
+@test
+distinct_removes_rows_that_are_same_including_nulls()
+    val rows = buf[Value]()
+
+    val pairs: [7](Value, string) = [(Int(1), "a"), (Null, "a"), (Int(1), "a"), (Null, "a"), (Null, "b"), (Int(1), "b"), (Int(1), "a")]
+
+    for (k, v) in pairs
+        rows.push(xo_row(k, v))
+
+    val got = xo_run(rows.view(), [2, 2], Distinct(xo_t())).unwrap()
+    val t = record(xo_cols())
+    assert_eq(got.len(), 4)
+
+    for r in rows
+        assert_eq(xo_count_same(t, got, r), 1)
+
+@test
+distinct_treats_nan_alike_and_zeroes_alike()
+    val cols = [Field("x", nullable(Float64)), Field("s", Text)]
+    val rows = buf[Value]()
+
+    val xs: [7]Value = [Float(nan()), Float(-0.0), Float(0.0), Float(nan()), Null, Null, Float(1.0)]
+
+    for x in xs
+        rows.push(rec([x, Text("s")]))
+
+    val got = buf[Value]()
+
+    for b in xo_run_batches(cols, xo_batches(record(cols), rows.view(), [1, 3]), Distinct(xo_t()), [], []).unwrap()
+        got.extend(values_of(b).view())
+
+    assert_eq(got.len(), 4)
+
+@test
+distinct_over_every_size()
+    for n in xe_counts()
+        val rows = buf[Value]()
+
+        for i in 0..<n
+            rows.push(xo_row(if i % 4 == 0 then Null else Int(i128(i % 6)), ["a", "b"][i % 2]))
+
+        val got = xo_run(rows.view(), [n / 2], Distinct(xo_t())).unwrap()
+        val t = record(xo_cols())
+
+        for r in rows
+            assert_eq(xo_count_same(t, got, r), 1)
+
+        for i in 0..<got.len()
+            for j in 0..<i
+                assert(!same(t, got[i], got[j]))
+
+// -- Tag, §6.15 ---------------------------------------------------------------------------------------
+
+@test
+tag_wraps_each_row_as_the_variant()
+    val shape = union_of([Field("old", record([Field("k", nullable(Int64)), Field("v", Text)])), Field("new", record([Field("k", nullable(Int64)), Field("v", Text)]))])
+    val got = xo_run(xo_seq(3).view(), [1], Tag(xo_t(), "u", shape, "new")).unwrap()
+    assert_eq(got.len(), 3)
+
+    for i in 0..<3
+        assert(got[i] == Variant(1, xo_row(Int(i128(i)), s"r$i")))

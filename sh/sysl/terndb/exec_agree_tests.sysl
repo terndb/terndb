@@ -1,0 +1,188 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{infinity, nan}
+
+// The vector kernels agree with the value-at-a-time semantics of `compare.sysl` (`query-tree.md`
+// §3–§4): `eq` and the orderings, `same`, the sort order, and coercion, on every pair drawn from a
+// generated set of values of each type, nulls and the float edge cases among them.
+
+private xa_point() -> Type = record([Field("a", nullable(Int32)), Field("b", Text)])
+
+private xa_shape() -> Type = union_of([Field("x", record([Field("n", nullable(Int64))])), Field("y", record([]))])
+
+/** Values of each type, every one nullable, a null among them. */
+private xa_samples() -> Buf[(Type, Buf[Value])]
+    val out = buf[(Type, Buf[Value])]()
+    val add = (t: Type, vs: []const Value) -> out.push((nullable(t), items_of(vs)))
+
+    add(Bool, [Null, Bool(false), Bool(true)])
+    add(Int8, [Null, Int(-128), Int(-1), Int(0), Int(127)])
+    add(Int16, [Int(-32768), Int(5), Null, Int(32767)])
+    add(Int32, [Int(0), Null, Int(-2147483648), Int(2147483647), Int(1)])
+    add(Int64, [Int(-9223372036854775808), Int(0), Int(9223372036854775807), Null])
+    add(Int128, [Int(-170141183460469231731687303715884105728), Int(3), Int(170141183460469231731687303715884105727), Null])
+    add(UInt8, [UInt(0), UInt(255), Null, UInt(128)])
+    add(UInt16, [UInt(65535), UInt(1), Null])
+    add(UInt32, [UInt(4294967295), Null, UInt(7)])
+    add(UInt64, [UInt(0), UInt(18446744073709551615), UInt(9223372036854775808), Null])
+    add(Float32, [Float(nan()), Float(-0.0), Float(0.0), Float(-infinity()), Float(infinity()), Float(1.5), Null])
+    add(Float64, [Float(nan()), Float(-nan()), Float(-0.0), Float(0.0), Float(-infinity()), Float(infinity()), Float(-1e300), Float(5e-324), Null])
+    add(Decimal(10, 2), [Int(-9999999999), Int(0), Int(1), Int(9999999999), Null])
+    add(Text, [Text(""), Text("a"), Text("ab"), Text("b"), Text("é"), Text("Z"), Null])
+    add(Bytes, [bytes_value([]), bytes_value([0]), bytes_value([0, 0]), bytes_value([255]), bytes_value([1, 255]), Null])
+    add(Json, [Text("1"), Text("[]"), Text("{\"a\":1}"), Null])
+    add(Date, [Int(-1), Int(0), Int(19000), Null])
+    add(Timestamp, [Int(-1), Int(0), Int(1700000000000000), Null])
+    add(Interval, [Interval(1, 0, 0), Interval(0, 30, 0), Interval(0, 0, -5), Interval(1, 0, 0), Null])
+    add(Uuid, [Uuid(0), Uuid(1), Uuid(340282366920938463463374607431768211455), Null])
+    add(xa_point(), [rec([Int(1), Text("a")]), rec([Null, Text("a")]), rec([Int(1), Text("b")]), rec([Int(0), Text("z")]), Null])
+    add(xa_shape(), [Variant(0, rec([Int(1)])), Variant(0, rec([Null])), Variant(1, rec([])), Null])
+    add(list(nullable(Int64)), [rel([]), rel([Int(1)]), rel([Int(1), Null]), rel([Null]), Null])
+    add(bag(Int32), [rel([Int(2), Int(1)]), rel([Int(1), Int(2)]), rel([Int(1)]), Null])
+    out
+end xa_samples
+
+/** Every pair `(vs[i], vs[j])` as two vectors of `t`, left and right. */
+private xa_pairs(t: Type, vs: Buf[Value]) -> (ColumnVector, ColumnVector)
+    val l = buf[Value]()
+    val r = buf[Value]()
+
+    for a in vs
+        for b in vs
+            l.push(a)
+            r.push(b)
+
+    (vector_of(t, l.view()), vector_of(t, r.view()))
+
+private xa_bool(r: Option[bool]) -> Value = r match
+    Some(x) -> Bool(x)
+    None -> Null
+
+private xa_oracle(f: string, t: Type, a: Value, b: Value) -> Value = f match
+    "eq" -> xa_bool(eq(t, a, b).unwrap())
+    "ne" -> xa_bool(ne(t, a, b).unwrap())
+    "lt" -> xa_bool(lt(t, a, b).unwrap())
+    "le" -> xa_bool(le(t, a, b).unwrap())
+    "gt" -> xa_bool(gt(t, a, b).unwrap())
+    "ge" -> xa_bool(ge(t, a, b).unwrap())
+    _ -> Bool(same(t, a, b))
+
+/** The comparisons `t` admits (§3.2 rule 4), and `same`, which it always does. */
+private xa_functions(t: Type) -> Buf[string]
+    val out = buf[string]()
+    out.push("same")
+
+    if check_equatable(t).is_ok()
+        out.push("eq")
+        out.push("ne")
+
+    if check_orderable(t).is_ok()
+        for f in ["lt", "le", "gt", "ge"]
+            out.push(f)
+
+    out
+
+@test
+vector_comparisons_agree_with_compare_on_every_pair()
+    var checked: usize = 0
+
+    for (t, vs) in xa_samples()
+        val (l, r) = xa_pairs(t, vs)
+
+        for f in xa_functions(t)
+            val got = compare_vectors(f, l, r).unwrap()
+            assert_eq(got.len, l.len)
+
+            for i in 0..<l.len
+                val (a, b) = (value_at(l, i), value_at(r, i))
+                val want = xa_oracle(f, t, a, b)
+
+                if value_at(got, i) != want then
+                    assert(false, s"$f on ${type_text(t)}: pair $i")
+
+                checked += 1
+
+    assert(checked > 1000)
+
+@test
+the_sort_order_agrees_with_cmp_on_every_pair()
+    for (t, vs) in xa_samples()
+        val v = vector_of(t, vs.view())
+        val order = slot_order(v)
+
+        for i in 0..<vs.len()
+            for j in 0..<vs.len()
+                if vs[i].is_null() || vs[j].is_null() then continue
+
+                assert_eq(int(order(i, j)), cmp(t, vs[i], vs[j]))
+
+/** Pairs of types that meet at a common type, with values of each. */
+private xa_mixed() -> Buf[(Type, Buf[Value], Type, Buf[Value])]
+    val out = buf[(Type, Buf[Value], Type, Buf[Value])]()
+    val ints: [4]Value = [Int(-128), Int(0), Int(5), Null]
+
+    out.push((nullable(Int8), items_of(ints), nullable(Int64), items_of([Int(-128), Int(5), Int(9223372036854775807), Null])))
+    out.push((nullable(UInt64), items_of([UInt(0), UInt(18446744073709551615), Null]), Int64, items_of([Int(-1), Int(0), Int(9223372036854775807)])))
+    out.push((UInt8, items_of([UInt(0), UInt(200)]), nullable(Int8), items_of([Int(-1), Int(127), Null])))
+    out.push((nullable(Int32), items_of([Int(1), Int(-3), Null]), Decimal(10, 2), items_of([Int(100), Int(-299), Int(-300), Int(101)])))
+    out.push((Decimal(5, 2), items_of([Int(150), Int(-1)]), nullable(Decimal(10, 4)), items_of([Int(15000), Int(-100), Int(-99), Null])))
+    out.push((nullable(Float32), items_of([Float(1.5), Float(nan()), Float(-0.0), Null]), Float64, items_of([Float(1.5), Float(nan()), Float(0.0), Float(0.1)])))
+    out.push((record([Field("a", Int32)]), items_of([rec([Int(1)]), rec([Int(2)])]), record([Field("a", nullable(Int64))]), items_of([rec([Int(1)]), rec([Null])])))
+    out
+
+@test
+mixed_type_comparisons_agree_with_compare_after_coercion()
+    for (ta, va, tb, vb) in xa_mixed()
+        val t = common_type(ta, tb).unwrap()
+        val l = buf[Value]()
+        val r = buf[Value]()
+
+        for a in va
+            for b in vb
+                l.push(a)
+                r.push(b)
+
+        val lv = vector_of(ta, l.view())
+        val rv = vector_of(tb, r.view())
+
+        for f in xa_functions(t)
+            val got = compare_vectors(f, lv, rv).unwrap()
+
+            for i in 0..<l.len()
+                val a = coerce(l[i], ta, t).unwrap()
+                val b = coerce(r[i], tb, t).unwrap()
+                assert(value_at(got, i) == xa_oracle(f, t, a, b), s"$f of ${type_text(ta)} and ${type_text(tb)}: pair $i")
+
+@test
+vector_coercion_agrees_with_coerce()
+    for (ta, va, tb, vb) in xa_mixed()
+        val t = common_type(ta, tb).unwrap()
+
+        for (from, vs) in [(ta, va), (tb, vb)]
+            val got = coerce_vector(vector_of(from, vs.view()), t).unwrap()
+            assert(got.ty == t)
+
+            for i in 0..<vs.len()
+                assert(same(t, value_at(got, i), coerce(vs[i], from, t).unwrap()))
+
+    // A value too large for the decimal's rescaling is `R0001` both ways.
+    val big = vector_of(Int128, [Int(170141183460469231731687303715884105727)])
+    assert_eq(coerce_vector(big, Decimal(38, 2)).unwrap_err().code, "R0001")
+    assert_eq(coerce(Int(170141183460469231731687303715884105727), Int128, Decimal(38, 2)).unwrap_err().code, "R0001")
+
+@test
+integer_casts_agree_with_the_value_cast()
+    val types = [Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64]
+    val vs: [9]Value = [Int(-129), Int(-128), Int(-1), Int(0), Int(127), Int(255), Int(65536), Int(4294967296), Int(-9223372036854775808)]
+
+    for to in types
+        val got = cast_vector(vector_of(Int128, vs), nullable(to), false).unwrap()
+
+        for i in 0..<vs.len
+            val want = cast_value(vs[i], Int128, to) match
+                Ok(x) -> x
+                Err(_) -> Null
+
+            assert(value_at(got, i) == want, s"${type_text(to)} slot $i")

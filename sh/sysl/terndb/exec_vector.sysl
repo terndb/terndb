@@ -1,0 +1,683 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// Column vectors: the executor's in-memory batches (`docs/design/executor.md` §1). A vector's layout
+// is the result format's column tree (`wire-protocol.md` §6.2–§6.3), each buffer held as a typed
+// `Buf`, so that the octets of a fixed-width lane are those of the wire's `values` buffer.
+
+/** The most rows an operator hands up in one batch. */
+const BatchSize: usize = 1024
+
+/** One `interval` slot: the three fields of `query-tree.md` §12.6, compared componentwise. */
+struct Ival derives Eq
+    months: i32
+    days: i32
+    micros: i64
+
+/** A vector's buffers after validity. The type gives a variant its meaning, as it does a `Value`'s:
+ * `I128s` is an `int128` or a decimal's unscaled value, `I32s` an `int32` or a `date`, `I64s` an
+ * `int64` or one of the 64-bit time types, `Bins` every octet string (`text`, `bytes`, `json`).
+ */
+enum Lanes
+    Bools(v: Buf[bool])
+    I8s(v: Buf[i8])
+    I16s(v: Buf[i16])
+    I32s(v: Buf[i32])
+    I64s(v: Buf[i64])
+    I128s(v: Buf[i128])
+    U8s(v: Buf[u8])
+    U16s(v: Buf[u16])
+    U32s(v: Buf[u32])
+    U64s(v: Buf[u64])
+    F32s(v: Buf[f32])
+    F64s(v: Buf[real])
+    Intervals(v: Buf[Ival])
+    Uuids(v: Buf[u128])
+    /** `offsets` has `len + 1` entries; slot `i` is `data[offsets[i]..<offsets[i + 1]]`. */
+    Bins(offsets: Buf[u32], data: Buf[u8])
+    /** One child per field, each with the record's slot count. */
+    Members(children: Buf[ColumnVector])
+    /** A discriminant and the slot's position in the child of its variant, canonical as §6.3 rule 6
+     * makes them: the rows of variant `j`, in order, are child `j`'s slots, and a null slot has
+     * discriminant 0 and occupies no child slot.
+     */
+    Tags(tags: Buf[u16], offsets: Buf[u32], children: Buf[ColumnVector])
+    /** `offsets` has `len + 1` entries; slot `i`'s elements are `child`'s slots in its range. */
+    Elems(offsets: Buf[u32], child: &ColumnVector)
+end Lanes
+
+/** `len` slots of the type `ty`.
+ *
+ * `validity` is the result format's bitmap (bit `i mod 8` of octet `i / 8`, set where the slot holds
+ * a value) and is **empty when no slot is null**, which is always so for a type that is not
+ * nullable. A null slot's lanes hold an unspecified value of their type: nothing reads them, and a
+ * kernel that can fail tests validity before it tests a value.
+ */
+struct ColumnVector
+    ty: Type
+    len: usize
+    validity: Buf[u8]
+    lanes: Lanes
+
+    is_valid(self, i: usize) -> bool = self.validity.len() == 0 || (self.validity[i / 8] >> u8(i % 8)) & 1 == 1
+
+    has_nulls(self) -> bool = self.validity.len() > 0
+
+    null_count(self) -> usize
+        if !self.has_nulls() then return 0
+
+        var n: usize = 0
+
+        for i in 0..<self.len
+            if !self.is_valid(i) then n += 1
+
+        n
+
+    /** Child `j` of a record vector. */
+    member(self, j: usize) -> ColumnVector = self.lanes match
+        Members(cs) -> cs[j]
+        _ -> panic("member: the vector is not a record")
+
+    /** The same slots, read as `ty`: a type that differs only in nullability or in being a `bag`
+     * rather than a `list` (§4.1 rules 5 and 6), at any depth.
+     */
+    as_type(self, ty: Type) -> ColumnVector = ColumnVector(ty, self.len, self.validity, relabel(ty.base(), self.lanes))
+end ColumnVector
+
+private relabel(t: Type, lanes: Lanes) -> Lanes = (t, lanes) match
+    (Record(fs), Members(cs)) ->
+        val out = buf[ColumnVector]()
+
+        for j in 0..<cs.len()
+            out.push(cs[j].as_type(fs[j].ty))
+
+        Members(out)
+    (Union(vs), Tags(tags, offsets, cs)) ->
+        val out = buf[ColumnVector]()
+
+        for j in 0..<cs.len()
+            out.push(cs[j].as_type(vs[j].ty))
+
+        Tags(tags, offsets, out)
+    (Bag(e), Elems(offsets, c)) | (List(e), Elems(offsets, c)) -> Elems(offsets, c.as_type(*e))
+    _ -> lanes
+
+// -- validity bitmaps ---------------------------------------------------------------------------
+
+/** The bitmap of `valid`, empty when every entry is `true`. This is the mask-to-bits step the
+ * design note marks: a scalar loop until sysl can turn a vector of `bool` into bits.
+ */
+private[terndb] bits_of(valid: []const bool) -> Buf[u8]
+    var all = true
+
+    for x in valid
+        if !x then all = false
+
+    val out = buf[u8]()
+
+    if all then return out
+
+    for i in 0..<valid.len
+        if i % 8 == 0 then out.push(0)
+        if valid[i] then out[i / 8] = out[i / 8] | u8(1) << u8(i % 8)
+
+    out
+
+/** The validity of slots that are valid where both `a` and `b` are. */
+private[terndb] and_validity(a: ColumnVector, b: ColumnVector) -> Buf[u8]
+    if !a.has_nulls() then return b.validity
+    if !b.has_nulls() then return a.validity
+
+    val valid = buf[bool]()
+
+    for i in 0..<a.len
+        valid.push(a.is_valid(i) && b.is_valid(i))
+
+    bits_of(valid.view())
+
+/** Every slot valid that `v` has valid, for `n` slots. */
+private[terndb] valid_flags(v: ColumnVector) -> Buf[bool]
+    val out = buf[bool]()
+
+    for i in 0..<v.len
+        out.push(v.is_valid(i))
+
+    out
+
+private take_bits(v: ColumnVector, rows: []const usize) -> Buf[u8]
+    if !v.has_nulls() then return buf[u8]()
+
+    val valid = buf[bool]()
+
+    for r in rows
+        valid.push(v.is_valid(r))
+
+    bits_of(valid.view())
+
+/** `v` with the slots where `keep` is `false` made null as well; its type becomes nullable. */
+private[terndb] masked(v: ColumnVector, keep: []const bool) -> ColumnVector
+    val valid = buf[bool]()
+
+    for i in 0..<v.len
+        valid.push(keep[i] && v.is_valid(i))
+
+    ColumnVector(nullable(v.ty), v.len, bits_of(valid.view()), v.lanes)
+
+// -- building a vector from values, and reading one back ------------------------------------------
+
+/** The vector of `values`, each of type `ty` (a null where `ty` is nullable). */
+vector_of(ty: Type, values: []const Value) -> ColumnVector
+    val valid = buf[bool]()
+
+    for v in values
+        valid.push(!v.is_null())
+
+    ColumnVector(ty, values.len, bits_of(valid.view()), lanes_of(ty.base(), values))
+
+/** A vector of `ty` with no slots. */
+empty_vector(ty: Type) -> ColumnVector = vector_of(ty, [])
+
+/** `n` slots, each holding `v`. */
+repeated(ty: Type, v: Value, n: usize) -> ColumnVector
+    val rows = buf[usize]()
+
+    for _ in 0..<n
+        rows.push(0)
+
+    take(vector_of(ty, [v]), rows.view())
+
+/** The value of a slot the result format writes for a slot under a null record (§6.5): zero, empty,
+ * a record of placeholders, variant 0 of placeholders.
+ */
+private[terndb] placeholder(t: Type) -> Value
+    if t.is_nullable() then return Null
+
+    t match
+        Bool -> Bool(false)
+        UInt8 | UInt16 | UInt32 | UInt64 -> UInt(0)
+        Float32 | Float64 -> Float(0.0)
+        Text | Json -> Text("")
+        Bytes -> bytes_value([])
+        Interval -> Interval(0, 0, 0)
+        Uuid -> Uuid(0)
+        Record(fs) ->
+            val out = buf[Value]()
+
+            for f in fs
+                out.push(placeholder(f.ty))
+
+            Record(out)
+        Union(vs) -> Variant(0, placeholder(vs[0].ty))
+        Bag(_) | List(_) -> rel([])
+        _ -> Int(0)
+end placeholder
+
+private ints_of[T: Integer](values: []const Value) -> Buf[T]
+    val out = buf[T]()
+
+    for v in values
+        out.push(v match
+            Int(n) -> T.wrap(n)
+            UInt(n) -> T.wrap(i128(n))
+            _ -> T(0))
+
+    out
+
+private lanes_of(t: Type, values: []const Value) -> Lanes = t match
+    Bool ->
+        val out = buf[bool]()
+
+        for v in values
+            out.push(v == Bool(true))
+
+        Bools(out)
+    Int8 -> I8s(ints_of(values))
+    Int16 -> I16s(ints_of(values))
+    Int32 | Date -> I32s(ints_of(values))
+    Int64 | Time | DateTime | Timestamp -> I64s(ints_of(values))
+    Int128 | Decimal(_, _) -> I128s(ints_of(values))
+    UInt8 -> U8s(ints_of(values))
+    UInt16 -> U16s(ints_of(values))
+    UInt32 -> U32s(ints_of(values))
+    UInt64 -> U64s(ints_of(values))
+    Float32 ->
+        val out = buf[f32]()
+
+        for v in values
+            out.push(v match
+                Float(x) -> f32(x)
+                _ -> 0.0)
+
+        F32s(out)
+    Float64 ->
+        val out = buf[real]()
+
+        for v in values
+            out.push(v match
+                Float(x) -> x
+                _ -> 0.0)
+
+        F64s(out)
+    Interval ->
+        val out = buf[Ival]()
+
+        for v in values
+            out.push(v match
+                Interval(m, d, u) -> Ival(m, d, u)
+                _ -> Ival(0, 0, 0))
+
+        Intervals(out)
+    Uuid ->
+        val out = buf[u128]()
+
+        for v in values
+            out.push(v match
+                Uuid(b) -> b
+                _ -> 0)
+
+        Uuids(out)
+    Text | Bytes | Json ->
+        val offsets = buf[u32]()
+        val data = buf[u8]()
+        offsets.push(0)
+
+        for v in values
+            v match
+                Text(s) -> data.extend(s.bytes)
+                Bytes(b) -> data.extend(b.view())
+                _ -> ()
+
+            offsets.push(u32(data.len()))
+
+        Bins(offsets, data)
+    Record(fs) ->
+        val children = buf[ColumnVector]()
+
+        for j in 0..<fs.len()
+            val column = buf[Value]()
+
+            for v in values
+                column.push(v match
+                    Record(xs) -> xs[j]
+                    _ -> placeholder(fs[j].ty))
+
+            children.push(vector_of(fs[j].ty, column.view()))
+
+        Members(children)
+    Union(vs) ->
+        val tags = buf[u16]()
+        val offsets = buf[u32]()
+        val payloads = buf[Buf[Value]]()
+
+        for _ in vs
+            payloads.push(buf[Value]())
+
+        for v in values
+            v match
+                Variant(tag, p) ->
+                    tags.push(u16(tag))
+                    offsets.push(u32(payloads[tag].len()))
+                    payloads[tag].push(*p)
+                _ ->
+                    tags.push(0)
+                    offsets.push(u32(payloads[0].len()))
+
+        val children = buf[ColumnVector]()
+
+        for j in 0..<vs.len()
+            children.push(vector_of(vs[j].ty, payloads[j].view()))
+
+        Tags(tags, offsets, children)
+    Bag(e) | List(e) ->
+        val offsets = buf[u32]()
+        val elems = buf[Value]()
+        offsets.push(0)
+
+        for v in values
+            v match
+                Relation(xs) -> elems.extend(xs.view())
+                _ -> ()
+
+            offsets.push(u32(elems.len()))
+
+        Elems(offsets, vector_of(*e, elems.view()))
+    _ -> panic("lanes_of: a named type reached the executor")
+end lanes_of
+
+/** Slot `i` of `v` as a `Value`. */
+value_at(v: ColumnVector, i: usize) -> Value
+    if !v.is_valid(i) then return Null
+
+    v.lanes match
+        Bools(x) -> Bool(x[i])
+        I8s(x) -> Int(i128(x[i]))
+        I16s(x) -> Int(i128(x[i]))
+        I32s(x) -> Int(i128(x[i]))
+        I64s(x) -> Int(i128(x[i]))
+        I128s(x) -> Int(x[i])
+        U8s(x) -> UInt(u64(x[i]))
+        U16s(x) -> UInt(u64(x[i]))
+        U32s(x) -> UInt(u64(x[i]))
+        U64s(x) -> UInt(x[i])
+        F32s(x) -> Float(real(x[i]))
+        F64s(x) -> Float(x[i])
+        Intervals(x) -> Interval(x[i].months, x[i].days, x[i].micros)
+        Uuids(x) -> Uuid(x[i])
+        Bins(offsets, data) ->
+            val b = data.view()[usize(offsets[i])..<usize(offsets[i + 1])]
+
+            if v.ty.base() == Bytes then bytes_value(b) else Text(from_utf8(b).unwrap())
+        Members(cs) ->
+            val out = buf[Value]()
+
+            for c in cs
+                out.push(value_at(c, i))
+
+            Record(out)
+        Tags(tags, offsets, cs) -> Variant(usize(tags[i]), value_at(cs[usize(tags[i])], usize(offsets[i])))
+        Elems(offsets, c) ->
+            val out = buf[Value]()
+
+            for j in usize(offsets[i])..<usize(offsets[i + 1])
+                out.push(value_at(*c, j))
+
+            Relation(out)
+end value_at
+
+/** Every slot of `v`, as values. */
+values_of(v: ColumnVector) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<v.len
+        out.push(value_at(v, i))
+
+    out
+
+// -- take: gathering slots ---------------------------------------------------------------------
+
+private take_lane[T](x: Buf[T], rows: []const usize) -> Buf[T]
+    val out = buf[T]()
+
+    for r in rows
+        out.push(x[r])
+
+    out
+
+/** The slots `rows` of `v`, in that order; a row may be named more than once. This is the gather the
+ * design note marks: a scalar loop until sysl has one.
+ */
+take(v: ColumnVector, rows: []const usize) -> ColumnVector
+    val lanes = v.lanes match
+        Bools(x) -> Bools(take_lane(x, rows))
+        I8s(x) -> I8s(take_lane(x, rows))
+        I16s(x) -> I16s(take_lane(x, rows))
+        I32s(x) -> I32s(take_lane(x, rows))
+        I64s(x) -> I64s(take_lane(x, rows))
+        I128s(x) -> I128s(take_lane(x, rows))
+        U8s(x) -> U8s(take_lane(x, rows))
+        U16s(x) -> U16s(take_lane(x, rows))
+        U32s(x) -> U32s(take_lane(x, rows))
+        U64s(x) -> U64s(take_lane(x, rows))
+        F32s(x) -> F32s(take_lane(x, rows))
+        F64s(x) -> F64s(take_lane(x, rows))
+        Intervals(x) -> Intervals(take_lane(x, rows))
+        Uuids(x) -> Uuids(take_lane(x, rows))
+        Bins(offsets, data) ->
+            val o = buf[u32]()
+            val d = buf[u8]()
+            o.push(0)
+
+            for r in rows
+                d.extend(data.view()[usize(offsets[r])..<usize(offsets[r + 1])])
+                o.push(u32(d.len()))
+
+            Bins(o, d)
+        Members(cs) ->
+            val out = buf[ColumnVector]()
+
+            for c in cs
+                out.push(take(c, rows))
+
+            Members(out)
+        Tags(tags, offsets, cs) ->
+            val t = buf[u16]()
+            val o = buf[u32]()
+            val picks = buf[Buf[usize]]()
+
+            for _ in cs
+                picks.push(buf[usize]())
+
+            for r in rows
+                if v.is_valid(r)
+                    val j = usize(tags[r])
+                    t.push(tags[r])
+                    o.push(u32(picks[j].len()))
+                    picks[j].push(usize(offsets[r]))
+                else
+                    t.push(0)
+                    o.push(u32(picks[0].len()))
+
+            val out = buf[ColumnVector]()
+
+            for j in 0..<cs.len()
+                out.push(take(cs[j], picks[j].view()))
+
+            Tags(t, o, out)
+        Elems(offsets, c) ->
+            val o = buf[u32]()
+            val picks = buf[usize]()
+            o.push(0)
+
+            for r in rows
+                for k in usize(offsets[r])..<usize(offsets[r + 1])
+                    picks.push(k)
+
+                o.push(u32(picks.len()))
+
+            Elems(o, take(*c, picks.view()))
+
+    ColumnVector(v.ty, rows.len, take_bits(v, rows), lanes)
+end take
+
+/** Slots `start..<end` of `v`. */
+slice(v: ColumnVector, start: usize, end: usize) -> ColumnVector
+    val rows = buf[usize]()
+
+    for i in start..<end
+        rows.push(i)
+
+    take(v, rows.view())
+
+// -- concat: one vector from several ------------------------------------------------------------
+
+private concat_lane[T](parts: []const ColumnVector, pick: (Lanes) -> Buf[T]) -> Buf[T]
+    val out = buf[T]()
+
+    for p in parts
+        out.extend(pick(p.lanes).view())
+
+    out
+
+private bools_lane(l: Lanes) -> Buf[bool] = l match
+    Bools(x) -> x
+    _ -> panic("a bool lane was expected")
+
+private i8_lane(l: Lanes) -> Buf[i8] = l match
+    I8s(x) -> x
+    _ -> panic("an int8 lane was expected")
+
+private i16_lane(l: Lanes) -> Buf[i16] = l match
+    I16s(x) -> x
+    _ -> panic("an int16 lane was expected")
+
+private i32_lane(l: Lanes) -> Buf[i32] = l match
+    I32s(x) -> x
+    _ -> panic("an int32 lane was expected")
+
+private i64_lane(l: Lanes) -> Buf[i64] = l match
+    I64s(x) -> x
+    _ -> panic("an int64 lane was expected")
+
+private i128_lane(l: Lanes) -> Buf[i128] = l match
+    I128s(x) -> x
+    _ -> panic("an int128 lane was expected")
+
+private u8_lane(l: Lanes) -> Buf[u8] = l match
+    U8s(x) -> x
+    _ -> panic("a uint8 lane was expected")
+
+private u16_lane(l: Lanes) -> Buf[u16] = l match
+    U16s(x) -> x
+    _ -> panic("a uint16 lane was expected")
+
+private u32_lane(l: Lanes) -> Buf[u32] = l match
+    U32s(x) -> x
+    _ -> panic("a uint32 lane was expected")
+
+private u64_lane(l: Lanes) -> Buf[u64] = l match
+    U64s(x) -> x
+    _ -> panic("a uint64 lane was expected")
+
+private f32_lane(l: Lanes) -> Buf[f32] = l match
+    F32s(x) -> x
+    _ -> panic("a float32 lane was expected")
+
+private f64_lane(l: Lanes) -> Buf[real] = l match
+    F64s(x) -> x
+    _ -> panic("a float64 lane was expected")
+
+private ival_lane(l: Lanes) -> Buf[Ival] = l match
+    Intervals(x) -> x
+    _ -> panic("an interval lane was expected")
+
+private uuid_lane(l: Lanes) -> Buf[u128] = l match
+    Uuids(x) -> x
+    _ -> panic("a uuid lane was expected")
+
+/** The slots of `parts`, one after another, as one vector of `ty`; every part has type `ty`. */
+concat(ty: Type, parts: []const ColumnVector) -> ColumnVector
+    if parts.len == 0 then return empty_vector(ty)
+    if parts.len == 1 then return parts[0]
+
+    var n: usize = 0
+    var nulls = false
+
+    for p in parts
+        n += p.len
+        if p.has_nulls() then nulls = true
+
+    val valid = buf[bool]()
+
+    if nulls
+        for p in parts
+            valid.extend(valid_flags(p).view())
+
+    val lanes = parts[0].lanes match
+        Bools(_) -> Bools(concat_lane(parts, bools_lane))
+        I8s(_) -> I8s(concat_lane(parts, i8_lane))
+        I16s(_) -> I16s(concat_lane(parts, i16_lane))
+        I32s(_) -> I32s(concat_lane(parts, i32_lane))
+        I64s(_) -> I64s(concat_lane(parts, i64_lane))
+        I128s(_) -> I128s(concat_lane(parts, i128_lane))
+        U8s(_) -> U8s(concat_lane(parts, u8_lane))
+        U16s(_) -> U16s(concat_lane(parts, u16_lane))
+        U32s(_) -> U32s(concat_lane(parts, u32_lane))
+        U64s(_) -> U64s(concat_lane(parts, u64_lane))
+        F32s(_) -> F32s(concat_lane(parts, f32_lane))
+        F64s(_) -> F64s(concat_lane(parts, f64_lane))
+        Intervals(_) -> Intervals(concat_lane(parts, ival_lane))
+        Uuids(_) -> Uuids(concat_lane(parts, uuid_lane))
+        Bins(_, _) ->
+            val o = buf[u32]()
+            val d = buf[u8]()
+            o.push(0)
+
+            for p in parts
+                p.lanes match
+                    Bins(offsets, data) ->
+                        val base = u32(d.len())
+
+                        for k in 1..<offsets.len()
+                            o.push(base + offsets[k])
+
+                        d.extend(data.view())
+                    _ -> panic("concat: the parts differ in kind")
+
+            Bins(o, d)
+        Members(first) ->
+            val out = buf[ColumnVector]()
+
+            for j in 0..<first.len()
+                val column = buf[ColumnVector]()
+
+                for p in parts
+                    column.push(p.member(j))
+
+                out.push(concat(first[j].ty, column.view()))
+
+            Members(out)
+        Tags(_, _, first) ->
+            val t = buf[u16]()
+            val o = buf[u32]()
+            val seen = buf[u32]()
+            val out = buf[ColumnVector]()
+
+            for _ in first
+                seen.push(0)
+
+            for p in parts
+                p.lanes match
+                    Tags(tags, offsets, cs) ->
+                        for i in 0..<p.len
+                            t.push(tags[i])
+                            o.push(seen[usize(tags[i])] + offsets[i])
+
+                        for j in 0..<cs.len()
+                            seen[j] = seen[j] + u32(cs[j].len)
+                    _ -> panic("concat: the parts differ in kind")
+
+            for j in 0..<first.len()
+                val column = buf[ColumnVector]()
+
+                for p in parts
+                    p.lanes match
+                        Tags(_, _, cs) -> column.push(cs[j])
+                        _ -> ()
+
+                out.push(concat(first[j].ty, column.view()))
+
+            Tags(t, o, out)
+        Elems(_, first) ->
+            val o = buf[u32]()
+            val column = buf[ColumnVector]()
+            var base: u32 = 0
+            o.push(0)
+
+            for p in parts
+                p.lanes match
+                    Elems(offsets, c) ->
+                        for k in 1..<offsets.len()
+                            o.push(base + offsets[k])
+
+                        base += u32(c.len)
+                        column.push(*c)
+                    _ -> panic("concat: the parts differ in kind")
+
+            Elems(o, concat(first.ty, column.view()))
+
+    ColumnVector(ty, n, bits_of(valid.view()), lanes)
+end concat
+
+/** `v` cut into vectors of at most `BatchSize` slots, none of them empty. */
+batches_of(v: ColumnVector) -> Buf[ColumnVector]
+    val out = buf[ColumnVector]()
+    var at: usize = 0
+
+    while at < v.len
+        val end = if at + BatchSize < v.len then at + BatchSize else v.len
+        out.push(slice(v, at, end))
+        at = end
+
+    out
