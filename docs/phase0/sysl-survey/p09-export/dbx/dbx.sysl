@@ -1,0 +1,46 @@
+module dbx
+
+
+// Need 9: a C ABI over an engine: opaque handles in and out, and a callback C supplies.
+import sysl.buf.{Buf, buf}
+
+// The handle C holds. Its storage is a sysl heap object with a counted field (the rows), so the
+// question is how a `*Db` handed to C keeps that object alive until C closes it.
+@export("dbx_db")
+opaque struct Db
+    rows: Buf[i64]
+    id: u32
+
+// The objects C holds handles to. A `&Db` has to be owned somewhere while C has only a `*Db`, and
+// there is no way to hand a count to C (no into_raw / from_raw), so the module keeps them.
+var open_dbs: Buf[&Db] = buf()
+
+@export("dbx_open")
+open() -> *Db
+    val d: &Db = Db(buf(), u32(open_dbs.len()))
+    open_dbs.push(d)
+    &*open_dbs[open_dbs.len() - 1]
+
+@export("dbx_put")
+put(db: *Db, v: i64) -> i32
+    db.rows.push(v)
+    i32(db.rows.len())
+
+// C's callback: one row and the context pointer C gave; a non-zero answer stops the scan.
+@export("dbx_row_fn")
+type RowFn = *extern(*u8, i64) -> i32
+
+@export("dbx_scan")
+scan(db: *Db, f: RowFn, ctx: *u8) -> i32
+    var n = 0
+
+    for v in db.rows
+        n += 1
+        if f(ctx, v) != 0 then break
+
+    i32(n)
+
+@export("dbx_close")
+close(db: *Db)
+    val i = int(db.id)
+    open_dbs[i].rows = buf()

@@ -1,0 +1,13 @@
+// Need 2, the variant without @unchecked(Share): the body is plain bytes beside an Atomic version.
+import sysl.sync.*
+
+struct SeqPage
+    version: Atomic[u64]
+    body: [64]u8
+
+val p: &sync SeqPage = SeqPage(Atomic(0), [0; 64])
+
+p.version.add(1, Relaxed)
+p.body[3] = 7
+p.version.add(1, Release)
+print(p.body[3])

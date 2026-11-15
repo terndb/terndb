@@ -1,0 +1,59 @@
+// Need 4: thread-per-core workers, pinning, an event loop per thread, a queue between threads.
+import sysl.cpu_count
+import sysl.threads.{scope, channel}
+import sysl.io.poll.{Event, Poller}
+import sysl.sync.*
+import sysl.time.millis
+
+// Pinning: the library has no affinity call. Linux would be pthread_setaffinity_np(pthread_self(),
+// sizeof(cpu_set_t), &set), whose cpu_set_t is a C struct the program would transcribe; macOS has no
+// hard pinning at all (thread_policy_set with THREAD_AFFINITY_POLICY is only a hint, and is a no-op
+// on Apple silicon). Here the Linux spelling is compiled only for Linux.
+#if linux
+@needs(os)
+extern pthread_self() -> usize
+@needs(os)
+extern pthread_setaffinity_np(t: usize, size: usize, set: *u64) -> i32
+
+pin(core: int) -> bool
+    var set: [16]u64 = [0; 16]
+    set[core / 64] = u64(1) << u64(core % 64)
+    pthread_setaffinity_np(pthread_self(), 128, &set[0]) == 0
+#else
+pin(core: int) -> bool = false
+#endif
+
+val n = cpu_count()
+print("cores", n > 0)
+
+var slots: [64]int = [0; 64]
+var ch = channel(slots[..])
+val chp = &ch
+val done: &sync Atomic[int] = Atomic(0)
+val sum: &sync Atomic[int] = Atomic(0)
+val loops: &sync Atomic[int] = Atomic(0)
+
+scope((s) ->
+    // workers: each owns a poller (its event loop) and drains the shared channel
+    for core in 0..<4
+        s.spawn(() ->
+            _ = pin(core)
+            val poller = Poller.open().unwrap()
+            var events: [8]Event = [Event.none; 8]
+
+            loop
+                // the event loop turn: nothing registered, so a zero wait answers at once
+                _ = poller.wait(events[..], Some(millis(0))).unwrap()
+                loops.add(1, Relaxed)
+
+                chp.receive() match
+                    Some(v) -> sum.add(v, Relaxed)
+                    None -> break
+
+            done.add(1, AcqRel))
+
+    s.spawn(() ->
+        for i in 1..1000 do _ = chp.send(i)
+        chp.close()))
+
+print("workers", done.load(), "sum", sum.load(), "turns", loops.load() >= 1000)

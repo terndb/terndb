@@ -1,0 +1,8 @@
+// Need 6, the movemask contortion: with no mask-to-bits conversion, widen the mask to <16>u16 lanes,
+// AND with the lane weights 1, 2, 4 … 32768, and sum. Then count trailing zeros on the u16.
+
+val a: <16>u8 = [1; 16]
+val b: <16>u8 = [1, 1, 1, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+val weights: <16>u16 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+val bits = (<16>u16(a != b) * weights).sum()
+print(bits, bits.trailing_zeros())

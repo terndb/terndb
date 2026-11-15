@@ -1,0 +1,74 @@
+// Need 2: a seqlock / optimistic read over a page another thread is writing.
+// The writer bumps the version to odd, rewrites the body, bumps it to even. The reader copies the
+// body between two version reads and retries if they differ or are odd.
+import sysl.sync.*
+import sysl.threads.scope
+import sysl.raw.ptr_cast
+
+// Without @unchecked(Share) the writer's `self.body[i] = …` through a &sync is refused (see
+// refused.sysl). With it, every write in the type is the program's promise.
+@unchecked(Share)
+struct SeqPage
+    version: Atomic[u64]
+    body: [512]u64
+
+impl SeqPage
+    // Writer: one thread only.
+    write(*self, fill: u64)
+        self.version.add(1, Relaxed)
+        atomic_fence(Release)
+
+        for i in 0..<self.body.len
+            // plain write racing the reader's read
+            self.body[i] = fill
+
+        self.version.add(1, Release)
+
+    // Reader A: plain racy reads of the body (what C++/Rust call UB; what LLVM calls undef).
+    read_plain(*self, out: *[512]u64) -> u64
+        loop
+            val v1 = self.version.load(Acquire)
+            if v1 % 2 == 1 then continue
+
+            for i in 0..<self.body.len
+                out[i] = self.body[i]
+
+            atomic_fence(Acquire)
+            if self.version.load(Relaxed) == v1 then return v1
+
+    // Reader B: every body word read with a Relaxed atomic load through its address: defined
+    // behaviour under the C11 model, the form Rust's seqlock crates use.
+    read_atomic(*self, out: *[512]u64) -> u64
+        loop
+            val v1 = self.version.load(Acquire)
+            if v1 % 2 == 1 then continue
+
+            for i in 0..<self.body.len
+                out[i] = atomic_load(&self.body[i], Relaxed)
+
+            atomic_fence(Acquire)
+            if self.version.load(Relaxed) == v1 then return v1
+
+val p: &sync SeqPage = SeqPage(Atomic(0), [0; 512])
+val torn: &sync Atomic[int] = Atomic(0)
+val reads: &sync Atomic[int] = Atomic(0)
+
+scope((s) ->
+    s.spawn(() ->
+        for k in 1..20000
+            p.write(u64(k)))
+
+    for r in 0..<2
+        s.spawn(() ->
+            var out: [512]u64 = [0; 512]
+
+            for _ in 0..<20000
+                if r == 0 then p.read_plain(&out) else p.read_atomic(&out)
+                reads.add(1, Relaxed)
+
+                for i in 1..<out.len
+                    if out[i] != out[0]
+                        torn.add(1, Relaxed)
+                        break))
+
+print("reads", reads.load(), "torn", torn.load(), "final", p.version.load())

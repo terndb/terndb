@@ -1,0 +1,16 @@
+// Reduction for p08/ref: a ref into a Buf[V], handed to a non-recursive function that only reads.
+import sysl.buf.{Buf, buf}
+
+enum V
+    I(n: int)
+    L(items: Buf[V])
+
+w(v: V) -> int = v match
+    I(n) -> n
+    L(items) -> int(items.len())
+
+var b: Buf[V] = buf()
+b.push(I(4))
+
+ref x = b[0]
+print(w(x))
