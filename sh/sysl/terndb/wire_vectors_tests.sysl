@@ -1,0 +1,436 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// The golden vectors of `wire-protocol.md` §10.2 in `docs/spec/vectors/wire/`, and replication.md
+// §15's worked messages: each `accept` vector decodes to the value its header states and re-encodes
+// to the same octets; each `reject` vector is refused with its code.
+
+/** A vector file's octets and the text of its `# expect:` line. */
+struct Vector
+    octets: Buf[u8]
+    expect: string
+
+/** The vector a file holds: `#` lines are headers, and every other line is spaced hex. */
+vector(file: []const u8) -> Vector
+    val digits = buf[u8]()
+    var expect = ""
+    var at: usize = 0
+
+    while at < file.len
+        var end = at
+        while end < file.len && file[end] != u8('\n')
+            end += 1
+
+        val line = file[at..<end]
+
+        if line.len > 0 && line[0] == u8('#')
+            val text = from_utf8_lossless(line)
+            if text.starts_with("# expect: ") then expect = text[10..]
+        else
+            for c in line
+                if c != u8(' ') then digits.push(c)
+
+        at = end + 1
+
+    Vector(hex(from_utf8_lossless(digits.view())), expect)
+end vector
+
+from_utf8_lossless(b: []const u8) -> string = from_utf8(b).unwrap()
+
+/** The code a `reject` vector names. */
+rejects_with(v: Vector) -> string = if v.expect.starts_with("reject ") then v.expect[7..<12] else "accept"
+
+/** What a server makes of `octets` after a preface, at wire minor `minor`. */
+at_server(octets: []const u8, minor: u64 = 1) -> Result[Buf[Arrival], CodecError]
+    var r = reassembler(Server)
+    r.minor = minor
+    r.limits = Limits(1048576, MinMessageSize, 128)
+
+    val pre = buf[u8]()
+    push_preface(pre)
+    r.push(pre.view())?
+
+    val out = r.push(octets)?
+    r.end_of_input()?
+    Ok(out)
+
+/** What a client that has sent requests `streams` makes of `octets`. */
+at_client(octets: []const u8, streams: []const u64, minor: u64 = 1) -> Result[Buf[Arrival], CodecError]
+    var r = reassembler(Client)
+    r.minor = minor
+    r.limits = Limits(1048576, MinMessageSize, 128)
+
+    for s in streams
+        r.sent(s)
+
+    val out = r.push(octets)?
+    r.end_of_input()?
+    Ok(out)
+
+raw_of(a: Arrival) -> RawMessage = a match
+    Whole(m) -> m
+    Refused(s, code) ->
+        assert(false, s"stream $s was refused with $code")
+        RawMessage(0, 0, buf())
+
+/** A decoded message and the stream it came on. */
+struct Delivered
+    stream: u64
+    m: Message
+
+/** The messages of `arrivals`, decoded at `minor`, with the streams they came on. */
+messages_of(arrivals: Buf[Arrival], minor: u64 = 1) -> Buf[Delivered]
+    val out = buf[Delivered]()
+
+    for a in arrivals
+        val raw = raw_of(a)
+        out.push(Delivered(raw.stream, raw.decode(minor).unwrap()))
+
+    out
+
+/** `v`'s one message, which must be `want` on `stream`, and must re-encode to `v`'s octets. */
+accepts_one(v: Vector, got: Buf[Arrival], stream: u64, want: Message, minor: u64 = 1, file: string = __FILE__, line: long = __LINE__)
+    val ms = messages_of(got, minor)
+
+    assert(ms.len() == 1, "the vector is one message", file, line)
+    assert(ms[0].stream == stream, "on its stream", file, line)
+    assert(ms[0].m == want, s"the vector decodes to its stated value: ${v.expect}", file, line)
+    same_bytes(encode_frames(want, stream, minor, 1048576).unwrap(), v.octets, "and re-encodes to its octets", file, line)
+
+const t127_hex = "01 00 01 01 02 69 64 03 00 01 1c 04 1a 01 08 03 61 70 70 01 74 01 74 05 0e 02 65 71 02 01 05 01 74 02 69 64 03 01 00 00"
+
+/** One tuple of one int64 parameter. */
+int_param(n: i128) -> Buf[u8] = encode_params([Int64], row_params([[Int(n)]])).unwrap()
+
+/** The 32 octets `hex` spells. */
+digest_hex(h: string) -> [32]u8
+    var d: [32]u8 = [0; 32]
+    val b = hex(h)
+
+    for i in 0..<32
+        d[i] = b[i]
+
+    d
+
+const d127_hex = "7A ED 67 F0 E6 4D 64 2F 3A 8E 1C 44 37 52 C6 05 CA 5F 44 DF A4 8E E1 CF 59 76 10 6C 66 21 1D 14"
+
+const after_token: u64 = 0x0001_0000_0000_0011
+
+const txid_token: u64 = 0x0001_0000_0000_0030
+
+// -- V1–V4: preface, frames, fragmentation -------------------------------------------------------
+
+@test
+v1_preface()
+    val v = vector(embed("../../../docs/spec/vectors/wire/preface.txt"))
+    val out = buf[u8]()
+    push_preface(out)
+
+    same_bytes(out, v.octets, "the preface")
+    assert_eq(code_of(check_preface(v.octets.view())), "ok")
+
+    var r = reassembler(Server)
+    assert_eq(r.push(v.octets.view()).unwrap().len(), 0)
+    assert_eq(code_of(r.end_of_input()), "ok")
+
+@test
+v2_frame_header_and_pong()
+    val ping = vector(embed("../../../docs/spec/vectors/wire/frame-header.txt"))
+    accepts_one(ping, at_server(ping.octets.view()).unwrap(), 0, Ping(0x0123_4567_89ab_cdef))
+
+    val pong = vector(embed("../../../docs/spec/vectors/wire/pong.txt"))
+    accepts_one(pong, at_client(pong.octets.view(), []).unwrap(), 0, Pong(0x0123_4567_89ab_cdef))
+
+@test
+v3_frames_refused_with_w1001()
+    val files = [
+        embed("../../../docs/spec/vectors/wire/frame-reserved-nonzero.txt"),
+        embed("../../../docs/spec/vectors/wire/frame-flag-bit1.txt"),
+        embed("../../../docs/spec/vectors/wire/frame-unknown-type.txt"),
+        embed("../../../docs/spec/vectors/wire/frame-wrong-direction.txt")]
+
+    for f in files
+        val v = vector(f)
+        assert_eq(rejects_with(v), "W1001")
+        assert_eq(code_of(at_server(v.octets.view())), "W1001")
+
+@test
+v4_a_fragmented_execute_and_a_type_change()
+    val v = vector(embed("../../../docs/spec/vectors/wire/fragmented-execute.txt"))
+    val want = ExecuteMsg(Execute(0, None, no_exec_options(), hex(t127_hex), int_param(42), None))
+    val ms = messages_of(at_server(v.octets.view()).unwrap())
+
+    assert_eq(ms.len(), 1)
+    assert_eq(ms[0].stream, 1u64)
+    assert(ms[0].m == want, "three frames make one Execute")
+    same_bytes(fragment_at(0x11, 1, encode_payload(want, 1).unwrap().view(), [20, 40]), v.octets, "split at 20 and 40")
+
+    val change = vector(embed("../../../docs/spec/vectors/wire/fragment-type-change.txt"))
+    assert_eq(rejects_with(change), "W1007")
+    assert_eq(code_of(at_server(change.octets.view())), "W1007")
+
+// -- V5–V8: the handshake ------------------------------------------------------------------------
+
+scram_hello() -> ClientHello =
+    ClientHello(versions([Version(1, 1)]), versions([Version(1, 0)]), "user", "app", "", strs(["scram-sha-256"]),
+        Some(octets("n,,n=user,r=rOprNGfwEbeRWgbNEkqO".bytes)), 1048576,
+        SessionDefaults(Some(Snapshot), Some(On), Some(1000), Some(30000), Some(5000)), strs(["zstd"]))
+
+token_hello(wire: []const Version) -> ClientHello
+    val token = buf[u8]()
+    for i in 0..<32
+        token.push(u8(i))
+
+    ClientHello(versions(wire), versions([Version(1, 0)]), "svc", "app", "loader", strs(["token"]), Some(token), 65536,
+        no_session_defaults(), buf())
+
+scram_server_hello() -> ServerHello =
+    ServerHello(1, 1, 1, 0, "terndb 0.0.1", 1048576, "scram-sha-256",
+        octets("r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096".bytes), "")
+
+scram_ready() -> Ready = Ready(1, Primary, 128, 16, 64 * 1024 * 1024, 1000, 1, octets("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=".bytes))
+
+@test
+v5_client_hellos()
+    val scram = vector(embed("../../../docs/spec/vectors/wire/client-hello-scram.txt"))
+    accepts_one(scram, at_server(scram.octets.view()).unwrap(), 0, ClientHelloMsg(scram_hello()))
+
+    val token = vector(embed("../../../docs/spec/vectors/wire/client-hello-token.txt"))
+    accepts_one(token, at_server(token.octets.view()).unwrap(), 0, ClientHelloMsg(token_hello([Version(1, 0)])))
+
+@test
+v6_server_hello_and_ready()
+    val hello = vector(embed("../../../docs/spec/vectors/wire/server-hello.txt"))
+    accepts_one(hello, at_client(hello.octets.view(), []).unwrap(), 0, ServerHelloMsg(scram_server_hello()))
+
+    val ready = vector(embed("../../../docs/spec/vectors/wire/ready.txt"))
+    accepts_one(ready, at_client(ready.octets.view(), []).unwrap(), 0, ReadyMsg(scram_ready()))
+
+@test
+v7_versions_not_descending_and_a_non_minimal_uvar()
+    val versions = vector(embed("../../../docs/spec/vectors/wire/hello-versions-not-descending.txt"))
+    assert_eq(rejects_with(versions), "W1001")
+    assert_eq(code_of(raw_of(at_server(versions.octets.view()).unwrap()[0]).decode(1)), "W1001")
+    assert_eq(encode_code(ClientHelloMsg(token_hello([Version(1, 0), Version(2, 0)]))), "W1001")
+
+    val uvar = vector(embed("../../../docs/spec/vectors/wire/uvar-non-minimal.txt"))
+    assert_eq(rejects_with(uvar), "W1001")
+    assert_eq(code_of(raw_of(at_server(uvar.octets.view()).unwrap()[0]).decode(1)), "W1001")
+
+@test
+v8_the_rfc_7677_exchange_framed()
+    val c2s = vector(embed("../../../docs/spec/vectors/wire/scram-exchange-c2s.txt"))
+    val ms = messages_of(at_server(c2s.octets.view()).unwrap())
+    val final = AuthResponse(octets("c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=".bytes))
+
+    assert_eq(ms.len(), 2)
+    assert(ms[0].m == ClientHelloMsg(scram_hello()) && ms[1].m == final, "ClientHello, then AuthResponse")
+
+    val sent = encode_frames(ms[0].m, 0, 1, 1048576).unwrap()
+    sent.extend(encode_frames(final, 0, 1, 1048576).unwrap().view())
+    same_bytes(sent, c2s.octets, "the client's half re-encodes")
+
+    val s2c = vector(embed("../../../docs/spec/vectors/wire/scram-exchange-s2c.txt"))
+    val back = messages_of(at_client(s2c.octets.view(), []).unwrap())
+
+    assert_eq(back.len(), 2)
+    assert(back[0].m == ServerHelloMsg(scram_server_hello()) && back[1].m == ReadyMsg(scram_ready()), "ServerHello, then Ready")
+
+// -- V9–V12: requests ---------------------------------------------------------------------------
+
+@test
+v9_execute_autocommit_with_the_qt_16_1_tree()
+    val v = vector(embed("../../../docs/spec/vectors/wire/execute-autocommit.txt"))
+    val tree = encode_envelope(users_and_posts()).unwrap()
+    val params = encode_params([Int64, Int64], row_params([[Int(50), Int(3)]])).unwrap()
+
+    accepts_one(v, at_server(v.octets.view()).unwrap(), 1, ExecuteMsg(Execute(0, None, no_exec_options(), tree, params, None)))
+
+    // The envelope is the tree, and the parameters decode by its declared types.
+    val env = envelope_of(tree).unwrap()
+    val types = buf[Type]()
+    for p in env.params
+        types.push(p.ty)
+
+    assert(env == users_and_posts(), "the envelope is [QT] §16.1's")
+    assert(decode_params(types.view(), params.view()).unwrap() == row_params([[Int(50), Int(3)]]), "$0 = 50, $1 = 3")
+
+@test
+v10_a_parameter_batch_of_three_tuples()
+    val v = vector(embed("../../../docs/spec/vectors/wire/execute-param-batch.txt"))
+    val implicit = TxnOptions(Some(Snapshot), None, None, None, None, None, None)
+    val params = encode_params([Int64], row_params([[Int(1)], [Int(2)], [Int(3)]])).unwrap()
+    val want = ExecuteMsg(Execute(0, Some(implicit), ExecOptions(Some(65536), Some(100), None, None), hex(t127_hex), params, Some(9)))
+
+    accepts_one(v, at_server(v.octets.view()).unwrap(), 2, want)
+    assert_eq(decode_params([Int64], params.view()).unwrap().tuples.len(), 3)
+
+@test
+v11_trailing_parameter_octets_are_q1001_at_params_0()
+    val v = vector(embed("../../../docs/spec/vectors/wire/params-trailing-octets.txt"))
+    assert_eq(rejects_with(v), "Q1001")
+
+    val m = raw_of(at_server(v.octets.view()).unwrap()[0]).decode(1).unwrap()
+
+    m match
+        ExecuteMsg(e) ->
+            val env = envelope_of(e.envelope).unwrap()
+            val refusal = decode_params([env.params[0].ty], e.params.view())
+            assert_eq(code_of(refusal), "Q1001")
+            refusal match
+                Err(err) -> assert_eq(err.path, "/params/0")
+                Ok(_) -> ()
+        _ -> assert(false, "an Execute")
+
+@test
+v12_prepare_prepared_and_both_plan_refs()
+    val shape = digest_hex(d127_hex)
+    assert(shape_digest(envelope_of(hex(t127_hex)).unwrap()).unwrap() == shape, "the digest is §12.7's shape digest")
+
+    val prepare = vector(embed("../../../docs/spec/vectors/wire/prepare.txt"))
+    accepts_one(prepare, at_server(prepare.octets.view()).unwrap(), 4, Prepare(7, hex(t127_hex)))
+
+    val prepared = vector(embed("../../../docs/spec/vectors/wire/prepared.txt"))
+    accepts_one(prepared, at_client(prepared.octets.view(), [4]).unwrap(), 4, Prepared(shape, 3, Some(bag(record([Field("id", Int64)])))))
+
+    val by_handle = vector(embed("../../../docs/spec/vectors/wire/execute-prepared-handle.txt"))
+    accepts_one(by_handle, at_server(by_handle.octets.view()).unwrap(), 5,
+        ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByHandle(7), int_param(42))))
+
+    val by_digest = vector(embed("../../../docs/spec/vectors/wire/execute-prepared-digest.txt"))
+    accepts_one(by_digest, at_server(by_digest.octets.view()).unwrap(), 6,
+        ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByDigest(shape), int_param(42))))
+
+// -- V13–V14: transactions -----------------------------------------------------------------------
+
+@test
+v13_begin_txn_begun_commit_txn_committed()
+    val begin = vector(embed("../../../docs/spec/vectors/wire/begin.txt"))
+    val options = TxnOptions(Some(ReadCommitted), Some(Remote), Some(true), Some(after_token), Some(1000), Some(5000), Some(250))
+    accepts_one(begin, at_server(begin.octets.view()).unwrap(), 7, Begin(1, options))
+
+    // A remote level is beyond wire 1.0.
+    assert_eq(code_of(raw_of(at_server(begin.octets.view(), 0).unwrap()[0]).decode(0)), "W1001")
+
+    val begun = vector(embed("../../../docs/spec/vectors/wire/txn-begun.txt"))
+    accepts_one(begun, at_client(begun.octets.view(), [7]).unwrap(), 7, TxnBegun(txid_token, after_token, ReadCommitted))
+
+    val commit = vector(embed("../../../docs/spec/vectors/wire/commit.txt"))
+    accepts_one(commit, at_server(commit.octets.view()).unwrap(), 8, Commit(1))
+
+    val committed = vector(embed("../../../docs/spec/vectors/wire/txn-committed.txt"))
+    accepts_one(committed, at_client(committed.octets.view(), [8]).unwrap(), 8, TxnCommitted(txid_token, Some(after_token + 1)))
+
+    val empty = vector(embed("../../../docs/spec/vectors/wire/txn-committed-empty.txt"))
+    accepts_one(empty, at_client(empty.octets.view(), [8]).unwrap(), 8, TxnCommitted(txid_token, None))
+
+@test
+v14_transaction_status_in_each_state()
+    val ask = vector(embed("../../../docs/spec/vectors/wire/transaction-status.txt"))
+    accepts_one(ask, at_server(ask.octets.view()).unwrap(), 10, TransactionStatus(txid_token))
+
+    val committed = vector(embed("../../../docs/spec/vectors/wire/txn-status-committed.txt"))
+    accepts_one(committed, at_client(committed.octets.view(), [10]).unwrap(), 10, TxnStatus(Committed, Some(after_token + 1)))
+
+    val aborted = vector(embed("../../../docs/spec/vectors/wire/txn-status-aborted.txt"))
+    accepts_one(aborted, at_client(aborted.octets.view(), [10]).unwrap(), 10, TxnStatus(Aborted, None))
+
+    val running = vector(embed("../../../docs/spec/vectors/wire/txn-status-in-progress.txt"))
+    accepts_one(running, at_client(running.octets.view(), [10]).unwrap(), 10, TxnStatus(InProgress, None))
+
+// -- V15–V16: a result ---------------------------------------------------------------------------
+
+@test
+v15_the_section_6_6_response()
+    val header = vector(embed("../../../docs/spec/vectors/wire/result-header.txt"))
+    val batch = vector(embed("../../../docs/spec/vectors/wire/batch.txt"))
+    val complete = vector(embed("../../../docs/spec/vectors/wire/complete.txt"))
+
+    val shape = shape_digest(users_and_posts()).unwrap()
+    accepts_one(header, at_client(header.octets.view(), [7]).unwrap(), 7, ResultHeaderMsg(ResultHeader(1000, 999, shape, Some(users_type()))))
+    accepts_one(batch, at_client(batch.octets.view(), [7]).unwrap(), 7, BatchReply(hex(users_batch_hex)))
+    accepts_one(complete, at_client(complete.octets.view(), [7]).unwrap(), 7, Complete(counts([2]), None))
+
+    // As one response: the header's type gives the column tree its batch is read by.
+    val all = octets(header.octets.view())
+    all.extend(batch.octets.view())
+    all.extend(complete.octets.view())
+
+    val ms = messages_of(at_client(all.view(), [7]).unwrap())
+    assert_eq(ms.len(), 3)
+
+    ms[0].m match
+        ResultHeaderMsg(h) -> ms[1].m match
+            BatchReply(p) ->
+                val tree = column_tree(h.result_type.unwrap()).unwrap()
+                assert(decode_batch(tree, p.view()).unwrap().rows() == users_rows(), "the §6.6 users")
+            _ -> assert(false, "a Batch second")
+        _ -> assert(false, "a ResultHeader first")
+
+    // Complete is terminal: nothing more is accepted on stream 7.
+    all.extend(complete.octets.view())
+    assert_eq(code_of(at_client(all.view(), [7])), "W1001")
+
+@test
+v16_nullable_batches()
+    for f in [embed("../../../docs/spec/vectors/wire/batch-nullable.txt"), embed("../../../docs/spec/vectors/wire/batch-nullable-no-null.txt")]
+        val v = vector(f)
+        assert_eq(messages_of(at_client(v.octets.view(), [7]).unwrap())[0].m.type_code(), u8(0x92))
+
+        val payload = raw_of(at_client(v.octets.view(), [7]).unwrap()[0]).payload
+        val rows = decode_batch(column_tree(nullable_type()).unwrap(), payload.view()).unwrap().rows()
+        same_bytes(encode_frames(BatchReply(encoded(nullable_type(), rows.view())), 7, 1, 1048576).unwrap(), v.octets, v.expect)
+
+    val first = vector(embed("../../../docs/spec/vectors/wire/batch-nullable.txt"))
+    val p = raw_of(at_client(first.octets.view(), [7]).unwrap()[0]).payload
+    assert(decode_batch(column_tree(nullable_type()).unwrap(), p.view()).unwrap().rows() == nullable_rows(), "§6.7's rows")
+
+// -- V22–V24: errors and control ------------------------------------------------------------------
+
+@test
+v22_errors()
+    val v = vector(embed("../../../docs/spec/vectors/wire/error-validation.txt"))
+    val first = ErrorEntry("Q3001", "type mismatch", "/statement/source/rows/0/1",
+        details([Detail("actual", "text"), Detail("expected", "int64")]), Some(SourceRange(18, 23)))
+    val second = ErrorEntry("Q3001", "type mismatch", "/statement/source/rows/1/1", buf(), None)
+    accepts_one(v, at_client(v.octets.view(), [12]).unwrap(), 12, ErrorReply(WireError(entries_of([first, second]), false, Unaffected, None, None)))
+
+    val unknown = vector(embed("../../../docs/spec/vectors/wire/error-commit-unknown.txt"))
+    val entry = ErrorEntry("T2001", "commit outcome unknown", "", buf(), None)
+    accepts_one(unknown, at_client(unknown.octets.view(), [13]).unwrap(), 13,
+        ErrorReply(WireError(entries_of([entry]), false, Closed, Some(txid_token), None)))
+
+@test
+v23_cancel_and_credit()
+    val cancel = vector(embed("../../../docs/spec/vectors/wire/cancel.txt"))
+    accepts_one(cancel, at_server(cancel.octets.view()).unwrap(), 5, Cancel)
+
+    val credit = vector(embed("../../../docs/spec/vectors/wire/credit.txt"))
+    accepts_one(credit, at_server(credit.octets.view()).unwrap(), 5, Credit(65536))
+
+@test
+v24_goodbye()
+    val v = vector(embed("../../../docs/spec/vectors/wire/goodbye.txt"))
+    accepts_one(v, at_client(v.octets.view(), []).unwrap(), 0, Goodbye("W4001", "shutting down", 30000))
+
+// -- replication.md §15 -------------------------------------------------------------------------
+
+@test
+replication_15_1_wal_data()
+    val v = vector(embed("../../../docs/spec/vectors/wire/wal-data.txt"))
+    val record = octets(v.octets.view()[48..])
+    accepts_one(v, at_client(v.octets.view(), [1]).unwrap(), 1,
+        WalDataMsg(WalData(0x0400_1000, 0x0400_2000, 0x0006_6045_57a9_85dc, 1, 1, record)))
+
+    assert_eq(record.len(), 64)
+    // Before wire 1.1 the type does not exist.
+    assert_eq(code_of(at_client(v.octets.view(), [1], 0)), "W1001")
+
+@test
+replication_15_2_replica_status()
+    val v = vector(embed("../../../docs/spec/vectors/wire/replica-status.txt"))
+    accepts_one(v, at_server(v.octets.view()).unwrap(), 1,
+        ReplicaStatusMsg(ReplicaStatus(0x0400_1040, 0x0400_1040, 0x0400_1040, 0x0001_0000_0000_0011, 0x0001_0000_0000_000f, 7, 0x0006_6045_57a9_88fc, 1, 0)))

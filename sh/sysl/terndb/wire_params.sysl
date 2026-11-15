@@ -1,0 +1,234 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The parameter block of `Execute` and `ExecutePrepared` (`wire-protocol.md` §4.2). It is decoded by
+// the statement's parameter types, in declaration order, so the message carries it as octets and the
+// caller decodes it once it knows them: from the envelope's `ParamDecl`s, or from the prepared
+// statement (§4.4 rule 7). The types must be resolved: a catalog type reference is the caller's to
+// look up first.
+//
+// Every refusal is a [QT] code (§8.3 rule 1): `Q1001` for octets that do not decode or are left over,
+// `Q1003` for a non-canonical value, `Q1004` for bad UTF-8, `Q1007` for a `json` value not in canonical
+// form, `Q4004` for no tuple at all. Its path is the `/params/<tuple>/<index>` of the value that failed,
+// followed by a step for each field or element into it (§4.2 rule 4); a defect of the block itself is
+// at `/params`, and octets left over at the last tuple's `/params/<tuple>`.
+
+/** A parameter block: `tuple_count` tuples of one value per declared parameter, and the indices of
+ * the relation-typed parameters sent columnar. A columnar value is a `Relation` like any other.
+ */
+struct Params derives Eq
+    columnar: Buf[u64]
+    tuples: Buf[Buf[Value]]
+
+/** The block a statement with no parameters sends: one empty tuple (§4.2 rule 3). */
+no_params() -> Params
+    val tuples = buf[Buf[Value]]()
+    tuples.push(buf())
+    Params(buf(), tuples)
+
+private at[T](path: string, code: string, what: string) -> Result[T, CodecError] = Err(refusal(code, what, []).at(path))
+
+/** The same refusal at `path`, unless it already has a deeper one. */
+private under[T](path: string, r: Result[T, CodecError]) -> Result[T, CodecError] = r match
+    Ok(v) -> Ok(v)
+    Err(e) -> Err(e.at(path))
+
+/** The block that is the whole of `bytes`, for parameters of `types`. */
+decode_params(types: []const Type, bytes: []const u8) -> Result[Params, CodecError]
+    var r = Reader(bytes, 0)
+    val tuple_count = under("/params", r.uvar())?
+
+    if tuple_count == 0 then return at("/params", "Q4004", "a parameter block holds at least one tuple")
+
+    val columnar = buf[u64]()
+
+    for _ in 0..<under("/params", r.uvar())?
+        val i = under("/params", r.uvar())?
+
+        if columnar.len() > 0 && i <= columnar[columnar.len() - 1] then
+            return at("/params", "Q1001", "the columnar indices are not strictly ascending")
+        if i >= u64(types.len) || !types[usize(i)].is_relation() then
+            return at("/params", "Q1001", s"parameter $i is not a relation-typed parameter")
+
+        columnar.push(i)
+
+    // A count of more tuples than the octets left could hold is refused before it is looped.
+    var least: usize = 0
+
+    for i in 0..<types.len
+        least += if listed(columnar, i) then 1 else least_octets(types[i])
+
+    if tuple_count >= u64(BatchLimit) || (least > 0 && tuple_count > u64(r.left())) then
+        return at("/params", "Q1001", s"$tuple_count tuples do not fit the octets left")
+
+    val tuples = buf[Buf[Value]]()
+
+    for t in 0..<tuple_count
+        val values = buf[Value]()
+
+        for i in 0..<types.len
+            val path = s"/params/$t/$i"
+
+            if listed(columnar, i) then
+                values.push(read_columnar(&r, types[i], path)?)
+            else
+                values.push(read_param(&r, types[i], path)?)
+
+        tuples.push(values)
+
+    if r.left() != 0 then
+        return at(s"/params/${tuple_count - 1}", "Q1001", "octets follow the last parameter tuple")
+
+    Ok(Params(columnar, tuples))
+end decode_params
+
+/** A value of `ty` in [QT] §12.6's encoding. */
+private read_param(r: *Reader, ty: Type, path: string) -> Result[Value, CodecError]
+    ty match
+        Nullable(inner) -> return if under(path, r.flag())? then read_param(r, *inner, path) else Ok(Null)
+        Record(fields) ->
+            val out = buf[Value]()
+
+            for j in 0..<fields.len()
+                out.push(read_param(r, fields[j].ty, s"$path/$j")?)
+
+            return Ok(Record(out))
+        Union(variants) ->
+            val tag = under(path, r.uvar())?
+
+            if tag >= u64(variants.len()) then return at(path, "Q1001", s"discriminant $tag is past the union's variants")
+
+            return Ok(Variant(usize(tag), read_param(r, variants[usize(tag)].ty, path)?))
+        Bag(elem) | List(elem) ->
+            val n = under(path, r.uvar())?
+
+            if n >= u64(BatchLimit) || (n > u64(r.left()) && least_octets(*elem) > 0) then
+                return at(path, "Q1001", s"a relation of $n elements does not fit the octets left")
+
+            val out = buf[Value]()
+
+            for j in 0..<n
+                out.push(read_param(r, *elem, s"$path/$j")?)
+
+            return Ok(Relation(out))
+        Named(schema, name) -> return at(path, "Q1001", s"the catalog type $schema.$name was not resolved")
+        _ -> return under(path, read_literal(r, ty))
+end read_param
+
+private listed(columnar: Buf[u64], i: usize) -> bool
+    for c in columnar
+        if c == u64(i) then return true
+
+    false
+
+/** The fewest octets a value of `ty` can take: what makes a huge count refusable before it is looped. */
+private least_octets(ty: Type) -> usize = ty match
+    Record(fields) ->
+        var n: usize = 0
+        for f in fields
+            n += least_octets(f.ty)
+        n
+    Nullable(_) | Union(_) | Bag(_) | List(_) | Text | Bytes | Json | Bool -> 1
+    _ -> ty.width()
+
+/** A relation sent columnar (§4.2 rule 2): `uvar batch_count`, then that many `bin`, each a `Batch`
+ * payload of the parameter's type with `tuple` 0. A batch inconsistent with §6 is `Q1001` here, not
+ * the `W1008` a result batch is.
+ */
+private read_columnar(r: *Reader, ty: Type, path: string) -> Result[Value, CodecError]
+    val tree = under(path, column_tree(ty))?
+    val count = under(path, r.uvar())?
+    val rows = buf[Value]()
+
+    for k in 0..<count
+        val n = under(path, r.uvar())?
+        val payload = under(path, r.take(n))?
+        val batch = decode_batch(tree, payload) match
+            Ok(b) -> b
+            Err(e) -> return at(path, "Q1001", s"batch $k: ${e.message}")
+
+        if batch.tuple != 0 then return at(path, "Q1001", s"batch $k: a parameter batch's tuple is 0")
+
+        rows.extend(batch.rows().view())
+
+    Ok(Relation(rows))
+end read_columnar
+
+/** `p`'s block for parameters of `types`. A value that does not fit its type is `Q3001`, and a block
+ * of no tuples `Q4004`. A columnar relation goes as one batch, or none when it is empty.
+ */
+encode_params(types: []const Type, p: Params) -> Result[Buf[u8], CodecError]
+    if p.tuples.len() == 0 then return at("/params", "Q4004", "a parameter block holds at least one tuple")
+
+    val out = buf[u8]()
+
+    push_uvar(out, u64(p.tuples.len()))
+    push_uvar(out, u64(p.columnar.len()))
+
+    for i in p.columnar
+        if i >= u64(types.len) || !types[usize(i)].is_relation() then
+            return at("/params", "Q1001", s"parameter $i is not a relation-typed parameter")
+        push_uvar(out, i)
+
+    for t in 0..<p.tuples.len()
+        val values = p.tuples[t]
+
+        if values.len() != types.len then
+            return at(s"/params/$t", "Q3001", s"a tuple holds ${values.len()} values for ${types.len} parameters")
+
+        for i in 0..<types.len
+            val path = s"/params/$t/$i"
+
+            if listed(p.columnar, i) then
+                push_columnar(out, types[i], values[i], path)?
+            else
+                push_param(out, types[i], values[i], path)?
+
+    Ok(out)
+end encode_params
+
+private push_param(out: Buf[u8], ty: Type, v: Value, path: string) -> Result[unit, CodecError]
+    ty match
+        Nullable(inner) ->
+            if v.is_null() then
+                out.push(0)
+            else
+                out.push(1)
+                push_param(out, *inner, v, path)?
+        Record(fields) -> v match
+            Record(values) ->
+                if values.len() != fields.len() then return at(path, "Q3001", "a record value has the wrong number of fields")
+                for j in 0..<fields.len()
+                    push_param(out, fields[j].ty, values[j], s"$path/$j")?
+            _ -> return at(path, "Q3001", "a record was expected")
+        Union(variants) -> v match
+            Variant(tag, payload) ->
+                if tag >= variants.len() then return at(path, "Q3001", "the variant is past the union's variants")
+                push_uvar(out, u64(tag))
+                push_param(out, variants[tag].ty, *payload, path)?
+            _ -> return at(path, "Q3001", "a union value was expected")
+        Bag(elem) | List(elem) -> v match
+            Relation(elems) ->
+                push_uvar(out, u64(elems.len()))
+                for j in 0..<elems.len()
+                    push_param(out, *elem, elems[j], s"$path/$j")?
+            _ -> return at(path, "Q3001", "a relation was expected")
+        Named(schema, name) -> return at(path, "Q1001", s"the catalog type $schema.$name was not resolved")
+        _ -> under(path, push_literal(out, ty, v))?
+
+    Ok(())
+end push_param
+
+private push_columnar(out: Buf[u8], ty: Type, v: Value, path: string) -> Result[unit, CodecError]
+    val elems = v match
+        Relation(e) -> e
+        _ -> return at(path, "Q3001", "a relation was expected")
+
+    if elems.len() == 0
+        push_uvar(out, 0)
+        return Ok(())
+
+    push_uvar(out, 1)
+    push_bin(out, under(path, encode_batch(ty, elems.view(), 0))?.view())
+    Ok(())

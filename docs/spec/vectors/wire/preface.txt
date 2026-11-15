@@ -1,0 +1,5 @@
+# name: preface
+# spec: §1.2
+# direction: c2s
+# expect: accept the preface TERNDB\r\n
+54 45 52 4E 44 42 0D 0A

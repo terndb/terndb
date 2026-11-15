@@ -56,7 +56,9 @@ RFC 9266 (TLS channel binding `tls-exporter`), RFC 8446 (TLS 1.3), RFC 7301 (ALP
 
 Immediately after the TLS handshake (or at once on a Unix connection), the client MUST send the
 8-octet **preface** `54 45 52 4E 44 42 0D 0A` (`TERNDB\r\n`). The server MUST check it, and MUST close the
-connection without a response if it differs. The server sends no preface.
+connection without a response if it differs; it MAY close at the first octet that differs, and a connection
+that ends before 8 octets has a preface that differs. The reason a server logs is `W1001`, though it sends
+nothing. The server sends no preface.
 *Rationale: a client that reached an HTTP server, a Postgres server or a stray port fails at once and visibly.*
 
 ### 1.3 Frames
@@ -105,6 +107,12 @@ After the preface, each direction is a sequence of **frames**. A frame is a 16-o
 3. `Cancel` and `Credit` (§7) carry the id of the request they act on and do not open a stream; they are exempt
    from rule 1. One that names an id that is closed or was never opened MUST be ignored.
 4. Stream 0 carries the handshake, `Ping`/`Pong`, `Terminate`, `Goodbye`, and connection-fatal `Error`s.
+5. A type whose Stream column (§3.2) is 0 MUST travel on stream 0, and a response type other than `Error` MUST
+   NOT; either breach is `W1001`. A client MUST refuse, with `W1001`, a response on a stream that is not one of
+   its open requests: one it never sent, or one whose terminal message has arrived. On the server, a frame of a
+   request type that starts a message on a stream whose request has already arrived breaks rule 1 (`W1006`).
+6. A connection that ends inside a frame (a truncated header or payload) is `W1001`; one that ends between
+   the frames of a message is `W1007`.
 
 ### 1.6 Encoding primitives
 
@@ -173,6 +181,10 @@ client                                        server
    beyond it is refused with `W2008` (retryable, not fatal). It MUST be at least 16.
 4. `Ready.max_open_txns` is the number of explicit transactions a client may have open at once on the connection
    (`W2016` beyond it). It MUST be at least 1.
+5. A `Ready` whose `max_message_size`, `max_in_flight` or `max_open_txns` is below its least value, or whose
+   `role` is not `primary` or `replica`, is `W1001`, and the client closes the connection.
+6. A request refused for `max_in_flight` still consumes its request id (§1.5 rule 1), and does not count
+   against the limit.
 
 ### 2.4 Authentication methods
 
@@ -328,15 +340,18 @@ Credit        := uvar octets
 ```
 
 1. A list in `wire_versions` or `tree_versions` that is empty or not strictly descending by major is `W1001`.
-2. `user` and `database` MUST be non-empty; an unknown database is `W3004` and is reported only after
-   authentication has succeeded (before it, the failure is `W3001`).
+2. `user` and `database` MUST be non-empty, and so must `auth_methods` (`W1001`); an unknown database is
+   `W3004` and is reported only after authentication has succeeded (before it, the failure is `W3001`).
 3. `SessionDefaults` gives the connection's defaults for every transaction it opens (§5.2). An absent field takes
-   the server's configured default. An out-of-range value is `W2011` (fatal during the handshake).
+   the server's configured default. An out-of-range value is `W2011` (fatal during the handshake). The client
+   sends `ClientHello` before the minor is known, so a `remote` or `remote_apply` default is allowed only when
+   some entry of `wire_versions` has `max_minor` ≥ 1, and is `W1001` otherwise; a server that then negotiates
+   wire 1.0 refuses it with `W1001` (§5.2 rule 5).
 4. `Terminate` asks the server to roll back every open transaction, cancel every in-flight request, and close.
    The server sends nothing further.
 5. `Goodbye` announces that the server will close: it accepts no new request after sending it (a request that
    arrives later is refused with `W4001`), lets in-flight requests run for up to `grace_ms`, cancels the rest with
-   `cancelled` (`details.reason = "shutdown"`), and closes. `code` is a `W4…` code.
+   `cancelled` (`details.reason = "shutdown"`), and closes. `code` is a `W4…` code; any other is `W1001`.
 6. The server MUST answer every `Ping` with a `Pong` carrying the same value, in the order the pings arrived.
 
 ### 3.5 Request messages
@@ -419,6 +434,11 @@ TxnStatus     := enum { committed, aborted, in_progress }
 Error         := §8.1
 ```
 
+1. A `result_type` that is present MUST be a relation type (§4.3 rule 3); any other, and a type node that does
+   not decode, is `W1008`.
+2. `Complete.counts` has one entry per parameter tuple, so it is never empty; `TxnStatus.commit` is present
+   exactly when the state is `committed`. A breach of either is `W1001`.
+
 ## 4. Requests
 
 ### 4.1 The tree envelope
@@ -428,6 +448,9 @@ Error         := §8.1
    compress it.
 2. The envelope's version MUST have the negotiated tree major and a minor no greater than the negotiated tree
    minor (`Q1005`, [QT] §13.5).
+3. A message is decoded with its envelope as opaque `bin` octets: an envelope the tree decoder refuses still
+   makes a well-formed message, and the refusal is the [QT] code of rule 1, never a `W` code (§8.3 rule 1). The
+   same holds for `params`, which is decoded by the statement's parameter types (§4.4 rule 7).
 
 ### 4.2 Parameter blocks
 
@@ -451,7 +474,9 @@ params := uvar tuple_count                    (≥ 1)
 4. Values that do not decode, or octets left over in `params`, are `Q1001`; a non-canonical value is `Q1003`;
    invalid UTF-8 in a `text` value is `Q1004`; null in a non-nullable position is `Q4005`. The error's `path` is
    `/params/<tuple>/<index>` (0-based), followed by `/<field or element index>` steps into a composite value
-   ([QT] §11.1).
+   ([QT] §11.1). A defect of the block itself (`tuple_count`, the `columnar` list, a count larger than the
+   octets left could hold) is at `/params`; octets left over after the last tuple are at `/params/<t>`, `t` the
+   last tuple's index.
 5. `tuple_count > 1` is a **parameter batch** ([QT] §10.3): the statement runs once per tuple, in order, within one
    transaction, atomically. The results for each tuple are kept apart (§6.4 `tuple`) and `Complete.counts` has
    one entry per tuple.
@@ -987,6 +1012,9 @@ ErrorEntry := str code
 8. A connection-fatal error is sent on stream 0 and the connection is then closed by its sender. The codes marked
    fatal in `errors.md` (every `W1…` and `W3…` code), and a handshake-time `Q1005` or `W2011`, are fatal; no other
    code is.
+9. A receiver refuses with `W1001` an `Error` whose `entries` is empty, whose `code` is not an area letter and
+   four digits, whose `details` are not sorted by key with unique keys, whose `span` ends before it starts, or
+   whose `retryable` disagrees with rule 5.
 
 ### 8.2 Codes of this document
 
@@ -1149,6 +1177,16 @@ vector to the stated value, re-encode it to the same octets, and refuse every `r
 | V23 | `cancel`, `credit` | §7 |
 | V24 | `goodbye` | §3.4 |
 | V25 | `union-257-variants`: a batch whose union uses 2-octet discriminants | §6.2.5 |
+
+A vector's file is `<name>.txt`, `<name>` as the table gives it. Its octets are whole frames, as the receiver
+reads them after the preface; a `reject` vector of a parameter block (V11) is a well-formed message whose
+`params` is refused when decoded by the envelope's types. These names are added to the table's: V8 is the pair
+`scram-exchange-c2s` (`ClientHello`, `AuthResponse`) and `scram-exchange-s2c` (`ServerHello`, `Ready`), since a
+file has one direction; V13's `txn-committed` without `commit` is `txn-committed-empty`; V14's states are
+`txn-status-committed`, `txn-status-aborted` and `txn-status-in-progress`; V16's no-null variant is
+`batch-nullable-no-null`. `wal-data` and `replica-status` are `replication.md` §15.1 and §15.2, at wire 1.1.
+V17–V21 and V25 are batch payloads of §6, checked by the result codec's own tests until their files are
+written.
 
 The C ABI conformance suite (`c-api.md`) MUST load V15–V21 through the embedded engine's own result for the same
 query and data, and compare `terndb_batch_bytes` to the vector.

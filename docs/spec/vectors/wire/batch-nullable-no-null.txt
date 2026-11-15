@@ -1,0 +1,8 @@
+# name: batch-nullable-no-null
+# spec: §6.4, §6.7
+# direction: s2c
+# expect: accept Batch on stream 7 of bag<{x: int32?}> with no null: rows {x: 7}, {x: 8}, {x: 9}; the validity buffer is empty
+20 00 00 00  92  00  00 00  07 00 00 00 00 00 00 00
+00  02  03 00  03 00  02  00 0C
+00 00 00 00 00 00 00
+07 00 00 00 08 00 00 00 09 00 00 00  00 00 00 00

@@ -1,0 +1,114 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{get_u16_le, get_u32_le, get_u64_le, push_u64_le}
+
+// The primitives of `wire-protocol.md` §1.6 as a control message reads and writes them. They are
+// `query-tree.md` §12.1's, read through `Reader`, but every defect of a control message is `W1001`
+// (§1.6): truncation, a non-minimal `uvar`, a `bool` or `opt` tag other than 0 or 1, an enum ordinal
+// past its values, and octets left over.
+
+private[terndb] malformed[T](what: string) -> Result[T, CodecError] = fail("W1001", what)
+
+/** The same refusal reported under `W1001`, whatever primitive it was found in. */
+private[terndb] as_malformed[T](r: Result[T, CodecError]) -> Result[T, CodecError] = r match
+    Ok(v) -> Ok(v)
+    Err(e) -> malformed(e.message)
+
+/** A control message's payload being read. */
+struct WireReader
+    r: Reader
+
+    uvar(*self) -> Result[u64, CodecError] = as_malformed(self.r.uvar())
+
+    flag(*self) -> Result[bool, CodecError] = as_malformed(self.r.flag())
+
+    str(*self) -> Result[string, CodecError] = as_malformed(self.r.str())
+
+    octets(*self, n: u64) -> Result[[]const u8, CodecError] = as_malformed(self.r.take(n))
+
+    /** A `bin`: a `uvar` length, then that many octets, copied out of the payload. */
+    bin(*self) -> Result[Buf[u8], CodecError]
+        val n = self.uvar()?
+        val out = buf[u8]()
+        out.extend(self.octets(n)?)
+        Ok(out)
+
+    /** Every octet left, copied: the tail of a message whose last field runs to its end. */
+    bin_rest(*self) -> Buf[u8]
+        val out = buf[u8]()
+        out.extend(self.r.bytes[self.r.at..])
+        self.r.at = self.r.bytes.len
+        out
+
+    octet(*self) ->Result[u8, CodecError] = as_malformed(self.r.byte())
+
+    le16(*self) -> Result[u16, CodecError] = Ok(get_u16_le(self.octets(2)?).unwrap())
+
+    le32(*self) -> Result[u32, CodecError] = Ok(get_u32_le(self.octets(4)?).unwrap())
+
+    le64(*self) -> Result[u64, CodecError] = Ok(get_u64_le(self.octets(8)?).unwrap())
+
+    /** An `i64`, little-endian two's complement: the replication messages' `send_time`. */
+    sle64(*self) -> Result[i64, CodecError] = Ok(i64.wrap(self.le64()?))
+
+    digest(*self) -> Result[[32]u8, CodecError]
+        var d: [32]u8 = [0; 32]
+        val b = self.octets(32)?
+
+        for i in 0..<32
+            d[i] = b[i]
+
+        Ok(d)
+
+    uuid(*self) -> Result[[16]u8, CodecError]
+        var u: [16]u8 = [0; 16]
+        val b = self.octets(16)?
+
+        for i in 0..<16
+            u[i] = b[i]
+
+        Ok(u)
+
+    /** An `enum` ordinal, which must be below `count`. */
+    ordinal(*self, count: u64) -> Result[u64, CodecError]
+        val v = self.uvar()?
+
+        if v >= count then return malformed(s"enum ordinal $v is past the enum's $count values")
+
+        Ok(v)
+
+    opt_uvar(*self) -> Result[Option[u64], CodecError] =
+        if self.flag()? then Ok(Some(self.uvar()?)) else Ok(None)
+
+    opt_bool(*self) -> Result[Option[bool], CodecError] =
+        if self.flag()? then Ok(Some(self.flag()?)) else Ok(None)
+
+    /** The whole payload has been read (§1.4 rule 4). */
+    done(self) -> Result[unit, CodecError]
+        if self.r.left() != 0 then return malformed("octets follow the message")
+
+        Ok(())
+end WireReader
+
+wire_reader(payload: []const u8) -> WireReader = WireReader(Reader(payload, 0))
+
+push_bin(out: Buf[u8], b: []const u8)
+    push_uvar(out, u64(b.len))
+    out.extend(b)
+
+push_flag(out: Buf[u8], b: bool) = out.push(if b then 1 else 0)
+
+push_opt_uvar(out: Buf[u8], v: Option[u64]) = v match
+    Some(n) ->
+        out.push(1)
+        push_uvar(out, n)
+    None -> out.push(0)
+
+push_opt_bool(out: Buf[u8], v: Option[bool]) = v match
+    Some(b) ->
+        out.push(1)
+        push_flag(out, b)
+    None -> out.push(0)
+
+push_i64_le(out: Buf[u8], v: i64) = push_u64_le(out, u64.wrap(v))

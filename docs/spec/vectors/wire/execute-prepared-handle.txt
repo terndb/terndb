@@ -1,0 +1,8 @@
+# name: execute-prepared-handle
+# spec: §3.5, §4.4 rule 4
+# direction: c2s
+# expect: accept ExecutePrepared on stream 5: txn 0, no implicit options, no ExecOptions, PlanRef handle 7, parameters $0 = 42 (int64)
+13 00 00 00  12  00  00 00  05 00 00 00 00 00 00 00
+00  00  00 00 00 00
+00 07
+0A  01 00  2A 00 00 00 00 00 00 00

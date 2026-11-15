@@ -1,0 +1,13 @@
+# name: begin
+# spec: §3.5, §5.2
+# direction: c2s
+# expect: accept Begin on stream 7 at wire 1.1: txn 1, every TxnOptions field present: isolation read_committed, synchronous remote, read_only true, after 0x0001000000000011, lock_timeout_ms 1000, replica_wait_timeout_ms 5000, max_lag_ms 250
+18 00 00 00  20  00  00 00  07 00 00 00 00 00 00 00
+01
+01 02
+01 02
+01 01
+01 91 80 80 80 80 80 40
+01 E8 07
+01 88 27
+01 FA 01

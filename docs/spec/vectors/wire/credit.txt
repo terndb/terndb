@@ -1,0 +1,6 @@
+# name: credit
+# spec: §3.4, §7.2
+# direction: c2s
+# expect: accept Credit of 65536 octets to request 5
+03 00 00 00  31  00  00 00  05 00 00 00 00 00 00 00
+80 80 04

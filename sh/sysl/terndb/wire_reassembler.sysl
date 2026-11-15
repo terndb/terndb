@@ -1,0 +1,236 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// Turning what one end receives back into whole messages (`wire-protocol.md` §1.3–§1.5, §2.3).
+// Frames of different streams interleave; on each stream a message is the frames up to the first with
+// `MORE = 0`. Every refusal is the connection-fatal code the section names, except a request past
+// `max_in_flight`, which is refused alone (`W2008`) while the connection carries on.
+
+/** Which end a reassembler serves: a server receives client-to-server types, a client the others. */
+enum Side
+    Server
+    Client
+
+/** The limits a receiver enforces (§2.3): the largest frame it announced, the largest message it
+ * accepts, and, on a server, how many requests may be open at once.
+ */
+struct Limits derives Eq
+    max_frame_size: u64
+    max_message_size: u64
+    max_in_flight: u64
+
+/** The limits in force before the handshake sets them: frames of 65,536 octets (§1.3 rule 3), messages
+ * of 16 MiB, and 16 requests in flight.
+ */
+handshake_limits() -> Limits = Limits(DefaultFrameSize, MinMessageSize, MinInFlight)
+
+/** A reassembled message, its payload not yet decoded (§1.4 rule 4). */
+struct RawMessage derives Eq
+    ty: u8
+    stream: u64
+    payload: Buf[u8]
+
+    decode(self, minor: u64) -> Result[Message, CodecError] = decode_payload(self.ty, self.payload.view(), minor)
+
+/** What a finished message comes to: the message, or the refusal of a request the receiver will not
+ * run, which the server answers with an `Error` on its stream.
+ */
+enum Arrival derives Eq
+    Whole(m: RawMessage)
+    Refused(stream: u64, code: string)
+
+private struct Partial
+    ty: u8
+    payload: Buf[u8]
+
+struct Reassembler
+    side: Side
+    /** The negotiated wire minor; 0 until `ServerHello` says otherwise. */
+    minor: u64
+    limits: Limits
+    /** The message being reassembled on each stream that has one. */
+    private open: Map[u64, &Partial]
+    /** A server's requests not yet answered by a terminal message; a client's requests sent and not
+     * yet ended by one.
+     */
+    private awaiting: Map[u64, bool]
+    /** A server's highest request id so far (§1.5 rule 1). */
+    private highest: u64
+    /** Octets received that do not yet make a whole frame. */
+    private pending: Buf[u8]
+    /** How many octets of the preface a server has checked. */
+    private preface_seen: usize
+    /** The refusal that ended the connection. Every refusal but `Refused` is fatal (§1.3 rule 2,
+     * §8.1 rule 8), so after one the reassembler gives it again for any further input.
+     */
+    private failed: Option[CodecError]
+
+    /** How many requests are open: on a server, received and not yet answered; on a client, sent
+     * and not yet ended.
+     */
+    in_flight(self) -> usize = self.awaiting.len()
+
+    /** A server has sent the terminal message of request `stream`, which no longer counts against
+     * `max_in_flight`.
+     */
+    answered(*self, stream: u64)
+        self.awaiting.remove(stream)
+
+    /** A client has sent request `stream`, whose responses it will now accept. */
+    sent(*self, stream: u64) = self.awaiting.put(stream, true)
+
+    /** One frame: its header and its `length` octets of payload. A message whose last frame this is
+     * comes back whole; a frame that only adds to one comes back as `None`.
+     */
+    feed(*self, h: FrameHeader, payload: []const u8) -> Result[Option[Arrival], CodecError]
+        self.failed match
+            Some(e) -> return Err(e)
+            None -> ()
+
+        val r = self.take_frame(h, payload)
+        self.note(r)
+        r
+
+    /** Keeps the refusal `r` carries, if it is one. */
+    private note[T](*self, r: Result[T, CodecError]) = r match
+        Err(e) -> self.failed = Some(e)
+        Ok(_) -> ()
+
+    private take_frame(*self, h: FrameHeader, payload: []const u8) -> Result[Option[Arrival], CodecError]
+        if payload.len != usize(h.length) then return malformed("a frame's payload is not its length")
+        if u64(h.length) > self.limits.max_frame_size then return fail("W1003", "a frame is larger than max_frame_size")
+
+        val toward = if self.side == Server then ToServer else ToClient
+        val info = check_type(h.ty, toward, self.minor)?
+
+        if h.more && h.length == 0 then return fail("W1007", "a frame with MORE set is empty")
+
+        info.stream match
+            Connection -> if h.stream != 0 then return malformed(s"type ${h.ty} travels on stream 0")
+            Answers -> if h.stream == 0 then return malformed(s"type ${h.ty} answers a request, never stream 0")
+            _ -> ()
+
+        val so_far = self.open.get(h.stream) match
+            Some(p) ->
+                if p.ty != h.ty then return fail("W1007", "a frame changes type inside a message")
+                p.payload.len()
+            None ->
+                self.start(h, info)?
+                0
+
+        if u64(so_far) + u64(h.length) > self.limits.max_message_size then
+            return fail("W1003", "a message is larger than max_message_size")
+
+        if h.more
+            self.open.get(h.stream) match
+                Some(p) -> p.payload.extend(payload)
+                None ->
+                    val p: &Partial = Partial(h.ty, buf())
+                    p.payload.extend(payload)
+                    self.open.put(h.stream, p)
+            return Ok(None)
+
+        val whole = buf[u8]()
+
+        self.open.get(h.stream) match
+            Some(p) ->
+                whole.extend(p.payload.view())
+                self.open.remove(h.stream)
+            None -> ()
+
+        whole.extend(payload)
+        Ok(Some(self.finish(RawMessage(h.ty, h.stream, whole), info)))
+    end take_frame
+
+    // The first frame of a message on a stream with none open: the request-id rule on a server, and
+    // on a client the rule that a response belongs to a request that is still open.
+    private start(*self, h: FrameHeader, info: TypeInfo) -> Result[unit, CodecError]
+        if self.side == Server && info.stream == Opens
+            if h.stream == 0 || h.stream <= self.highest then
+                return fail("W1006", s"request id ${h.stream} is zero or not above every earlier one")
+            self.highest = h.stream
+
+        if self.side == Client && h.stream != 0 && (info.stream == Answers || info.stream == AnswersOrConnection) then
+            if self.awaiting.get(h.stream).is_none() then
+                return malformed(s"a response on stream ${h.stream}, which is not an open request")
+
+        Ok(())
+
+    private finish(*self, m: RawMessage, info: TypeInfo) -> Arrival
+        if self.side == Server && info.stream == Opens
+            if u64(self.awaiting.len()) >= self.limits.max_in_flight then return Refused(m.stream, "W2008")
+            self.awaiting.put(m.stream, true)
+
+        if self.side == Client && info.kind == Terminal && m.stream != 0 then self.awaiting.remove(m.stream)
+
+        Whole(m)
+
+    /** Octets as they arrive from the transport: on a server the preface first (§1.2), then frames. A
+     * header is checked as soon as its 16 octets are in, so an oversize frame is refused before its
+     * payload is read; a frame cut short waits for the rest.
+     */
+    push(*self, chunk: []const u8) -> Result[Buf[Arrival], CodecError]
+        self.failed match
+            Some(e) -> return Err(e)
+            None -> ()
+
+        val r = self.take_octets(chunk)
+        self.note(r)
+        r
+
+    private take_octets(*self, chunk: []const u8) -> Result[Buf[Arrival], CodecError]
+        val out = buf[Arrival]()
+        var at: usize = 0
+
+        while self.side == Server && self.preface_seen < 8 && at < chunk.len
+            if chunk[at] != Preface[self.preface_seen] then return bad_preface()
+            self.preface_seen += 1
+            at += 1
+
+        self.pending.extend(chunk[at..])
+
+        var used: usize = 0
+
+        loop
+            val left = self.pending.view()[used..]
+
+            if left.len < HeaderSize then break
+
+            val h = parse_header(left)?
+
+            if u64(h.length) > self.limits.max_frame_size then return fail("W1003", "a frame is larger than max_frame_size")
+            if left.len < HeaderSize + usize(h.length) then break
+
+            self.take_frame(h, left[HeaderSize..<HeaderSize + usize(h.length)])? match
+                Some(a) -> out.push(a)
+                None -> ()
+
+            used += HeaderSize + usize(h.length)
+
+        if used > 0
+            val rest = buf[u8]()
+            rest.extend(self.pending.view()[used..])
+            self.pending = rest
+
+        Ok(out)
+    end take_octets
+
+    /** The transport has ended: octets of an unfinished frame are a truncated frame (`W1001`), and a
+     * message whose last frame never came is `W1007`.
+     */
+    end_of_input(self) -> Result[unit, CodecError]
+        self.failed match
+            Some(e) -> return Err(e)
+            None -> ()
+
+        if self.side == Server && self.preface_seen < 8 then return bad_preface()
+        if self.pending.len() != 0 then return malformed("the input ends inside a frame")
+        if self.open.len() != 0 then return fail("W1007", "the input ends inside a message")
+
+        Ok(())
+end Reassembler
+
+/** A receiver for `side`, before the handshake. */
+reassembler(side: Side) -> Reassembler = Reassembler(side, 0, handshake_limits(), map(), map(), 0, buf(), 0, None)

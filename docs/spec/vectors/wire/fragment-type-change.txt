@@ -1,0 +1,9 @@
+# name: fragment-type-change
+# spec: §1.4
+# direction: c2s
+# expect: reject W1007 (the first frame of fragmented-execute, then a Prepare frame on the same stream)
+14 00 00 00  11  01  00 00  01 00 00 00 00 00 00 00
+00  00  00 00 00 00  28
+01 00 01 01 02 69 64 03 00 01 1C 04 1A
+02 00 00 00  10  00  00 00  01 00 00 00 00 00 00 00
+00 00

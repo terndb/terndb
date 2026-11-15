@@ -1,0 +1,424 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The message catalogue (`wire-protocol.md` §3.4–§3.6, §8.1, `replication.md` §3–§5, §10): every kind
+// round-trips, every truncation and trailing octet is refused (§10.1 property 4), and each rule of a
+// grammar is refused at its value's edge, by the encoder and the decoder alike.
+
+octets(b: []const u8) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(b)
+    out
+
+strs(s: []const string) -> Buf[string]
+    val out = buf[string]()
+    out.extend(s)
+    out
+
+versions(v: []const Version) -> Buf[Version]
+    val out = buf[Version]()
+    out.extend(v)
+    out
+
+hello(wire: []const Version, max_frame_size: u64, defaults: SessionDefaults) -> ClientHello =
+    ClientHello(versions(wire), versions([Version(1, 0)]), "user", "app", "", strs(["scram-sha-256"]),
+        Some(octets("n,,n=user,r=abc".bytes)), max_frame_size, defaults, buf())
+
+server_hello(max_frame_size: u64) -> ServerHello =
+    ServerHello(1, 1, 1, 0, "terndb 0.0.1", max_frame_size, "token", buf(), "")
+
+ready(max_in_flight: u64, max_open_txns: u64, max_message_size: u64) -> Ready =
+    Ready(9, Primary, max_in_flight, max_open_txns, max_message_size, 100, 3, buf())
+
+every_txn_option() -> TxnOptions = TxnOptions(Some(Snapshot), Some(RemoteApply), Some(false), Some(77), Some(1), Some(2), Some(3))
+
+entry(code: string) -> ErrorEntry = ErrorEntry(code, "it failed", "/statement", buf(), None)
+
+wire_error(entries: []const ErrorEntry, retryable: bool) -> WireError =
+    WireError(entries_of(entries), retryable, Unaffected, Some(5), None)
+
+details(pairs: []const Detail) -> Buf[Detail]
+    val out = buf[Detail]()
+    out.extend(pairs)
+    out
+
+counts(c: []const u64) -> Buf[u64]
+    val out = buf[u64]()
+    out.extend(c)
+    out
+
+uuid_of(b: u8) -> [16]u8 = [b; 16]
+
+digest_of(b: u8) -> [32]u8 = [b; 32]
+
+/** One message of every kind, its fields away from their defaults where they have any. */
+every_kind() -> Buf[Message]
+    val e = ErrorEntry("Q3001", "type mismatch", "/statement/source", details([Detail("actual", "text"), Detail("expected", "int64")]), Some(SourceRange(4, 9)))
+    val pages = buf[PageRange]()
+    pages.push(PageRange(1, 8, 2))
+    val files = buf[SegmentFile]()
+    files.push(SegmentFile(0, 3, 4096))
+    val page = buf[u8]()
+    for i in 0..<2 * PageSize
+        page.push(u8.wrap(i))
+
+    val out = buf[Message]()
+    out.extend([
+        ClientHelloMsg(hello([Version(2, 0), Version(1, 1)], 1048576, SessionDefaults(Some(ReadCommitted), Some(Remote), Some(1), None, Some(3)))),
+        AuthResponse(octets("c=biws".bytes)),
+        Terminate,
+        Ping(0x0123_4567_89ab_cdef),
+        Prepare(7, octets([1, 0, 0])),
+        ExecuteMsg(Execute(0, Some(every_txn_option()), ExecOptions(Some(65536), Some(100), None, Some(250)), octets([1, 0]), octets([1, 0]), Some(4))),
+        ExecuteMsg(Execute(3, None, no_exec_options(), buf(), buf(), None)),
+        ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByHandle(7), octets([1, 0]))),
+        ExecutePreparedMsg(ExecutePrepared(2, None, no_exec_options(), ByDigest(digest_of(0xab)), octets([1, 0]))),
+        ClosePrepared(7),
+        Begin(1, every_txn_option()),
+        Begin(1, no_txn_options()),
+        Commit(1),
+        Rollback(1),
+        Savepoint(1, "sp"),
+        RollbackToSavepoint(1, "sp"),
+        ReleaseSavepoint(1, "sp"),
+        TransactionStatus(0x0001_0000_0000_0030),
+        Cancel,
+        Credit(65536),
+        ServerHelloMsg(server_hello(1048576)),
+        AuthChallenge(octets([1, 2, 3])),
+        ReadyMsg(ready(128, 16, MinMessageSize)),
+        Pong(0xfedc_ba98_7654_3210),
+        Goodbye("W4001", "shutting down", 30000),
+        Prepared(digest_of(0x11), 3, Some(bag(record([Field("id", Int64)])))),
+        Prepared(digest_of(0x11), 3, None),
+        ResultHeaderMsg(ResultHeader(4, 5, digest_of(0x22), Some(users_type()))),
+        BatchReply(hex(users_batch_hex)),
+        Complete(counts([2, 0, 7]), Some(9)),
+        OkReply,
+        TxnBegun(4, 5, ReadCommitted),
+        TxnCommitted(4, Some(6)),
+        TxnCommitted(4, None),
+        TxnStatus(Committed, Some(6)),
+        TxnStatus(Aborted, None),
+        TxnStatus(InProgress, None),
+        ErrorReply(wire_error([e, entry("Q3002")], false)),
+        ErrorReply(WireError(entries_of([entry("T1001")]), true, Closed, None, Some(2))),
+        Identify,
+        StartReplicationMsg(StartReplication(uuid_of(1), 2, 1, 0x0400_1000, "r1", "slot", true, MinWindow, 1)),
+        ReplicaStatusMsg(ReplicaStatus(10, 9, 8, 7, 6, 5, -4, 1, 1)),
+        FetchHistory(2),
+        StartBackupMsg(StartBackup(Pages, pages, "", true)),
+        StartBackupMsg(StartBackup(Full, buf(), "slot", false)),
+        Fence(3, uuid_of(9), "node-b"),
+        IdentityMsg(ServerIdentity(uuid_of(1), Fenced, 2, 2, 100, 90, 1, 2, 1, "terndb 0.0.1")),
+        WalDataMsg(WalData(64, 128, -1, 1, 2, octets([1, 2, 3]))),
+        PrimaryStatusMsg(PrimaryStatus(100, 99, 7, 2, 7, 3, 50)),
+        ReplicationEnd(1, 0x0400_2000),
+        History(octets("1\t0x04000000\n".bytes)),
+        BackupBeginMsg(BackupBegin(uuid_of(1), 1, 2, 3, 4, 5, 6, 5, 1, files)),
+        BackupDataMsg(BackupData(1, 3, 8, page)),
+        BackupEnd(0x0400_3000, 42),
+        FencedMsg(Fenced(3, uuid_of(9), 2, 100, 90))
+    ])
+    out
+end every_kind
+
+entries_of(entries: []const ErrorEntry) -> Buf[ErrorEntry]
+    val out = buf[ErrorEntry]()
+    out.extend(entries)
+    out
+
+payload_of(m: Message, minor: u64 = 1) -> Buf[u8] = encode_payload(m, minor).unwrap()
+
+/** The code `ty`'s payload `p` is refused with at `minor`, or "ok". */
+decode_code(ty: u8, p: []const u8, minor: u64 = 1) -> string = code_of(decode_payload(ty, p, minor))
+
+encode_code(m: Message, minor: u64 = 1) -> string = code_of(encode_payload(m, minor))
+
+/** A message whose payload ends where its last field does, so a shorter one is not a message. */
+ends_at_its_last_field(m: Message) -> bool = m match
+    BatchReply(_) | WalDataMsg(_) | BackupDataMsg(_) -> false
+    _ -> true
+
+@test
+every_kind_round_trips()
+    var seen: [256]bool = [false; 256]
+    var kinds = 0
+
+    for m in every_kind()
+        val p = payload_of(m)
+        val back = decode_payload(m.type_code(), p.view(), 1).unwrap()
+
+        assert(back == m, s"type ${m.type_code()} decodes to what was encoded")
+        same_bytes(payload_of(back), p, "it re-encodes to the same octets")
+
+        if !seen[m.type_code()]
+            seen[m.type_code()] = true
+            kinds += 1
+
+    // Every type of §3.2 and of replication.md §2.3: 31 and 15.
+    assert_eq(kinds, 46)
+
+@test
+every_truncated_payload_is_refused()
+    for m in every_kind()
+        if !ends_at_its_last_field(m) then continue
+
+        val p = payload_of(m)
+
+        for n in 0..<p.len()
+            assert_eq(decode_code(m.type_code(), p.view()[0..<n]), "W1001")
+
+@test
+a_trailing_octet_is_refused()
+    for m in every_kind()
+        if !ends_at_its_last_field(m) then continue
+
+        val p = payload_of(m)
+        p.push(0)
+        assert_eq(decode_code(m.type_code(), p.view()), "W1001")
+
+@test
+non_canonical_primitives_are_refused()
+    // A non-minimal uvar, in Credit and in a list count.
+    assert_eq(decode_code(0x31, hex("80 00").view()), "W1001")
+    assert_eq(decode_code(0x31, hex("00").view()), "ok")
+    assert_eq(decode_code(0x93, hex("81 00 02 00").view()), "W1001")
+    // An opt tag of 2, and a bool of 2.
+    assert_eq(decode_code(0xa1, hex("04 02 06").view()), "W1001")
+    assert_eq(decode_code(0x20, hex("01 00 00 01 02 00 00 00 00").view()), "W1001")
+    assert_eq(decode_code(0x20, hex("01 00 00 01 01 00 00 00 00").view()), "ok")
+    // An enum ordinal past its values: TxnBegun's isolation, Ready's role, PlanRef.
+    assert_eq(decode_code(0xa0, hex("04 05 02").view()), "ok")
+    assert_eq(decode_code(0xa0, hex("04 05 03").view()), "W1001")
+    assert_eq(decode_code(0x12, hex("00 00 00 00 00 00 02 07 00").view()), "W1001")
+    // A uvar past 64 bits.
+    assert_eq(decode_code(0x31, hex("FF FF FF FF FF FF FF FF FF 01").view()), "ok")
+    assert_eq(decode_code(0x31, hex("FF FF FF FF FF FF FF FF FF 02").view()), "W1001")
+
+@test
+a_type_beyond_the_minor_is_refused_both_ways()
+    for m in every_kind()
+        val ty = m.type_code()
+        val replication = (ty >= 0x60 && ty <= 0x6f) || ty >= 0xe0
+
+        if replication
+            assert_eq(encode_code(m, 0), "W1001")
+            assert_eq(decode_code(ty, payload_of(m).view(), 0), "W1001")
+
+    for ty in [u8(0x05), 0x66, 0x86, 0xe9]
+        assert_eq(decode_code(ty, [], 1), "W1001")
+
+@test
+a_remote_level_needs_wire_1_1()
+    for level in [Remote, RemoteApply]
+        val options = TxnOptions(None, Some(level), None, None, None, None, None)
+        val begin = Begin(1, options)
+
+        assert_eq(encode_code(begin, 0), "W1001")
+        assert_eq(encode_code(begin, 1), "ok")
+        assert_eq(decode_code(0x20, payload_of(begin).view(), 0), "W1001")
+
+        val implicit = ExecuteMsg(Execute(0, Some(options), no_exec_options(), buf(), buf(), None))
+        assert_eq(encode_code(implicit, 0), "W1001")
+
+    // off and on are 00 and 01 at wire 1.0, as the bool was (§5.2 rule 5).
+    assert_eq(decode_code(0x20, hex("01 00 01 01 00 00 00 00 00").view(), 0), "ok")
+
+    // A client offering only 1.0 names no remote default.
+    val defaults = SessionDefaults(None, Some(Remote), None, None, None)
+    assert_eq(encode_code(ClientHelloMsg(hello([Version(1, 0)], 65536, defaults))), "W1001")
+    assert_eq(encode_code(ClientHelloMsg(hello([Version(1, 1)], 65536, defaults))), "ok")
+
+@test
+implicit_options_on_an_explicit_transaction_are_w2011()
+    val m = ExecuteMsg(Execute(3, Some(no_txn_options()), no_exec_options(), buf(), buf(), None))
+    assert_eq(encode_code(m), "W2011")
+
+    val ok = ExecuteMsg(Execute(0, Some(no_txn_options()), no_exec_options(), buf(), buf(), None))
+    val p = payload_of(ok)
+    p[0] = 3
+    assert_eq(decode_code(0x11, p.view()), "W2011")
+
+    val prepared = ExecutePreparedMsg(ExecutePrepared(1, Some(no_txn_options()), no_exec_options(), ByHandle(1), buf()))
+    assert_eq(encode_code(prepared), "W2011")
+
+@test
+hello_version_lists_are_non_empty_and_strictly_descending()
+    assert_eq(encode_code(ClientHelloMsg(hello([Version(2, 0), Version(1, 3)], 65536, no_session_defaults()))), "ok")
+    assert_eq(encode_code(ClientHelloMsg(hello([Version(1, 0), Version(2, 0)], 65536, no_session_defaults()))), "W1001")
+    assert_eq(encode_code(ClientHelloMsg(hello([Version(1, 0), Version(1, 1)], 65536, no_session_defaults()))), "W1001")
+    assert_eq(encode_code(ClientHelloMsg(hello([], 65536, no_session_defaults()))), "W1001")
+
+    // The decoder refuses what the encoder would: lists the wire carries in the wrong order.
+    val p = payload_of(ClientHelloMsg(hello([Version(2, 0), Version(1, 0)], 65536, no_session_defaults())))
+    p[1] = 1
+    p[3] = 2
+    assert_eq(decode_code(0x01, p.view()), "W1001")
+
+@test
+hello_names_and_methods_are_non_empty()
+    val h = hello([Version(1, 0)], 65536, no_session_defaults())
+
+    for which in 0..<3
+        var bad = h
+        if which == 0 then bad.user = ""
+        if which == 1 then bad.database = ""
+        if which == 2 then bad.auth_methods = buf()
+        assert_eq(encode_code(ClientHelloMsg(bad)), "W1001")
+
+    var empty_app = h
+    empty_app.application = ""
+    assert_eq(encode_code(ClientHelloMsg(empty_app)), "ok")
+
+@test
+max_frame_size_is_between_65536_and_2_31_minus_1()
+    val sizes = [u64(65536), 65535, 0x7fff_ffff, 0x8000_0000]
+    val wants = ["ok", "W1001", "ok", "W1001"]
+
+    for i in 0..<4
+        assert_eq(encode_code(ClientHelloMsg(hello([Version(1, 0)], sizes[i], no_session_defaults()))), wants[i])
+        assert_eq(encode_code(ServerHelloMsg(server_hello(sizes[i]))), wants[i])
+
+    val p = payload_of(ServerHelloMsg(server_hello(65536)))
+    // The max_frame_size uvar 80 80 04 follows "terndb 0.0.1"; 65,535 is FF FF 03.
+    p[17] = 0xff
+    p[18] = 0xff
+    p[19] = 0x03
+    assert_eq(decode_code(0x81, p.view()), "W1001")
+
+@test
+ready_limits_hold_at_their_least_value_and_not_below()
+    assert_eq(encode_code(ReadyMsg(ready(16, 1, MinMessageSize))), "ok")
+    assert_eq(encode_code(ReadyMsg(ready(15, 1, MinMessageSize))), "W1001")
+    assert_eq(encode_code(ReadyMsg(ready(16, 0, MinMessageSize))), "W1001")
+    assert_eq(encode_code(ReadyMsg(ready(16, 1, MinMessageSize - 1))), "W1001")
+
+    var fenced = ready(16, 1, MinMessageSize)
+    fenced.role = Fenced
+    assert_eq(encode_code(ReadyMsg(fenced)), "W1001")
+
+    val p = payload_of(ReadyMsg(ready(16, 1, MinMessageSize)))
+    p[1] = 2
+    assert_eq(decode_code(0x83, p.view()), "W1001")
+    p[1] = 0
+    p[2] = 15
+    assert_eq(decode_code(0x83, p.view()), "W1001")
+
+@test
+an_error_keeps_section_8_1()
+    val e = ErrorEntry("Q3001", "m", "", details([Detail("a", "1"), Detail("b", "2")]), Some(SourceRange(3, 3)))
+    assert_eq(encode_code(ErrorReply(wire_error([e], false))), "ok")
+
+    assert_eq(encode_code(ErrorReply(wire_error([], false))), "W1001")
+
+    var unsorted = e
+    unsorted.details = details([Detail("b", "2"), Detail("a", "1")])
+    assert_eq(encode_code(ErrorReply(wire_error([unsorted], false))), "W1001")
+
+    var doubled = e
+    doubled.details = details([Detail("a", "1"), Detail("a", "2")])
+    assert_eq(encode_code(ErrorReply(wire_error([doubled], false))), "W1001")
+
+    var backwards = e
+    backwards.span = Some(SourceRange(4, 3))
+    assert_eq(encode_code(ErrorReply(wire_error([backwards], false))), "W1001")
+
+    for bad in ["serialization_failure", "q3001", "Q300", "Q30011", "Q30x1", ""]
+        assert_eq(encode_code(ErrorReply(wire_error([entry(bad)], false))), "W1001")
+
+@test
+retryable_is_set_exactly_for_the_retryable_codes()
+    for code in ["T1001", "T1007", "W2004", "W2008", "W4001", "S1001", "S1007"]
+        assert_eq(encode_code(ErrorReply(wire_error([entry(code)], true))), "ok")
+        assert_eq(encode_code(ErrorReply(wire_error([entry(code)], false))), "W1001")
+
+    for code in ["T2001", "D1001", "Q3001", "W1001", "S1002", "W2003"]
+        assert_eq(encode_code(ErrorReply(wire_error([entry(code)], false))), "ok")
+        assert_eq(encode_code(ErrorReply(wire_error([entry(code)], true))), "W1001")
+
+    // Only entries[0] decides.
+    assert_eq(encode_code(ErrorReply(wire_error([entry("Q3001"), entry("T1001")], false))), "ok")
+
+@test
+a_goodbye_carries_a_w4_code()
+    assert_eq(encode_code(Goodbye("W4002", "idle", 0)), "ok")
+    assert_eq(encode_code(Goodbye("W3001", "no", 0)), "W1001")
+    assert_eq(encode_code(Goodbye("shutting_down", "no", 0)), "W1001")
+
+@test
+complete_and_txn_status_keep_their_rules()
+    assert_eq(encode_code(Complete(counts([0]), None)), "ok")
+    assert_eq(encode_code(Complete(buf(), None)), "W1001")
+    assert_eq(encode_code(TxnStatus(Committed, None)), "W1001")
+    assert_eq(encode_code(TxnStatus(Aborted, Some(1))), "W1001")
+    assert_eq(encode_code(TxnStatus(InProgress, Some(1))), "W1001")
+    assert_eq(decode_code(0xa2, hex("00 00").view()), "W1001")
+    assert_eq(decode_code(0xa2, hex("01 01 05").view()), "W1001")
+
+@test
+a_result_type_that_is_not_one_is_w1008()
+    assert_eq(encode_code(Prepared(digest_of(1), 1, Some(Int64))), "W1008")
+    assert_eq(encode_code(ResultHeaderMsg(ResultHeader(1, 1, digest_of(1), Some(Int64)))), "W1008")
+
+    // Prepared's type node, kind 18 (bag), replaced by a well-formed int64 node, 03 00.
+    val p = payload_of(Prepared(digest_of(1), 1, Some(bag(Int64))))
+    assert_eq(decode_code(0x90, p.view()), "ok")
+    val scalar = octets(p.view()[0..<34])
+    scalar.extend([u8(3), 0])
+    assert_eq(decode_code(0x90, scalar.view()), "W1008")
+
+    val q = payload_of(ResultHeaderMsg(ResultHeader(1, 1, digest_of(1), Some(bag(Int64)))))
+    assert_eq(decode_code(0x91, q.view()), "ok")
+    // The type node's kind 18 (bag) becomes 3 (int64), whose payload must then be empty.
+    q[35] = 3
+    assert_eq(decode_code(0x91, q.view()), "W1008")
+
+@test
+an_envelope_crosses_unaltered_and_is_decoded_with_qt_codes()
+    val tree = hex("01 00 01 01 02 69 64 03 00 01 1c 04 1a 01 08 03 61 70 70 01 74 01 74 05 0e 02 65 71 02 01 05 01 74 02 69 64 03 01 00 00")
+    val m = Prepare(0, tree)
+    val back = decode_payload(0x10, payload_of(m).view(), 1).unwrap()
+
+    back match
+        Prepare(_, envelope) ->
+            same_bytes(envelope, tree, "the envelope's octets")
+            assert(envelope_of(envelope).is_ok(), "it decodes as [QT] §12.7's tree")
+        _ -> assert(false, "a Prepare")
+
+    // An envelope the tree decoder refuses is still a well-formed message; the refusal is [QT]'s.
+    val bad = hex("02 00")
+    assert_eq(decode_code(0x10, payload_of(Prepare(0, bad)).view()), "ok")
+    assert_eq(code_of(envelope_of(bad)), "Q1005")
+
+@test
+replication_fixed_headers_keep_their_rules()
+    assert_eq(encode_code(ReplicaStatusMsg(ReplicaStatus(1, 1, 1, 1, 1, 0, 0, 1, 2))), "W1001")
+    assert_eq(encode_code(PrimaryStatusMsg(PrimaryStatus(1, 1, 0, 1, 8, 0, 0))), "W1001")
+    assert_eq(encode_code(WalDataMsg(WalData(64, 128, 0, 1, 1, buf()))), "W1001")
+    assert_eq(encode_code(WalDataMsg(WalData(64, 66, 0, 1, 1, octets([1, 2])))), "ok")
+    assert_eq(encode_code(WalDataMsg(WalData(64, 65, 0, 1, 1, octets([1, 2])))), "W1001")
+    assert_eq(encode_code(StartReplicationMsg(StartReplication(uuid_of(1), 1, 1, 0, "", "", false, MinWindow - 1, 1))), "W1001")
+    assert_eq(encode_code(StartBackupMsg(StartBackup(Full, every_page_range(), "", false))), "W1001")
+    assert_eq(encode_code(StartBackupMsg(StartBackup(Pages, buf(), "", false))), "W1001")
+
+    val half = buf[u8]()
+    for _ in 0..<PageSize / 2
+        half.push(0)
+    assert_eq(encode_code(BackupDataMsg(BackupData(0, 1, 0, half))), "W1001")
+    assert_eq(encode_code(BackupDataMsg(BackupData(2, 1, 0, half))), "W1001")
+
+    // BackupData's 7 reserved octets are zero.
+    val p = hex("00 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00")
+    for _ in 0..<PageSize
+        p.push(0)
+    assert_eq(decode_code(0xe6, p.view()), "ok")
+    p[3] = 1
+    assert_eq(decode_code(0xe6, p.view()), "W1001")
+
+every_page_range() -> Buf[PageRange]
+    val out = buf[PageRange]()
+    out.push(PageRange(0, 0, 1))
+    out

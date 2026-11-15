@@ -1,0 +1,176 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{get_u16_le, get_u32_le, get_u64_le, push_u16_le, push_u32_le, push_u64_le}
+
+// The framing of the native protocol (`wire-protocol.md` §1): the preface, the 16-octet frame header,
+// the message-type registry with each type's direction and stream, and the fragmenter that splits a
+// message into frames. Everything here is a refusal with a registry code or a run of octets; nothing
+// reads a socket.
+
+/** The 8 octets a client sends before its first frame, `TERNDB\r\n` (§1.2). */
+val Preface: [8]u8 =[0x54, 0x45, 0x52, 0x4e, 0x44, 0x42, 0x0d, 0x0a]
+
+/** The octets of a frame header (§1.3). */
+const HeaderSize: usize = 16
+
+/** Flag bit 0 of a frame: more frames of the same message follow. */
+const MoreFlag: u8 = 0x01
+
+/** `max_frame_size` until the handshake sets it, and the least either side may announce (§2.3). */
+const DefaultFrameSize: u64 = 65536
+
+/** The most either side may announce as its `max_frame_size`: 2³¹ − 1 (§2.3 rule 1). */
+const MaxFrameSize: u64 = 0x7fff_ffff
+
+/** The least `Ready.max_message_size` a server may announce: 16 MiB (§2.3 rule 2). */
+const MinMessageSize: u64 = 16 * 1024 * 1024
+
+/** The least `Ready.max_in_flight` (§2.3 rule 3). */
+const MinInFlight: u64 = 16
+
+/** The preface's check: the first 8 octets a server reads (§1.2). Anything else, a short read
+ * included, is refused. The server closes without a response; `W1001` is the reason it logs.
+ */
+check_preface(first: []const u8) -> Result[unit, CodecError]
+    if first != Preface[..] then return bad_preface()
+
+    Ok(())
+
+private[terndb] bad_preface[T]() -> Result[T, CodecError] = fail("W1001", "the preface is not TERNDB\\r\\n")
+
+push_preface(out: Buf[u8]) = out.extend(Preface[..])
+
+/** A frame header, as §1.3 lays it out. `more` is flag bit 0; the other flag bits and the reserved
+ * field are zero in every header this type can hold.
+ */
+struct FrameHeader derives Eq
+    length: u32
+    ty: u8
+    more: bool
+    stream: u64
+
+/** The header at the start of `bytes`, whose layout and zero fields are checked (§1.3 rule 2). Fewer
+ * than 16 octets, a flag bit 1–7 or a non-zero reserved field is `W1001`. Whether the type exists and
+ * travels in this direction is `check_type`'s question, since it needs the negotiated minor.
+ */
+parse_header(bytes: []const u8) -> Result[FrameHeader, CodecError]
+    if bytes.len < HeaderSize then return fail("W1001", "a frame header is 16 octets")
+
+    val flags = bytes[5]
+
+    if flags & ~MoreFlag != 0 then return fail("W1001", "a frame sets a flag bit other than MORE")
+    if get_u16_le(bytes[6..]).unwrap() != 0 then return fail("W1001", "a frame's reserved field is not zero")
+
+    Ok(FrameHeader(get_u32_le(bytes).unwrap(), bytes[4], flags == MoreFlag, get_u64_le(bytes[8..]).unwrap()))
+
+push_header(out: Buf[u8], h: FrameHeader)
+    push_u32_le(out, h.length)
+    out.push(h.ty)
+    out.push(if h.more then MoreFlag else 0)
+    push_u16_le(out, 0)
+    push_u64_le(out, h.stream)
+
+// -- the type registry, §3.2 and replication.md §2.3 ---------------------------------------------
+
+/** Which way a message travels: the high bit of its type (§3.2). */
+enum Direction
+    ToServer
+    ToClient
+
+/** Which stream a type travels on: the registry's Stream column. */
+enum StreamRule
+    /** Stream 0, the connection itself. */
+    Connection
+    /** A new request id, which the message opens (§1.5 rule 1). */
+    Opens
+    /** The id of an earlier request it acts on, opening nothing (§1.5 rule 3). */
+    Target
+    /** The id of the request it answers. */
+    Answers
+    /** The request it answers, or stream 0 for a connection-fatal error: `Error` alone. */
+    AnswersOrConnection
+
+/** What a type's message is to its stream: the registry's Kind column. */
+enum TypeKind
+    Handshake
+    Control
+    Request
+    Partial
+    Terminal
+
+struct TypeInfo
+    stream: StreamRule
+    kind: TypeKind
+
+direction_of(ty: u8) -> Direction = if ty & 0x80 == 0 then ToServer else ToClient
+
+/** The registry entry of `ty` on a connection that negotiated wire minor `minor`, or `None` for a
+ * reserved type. The replication types exist from wire 1.1 (§2.2 rule 4, `replication.md` §2.3).
+ */
+type_info(ty: u8, minor: u64) -> Option[TypeInfo]
+    val info = ty match
+        0x01 | 0x02 -> TypeInfo(Connection, Handshake)
+        0x03 | 0x04 -> TypeInfo(Connection, Control)
+        0x10 | 0x11 | 0x12 | 0x13 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 -> TypeInfo(Opens, Request)
+        0x30 | 0x31 -> TypeInfo(Target, Control)
+        0x81 | 0x82 | 0x83 -> TypeInfo(Connection, Handshake)
+        0x84 | 0x85 -> TypeInfo(Connection, Control)
+        0x90 | 0x93 | 0x94 | 0xa0 | 0xa1 | 0xa2 -> TypeInfo(Answers, Terminal)
+        0x91 | 0x92 -> TypeInfo(Answers, Partial)
+        0xc0 -> TypeInfo(AnswersOrConnection, Terminal)
+        _ -> return if minor >= 1 then replication_info(ty) else None
+
+    Some(info)
+
+private replication_info(ty: u8) -> Option[TypeInfo]
+    val info = ty match
+        0x60 | 0x61 | 0x63 | 0x64 | 0x65 -> TypeInfo(Opens, Request)
+        0x62 -> TypeInfo(Target, Control)
+        0xe0 | 0xe3 | 0xe4 | 0xe7 | 0xe8 -> TypeInfo(Answers, Terminal)
+        0xe1 | 0xe2 | 0xe5 | 0xe6 -> TypeInfo(Answers, Partial)
+        _ -> return None
+
+    Some(info)
+
+/** `ty`'s registry entry, if it exists at `minor` and travels `toward` (§1.3 rule 2): otherwise `W1001`. */
+check_type(ty: u8, toward: Direction, minor: u64) -> Result[TypeInfo, CodecError]
+    val info = type_info(ty, minor) match
+        Some(i) -> i
+        None -> return fail("W1001", s"type $ty is reserved")
+
+    if direction_of(ty) != toward then return fail("W1001", s"type $ty travels the other way")
+
+    Ok(info)
+
+// -- the fragmenter, §1.4 -----------------------------------------------------------------------
+
+/** The frames of one message of type `ty` on `stream`, each payload at most `max_frame` octets, as the
+ * octets that go on the wire. A message with an empty payload is one empty frame; otherwise no frame is
+ * empty, which `MORE = 1` requires (§1.4 rule 1).
+ */
+fragment(ty: u8, stream: u64, payload: []const u8, max_frame: usize) -> Buf[u8]
+    val cuts = buf[usize]()
+    var at = max_frame
+
+    while at < payload.len
+        cuts.push(at)
+        at += max_frame
+
+    fragment_at(ty, stream, payload, cuts.view())
+
+/** The frames of one message split at the payload offsets `cuts`, which ascend strictly and lie
+ * strictly inside the payload: frame `i` carries the octets from cut `i − 1` to cut `i`.
+ */
+fragment_at(ty: u8, stream: u64, payload: []const u8, cuts: []const usize) -> Buf[u8]
+    val out = buf[u8]()
+    var from: usize = 0
+
+    for i in 0..cuts.len
+        val to = if i < cuts.len then cuts[i] else payload.len
+
+        push_header(out, FrameHeader(u32(to - from), ty, i < cuts.len, stream))
+        out.extend(payload[from..<to])
+        from = to
+
+    out

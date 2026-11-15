@@ -1,0 +1,221 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Reading a message's payload back into a `Message`. A payload is decoded only after reassembly, and
+// its length must be exactly what its grammar consumes (`wire-protocol.md` §1.4 rule 4): every
+// defect is `W1001`, except a result type that is not one (`W1008`, §6.4 rule 2) and the request
+// rules `check_message` gives other codes.
+
+/** The message of type `ty` whose whole payload is `payload`, on a connection at wire minor `minor`. */
+decode_payload(ty: u8, payload: []const u8, minor: u64) -> Result[Message, CodecError]
+    if type_info(ty, minor).is_none() then return malformed(s"type $ty is reserved")
+
+    var r = wire_reader(payload)
+    val m = read_message(&r, ty)?
+
+    r.done()?
+    check_message(m, minor)?
+    Ok(m)
+
+private read_message(r: *WireReader, ty: u8) -> Result[Message, CodecError]
+    val m = ty match
+        0x01 -> ClientHelloMsg(read_client_hello(r)?)
+        0x02 -> AuthResponse(r.bin()?)
+        0x03 -> Terminate
+        0x04 -> Ping(r.le64()?)
+        0x10 -> Prepare(r.uvar()?, r.bin()?)
+        0x11 -> ExecuteMsg(Execute(r.uvar()?, read_opt_txn_options(r)?, read_exec_options(r)?, r.bin()?, r.bin()?, r.opt_uvar()?))
+        0x12 -> ExecutePreparedMsg(ExecutePrepared(r.uvar()?, read_opt_txn_options(r)?, read_exec_options(r)?, read_plan(r)?, r.bin()?))
+        0x13 -> ClosePrepared(r.uvar()?)
+        0x20 -> Begin(r.uvar()?, read_txn_options(r)?)
+        0x21 -> Commit(r.uvar()?)
+        0x22 -> Rollback(r.uvar()?)
+        0x23 -> Savepoint(r.uvar()?, r.str()?)
+        0x24 -> RollbackToSavepoint(r.uvar()?, r.str()?)
+        0x25 -> ReleaseSavepoint(r.uvar()?, r.str()?)
+        0x26 -> TransactionStatus(r.uvar()?)
+        0x30 -> Cancel
+        0x31 -> Credit(r.uvar()?)
+        0x81 -> ServerHelloMsg(ServerHello(r.uvar()?, r.uvar()?, r.uvar()?, r.uvar()?, r.str()?, r.uvar()?, r.str()?, r.bin()?, r.str()?))
+        0x82 -> AuthChallenge(r.bin()?)
+        0x83 -> ReadyMsg(Ready(r.uvar()?, read_role(r, 2)?, r.uvar()?, r.uvar()?, r.uvar()?, r.uvar()?, r.uvar()?, r.bin()?))
+        0x84 -> Pong(r.le64()?)
+        0x85 -> Goodbye(r.str()?, r.str()?, r.uvar()?)
+        0x90 -> Prepared(r.digest()?, r.uvar()?, read_opt_type(r)?)
+        0x91 -> ResultHeaderMsg(ResultHeader(r.uvar()?, r.uvar()?, r.digest()?, read_opt_type(r)?))
+        0x92 -> BatchReply(r.bin_rest())
+        0x93 -> Complete(read_uvars(r)?, r.opt_uvar()?)
+        0x94 -> OkReply
+        0xa0 -> TxnBegun(r.uvar()?, r.uvar()?, read_isolation(r)?)
+        0xa1 -> TxnCommitted(r.uvar()?, r.opt_uvar()?)
+        0xa2 -> TxnStatus(read_txn_state(r)?, r.opt_uvar()?)
+        0xc0 -> ErrorReply(read_wire_error(r)?)
+        0x60 -> Identify
+        0x61 -> StartReplicationMsg(StartReplication(r.uuid()?, r.le32()?, r.le32()?, r.le64()?, r.str()?, r.str()?, r.flag()?, r.le64()?, r.uvar()?))
+        0x62 -> ReplicaStatusMsg(ReplicaStatus(r.le64()?, r.le64()?, r.le64()?, r.le64()?, r.le64()?, r.le64()?, r.sle64()?, r.le32()?, r.le32()?))
+        0x63 -> FetchHistory(r.le32()?)
+        0x64 -> StartBackupMsg(read_start_backup(r)?)
+        0x65 -> Fence(r.le32()?, r.uuid()?, r.str()?)
+        0xe0 -> IdentityMsg(ServerIdentity(r.uuid()?, read_role(r, 3)?, r.le32()?, r.le32()?, r.le64()?, r.le64()?, r.uvar()?, r.uvar()?, r.uvar()?, r.str()?))
+        0xe1 -> WalDataMsg(WalData(r.le64()?, r.le64()?, r.sle64()?, r.le32()?, r.le32()?, r.bin_rest()))
+        0xe2 -> PrimaryStatusMsg(PrimaryStatus(r.le64()?, r.le64()?, r.sle64()?, r.le32()?, r.le32()?, r.le64()?, r.le64()?))
+        0xe3 -> ReplicationEnd(r.le32()?, r.le64()?)
+        0xe4 -> History(r.bin()?)
+        0xe5 -> BackupBeginMsg(read_backup_begin(r)?)
+        0xe6 -> BackupDataMsg(read_backup_data(r)?)
+        0xe7 -> BackupEnd(r.le64()?, r.le64()?)
+        0xe8 -> FencedMsg(Fenced(r.le32()?, r.uuid()?, r.le32()?, r.le64()?, r.le64()?))
+        _ -> return malformed(s"type $ty is reserved")
+
+    Ok(m)
+end read_message
+
+private read_versions(r: *WireReader) -> Result[Buf[Version], CodecError]
+    val out = buf[Version]()
+
+    for _ in 0..<r.uvar()?
+        out.push(Version(r.uvar()?, r.uvar()?))
+
+    Ok(out)
+
+private read_strs(r: *WireReader) -> Result[Buf[string], CodecError]
+    val out = buf[string]()
+
+    for _ in 0..<r.uvar()?
+        out.push(r.str()?)
+
+    Ok(out)
+
+private read_uvars(r: *WireReader) -> Result[Buf[u64], CodecError]
+    val out = buf[u64]()
+
+    for _ in 0..<r.uvar()?
+        out.push(r.uvar()?)
+
+    Ok(out)
+
+private read_client_hello(r: *WireReader) -> Result[ClientHello, CodecError]
+    val wire = read_versions(r)?
+    val tree = read_versions(r)?
+    val user = r.str()?
+    val database = r.str()?
+    val application = r.str()?
+    val methods = read_strs(r)?
+    val initial = if r.flag()? then Some(r.bin()?) else None
+    val max_frame_size = r.uvar()?
+    val defaults = SessionDefaults(read_opt_isolation(r)?, read_opt_synchronous(r)?, r.opt_uvar()?, r.opt_uvar()?, r.opt_uvar()?)
+
+    Ok(ClientHello(wire, tree, user, database, application, methods, initial, max_frame_size, defaults, read_strs(r)?))
+
+private read_txn_options(r: *WireReader) -> Result[TxnOptions, CodecError] =
+    Ok(TxnOptions(read_opt_isolation(r)?, read_opt_synchronous(r)?, r.opt_bool()?, r.opt_uvar()?, r.opt_uvar()?, r.opt_uvar()?, r.opt_uvar()?))
+
+private read_opt_txn_options(r: *WireReader) -> Result[Option[TxnOptions], CodecError] =
+    if r.flag()? then Ok(Some(read_txn_options(r)?)) else Ok(None)
+
+private read_exec_options(r: *WireReader) -> Result[ExecOptions, CodecError] =
+    Ok(ExecOptions(r.opt_uvar()?, r.opt_uvar()?, r.opt_uvar()?, r.opt_uvar()?))
+
+private read_plan(r: *WireReader) -> Result[PlanRef, CodecError] =
+    if r.ordinal(2)? == 0 then Ok(ByHandle(r.uvar()?)) else Ok(ByDigest(r.digest()?))
+
+private read_isolation(r: *WireReader) -> Result[Isolation, CodecError] = r.ordinal(3)? match
+    0 -> Ok(Serializable)
+    1 -> Ok(Snapshot)
+    _ -> Ok(ReadCommitted)
+
+private read_opt_isolation(r: *WireReader) -> Result[Option[Isolation], CodecError] =
+    if r.flag()? then Ok(Some(read_isolation(r)?)) else Ok(None)
+
+private read_opt_synchronous(r: *WireReader) -> Result[Option[Synchronous], CodecError]
+    if !r.flag()? then return Ok(None)
+
+    val s = r.ordinal(4)? match
+        0 -> Off
+        1 -> On
+        2 -> Remote
+        _ -> RemoteApply
+
+    Ok(Some(s))
+
+/** A role whose grammar lists its first `count` values. */
+private read_role(r: *WireReader, count: u64) -> Result[Role, CodecError] = r.ordinal(count)? match
+    0 -> Ok(Primary)
+    1 -> Ok(Replica)
+    _ -> Ok(Fenced)
+
+private read_txn_state(r: *WireReader) -> Result[TxnState, CodecError] = r.ordinal(3)? match
+    0 -> Ok(Committed)
+    1 -> Ok(Aborted)
+    _ -> Ok(InProgress)
+
+private read_txn_effect(r: *WireReader) -> Result[TxnEffect, CodecError] = r.ordinal(3)? match
+    0 -> Ok(Unaffected)
+    1 -> Ok(Aborted)
+    _ -> Ok(Closed)
+
+/** An `opt<node Type>`: the node's own length bounds it, and what it holds must be a result type. */
+private read_opt_type(r: *WireReader) -> Result[Option[Type], CodecError]
+    if !r.flag()? then return Ok(None)
+
+    val start = r.r.at
+    r.uvar()?
+    val n = r.uvar()?
+    r.octets(n)?
+
+    Ok(Some(as_bad_batch(decode_result_type(r.r.bytes[start..<r.r.at]))?))
+
+private read_wire_error(r: *WireReader) -> Result[WireError, CodecError]
+    val entries = buf[ErrorEntry]()
+
+    for _ in 0..<r.uvar()?
+        val code = r.str()?
+        val message = r.str()?
+        val path = r.str()?
+        val details = buf[Detail]()
+
+        for _ in 0..<r.uvar()?
+            details.push(Detail(r.str()?, r.str()?))
+
+        val span = if r.flag()? then Some(SourceRange(r.uvar()?, r.uvar()?)) else None
+
+        entries.push(ErrorEntry(code, message, path, details, span))
+
+    Ok(WireError(entries, r.flag()?, read_txn_effect(r)?, r.opt_uvar()?, r.opt_uvar()?))
+end read_wire_error
+
+private read_start_backup(r: *WireReader) -> Result[StartBackup, CodecError]
+    val mode = if r.ordinal(2)? == 0 then Full else Pages
+    val pages = buf[PageRange]()
+
+    for _ in 0..<r.uvar()?
+        pages.push(PageRange(r.octet()?, r.le64()?, r.le64()?))
+
+    Ok(StartBackup(mode, pages, r.str()?, r.flag()?))
+
+private read_backup_begin(r: *WireReader) -> Result[BackupBegin, CodecError]
+    val uuid = r.uuid()?
+    val term = r.le32()?
+    val generation = r.le32()?
+    val redo_lsn = r.le64()?
+    val checkpoint_lsn = r.le64()?
+    val undo_low = r.le64()?
+    val format_current = r.le16()?
+    val format_min = r.le16()?
+    val wal_format = r.uvar()?
+    val files = buf[SegmentFile]()
+
+    for _ in 0..<r.uvar()?
+        files.push(SegmentFile(r.octet()?, r.le64()?, r.le32()?))
+
+    Ok(BackupBegin(uuid, term, generation, redo_lsn, checkpoint_lsn, undo_low, format_current, format_min, wal_format, files))
+end read_backup_begin
+
+private read_backup_data(r: *WireReader) -> Result[BackupData, CodecError]
+    val space = r.octet()?
+
+    for _ in 0..<7
+        if r.octet()? != 0 then return malformed("BackupData's reserved octets are not zero")
+
+    Ok(BackupData(space, r.le64()?, r.le64()?, r.bin_rest()))

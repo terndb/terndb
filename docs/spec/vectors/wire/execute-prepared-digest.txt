@@ -1,0 +1,9 @@
+# name: execute-prepared-digest
+# spec: §3.5, §4.4 rule 5
+# direction: c2s
+# expect: accept ExecutePrepared on stream 6: txn 0, no implicit options, no ExecOptions, PlanRef digest = prepared's shape, parameters $0 = 42 (int64)
+32 00 00 00  12  00  00 00  06 00 00 00 00 00 00 00
+00  00  00 00 00 00
+01
+7A ED 67 F0 E6 4D 64 2F 3A 8E 1C 44 37 52 C6 05 CA 5F 44 DF A4 8E E1 CF 59 76 10 6C 66 21 1D 14
+0A  01 00  2A 00 00 00 00 00 00 00

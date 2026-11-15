@@ -1,0 +1,6 @@
+# name: frame-reserved-nonzero
+# spec: §1.3
+# direction: c2s
+# expect: reject W1001 (the frame-header Ping with reserved octet 7 set)
+08 00 00 00  04  00  00 01  00 00 00 00 00 00 00 00
+EF CD AB 89 67 45 23 01

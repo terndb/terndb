@@ -1,0 +1,340 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Reassembly (`wire-protocol.md` §1.3–§1.5, §2.3): a message split at any frame boundary comes back
+// whole, streams interleave independently, each limit holds at its value and is refused one past it,
+// and every framing defect is refused with its code (§10.1 properties 2, 3, 9 and 10 at this layer).
+
+small_execute() -> Message = ExecuteMsg(Execute(0, None, no_exec_options(), hex(t127_hex), int_param(42), None))
+
+/** A server past its preface. */
+server() -> Reassembler
+    var r = reassembler(Server)
+    val pre = buf[u8]()
+    push_preface(pre)
+    r.push(pre.view()).unwrap()
+    r
+
+/** Every arrival of `frames`, pushed in one go. */
+all_of(r: *Reassembler, frames: []const u8) -> Result[Buf[Arrival], CodecError] = r.push(frames)
+
+whole(m: Message, stream: u64) -> Arrival = Whole(RawMessage(m.type_code(), stream, encode_payload(m, 1).unwrap()))
+
+frame(ty: u8, stream: u64, more: bool, payload: []const u8) -> Buf[u8]
+    val out = buf[u8]()
+    push_header(out, FrameHeader(u32(payload.len), ty, more, stream))
+    out.extend(payload)
+    out
+
+@test
+a_message_split_at_any_one_boundary_reassembles()
+    val m = small_execute()
+    val p = encode_payload(m, 1).unwrap()
+
+    for cut in 1..<p.len()
+        var r = server()
+        val got = all_of(&r, fragment_at(0x11, 1, p.view(), [cut]).view()).unwrap()
+
+        assert(got.len() == 1 && got[0] == whole(m, 1), s"cut at $cut")
+
+@test
+a_message_split_at_any_two_boundaries_reassembles()
+    val m = small_execute()
+    val p = encode_payload(m, 1).unwrap()
+
+    for a in 1..<p.len()
+        for b in a + 1..<p.len()
+            var r = server()
+            val got = all_of(&r, fragment_at(0x11, 1, p.view(), [a, b]).view()).unwrap()
+
+            assert(got.len() == 1 && got[0] == whole(m, 1), s"cuts at $a and $b")
+
+@test
+a_message_of_one_octet_frames_reassembles()
+    val m = small_execute()
+    var r = server()
+    val got = all_of(&r, fragment(0x11, 1, encode_payload(m, 1).unwrap().view(), 1).view()).unwrap()
+
+    assert(got.len() == 1 && got[0] == whole(m, 1), "one octet a frame")
+
+@test
+octets_arriving_in_any_chunk_size_reassemble()
+    val m = small_execute()
+    val wire = buf[u8]()
+    push_preface(wire)
+    wire.extend(fragment(0x11, 1, encode_payload(m, 1).unwrap().view(), 7).view())
+    wire.extend(encode_frames(Ping(5), 0, 1, 65536).unwrap().view())
+
+    for size in 1..wire.len()
+        var r = reassembler(Server)
+        val got = buf[Arrival]()
+        var at: usize = 0
+
+        while at < wire.len()
+            val to = if at + size < wire.len() then at + size else wire.len()
+            got.extend(r.push(wire.view()[at..<to]).unwrap().view())
+            at = to
+
+        assert_eq(code_of(r.end_of_input()), "ok")
+        assert(got.len() == 2 && got[0] == whole(m, 1) && got[1] == whole(Ping(5), 0), s"chunks of $size")
+
+@test
+interleaved_streams_reassemble_independently()
+    val a = small_execute()
+    val b = Prepare(3, hex(t127_hex))
+    val fa = fragment(0x11, 1, encode_payload(a, 1).unwrap().view(), 5)
+    val fb = fragment(0x10, 2, encode_payload(b, 1).unwrap().view(), 3)
+
+    // Alternate frames of the two messages, a Ping between each pair.
+    val wire = buf[u8]()
+    var ia: usize = 0
+    var ib: usize = 0
+
+    while ia < fa.len() || ib < fb.len()
+        if ia < fa.len()
+            val n = HeaderSize + usize(parse_header(fa.view()[ia..]).unwrap().length)
+            wire.extend(fa.view()[ia..<ia + n])
+            ia += n
+        if ib < fb.len()
+            val n = HeaderSize + usize(parse_header(fb.view()[ib..]).unwrap().length)
+            wire.extend(fb.view()[ib..<ib + n])
+            ib += n
+        wire.extend(encode_frames(Ping(1), 0, 1, 65536).unwrap().view())
+
+    var r = server()
+    val got = all_of(&r, wire.view()).unwrap()
+    var execs = 0
+    var prepares = 0
+
+    for x in got
+        if x == whole(a, 1) then execs += 1
+        if x == whole(b, 2) then prepares += 1
+
+    assert(execs == 1 && prepares == 1, "each stream's message comes back once and whole")
+
+    // Stream 2 opened after stream 1, so its id is greater, as rule 1 needs; the other order fails.
+    var r2 = server()
+    val flipped = fragment(0x10, 2, encode_payload(b, 1).unwrap().view(), 3)
+    flipped.extend(fa.view())
+    assert_eq(code_of(all_of(&r2, flipped.view())), "W1006")
+
+// -- §2.3 limits -------------------------------------------------------------------------------
+
+@test
+a_frame_of_max_frame_size_is_accepted_and_one_more_is_w1003()
+    val payload = buf[u8]()
+    for _ in 0..<65536
+        payload.push(0)
+
+    // A Credit's payload is parsed only on decoding; the reassembler takes any length.
+    var r = server()
+    assert_eq(all_of(&r, frame(0x31, 1, false, payload.view()).view()).unwrap().len(), 1)
+
+    payload.push(0)
+    var big = server()
+    assert_eq(code_of(all_of(&big, frame(0x31, 1, false, payload.view()).view())), "W1003")
+
+    // The header alone is refused, before the payload arrives.
+    var early = server()
+    assert_eq(code_of(early.push(frame(0x31, 1, false, payload.view()).view()[0..<HeaderSize])), "W1003")
+
+    // A larger limit after the handshake.
+    var after = server()
+    after.limits = Limits(65537, MinMessageSize, MinInFlight)
+    assert_eq(code_of(all_of(&after, frame(0x31, 1, false, payload.view()).view())), "ok")
+
+@test
+a_message_of_max_message_size_is_accepted_and_one_more_is_w1003()
+    var r = server()
+    r.limits = Limits(65536, 100, MinInFlight)
+
+    val p = buf[u8]()
+    for _ in 0..<100
+        p.push(1)
+
+    assert_eq(all_of(&r, fragment(0x11, 1, p.view(), 30).view()).unwrap().len(), 1)
+
+    p.push(1)
+    var big = server()
+    big.limits = Limits(65536, 100, MinInFlight)
+    assert_eq(code_of(all_of(&big, fragment(0x11, 1, p.view(), 30).view())), "W1003")
+
+    // Found at the frame that passes the limit, before the message's last frame: 150 octets in
+    // frames of 60, 60 and 30, of which the first two are pushed.
+    for _ in 0..<49
+        p.push(1)
+
+    var early = server()
+    early.limits = Limits(65536, 100, MinInFlight)
+    assert_eq(code_of(all_of(&early, fragment(0x11, 1, p.view(), 60).view()[0..<2 * HeaderSize + 120])), "W1003")
+
+@test
+the_request_past_max_in_flight_is_refused_alone()
+    var r = server()
+    val ping = encode_payload(Commit(1), 1).unwrap()
+
+    for s in 1..16
+        val got = all_of(&r, frame(0x21, u64(s), false, ping.view()).view()).unwrap()
+        assert(got[0] == Whole(RawMessage(0x21, u64(s), octets(ping.view()))), s"request $s")
+
+    assert_eq(r.in_flight(), 16)
+
+    val over = all_of(&r, frame(0x21, 17, false, ping.view()).view()).unwrap()
+    assert(over[0] == Refused(17, "W2008"), "the seventeenth is refused")
+    assert_eq(r.in_flight(), 16)
+
+    // An answered request frees its place.
+    r.answered(3)
+    assert(all_of(&r, frame(0x21, 18, false, ping.view()).view()).unwrap()[0] == Whole(RawMessage(0x21, 18, octets(ping.view()))), "18 runs")
+    assert_eq(r.in_flight(), 16)
+
+    // The refused id stays used.
+    var again = server()
+    for s in 1..17
+        all_of(&again, frame(0x21, u64(s), false, ping.view()).view()).unwrap()
+    again.answered(1)
+    assert_eq(code_of(all_of(&again, frame(0x21, 17, false, ping.view()).view())), "W1006")
+
+    // Cancel and Credit open nothing, so they are never refused for it.
+    assert(all_of(&r, frame(0x30, 3, false, []).view()).unwrap()[0] == Whole(RawMessage(0x30, 3, buf())), "Cancel")
+
+// -- framing defects ----------------------------------------------------------------------------
+
+@test
+frame_defects_are_w1001()
+    val ping = hex("08 00 00 00 04 00 00 00 00 00 00 00 00 00 00 00 01 02 03 04 05 06 07 08")
+
+    // Flag bits 7 and 1, each reserved octet, a reserved type, a server-to-client type, a notification
+    // type and, at wire 1.0, a replication type.
+    val ats = [usize(5), 5, 6, 7, 4, 4, 4, 4]
+    val octets_at = [u8(0x80), 0x02, 0x01, 0x10, 0x05, 0x84, 0x40, 0x60]
+
+    for i in 0..<ats.len
+        var r = server()
+        assert_eq(code_of(all_of(&r, with_octet(ping, ats[i], octets_at[i]).view())), "W1001")
+
+    var r = server()
+    assert_eq(all_of(&r, ping.view()).unwrap().len(), 1)
+
+@test
+a_connection_type_off_stream_0_and_a_response_on_stream_0_are_w1001()
+    var r = server()
+    assert_eq(code_of(all_of(&r, frame(0x04, 1, false, hex("00 00 00 00 00 00 00 00").view()).view())), "W1001")
+
+    var c = reassembler(Client)
+    assert_eq(code_of(c.push(frame(0x94, 0, false, []).view())), "W1001")
+
+    // An Error may travel on stream 0, the connection's.
+    var e = reassembler(Client)
+    val error = encode_frames(ErrorReply(wire_error([entry("W1001")], false)), 0, 0, 65536).unwrap()
+    assert_eq(e.push(error.view()).unwrap().len(), 1)
+
+@test
+an_empty_more_frame_and_a_type_change_are_w1007()
+    var r = server()
+    assert_eq(code_of(all_of(&r, frame(0x11, 1, true, []).view())), "W1007")
+
+    var t = server()
+    val two = frame(0x11, 1, true, [1, 2])
+    two.extend(frame(0x12, 1, false, [3]).view())
+    assert_eq(code_of(all_of(&t, two.view())), "W1007")
+
+    // A Cancel of a request whose message is still arriving is a type change on its stream.
+    var c = server()
+    val cancel = frame(0x11, 1, true, [1, 2])
+    cancel.extend(frame(0x30, 1, false, []).view())
+    assert_eq(code_of(all_of(&c, cancel.view())), "W1007")
+
+@test
+request_ids_are_non_zero_and_increasing()
+    val commit = encode_payload(Commit(1), 1).unwrap()
+
+    var zero = server()
+    assert_eq(code_of(all_of(&zero, frame(0x21, 0, false, commit.view()).view())), "W1006")
+
+    var r = server()
+    assert_eq(all_of(&r, frame(0x21, 5, false, commit.view()).view()).unwrap().len(), 1)
+    assert_eq(code_of(all_of(&r, frame(0x21, 9, false, commit.view()).view())), "ok")
+    // Not greater than 9, and a frame on stream 5, whose request is complete: a closed stream.
+    assert_eq(code_of(all_of(&r, frame(0x21, 7, false, commit.view()).view())), "W1006")
+
+    var closed = server()
+    all_of(&closed, frame(0x21, 5, false, commit.view()).view()).unwrap()
+    assert_eq(code_of(all_of(&closed, frame(0x21, 5, false, commit.view()).view())), "W1006")
+
+    // The refusal is fatal: whatever follows is refused with it.
+    assert_eq(code_of(all_of(&closed, frame(0x21, 6, false, commit.view()).view())), "W1006")
+    assert_eq(code_of(closed.end_of_input()), "W1006")
+    assert_eq(code_of(closed.feed(FrameHeader(1, 0x21, false, 7), commit.view())), "W1006")
+
+    var ignored = server()
+    all_of(&ignored, frame(0x21, 5, false, commit.view()).view()).unwrap()
+
+    // Cancel and Credit naming closed or never-opened ids pass through, for the session to ignore.
+    assert_eq(code_of(all_of(&ignored, frame(0x30, 5, false, []).view())), "ok")
+    assert_eq(code_of(all_of(&ignored, frame(0x31, 99, false, [0]).view())), "ok")
+
+@test
+a_response_on_a_stream_that_is_not_open_is_w1001()
+    val ok = encode_frames(OkReply, 4, 1, 65536).unwrap()
+
+    // Never sent.
+    var c = reassembler(Client)
+    assert_eq(code_of(c.push(ok.view())), "W1001")
+
+    // Sent, answered, then answered again: nothing follows a terminal message (§10.1 property 10).
+    var d = reassembler(Client)
+    d.sent(4)
+    assert_eq(d.push(ok.view()).unwrap().len(), 1)
+    assert_eq(d.in_flight(), 0)
+    assert_eq(code_of(d.push(ok.view())), "W1001")
+
+    // A partial response leaves the stream open.
+    var e = reassembler(Client)
+    e.sent(4)
+    e.push(encode_frames(BatchReply(hex(users_batch_hex)), 4, 1, 65536).unwrap().view()).unwrap()
+    assert_eq(e.in_flight(), 1)
+    assert_eq(code_of(e.push(ok.view())), "ok")
+    assert_eq(e.in_flight(), 0)
+
+@test
+a_bad_preface_is_refused_at_its_first_wrong_octet()
+    var r = reassembler(Server)
+    assert_eq(code_of(r.push(hex("54 45 52").view())), "ok")
+    assert_eq(code_of(r.push(hex("58").view())), "W1001")
+
+    var http = reassembler(Server)
+    assert_eq(code_of(http.push("GET / HTTP/1.1\r\n".bytes)), "W1001")
+
+    // A client receives no preface.
+    var c = reassembler(Client)
+    assert_eq(code_of(c.push(encode_frames(Pong(1), 0, 1, 65536).unwrap().view())), "ok")
+
+@test
+input_that_ends_early_is_refused()
+    var preface = reassembler(Server)
+    preface.push(hex("54 45 52 4E").view()).unwrap()
+    assert_eq(code_of(preface.end_of_input()), "W1001")
+
+    for n in 1..<HeaderSize + 2
+        var r = server()
+        val ping = encode_frames(Ping(1), 0, 1, 65536).unwrap()
+        r.push(ping.view()[0..<n]).unwrap()
+        assert_eq(code_of(r.end_of_input()), "W1001")
+
+    var message = server()
+    message.push(frame(0x11, 1, true, [1]).view()).unwrap()
+    assert_eq(code_of(message.end_of_input()), "W1007")
+
+@test
+the_replication_types_are_reassembled_only_from_wire_1_1()
+    val status = encode_frames(ReplicaStatusMsg(ReplicaStatus(1, 1, 1, 1, 1, 0, 0, 1, 0)), 1, 1, 65536).unwrap()
+
+    var old = server()
+    assert_eq(code_of(all_of(&old, status.view())), "W1001")
+
+    var r = server()
+    r.minor = 1
+    assert_eq(all_of(&r, status.view()).unwrap().len(), 1)

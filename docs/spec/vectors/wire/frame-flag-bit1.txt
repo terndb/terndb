@@ -1,0 +1,6 @@
+# name: frame-flag-bit1
+# spec: §1.3
+# direction: c2s
+# expect: reject W1001 (the frame-header Ping with flag bit 1 set)
+08 00 00 00  04  02  00 00  00 00 00 00 00 00 00 00
+EF CD AB 89 67 45 23 01

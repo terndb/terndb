@@ -1,0 +1,6 @@
+# name: transaction-status
+# spec: §3.5, §5.6
+# direction: c2s
+# expect: accept TransactionStatus on stream 10: txid 0x0001000000000030
+07 00 00 00  26  00  00 00  0A 00 00 00 00 00 00 00
+B0 80 80 80 80 80 40

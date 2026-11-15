@@ -1,0 +1,7 @@
+# name: txn-committed-empty
+# spec: §3.6, §5.4
+# direction: s2c
+# expect: accept TxnCommitted on stream 8: txid 0x0001000000000030, commit absent (the write set was empty)
+08 00 00 00  A1  00  00 00  08 00 00 00 00 00 00 00
+B0 80 80 80 80 80 40
+00

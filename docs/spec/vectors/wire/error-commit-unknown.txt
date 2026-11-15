@@ -1,0 +1,15 @@
+# name: error-commit-unknown
+# spec: §8.1 rule 7
+# direction: s2c
+# expect: accept Error on stream 13: one entry T2001 "commit outcome unknown", no path, details or span; retryable false, txn_state closed, txid 0x0001000000000030, no tuple
+2C 00 00 00  C0  00  00 00  0D 00 00 00 00 00 00 00
+01
+05 54 32 30 30 31
+16 63 6F 6D 6D 69 74 20 6F 75 74 63 6F 6D 65 20 75 6E 6B 6E 6F 77 6E
+00
+00
+00
+00
+02
+01 B0 80 80 80 80 80 40
+00

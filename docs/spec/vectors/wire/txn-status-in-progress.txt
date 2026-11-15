@@ -1,0 +1,6 @@
+# name: txn-status-in-progress
+# spec: §3.6, §5.6
+# direction: s2c
+# expect: accept TxnStatus on stream 10: in_progress, commit absent
+02 00 00 00  A2  00  00 00  0A 00 00 00 00 00 00 00
+02 00

@@ -1,0 +1,6 @@
+# name: frame-header
+# spec: §1.3, §3.4
+# direction: c2s
+# expect: accept Ping on stream 0, opaque 0x0123456789abcdef
+08 00 00 00  04  00  00 00  00 00 00 00 00 00 00 00
+EF CD AB 89 67 45 23 01

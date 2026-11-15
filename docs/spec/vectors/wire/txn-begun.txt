@@ -1,0 +1,8 @@
+# name: txn-begun
+# spec: §3.6, §5.2
+# direction: s2c
+# expect: accept TxnBegun on stream 7: txid 0x0001000000000030, snapshot 0x0001000000000011, effective read_committed
+0F 00 00 00  A0  00  00 00  07 00 00 00 00 00 00 00
+B0 80 80 80 80 80 40
+91 80 80 80 80 80 40
+02

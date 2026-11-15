@@ -1,0 +1,15 @@
+# name: client-hello-scram
+# spec: §3.4, §2.4
+# direction: c2s
+# expect: accept ClientHello: wire [(1, 1)], tree [(1, 0)], user "user", database "app", application "", methods ["scram-sha-256"], initial = RFC 7677's client-first-message "n,,n=user,r=rOprNGfwEbeRWgbNEkqO", max_frame_size 1048576, SessionDefaults all present (snapshot, on, lock 1000, statement 30000, replica wait 5000), compression ["zstd"]
+58 00 00 00  01  00  00 00  00 00 00 00 00 00 00 00
+01 01 01
+01 01 00
+04 75 73 65 72
+03 61 70 70
+00
+01 0D 73 63 72 61 6D 2D 73 68 61 2D 32 35 36
+01 20 6E 2C 2C 6E 3D 75 73 65 72 2C 72 3D 72 4F 70 72 4E 47 66 77 45 62 65 52 57 67 62 4E 45 6B 71 4F
+80 80 40
+01 01  01 01  01 E8 07  01 B0 EA 01  01 88 27
+01 04 7A 73 74 64

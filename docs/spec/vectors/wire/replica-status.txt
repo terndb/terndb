@@ -1,0 +1,13 @@
+# name: replica-status
+# spec: replication.md §5.4, §15.2
+# direction: c2s
+# expect: accept ReplicaStatus naming stream 1 at wire 1.1, as replication.md §15.2 prints it: received, flushed and applied 0x04001040, applied_commit 0x0001000000000011, oldest_snapshot 0x000100000000000f, probe 7, send_time 0x0006604557a988fc, fence_term 1, flags 0
+40 00 00 00  62  00  00 00  01 00 00 00 00 00 00 00
+40 10 00 04 00 00 00 00
+40 10 00 04 00 00 00 00
+40 10 00 04 00 00 00 00
+11 00 00 00 00 00 01 00
+0F 00 00 00 00 00 01 00
+07 00 00 00 00 00 00 00
+FC 88 A9 57 45 60 06 00
+01 00 00 00 00 00 00 00

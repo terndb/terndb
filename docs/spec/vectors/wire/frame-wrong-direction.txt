@@ -1,0 +1,6 @@
+# name: frame-wrong-direction
+# spec: §1.3, §3.2
+# direction: c2s
+# expect: reject W1001 (a Pong, 0x84, sent to the server)
+08 00 00 00  84  00  00 00  00 00 00 00 00 00 00 00
+EF CD AB 89 67 45 23 01

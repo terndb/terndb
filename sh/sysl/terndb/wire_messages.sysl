@@ -1,0 +1,385 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The messages of the native protocol: every grammar of `wire-protocol.md` §3.4–§3.6 and §8.1, and the
+// replication messages `replication.md` adds in wire 1.1 (§3–§5, §10). A message is its payload's
+// fields; its stream travels beside it, in the frame header.
+//
+// Three payloads are carried as the octets they arrived as. A tree envelope (§4.1) is the client's
+// canonical [QT] encoding, which the protocol never alters and the server validates with [QT] codes,
+// so it is read by `envelope_of` rather than by the message decoder. A parameter block (§4.2) is decoded
+// by its statement's parameter types, which only the statement knows (`decode_params`). A `Batch`
+// payload (§6.4) is decoded by its result's column tree, which only the request's `ResultHeader` gives
+// (`decode_batch`).
+
+/** A `(major, max_minor)` pair of `ClientHello`'s version lists (§2.2). */
+struct Version derives Eq
+    major: u64
+    max_minor: u64
+
+enum Isolation
+    Serializable
+    Snapshot
+    ReadCommitted
+
+/** [ISO] §6's commit levels. `Remote` and `RemoteApply` exist from wire 1.1 (§5.2 rule 5). */
+enum Synchronous
+    Off
+    On
+    Remote
+    RemoteApply
+
+/** A server's role: `Ready.role` takes the first two, `Identity.role` all three. */
+enum Role
+    Primary
+    Replica
+    Fenced
+
+/** `TxnStatus`'s answer (§5.6). */
+enum TxnState
+    Committed
+    Aborted
+    InProgress
+
+/** `Error.txn_state`: what became of the request's transaction (§8.1 rule 6). */
+enum TxnEffect
+    Unaffected
+    Aborted
+    Closed
+
+enum BackupMode
+    Full
+    Pages
+
+struct SessionDefaults derives Eq
+    isolation: Option[Isolation]
+    synchronous: Option[Synchronous]
+    lock_timeout_ms: Option[u64]
+    statement_timeout_ms: Option[u64]
+    replica_wait_timeout_ms: Option[u64]
+
+struct TxnOptions derives Eq
+    isolation: Option[Isolation]
+    synchronous: Option[Synchronous]
+    read_only: Option[bool]
+    after: Option[u64]
+    lock_timeout_ms: Option[u64]
+    replica_wait_timeout_ms: Option[u64]
+    max_lag_ms: Option[u64]
+
+struct ExecOptions derives Eq
+    credit: Option[u64]
+    batch_rows: Option[u64]
+    batch_bytes: Option[u64]
+    statement_timeout_ms: Option[u64]
+
+no_session_defaults() -> SessionDefaults = SessionDefaults(None, None, None, None, None)
+
+no_txn_options() -> TxnOptions = TxnOptions(None, None, None, None, None, None, None)
+
+no_exec_options() -> ExecOptions = ExecOptions(None, None, None, None)
+
+/** Which statement an `ExecutePrepared` runs (§4.4 rules 4 and 5). */
+enum PlanRef derives Eq
+    ByHandle(handle: u64)
+    ByDigest(shape: [32]u8)
+
+struct ClientHello derives Eq
+    wire_versions: Buf[Version]
+    tree_versions: Buf[Version]
+    user: string
+    database: string
+    application: string
+    auth_methods: Buf[string]
+    initial: Option[Buf[u8]]
+    max_frame_size: u64
+    defaults: SessionDefaults
+    compression: Buf[string]
+
+struct ServerHello derives Eq
+    wire_major: u64
+    wire_minor: u64
+    tree_major: u64
+    tree_minor: u64
+    server_version: string
+    max_frame_size: u64
+    auth_method: string
+    auth_data: Buf[u8]
+    compression: string
+
+struct Ready derives Eq
+    connection_id: u64
+    role: Role
+    max_in_flight: u64
+    max_open_txns: u64
+    max_message_size: u64
+    horizon: u64
+    catalog_version: u64
+    auth_final: Buf[u8]
+
+struct Execute derives Eq
+    txn: u64
+    implicit: Option[TxnOptions]
+    options: ExecOptions
+    envelope: Buf[u8]
+    params: Buf[u8]
+    prepare_as: Option[u64]
+
+struct ExecutePrepared derives Eq
+    txn: u64
+    implicit: Option[TxnOptions]
+    options: ExecOptions
+    plan: PlanRef
+    params: Buf[u8]
+
+struct ResultHeader derives Eq
+    txid: u64
+    snapshot: u64
+    shape: [32]u8
+    result_type: Option[Type]
+
+/** An error's source range in the envelope's spans ([QT] §5.4). */
+struct SourceRange derives Eq
+    start: u64
+    end: u64
+
+/** One `ErrorEntry` of an `Error`. Its `details` are a refusal's (`error.sysl`'s `Detail`). */
+struct ErrorEntry derives Eq
+    code: string
+    message: string
+    path: string
+    details: Buf[Detail]
+    span: Option[SourceRange]
+
+/** The entry that reports refusal `e`, with the source range of its node when the envelope gave one. */
+entry_of(e: CodecError, span: Option[SourceRange]) -> ErrorEntry = ErrorEntry(e.code, e.message, e.path, e.details, span)
+
+/** The `Error` message (§8.1). */
+struct WireError derives Eq
+    entries: Buf[ErrorEntry]
+    retryable: bool
+    txn_state: TxnEffect
+    txid: Option[u64]
+    tuple: Option[u64]
+
+// -- replication.md --------------------------------------------------------------------------
+
+/** `Identity` (`replication.md` §3), named apart from a column's `Identity`. */
+struct ServerIdentity derives Eq
+    db_uuid: [16]u8
+    role: Role
+    term: u32
+    fence_term: u32
+    durable_lsn: u64
+    applied_lsn: u64
+    wal_format: u64
+    wal_format_max: u64
+    format_current: u64
+    server_version: string
+
+struct StartReplication derives Eq
+    db_uuid: [16]u8
+    term: u32
+    fence_term: u32
+    start_lsn: u64
+    replica_name: string
+    slot: string
+    create_slot: bool
+    window: u64
+    wal_format_max: u64
+
+/** `ReplicaStatus`, a fixed 64-octet payload (`replication.md` §5.4). */
+struct ReplicaStatus derives Eq
+    received: u64
+    flushed: u64
+    applied: u64
+    applied_commit: u64
+    oldest_snapshot: u64
+    probe: u64
+    send_time: i64
+    fence_term: u32
+    flags: u32
+
+/** A `(space, first_page, count)` range of a `StartBackup` in `pages` mode. */
+struct PageRange derives Eq
+    space: u8
+    first_page: u64
+    count: u64
+
+struct StartBackup derives Eq
+    mode: BackupMode
+    pages: Buf[PageRange]
+    slot: string
+    fast: bool
+
+/** A `(space, segment_no, page_count)` entry of `BackupBegin.files`. */
+struct SegmentFile derives Eq
+    space: u8
+    segment_no: u64
+    page_count: u32
+
+struct BackupBegin derives Eq
+    db_uuid: [16]u8
+    term: u32
+    generation: u32
+    redo_lsn: u64
+    checkpoint_lsn: u64
+    undo_low: u64
+    format_current: u16
+    format_min: u16
+    wal_format: u64
+    files: Buf[SegmentFile]
+
+/** `BackupData`: a fixed 24-octet header, then whole 16 KiB pages (`replication.md` §4.1). */
+struct BackupData derives Eq
+    space: u8
+    segment_no: u64
+    first_page: u64
+    pages: Buf[u8]
+
+/** `WalData`: a fixed 32-octet header, then at least one WAL octet (`replication.md` §5.2). */
+struct WalData derives Eq
+    start_lsn: u64
+    durable_lsn: u64
+    send_time: i64
+    timeline: u32
+    term: u32
+    wal: Buf[u8]
+
+/** `PrimaryStatus`, a fixed 48-octet payload (`replication.md` §5.3). */
+struct PrimaryStatus derives Eq
+    durable_lsn: u64
+    durable_commit: u64
+    send_time: i64
+    term: u32
+    flags: u32
+    echo: u64
+    horizon: u64
+
+struct Fenced derives Eq
+    fence_term: u32
+    promotion_id: [16]u8
+    timeline: u32
+    flushed: u64
+    applied: u64
+
+/** The octets of one page of `BackupData` ([DISK] §2.1). */
+const PageSize: usize = 16384
+
+/** `PrimaryStatus.flags` bits 0–2; the rest are zero. */
+const PrimaryStatusFlags: u32 = 0x7
+
+/** `ReplicaStatus.flags` bit 0; the rest are zero. */
+const ReplicaStatusFlags: u32 = 0x1
+
+/** The least `StartReplication.window` (`replication.md` §5.1). */
+const MinWindow: u64 = 1048576
+
+/** One message of the protocol, by its registry name. Three variants are renamed so that they do
+ * not read as something else: `OkReply` is the registry's `Ok`, `BatchReply` its `Batch` and
+ * `ErrorReply` its `Error`.
+ */
+enum Message derives Eq
+    ClientHelloMsg(m: ClientHello)
+    AuthResponse(data: Buf[u8])
+    Terminate
+    Ping(opaque: u64)
+    Prepare(handle: u64, envelope: Buf[u8])
+    ExecuteMsg(m: Execute)
+    ExecutePreparedMsg(m: ExecutePrepared)
+    ClosePrepared(handle: u64)
+    Begin(txn: u64, options: TxnOptions)
+    Commit(txn: u64)
+    Rollback(txn: u64)
+    Savepoint(txn: u64, name: string)
+    RollbackToSavepoint(txn: u64, name: string)
+    ReleaseSavepoint(txn: u64, name: string)
+    TransactionStatus(txid: u64)
+    Cancel
+    Credit(octets: u64)
+    ServerHelloMsg(m: ServerHello)
+    AuthChallenge(data: Buf[u8])
+    ReadyMsg(m: Ready)
+    Pong(opaque: u64)
+    Goodbye(code: string, message: string, grace_ms: u64)
+    Prepared(shape: [32]u8, catalog_version: u64, result_type: Option[Type])
+    ResultHeaderMsg(m: ResultHeader)
+    BatchReply(payload: Buf[u8])
+    Complete(counts: Buf[u64], commit: Option[u64])
+    OkReply
+    TxnBegun(txid: u64, snapshot: u64, effective: Isolation)
+    TxnCommitted(txid: u64, commit: Option[u64])
+    TxnStatus(state: TxnState, commit: Option[u64])
+    ErrorReply(e: WireError)
+    Identify
+    StartReplicationMsg(m: StartReplication)
+    ReplicaStatusMsg(m: ReplicaStatus)
+    FetchHistory(term: u32)
+    StartBackupMsg(m: StartBackup)
+    Fence(term: u32, promotion_id: [16]u8, candidate: string)
+    IdentityMsg(m: ServerIdentity)
+    WalDataMsg(m: WalData)
+    PrimaryStatusMsg(m: PrimaryStatus)
+    ReplicationEnd(term: u32, end_lsn: u64)
+    History(file: Buf[u8])
+    BackupBeginMsg(m: BackupBegin)
+    BackupDataMsg(m: BackupData)
+    BackupEnd(stop_lsn: u64, stop_commit: u64)
+    FencedMsg(m: Fenced)
+
+    /** The message's type octet (§3.2, `replication.md` §2.3). */
+    type_code(self) -> u8 = self match
+        ClientHelloMsg(_) -> 0x01
+        AuthResponse(_) -> 0x02
+        Terminate -> 0x03
+        Ping(_) -> 0x04
+        Prepare(_, _) -> 0x10
+        ExecuteMsg(_) -> 0x11
+        ExecutePreparedMsg(_) -> 0x12
+        ClosePrepared(_) -> 0x13
+        Begin(_, _) -> 0x20
+        Commit(_) -> 0x21
+        Rollback(_) -> 0x22
+        Savepoint(_, _) -> 0x23
+        RollbackToSavepoint(_, _) -> 0x24
+        ReleaseSavepoint(_, _) -> 0x25
+        TransactionStatus(_) -> 0x26
+        Cancel -> 0x30
+        Credit(_) -> 0x31
+        ServerHelloMsg(_) -> 0x81
+        AuthChallenge(_) -> 0x82
+        ReadyMsg(_) -> 0x83
+        Pong(_) -> 0x84
+        Goodbye(_, _, _) -> 0x85
+        Prepared(_, _, _) -> 0x90
+        ResultHeaderMsg(_) -> 0x91
+        BatchReply(_) -> 0x92
+        Complete(_, _) -> 0x93
+        OkReply -> 0x94
+        TxnBegun(_, _, _) -> 0xa0
+        TxnCommitted(_, _) -> 0xa1
+        TxnStatus(_, _) -> 0xa2
+        ErrorReply(_) -> 0xc0
+        Identify -> 0x60
+        StartReplicationMsg(_) -> 0x61
+        ReplicaStatusMsg(_) -> 0x62
+        FetchHistory(_) -> 0x63
+        StartBackupMsg(_) -> 0x64
+        Fence(_, _, _) -> 0x65
+        IdentityMsg(_) -> 0xe0
+        WalDataMsg(_) -> 0xe1
+        PrimaryStatusMsg(_) -> 0xe2
+        ReplicationEnd(_, _) -> 0xe3
+        History(_) -> 0xe4
+        BackupBeginMsg(_) -> 0xe5
+        BackupDataMsg(_) -> 0xe6
+        BackupEnd(_, _) -> 0xe7
+        FencedMsg(_) -> 0xe8
+    end type_code
+end Message
+
+/** The tree envelope an `Execute` or `Prepare` carries, decoded and checked as [QT] specifies, with
+ * [QT] codes (§4.1 rule 1). The octets themselves are never altered.
+ */
+envelope_of(octets: Buf[u8]) -> Result[Envelope, CodecError] = decode_envelope(octets.view())

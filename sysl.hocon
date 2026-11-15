@@ -5,7 +5,9 @@
 // the wire and the C ABI share (`docs/spec/wire-protocol.md` §6); and value semantics: equality,
 // the total order and the canonical text forms (`docs/spec/query-tree.md` §3); and the query tree
 // itself: its nodes, their canonical encoding, the structural checks and the shape digest
-// (`docs/spec/query-tree.md` §5–§12).
+// (`docs/spec/query-tree.md` §5–§12); and the native wire protocol's framing and messages: the preface,
+// frames, fragmentation and reassembly, every message of its catalogue and parameter blocks
+// (`docs/spec/wire-protocol.md` §1–§4, §8.1, `docs/spec/replication.md` §2–§5).
 
 package {
   name    = "terndb"

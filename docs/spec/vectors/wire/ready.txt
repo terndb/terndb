@@ -1,0 +1,15 @@
+# name: ready
+# spec: §3.4, §2.3
+# direction: s2c
+# expect: accept Ready: connection_id 1, role primary, max_in_flight 128, max_open_txns 16, max_message_size 67108864, horizon 1000, catalog_version 1, auth_final = RFC 7677's server-final-message "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+3B 00 00 00  83  00  00 00  00 00 00 00 00 00 00 00
+01
+00
+80 01
+10
+80 80 80 20
+E8 07
+01
+2E
+76 3D 36 72 72 69 54 52 42 69 32 33 57 70 52 52 2F 77 74 75 70 2B 6D 4D 68 55 5A 55 6E 2F 64 42
+35 6E 4C 54 4A 52 73 6A 6C 39 35 47 34 3D

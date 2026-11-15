@@ -1,0 +1,6 @@
+# name: commit
+# spec: §3.5, §5.4
+# direction: c2s
+# expect: accept Commit on stream 8: txn 1
+01 00 00 00  21  00  00 00  08 00 00 00 00 00 00 00
+01

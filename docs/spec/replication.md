@@ -180,6 +180,12 @@ during streaming — `WalData`, `PrimaryStatus`, `ReplicaStatus` — have fixed-
 tables, so that both ends parse them without a varint loop; their payloads are exactly the sizes the tables give
 ([WIRE] §1.4 rule 4).
 
+A receiver refuses with `W1001`, as it does any malformed message: a flag bit that a table marks zero set in
+`PrimaryStatus` or `ReplicaStatus`; a `WalData` with no WAL octet, or whose bytes reach past its `durable_lsn`
+(§5.2 rule 1); a `BackupData` whose reserved octets are not zero or whose pages are not one or more whole
+16,384-octet pages; a `space` other than 0 or 1; a `StartBackup` in `full` mode that lists pages, or in `pages`
+mode that lists none; and a `StartReplication` whose `window` is below 1,048,576.
+
 ## 3. Identify and history
 
 ```

@@ -1,0 +1,6 @@
+# name: uvar-non-minimal
+# spec: §1.6
+# direction: c2s
+# expect: reject W1001 (a Credit on stream 5 whose octets is 0 written as 80 00)
+02 00 00 00  31  00  00 00  05 00 00 00 00 00 00 00
+80 00

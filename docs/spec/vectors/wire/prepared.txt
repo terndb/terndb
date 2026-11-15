@@ -1,0 +1,8 @@
+# name: prepared
+# spec: §3.6, §4.4
+# direction: s2c
+# expect: accept Prepared on stream 4: shape = the SHA-256 shape digest of the [QT] §12.7 envelope (its shape form is [QT] §12.7's second listing), catalog_version 3, result_type bag<{id: int64}>
+2C 00 00 00  90  00  00 00  04 00 00 00 00 00 00 00
+7A ED 67 F0 E6 4D 64 2F 3A 8E 1C 44 37 52 C6 05 CA 5F 44 DF A4 8E E1 CF 59 76 10 6C 66 21 1D 14
+03
+01  12 08 10 06 01 02 69 64 03 00

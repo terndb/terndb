@@ -1,0 +1,20 @@
+# name: error-validation
+# spec: §8.1
+# direction: s2c
+# expect: accept Error on stream 12 with two entries: Q3001 "type mismatch" at /statement/source/rows/0/1 with details actual = text, expected = int64 and span 18..23; then Q3001 "type mismatch" at /statement/source/rows/1/1 with no details and no span; retryable false, txn_state unaffected, no txid, no tuple
+84 00 00 00  C0  00  00 00  0C 00 00 00 00 00 00 00
+02
+05 51 33 30 30 31
+0D 74 79 70 65 20 6D 69 73 6D 61 74 63 68
+1A 2F 73 74 61 74 65 6D 65 6E 74 2F 73 6F 75 72 63 65 2F 72 6F 77 73 2F 30 2F 31
+02  06 61 63 74 75 61 6C 04 74 65 78 74  08 65 78 70 65 63 74 65 64 05 69 6E 74 36 34
+01 12 17
+05 51 33 30 30 31
+0D 74 79 70 65 20 6D 69 73 6D 61 74 63 68
+1A 2F 73 74 61 74 65 6D 65 6E 74 2F 73 6F 75 72 63 65 2F 72 6F 77 73 2F 31 2F 31
+00
+00
+00
+00
+00
+00

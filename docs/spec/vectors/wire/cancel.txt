@@ -1,0 +1,5 @@
+# name: cancel
+# spec: §3.4, §7.3
+# direction: c2s
+# expect: accept Cancel of request 5
+00 00 00 00  30  00  00 00  05 00 00 00 00 00 00 00

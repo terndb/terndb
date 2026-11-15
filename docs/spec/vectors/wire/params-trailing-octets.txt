@@ -1,0 +1,11 @@
+# name: params-trailing-octets
+# spec: §4.2 rule 4
+# direction: c2s
+# expect: reject Q1001 path /params/0 (an Execute on stream 3 whose message is well formed, with the [QT] §12.7 envelope and $0 = 42 followed by one octet FF; the parameter block is refused when it is decoded by the envelope's parameter types)
+3C 00 00 00  11  00  00 00  03 00 00 00 00 00 00 00
+00  00  00 00 00 00
+28
+01 00 01 01 02 69 64 03 00 01 1C 04 1A 01 08 03 61 70 70 01 74 01 74 05 0E 02 65 71 02 01 05 01 74
+02 69 64 03 01 00 00
+0B  01 00  2A 00 00 00 00 00 00 00  FF
+00

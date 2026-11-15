@@ -1,0 +1,6 @@
+# name: pong
+# spec: §1.3, §3.4
+# direction: s2c
+# expect: accept Pong on stream 0, opaque 0x0123456789abcdef (the frame-header Ping's value)
+08 00 00 00  84  00  00 00  00 00 00 00 00 00 00 00
+EF CD AB 89 67 45 23 01

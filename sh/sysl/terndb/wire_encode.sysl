@@ -1,0 +1,511 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{push_u16_le, push_u32_le, push_u64_le}
+
+// Writing a message's payload (`wire-protocol.md` §3, §8.1, `replication.md` §3–§5, §10), and the
+// rules both directions check: `check_message` is run by the encoder before it writes and by the
+// decoder after it reads, so a message either side accepts is one the other accepts.
+
+/** `m`'s payload, on a connection that negotiated wire minor `minor`. A message that breaks a rule of
+ * its grammar is refused with the code a receiver would refuse it with; a type or value beyond the
+ * minor is `W1001` (§2.2 rule 4).
+ */
+encode_payload(m: Message, minor: u64) -> Result[Buf[u8], CodecError]
+    if type_info(m.type_code(), minor).is_none() then return malformed(s"type ${m.type_code()} is not in wire 1.$minor")
+
+    check_message(m, minor)?
+
+    val out = buf[u8]()
+
+    m match
+        ClientHelloMsg(h) -> push_client_hello(out, h)
+        AuthResponse(data) | AuthChallenge(data) | History(data) -> push_bin(out, data.view())
+        Terminate | Cancel | OkReply | Identify -> ()
+        Ping(v) | Pong(v) -> push_u64_le(out, v)
+        Prepare(handle, envelope) ->
+            push_uvar(out, handle)
+            push_bin(out, envelope.view())
+        ExecuteMsg(e) ->
+            push_uvar(out, e.txn)
+            push_opt_txn_options(out, e.implicit)
+            push_exec_options(out, e.options)
+            push_bin(out, e.envelope.view())
+            push_bin(out, e.params.view())
+            push_opt_uvar(out, e.prepare_as)
+        ExecutePreparedMsg(e) ->
+            push_uvar(out, e.txn)
+            push_opt_txn_options(out, e.implicit)
+            push_exec_options(out, e.options)
+            e.plan match
+                ByHandle(h) ->
+                    push_uvar(out, 0)
+                    push_uvar(out, h)
+                ByDigest(d) ->
+                    push_uvar(out, 1)
+                    out.extend(d[..])
+            push_bin(out, e.params.view())
+        ClosePrepared(n) | Commit(n) | Rollback(n) | TransactionStatus(n) | Credit(n) -> push_uvar(out, n)
+        Begin(txn, options) ->
+            push_uvar(out, txn)
+            push_txn_options(out, options)
+        Savepoint(txn, name) | RollbackToSavepoint(txn, name) | ReleaseSavepoint(txn, name) ->
+            push_uvar(out, txn)
+            push_str(out, name)
+        ServerHelloMsg(h) -> push_server_hello(out, h)
+        ReadyMsg(r) -> push_ready(out, r)
+        Goodbye(code, message, grace_ms) ->
+            push_str(out, code)
+            push_str(out, message)
+            push_uvar(out, grace_ms)
+        Prepared(shape, catalog_version, result_type) ->
+            out.extend(shape[..])
+            push_uvar(out, catalog_version)
+            push_opt_type(out, result_type)
+        ResultHeaderMsg(h) ->
+            push_uvar(out, h.txid)
+            push_uvar(out, h.snapshot)
+            out.extend(h.shape[..])
+            push_opt_type(out, h.result_type)
+        BatchReply(payload) -> out.extend(payload.view())
+        Complete(counts, commit) ->
+            push_uvar(out, u64(counts.len()))
+            for c in counts
+                push_uvar(out, c)
+            push_opt_uvar(out, commit)
+        TxnBegun(txid, snapshot, effective) ->
+            push_uvar(out, txid)
+            push_uvar(out, snapshot)
+            push_uvar(out, isolation_ordinal(effective))
+        TxnCommitted(txid, commit) ->
+            push_uvar(out, txid)
+            push_opt_uvar(out, commit)
+        TxnStatus(state, commit) ->
+            push_uvar(out, txn_state_ordinal(state))
+            push_opt_uvar(out, commit)
+        ErrorReply(e) -> push_wire_error(out, e)
+        StartReplicationMsg(s) -> push_start_replication(out, s)
+        ReplicaStatusMsg(s) -> push_replica_status(out, s)
+        FetchHistory(term) -> push_u32_le(out, term)
+        StartBackupMsg(s) -> push_start_backup(out, s)
+        Fence(term, promotion_id, candidate) ->
+            push_u32_le(out, term)
+            out.extend(promotion_id[..])
+            push_str(out, candidate)
+        IdentityMsg(i) -> push_identity(out, i)
+        WalDataMsg(w) ->
+            push_u64_le(out, w.start_lsn)
+            push_u64_le(out, w.durable_lsn)
+            push_i64_le(out, w.send_time)
+            push_u32_le(out, w.timeline)
+            push_u32_le(out, w.term)
+            out.extend(w.wal.view())
+        PrimaryStatusMsg(p) ->
+            push_u64_le(out, p.durable_lsn)
+            push_u64_le(out, p.durable_commit)
+            push_i64_le(out, p.send_time)
+            push_u32_le(out, p.term)
+            push_u32_le(out, p.flags)
+            push_u64_le(out, p.echo)
+            push_u64_le(out, p.horizon)
+        ReplicationEnd(term, end_lsn) ->
+            push_u32_le(out, term)
+            push_u64_le(out, end_lsn)
+        BackupBeginMsg(b) -> push_backup_begin(out, b)
+        BackupDataMsg(d) ->
+            out.push(d.space)
+            for _ in 0..<7
+                out.push(0)
+            push_u64_le(out, d.segment_no)
+            push_u64_le(out, d.first_page)
+            out.extend(d.pages.view())
+        BackupEnd(stop_lsn, stop_commit) ->
+            push_u64_le(out, stop_lsn)
+            push_u64_le(out, stop_commit)
+        FencedMsg(f) ->
+            push_u32_le(out, f.fence_term)
+            out.extend(f.promotion_id[..])
+            push_u32_le(out, f.timeline)
+            push_u64_le(out, f.flushed)
+            push_u64_le(out, f.applied)
+
+    Ok(out)
+end encode_payload
+
+/** `m` as the frames that carry it on `stream`, each payload at most `max_frame` octets (§1.4). */
+encode_frames(m: Message, stream: u64, minor: u64, max_frame: usize) -> Result[Buf[u8], CodecError] =
+    Ok(fragment(m.type_code(), stream, encode_payload(m, minor)?.view(), max_frame))
+
+// -- the records ----------------------------------------------------------------------------------
+
+private push_versions(out: Buf[u8], versions: Buf[Version])
+    push_uvar(out, u64(versions.len()))
+
+    for v in versions
+        push_uvar(out, v.major)
+        push_uvar(out, v.max_minor)
+
+private push_strs(out: Buf[u8], strs: Buf[string])
+    push_uvar(out, u64(strs.len()))
+
+    for s in strs
+        push_str(out, s)
+
+private push_client_hello(out: Buf[u8], h: ClientHello)
+    push_versions(out, h.wire_versions)
+    push_versions(out, h.tree_versions)
+    push_str(out, h.user)
+    push_str(out, h.database)
+    push_str(out, h.application)
+    push_strs(out, h.auth_methods)
+
+    h.initial match
+        Some(b) ->
+            out.push(1)
+            push_bin(out, b.view())
+        None -> out.push(0)
+
+    push_uvar(out, h.max_frame_size)
+    push_opt_isolation(out, h.defaults.isolation)
+    push_opt_synchronous(out, h.defaults.synchronous)
+    push_opt_uvar(out, h.defaults.lock_timeout_ms)
+    push_opt_uvar(out, h.defaults.statement_timeout_ms)
+    push_opt_uvar(out, h.defaults.replica_wait_timeout_ms)
+    push_strs(out, h.compression)
+end push_client_hello
+
+private push_server_hello(out: Buf[u8], h: ServerHello)
+    push_uvar(out, h.wire_major)
+    push_uvar(out, h.wire_minor)
+    push_uvar(out, h.tree_major)
+    push_uvar(out, h.tree_minor)
+    push_str(out, h.server_version)
+    push_uvar(out, h.max_frame_size)
+    push_str(out, h.auth_method)
+    push_bin(out, h.auth_data.view())
+    push_str(out, h.compression)
+
+private push_ready(out: Buf[u8], r: Ready)
+    push_uvar(out, r.connection_id)
+    push_uvar(out, role_ordinal(r.role))
+    push_uvar(out, r.max_in_flight)
+    push_uvar(out, r.max_open_txns)
+    push_uvar(out, r.max_message_size)
+    push_uvar(out, r.horizon)
+    push_uvar(out, r.catalog_version)
+    push_bin(out, r.auth_final.view())
+
+private push_txn_options(out: Buf[u8], o: TxnOptions)
+    push_opt_isolation(out, o.isolation)
+    push_opt_synchronous(out, o.synchronous)
+    push_opt_bool(out, o.read_only)
+    push_opt_uvar(out, o.after)
+    push_opt_uvar(out, o.lock_timeout_ms)
+    push_opt_uvar(out, o.replica_wait_timeout_ms)
+    push_opt_uvar(out, o.max_lag_ms)
+
+private push_opt_txn_options(out: Buf[u8], o: Option[TxnOptions]) = o match
+    Some(options) ->
+        out.push(1)
+        push_txn_options(out, options)
+    None -> out.push(0)
+
+private push_exec_options(out: Buf[u8], o: ExecOptions)
+    push_opt_uvar(out, o.credit)
+    push_opt_uvar(out, o.batch_rows)
+    push_opt_uvar(out, o.batch_bytes)
+    push_opt_uvar(out, o.statement_timeout_ms)
+
+private push_opt_isolation(out: Buf[u8], i: Option[Isolation]) = push_opt_uvar(out, i.map(isolation_ordinal))
+
+private push_opt_synchronous(out: Buf[u8], s: Option[Synchronous]) = push_opt_uvar(out, s.map(synchronous_ordinal))
+
+private push_opt_type(out: Buf[u8], t: Option[Type]) = t match
+    Some(ty) ->
+        out.push(1)
+        encode_type(ty, out)
+    None -> out.push(0)
+
+private push_wire_error(out: Buf[u8], e: WireError)
+    push_uvar(out, u64(e.entries.len()))
+
+    for entry in e.entries
+        push_str(out, entry.code)
+        push_str(out, entry.message)
+        push_str(out, entry.path)
+        push_uvar(out, u64(entry.details.len()))
+
+        for d in entry.details
+            push_str(out, d.key)
+            push_str(out, d.value)
+
+        entry.span match
+            Some(s) ->
+                out.push(1)
+                push_uvar(out, s.start)
+                push_uvar(out, s.end)
+            None -> out.push(0)
+
+    push_flag(out, e.retryable)
+    push_uvar(out, txn_effect_ordinal(e.txn_state))
+    push_opt_uvar(out, e.txid)
+    push_opt_uvar(out, e.tuple)
+end push_wire_error
+
+private push_identity(out: Buf[u8], i: ServerIdentity)
+    out.extend(i.db_uuid[..])
+    push_uvar(out, role_ordinal(i.role))
+    push_u32_le(out, i.term)
+    push_u32_le(out, i.fence_term)
+    push_u64_le(out, i.durable_lsn)
+    push_u64_le(out, i.applied_lsn)
+    push_uvar(out, i.wal_format)
+    push_uvar(out, i.wal_format_max)
+    push_uvar(out, i.format_current)
+    push_str(out, i.server_version)
+
+private push_start_replication(out: Buf[u8], s: StartReplication)
+    out.extend(s.db_uuid[..])
+    push_u32_le(out, s.term)
+    push_u32_le(out, s.fence_term)
+    push_u64_le(out, s.start_lsn)
+    push_str(out, s.replica_name)
+    push_str(out, s.slot)
+    push_flag(out, s.create_slot)
+    push_u64_le(out, s.window)
+    push_uvar(out, s.wal_format_max)
+
+private push_replica_status(out: Buf[u8], s: ReplicaStatus)
+    push_u64_le(out, s.received)
+    push_u64_le(out, s.flushed)
+    push_u64_le(out, s.applied)
+    push_u64_le(out, s.applied_commit)
+    push_u64_le(out, s.oldest_snapshot)
+    push_u64_le(out, s.probe)
+    push_i64_le(out, s.send_time)
+    push_u32_le(out, s.fence_term)
+    push_u32_le(out, s.flags)
+
+private push_start_backup(out: Buf[u8], s: StartBackup)
+    push_uvar(out, if s.mode == Full then 0 else 1)
+    push_uvar(out, u64(s.pages.len()))
+
+    for p in s.pages
+        out.push(p.space)
+        push_u64_le(out, p.first_page)
+        push_u64_le(out, p.count)
+
+    push_str(out, s.slot)
+    push_flag(out, s.fast)
+
+private push_backup_begin(out: Buf[u8], b: BackupBegin)
+    out.extend(b.db_uuid[..])
+    push_u32_le(out, b.term)
+    push_u32_le(out, b.generation)
+    push_u64_le(out, b.redo_lsn)
+    push_u64_le(out, b.checkpoint_lsn)
+    push_u64_le(out, b.undo_low)
+    push_u16_le(out, b.format_current)
+    push_u16_le(out, b.format_min)
+    push_uvar(out, b.wal_format)
+    push_uvar(out, u64(b.files.len()))
+
+    for f in b.files
+        out.push(f.space)
+        push_u64_le(out, f.segment_no)
+        push_u32_le(out, f.page_count)
+end push_backup_begin
+
+// -- the enums' ordinals, in their grammars' order -------------------------------------------------
+
+private[terndb] isolation_ordinal(i: Isolation) -> u64 = i match
+    Serializable -> 0
+    Snapshot -> 1
+    ReadCommitted -> 2
+
+private[terndb] synchronous_ordinal(s: Synchronous) -> u64 = s match
+    Off -> 0
+    On -> 1
+    Remote -> 2
+    RemoteApply -> 3
+
+private[terndb] role_ordinal(r: Role) -> u64 = r match
+    Primary -> 0
+    Replica -> 1
+    Fenced -> 2
+
+private[terndb] txn_state_ordinal(s: TxnState) -> u64 = s match
+    Committed -> 0
+    Aborted -> 1
+    InProgress -> 2
+
+private[terndb] txn_effect_ordinal(e: TxnEffect) -> u64 = e match
+    Unaffected -> 0
+    Aborted -> 1
+    Closed -> 2
+
+// -- the rules of the grammars -----------------------------------------------------------------
+
+/** The rules a message's fields must keep beyond its grammar's primitives, each with the code a
+ * receiver refuses its breach with.
+ */
+check_message(m: Message, minor: u64) -> Result[unit, CodecError]
+    m match
+        ClientHelloMsg(h) -> check_client_hello(h)?
+        ServerHelloMsg(h) -> check_frame_size(h.max_frame_size)?
+        ReadyMsg(r) -> check_ready(r)?
+        Goodbye(code, _, _) ->
+            if !is_code(code) || code.bytes[0] != u8('W') || code.bytes[1] != u8('4') then
+                return malformed("a Goodbye's code is not a W4 code")
+        Prepared(_, _, t) -> check_result_type(t)?
+        ResultHeaderMsg(h) -> check_result_type(h.result_type)?
+        ExecuteMsg(e) -> check_exec(e.txn, e.implicit, minor)?
+        ExecutePreparedMsg(e) -> check_exec(e.txn, e.implicit, minor)?
+        Begin(_, options) -> check_txn_options(options, minor)?
+        Complete(counts, _) ->
+            if counts.len() == 0 then return malformed("Complete has one count per parameter tuple, at least one")
+        TxnStatus(state, commit) ->
+            if (state == Committed) != commit.is_some() then
+                return malformed("TxnStatus carries a commit exactly when the transaction committed")
+        ErrorReply(e) -> check_wire_error(e)?
+        StartReplicationMsg(s) ->
+            if s.window < MinWindow then return malformed("a replication window is at least 1,048,576 octets")
+        ReplicaStatusMsg(s) ->
+            if s.flags & ~ReplicaStatusFlags != 0 then return malformed("ReplicaStatus sets a reserved flag")
+        PrimaryStatusMsg(p) ->
+            if p.flags & ~PrimaryStatusFlags != 0 then return malformed("PrimaryStatus sets a reserved flag")
+        StartBackupMsg(s) ->
+            if (s.mode == Full) != (s.pages.len() == 0) then
+                return malformed("a full backup lists no pages, and a pages backup lists at least one range")
+            for p in s.pages
+                check_space(p.space)?
+        BackupBeginMsg(b) ->
+            for f in b.files
+                check_space(f.space)?
+        BackupDataMsg(d) ->
+            check_space(d.space)?
+            if d.pages.len() == 0 || d.pages.len() % PageSize != 0 then
+                return malformed("BackupData carries one or more whole 16 KiB pages")
+        WalDataMsg(w) ->
+            if w.wal.len() == 0 then return malformed("WalData carries at least one WAL octet")
+            if w.durable_lsn < w.start_lsn || w.durable_lsn - w.start_lsn < u64(w.wal.len()) then
+                return malformed("WalData sends only WAL below its durable_lsn")
+        _ -> ()
+
+    Ok(())
+end check_message
+
+/** A result type is a relation (§4.3 rule 3, §6.1 rule 1); anything else is `W1008`. */
+private check_result_type(t: Option[Type]) -> Result[unit, CodecError]
+    t match
+        Some(ty) -> if !ty.is_relation() then return fail("W1008", "a result type must be a bag or a list")
+        None -> ()
+
+    Ok(())
+
+private check_frame_size(n: u64) -> Result[unit, CodecError]
+    if n < DefaultFrameSize || n > MaxFrameSize then return malformed("max_frame_size is outside 65,536 to 2^31 - 1")
+
+    Ok(())
+
+private check_versions(versions: Buf[Version], what: string) -> Result[unit, CodecError]
+    if versions.len() == 0 then return malformed(s"$what is empty")
+
+    for i in 1..<versions.len()
+        if versions[i].major >= versions[i - 1].major then return malformed(s"$what is not strictly descending by major")
+
+    Ok(())
+
+private check_client_hello(h: ClientHello) -> Result[unit, CodecError]
+    check_versions(h.wire_versions, "wire_versions")?
+    check_versions(h.tree_versions, "tree_versions")?
+
+    if h.user.len == 0 || h.database.len == 0 then return malformed("user and database are non-empty")
+    if h.auth_methods.len() == 0 then return malformed("auth_methods is empty")
+
+    check_frame_size(h.max_frame_size)?
+
+    // The client does not know the minor yet: a remote level is a default only where it offers one.
+    var offers_minor = false
+
+    for v in h.wire_versions
+        if v.max_minor >= 1 then offers_minor = true
+
+    check_synchronous(h.defaults.synchronous, if offers_minor then 1 else 0)
+end check_client_hello
+
+private check_ready(r: Ready) -> Result[unit, CodecError]
+    if r.role == Fenced then return malformed("Ready's role is primary or replica")
+    if r.max_in_flight < MinInFlight then return malformed("max_in_flight is at least 16")
+    if r.max_open_txns < 1 then return malformed("max_open_txns is at least 1")
+    if r.max_message_size < MinMessageSize then return malformed("max_message_size is at least 16 MiB")
+
+    Ok(())
+
+private check_synchronous(s: Option[Synchronous], minor: u64) -> Result[unit, CodecError]
+    if minor == 0 && (s == Some(Remote) || s == Some(RemoteApply)) then
+        return malformed("a remote synchronous level needs wire 1.1")
+
+    Ok(())
+
+private check_txn_options(o: TxnOptions, minor: u64) -> Result[unit, CodecError] = check_synchronous(o.synchronous, minor)
+
+private check_exec(txn: u64, implicit: Option[TxnOptions], minor: u64) -> Result[unit, CodecError]
+    implicit match
+        Some(o) ->
+            check_txn_options(o, minor)?
+            if txn != 0 then return fail("W2011", "implicit options are given only for an implicit transaction")
+        None -> ()
+
+    Ok(())
+
+private check_space(space: u8) -> Result[unit, CodecError]
+    if space > 1 then return malformed("a space is 0, data, or 1, undo")
+
+    Ok(())
+
+/** A registry code: an area letter and four digits (§8.1 rule 1). */
+private is_code(code: string) -> bool
+    val b = code.bytes
+
+    if b.len != 5 || b[0] < u8('A') || b[0] > u8('Z') then return false
+
+    for i in 1..<5
+        if b[i] < u8('0') || b[i] > u8('9') then return false
+
+    true
+
+/** Whether `code` is marked retryable in `errors.md` (§8.1 rule 5). */
+is_retryable_code(code: string) -> bool =
+    code.starts_with("T1") || code == "W2004" || code == "W2008" || code == "W4001" || code == "S1001" || code == "S1007"
+
+private check_wire_error(e: WireError) -> Result[unit, CodecError]
+    if e.entries.len() == 0 then return malformed("an Error has at least one entry")
+
+    for entry in e.entries
+        if !is_code(entry.code) then return malformed(s"'${entry.code}' is not a registry code")
+
+        for i in 1..<entry.details.len()
+            if !before(entry.details[i - 1].key, entry.details[i].key) then
+                return malformed("an entry's details are sorted by key, keys unique")
+
+        entry.span match
+            Some(s) -> if s.start > s.end then return malformed("a span ends before it starts")
+            None -> ()
+
+    if e.retryable != is_retryable_code(e.entries[0].code) then
+        return malformed("retryable is set exactly for the retryable codes")
+
+    Ok(())
+end check_wire_error
+
+/** `a` sorts strictly before `b`, octet by octet. */
+private before(a: string, b: string) -> bool
+    val x = a.bytes
+    val y = b.bytes
+    val n = if x.len < y.len then x.len else y.len
+
+    for i in 0..<n
+        if x[i] != y[i] then return x[i] < y[i]
+
+    x.len < y.len

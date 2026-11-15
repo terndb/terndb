@@ -1,0 +1,13 @@
+# name: execute-param-batch
+# spec: §3.5, §4.2 rule 5
+# direction: c2s
+# expect: accept Execute on stream 2: txn 0, implicit options with isolation snapshot alone, credit 65536 and batch_rows 100, the [QT] §12.7 envelope, three parameter tuples $0 = 1, 2, 3 (int64), prepare_as 9
+58 00 00 00  11  00  00 00  02 00 00 00 00 00 00 00
+00
+01  01 01  00 00 00 00 00 00
+01 80 80 04  01 64  00  00
+28
+01 00 01 01 02 69 64 03 00 01 1C 04 1A 01 08 03 61 70 70 01 74 01 74 05 0E 02 65 71 02 01 05 01 74
+02 69 64 03 01 00 00
+1A  03 00  01 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  03 00 00 00 00 00 00 00
+01 09

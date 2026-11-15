@@ -1,0 +1,6 @@
+# name: complete
+# spec: §3.6, §6.6
+# direction: s2c
+# expect: accept Complete on stream 7, as §6.6 prints it: counts [2], commit absent
+03 00 00 00  93  00  00 00  07 00 00 00 00 00 00 00
+01 02  00

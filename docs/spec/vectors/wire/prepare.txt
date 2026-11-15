@@ -1,0 +1,9 @@
+# name: prepare
+# spec: §3.5, §4.4
+# direction: c2s
+# expect: accept Prepare on stream 4: handle 7, the [QT] §12.7 envelope
+2A 00 00 00  10  00  00 00  04 00 00 00 00 00 00 00
+07
+28
+01 00 01 01 02 69 64 03 00 01 1C 04 1A 01 08 03 61 70 70 01 74 01 74 05 0E 02 65 71 02 01 05 01 74
+02 69 64 03 01 00 00

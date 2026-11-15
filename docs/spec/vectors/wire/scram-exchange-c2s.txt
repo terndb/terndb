@@ -1,0 +1,23 @@
+# name: scram-exchange-c2s
+# spec: §2.1, §2.4
+# direction: c2s
+# expect: accept the client's half of RFC 7677's SCRAM-SHA-256 exchange (user "user", password "pencil"), framed: client-hello-scram, then AuthResponse carrying the client-final-message "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+58 00 00 00  01  00  00 00  00 00 00 00 00 00 00 00
+01 01 01
+01 01 00
+04 75 73 65 72
+03 61 70 70
+00
+01 0D 73 63 72 61 6D 2D 73 68 61 2D 32 35 36
+01 20 6E 2C 2C 6E 3D 75 73 65 72 2C 72 3D 72 4F 70 72 4E 47 66 77 45 62 65 52 57 67 62 4E 45 6B 71 4F
+80 80 40
+01 01  01 01  01 E8 07  01 B0 EA 01  01 88 27
+01 04 7A 73 74 64
+6B 00 00 00  02  00  00 00  00 00 00 00 00 00 00 00
+6A
+63 3D 62 69 77 73 2C
+72 3D 72 4F 70 72 4E 47 66 77 45 62 65 52 57 67 62 4E 45 6B 71 4F
+25 68 76 59 44 70 57 55 61 32 52 61 54 43 41 66 75 78 46 49 6C 6A 29 68 4E 6C 46 24 6B 30
+2C 70 3D
+64 48 7A 62 5A 61 70 57 49 6B 34 6A 55 68 4E 2B 55 74 65 39 79 74 61 67 39 7A 6A 66 4D 48 67 73
+71 6D 6D 69 7A 37 41 6E 64 56 51 3D

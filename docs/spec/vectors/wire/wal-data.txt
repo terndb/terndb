@@ -1,0 +1,17 @@
+# name: wal-data
+# spec: replication.md §5.2, §15.1
+# direction: s2c
+# expect: accept WalData on stream 1 at wire 1.1, as replication.md §15.1 prints it: start_lsn 0x04001000, durable_lsn 0x04002000, send_time 0x0006604557a985dc, timeline 1, term 1, and the 64 octets of one TXN_COMMIT record
+60 00 00 00  E1  00  00 00  01 00 00 00 00 00 00 00
+00 10 00 04 00 00 00 00
+00 20 00 04 00 00 00 00
+DC 85 A9 57 45 60 06 00
+01 00 00 00 01 00 00 00
+1E F9 7A 8F 40 00 00 00
+00 10 00 04 00 00 00 00
+2A 00 00 00 00 00 01 00
+20 00 01 00 00 00 00 00
+00 80 A9 57 45 60 06 00
+20 40 01 00 00 00 00 00
+11 00 00 00 00 00 01 00
+00 00 00 00 00 00 00 00
