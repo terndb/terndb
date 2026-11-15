@@ -1,0 +1,70 @@
+// Need 6: SIMD: 16/32 bytes compared at once, a vectorised filter over an i64 column, mask, select,
+// and gather.
+
+// Equal 32-byte keys: two loads, one compare, one reduction.
+eq32(a: []const u8, b: []const u8) -> bool
+    val x: <32>u8 = a.load(0)
+    val y: <32>u8 = b.load(0)
+    (x == y).all()
+
+// Where two 16-byte keys first differ. The idiom is movemask + count-trailing-zeros; here the mask
+// is widened to bytes and the index found by a select and a min reduction.
+first_diff16(a: []const u8, b: []const u8) -> int
+    val x: <16>u8 = a.load(0)
+    val y: <16>u8 = b.load(0)
+    val ne = x != y
+    if !ne.any() then return 16
+    val lanes: <16>u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    int(ne.select(lanes, u8(255)).min())
+
+// A filter `col > lo && col < hi` over an i64 column: count, sum and the selection vector.
+filter(col: []const i64, lo: i64, hi: i64, out: []u32) -> (int, i64)
+    var n = 0
+    var total: i64 = 0
+    var i = 0
+
+    while i + 4 <= col.len
+        val v: <4>i64 = col.load(i)
+        val m = (v > lo) & (v < hi)
+        total += m.select(v, 0).sum()
+
+        // compaction (the selection vector) has no vector form: lane by lane
+        for const k in 0..<4
+            if m[k]
+                out[n] = u32(i + k)
+                n += 1
+
+        i += 4
+
+    while i < col.len
+        if col[i] > lo && col[i] < hi
+            out[n] = u32(i)
+            n += 1
+            total += col[i]
+        i += 1
+
+    (n, total)
+
+// Gather: four i64s at four indexes. No gather form, so four scalar loads into a vector.
+gather4(col: []const i64, idx: <4>u32) -> <4>i64
+    var g: <4>i64 = [0, 0, 0, 0]
+    for const k in 0..<4 do g[k] = col[int(idx[k])]
+    g
+
+var ka: [32]u8 = [0; 32]
+var kb: [32]u8 = [0; 32]
+for i in 0..<32
+    ka[i] = u8(i)
+    kb[i] = u8(i)
+
+print("eq32", eq32(ka[..], kb[..]))
+kb[11] = 99
+print("eq32", eq32(ka[..], kb[..]), "first diff", first_diff16(ka[..], kb[..]))
+
+var col: [10]i64 = [5, 50, 7, 70, 9, 90, 11, 110, 13, 130]
+var sel: [10]u32 = [0; 10]
+val (n, total) = filter(col[..], 6, 100, sel[..])
+print("filter", n, total, sel[0], sel[n - 1])
+
+val g = gather4(col[..], [9, 0, 3, 3])
+print("gather", g[0], g[1], g[2], g[3])

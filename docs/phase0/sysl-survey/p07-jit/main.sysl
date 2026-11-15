@@ -1,0 +1,68 @@
+// Need 7: code generation at run time. No package in the org binds LLVM or any JIT, so this reaches
+// Homebrew's libLLVM through hand-written externs over its C API (llvm-c/Core.h, Orc.h, LLJIT.h):
+// build `add(i64, i64) -> i64` as IR, JIT it with ORC's LLJIT, and call it through a *extern.
+@link("LLVM")
+import sysl.raw.ptr_cast
+import sysl.text.cstring
+
+extern LLVMInitializeAArch64TargetInfo()
+extern LLVMInitializeAArch64Target()
+extern LLVMInitializeAArch64TargetMC()
+extern LLVMInitializeAArch64AsmPrinter()
+
+extern LLVMContextCreate() -> *u8
+extern LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx: *u8) -> *u8
+extern LLVMModuleCreateWithNameInContext(name: *u8, ctx: *u8) -> *u8
+extern LLVMInt64TypeInContext(ctx: *u8) -> *u8
+extern LLVMFunctionType(ret: *u8, params: **u8, n: u32, vararg: i32) -> *u8
+extern LLVMAddFunction(m: *u8, name: *u8, ty: *u8) -> *u8
+extern LLVMAppendBasicBlockInContext(ctx: *u8, f: *u8, name: *u8) -> *u8
+extern LLVMCreateBuilderInContext(ctx: *u8) -> *u8
+extern LLVMPositionBuilderAtEnd(b: *u8, bb: *u8)
+extern LLVMGetParam(f: *u8, i: u32) -> *u8
+extern LLVMBuildAdd(b: *u8, l: *u8, r: *u8, name: *u8) -> *u8
+extern LLVMBuildMul(b: *u8, l: *u8, r: *u8, name: *u8) -> *u8
+extern LLVMBuildRet(b: *u8, v: *u8) -> *u8
+extern LLVMDisposeBuilder(b: *u8)
+
+extern LLVMOrcCreateNewThreadSafeModule(m: *u8, ts: *u8) -> *u8
+extern LLVMOrcCreateLLJIT(out: **u8, builder: *u8) -> *u8
+extern LLVMOrcLLJITGetMainJITDylib(j: *u8) -> *u8
+extern LLVMOrcLLJITAddLLVMIRModule(j: *u8, jd: *u8, tsm: *u8) -> *u8
+extern LLVMOrcLLJITLookup(j: *u8, out: *u64, name: *u8) -> *u8
+extern LLVMGetErrorMessage(e: *u8) -> *u8
+extern LLVMOrcDisposeLLJIT(j: *u8) -> *u8
+
+check(what: string, e: *u8)
+    if e != null
+        print(what, "failed")
+
+LLVMInitializeAArch64TargetInfo()
+LLVMInitializeAArch64Target()
+LLVMInitializeAArch64TargetMC()
+LLVMInitializeAArch64AsmPrinter()
+
+// The expression a query compiled: (a + b) * a
+val ctx = LLVMContextCreate()
+val m = LLVMModuleCreateWithNameInContext(cstring("q").ptr, ctx)
+val i64t = LLVMInt64TypeInContext(ctx)
+var params: [2]*u8 = [i64t, i64t]
+val fty = LLVMFunctionType(i64t, &params[0], 2, 0)
+val f = LLVMAddFunction(m, cstring("expr").ptr, fty)
+val b = LLVMCreateBuilderInContext(ctx)
+LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, f, cstring("entry").ptr))
+val a0 = LLVMGetParam(f, 0)
+val a1 = LLVMGetParam(f, 1)
+LLVMBuildRet(b, LLVMBuildMul(b, LLVMBuildAdd(b, a0, a1, cstring("s").ptr), a0, cstring("p").ptr))
+LLVMDisposeBuilder(b)
+
+var jit: *u8 = null
+check("create", LLVMOrcCreateLLJIT(&jit, null))
+val ts = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx)
+check("add", LLVMOrcLLJITAddLLVMIRModule(jit, LLVMOrcLLJITGetMainJITDylib(jit), LLVMOrcCreateNewThreadSafeModule(m, ts)))
+
+var addr: u64 = 0
+check("lookup", LLVMOrcLLJITLookup(jit, &addr, cstring("expr").ptr))
+
+val expr: *extern(i64, i64) -> i64 = ptr_cast(usize(addr))
+print("jit", addr != 0, expr(6, 7), expr(10, -3))

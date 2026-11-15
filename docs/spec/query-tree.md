@@ -1,0 +1,1078 @@
+# TernDB query tree
+
+**Status:** normative, draft. **Tree schema version:** 1.0.
+
+This document defines TernDB's native query input: the **typed query tree**. It fixes the type system,
+every node kind, how names resolve, how parameters work, what validation reports, the canonical binary
+encoding, how the schema evolves, and how Substrait plans map onto it. The wire protocol
+(`wire-protocol.md`) and the C ABI (`libterndb`) carry trees in the encoding defined here.
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119. Every MUST in this
+document is meant to be checkable by a test that builds a tree, submits it and inspects the result,
+the error code or the `EXPLAIN` output. Text marked *Rationale* explains a choice and is not itself a
+rule. Text marked *Informative* has no force.
+
+## 1. Model
+
+1. A **statement** is a tree of nodes. There are three families of node: **relational nodes** (`Rel`),
+   which denote relations; **expressions** (`Expr`), which denote values; and **statement roots**
+   (`Query`, `Insert`, `Update`, `Delete`).
+2. A tree contains **no literal values**. Every value a client supplies is a **parameter**: a typed
+   hole, declared in the statement's envelope and bound separately at execution (§10). The only
+   constant-like node is `Null(type)`, which carries a type and no data.
+   *Rationale: injection is impossible by construction, and two queries that differ only in values
+   share one plan.*
+3. SQL (TernDB's own dialect) and GraphQL are **front ends**. Each produces a tree; neither has
+   semantics of its own beyond the tree it produces. A server MUST validate a tree it receives exactly
+   as it validates the tree its own SQL front end produces: the same checks, the same error codes.
+4. The meaning of a tree MUST NOT depend on session state (time zone, search path, locale, date
+   style). Names in a tree are fully qualified (§8.1) and every zone-dependent operation takes its zone
+   as an argument. The only exceptions are the statement-time functions (`statement_timestamp()` and
+   kin), which read the clock, and the snapshot the statement runs against.
+   *Rationale: one tree, one meaning, which is what makes shape-keyed plan caching sound.*
+5. **DDL is deferred** to a separate specification (`ddl.md`). This spec reserves statement kinds
+   32–63 for it (§12.5). Until that spec exists, DDL is reachable only through the SQL front end, and a
+   tree whose root kind is in the reserved range is refused with `Q1002`.
+
+## 2. Types
+
+### 2.1 Scalar types
+
+| Type | Values | Justification |
+|---|---|---|
+| `bool` | `false`, `true` | Predicates. |
+| `int16`, `int32`, `int64`, `int128` | two's-complement integers of that width | 16/32/64 match every client language and SQL's `smallint`/`integer`/`bigint`; `int128` holds exact sums of `int64` without falling to decimal. |
+| `decimal(p, s)` | exact numbers with `p` significant digits, `s` of them after the point; `1 ≤ p ≤ 38`, `0 ≤ s ≤ p` | Money and exact arithmetic. 38 digits fit an `int128` unscaled value, so decimals are fixed-width and vectorisable. |
+| `float32`, `float64` | IEEE 754 binary32/binary64, including ±0, ±∞ and NaN | Measurements, scores, vectors' components. |
+| `text` | any sequence of Unicode scalar values, encoded UTF-8; NUL is allowed | Strings. Length-prefixed everywhere, so NUL needs no exclusion. |
+| `bytes` | any octet sequence | Opaque data. |
+| `date` | a proleptic Gregorian calendar day, years −4713 … 294276 | Calendar dates. |
+| `time` | a time of day with microsecond precision, `00:00:00` … `23:59:59.999999` | Wall-clock time without a date. |
+| `datetime` | a civil date and time with microsecond precision and **no** zone | A local reading ("the meeting is at 09:00"). |
+| `timestamp` | an instant: microseconds since 1970-01-01T00:00:00Z | A point on the global timeline. |
+| `interval` | a triple (`months`: int32, `days`: int32, `micros`: int64) | Calendar arithmetic needs months and days kept apart from elapsed time. |
+| `uuid` | 128 bits | Identifiers. |
+
+1. There is no unsigned integer type, no `int8`, no `char(n)`/`varchar(n)`, no `timetz`, no `money`
+   and no `json` type in version 1.0. A length or range limit is a constraint, not a type.
+   *Rationale: Postgres's `timestamp`/`timestamptz` split is the source of its most common time bug;
+   TernDB names the two concepts `datetime` and `timestamp` and never converts between them
+   implicitly. `timetz` has no coherent meaning.*
+2. Microsecond precision gives `timestamp` a range of about ±292,000 years in an `int64`. Nanosecond
+   precision would cut that range to 1677–2262.
+
+### 2.2 Nullability
+
+1. Nullability is part of the type. `T` does not admit null; `T?` admits every value of `T` and null.
+   `T??` does not exist: making a nullable type nullable yields the same type.
+2. Any type may be nullable, including a record, a union and a relation type.
+3. A table column declared `NOT NULL` has type `T`; otherwise `T?`.
+
+### 2.3 Records
+
+1. `{n₁: T₁, …, nₖ: Tₖ}` is an ordered sequence of named fields. Names are non-empty, unique within the
+   record (`Q3015`), and compared byte-for-byte (case-sensitive). `k = 0` is allowed: `{}` is the type
+   with exactly one value.
+2. Record types are **structural**: two record types are identical iff they have the same names, in
+   the same order, with identical field types.
+
+### 2.4 Tagged unions
+
+1. `union<t₁: R₁, …, tₖ: Rₖ>` holds exactly one variant, identified by its **tag**. `k ≥ 1`. Tags are
+   unique (`Q3015`). Each payload `Rᵢ` MUST be a record type (`Q3014`); a variant with no data has
+   payload `{}`, so an enum is a union whose payloads are all `{}`.
+2. The **discriminant** of a variant is its tag's ordinal in the declaration (0-based). The encoding
+   carries the discriminant; the tag name appears only in the type.
+3. Union types are structural: identical iff the same tags in the same order with identical payloads.
+4. The **shared columns** of a union are the fields that appear in every payload with the same name
+   and the identical type. They are ordered as in the first payload. (They are how GraphQL interface
+   fields are read without a `Match`.)
+
+### 2.5 Relation types
+
+1. A relation type is `bag<E>` (a multiset: no order, duplicates counted) or `list<E>` (a sequence:
+   order is part of the value).
+2. The element type `E` MUST be a record type or a union whose payloads are records (`Q3014`).
+   Relation types may nest to any depth: `bag<{id: int64, posts: list<{id: int64}>}>` is legal.
+3. Relation-valued columns are values like any other: they can be stored in a table column, passed as
+   parameters, compared (§3), hashed, grouped on and indexed.
+4. A relation value is never null unless its type is `bag<E>?`/`list<E>?`; the absence of rows is the
+   empty relation, which is distinct from null.
+
+### 2.6 Type identity
+
+Two types are **identical** iff they are the same scalar (with the same `p, s` for decimal), or
+structurally identical per §2.3–2.5, with identical nullability at every level.
+
+## 3. Value semantics: equality, ordering, hashing
+
+TernDB has two notions of equality. Both are defined over every type.
+
+### 3.1 Identity equality `same`
+
+`same(a, b)` is total: it always returns `true` or `false`, never null. It is the equality used by
+grouping, `DISTINCT`, set operations, `Nest`, join keys produced by the decorrelator, unique
+constraints and hash indexes.
+
+1. `same(null, null)` is `true`; `same(null, x)` for non-null `x` is `false`.
+2. Integers and decimals compare by numeric value after coercion to a common type (§4.2).
+3. Floats: `same(NaN, NaN)` is `true` for every NaN payload; `same(-0.0, +0.0)` is `true`; otherwise
+   IEEE equality.
+4. `text` and `bytes` compare as octet sequences. (No collation applies in 1.0; see Open questions.)
+5. `interval` compares **componentwise**: `same('1 month', '30 days')` is `false`.
+   *Rationale: Postgres's normalisation makes equal intervals produce different dates.*
+6. Records: fieldwise `same`, all fields.
+7. Unions: same discriminant and `same` payloads.
+8. `list<E>`: same length and `same` element by element.
+9. `bag<E>`: equal as multisets under `same` — there is a bijection pairing each element of one with a
+   `same` element of the other.
+
+### 3.2 SQL equality `eq` and comparisons
+
+`eq`, `ne`, `lt`, `le`, `gt`, `ge` follow three-valued logic: if either operand is null the result is
+null.
+
+1. On scalars `eq` agrees with `same` for non-null operands (so `eq(NaN, NaN)` is `true`).
+   *Rationale: one equality on non-null values keeps indexes and predicates consistent.*
+2. On records, `eq` is SQL row comparison: `false` if any field pair is `eq`-false; else null if any
+   pair is null; else `true`. `lt` etc. compare lexicographically by field with the same rule.
+3. On unions, `eq` is `false` if the discriminants differ, otherwise `eq` of the payloads.
+4. `eq`/`ne` on a relation type, and `lt`/`le`/`gt`/`ge` on a relation type, a union type or
+   `interval`, MUST be refused with `Q3006` (relations) or `Q3007` (unions, intervals).
+   *Rationale: three-valued multiset equality has no useful definition; use `same`. Intervals and
+   unions have no natural order; `Sort` still orders them through `cmp`.*
+
+### 3.3 Total order `cmp`
+
+`cmp(a, b)` returns −1, 0 or +1 and is a total order consistent with `same` (`cmp(a,b) = 0` iff
+`same(a,b)`). It is used by `Sort`, ordered indexes and the bag comparison below.
+
+1. Null sorts below every non-null value. (`Sort` keys override this at the top level, §6.9.)
+2. `false < true`. Integers and decimals by numeric value.
+3. Floats: −∞ < negative < −0 = +0 < positive < +∞ < NaN.
+4. `text` and `bytes`: unsigned octet-lexicographic (for valid UTF-8 this is code point order); a
+   proper prefix sorts first.
+5. `date`, `time`, `datetime`, `timestamp`: chronologically. `uuid`: as a 128-bit big-endian unsigned
+   number. `interval`: lexicographically on (`months`, `days`, `micros`).
+6. Records: lexicographic by field. Unions: by discriminant, then payload.
+7. `list<E>`: lexicographic by element; a proper prefix sorts first.
+8. `bag<E>`: compare the two bags' elements each sorted ascending by `cmp`, as lists.
+
+### 3.4 Hashing
+
+1. Any hash a server uses for grouping, joining or indexing MUST satisfy `same(a,b) ⇒ hash(a) =
+   hash(b)`. In particular every NaN hashes alike, −0.0 and +0.0 hash alike, numerically equal
+   decimals of different scales hash alike, and a bag's hash is independent of element order.
+2. The hash function itself is not part of this specification. Where a hash is persisted, it is fixed
+   by `on-disk-format.md`.
+
+## 4. Inference and coercion
+
+The tree is explicitly typed at its leaves: every column has a catalog type, every parameter a
+declared type, every `Null` a type. Types of all other expressions are inferred bottom-up. There is no
+inference of a parameter's type from its context: the front end that builds the tree decides it.
+
+### 4.1 Implicit coercions
+
+Only these coercions are applied implicitly, and only where an expected type is known (a function
+argument, a `SetOp` column, an insert or update target, an `If` arm, a `Values` column):
+
+1. **Integer widening**: `int16 → int32 → int64 → int128`.
+2. **Integer to decimal**: `intN → decimal(p, 0)` with `p` = 5, 10, 19, 38 for `int16`, `int32`,
+   `int64`, `int128`; and onward by decimal widening.
+3. **Decimal widening**: `decimal(p, s) → decimal(p', s')` when `s' ≥ s` and `p' − s' ≥ p − s`.
+4. **Float widening**: `float32 → float64`.
+5. **Null widening**: `T → T?`, at any depth (a record field, a relation's element).
+6. **Order forgetting**: `list<E> → bag<E>`.
+7. **Structural**: a record, union or relation coerces to another of the same shape (names, tags,
+   order) when each component coerces.
+
+Everything else MUST be refused with `Q3001`, in particular: integer or decimal to float and back,
+any type to or from `text`, `bool` to or from integer, `datetime` to or from `timestamp`, `date` to
+`datetime`, `T?` to `T`, and `bag<E>` to `list<E>`. These are written as an explicit `Cast` (§7.6),
+an `assert_not_null` call, or a `Sort`.
+*Rationale: every implicit conversion Postgres performs has a known silent-wrong-answer case; the
+ones kept are lossless.*
+
+### 4.2 Common type
+
+Where two or more types must unify (`SetOp` columns, `If` arms, `coalesce`, `Values` rows, binary
+arithmetic and comparison operands), the **common type** is the least type every input coerces to by
+§4.1. If none exists, the node is refused with `Q3001` (or `Q3010` for `SetOp`).
+
+### 4.3 Function and operator resolution
+
+Operators are functions with stable names (§7.12). A call `f(a₁…aₙ)` resolves as follows:
+
+1. If one overload of `f` accepts the argument types exactly, it is chosen.
+2. Otherwise, the overloads reachable by implicit coercions are collected; if exactly one needs the
+   fewest coercion steps, it is chosen. If several tie, `Q3003`. If none, `Q3002`.
+3. A function is **strict** unless the catalog says otherwise: its result is `R?` if any argument is
+   nullable, and null when any argument is null.
+
+### 4.4 Arithmetic result types
+
+1. Integer `add`, `sub`, `mul`, `div`, `mod`, `neg`: operands widen to the wider type; the result has
+   that type. Overflow is the runtime error `R0001`; integers never wrap. `div` truncates toward zero;
+   `mod`'s sign follows the dividend; division by zero is `R0002`.
+2. Decimal `add`/`sub`: `s = max(s₁, s₂)`, `p = min(38, max(p₁ − s₁, p₂ − s₂) + s + 1)`. `mul`:
+   `s = s₁ + s₂`, `p = min(38, p₁ + p₂)`; if `s > 38` the call is refused with `Q3011`. `div`:
+   `s = max(6, s₁, s₂)`, `p = 38`, rounded half away from zero. A result outside the result type's range
+   is `R0001`.
+3. Float arithmetic is IEEE 754 in the operands' common type; it never raises errors.
+4. Mixing float with integer or decimal operands is refused (`Q3002`).
+
+## 5. Statements
+
+A tree on the wire or across the C ABI is an **envelope**:
+
+```
+Envelope  = { version: (major, minor), params: [ParamDecl], statement: Statement, spans: Spans? }
+ParamDecl = { name: text?, type: Type }
+Statement = Query | Insert | Update | Delete
+```
+
+1. `Query { rel: Rel }` returns `rel`'s value. Its result type is `rel`'s relation type.
+2. `Insert`, `Update`, `Delete` are defined in §9. With a `returning` list they return a `bag` of
+   records; without one they return the affected row count as `int64`.
+3. The **result type** of a statement is determined by validation alone. A server MUST be able to
+   return it without executing the statement (the wire spec's describe step).
+4. `spans`, when present, maps nodes (by pre-order index) to byte ranges in a front end's source text.
+   It is metadata: it changes neither meaning nor shape, and it lets errors point at source.
+5. The output columns of the root `Rel`, of every `Relation`/`Scalar` subquery and of every `SetOp`
+   input and `Insert` source MUST have unique names (`Q2005`).
+
+## 6. Relational nodes
+
+Every `Rel` has an **output type**: `bag<E>` or `list<E>`, where `E` is a record of its output
+columns (or a union, §6.15). The column of the output, their names and their types are fixed by the
+rules below. "Exposes" refers to the binders a node makes visible to the expressions of its parent
+(§8.2).
+
+| Node | Fields | Output kind | Exposes |
+|---|---|---|---|
+| `Scan` | `table: QualName, as: binder` | bag | `as` |
+| `Values` | `as, columns: [(name, Type)], rows: [[Expr]]` | list | `as` |
+| `ParamScan` | `as, param: index` | the parameter's kind | `as` |
+| `Filter` | `input, predicate: Expr` | input's | input's |
+| `Project` | `input, as, items: [(name, Expr)]` | input's | `as` |
+| `Join` | `kind, left, right, on: Expr?, mark: name?, as: binder?` | bag | see §6.5 |
+| `Apply` | `kind, left, right, on: Expr?, mark: name?, as: binder?` | bag | see §6.6 |
+| `Aggregate` | `input, as, keys: [(name, Expr)], aggs: [(name, AggCall)]` | bag | `as` |
+| `Window` | `input, as, items: [(name, WinCall)]` | input's | input's + `as` |
+| `Sort` | `input, keys: [SortKey]` | list | input's |
+| `Limit` | `input, count: Expr?, offset: Expr?, ties: bool, arbitrary: bool` | input's | input's |
+| `Distinct` | `input` | bag | input's |
+| `SetOp` | `op, all: bool, as, inputs: [Rel]` | bag | `as` |
+| `With` | `recursive: bool, ctes: [CteDef], body: Rel` | body's | body's |
+| `CteRef` | `name, as` | the CTE's | `as` |
+| `Nest` | `input, as, keys: [(name, Expr)], name, items: [(name, Expr)], order: [SortKey]` | bag | `as` |
+| `Unnest` | `input, as, value: Expr, outer: bool, ordinality: name?` | bag | input's + `as` |
+| `Tag` | `input, as, type: Type, tag` | input's | `as` |
+
+### 6.1 Scan
+
+Reads every row of a table or view visible in the statement's snapshot. Output columns are the
+table's columns in catalog order, with catalog types. An unknown table is `Q2001`. (View expansion is
+defined by `ddl.md`.)
+
+### 6.2 Values
+
+1. Each row MUST have one expression per declared column (`Q5009`), each coercing to its column's type
+   (`Q3001`). Zero rows is allowed.
+2. The output is a `list` in row order. Row expressions MAY reference parameters and outer binders
+   (§8.3) but no binder of a sibling.
+
+### 6.3 ParamScan
+
+Reads a relation-valued parameter as a source. The parameter MUST have a relation type (`Q3001`); its
+element type's fields are the output columns. This is the bulk-load path: one execution, any number of
+rows (§10.4).
+
+### 6.4 Filter and Project
+
+1. `Filter` keeps the input rows whose `predicate` is `true`; null and `false` drop the row. The
+   predicate MUST have type `bool` or `bool?` (`Q3004`). A list input stays a list in the same order.
+2. `Project` evaluates each item once per input row. `items` MUST be non-empty (`Q5009`) with unique
+   names (`Q2005`). Items MAY be relation-valued (`Relation`, §7.9); this is how nested results are
+   written. A list input stays a list in the same order.
+
+### 6.5 Join
+
+`kind` is one of `inner`, `left`, `right`, `full`, `semi`, `anti`, `mark`, `single`.
+
+1. `on` is evaluated with both sides' binders visible; absent means `true` (a cross join when
+   `kind = inner`). It MUST be `bool`/`bool?` (`Q3004`).
+2. The right input MUST NOT reference a binder exposed by the left input (`Q5006`); that is an `Apply`.
+3. `inner`, `left`, `right`, `full` expose both inputs' binders. `left` makes every right-side column
+   nullable, `right` every left-side column, `full` both.
+4. `semi` keeps left rows with at least one right row for which `on` is `true`; `anti` keeps left rows
+   with none. Both expose only the left binders.
+5. `mark` keeps every left row and adds column `mark` (required, `Q5009` if absent) under binder `as`
+   (required): `true` if some right row makes `on` `true`; else null if some makes it null; else `false`.
+   Its type is `bool?` when `on` is nullable, else `bool`. This is SQL `IN` semantics.
+6. `single` is a left join that MUST raise `R0003` if a left row matches more than one right row. It is
+   the decorrelated form of a scalar subquery.
+7. The output is a bag. *Rationale: preserving order across joins forbids hash joins; order is
+   restored with `Sort`.*
+
+### 6.6 Apply (correlated source form)
+
+`Apply` has `Join`'s fields; its `kind` is one of `cross`, `outer`, `semi`, `anti`, `mark`, `single`, but
+its right input MAY reference the left input's binders: the right side is evaluated once per left row,
+conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as `left`.
+
+1. `Apply` is the form every correlated subquery denotes: `Relation`, `Scalar`, `Exists` and `In`
+   expressions (§7.9–7.11) are equivalent to an `Apply` of kind `outer`-with-collect, `single`, `mark`
+   and `mark` respectively.
+2. A conforming planner MUST remove every `Apply`, at every nesting depth, by general unnesting
+   (Neumann–Kemper, "Unnesting Arbitrary Queries", BTW 2015) before execution. The executed plan
+   MUST contain no operator that re-evaluates a subtree once per outer row, and `EXPLAIN` of the
+   physical plan MUST show no `Apply`. A per-level `Limit`, `Sort` or `Aggregate` inside the right side
+   keeps its per-outer-row meaning through unnesting (it becomes a partitioned window or a grouped
+   aggregate on the outer key).
+3. A client MAY send `Apply` directly. Its meaning is the per-row one, whatever the plan.
+
+### 6.7 Aggregate
+
+1. Groups the input by `keys` under `same` and emits one row per group: the keys, then the aggregates,
+   under binder `as`. With no keys, it emits **exactly one row**, also for empty input.
+2. `AggCall = { function, args: [Expr], distinct: bool, filter: Expr?, order: [SortKey] }`. `filter`
+   restricts the rows the call sees. `order` is honoured by order-sensitive aggregates (`collect`,
+   `string_agg`) and refused on the others (`Q3002`).
+3. Aggregate calls MUST appear only in `Aggregate.aggs` and `Window.items` (`Q3013`). `HAVING` is a
+   `Filter` above the `Aggregate`.
+4. Core aggregates: `count()` (rows) and `count(x)` (non-null `x`) → `int64`; `sum` → `int128` for
+   integer inputs, `decimal(38, s)` for `decimal(p, s)`, `float64` for floats; `min`, `max` (any type
+   with `cmp`); `bool_and`, `bool_or`; `collect(x)` where `x` is a record or union → `bag<X>`, or
+   `list<X>` when `order` is non-empty. Over an empty set every core aggregate except `count` and
+   `collect` (empty relation) yields null, so its result type is nullable.
+
+### 6.8 Window
+
+`WinCall = { function, args, partition: [Expr], order: [SortKey], frame: Frame? }`. Each item adds one
+column under binder `as`; the input's rows, binders, kind and order are unchanged. Ranking functions
+(`row_number`, `rank`, `dense_rank`) → `int64`; `lag`, `lead`, `first_value`, `last_value`; and every
+core aggregate. `Frame = { unit: rows | range | groups, start: Bound, end: Bound, exclude: none |
+current | group | ties }`; `Bound = { kind: unbounded_preceding | preceding | current |
+following | unbounded_following, offset: Expr? }`. An invalid frame (start after end, `range` with an
+offset and not exactly one order key) is `Q5008`.
+
+### 6.9 Sort
+
+`SortKey = { expr: Expr, desc: bool, nulls_first: bool }`. Both flags are always present in the tree;
+front ends supply the defaults. The output is a `list` ordered by the keys using `cmp` (§3.3), with
+null placed per `nulls_first` for each key's top-level value. The sort is **stable**: when the input is
+a list, rows equal on every key keep their input order. A key MAY be of any type, including unions and
+relations.
+
+### 6.10 Limit
+
+1. `count` and `offset` MUST be `int64` (`Q3001`) and MUST NOT reference the input's binders; they MAY
+   reference parameters and outer binders. A negative value is `R0006`. Absent `count` means no limit;
+   absent `offset` means 0.
+2. The input MUST be a list (`Q3008`) unless `arbitrary` is `true`, in which case any `count` rows of a
+   bag are chosen. *Rationale: an unordered `LIMIT` is a nondeterminism bug far more often than a
+   wish; the flag makes the wish explicit.*
+3. `ties = true` also keeps every row equal on all sort keys to the last kept row; it requires the input
+   to be a `Sort` node directly (`Q3008`).
+
+### 6.11 Distinct
+
+Removes duplicates under `same`. The output is a bag with the input's binders.
+
+### 6.12 SetOp
+
+`op` is `union`, `intersect` or `except`; `all` selects multiset (`true`) or set (`false`) semantics.
+`inputs` holds at least two relations (`Q5009`), each with the same number of columns (`Q3010`);
+columns unify positionally to their common type (§4.2, `Q3010`); output names are the first input's.
+Duplicates are judged by `same`. The output is a bag; `union all` of lists is a bag.
+
+### 6.13 With and CteRef
+
+1. `CteDef = { name, columns: [(name, Type)]?, rel: Rel }`. Names are unique in one `With` (`Q2004`).
+   A `CteRef` names a CTE of an enclosing `With` (`Q2008`); its output is the CTE's, under its own
+   binder.
+2. Every `CteRef` of a non-recursive CTE observes one and the same value within a statement. The
+   planner MAY inline a CTE whose body is free of volatile functions.
+3. With `recursive = true`, each CTE MUST declare `columns` (`Q5001`) and its `rel` MUST be a `SetOp`
+   with `op = union` whose first input does not reference the CTE (the seed) and whose remaining inputs
+   each reference it exactly once (linear recursion), never inside an `Aggregate`, `Distinct`, the
+   null-supplying side of an outer join, an `anti` join's right input, or a `Relation` subquery
+   (`Q5001`). Mutual recursion is refused (`Q5001`).
+4. Evaluation iterates: the working set is the seed; each step evaluates the recursive inputs against
+   the previous step's new rows; with `all = false`, rows `same` as any earlier row are discarded. It
+   ends when a step yields no new rows. A server MAY bound the number of steps; exceeding the bound is
+   `R0005`.
+
+### 6.14 Nest and Unnest
+
+1. `Nest` groups its input by `keys` under `same` and emits, per group, the keys followed by one
+   column `name` holding the group's rows as `bag<{items}>` (or `list<{items}>`, sorted by `order`, when
+   `order` is non-empty). It MUST equal `Aggregate` with the same keys and the single aggregate
+   `collect(Record(items))` with that `order`.
+2. `Unnest` evaluates `value`, a relation-typed expression that MAY reference the input's binders, per
+   input row, and emits one row per element: the input's columns followed by the element's columns
+   under binder `as`. With `outer = true`, an input row whose relation is empty or null emits one row
+   with every element column null (so they are nullable). `ordinality` adds an `int64` column, 1-based,
+   under `as`; it requires `value` to be a list (`Q3008`).
+
+### 6.15 Tag and union-element relations
+
+1. `Tag` turns a relation of records into a relation of union values: each row becomes variant `tag` of
+   `type`, which MUST be a union (`Q3001`) with a variant `tag` (`Q2010`) whose payload the input's
+   element type coerces to (`Q3001`).
+2. A relation whose element type is a union exposes, under its binder, the union's **shared columns**
+   (§2.4) as ordinary columns, and the whole element through `Row(binder)` (§7.2). Variant-specific
+   fields are read with `Match` (§7.7).
+3. `SetOp` inputs of union element type MUST have identical union types (`Q3010`).
+
+## 7. Expressions
+
+| Expr | Fields | Type |
+|---|---|---|
+| `Col` | `binder, name` | the column's |
+| `Row` | `binder` | the binder's element type |
+| `Param` | `index` | the declared type |
+| `Null` | `type` | `type?` |
+| `Call` | `function, args: [Expr]` | per §4.3 |
+| `Cast` | `expr, type, mode: strict \| try` | `type` (`type?` for `try`) |
+| `If` | `arms: [(cond, value)], else: Expr?` | common type of values |
+| `Match` | `expr, arms: [(tag, binder, Expr)], else: Expr?` | common type of arms |
+| `Record` | `fields: [(name, Expr)]` | record |
+| `Field` | `expr, name` | the field's |
+| `Variant` | `type, tag, expr` | `type` |
+| `Relation` | `rel` | `rel`'s relation type |
+| `Scalar` | `rel` | the single column's |
+| `Exists` | `rel` | `bool` |
+| `In` | `exprs: [Expr], rel` | `bool` or `bool?` |
+| `Action` | — | the DML action union (§9.5) |
+
+### 7.1 Col
+
+Names a column of a binder visible at this point (§8). Its type is the column's as seen there,
+including nullability added by an outer join between the binder and this point.
+
+### 7.2 Row
+
+The whole current row of `binder` as a record (or, for a union-element relation, the union value).
+
+### 7.3 Param and Null
+
+`Param` refers to the envelope's parameter `index` (0-based; `Q4001`). `Null(type)` is the null value
+of `type?`.
+
+### 7.4 Call
+
+Applies a catalog function (§7.12). Unknown function: `Q2007`.
+
+### 7.5 If
+
+Evaluates conditions in order; the first `true` selects its value. No arm `true` and no `else` yields
+null (so the type is nullable). Conditions MUST be `bool`/`bool?` (`Q3004`). Unselected arms MUST NOT
+be evaluated, so their runtime errors do not occur.
+
+### 7.6 Cast
+
+`strict` raises `R0006` on a value that does not convert; `try` yields null. Permitted casts: between
+any two numeric types (range-checked; rounding half away from zero into decimal and integer targets);
+between `text` and every scalar (parsing and printing the canonical literal forms, which are not yet
+fixed; see Open questions); `bytes` ↔ `uuid` (16 octets); records, unions and relations
+componentwise where shapes match; `list<E> → bag<E>`. Anything else, including `bag → list`,
+`timestamp ↔ datetime` and `T? → T`, is `Q3012`. The zone conversions are functions
+(`at_zone(timestamp, text) → datetime`, `from_zone(datetime, text) → timestamp`); a non-null value is
+obtained from a nullable one with `assert_not_null(x) → T` (`R0004` on null).
+
+### 7.7 Match
+
+1. `expr` MUST have a union type (`Q3001`). Each arm names a tag (`Q2010`; a tag twice is `Q3009`) and a
+   binder through which the payload's fields are read as `Col(binder, field)`.
+2. Arms MUST cover every tag unless `else` is present (`Q3009`, naming the missing tags). *Rationale:
+   adding a variant to a stored union then fails validation of every query that would silently
+   mishandle it.*
+3. A null `expr` yields null.
+
+### 7.8 Record, Field, Variant
+
+`Record` builds a record (unique names, `Q2005`). `Field` reads a field of a record-typed expression
+(`Q2011`); null record yields null. `Variant` builds variant `tag` of union `type` from a record
+expression.
+
+### 7.9 Relation
+
+The value of `rel`, evaluated with the enclosing row's binders visible (§8.3). It is the only way a
+nested result is written: TernDB never encodes a nested relation as JSON. A per-level `Sort`, `Limit`
+or `Aggregate` inside `rel` applies per enclosing row.
+
+### 7.10 Scalar and Exists
+
+1. `Scalar` requires `rel` to have exactly one column (`Q5009`). More than one row is `R0003`. Zero rows
+   yields null, so the type is `T?` — **unless** `rel` is cardinality-one: an `Aggregate` with no keys,
+   or a `Project` or `Window` whose input is cardinality-one. Then the type is the column's own.
+2. `Exists` is `true` iff `rel` has at least one row.
+
+### 7.11 In
+
+`In(exprs, rel)` requires `rel` to have one column per expression, pairwise comparable by `eq`
+(`Q3001`). It is `true` if some row is `eq`-true to the tuple; else null if some comparison is null;
+else `false` (SQL semantics, including `NOT IN`'s behaviour with nulls).
+
+### 7.12 The core function catalog
+
+The function catalog is versioned with the tree schema (§13) and published with it. This spec fixes
+the core operators' names and typing:
+
+- comparison: `eq ne lt le gt ge` (§3.2), `same` (§3.1, always `bool`), `is_null`, `is_not_null`
+  (non-strict, `bool`);
+- logic: `and or not` (three-valued, non-strict; `and` is `false` if either side is `false`);
+- arithmetic: `add sub mul div mod neg abs` (§4.4);
+- `coalesce(x₁…xₙ)`: common type, nullable iff every argument is nullable;
+- `assert_not_null`, `at_zone`, `from_zone` (§7.6);
+- text: `concat length lower upper contains starts_with like` (`like` takes its escape character as an
+  argument);
+- time: `add(timestamp, interval)` computes calendar parts in UTC; `add(datetime, interval)` and
+  `add(date, interval) → datetime` compute in civil time; `statement_timestamp() → timestamp`.
+
+## 8. Names, binders and scoping
+
+### 8.1 Catalog names
+
+A `QualName` is `(schema, name)`, both required. There is no search path in a tree; the front end
+resolves one. Names compare byte-for-byte.
+
+### 8.2 Binders
+
+1. Columns are referenced by **binder and name**: `Col(binder, name)`. Ordinals are never used in a
+   tree. *Rationale: names survive column reordering, read well in `EXPLAIN`, and are what a client
+   building trees by hand already has; resolution to positions is the server's job.*
+2. A binder is a non-empty string introduced by a node's `as` field (or a `Match` arm). Every binder
+   MUST be unique across the whole statement (`Q2004`). *Rationale: no shadowing, so a reference has
+   exactly one possible meaning and the error is always "unknown", never "ambiguous".*
+3. The nodes listed with `as` in §6 introduce a binder; their consumers see their columns only
+   through it. `Filter`, `Sort`, `Limit` and `Distinct` pass their input's exposed binders through
+   unchanged. `Join` and `Apply` expose per §6.5; `Window` and `Unnest` add their own binder to the
+   input's.
+4. A `Join` or `Apply` binder is required for `mark` and otherwise MUST be absent (`Q5009`).
+
+### 8.3 Scope
+
+The binders **visible** to an expression attached to node `N` are, in order of search:
+
+1. the binders exposed by `N`'s inputs (for `Join` and `Apply`'s `on`, both inputs; for `Project`,
+   `Aggregate`, `Window`, `Filter`, `Sort`, `Nest`, `Unnest`, its one input; for a DML node, §9);
+2. then, if `N` lies inside a subquery expression (`Relation`, `Scalar`, `Exists`, `In`) or the right
+   input of an `Apply`, the binders visible at that expression (or exposed by the `Apply`'s left
+   input), recursively outward.
+
+A reference to a binder found by step 2 is a **correlated** reference. A binder that exists in the
+statement but is not visible is `Q2006`; one that does not exist is `Q2002`; a column the binder does
+not have is `Q2003`.
+
+Expressions under `Limit.count`/`offset` and `Values.rows` see only step 2.
+
+### 8.4 Output names
+
+A node's output columns are its exposed binders' columns, in the order the binders were exposed
+(left before right), each binder's columns in their own order. Where §5 rule 5 requires unique names, the
+plain column names (without binder) MUST be unique.
+
+## 9. DML
+
+All DML nodes are statement roots only; a DML node elsewhere is `Q5002`. Data-modifying CTEs are not
+in 1.0.
+
+### 9.1 Binders in DML
+
+Each DML node has a binder `as` for the target row and an optional binder `old`. In `filter`, `set`
+and the conflict action, `as` denotes the existing row. In `returning`, `as` denotes the row as it was
+written (or, for `Delete`, as it was removed), and `old` denotes the row as it was before the
+statement, with every column nullable (null for a newly inserted row).
+
+### 9.2 Insert
+
+`Insert { table, as, old: binder?, columns: [name], source: Rel, on_conflict: OnConflict?, returning:
+[(name, Expr)] }`
+
+1. `columns` MUST name distinct (`Q5005`) insertable columns (`Q5003`). Source columns pair with
+   `columns` by position; their counts MUST match (`Q3001`) and each MUST coerce to the target column
+   (`Q3001`). A nullable source column into a non-null target is `Q3005`.
+   *Rationale: a NOT NULL violation that can be found statically is found statically.*
+2. Columns not named take their defaults (defined in `ddl.md`).
+
+### 9.3 Upsert
+
+`OnConflict { target: columns [name] | constraint name, excluded: binder, action: nothing | update {
+set: [(name, Expr)], where: Expr? } }`
+
+1. `target` MUST identify a unique constraint or unique index of the table (`Q5004`).
+2. For each source row: if no existing row conflicts on `target`, the row is inserted. Otherwise, with
+   `nothing` the row is skipped; with `update`, if `where` is absent or `true` the existing row is
+   updated by `set`, evaluated with `as` (the existing row) and `excluded` (the proposed row) visible;
+   else it is skipped. Skipped rows produce no `returning` row and are not counted.
+3. A statement that would insert or update the same target row twice is `R0007`.
+
+### 9.4 Update and Delete
+
+`Update { table, as, old: binder?, from: Rel?, filter: Expr?, set: [(name, Expr)], returning }`,
+`Delete { table, as, old: binder?, using: Rel?, filter: Expr?, returning }`.
+
+1. `set` MUST be non-empty (`Q5009`) and name each column at most once (`Q5005`); values coerce to the
+   column's type (`Q3001`, `Q3005`).
+2. `from`/`using` is joined to the target by `filter`; its binders are visible in `filter`, `set` and
+   `returning`. A target row matched by more than one `from` row MUST raise `R0007` (Postgres picks one
+   arbitrarily; TernDB refuses).
+3. Absent `filter` means every row.
+
+### 9.5 Returning and Action
+
+`returning` items see `as`, `old`, and the `from`/`using` binders. `Action()` is valid only in
+`returning` (`Q5002`) and has type `union<inserted: {}, updated: {}, deleted: {}>`. The result is a bag
+of the returning records.
+
+## 10. Parameters, shape and batches
+
+### 10.1 Declaration and binding
+
+1. Every parameter is declared in the envelope with a type (any type, including relation types).
+   Every declared parameter MUST be referenced at least once (`Q4002`).
+2. A bound value MUST have the declared type exactly (`Q4003`); no coercion happens at bind. The
+   number of values MUST equal the number of declarations (`Q4004`). Null bound to a non-nullable
+   parameter is `Q4005`.
+3. Parameter names are documentation and error-message material only.
+
+### 10.2 Shape
+
+The **shape form** of a validated statement is its canonical encoding (§12) at the server's current
+schema version, after: (a) every `ParamDecl.name` is made absent; (b) `spans` is made absent; (c) every
+binder is replaced by `b<i>` and every CTE name by `c<i>`, numbered in order of first introduction in
+pre-order. Output column names, parameter types, table names and everything else are kept.
+
+1. Two statements have the **same shape** iff their shape forms are byte-identical.
+2. A server's plan cache MUST key on the shape form (or a 256-bit-or-wider collision-resistant digest
+   of it) together with the catalog version the plan was made against. A server MAY re-plan for
+   particular parameter values, but MUST NOT give two statements of the same shape different
+   validation results.
+3. `EXPLAIN` MUST report the shape digest, so a test can check that two trees share a plan.
+
+### 10.3 Batches
+
+An execution MAY bind a **batch**: a sequence of parameter tuples. The statement then runs once per
+tuple, in order, within one transaction (the caller's, or an implicit one), atomically: if any run
+fails, none take effect. Results are returned per tuple, in order, tagged with the tuple's index.
+
+### 10.4 Relation-valued parameters
+
+A parameter of relation type, read through `ParamScan` or used as a `Relation`-typed expression, is
+the preferred form of bulk input: one execution, one plan, set-based. *Rationale: a batch of 10,000
+inserts is 10,000 executions; a `ParamScan` of 10,000 rows is one.*
+
+## 11. Validation and the error model
+
+### 11.1 Errors
+
+A validation error is `{ code, path, message, details }`. `code` is stable across releases and is what
+clients and tests match on; `message` is human text and not stable. `path` locates the node: a
+sequence of steps, each a field name from the schema with an index for list elements, written
+`/statement/source/rows/0/1`. `details` is a map from stable keys (`binder`, `column`, `expected`,
+`actual`, `missing_tags`, …) to text. When `spans` is present, the error also carries the source span.
+
+### 11.2 Order of checks
+
+Validation runs in phases: decode (`Q1…`), names (`Q2…`), types (`Q3…`), parameters and structure
+(`Q4…`, `Q5…`). A server MUST stop after the first phase that finds an error. Within that phase it MUST
+report the error whose path comes first in pre-order, and SHOULD report every other independent error
+in that phase, sorted by path.
+
+### 11.3 Codes
+
+| Code | Meaning |
+|---|---|
+| `Q1001` | Malformed encoding: truncated input, bad varint, payload length mismatch, trailing bytes. |
+| `Q1002` | Unknown or reserved node, type or enum ordinal for the negotiated version. |
+| `Q1003` | Non-canonical encoding (§12.1). |
+| `Q1004` | Invalid UTF-8 in a name or text value. |
+| `Q1005` | Envelope version not supported or above the negotiated one. |
+| `Q1006` | Nesting deeper than the server's limit (which MUST be at least 256). |
+| `Q2001` | Unknown table or view. |
+| `Q2002` | Unknown binder. |
+| `Q2003` | Unknown column of a binder. |
+| `Q2004` | Duplicate binder or duplicate CTE name. |
+| `Q2005` | Duplicate output name where unique names are required. |
+| `Q2006` | Binder exists but is not visible here. |
+| `Q2007` | Unknown function. |
+| `Q2008` | Unknown CTE. |
+| `Q2010` | Unknown union tag. |
+| `Q2011` | Unknown record field. |
+| `Q3001` | Type mismatch (`expected`, `actual`). |
+| `Q3002` | No overload matches. |
+| `Q3003` | Ambiguous overload. |
+| `Q3004` | Condition is not boolean. |
+| `Q3005` | Nullable value where a non-null one is required. |
+| `Q3006` | `eq`/`ne` on a relation type; use `same`. |
+| `Q3007` | Ordering comparison on an unorderable type. |
+| `Q3008` | Order required but the relation is a bag (`Limit`, `ties`, `ordinality`). |
+| `Q3009` | Non-exhaustive or duplicated `Match` arm. |
+| `Q3010` | `SetOp` inputs incompatible. |
+| `Q3011` | Decimal precision or scale out of range. |
+| `Q3012` | Cast not permitted. |
+| `Q3013` | Aggregate or window function outside `Aggregate`/`Window`. |
+| `Q3014` | Union payload or relation element is not a record. |
+| `Q3015` | Duplicate field or tag name in a type. |
+| `Q4001` | Parameter index out of range. |
+| `Q4002` | Declared parameter never referenced. |
+| `Q4003` | Bound value's type differs from the declaration. |
+| `Q4004` | Wrong number of bound values. |
+| `Q4005` | Null bound to a non-nullable parameter. |
+| `Q5001` | Invalid recursive CTE (non-linear, unstratified, mutual, missing column types). |
+| `Q5002` | Node not allowed here (DML not at root, `Action` outside `returning`). |
+| `Q5003` | DML target is not a table or column not writable. |
+| `Q5004` | Conflict target matches no unique constraint or index. |
+| `Q5005` | Column assigned or listed twice. |
+| `Q5006` | `Join` right input references the left input; use `Apply`. |
+| `Q5008` | Invalid window frame. |
+| `Q5009` | Arity or required-field violation (empty items, missing `mark`, row width, `Scalar` width). |
+| `Q7001` | Substrait relation not supported. |
+| `Q7002` | Substrait type not supported. |
+| `Q7003` | Substrait function not in the mapping. |
+| `Q7004` | Substrait plan version not supported. |
+
+Runtime errors referenced by this spec: `R0001` arithmetic overflow, `R0002` division by zero,
+`R0003` more than one row for a scalar subquery or `single` join, `R0004` `assert_not_null` on null,
+`R0005` recursion bound exceeded, `R0006` invalid value (cast failure, negative limit), `R0007` a
+target row affected twice. Constraint violations and transaction errors are defined in `isolation.md`.
+
+Codes are never reused. A code withdrawn in a later version stays reserved.
+
+## 12. Canonical binary encoding
+
+The same bytes cross the C ABI and the wire. `wire-protocol.md` frames them and MUST NOT alter them.
+
+### 12.1 Primitives
+
+| Primitive | Encoding |
+|---|---|
+| `uvar` | unsigned LEB128, minimal (no redundant `0x80` continuation bytes) |
+| `svar` | zigzag, then `uvar` |
+| `bool` | one octet, `0x00` or `0x01` |
+| `str` | `uvar` byte length, then UTF-8 |
+| `list<X>` | `uvar` count, then each `X` |
+| `opt<X>` | `0x00`, or `0x01` then `X` |
+| `enum` | `uvar` ordinal |
+| `node` | `uvar` kind, `uvar` payload length, then the payload: the node's fields in the order this spec lists them |
+
+The encoding is **canonical**: one tree has exactly one encoding. A decoder MUST refuse with `Q1003` a
+non-minimal `uvar`, a `bool` other than 0/1, an `opt` tag other than 0/1, or a nullable wrapper around
+a nullable type. *Rationale: canonical bytes make shape equality a byte comparison.* Pairs
+`(name, X)` encode as `str` then `X`. A binder is a `str`.
+
+### 12.2 Envelope
+
+```
+Envelope  := uvar major, uvar minor, list<ParamDecl>, node Statement, opt<Spans>
+ParamDecl := opt<str> name, Type
+Spans     := list<(uvar node_preorder_index, uvar start, uvar end)>   ordered by index
+```
+
+### 12.3 Types
+
+`Type` is a `node` with kind:
+
+| Kind | Type | Payload |
+|---|---|---|
+| 0 | `bool` | — |
+| 1–4 | `int16`, `int32`, `int64`, `int128` | — |
+| 5, 6 | `float32`, `float64` | — |
+| 7 | `decimal` | `uvar p, uvar s` |
+| 8, 9 | `text`, `bytes` | — |
+| 10–13 | `date`, `time`, `datetime`, `timestamp` | — |
+| 14, 15 | `interval`, `uuid` | — |
+| 16 | record | `list<(str, Type)>` |
+| 17 | union | `list<(str, Type)>` |
+| 18 | `bag` | `Type` |
+| 19 | `list` | `Type` |
+| 20 | nullable | `Type` (not itself nullable) |
+| 21–63 | reserved (named catalog types, `ddl.md`) | |
+
+### 12.4 Relational and expression kinds
+
+Each payload is the fields in the order of the tables in §6, §7 and §9; an `Expr?` is `opt<node>`, a
+`[X]` is `list<X>`, a name or binder is `str`, `QualName` is `str schema, str name`, a kind/op/mode is
+an `enum` in the order the spec lists its values.
+
+Rel kinds: 1 `Scan`, 2 `Values`, 3 `ParamScan`, 4 `Filter`, 5 `Project`, 6 `Join`, 7 `Apply`,
+8 `Aggregate`, 9 `Window`, 10 `Sort`, 11 `Limit`, 12 `Distinct`, 13 `SetOp`, 14 `With`, 15 `CteRef`,
+16 `Nest`, 17 `Unnest`, 18 `Tag`. Expr kinds: 1 `Col`, 2 `Row`, 3 `Param`, 4 `Null`, 5 `Call`, 6 `Cast`,
+7 `If`, 8 `Match`, 9 `Record`, 10 `Field`, 11 `Variant`, 12 `Relation`, 13 `Scalar`, 14 `Exists`, 15 `In`,
+16 `Action`. The auxiliary records `AggCall`, `WinCall`, `Frame`, `Bound`, `SortKey`, `CteDef`,
+`OnConflict` are encoded inline as their fields in order (not as nodes); a choice inside them
+(`OnConflict.target`, `action`) is an `enum` followed by the chosen alternative's fields. Kind 0 and
+kinds 64 and above in every family are reserved.
+
+### 12.5 Statement kinds
+
+1 `Query`, 2 `Insert`, 3 `Update`, 4 `Delete`; 32–63 reserved for DDL.
+
+### 12.6 Parameter values
+
+A parameter value is encoded by its declared type, with no tags (the type is known):
+
+| Type | Encoding |
+|---|---|
+| `bool` | one octet |
+| `intN` | N/8 octets, little-endian two's complement |
+| `decimal(p, s)` | 16 octets, little-endian unscaled `int128` |
+| `float32`/`float64` | IEEE 754, little-endian |
+| `text`, `bytes` | `uvar` length, octets |
+| `date` | `int32` LE, days since 1970-01-01 |
+| `time`, `datetime`, `timestamp` | `int64` LE microseconds (since midnight; since 1970-01-01T00:00 civil; since the Unix epoch) |
+| `interval` | `int32` months, `int32` days, `int64` micros, each LE |
+| `uuid` | 16 octets, RFC 9562 order |
+| `T?` | `0x00` for null, or `0x01` then the `T` encoding |
+| record | each field in order |
+| union | `uvar` discriminant, then the payload record |
+| `bag`/`list` | `uvar` count, then each element |
+
+Fixed-width scalars are fixed-width so a decoder can read a column without a varint loop.
+`wire-protocol.md` MUST fix how result rows are framed and streamed; it MUST encode each individual
+value as this table does, so one value decoder serves parameters, results, the wire and the C ABI. If
+the wire spec needs a different value encoding, it changes this table in the same commit.
+
+## 13. Versioning and negotiation
+
+1. The tree schema has a version `major.minor`, published with every release as a machine-readable
+   schema file (format: see Open questions) together with the function catalog and error codes.
+2. A **minor** version MAY add node kinds, enum values, functions, error codes and fields. An added
+   field MUST be appended to the end of its node's payload and MUST have a default value under which the
+   node means exactly what it meant before. A minor version MUST NOT change the meaning of any existing
+   tree.
+3. A **major** version MAY change anything. A server MUST support its current major and SHOULD support
+   the previous one.
+4. **Negotiation.** On the wire, the client offers the list of `(major, max_minor)` it supports; the
+   server answers with the highest common major and, for it, `min(client max_minor, server max_minor)`.
+   No common major ends the connection with `Q1005`. Through the C ABI, `terndb_tree_version()` reports
+   the library's `(major, minor)`, and that is the negotiated version.
+5. An envelope's version MUST have the negotiated major and a minor at most the negotiated minor
+   (`Q1005`). Its fields are decoded per its own minor; fields of a later minor take their defaults.
+   An encoder MUST NOT emit a field or kind beyond the envelope's minor.
+6. Shape forms are computed after re-encoding at the server's current version (§10.2), so one query
+   sent by clients of different minors has one shape.
+
+## 14. Substrait
+
+A server MUST accept a Substrait plan in place of a tree, for the Substrait versions it publishes
+(`Q7004` otherwise), and MUST translate it to a tree that is then validated as any other. Errors from
+the translation are `Q7…` with a path into the Substrait plan; errors from validation carry the tree
+path and the Substrait relation's anchor. Only inbound translation is required in 1.0.
+
+### 14.1 What maps
+
+| Substrait | Tree |
+|---|---|
+| `ReadRel` named table | `Scan` |
+| `ReadRel` virtual table | `Values`, every literal hoisted to a new parameter |
+| `FilterRel`, `SortRel` | `Filter`, `Sort` |
+| `ProjectRel` (+ `emit`) | `Project` listing the kept input fields and the new expressions |
+| `JoinRel` inner/left/right/outer/left_semi/left_anti/left_single/left_mark | `Join` inner/left/right/full/semi/anti/single/mark; the `right_*` kinds swap inputs |
+| `CrossRel` | `Join` inner, no `on` |
+| `HashJoinRel`, `MergeJoinRel`, `NestedLoopJoinRel` | `Join`; the physical choice is dropped |
+| `AggregateRel` with one grouping set | `Aggregate` |
+| `FetchRel` | `Limit`, with `arbitrary = true` unless its input maps to a `Sort` |
+| `SetRel` union/minus/intersection (primary and multiset forms with two inputs) | `SetOp` |
+| `ConsistentPartitionWindowRel`, window function expressions | `Window` |
+| `WriteRel` insert/delete/update | `Insert`/`Delete`/`Update`; output mode "modified records" becomes `returning` of every column |
+| field reference (ordinal, `outer_reference` steps) | `Col` by the referenced column's name; outer steps become correlated references |
+| literal | a new `Param` with the literal bound as its value |
+| scalar function in a mapped extension URI | `Call` per the published mapping table |
+| `IfThen`, `SwitchExpression` | `If` |
+| `Cast` (throw / return null) | `Cast` strict / try |
+| scalar, in-predicate and `exists` subqueries | `Scalar`, `In`, `Exists` |
+| `SingularOrList`, `MultiOrList` | `In` over `Values` |
+| types `boolean i16 i32 i64 fp32 fp64 string binary date time uuid decimal(p≤38)` | the matching scalar |
+| `timestamp`, `timestamp_tz`, precision variants with precision ≤ 6 | `datetime`, `timestamp` |
+| `interval_year`, `interval_day`, `interval_compound` | `interval` |
+| `struct` (names from the enclosing `NamedStruct`, else `f0`, `f1`, …) | record |
+| `list<struct>` | `list<record>` |
+
+### 14.2 What does not map, and why
+
+| Substrait | Code | Why |
+|---|---|---|
+| `i8` | `Q7002` | No `int8`; widening would change overflow behaviour. |
+| `varchar<L>`, `fixed_char`, `fixed_binary` | `Q7002` | A length is a constraint in TernDB, not a type. |
+| precision > 6 timestamps | `Q7002` | Microsecond values cannot hold them losslessly. |
+| `map`, `list` of a non-struct, user-defined types | `Q7002` | No equivalent type in 1.0. |
+| multiple grouping sets, `ExpandRel` | `Q7001` | Grouping sets are not in 1.0. |
+| `ExtensionLeaf/Single/MultiRel`, `ExchangeRel`, `DdlRel`, local files | `Q7001` | Opaque, distributed or DDL: outside the tree. |
+| functions outside the mapping table | `Q7003` | No silent approximation of a function's semantics. |
+| `unique` set predicate | `Q7001` | No tree equivalent in 1.0. |
+
+Tagged unions, `bag`-typed nested relations, upsert and `Action` have no Substrait form; they are
+reachable only through a tree.
+
+## 15. Text form and EXPLAIN
+
+`EXPLAIN` prints the validated tree in the text form below, then the physical plan, then the shape
+digest. The text form is also how this spec writes examples. A server SHOULD provide a parser for it
+(tests are written in it); the binary encoding stays the only input format a client is required to
+produce.
+
+```
+node    = "(" kind field* ")"
+field   = ":" fname value
+value   = node | "[" item* "]" | binder "." column | "$" index | name | type
+item    = value | name ":" value
+```
+
+A `Col(b, c)` prints as `b.c`; a `Param(i)` as `$i`; a pair list as `[name: value …]`; `SortKey` as
+`(asc|desc expr nulls_first|nulls_last)`; types as `int64`, `text?`, `{a: int64}`, `bag<…>`,
+`list<…>`, `union<T: {…}, …>`. A field holding its default is omitted.
+
+## 16. Worked examples
+
+### 16.1 Users, their 3 newest posts with comments, and a post count
+
+GraphQL:
+
+```graphql
+query { users(first: 50, orderBy: {id: ASC}) {
+  id name postCount
+  posts(first: 3, orderBy: {createdAt: DESC}) { id title comments { id body } } } }
+```
+
+Parameters: `$0: int64` = 50, `$1: int64` = 3. Every column is `NOT NULL`.
+
+```
+(query :rel
+ (project :as r
+  :input (limit :count $0
+           :input (sort :keys [(asc u.id nulls_last)]
+                    :input (scan :table app.users :as u)))
+  :items [
+   id: u.id
+   name: u.name
+   post_count: (scalar :rel
+     (aggregate :as pc
+       :input (filter :input (scan :table app.posts :as p1)
+                      :predicate (call eq p1.author_id u.id))
+       :aggs [n: (count)]))
+   posts: (relation :rel
+     (project :as pp
+       :input (limit :count $1
+                :input (sort :keys [(desc p.created_at nulls_last) (desc p.id nulls_last)]
+                         :input (filter :input (scan :table app.posts :as p)
+                                        :predicate (call eq p.author_id u.id))))
+       :items [
+        id: p.id
+        title: p.title
+        comments: (relation :rel
+          (project :as cc
+            :input (filter :input (scan :table app.comments :as c)
+                           :predicate (call eq c.post_id p.id))
+            :items [id: c.id body: c.body]))]))]))
+```
+
+Result type:
+
+```
+list<{id: int64, name: text, post_count: int64,
+      posts: list<{id: int64, title: text, comments: bag<{id: int64, body: text}>}>}>
+```
+
+`post_count` is `int64`, not `int64?`, because a keyless `Aggregate` is cardinality-one (§7.10). The
+second sort key makes the per-user order total, so the result is deterministic. `comments` is a bag
+because nothing ordered it.
+
+*Informative — what the unnester produces.* `U` = the 50 users. `P` = `posts` semi-joined to `U` on
+`author_id`, with window columns `rn = row_number()` and `cnt = count()` partitioned by `author_id`
+and ordered by `(created_at desc, id desc)`, filtered to `rn ≤ $1`. `C` = `comments` semi-joined to `P`
+on `post_id`. Then `Nest C` into `P` by `post_id`, `Nest P` into `U` by `author_id` with a left join,
+and `post_count` = `cnt` or 0 for a user with no posts (Neumann–Kemper's treatment of the COUNT bug).
+Three scans, three batched joins, no per-user work.
+
+### 16.2 A list of union elements
+
+GraphQL `search(text: $q, first: 10)` returns `[SearchResult]`, where `SearchResult = Post | Photo`
+and both implement an interface with `id` and `createdAt`.
+
+```
+SR = union<Post: {id: int64, created_at: timestamp, title: text},
+           Photo: {id: int64, created_at: timestamp, url: text}>
+```
+
+Parameters: `$0: text`, `$1: int64` = 10.
+
+```
+(query :rel
+ (limit :count $1
+  :input (sort :keys [(desc s.created_at nulls_last) (asc s.id nulls_last)]
+   :input (setop :op union :all true :as s
+    :inputs [
+     (tag :as t1 :type SR :tag Post
+       :input (project :as a
+                :input (filter :input (scan :table app.posts :as p)
+                               :predicate (call contains p.title $0))
+                :items [id: p.id created_at: p.created_at title: p.title]))
+     (tag :as t2 :type SR :tag Photo
+       :input (project :as b
+                :input (filter :input (scan :table app.photos :as f)
+                               :predicate (call contains f.caption $0))
+                :items [id: f.id created_at: f.created_at url: f.url]))]))))
+```
+
+Result type `list<SR>`. `s.created_at` and `s.id` are SR's shared columns (§2.4), so the sort needs no
+`Match`. A projection that reads variant fields must match:
+
+```
+(project :as out :input … :items [
+  id: s.id
+  label: (match :expr (row s) :arms [(Post x x.title) (Photo y y.url)])])
+```
+
+Dropping the `Photo` arm is refused with `Q3009`, `details.missing_tags = "Photo"`.
+
+### 16.3 Upsert with returning
+
+SQL intent: add `$1` to counter `$0`, creating it if absent, and report what happened.
+
+Parameters: `$0: text`, `$1: int64`. Table `app.counters(key text primary key, n int64 not null)`.
+
+```
+(insert :table app.counters :as t :old o
+  :columns [key n]
+  :source (values :as v :columns [key: text n: int64] :rows [[$0 $1]])
+  :on_conflict (on_conflict :target (columns [key]) :excluded x
+                 :action (update :set [n: (call add t.n x.n)]))
+  :returning [key: t.key n: t.n previous: o.n action: (action)])
+```
+
+Result type `bag<{key: text, n: int64, previous: int64?, action: union<inserted: {}, updated: {},
+deleted: {}>}>`. First run with (`"hits"`, 1): one row `{hits, 1, null, inserted}`. Second run with
+(`"hits"`, 5): `{hits, 6, 1, updated}`. Binding `$1` to null is `Q4005`; declaring `$1: int64?` makes
+the `set` nullable into a `NOT NULL` column and is refused with `Q3005`.
+
+## 17. Open questions
+
+These need the user's decision; the spec above takes the stated provisional position.
+
+1. **Unsigned integers and `int8`.** Excluded (§2.1) for SQL and Substrait alignment, although sysl
+   has every width. Should `uint8…uint64` exist?
+2. **Unbounded decimal.** Only `decimal(p ≤ 38)` exists. Is a Postgres-style arbitrary-precision
+   `numeric` needed?
+3. **Collation.** Text compares by octets only. Are collations (ICU or otherwise) in scope for v1, and
+   are they part of the type (`text collate x`) or of the comparison?
+4. **Scalar arrays.** A relation's element must be a record, so an array of integers is
+   `list<{value: int64}>`. Should `list<int64>` be allowed directly?
+5. **JSON.** No `json` type in 1.0. Is one wanted for documents that are genuinely schemaless?
+6. **Literals.** The tree has none, so even a constant `0` or a `LIMIT 3` is a parameter. Acceptable,
+   or should non-injectable compile-time constants (numbers, booleans) be allowed as literal nodes?
+7. **Schema file format** for the published tree schema: an own IDL, JSON Schema, or a sysl source the
+   others are generated from?
+8. **Support window**: how many previous majors must a server keep accepting?
+9. **Data-modifying CTEs** and **grouping sets**: deferred from 1.0 (§9, §14.2). Confirm.
+10. **Substrait outbound**: should TernDB export its plans as Substrait, and which Substrait versions
+    are the published range?
+11. **`Limit` over a bag** requires `arbitrary: true`. Is that strictness wanted, given that GraphQL
+    `first:` without `orderBy` then needs the flag from the front end?
+12. **Canonical text forms of values** (what `Cast` between `text` and each scalar parses and prints):
+    ISO 8601 for the time types and RFC 9562 for `uuid` are the obvious defaults. Should they be fixed
+    in this spec or in a separate value-format spec?

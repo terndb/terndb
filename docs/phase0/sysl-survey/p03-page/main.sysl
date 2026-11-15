@@ -1,0 +1,104 @@
+// Need 3: page memory: a 16 KiB aligned page, a slotted-page header read at a byte offset as a typed
+// struct, prefix-compressed keys, and a child pointer swizzled to a page id and back.
+import sysl.raw.{ptr_cast, str_alias}
+import sysl.slices.copy
+
+const PAGE = 16384
+
+@align(16384)
+struct Page
+    bytes: [16384]u8
+
+// The header sits at offset 0; the slot directory follows it; cells grow down from the end.
+@packed
+struct Header
+    lsn: u64
+    nslots: u16
+    free_lo: u16
+    free_hi: u16
+    prefix_len: u16
+
+@packed
+struct Slot
+    off: u16
+    len: u16
+
+// A child reference: either a live pointer (low bit 0) or an on-disk page id (low bit 1).
+struct Swip
+    word: u64
+
+impl Swip
+    is_hot(self) -> bool = self.word & 1 == 0
+    of_ptr(p: *Page) -> Swip = Swip(u64(usize(p)))
+    of_id(id: u64) -> Swip = Swip(id << 1 | 1)
+    ptr(self) -> *Page = ptr_cast(usize(self.word))
+    id(self) -> u64 = self.word >> 1
+
+header(p: *Page) -> *Header = ptr_cast(&p.bytes[0])
+
+slot(p: *Page, i: int) -> *Slot = ptr_cast(&p.bytes[int(sizeof(Header)) + i * int(sizeof(Slot))])
+
+// Insert a key (stored without the page's common prefix) and answer its slot number.
+insert(p: *Page, key: []const u8) -> int
+    val h = header(p)
+    val suffix = key[int(h.prefix_len)..]
+    val n = int(suffix.len)
+    val at = int(h.free_hi) - n
+
+    copy(p.bytes[at..<at + n], suffix)
+
+    val i = int(h.nslots)
+    val s = slot(p, i)
+    s.off = u16(at)
+    s.len = u16(n)
+    h.nslots += 1
+    h.free_hi = u16(at)
+    h.free_lo = u16(int(sizeof(Header)) + (i + 1) * int(sizeof(Slot)))
+    i
+
+// A key's suffix as a view of the page's own bytes, with no copy.
+suffix_of(p: *Page, i: int) -> []u8
+    val s = slot(p, i)
+    p.bytes[int(s.off)..<int(s.off) + int(s.len)]
+
+// Compare a probe key against slot i: prefix first, then the stored suffix.
+compare(p: *Page, prefix: []const u8, i: int, key: []const u8) -> int
+    val n = prefix.len
+
+    for j in 0..<n
+        if key[j] != prefix[j] then return int(key[j]) - int(prefix[j])
+
+    val tail = suffix_of(p, i)
+    val rest = key[n..]
+
+    for j in 0..<rest.len
+        if j >= tail.len then return 1
+        if rest[j] != tail[j] then return int(rest[j]) - int(tail[j])
+
+    if rest.len == tail.len then 0 else -1
+
+val page: &Page = Page([0; 16384])
+val pp: *Page = &*page
+
+print("aligned", usize(pp) % PAGE, sizeof(Header), sizeof(Slot))
+
+val h = header(pp)
+h.lsn = 42
+h.free_hi = u16(PAGE)
+h.prefix_len = 4
+
+val prefix = "user"
+insert(pp, "user:alice".bytes)
+insert(pp, "user:bob".bytes)
+
+print(h.nslots, h.free_lo, h.free_hi, str_alias(suffix_of(pp, 1)))
+print(compare(pp, prefix.bytes, 0, "user:alice".bytes), compare(pp, prefix.bytes, 1, "user:bz".bytes) > 0)
+
+// Swizzling: pointer to id and back.
+var sw = Swip.of_ptr(pp)
+print(sw.is_hot(), sw.ptr() == pp)
+sw = Swip.of_id(77)
+print(sw.is_hot(), sw.id())
+
+// The header read back as plain little-endian bytes at its offset.
+print(page.bytes[0], page.bytes[8])
