@@ -1,0 +1,323 @@
+module sh.sysl.terndb
+@tests
+
+// `query-tree.md` §3.5: every scalar's printed form, the variants its parser also takes, and the
+// texts it refuses with `R0006`.
+
+private printed(t: Type, v: Value) -> string = to_text(t, v) match
+    Ok(s) -> s
+    Err(e) -> e.code
+
+private parsed(t: Type, text: string) -> Value = from_text(t, text).unwrap()
+
+private refused(t: Type, text: string) -> string = from_text(t, text) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** `text` is `t`'s printed form of the value it parses to. */
+private round_trips(t: Type, text: string, file: string = __FILE__, line: long = __LINE__)
+    val back = printed(t, from_text(t, text).unwrap())
+
+    if back != text then print("\nwanted: ", text, "\ngot:    ", back, "\n")
+
+    assert(back == text, "the printed form does not read back to itself", file, line)
+
+private float_bits(t: Type, text: string) -> u64 = parsed(t, text) match
+    Float(x) -> x.bits()
+    _ -> 0
+
+@test
+booleans_are_two_words_and_nothing_else()
+    assert_eq(printed(Bool, Value.Bool(true)), "true")
+    assert_eq(printed(Bool, Value.Bool(false)), "false")
+    assert_eq(parsed(Bool, "false"), Value.Bool(false))
+
+    for text in ["TRUE", "True", " true", "true ", "1", "t", ""]
+        assert_eq(refused(Bool, text), "R0006")
+
+@test
+integers_print_without_leading_zeros()
+    assert_eq(printed(Int64, Int(0)), "0")
+    assert_eq(printed(Int64, Int(-42)), "-42")
+    assert_eq(printed(Int128, Int(i128::Min)), "-170141183460469231731687303715884105728")
+    assert_eq(printed(Int128, Int(i128::Max)), "170141183460469231731687303715884105727")
+    assert_eq(printed(UInt64, UInt(u64::Max)), "18446744073709551615")
+    assert_eq(printed(nullable(Int8), Int(7)), "7")
+
+@test
+integers_parse_with_a_leading_plus_and_their_extremes()
+    assert_eq(parsed(Int32, "+7"), Int(7))
+    assert_eq(parsed(Int32, "-0"), Int(0))
+    assert_eq(parsed(UInt8, "+255"), UInt(255))
+    assert_eq(parsed(Int8, "-128"), Int(-128))
+    assert_eq(parsed(Int8, "127"), Int(127))
+    round_trips(Int128, "-170141183460469231731687303715884105728")
+    round_trips(Int128, "170141183460469231731687303715884105727")
+    round_trips(UInt64, "18446744073709551615")
+
+@test
+integers_out_of_range_or_misspelled_are_refused()
+    assert_eq(refused(Int8, "128"), "R0006")
+    assert_eq(refused(Int8, "-129"), "R0006")
+    assert_eq(refused(Int128, "170141183460469231731687303715884105728"), "R0006")
+    assert_eq(refused(Int128, "-170141183460469231731687303715884105729"), "R0006")
+    assert_eq(refused(Int128, "999999999999999999999999999999999999999999"), "R0006")
+    assert_eq(refused(UInt64, "18446744073709551616"), "R0006")
+    assert_eq(refused(UInt8, "-1"), "R0006")
+    assert_eq(refused(UInt8, "-0"), "R0006")
+
+    for text in ["", "+", "-", "007", "00", "1 ", " 1", "1.0", "1e3", "0x10", "--1", "+-1", "١"]
+        assert_eq(refused(Int64, text), "R0006")
+
+@test
+decimals_print_exactly_their_scale()
+    assert_eq(printed(Decimal(4, 2), Int(1250)), "12.50")
+    assert_eq(printed(Decimal(4, 2), Int(-5)), "-0.05")
+    assert_eq(printed(Decimal(4, 2), Int(0)), "0.00")
+    assert_eq(printed(Decimal(5, 0), Int(-42)), "-42")
+    assert_eq(printed(Decimal(38, 38), Int(1)), "0.00000000000000000000000000000000000001")
+    assert_eq(printed(Decimal(38, 0), Int(pow10(38) - 1)), "99999999999999999999999999999999999999")
+
+@test
+decimals_parse_more_or_fewer_digits_rounding_half_away_from_zero()
+    val t = Decimal(4, 2)
+
+    assert_eq(parsed(t, "12.5"), Int(1250))
+    assert_eq(parsed(t, "12"), Int(1200))
+    assert_eq(parsed(t, "+12.50"), Int(1250))
+    assert_eq(parsed(t, "12.504"), Int(1250))
+    assert_eq(parsed(t, "12.505"), Int(1251))
+    assert_eq(parsed(t, "-12.505"), Int(-1251))
+    assert_eq(parsed(t, "-12.5049999999999999999999999999999999999999"), Int(-1250))
+    assert_eq(parsed(t, "0.5"), Int(50))
+    assert_eq(parsed(t, "-0.001"), Int(0))
+    assert_eq(parsed(Decimal(3, 0), "-0.5"), Int(-1))
+    round_trips(Decimal(38, 0), "-99999999999999999999999999999999999999")
+
+@test
+decimals_past_their_precision_or_misspelled_are_refused()
+    val t = Decimal(4, 2)
+
+    assert_eq(refused(t, "100.00"), "R0006")
+    assert_eq(refused(t, "99.995"), "R0006")
+    assert_eq(refused(Decimal(38, 0), "100000000000000000000000000000000000000"), "R0006")
+
+    for text in ["", "12.", ".5", "00.5", "1.2.3", "1,5", "1e2", " 1.5", "1.5 ", "-", "+.5", "nan"]
+        assert_eq(refused(t, text), "R0006")
+
+@test
+floats_print_the_shortest_digits_that_read_back()
+    assert_eq(printed(Float64, Float(0.1)), "0.1")
+    assert_eq(printed(Float64, Float(-2.5)), "-2.5")
+    assert_eq(printed(Float64, Float(100.0)), "100")
+    assert_eq(printed(Float64, Float(123.456)), "123.456")
+    assert_eq(printed(Float64, Float(1.7976931348623157e308)), "1.7976931348623157e308")
+    assert_eq(printed(Float64, Float(5e-324)), "5e-324")
+    assert_eq(printed(Float32, Float(real(f32(0.1)))), "0.1")
+    assert_eq(printed(Float64, Float(real(f32(0.1)))), "0.10000000149011612")
+    assert_eq(printed(Float32, Float(real(f32(3.4028235e38f32)))), "3.4028235e38")
+
+@test
+a_float_switches_to_an_exponent_outside_a_millionth_to_ten_to_the_21()
+    assert_eq(printed(Float64, Float(0.000001)), "0.000001")
+    assert_eq(printed(Float64, Float(0.0000015)), "0.0000015")
+    assert_eq(printed(Float64, Float(1e-7)), "1e-7")
+    assert_eq(printed(Float64, Float(1.5e-7)), "1.5e-7")
+    assert_eq(printed(Float64, Float(1e20)), "100000000000000000000")
+    assert_eq(printed(Float64, Float(1.2345678901234568e20)), "123456789012345680000")
+    assert_eq(printed(Float64, Float(1e21)), "1e21")
+    assert_eq(printed(Float64, Float(-1.5e300)), "-1.5e300")
+
+@test
+the_special_floats_print_by_name()
+    assert_eq(printed(Float64, Float(-0.0)), "-0")
+    assert_eq(printed(Float64, Float(0.0)), "0")
+    assert_eq(printed(Float64, Float(real.infinity)), "inf")
+    assert_eq(printed(Float64, Float(-real.infinity)), "-inf")
+    assert_eq(printed(Float64, Float(real.nan)), "nan")
+    assert_eq(printed(Float32, Float(-real.nan)), "nan")
+
+@test
+floats_parse_any_decimal_or_exponent_form_and_the_long_names()
+    assert_eq(parsed(Float64, "1E5"), Float(100000.0))
+    assert_eq(parsed(Float64, "+1.5"), Float(1.5))
+    assert_eq(parsed(Float64, "007.50e-1"), Float(0.75))
+    assert_eq(parsed(Float64, "Infinity"), Float(real.infinity))
+    assert_eq(parsed(Float64, "-Infinity"), Float(-real.infinity))
+    assert_eq(parsed(Float64, "-inf"), Float(-real.infinity))
+    assert_eq(float_bits(Float64, "-0"), (-0.0).bits())
+    assert(float_bits(Float64, "NaN") == real.nan.bits())
+    assert(float_bits(Float64, "nan") == real.nan.bits())
+    assert_eq(float_bits(Float32, "0.1"), real(f32(0.1)).bits())
+
+@test
+every_printed_float_reads_back_to_its_own_bits()
+    for x in [0.1, -0.0, 5e-324, 2.2250738585072014e-308, 1.7976931348623157e308, 1e21, 1e-7, 123456.789, -1e100]
+        assert_eq(float_bits(Float64, printed(Float64, Float(x))), x.bits())
+
+    for x in [0.1f32, 1e-45f32, 1.1754944e-38f32, 3.4028235e38f32, 16777217.0f32, -7.25f32]
+        assert_eq(float_bits(Float32, printed(Float32, Float(real(x)))), real(x).bits())
+
+@test
+floats_too_large_or_misspelled_are_refused()
+    assert_eq(refused(Float64, "1e400"), "R0006")
+    assert_eq(refused(Float32, "3.5e38"), "R0006")
+
+    for text in ["", ".5", "5.", "1e", "1e+", "--1", "0x1p3", "inf ", " 1", "INF", "+inf", "+nan", "-nan",
+                 "infinity", "1,5", "1_000", "e5"]
+        assert_eq(refused(Float64, text), "R0006")
+
+@test
+text_is_its_own_form()
+    assert_eq(printed(Text, Text("")), "")
+    assert_eq(printed(Text, Text("a\0b")), "a\0b")
+    assert_eq(parsed(Text, " spaces kept "), Value.Text(" spaces kept "))
+    assert_eq(parsed(Text, "é\0"), Value.Text("é\0"))
+
+@test
+bytes_print_as_lowercase_hex_after_a_backslash_x()
+    assert_eq(printed(Bytes, bytes_value([0x00, 0xab, 0xff])), "\\x00abff")
+    assert_eq(printed(Bytes, bytes_value([])), "\\x")
+    assert_eq(parsed(Bytes, "\\x00ABff"), bytes_value([0x00, 0xab, 0xff]))
+    assert_eq(parsed(Bytes, "\\x"), bytes_value([]))
+
+    for text in ["", "\\", "\\x0", "x00", "\\X00", "\\xzz", "\\x 00", "00", "\\x00 "]
+        assert_eq(refused(Bytes, text), "R0006")
+
+@test
+dates_print_iso_8601_with_astronomical_years()
+    assert_eq(printed(Date, Int(0)), "1970-01-01")
+    assert_eq(printed(Date, Int(-1)), "1969-12-31")
+    assert_eq(printed(Date, Int(11016)), "2000-02-29")
+    assert_eq(printed(Date, Int(-2440588)), "-04713-11-24")
+    assert_eq(printed(Date, Int(-719528)), "0000-01-01")
+    assert_eq(printed(Date, Int(-719529)), "-00001-12-31")
+    assert_eq(printed(Date, Int(2932896)), "9999-12-31")
+    assert_eq(printed(Date, Int(2932897)), "+10000-01-01")
+
+@test
+dates_parse_their_printed_form_within_the_year_range()
+    assert_eq(parsed(Date, "2000-02-29"), Int(11016))
+    assert_eq(parsed(Date, "-04713-11-24"), Int(-2440588))
+    round_trips(Date, "-04713-01-01")
+    round_trips(Date, "+294276-12-31")
+    round_trips(Date, "0000-02-29")
+    round_trips(Date, "+10000-01-01")
+
+@test
+dates_outside_the_range_or_the_calendar_are_refused()
+    for text in ["-04714-12-31", "+294277-01-01", "2023-02-29", "1900-02-29", "2024-04-31", "2024-13-01",
+                 "2024-00-10", "2024-01-00", "+2024-01-01", "10000-01-01", "+010000-01-01", "-4713-11-24",
+                 "-004713-11-24", "2024-1-01", "2024-01-1", "2024/01/01", "20240101", " 2024-01-01", "",
+                 "2024-01-01T00:00:00"]
+        assert_eq(refused(Date, text), "R0006")
+
+@test
+times_print_a_fraction_only_when_there_is_one()
+    assert_eq(printed(Time, Int(0)), "00:00:00")
+    assert_eq(printed(Time, Int(1500000)), "00:00:01.5")
+    assert_eq(printed(Time, Int(45296000001)), "12:34:56.000001")
+    assert_eq(printed(Time, Int(86399999999)), "23:59:59.999999")
+    assert_eq(printed(Time, Int(43200120000)), "12:00:00.12")
+
+@test
+times_parse_zero_to_six_fraction_digits()
+    assert_eq(parsed(Time, "12:00:00.000"), Int(43200000000))
+    assert_eq(parsed(Time, "12:00:00.1"), Int(43200100000))
+    assert_eq(parsed(Time, "23:59:59.999999"), Int(86399999999))
+    round_trips(Time, "00:00:00")
+
+    for text in ["24:00:00", "12:60:00", "12:00:60", "1:00:00", "12:00", "12:00:00.", "12:00:00.1234567",
+                 "12:00:00Z", "12-00-00", " 12:00:00", "12:00:00 ", "12:00:00,5", ""]
+        assert_eq(refused(Time, text), "R0006")
+
+@test
+datetimes_join_a_date_and_a_time()
+    assert_eq(printed(DateTime, Int(0)), "1970-01-01T00:00:00")
+    assert_eq(printed(DateTime, Int(-1)), "1969-12-31T23:59:59.999999")
+    assert_eq(parsed(DateTime, "1970-01-02 00:00:00.5"), Int(86400500000))
+    round_trips(DateTime, "-04713-01-01T00:00:00")
+    round_trips(DateTime, "2024-02-29T23:59:59.25")
+
+    for text in ["1970-01-01t00:00:00", "1970-01-01T00:00:00Z", "1970-01-01", "1970-01-01T", "1970-01-01T24:00:00",
+                 "1970-01-01  00:00:00", "+294247-01-10T04:00:54.775808"]
+        assert_eq(refused(DateTime, text), "R0006")
+
+@test
+timestamps_print_in_utc_with_a_z()
+    assert_eq(printed(Timestamp, Int(0)), "1970-01-01T00:00:00Z")
+    assert_eq(printed(Timestamp, Int(i128(i64::Max))), "+294247-01-10T04:00:54.775807Z")
+    assert_eq(printed(Timestamp, Int(i128(i64::Min))), "-290308-12-21T19:59:05.224192Z")
+
+@test
+timestamps_parse_an_offset_converted_to_utc()
+    assert_eq(parsed(Timestamp, "1970-01-01T01:00:00+01:00"), Int(0))
+    assert_eq(parsed(Timestamp, "1969-12-31T23:00:00-01:00"), Int(0))
+    assert_eq(parsed(Timestamp, "1970-01-01 05:30:00+05:30"), Int(0))
+    assert_eq(parsed(Timestamp, "1970-01-01T00:00:00-00:00"), Int(0))
+    round_trips(Timestamp, "+294247-01-10T04:00:54.775807Z")
+
+    for text in ["1970-01-01T00:00:00", "1970-01-01T00:00:00z", "1970-01-01T00:00:00+0100", "1970-01-01T00:00:00+1",
+                 "1970-01-01T00:00:00+24:00", "1970-01-01T00:00:00+01:60", "1970-01-01T00:00:00 Z",
+                 "+294247-01-10T04:00:54.775808Z", "+294247-01-10T03:00:54.775808-01:00",
+                 "-290308-12-21T19:59:05.224192Z"]
+        assert_eq(refused(Timestamp, text), "R0006")
+
+@test
+intervals_print_each_non_zero_component()
+    assert_eq(printed(Interval, Value.Interval(14, -3, 90500000)), "P14M-3DT90.5S")
+    assert_eq(printed(Interval, Value.Interval(0, 0, 0)), "PT0S")
+    assert_eq(printed(Interval, Value.Interval(1, 0, 0)), "P1M")
+    assert_eq(printed(Interval, Value.Interval(0, 2, 0)), "P2D")
+    assert_eq(printed(Interval, Value.Interval(0, 0, -500000)), "PT-0.5S")
+    assert_eq(printed(Interval, Value.Interval(0, 0, 1)), "PT0.000001S")
+    assert_eq(printed(Interval, Value.Interval(i32::Min, i32::Max, i64::Min)),
+              "P-2147483648M2147483647DT-9223372036854.775808S")
+
+@test
+intervals_parse_only_their_printed_form()
+    assert_eq(parsed(Interval, "P14M-3DT90.5S"), Value.Interval(14, -3, 90500000))
+    round_trips(Interval, "PT0S")
+    round_trips(Interval, "P-1M")
+    round_trips(Interval, "P5DT-1S")
+    round_trips(Interval, "PT-0.000001S")
+    round_trips(Interval, "P-2147483648M2147483647DT-9223372036854.775808S")
+    round_trips(Interval, "PT9223372036854.775807S")
+
+    for text in ["", "P", "P0M", "P0D", "PT0.0S", "PT1.50S", "P1D2M", "p1M", "P1m", "P1M ", "PT1.1234567S", "PT1",
+                 "P1", "PT", "P+1M", "P01M", "P1.5M", "P2147483648M", "PT9223372036854.775808S", "1M", "P1MT0S"]
+        assert_eq(refused(Interval, text), "R0006")
+
+@test
+uuids_print_as_lowercase_8_4_4_4_12()
+    val bits = 0x0123456789abcdef0123456789abcdefu128
+
+    assert_eq(printed(Uuid, Value.Uuid(bits)), "01234567-89ab-cdef-0123-456789abcdef")
+    assert_eq(printed(Uuid, Value.Uuid(0)), "00000000-0000-0000-0000-000000000000")
+    assert_eq(parsed(Uuid, "01234567-89AB-CDEF-0123-456789ABCDEF"), Value.Uuid(bits))
+    assert_eq(parsed(Uuid, "ffffffff-ffff-ffff-ffff-ffffffffffff"), Value.Uuid(u128::Max))
+
+    for text in ["", "0123456789abcdef0123456789abcdef", "{01234567-89ab-cdef-0123-456789abcdef}",
+                 "01234567-89ab-cdef-0123-456789abcde", "01234567-89ab-cdef-0123-456789abcdeg",
+                 "0123456-789ab-cdef-0123-456789abcdef", "01234567-89ab-cdef-0123-456789abcdef "]
+        assert_eq(refused(Uuid, text), "R0006")
+
+@test
+json_prints_as_held_and_parses_to_canonical_form()
+    assert_eq(printed(Json, Text("{\"a\":1}")), "{\"a\":1}")
+    assert_eq(parsed(Json, " { \"b\" : 1.0E2, \"a\" : [ true , null ] } "), Value.Text("{\"a\":[true,null],\"b\":100}"))
+    assert_eq(refused(Json, "{\"a\":}"), "R0006")
+    assert_eq(refused(Json, ""), "R0006")
+
+@test
+records_unions_and_relations_have_no_text_form()
+    for t in [record([Field("a", Int8)]), union_of([Field("x", record([]))]), bag(Int8), nullable(list(Text))]
+        assert_eq(refused(t, ""), "Q3012")
+
+    assert_eq(printed(record([Field("a", Int8)]), rec([Int(1)])), "Q3012")
+    assert_eq(printed(nullable(bag(Int8)), Null), "Q3012")
+
+@test
+a_null_has_no_text_form()
+    assert_eq(printed(nullable(Int64), Null), "R0006")
+    assert_eq(printed(nullable(Text), Null), "R0006")

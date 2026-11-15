@@ -153,10 +153,16 @@ null.
 1. On scalars `eq` agrees with `same` for non-null operands (so `eq(NaN, NaN)` is `true`).
    *Rationale: one equality on non-null values keeps indexes and predicates consistent.*
 2. On records, `eq` is SQL row comparison: `false` if any field pair is `eq`-false; else null if any
-   pair is null; else `true`. `lt` etc. compare lexicographically by field with the same rule.
+   pair is null; else `true`. `lt` etc. compare lexicographically by field: the field pairs are taken
+   in order, the first pair that is not equal decides, and a pair that is null before any pair has
+   decided makes the comparison null (`(1, null) < (2, 0)` is `true`, `(1, null) < (1, 3)` is null);
+   when every pair is equal the operands are equal. A nested record field follows the same rules.
 3. On unions, `eq` is `false` if the discriminants differ, otherwise `eq` of the payloads.
 4. `eq`/`ne` on a relation type, and `lt`/`le`/`gt`/`ge` on a relation type, a union type,
    `interval` or `json`, MUST be refused with `Q3006` (relations) or `Q3007` (unions, intervals, `json`).
+   The refusal is by type, whatever the operands' values: it applies equally to a record or union
+   that holds such a type in a field or payload at any depth, and a relation is `Q3006` for every
+   operator.
    *Rationale: three-valued multiset equality has no useful definition; use `same`. Intervals and
    unions have no natural order; `Sort` still orders them through `cmp`.*
 
@@ -209,6 +215,31 @@ MUST raise `R0006` (or yield null under `try`) on anything else, including surro
 A `json` value is always held in canonical form, so `same` on `json` is octet equality of canonical
 forms. A `json` literal or parameter value that is not canonical is `Q1007`. Records, unions and
 relations have no text form in version 1.0.
+
+The table is made exact by these rules:
+
+1. **Integers.** A signed type also parses `-0` as zero; an unsigned type refuses `-` in any form. A
+   text outside the type's range is `R0006`.
+2. **Decimals.** The whole part has no redundant leading zero (`0.5`, never `00.5` or `.5`); a `.`
+   is followed by at least one digit, and no `.` at all is a text with no fraction digits (`12` is
+   `12.00` in `decimal(4, 2)`). A leading `+` is accepted, as for integers. A value that needs more
+   than `p` digits after rounding is `R0006`.
+3. **Floats.** Plain notation is used from 10⁻⁶ up to but not including 10²¹, as ECMAScript's
+   `Number.prototype.toString` does; outside it the form is the first digit, `.` and the rest when
+   there are more, then `e` and the exponent, with `-` for a negative exponent and no sign otherwise
+   (`1e21`, `1.5e-7`). Parsing accepts `[+-]? digits ("." digits)? ([eE] [+-]? digits)?`, leading
+   zeros allowed, and exactly the six names `inf`, `-inf`, `nan`, `Infinity`, `-Infinity`, `NaN`. A
+   finite text whose value rounds past the type's largest finite value is `R0006`, not an infinity.
+4. **Dates.** The parsable range is `-04713-01-01` through `+294276-12-31`. A `datetime` or
+   `timestamp` must also fit the `int64` of microseconds it is held in, so the latest `timestamp` is
+   `+294247-01-10T04:00:54.775807Z`. A date or interval text is accepted only where it is exactly the
+   printed form of the value it reads as: no redundant sign or zero in the year, no zero component,
+   no day past its month's end.
+5. **Offsets.** A `timestamp` offset is `+` or `-`, then hours `00`–`23`, `:` and minutes `00`–`59`.
+6. **`json`.** The canonical form is RFC 8785's, so a positive number exponent is written `e+`
+   (`1e+21`) and `-0` is `0`. A text RFC 8785 cannot canonicalise is refused: a name twice in one
+   object, a number outside binary64's finite range, an unpaired surrogate escape, and arrays and
+   objects nested more than 256 deep.
 
 ## 4. Inference and coercion
 

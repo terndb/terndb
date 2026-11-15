@@ -2,7 +2,8 @@
 //
 // The module is `sh.sysl.terndb`. What is here so far is the result codec: the query-tree type
 // model, its canonical encoding (`docs/spec/query-tree.md` §12.3), and the columnar result format
-// the wire and the C ABI share (`docs/spec/wire-protocol.md` §6).
+// the wire and the C ABI share (`docs/spec/wire-protocol.md` §6); and value semantics: equality,
+// the total order and the canonical text forms (`docs/spec/query-tree.md` §3).
 
 package {
   name    = "terndb"

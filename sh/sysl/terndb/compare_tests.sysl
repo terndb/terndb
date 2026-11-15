@@ -1,0 +1,476 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `query-tree.md` §3.1–3.3, rule by rule: `same`, the three-valued `eq` family and the total order
+// `cmp`, with the common type and the coercion that come before comparing two types.
+
+private n(x: i128) -> Value = Int(x)
+
+private u(x: u64) -> Value = UInt(x)
+
+private fl(x: real) -> Value = Float(x)
+
+private tx(s: string) -> Value = Text(s)
+
+private iv(months: i32, days: i32, micros: i64) -> Value = Value.Interval(months, days, micros)
+
+private v(tag: usize, fields: []const Value) -> Value = variant(tag, rec(fields))
+
+/** A SQL truth value or a refusal, spelled so one `assert_eq` says which. */
+private sql(r: Result[Option[bool], CodecError]) -> string = r match
+    Ok(Some(true)) -> "true"
+    Ok(Some(false)) -> "false"
+    Ok(None) -> "null"
+    Err(e) -> e.code
+
+private code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** `vs` are strictly ascending under `t`: `cmp` agrees with their positions in both directions, and
+ * `same` holds of each with itself and of no two different ones.
+ */
+private ascending(t: Type, vs: []const Value, file: string = __FILE__, line: long = __LINE__)
+    for i in 0..<vs.len
+        for j in 0..<vs.len
+            val want = if i < j then -1 elif i > j then 1 else 0
+
+            assert(cmp(t, vs[i], vs[j]) == want, "cmp out of order", file, line)
+            assert(same(t, vs[i], vs[j]) == (i == j), "same disagrees with cmp", file, line)
+
+private int64_pair() -> Type = record([Field("a", Int64), Field("b", nullable(Text))])
+
+private shape() -> Type = union_of([Field("circle", record([Field("r", nullable(Int64))])), Field("empty", record([]))])
+
+// -- null ---------------------------------------------------------------------------------------
+
+@test
+null_is_the_same_as_null_and_nothing_else()
+    val t = nullable(Int64)
+
+    assert(same(t, Null, Null))
+    assert(!same(t, Null, n(0)))
+    assert(!same(t, n(0), Null))
+
+@test
+eq_and_every_ordering_of_a_null_is_null()
+    val t = nullable(Int64)
+
+    assert_eq(sql(eq(t, Null, Null)), "null")
+    assert_eq(sql(eq(t, n(1), Null)), "null")
+    assert_eq(sql(ne(t, Null, n(1))), "null")
+    assert_eq(sql(lt(t, Null, n(1))), "null")
+    assert_eq(sql(le(t, n(1), Null)), "null")
+    assert_eq(sql(gt(t, Null, Null)), "null")
+    assert_eq(sql(ge(t, Null, n(1))), "null")
+
+@test
+null_sorts_below_every_value()
+    ascending(nullable(Int128), [Null, n(i128::Min), n(0), n(i128::Max)])
+    ascending(nullable(Float64), [Null, fl(-real.infinity), fl(real.nan)])
+    ascending(nullable(Text), [Null, tx("")])
+
+// -- scalars ------------------------------------------------------------------------------------
+
+@test
+booleans_order_false_first()
+    ascending(Bool, [Value.Bool(false), Value.Bool(true)])
+    assert_eq(sql(lt(Bool, Value.Bool(false), Value.Bool(true))), "true")
+
+@test
+integers_order_by_value_out_to_the_extremes_of_int128()
+    ascending(Int128, [n(i128::Min), n(i128::Min + 1), n(-1), n(0), n(1), n(i128::Max - 1), n(i128::Max)])
+    ascending(UInt64, [u(0), u(1), u(u64::Max)])
+    assert_eq(sql(eq(Int128, n(i128::Min), n(i128::Min))), "true")
+    assert_eq(sql(lt(Int128, n(i128::Min), n(i128::Max))), "true")
+    assert_eq(sql(ge(Int128, n(i128::Min), n(i128::Max))), "false")
+
+@test
+every_nan_is_the_same_and_sorts_after_infinity()
+    val quiet = fl(real.nan)
+    val negative = fl(-real.nan)
+    val signalling = fl(real.from_bits(0x7ff0000000000001))
+    val payload = fl(real.from_bits(0xfff8000000000abc))
+
+    assert(same(Float64, quiet, negative))
+    assert(same(Float64, quiet, signalling))
+    assert(same(Float64, signalling, payload))
+    assert_eq(cmp(Float64, negative, payload), 0)
+    assert_eq(sql(eq(Float64, quiet, payload)), "true")
+    assert_eq(sql(ne(Float64, quiet, payload)), "false")
+    assert_eq(sql(gt(Float64, quiet, fl(real.infinity))), "true")
+
+@test
+minus_zero_is_plus_zero()
+    assert(same(Float64, fl(-0.0), fl(0.0)))
+    assert_eq(cmp(Float64, fl(-0.0), fl(0.0)), 0)
+    assert_eq(sql(eq(Float64, fl(-0.0), fl(0.0))), "true")
+    assert_eq(sql(lt(Float64, fl(-0.0), fl(0.0))), "false")
+
+@test
+floats_order_as_the_spec_lists_them()
+    ascending(Float64, [fl(-real.infinity), fl(-1e308), fl(-1.0), fl(-5e-324), fl(0.0), fl(5e-324), fl(1.0),
+                        fl(real.infinity), fl(real.nan)])
+    ascending(Float32, [fl(-real.infinity), fl(real(f32(-0.5))), fl(0.0), fl(real(f32(0.1))), fl(real.nan)])
+
+@test
+text_orders_by_its_utf8_octets_case_and_all()
+    ascending(Text, [tx(""), tx("\0"), tx("A"), tx("B"), tx("a"), tx("a\0"), tx("ab"), tx("b"), tx("é"), tx("€"),
+                     tx("\u{FB33}"), tx("😀")])
+    assert(!same(Text, tx("a"), tx("A")))
+
+@test
+a_composed_and_a_decomposed_accent_are_different_text()
+    assert(!same(Text, tx("é"), tx("e\u{301}")))
+    assert_eq(sql(eq(Text, tx("é"), tx("e\u{301}"))), "false")
+
+@test
+bytes_order_unsigned_with_a_prefix_first()
+    ascending(Bytes, [bytes_value([]), bytes_value([0]), bytes_value([0, 0]), bytes_value([0, 1]),
+                      bytes_value([1]), bytes_value([0x7f]), bytes_value([0x80]), bytes_value([0xff])])
+
+@test
+json_compares_as_its_canonical_octets()
+    ascending(Json, [tx("1"), tx("[1]"), tx("[]"), tx("{\"a\":1}")])
+    assert_eq(sql(eq(Json, tx("{\"a\":1}"), tx("{\"a\":1}"))), "true")
+
+@test
+time_types_order_chronologically()
+    for t in [Date, Time, DateTime, Timestamp]
+        ascending(t, [n(-2440588), n(-1), n(0), n(1), n(1000000)])
+
+@test
+uuid_orders_as_an_unsigned_128_bit_number()
+    ascending(Uuid, [Value.Uuid(0), Value.Uuid(1), Value.Uuid(u128(1) << 127), Value.Uuid(u128::Max)])
+
+@test
+interval_is_compared_componentwise()
+    assert(!same(Interval, iv(1, 0, 0), iv(0, 30, 0)))
+    assert(!same(Interval, iv(0, 1, 0), iv(0, 0, 86400000000)))
+    assert(same(Interval, iv(1, -3, 5), iv(1, -3, 5)))
+    assert_eq(sql(eq(Interval, iv(1, 0, 0), iv(0, 30, 0))), "false")
+    assert_eq(sql(eq(Interval, iv(1, 2, 3), iv(1, 2, 3))), "true")
+    ascending(Interval, [iv(-1, 99, 99), iv(0, 30, 0), iv(1, -5, 0), iv(1, 0, -1), iv(1, 0, 0)])
+
+// -- the common type and coercion ---------------------------------------------------------------
+
+@test
+integers_unify_to_the_narrowest_integer_holding_both()
+    assert_eq(common_type(Int8, Int64).unwrap(), Int64)
+    assert_eq(common_type(UInt8, UInt16).unwrap(), UInt16)
+    assert_eq(common_type(Int32, UInt32).unwrap(), Int64)
+    assert_eq(common_type(UInt32, Int64).unwrap(), Int64)
+    assert_eq(common_type(UInt64, Int8).unwrap(), Int128)
+    assert_eq(common_type(Int128, UInt64).unwrap(), Int128)
+
+@test
+decimals_unify_by_whole_digits_and_scale()
+    assert_eq(common_type(Decimal(4, 2), Decimal(5, 3)).unwrap(), Decimal(5, 3))
+    assert_eq(common_type(Decimal(6, 1), Decimal(4, 3)).unwrap(), Decimal(8, 3))
+    assert_eq(common_type(Int64, Decimal(10, 2)).unwrap(), Decimal(21, 2))
+    assert_eq(common_type(UInt64, Decimal(3, 3)).unwrap(), Decimal(23, 3))
+    assert_eq(common_type(Int128, Decimal(38, 0)).unwrap(), Decimal(38, 0))
+
+@test
+types_with_no_common_type_are_refused()
+    assert_eq(code(common_type(Decimal(38, 0), Decimal(38, 38))), "Q3001")
+    assert_eq(code(common_type(Int128, Decimal(2, 1))), "Q3001")
+    assert_eq(code(common_type(Int64, Float64)), "Q3001")
+    assert_eq(code(common_type(Text, Json)), "Q3001")
+    assert_eq(code(common_type(Bool, Int8)), "Q3001")
+    assert_eq(code(common_type(DateTime, Timestamp)), "Q3001")
+    assert_eq(code(common_type(record([Field("a", Int8)]), record([Field("b", Int8)]))), "Q3001")
+    assert_eq(code(common_type(record([Field("a", Int8)]), record([]))), "Q3001")
+    assert_eq(code(common_type(list(Int8), Int8)), "Q3001")
+
+@test
+structured_types_unify_component_by_component()
+    assert_eq(common_type(Float32, Float64).unwrap(), Float64)
+    assert_eq(common_type(nullable(Int32), Int64).unwrap(), nullable(Int64))
+    assert_eq(common_type(list(Int8), bag(nullable(Int16))).unwrap(), bag(nullable(Int16)))
+    assert_eq(common_type(list(Int8), list(UInt8)).unwrap(), list(Int16))
+    assert_eq(common_type(record([Field("a", Decimal(3, 1))]), record([Field("a", Int8)])).unwrap(),
+              record([Field("a", Decimal(4, 1))]))
+
+@test
+decimals_of_different_scales_compare_by_value()
+    val a = Decimal(4, 2)
+    val b = Decimal(5, 3)
+    val c = common_type(a, b).unwrap()
+    val twelve_fifty = coerce(n(1250), a, c).unwrap()
+
+    assert_eq(twelve_fifty, n(12500))
+    assert(same(c, twelve_fifty, coerce(n(12500), b, c).unwrap()))
+    assert_eq(cmp(c, twelve_fifty, coerce(n(12501), b, c).unwrap()), -1)
+    assert_eq(cmp(c, coerce(n(-1), a, c).unwrap(), coerce(n(-9), b, c).unwrap()), -1)
+    assert_eq(sql(eq(c, twelve_fifty, coerce(n(12500), b, c).unwrap())), "true")
+
+@test
+an_integer_meets_a_decimal_at_its_scale()
+    val c = common_type(Int32, Decimal(12, 2)).unwrap()
+
+    assert_eq(coerce(n(5), Int32, c).unwrap(), n(500))
+    assert_eq(coerce(u(5), UInt8, c).unwrap(), n(500))
+    assert(same(c, coerce(n(-7), Int32, c).unwrap(), n(-700)))
+
+@test
+coercion_carries_nulls_and_goes_inside_structure()
+    assert_eq(coerce(Null, nullable(Int8), nullable(Decimal(5, 2))).unwrap(), Value.Null)
+    assert_eq(coerce(u(200), UInt8, Int16).unwrap(), n(200))
+
+    val from = list(record([Field("a", nullable(Decimal(3, 1)))]))
+    val to = list(record([Field("a", nullable(Decimal(4, 2)))]))
+
+    assert_eq(coerce(rel([rec([n(15)]), rec([Null])]), from, to).unwrap(), rel([rec([n(150)]), rec([Null])]))
+
+    val un = union_of([Field("x", record([Field("v", Int8)]))])
+    val wide = union_of([Field("x", record([Field("v", Int64)]))])
+
+    assert_eq(coerce(v(0, [u(3)]), union_of([Field("x", record([Field("v", UInt8)]))]), wide).unwrap(), v(0, [n(3)]))
+    assert_eq(coerce(v(0, [n(3)]), un, wide).unwrap(), v(0, [n(3)]))
+
+@test
+a_rescaling_that_overflows_is_refused()
+    assert_eq(code(coerce(n(i128::Max), Int128, Decimal(38, 1))), "R0001")
+    assert_eq(code(coerce(n(i128::Min), Int128, Decimal(38, 2))), "R0001")
+
+// -- records ------------------------------------------------------------------------------------
+
+@test
+records_are_the_same_field_by_field()
+    val t = int64_pair()
+
+    assert(same(t, rec([n(1), tx("x")]), rec([n(1), tx("x")])))
+    assert(!same(t, rec([n(1), tx("x")]), rec([n(1), tx("y")])))
+    assert(same(t, rec([n(1), Null]), rec([n(1), Null])))
+    assert(!same(t, rec([n(1), Null]), rec([n(1), tx("")])))
+
+@test
+records_order_lexicographically_by_field()
+    ascending(int64_pair(), [rec([n(-1), tx("z")]), rec([n(1), Null]), rec([n(1), tx("")]), rec([n(1), tx("a")]),
+                             rec([n(2), Null])])
+
+@test
+record_eq_is_false_on_any_false_pair_before_null()
+    val t = int64_pair()
+
+    assert_eq(sql(eq(t, rec([n(1), tx("a")]), rec([n(1), tx("a")]))), "true")
+    assert_eq(sql(eq(t, rec([n(1), Null]), rec([n(2), tx("a")]))), "false")
+    assert_eq(sql(eq(t, rec([n(1), Null]), rec([n(1), tx("a")]))), "null")
+    assert_eq(sql(ne(t, rec([n(1), Null]), rec([n(2), tx("a")]))), "true")
+    assert_eq(sql(ne(t, rec([n(1), Null]), rec([n(1), tx("a")]))), "null")
+
+@test
+a_false_pair_after_a_null_pair_still_makes_eq_false()
+    val t = record([Field("a", nullable(Int64)), Field("b", Int64)])
+
+    assert_eq(sql(eq(t, rec([Null, n(1)]), rec([n(5), n(2)]))), "false")
+    assert_eq(sql(eq(t, rec([Null, n(1)]), rec([n(5), n(1)]))), "null")
+
+@test
+record_orderings_stop_at_the_first_unequal_or_null_pair()
+    val t = record([Field("a", nullable(Int64)), Field("b", nullable(Int64))])
+
+    assert_eq(sql(lt(t, rec([n(1), Null]), rec([n(2), n(0)]))), "true")
+    assert_eq(sql(gt(t, rec([n(1), Null]), rec([n(2), n(0)]))), "false")
+    assert_eq(sql(lt(t, rec([n(1), Null]), rec([n(1), n(3)]))), "null")
+    assert_eq(sql(lt(t, rec([Null, n(5)]), rec([n(1), n(9)]))), "null")
+    assert_eq(sql(lt(t, rec([n(1), n(2)]), rec([n(1), n(2)]))), "false")
+    assert_eq(sql(le(t, rec([n(1), n(2)]), rec([n(1), n(2)]))), "true")
+    assert_eq(sql(ge(t, rec([n(1), n(3)]), rec([n(1), n(2)]))), "true")
+
+@test
+nested_records_follow_the_row_rules_at_every_level()
+    val inner = record([Field("x", nullable(Int64))])
+    val t = record([Field("p", inner), Field("q", Int64)])
+
+    assert_eq(sql(eq(t, rec([rec([Null]), n(1)]), rec([rec([n(0)]), n(2)]))), "false")
+    assert_eq(sql(eq(t, rec([rec([Null]), n(1)]), rec([rec([n(0)]), n(1)]))), "null")
+    assert_eq(sql(lt(t, rec([rec([n(1)]), n(9)]), rec([rec([n(2)]), n(0)]))), "true")
+
+@test
+the_empty_record_has_one_value()
+    val t = record([])
+
+    assert(same(t, rec([]), rec([])))
+    assert_eq(cmp(t, rec([]), rec([])), 0)
+    assert_eq(sql(eq(t, rec([]), rec([]))), "true")
+    assert_eq(sql(lt(t, rec([]), rec([]))), "false")
+
+@test
+an_all_null_record_is_the_same_as_itself_and_eq_null()
+    val t = record([Field("a", nullable(Int64)), Field("b", nullable(Text))])
+    val nulls = rec([Null, Null])
+
+    assert(same(t, nulls, rec([Null, Null])))
+    assert_eq(cmp(t, nulls, rec([Null, Null])), 0)
+    assert_eq(cmp(t, nulls, rec([Null, tx("")])), -1)
+    assert_eq(sql(eq(t, nulls, rec([Null, Null]))), "null")
+    assert(!same(nullable(t), Null, nulls))
+
+// -- unions -------------------------------------------------------------------------------------
+
+@test
+unions_compare_the_discriminant_first()
+    ascending(shape(), [v(0, [Null]), v(0, [n(-5)]), v(0, [n(i128::Max)]), v(1, [])])
+    assert(!same(shape(), v(0, [Null]), v(1, [])))
+
+@test
+union_eq_is_false_on_different_discriminants_even_beside_a_null()
+    assert_eq(sql(eq(shape(), v(0, [Null]), v(1, []))), "false")
+    assert_eq(sql(eq(shape(), v(0, [Null]), v(0, [n(1)]))), "null")
+    assert_eq(sql(eq(shape(), v(0, [n(1)]), v(0, [n(1)]))), "true")
+    assert_eq(sql(eq(shape(), v(1, []), v(1, []))), "true")
+    assert_eq(sql(ne(shape(), v(0, [n(1)]), v(1, []))), "true")
+
+@test
+an_enum_is_ordered_by_its_declaration()
+    val t = union_of([Field("low", record([])), Field("mid", record([])), Field("high", record([]))])
+
+    ascending(t, [v(0, []), v(1, []), v(2, [])])
+
+// -- relations ----------------------------------------------------------------------------------
+
+@test
+a_list_is_the_same_only_in_the_same_order()
+    val t = list(Int64)
+
+    assert(same(t, rel([n(1), n(2)]), rel([n(1), n(2)])))
+    assert(!same(t, rel([n(1), n(2)]), rel([n(2), n(1)])))
+    assert(!same(t, rel([n(1)]), rel([n(1), n(1)])))
+
+@test
+lists_order_lexicographically_with_a_prefix_first()
+    ascending(list(Int64), [rel([]), rel([n(0)]), rel([n(0), n(0)]), rel([n(0), n(1)]), rel([n(1)])])
+
+@test
+a_bag_is_a_multiset()
+    val t = bag(Int64)
+
+    assert(same(t, rel([n(1), n(2), n(1)]), rel([n(2), n(1), n(1)])))
+    assert(!same(t, rel([n(1), n(1), n(2)]), rel([n(1), n(2), n(2)])))
+    assert(!same(t, rel([n(1)]), rel([n(1), n(1)])))
+    assert_eq(cmp(t, rel([n(3), n(1)]), rel([n(1), n(3)])), 0)
+
+@test
+bags_order_as_their_sorted_elements()
+    val t = bag(Int64)
+
+    assert_eq(cmp(t, rel([n(3), n(1)]), rel([n(2)])), -1)
+    assert_eq(cmp(t, rel([n(2)]), rel([n(3), n(1)])), 1)
+    assert_eq(cmp(t, rel([n(1)]), rel([n(1), n(0)])), 1)
+    ascending(t, [rel([]), rel([n(0)]), rel([n(1), n(0)]), rel([n(1)]), rel([n(2), n(1), n(9)])])
+
+@test
+a_bag_matches_nulls_nans_and_zeros_by_same()
+    assert(same(bag(nullable(Int64)), rel([Null, n(1), Null]), rel([n(1), Null, Null])))
+    assert(!same(bag(nullable(Int64)), rel([Null, n(1)]), rel([n(1), n(1)])))
+    assert(same(bag(Float64), rel([fl(real.nan), fl(-0.0), fl(1.0)]), rel([fl(1.0), fl(0.0), fl(-real.nan)])))
+
+@test
+an_all_null_bag_counts_its_nulls()
+    val t = bag(nullable(Text))
+
+    assert(same(t, rel([Null, Null]), rel([Null, Null])))
+    assert(!same(t, rel([Null, Null]), rel([Null])))
+    assert_eq(cmp(t, rel([Null]), rel([Null, Null])), -1)
+
+@test
+the_empty_relation_is_not_null()
+    for t in [nullable(list(Int64)), nullable(bag(Int64))]
+        assert(same(t, rel([]), rel([])))
+        assert(!same(t, Null, rel([])))
+        assert_eq(cmp(t, Null, rel([])), -1)
+        assert_eq(cmp(t, rel([]), rel([n(i128::Min)])), -1)
+
+@test
+bags_of_records_match_whole_rows()
+    val t = bag(record([Field("id", Int64), Field("name", Text)]))
+
+    assert(same(t, rel([rec([n(1), tx("a")]), rec([n(2), tx("b")])]), rel([rec([n(2), tx("b")]), rec([n(1), tx("a")])])))
+    assert(!same(t, rel([rec([n(1), tx("a")]), rec([n(2), tx("b")])]), rel([rec([n(1), tx("b")]), rec([n(2), tx("a")])])))
+
+@test
+nested_relations_compare_as_their_own_kinds_at_every_level()
+    val post = record([Field("id", Int64), Field("tags", bag(Text))])
+    val t = bag(record([Field("id", Int64), Field("posts", list(post))]))
+    val first = rec([n(1), rel([rec([n(10), rel([tx("a"), tx("b")])]), rec([n(11), rel([])])])])
+    val reordered_tags = rec([n(1), rel([rec([n(10), rel([tx("b"), tx("a")])]), rec([n(11), rel([])])])])
+    val reordered_posts = rec([n(1), rel([rec([n(11), rel([])]), rec([n(10), rel([tx("a"), tx("b")])])])])
+    val second = rec([n(2), rel([])])
+
+    assert(same(t, rel([first, second]), rel([second, reordered_tags])))
+    assert(!same(t, rel([first, second]), rel([second, reordered_posts])))
+    assert(cmp(t, rel([first]), rel([reordered_posts])) != 0)
+
+/** A record of `depth` records, one inside the next, with `leaf` at the bottom. */
+private nested_type(depth: usize) -> Type
+    var t = record([Field("leaf", Int64)])
+
+    for _ in 0..<depth
+        t = record([Field("inner", t)])
+
+    t
+
+private nested_value(depth: usize, leaf: i128) -> Value
+    var x = rec([n(leaf)])
+
+    for _ in 0..<depth
+        x = rec([x])
+
+    x
+
+@test
+the_deepest_nesting_compares_by_its_innermost_field()
+    val t = nested_type(255)
+
+    assert(same(t, nested_value(255, 7), nested_value(255, 7)))
+    assert_eq(cmp(t, nested_value(255, 7), nested_value(255, 8)), -1)
+    assert_eq(sql(eq(t, nested_value(255, 7), nested_value(255, 8))), "false")
+    assert_eq(sql(lt(t, nested_value(255, 7), nested_value(255, 8))), "true")
+
+@test
+the_deepest_relation_nesting_reaches_its_innermost_bag()
+    var t = bag(Int64)
+    var a = rel([n(1), n(2)])
+    var b = rel([n(2), n(1)])
+
+    for _ in 0..<64
+        t = bag(record([Field("r", t)]))
+        a = rel([rec([a]), rec([rel([])])])
+        b = rel([rec([rel([])]), rec([b])])
+
+    assert(same(t, a, b))
+    assert_eq(cmp(t, a, b), 0)
+
+// -- refusals -----------------------------------------------------------------------------------
+
+@test
+eq_on_a_relation_is_refused_with_q3006()
+    assert_eq(sql(eq(list(Int64), rel([]), rel([]))), "Q3006")
+    assert_eq(sql(ne(bag(Int64), rel([]), rel([]))), "Q3006")
+    assert_eq(sql(eq(nullable(bag(Int64)), Null, Null)), "Q3006")
+    assert_eq(sql(eq(record([Field("r", list(Int64))]), rec([rel([])]), rec([rel([])]))), "Q3006")
+    assert_eq(sql(eq(union_of([Field("x", record([Field("r", bag(Int64))]))]), v(0, [rel([])]), v(0, [rel([])]))),
+              "Q3006")
+
+@test
+orderings_on_a_relation_are_refused_with_q3006()
+    assert_eq(sql(lt(list(Int64), rel([]), rel([]))), "Q3006")
+    assert_eq(sql(ge(bag(Int64), rel([]), rel([]))), "Q3006")
+
+@test
+orderings_on_unions_intervals_and_json_are_refused_with_q3007()
+    assert_eq(sql(lt(shape(), v(1, []), v(1, []))), "Q3007")
+    assert_eq(sql(le(Interval, iv(0, 0, 0), iv(0, 0, 1))), "Q3007")
+    assert_eq(sql(gt(nullable(Json), Null, Null)), "Q3007")
+    assert_eq(sql(ge(record([Field("a", Int64), Field("i", Interval)]), rec([n(1), iv(0, 0, 0)]),
+                     rec([n(1), iv(0, 0, 0)]))), "Q3007")
+
+@test
+eq_on_unions_intervals_and_json_is_allowed()
+    assert_eq(sql(eq(shape(), v(1, []), v(1, []))), "true")
+    assert_eq(sql(eq(Interval, iv(0, 0, 1), iv(0, 0, 1))), "true")
+    assert_eq(sql(eq(Json, tx("1"), tx("2"))), "false")

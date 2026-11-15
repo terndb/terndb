@@ -1,0 +1,453 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort_by
+
+// Value semantics (`query-tree.md` §3): identity equality `same`, SQL's three-valued `eq` and its
+// orderings, and the total order `cmp`. Each takes the one type both operands have. Operands of two
+// types are first brought to their common type (§4.2) with `common_type` and `coerce`, which is what
+// "after coercion to a common type" means in §3.1 rule 2.
+//
+// A value must be of the type it is compared under, as the encoder checks (`encode_batch`); a value
+// of another shape is a caller's error and stops the program.
+
+// -- the common type, §4.1 and §4.2 -------------------------------------------------------------
+
+/** The least type both `a` and `b` coerce to by `query-tree.md` §4.1, or `Q3001` where none exists. */
+common_type(a: Type, b: Type) -> Result[Type, CodecError]
+    if a.is_nullable() || b.is_nullable() then return Ok(nullable(common_type(a.base(), b.base())?))
+    if a == b then return Ok(a)
+
+    val ints = common_integer(a, b)
+
+    if ints.is_some() then return Ok(ints.unwrap())
+
+    val ea = exact_shape(a)
+    val eb = exact_shape(b)
+
+    if ea.is_some() && eb.is_some()
+        val (ia, sa) = ea.unwrap()
+        val (ib, sb) = eb.unwrap()
+        val whole = if ia > ib then ia else ib
+        val scale = if sa > sb then sa else sb
+
+        if whole + scale > 38 then return mismatch_types(a, b)
+
+        return Ok(Decimal(u8(whole + scale), u8(scale)))
+
+    (a, b) match
+        (Float32, Float64) | (Float64, Float32) -> Ok(Float64)
+        (Record(fa), Record(fb)) -> Ok(Record(common_members(fa, fb, a, b)?))
+        (Union(va), Union(vb)) -> Ok(Union(common_members(va, vb, a, b)?))
+        (List(x), List(y)) -> Ok(List(common_type(*x, *y)?))
+        (List(x), Bag(y)) | (Bag(x), List(y)) | (Bag(x), Bag(y)) -> Ok(Bag(common_type(*x, *y)?))
+        _ -> mismatch_types(a, b)
+end common_type
+
+private mismatch_types[T](a: Type, b: Type) -> Result[T, CodecError] =
+    fail("Q3001", "the two types have no common type")
+
+// Records and unions coerce structurally: the same names in the same order, each member's types
+// unified in turn.
+private common_members(ma: Buf[Field], mb: Buf[Field], a: Type, b: Type) -> Result[Buf[Field], CodecError]
+    if ma.len() != mb.len() then return mismatch_types(a, b)
+
+    val out = buf[Field]()
+
+    for i in 0..<ma.len()
+        if ma[i].name != mb[i].name then return mismatch_types(a, b)
+
+        out.push(Field(ma[i].name, common_type(ma[i].ty, mb[i].ty)?))
+
+    Ok(out)
+end common_members
+
+private signed_bits(t: Type) -> int = t match
+    Int8 -> 8
+    Int16 -> 16
+    Int32 -> 32
+    Int64 -> 64
+    Int128 -> 128
+    _ -> 0
+
+private unsigned_bits(t: Type) -> int = t match
+    UInt8 -> 8
+    UInt16 -> 16
+    UInt32 -> 32
+    UInt64 -> 64
+    _ -> 0
+
+private signed_type(bits: int) -> Type = bits match
+    8 -> Int8
+    16 -> Int16
+    32 -> Int32
+    64 -> Int64
+    _ -> Int128
+
+private unsigned_type(bits: int) -> Type = bits match
+    8 -> UInt8
+    16 -> UInt16
+    32 -> UInt32
+    _ -> UInt64
+
+// Two integer types unify to an integer type: the wider of two signed or of two unsigned types, and
+// for a mix the signed type twice the unsigned one's width (`uintN → int(2N)`) or wider.
+private common_integer(a: Type, b: Type) -> Option[Type]
+    val sa = signed_bits(a)
+    val ua = unsigned_bits(a)
+    val sb = signed_bits(b)
+    val ub = unsigned_bits(b)
+
+    if sa + ua == 0 || sb + ub == 0 then return None
+    if ua > 0 && ub > 0 then return Some(unsigned_type(if ua > ub then ua else ub))
+
+    val na = if sa > 0 then sa else 2 * ua
+    val nb = if sb > 0 then sb else 2 * ub
+
+    Some(signed_type(if na > nb then na else nb))
+end common_integer
+
+// An exact numeric type as (digits before the point, digits after it): a decimal's own, or the
+// `decimal(p, 0)` an integer type coerces to (§4.1 rule 2).
+private exact_shape(t: Type) -> Option[(int, int)] = t match
+    Decimal(p, s) -> Some((int(p) - int(s), int(s)))
+    Int8 | UInt8 -> Some((3, 0))
+    Int16 | UInt16 -> Some((5, 0))
+    Int32 | UInt32 -> Some((10, 0))
+    Int64 -> Some((19, 0))
+    UInt64 -> Some((20, 0))
+    Int128 -> Some((38, 0))
+    _ -> None
+
+/** `v`, of type `from`, as a value of `to`, a type `from` coerces to (`common_type` finds one). A
+ * decimal's unscaled value is rescaled; a value too large for the rescaling is `R0001`.
+ */
+coerce(v: Value, from: Type, to: Type) -> Result[Value, CodecError]
+    if v.is_null() then return Ok(v)
+
+    val f = from.base()
+    val t = to.base()
+
+    if f == t then return Ok(v)
+
+    t match
+        Decimal(_, s) ->
+            val n = v match
+                Int(n) -> n
+                UInt(n) -> i128(n)
+                _ -> panic("coerce: an exact number was expected")
+            val k = int(s) - (exact_shape(f).unwrap().1)
+            val scaled = n.checked_mul(pow10(k))
+
+            if scaled.is_none() then return fail("R0001", "the value does not fit the decimal")
+
+            Ok(Int(scaled.unwrap()))
+        Int8 | Int16 | Int32 | Int64 | Int128 -> v match
+            UInt(n) -> Ok(Int(i128(n)))
+            _ -> Ok(v)
+        Record(tf) ->
+            val ff = fields_of(f)
+            val vs = fields(v)
+            val out = buf[Value]()
+
+            for i in 0..<vs.len()
+                out.push(coerce(vs[i], ff[i].ty, tf[i].ty)?)
+
+            Ok(Record(out))
+        Union(tv) ->
+            val (tag, payload) = variant_parts(v)
+
+            Ok(Variant(tag, coerce(payload, fields_of(f)[tag].ty, tv[tag].ty)?))
+        Bag(e) | List(e) ->
+            val fe = elem_of(f)
+            val out = buf[Value]()
+
+            for x in elems(v)
+                out.push(coerce(x, fe, *e)?)
+
+            Ok(Relation(out))
+        _ -> Ok(v)
+end coerce
+
+/** `10^k` for `0 ≤ k ≤ 38`. */
+private[terndb] pow10(k: int) -> i128
+    var p: i128 = 1
+
+    for _ in 0..<k
+        p *= 10
+
+    p
+
+// -- reading a value by the shape its type gives it ---------------------------------------------
+
+private fields_of(t: Type) -> Buf[Field] = t match
+    Record(fs) | Union(fs) -> fs
+    _ -> panic("a record or union type was expected")
+
+private elem_of(t: Type) -> Type = t match
+    Bag(e) | List(e) -> *e
+    _ -> panic("a relation type was expected")
+
+private fields(v: Value) -> Buf[Value] = v match
+    Record(fs) -> fs
+    _ -> panic("a record value was expected")
+
+private elems(v: Value) -> Buf[Value] = v match
+    Relation(es) -> es
+    _ -> panic("a relation value was expected")
+
+private variant_parts(v: Value) -> (usize, Value) = v match
+    Variant(tag, payload) -> (tag, *payload)
+    _ -> panic("a union value was expected")
+
+private three[T: Ord](a: T, b: T) -> int = if a < b then -1 elif b < a then 1 else 0
+
+// -- identity equality, §3.1 --------------------------------------------------------------------
+
+/** Identity equality (`query-tree.md` §3.1): total, null equal to null, every NaN equal to every
+ * other, `-0.0` equal to `+0.0`, intervals componentwise and bags as multisets.
+ */
+same(t: Type, a: Value, b: Value) -> bool =
+    if has_bag(t) then same_sorted(t, sorted_bags(t, a), sorted_bags(t, b)) else same_sorted(t, a, b)
+
+// `same` of two values whose bags are already sorted, so that a bag compares as the list it now is:
+// two bags are the same multiset exactly when their sorted sequences are the same element by
+// element, because `cmp` is zero exactly where `same` holds.
+private same_sorted(t: Type, a: Value, b: Value) -> bool
+    if a.is_null() || b.is_null() then return a.is_null() && b.is_null()
+
+    t.base() match
+        Record(fs) ->
+            val xs = fields(a)
+            val ys = fields(b)
+
+            for i in 0..<fs.len()
+                if !same_sorted(fs[i].ty, xs[i], ys[i]) then return false
+
+            true
+        Union(vs) ->
+            val (ta, pa) = variant_parts(a)
+            val (tb, pb) = variant_parts(b)
+
+            ta == tb && same_sorted(vs[ta].ty, pa, pb)
+        Bag(e) | List(e) ->
+            val xs = elems(a)
+            val ys = elems(b)
+
+            if xs.len() != ys.len() then return false
+
+            for i in 0..<xs.len()
+                if !same_sorted(*e, xs[i], ys[i]) then return false
+
+            true
+        _ -> cmp_scalar(a, b) == 0
+end same_sorted
+
+private is_bag(t: Type) -> bool = t.base() match
+    Bag(_) -> true
+    _ -> false
+
+private has_bag(t: Type) -> bool = t.base() match
+    Bag(_) -> true
+    List(e) -> has_bag(*e)
+    Record(fs) | Union(fs) ->
+        for f in fs
+            if has_bag(f.ty) then return true
+
+        false
+    _ -> false
+
+// `v` with every bag in it, at every depth, sorted ascending by `cmp`. Sorting from the inside out
+// once is what keeps nested bags linear: an inner bag is sorted before the bag holding it compares
+// its elements, rather than again at every comparison.
+private sorted_bags(t: Type, v: Value) -> Value
+    if v.is_null() || !has_bag(t) then return v
+
+    t.base() match
+        Record(fs) ->
+            val xs = fields(v)
+            val out = buf[Value]()
+
+            for i in 0..<fs.len()
+                out.push(sorted_bags(fs[i].ty, xs[i]))
+
+            Record(out)
+        Union(vs) ->
+            val (tag, payload) = variant_parts(v)
+
+            Variant(tag, sorted_bags(vs[tag].ty, payload))
+        Bag(e) | List(e) ->
+            var out = buf[Value]()
+
+            for x in elems(v)
+                out.push(sorted_bags(*e, x))
+
+            if is_bag(t) then sort_by(out.view_mut(), (x, y) -> cmp_sorted(*e, x, y) < 0)
+
+            Relation(out)
+        _ -> v
+end sorted_bags
+
+// -- the total order, §3.3 ----------------------------------------------------------------------
+
+/** The total order (`query-tree.md` §3.3): −1, 0 or +1, zero exactly where `same` holds. Null sorts
+ * first, NaN after `+∞`, a proper prefix before the longer sequence, and a bag as its elements
+ * sorted ascending.
+ */
+cmp(t: Type, a: Value, b: Value) -> int =
+    if has_bag(t) then cmp_sorted(t, sorted_bags(t, a), sorted_bags(t, b)) else cmp_sorted(t, a, b)
+
+// `cmp` of two values whose bags are already sorted.
+private cmp_sorted(t: Type, a: Value, b: Value) -> int
+    if a.is_null() || b.is_null() then return three(int(!a.is_null()), int(!b.is_null()))
+
+    t.base() match
+        Record(fs) ->
+            val xs = fields(a)
+            val ys = fields(b)
+
+            for i in 0..<fs.len()
+                val c = cmp_sorted(fs[i].ty, xs[i], ys[i])
+
+                if c != 0 then return c
+
+            0
+        Union(vs) ->
+            val (ta, pa) = variant_parts(a)
+            val (tb, pb) = variant_parts(b)
+
+            if ta != tb then three(ta, tb) else cmp_sorted(vs[ta].ty, pa, pb)
+        Bag(e) | List(e) ->
+            val xs = elems(a)
+            val ys = elems(b)
+            val n = if xs.len() < ys.len() then xs.len() else ys.len()
+
+            for i in 0..<n
+                val c = cmp_sorted(*e, xs[i], ys[i])
+
+                if c != 0 then return c
+
+            three(xs.len(), ys.len())
+        _ -> cmp_scalar(a, b)
+end cmp_sorted
+
+// Two non-null scalars of one type. Every type that shares a variant orders the way the variant's
+// number does: a decimal's unscaled values share their scale, and the time types count from one
+// epoch each.
+private cmp_scalar(a: Value, b: Value) -> int = (a, b) match
+    (Bool(x), Bool(y)) -> three(int(x), int(y))
+    (Int(x), Int(y)) -> three(x, y)
+    (UInt(x), UInt(y)) -> three(x, y)
+    (Float(x), Float(y)) -> cmp_float(x, y)
+    (Text(x), Text(y)) -> three(x, y)
+    (Bytes(x), Bytes(y)) -> cmp_octets(x.view(), y.view())
+    (Interval(ma, da, ua), Interval(mb, db, ub)) ->
+        if ma != mb then three(ma, mb) elif da != db then three(da, db) else three(ua, ub)
+    (Uuid(x), Uuid(y)) -> three(x, y)
+    _ -> panic("two scalars of one type were expected")
+
+// −∞ < negative < −0 = +0 < positive < +∞ < NaN, every NaN alike.
+private cmp_float(x: real, y: real) -> int
+    if x.is_nan() || y.is_nan() then return three(int(x.is_nan()), int(y.is_nan()))
+
+    if x < y then -1 elif y < x then 1 else 0
+
+private cmp_octets(x: []const u8, y: []const u8) -> int
+    val n = if x.len < y.len then x.len else y.len
+
+    for i in 0..<n
+        if x[i] != y[i] then return three(x[i], y[i])
+
+    three(x.len, y.len)
+
+// -- SQL equality and comparisons, §3.2 ---------------------------------------------------------
+
+/** SQL equality (`query-tree.md` §3.2): null where an operand is null, `None` standing for SQL's
+ * null. A relation type anywhere in `t` is refused with `Q3006`.
+ */
+eq(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError]
+    if has_relation(t) then return fail("Q3006", "eq on a relation type; use same")
+
+    Ok(eq_of(t, a, b))
+
+/** `not eq`, null where `eq` is null, refused as `eq` is. */
+ne(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError] = Ok(eq(t, a, b)?.map(x -> !x))
+
+lt(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError] = ordered(t, a, b, c -> c < 0)
+
+le(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError] = ordered(t, a, b, c -> c <= 0)
+
+gt(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError] = ordered(t, a, b, c -> c > 0)
+
+ge(t: Type, a: Value, b: Value) -> Result[Option[bool], CodecError] = ordered(t, a, b, c -> c >= 0)
+
+// A record is SQL's row value: `false` as soon as one field pair is `eq`-false, else null if a pair is
+// null, else `true`.
+private eq_of(t: Type, a: Value, b: Value) -> Option[bool]
+    if a.is_null() || b.is_null() then return None
+
+    t.base() match
+        Record(fs) ->
+            val xs = fields(a)
+            val ys = fields(b)
+            var unknown = false
+
+            for i in 0..<fs.len()
+                eq_of(fs[i].ty, xs[i], ys[i]) match
+                    Some(false) -> return Some(false)
+                    None -> unknown = true
+                    _ -> ()
+
+            if unknown then None else Some(true)
+        Union(vs) ->
+            val (ta, pa) = variant_parts(a)
+            val (tb, pb) = variant_parts(b)
+
+            if ta != tb then Some(false) else eq_of(vs[ta].ty, pa, pb)
+        _ -> Some(cmp_scalar(a, b) == 0)
+end eq_of
+
+// The orderings: a relation anywhere in the type is `Q3006`, a union, an interval or `json` is
+// `Q3007`.
+private ordered(t: Type, a: Value, b: Value, holds: (int) -> bool) -> Result[Option[bool], CodecError]
+    if has_relation(t) then return fail("Q3006", "an ordering comparison on a relation type")
+    if !orderable(t) then return fail("Q3007", "an ordering comparison on an unorderable type")
+
+    Ok(order_of(t, a, b).map(holds))
+
+// A record compares lexicographically, field by field: the first pair that is not equal decides, and a
+// null pair met before one does makes the comparison null.
+private order_of(t: Type, a: Value, b: Value) -> Option[int]
+    if a.is_null() || b.is_null() then return None
+
+    t.base() match
+        Record(fs) ->
+            val xs = fields(a)
+            val ys = fields(b)
+
+            for i in 0..<fs.len()
+                val c = order_of(fs[i].ty, xs[i], ys[i])
+
+                if c != Some(0) then return c
+
+            Some(0)
+        _ -> Some(cmp_scalar(a, b))
+end order_of
+
+private has_relation(t: Type) -> bool = t.base() match
+    Bag(_) | List(_) -> true
+    Record(fs) | Union(fs) ->
+        for f in fs
+            if has_relation(f.ty) then return true
+
+        false
+    _ -> false
+
+private orderable(t: Type) -> bool = t.base() match
+    Union(_) | Interval | Json -> false
+    Record(fs) ->
+        for f in fs
+            if !orderable(f.ty) then return false
+
+        true
+    _ -> true

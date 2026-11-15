@@ -1,0 +1,620 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.{RealDigits, RealKind, real_digits}
+import sysl.text.{parse_f32, parse_real, str_builder}
+
+// The canonical text forms of the scalars (`query-tree.md` §3.5): what `Cast` to `text` prints and
+// what `Cast` from `text` parses. Printing writes exactly one form per value; parsing takes that form
+// and the variants the table lists, and refuses everything else with `R0006`, surrounding whitespace
+// included. Records, unions and relations have no text form, so either direction refuses them with
+// `Q3012`, the code of a cast that is not permitted (§7.6).
+
+const MicrosPerDay: i128 = 86400000000
+
+/** `v`'s canonical text form under `t`. A null has none, since a `Cast` of null is null before any
+ * text is made, and asking for one is `R0006`.
+ */
+to_text(t: Type, v: Value) -> Result[string, CodecError]
+    val u = t.base()
+
+    if !has_text_form(u) then return fail("Q3012", "records, unions and relations have no text form")
+    if v.is_null() then return fail("R0006", "null has no text form")
+
+    Ok((u, v) match
+        (Bool, Bool(b)) -> if b then "true" else "false"
+        (Decimal(_, s), Int(n)) -> decimal_text(n, int(s))
+        (Float32, Float(x)) -> float_text(real_digits(f32(x)), false)
+        (Float64, Float(x)) -> float_text(real_digits(x), false)
+        (Text | Json, Text(s)) -> s
+        (Bytes, Bytes(octets)) -> bytes_text(octets)
+        (Date, Int(n)) -> date_text(n)
+        (Time, Int(n)) -> time_text(n)
+        (DateTime, Int(n)) -> datetime_text(n)
+        (Timestamp, Int(n)) -> datetime_text(n) + "Z"
+        (Interval, Interval(months, days, micros)) -> interval_text(months, days, micros)
+        (Uuid, Uuid(bits)) -> uuid_text(bits)
+        (_, Int(n)) -> n.to_string()
+        (_, UInt(n)) -> n.to_string()
+        _ -> panic("to_text: the value is not of its type"))
+end to_text
+
+/** The value of `t` that `text` spells, as `Cast` from `text` reads it: `R0006` for anything that is
+ * not a form §3.5 accepts or that lies outside the type's range.
+ */
+from_text(t: Type, text: string) -> Result[Value, CodecError]
+    val u = t.base()
+    val b = text.bytes
+
+    if !has_text_form(u) then return fail("Q3012", "records, unions and relations have no text form")
+
+    val got = u match
+        Bool -> text match
+            "true" -> Some(Bool(true))
+            "false" -> Some(Bool(false))
+            else None
+        Int8 | Int16 | Int32 | Int64 | Int128 -> parse_integer(b, signed_width(u), true)
+        UInt8 | UInt16 | UInt32 | UInt64 -> parse_integer(b, unsigned_width(u), false)
+        Decimal(p, s) -> parse_decimal(b, int(p), int(s)).map(n -> Int(n))
+        Float32 -> parse_float(text, true).map(x -> Float(x))
+        Float64 -> parse_float(text, false).map(x -> Float(x))
+        Text -> Some(Text(text))
+        Json -> canonical_json(text).map(s -> Text(s))
+        Bytes -> parse_bytes(b)
+        Date -> parse_date(b).map(n -> Int(n))
+        Time -> parse_time(b).map(n -> Int(n))
+        DateTime -> parse_datetime(b).map(n -> Int(n))
+        Timestamp -> parse_timestamp(b).map(n -> Int(n))
+        Interval -> parse_interval(text)
+        Uuid -> parse_uuid(b).map(bits -> Uuid(bits))
+        _ -> None
+
+    got match
+        Some(v) -> Ok(v)
+        None -> fail("R0006", "the text is not a value of the type")
+end from_text
+
+/** A `json` literal or parameter value, which must already be in canonical form: `Q1007` otherwise. */
+json_literal(text: string) -> Result[Value, CodecError] = canonical_json(text) match
+    Some(c) -> if c == text then Ok(Text(text)) else fail("Q1007", "the json text is not in canonical form")
+    None -> fail("Q1007", "the text is not JSON")
+
+private has_text_form(u: Type) -> bool = u match
+    Record(_) | Union(_) | Bag(_) | List(_) -> false
+    _ -> true
+
+private signed_width(t: Type) -> int = t match
+    Int8 -> 8
+    Int16 -> 16
+    Int32 -> 32
+    Int64 -> 64
+    _ -> 128
+
+private unsigned_width(t: Type) -> int = t match
+    UInt8 -> 8
+    UInt16 -> 16
+    UInt32 -> 32
+    _ -> 64
+
+// -- printing ------------------------------------------------------------------------------------
+
+private magnitude(n: i128) -> u128 = if n < 0 then u128(-(n + 1)) + 1 else u128(n)
+
+// `n`'s digits padded with zeros on the left to `width` of them.
+private padded(n: u128, width: int) -> string
+    var digits = n.to_string()
+
+    while int(digits.len) < width
+        digits = "0" + digits
+
+    digits
+
+private decimal_text(n: i128, scale: int) -> string
+    val digits = padded(magnitude(n), scale + 1)
+    val sign = if n < 0 then "-" else ""
+
+    if scale == 0 then return sign + digits
+
+    val point = digits.len - usize(scale)
+
+    sign + digits[0..<point] + "." + digits[point..]
+
+/** The shortest decimal that reads back as the value the digits came from, in plain notation from
+ * 10⁻⁶ up to but not including 10²¹ and with an `e` exponent outside it. `json` writes the exponent
+ * as RFC 8785 does (`1e+21`, and `0` for `-0`); otherwise a positive exponent has no sign.
+ */
+private[terndb] float_text(d: RealDigits, json: bool) -> string
+    d.kind match
+        RealKind.NaN -> return "nan"
+        RealKind.Infinite -> return if d.negative then "-inf" else "inf"
+        RealKind.Zero -> return if d.negative && !json then "-0" else "0"
+        RealKind.Finite -> ()
+
+    var sb = str_builder()
+    val digits = d.digits
+    val k = int(digits.len)
+    val e = d.exponent
+
+    if d.negative then sb.push("-")
+
+    if e >= -6 && e < 21
+        if e >= k - 1
+            sb.push(digits)
+
+            for _ in 0..<(e - k + 1)
+                sb.push("0")
+        elif e >= 0
+            sb.push(digits[0..<usize(e + 1)])
+            sb.push(".")
+            sb.push(digits[usize(e + 1)..])
+        else
+            sb.push("0.")
+
+            for _ in 0..<(-e - 1)
+                sb.push("0")
+
+            sb.push(digits)
+    else
+        sb.push(digits[0..<1])
+
+        if k > 1
+            sb.push(".")
+            sb.push(digits[1..])
+
+        sb.push(if json && e > 0 then "e+" else "e")
+        sb.push_int(e)
+
+    sb.finish()
+end float_text
+
+private[terndb] hex_digit(n: u128) -> string = "0123456789abcdef"[usize(n)..<usize(n) + 1]
+
+private bytes_text(octets: Buf[u8]) -> string
+    var sb = str_builder()
+    sb.push("\\x")
+
+    for o in octets
+        sb.push(hex_digit(u128(o >> 4)))
+        sb.push(hex_digit(u128(o & 0xf)))
+
+    sb.finish()
+
+// `a / b` rounded towards −∞, for `b > 0`.
+private floor_div(a: i128, b: i128) -> i128 = if a % b != 0 && a < 0 then a / b - 1 else a / b
+
+/** The proleptic Gregorian (year, month, day) of the day `z` days after 1970-01-01. */
+private civil(z0: i128) -> (i128, i128, i128)
+    val z = z0 + 719468
+    val era = floor_div(z, 146097)
+    val doe = z - era * 146097
+    val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    val mp = (5 * doy + 2) / 153
+    val day = doy - (153 * mp + 2) / 5 + 1
+    val month = if mp < 10 then mp + 3 else mp - 9
+    val year = yoe + era * 400 + (if month <= 2 then 1 else 0)
+
+    (year, month, day)
+end civil
+
+/** The days from 1970-01-01 to the proleptic Gregorian `year-month-day`, `month` in 1–12. */
+private days_from_civil(year: i128, month: i128, day: i128) -> i128
+    val y = if month <= 2 then year - 1 else year
+    val era = floor_div(y, 400)
+    val yoe = y - era * 400
+    val mp = if month > 2 then month - 3 else month + 9
+    val doy = (153 * mp + 2) / 5 + day - 1
+    val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+
+    era * 146097 + doe - 719468
+
+private date_text(days: i128) -> string
+    val (year, month, day) = civil(days)
+    val y = if year >= 0 && year <= 9999 then padded(u128(year), 4)
+    elif year < 0 then "-" + padded(magnitude(year), 5) else "+" + padded(u128(year), 5)
+
+    y + "-" + padded(u128(month), 2) + "-" + padded(u128(day), 2)
+
+// The fraction of a second after `.`, one to six digits with the trailing zeros removed; nothing for a
+// whole second.
+private fraction_text(micros: u128) -> string
+    if micros == 0 then return ""
+
+    var digits = padded(micros, 6)
+
+    while digits[digits.len - 1..] == "0"
+        digits = digits[0..<digits.len - 1]
+
+    "." + digits
+
+private time_text(micros: i128) -> string
+    val secs = u128(micros / 1000000)
+
+    padded(secs / 3600, 2) + ":" + padded(secs / 60 % 60, 2) + ":" + padded(secs % 60, 2) +
+        fraction_text(u128(micros % 1000000))
+
+private datetime_text(micros: i128) -> string
+    val days = floor_div(micros, MicrosPerDay)
+
+    date_text(days) + "T" + time_text(micros - days * MicrosPerDay)
+
+private interval_text(months: i32, days: i32, micros: i64) -> string
+    if months == 0 && days == 0 && micros == 0 then return "PT0S"
+
+    var sb = str_builder()
+    sb.push("P")
+
+    if months != 0
+        sb.push_int(months)
+        sb.push("M")
+
+    if days != 0
+        sb.push_int(days)
+        sb.push("D")
+
+    if micros != 0
+        val mag = magnitude(micros)
+
+        sb.push(if micros < 0 then "T-" else "T")
+        sb.push((mag / 1000000).to_string())
+        sb.push(fraction_text(mag % 1000000))
+        sb.push("S")
+
+    sb.finish()
+end interval_text
+
+private uuid_text(bits: u128) -> string
+    var sb = str_builder()
+
+    for i in 0..<32
+        if i == 8 || i == 12 || i == 16 || i == 20 then sb.push("-")
+
+        sb.push(hex_digit((bits >> (124 - 4 * i)) & 0xf))
+
+    sb.finish()
+
+// -- parsing -------------------------------------------------------------------------------------
+
+private[terndb] is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+// The decimal digits `b` spells, refused where it is empty, holds anything but digits, starts with a
+// redundant zero, or does not fit a `u128`.
+private whole_number(b: []const u8) -> Option[u128]
+    if b.len == 0 || (b.len > 1 && b[0] == u8('0')) then return None
+
+    var n: u128 = 0
+
+    for c in b
+        if !is_digit(c) then return None
+
+        n = n.checked_mul(10)?.checked_add(u128(c - u8('0')))?
+
+    Some(n)
+
+// Digits with leading zeros allowed, at most `most` of them, as fixed-width fields are.
+private field(b: []const u8, most: usize) -> Option[i128]
+    if b.len == 0 || b.len > most then return None
+
+    var n: i128 = 0
+
+    for c in b
+        if !is_digit(c) then return None
+
+        n = n * 10 + i128(c - u8('0'))
+
+    Some(n)
+
+// An integer of `bits` bits, `-` refused on an unsigned type, `+` accepted on either. A `-` before
+// zero reads as zero.
+private parse_integer(b: []const u8, bits: int, signed: bool) -> Option[Value]
+    val has_sign = b.len > 0 && (b[0] == u8('+') || b[0] == u8('-'))
+    val negative = has_sign && b[0] == u8('-')
+
+    if negative && !signed then return None
+
+    val mag = whole_number(b[(if has_sign then 1 else 0)..])?
+
+    if !signed then return if mag <= (u128(1) << bits) - 1 then Some(UInt(u64(mag))) else None
+
+    val limit = u128(1) << (bits - 1)
+
+    if negative then
+        if mag > limit then return None
+
+        return Some(Int(if mag == 0 then 0 else -i128(mag - 1) - 1))
+
+    if mag >= limit then None else Some(Int(i128(mag)))
+end parse_integer
+
+// A `decimal(p, s)`'s unscaled value: an optional sign, the whole part without redundant zeros, and a
+// fraction of any length rounded half away from zero to `s` digits.
+private parse_decimal(b: []const u8, p: int, s: int) -> Option[i128]
+    val has_sign = b.len > 0 && (b[0] == u8('+') || b[0] == u8('-'))
+    val negative = has_sign && b[0] == u8('-')
+    val body = b[(if has_sign then 1 else 0)..]
+    var point = body.len
+
+    for i in 0..<body.len
+        if body[i] == u8('.')
+            point = i
+            break
+
+    val whole = whole_number(body[0..<point])?
+    val frac = if point < body.len then body[point + 1..] else body[body.len..]
+
+    if point < body.len && frac.len == 0 then return None
+
+    var n = whole
+
+    for i in 0..<s
+        val digit = if usize(i) < frac.len then frac[usize(i)] else u8('0')
+
+        if !is_digit(digit) then return None
+
+        n = n.checked_mul(10)?.checked_add(u128(digit - u8('0')))?
+
+    for i in usize(s)..<frac.len
+        if !is_digit(frac[i]) then return None
+
+    if usize(s) < frac.len && frac[usize(s)] >= u8('5') then n = n.checked_add(1)?
+
+    if n >= u128(pow10(p)) then return None
+
+    Some(if negative then -i128(n) else i128(n))
+end parse_decimal
+
+// The forms a float reads: the names of the specials, and an optional sign, digits, an optional
+// fraction and an optional exponent, each part with at least one digit. A finite text too large for
+// the type is refused rather than read as an infinity.
+private parse_float(text: string, single: bool) -> Option[real]
+    text match
+        "inf" | "Infinity" -> return Some(real.infinity)
+        "-inf" | "-Infinity" -> return Some(-real.infinity)
+        "nan" | "NaN" -> return Some(real.nan)
+        else ()
+
+    if !float_syntax(text.bytes) then return None
+
+    val x = if single then real(parse_f32(text).ok()?) else parse_real(text).ok()?
+
+    if x == real.infinity || x == -real.infinity then None else Some(x)
+
+private float_syntax(b: []const u8) -> bool
+    var i: usize = if b.len > 0 && (b[0] == u8('+') || b[0] == u8('-')) then 1 else 0
+    val start = i
+
+    while i < b.len && is_digit(b[i])
+        i += 1
+
+    if i == start then return false
+
+    if i < b.len && b[i] == u8('.')
+        i += 1
+        val frac = i
+
+        while i < b.len && is_digit(b[i])
+            i += 1
+
+        if i == frac then return false
+
+    if i < b.len && (b[i] == u8('e') || b[i] == u8('E'))
+        i += 1
+
+        if i < b.len && (b[i] == u8('+') || b[i] == u8('-')) then i += 1
+
+        val exp = i
+
+        while i < b.len && is_digit(b[i])
+            i += 1
+
+        if i == exp then return false
+
+    i == b.len
+end float_syntax
+
+private[terndb] hex_value(c: u8) -> Option[u8]
+    if is_digit(c) then return Some(c - u8('0'))
+    if c >= u8('a') && c <= u8('f') then return Some(c - u8('a') + 10)
+    if c >= u8('A') && c <= u8('F') then return Some(c - u8('A') + 10)
+
+    None
+
+private parse_bytes(b: []const u8) -> Option[Value]
+    if b.len < 2 || b[0] != u8('\\') || b[1] != u8('x') || b.len % 2 != 0 then return None
+
+    val octets = buf[u8]()
+    var i: usize = 2
+
+    while i < b.len
+        octets.push(hex_value(b[i])? << 4 | hex_value(b[i + 1])?)
+        i += 2
+
+    Some(Bytes(octets))
+
+private[terndb] same_octets(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+
+    true
+
+// A date has one printed form and no variants, so a text is read leniently and kept only where it
+// prints back to itself: that refuses a redundant sign or zero in the year, a day past the end of its
+// month, and every other spelling at once.
+private parse_date(b: []const u8) -> Option[i128]
+    if b.len < 10 || b[b.len - 6] != u8('-') || b[b.len - 3] != u8('-') then return None
+
+    val month = field(b[b.len - 5..<b.len - 3], 2)?
+    val day = field(b[b.len - 2..], 2)?
+    val y = b[0..<b.len - 6]
+    val has_sign = y.len > 0 && (y[0] == u8('+') || y[0] == u8('-'))
+    val mag = field(y[(if has_sign then 1 else 0)..], 7)?
+    val year = if has_sign && y[0] == u8('-') then -mag else mag
+
+    if year < -4713 || year > 294276 || month < 1 || month > 12 || day < 1 || day > 31 then return None
+
+    val days = days_from_civil(year, month, day)
+
+    if same_octets(date_text(days).bytes, b) then Some(days) else None
+end parse_date
+
+// `HH:MM:SS`, then optionally `.` and one to six digits, as microseconds since midnight.
+private parse_time(b: []const u8) -> Option[i128]
+    if b.len < 8 || b[2] != u8(':') || b[5] != u8(':') then return None
+
+    val h = field(b[0..<2], 2)?
+    val m = field(b[3..<5], 2)?
+    val s = field(b[6..<8], 2)?
+
+    if h > 23 || m > 59 || s > 59 then return None
+
+    var micros = ((h * 60 + m) * 60 + s) * 1000000
+
+    if b.len > 8
+        if b[8] != u8('.') then return None
+
+        val digits = b[9..]
+        var frac = field(digits, 6)?
+
+        for _ in digits.len..<6
+            frac *= 10
+
+        micros += frac
+
+    Some(micros)
+end parse_time
+
+private fits_i64(n: i128) -> bool = n >= -(i128(1) << 63) && n < i128(1) << 63
+
+private parse_datetime(b: []const u8) -> Option[i128]
+    var at = b.len
+
+    for i in 0..<b.len
+        if b[i] == u8('T') || b[i] == u8(' ')
+            at = i
+            break
+
+    if at == b.len then return None
+
+    val micros = parse_date(b[0..<at])? * MicrosPerDay + parse_time(b[at + 1..])?
+
+    if fits_i64(micros) then Some(micros) else None
+
+// The `datetime` form of the instant in UTC and `Z`, or of a local reading and its `±HH:MM` offset,
+// which is subtracted to reach UTC.
+private parse_timestamp(b: []const u8) -> Option[i128]
+    if b.len > 0 && b[b.len - 1] == u8('Z') then return parse_datetime(b[0..<b.len - 1])
+    if b.len < 6 || b[b.len - 3] != u8(':') then return None
+
+    val sign = b[b.len - 6]
+
+    if sign != u8('+') && sign != u8('-') then return None
+
+    val h = field(b[b.len - 5..<b.len - 3], 2)?
+    val m = field(b[b.len - 2..], 2)?
+
+    if h > 23 || m > 59 then return None
+
+    val offset = (h * 60 + m) * 60000000
+    val local = parse_datetime(b[0..<b.len - 6])?
+    val utc = if sign == u8('+') then local - offset else local + offset
+
+    if fits_i64(utc) then Some(utc) else None
+end parse_timestamp
+
+// A signed integer at `b[at..]`: an optional `-` and digits, and where it ends.
+private signed_at(b: []const u8, at: usize) -> Option[(i128, usize)]
+    var i = at
+
+    if i < b.len && b[i] == u8('-') then i += 1
+
+    val start = i
+
+    while i < b.len && is_digit(b[i])
+        i += 1
+
+    if i == start || i - start > 20 then return None
+
+    val n = i128(field(b[start..<i], 20)?)
+
+    Some((if b[at] == u8('-') then -n else n, i))
+
+// An interval has one printed form, so it is read leniently, `P`, then `<n>M`, `<n>D` and `T<s>S` each
+// optional and in that order, and kept only where it prints back to itself.
+private parse_interval(text: string) -> Option[Value]
+    val b = text.bytes
+
+    if b.len < 2 || b[0] != u8('P') then return None
+
+    var i: usize = 1
+    var months: i128 = 0
+    var days: i128 = 0
+    var micros: i128 = 0
+
+    if i < b.len && b[i] != u8('T')
+        val (n, end) = signed_at(b, i)?
+
+        if end < b.len && b[end] == u8('M')
+            months = n
+            i = end + 1
+        elif end < b.len && b[end] == u8('D')
+            days = n
+            i = end + 1
+        else
+            return None
+
+    if i < b.len && b[i] != u8('T') && days == 0
+        val (n, end) = signed_at(b, i)?
+
+        if end >= b.len || b[end] != u8('D') then return None
+
+        days = n
+        i = end + 1
+
+    if i < b.len
+        if b[i] != u8('T') then return None
+
+        val negative = i + 1 < b.len && b[i + 1] == u8('-')
+        val (whole, end) = signed_at(b, i + 1)?
+        var j = end
+        var frac: i128 = 0
+
+        if j < b.len && b[j] == u8('.')
+            val start = j + 1
+            j = start
+
+            while j < b.len && is_digit(b[j])
+                j += 1
+
+            frac = field(b[start..<j], 6)?
+
+            for _ in (j - start)..<6
+                frac *= 10
+
+        if j + 1 != b.len || b[j] != u8('S') then return None
+
+        micros = whole * 1000000 + (if negative then -frac else frac)
+
+    if months < -(i128(1) << 31) || months >= i128(1) << 31 || days < -(i128(1) << 31) ||
+        days >= i128(1) << 31 || !fits_i64(micros) then return None
+
+    val m = i32(months)
+    val d = i32(days)
+    val u = i64(micros)
+
+    if interval_text(m, d, u) == text then Some(Value.Interval(m, d, u)) else None
+end parse_interval
+
+private parse_uuid(b: []const u8) -> Option[u128]
+    if b.len != 36 then return None
+
+    var bits: u128 = 0
+
+    for i in 0..<36
+        if i == 8 || i == 13 || i == 18 || i == 23
+            if b[i] != u8('-') then return None
+        else
+            bits = bits << 4 | u128(hex_value(b[i])?)
+
+    Some(bits)

@@ -1,0 +1,111 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.text.str_builder
+
+// `json`'s canonical form, RFC 8785. The RFC's own worked examples are the oracle where it has them.
+
+private canon(text: string) -> string = canonical_json(text).unwrap_or("refused")
+
+private literal_code(text: string) -> string = json_literal(text) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** `depth` arrays, each inside the one before. */
+private arrays(depth: usize) -> string
+    var sb = str_builder()
+
+    for _ in 0..<depth
+        sb.push("[")
+
+    for _ in 0..<depth
+        sb.push("]")
+
+    sb.finish()
+
+@test
+the_rfc_8785_sample_canonicalises_as_the_rfc_prints_it()
+    val input = raw"""
+        {
+          "numbers": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001],
+          "string": "\u20ac$\u000F\u000aA'\u0042\u0022\u005c\\\"\/",
+          "literals": [null, true, false]
+        }
+        """
+
+    assert_eq(canon(input),
+              "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}")
+
+@test
+names_sort_by_utf16_code_units_as_the_rfc_8785_example_does()
+    val input = raw"""
+        {
+          "\u20ac": "Euro Sign",
+          "\r": "Carriage Return",
+          "\ufb33": "Hebrew Letter Dalet With Dagesh",
+          "1": "One",
+          "\ud83d\ude00": "Emoji: Grinning Face",
+          "\u0080": "Control",
+          "\u00f6": "Latin Small Letter O With Diaeresis"
+        }
+        """
+
+    assert_eq(canon(input),
+              "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\u{80}\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"\u{FB33}\":\"Hebrew Letter Dalet With Dagesh\"}")
+
+@test
+numbers_print_as_ecmascript_prints_them()
+    assert_eq(canon("-0"), "0")
+    assert_eq(canon("-0.0e5"), "0")
+    assert_eq(canon("1e21"), "1e+21")
+    assert_eq(canon("1e20"), "100000000000000000000")
+    assert_eq(canon("0.000001"), "0.000001")
+    assert_eq(canon("1E-7"), "1e-7")
+    assert_eq(canon("9007199254740993"), "9007199254740992")
+    assert_eq(canon("5e-324"), "5e-324")
+    assert_eq(canon("1.7976931348623157e308"), "1.7976931348623157e+308")
+    assert_eq(canon("-1.50"), "-1.5")
+    assert_eq(canon("1e-400"), "0")
+
+@test
+strings_keep_every_character_but_the_ones_that_must_be_escaped()
+    assert_eq(canon("\"\\u0041\\/\\b\\f\\n\\r\\t\\u001f\\u007f\""), "\"A/\\b\\f\\n\\r\\t\\u001f\u{7f}\"")
+    assert_eq(canon("\"\\u2028\\uD834\\uDD1E\""), "\"\u{2028}𝄞\"")
+    assert_eq(canon("\"é\""), "\"é\"")
+    assert_eq(canon("\"\\u0000\""), "\"\\u0000\"")
+
+@test
+whitespace_between_tokens_goes_and_structure_stays()
+    assert_eq(canon(" \t\r\n[ 1 , { } , [ ] , \"\" ] \n"), "[1,{},[],\"\"]")
+    assert_eq(canon("{ }"), "{}")
+    assert_eq(canon("{\"b\":{\"d\":1,\"c\":2},\"a\":[{\"z\":0,\"y\":0}]}"), "{\"a\":[{\"y\":0,\"z\":0}],\"b\":{\"c\":2,\"d\":1}}")
+    assert_eq(canon("true"), "true")
+    assert_eq(canon("null"), "null")
+    assert_eq(canon("\"x\""), "\"x\"")
+
+@test
+text_that_is_not_json_is_refused()
+    for text in ["", " ", "nul", "True", "01", "1.", ".1", "-", "+1", "1e", "0x10", "NaN", "Infinity", "1e400",
+                 "-1e400", "[1,]", "[,1]", "{\"a\":1,}", "{\"a\" 1}", "{a:1}", "{'a':1}", "[1 2]", "[1", "{\"a\":1",
+                 "\"abc", "\"\\x41\"", "\"\\u12\"", "\"\\uD800\"", "\"\\uDC00\"", "\"\\uD800\\u0041\"",
+                 "\"tab\there\"", "1 2", "[]]", "{}{}", "\u{FEFF}1"]
+        assert_eq(canon(text), "refused")
+
+@test
+a_name_twice_in_one_object_is_refused()
+    assert_eq(canon("{\"a\":1,\"a\":2}"), "refused")
+    assert_eq(canon("{\"a\":1,\"b\":2,\"\\u0061\":3}"), "refused")
+    assert_eq(canon("[{\"a\":1},{\"a\":2}]"), "[{\"a\":1},{\"a\":2}]")
+
+@test
+nesting_is_refused_past_256_levels()
+    assert_eq(canon(arrays(256)), arrays(256))
+    assert_eq(canon(arrays(257)), "refused")
+
+@test
+a_json_literal_must_already_be_canonical()
+    assert_eq(literal_code("{\"a\":[1,true]}"), "ok")
+    assert_eq(literal_code("{\"a\": [1, true]}"), "Q1007")
+    assert_eq(literal_code("1.0"), "Q1007")
+    assert_eq(literal_code("{\"b\":1,\"a\":2}"), "Q1007")
+    assert_eq(literal_code("{"), "Q1007")

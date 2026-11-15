@@ -1,0 +1,325 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.real_digits
+import sysl.slices.sort_by
+import sysl.text.{StrBuilder, char_from_u32, parse_real, str_builder}
+
+// `json`'s canonical form (`query-tree.md` §3.5): RFC 8785, the JSON Canonicalization Scheme. Whitespace
+// between tokens goes; an object's members are sorted by their names' UTF-16 code units; a string
+// keeps every character as itself except `"`, `\` and the controls, which take the shortest escape; a
+// number is the binary64 value it reads as, printed as ECMAScript prints a number.
+
+/** How deep arrays and objects may nest in one `json` text before it is refused. */
+const MaxJsonDepth: usize = 256
+
+/** `text`, any RFC 8259 JSON text, in canonical form. `None` where it is not JSON, or is not the
+ * I-JSON RFC 8785 requires: a name twice in one object, a number past binary64's finite range, a
+ * surrogate escape without its pair.
+ */
+canonical_json(text: string) -> Option[string]
+    var r = JsonReader(text, 0)
+    var out = str_builder()
+
+    r.space()
+    r.value(&out, 0)?
+    r.space()
+
+    if r.at != text.len then None else Some(out.finish())
+
+private struct Member
+    key: string
+    text: string
+
+private struct JsonReader
+    text: string
+    at: usize
+
+    peek(self) -> u8 = if self.at < self.text.len then self.text.bytes[self.at] else 0
+
+    space(*self)
+        while self.at < self.text.len
+            val c = self.text.bytes[self.at]
+
+            if c != u8(' ') && c != u8('\t') && c != u8('\n') && c != u8('\r') then return
+
+            self.at += 1
+
+    value(*self, out: *StrBuilder, depth: usize) -> Option[unit]
+        if depth >= MaxJsonDepth then return None
+
+        self.peek() match
+            u8('{') -> self.object(out, depth)
+            u8('[') -> self.array(out, depth)
+            u8('"') ->
+                escape(self.string()?, out)
+                Some(())
+            u8('t') -> self.literal("true", out)
+            u8('f') -> self.literal("false", out)
+            u8('n') -> self.literal("null", out)
+            _ -> self.number(out)
+
+    literal(*self, word: string, out: *StrBuilder) -> Option[unit]
+        val end = self.at + word.len
+
+        if end > self.text.len || !same_octets(self.text.bytes[self.at..<end], word.bytes) then return None
+
+        self.at = end
+        out.push(word)
+        Some(())
+
+    // Members are gathered with their values already canonical, then sorted and written; a name met
+    // twice is refused once the sort has put the two side by side.
+    object(*self, out: *StrBuilder, depth: usize) -> Option[unit]
+        var members = buf[Member]()
+
+        self.at += 1
+        self.space()
+
+        if self.peek() == u8('}')
+            self.at += 1
+        else
+            loop
+                self.space()
+
+                if self.peek() != u8('"') then return None
+
+                val key = self.string()?
+
+                self.space()
+
+                if self.peek() != u8(':') then return None
+
+                self.at += 1
+                self.space()
+
+                var text = str_builder()
+
+                self.value(&text, depth + 1)?
+                members.push(Member(key, text.finish()))
+                self.space()
+
+                val c = self.peek()
+
+                self.at += 1
+
+                if c == u8('}') then break
+                if c != u8(',') then return None
+
+        sort_by(members.view_mut(), (a, b) -> utf16_less(a.key, b.key))
+        out.push("{")
+
+        for i in 0..<members.len()
+            if i > 0
+                if members[i].key == members[i - 1].key then return None
+
+                out.push(",")
+
+            escape(members[i].key, out)
+            out.push(":")
+            out.push(members[i].text)
+
+        out.push("}")
+        Some(())
+    end object
+
+    array(*self, out: *StrBuilder, depth: usize) -> Option[unit]
+        self.at += 1
+        self.space()
+        out.push("[")
+
+        if self.peek() == u8(']')
+            self.at += 1
+        else
+            var first = true
+
+            loop
+                if !first then out.push(",")
+
+                first = false
+                self.space()
+                self.value(out, depth + 1)?
+                self.space()
+
+                val c = self.peek()
+
+                self.at += 1
+
+                if c == u8(']') then break
+                if c != u8(',') then return None
+
+        out.push("]")
+        Some(())
+    end array
+
+    // A string token, its escapes decoded. A raw control character is refused, as RFC 8259 requires.
+    string(*self) -> Option[string]
+        var sb = str_builder()
+
+        self.at += 1
+
+        var run = self.at
+
+        loop
+            if self.at >= self.text.len then return None
+
+            val c = self.text.bytes[self.at]
+
+            if c == u8('"')
+                sb.push(self.text[run..<self.at])
+                self.at += 1
+                return Some(sb.finish())
+
+            if c < 0x20 then return None
+
+            if c == u8('\\')
+                sb.push(self.text[run..<self.at])
+                self.at += 1
+                sb.push_char(self.escaped()?)
+                run = self.at
+            else
+                self.at += 1
+    end string
+
+    escaped(*self) -> Option[char]
+        val c = self.peek()
+
+        self.at += 1
+
+        val unit: u32 = c match
+            u8('"') -> 0x22
+            u8('\\') -> 0x5c
+            u8('/') -> 0x2f
+            u8('b') -> 0x8
+            u8('f') -> 0xc
+            u8('n') -> 0xa
+            u8('r') -> 0xd
+            u8('t') -> 0x9
+            u8('u') -> return self.unicode()
+            _ -> return None
+
+        char_from_u32(unit)
+
+    // `\uXXXX`, the `\u` already read: a scalar value, or a high surrogate and the low one after it.
+    unicode(*self) -> Option[char]
+        val hi = self.hex4()?
+
+        if hi >= 0xdc00 && hi <= 0xdfff then return None
+        if hi < 0xd800 || hi > 0xdbff then return char_from_u32(hi)
+        if self.peek() != u8('\\') then return None
+
+        self.at += 1
+
+        if self.peek() != u8('u') then return None
+
+        self.at += 1
+
+        val lo = self.hex4()?
+
+        if lo < 0xdc00 || lo > 0xdfff then return None
+
+        char_from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00))
+
+    hex4(*self) -> Option[u32]
+        var n: u32 = 0
+
+        for _ in 0..<4
+            n = n << 4 | u32(hex_value(self.peek())?)
+            self.at += 1
+
+        Some(n)
+
+    // RFC 8259's number grammar exactly, read as the nearest binary64 and printed as ECMAScript does.
+    number(*self, out: *StrBuilder) -> Option[unit]
+        val start = self.at
+
+        if self.peek() == u8('-') then self.at += 1
+
+        if self.peek() == u8('0')
+            self.at += 1
+        elif is_digit(self.peek())
+            self.digits()
+        else
+            return None
+
+        if self.peek() == u8('.')
+            self.at += 1
+
+            if !is_digit(self.peek()) then return None
+
+            self.digits()
+
+        if self.peek() == u8('e') || self.peek() == u8('E')
+            self.at += 1
+
+            if self.peek() == u8('+') || self.peek() == u8('-') then self.at += 1
+            if !is_digit(self.peek()) then return None
+
+            self.digits()
+
+        val x = parse_real(self.text.bytes[start..<self.at]).ok()?
+
+        if x == real.infinity || x == -real.infinity then return None
+
+        out.push(float_text(real_digits(x), true))
+        Some(())
+    end number
+
+    digits(*self)
+        while is_digit(self.peek())
+            self.at += 1
+end JsonReader
+
+// `s` as a canonical JSON string token.
+private escape(s: string, out: *StrBuilder)
+    out.push("\"")
+
+    for c in s.chars
+        val u = u32(c)
+
+        if c == '"'
+            out.push("\\\"")
+        elif c == '\\'
+            out.push("\\\\")
+        elif u == 0x8
+            out.push("\\b")
+        elif u == 0x9
+            out.push("\\t")
+        elif u == 0xa
+            out.push("\\n")
+        elif u == 0xc
+            out.push("\\f")
+        elif u == 0xd
+            out.push("\\r")
+        elif u < 0x20
+            out.push("\\u00")
+            out.push(hex_digit(u128(u >> 4)))
+            out.push(hex_digit(u128(u & 0xf)))
+        else
+            out.push_char(c)
+
+    out.push("\"")
+end escape
+
+// Where a scalar value sorts among UTF-16 code units: below the surrogates as itself, a supplementary
+// one among the high surrogates its first unit is, and U+E000–U+FFFF above them all.
+private utf16_rank(c: char) -> u32
+    val u = u32(c)
+
+    if u < 0xd800 then u elif u >= 0x10000 then 0xd800 + (u - 0x10000) else u + 0x100000
+
+private utf16_less(a: string, b: string) -> bool
+    var x = a.chars
+    var y = b.chars
+
+    loop
+        val p = x.next()
+        val q = y.next()
+
+        if q.is_none() then return false
+        if p.is_none() then return true
+
+        val rp = utf16_rank(p.unwrap())
+        val rq = utf16_rank(q.unwrap())
+
+        if rp != rq then return rp < rq
