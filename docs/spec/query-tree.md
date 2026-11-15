@@ -568,7 +568,9 @@ The whole current row of `binder` as a record (or, for a union-element relation,
 
 `Param` refers to the envelope's parameter `index` (0-based; `Q4001`). `Null(type)` is the null value
 of `type?`. `Literal(type, value)` is a constant: `type` MUST be a non-nullable scalar (§2.1; `Q3017`),
-and `value` is that type's §12.6 encoding (a `json` value in canonical form, `Q1007`). A literal is
+and `value` is that type's §12.6 encoding (a `json` value in canonical form, `Q1007`). A
+`decimal(p, s)` literal's unscaled value MUST have at most `p` digits, `−10ᵖ < v < 10ᵖ` whatever `s`
+is (`Q3011`, found by the decoder like `Q3017`, since the value is read by its type). A literal is
 kept in the shape form (§10.2); a front end puts a value in a literal only when it is a constant of
 the statement, and in a parameter when it varies between executions.
 
@@ -811,12 +813,43 @@ sequence of steps, each a field name from the schema with an index for list elem
 by one `/<field or element index>` step per level into a composite value. `details` is a map from stable keys (`binder`, `column`, `expected`,
 `actual`, `missing_tags`, …) to text. When `spans` is present, the error also carries the source span.
 
+1. **Steps.** Field names are the schema's (§5–§9, `ddl.md` §3.2–§3.3: `as`, `else`), not an
+   implementation's. A component of a tuple the schema writes in parentheses is a step by its name
+   where the schema names it (`If`'s `arms/0/cond`) and otherwise by its 0-based position: the
+   expression of a `(name, Expr)` item is `items/0/1`, an aggregate's call `aggs/0/1`, a `Match` arm's
+   expression `arms/0/2`, an `append_fields` fill `fields/0/2`. A `choice` adds no step: the chosen
+   alternative's fields follow the field that holds it (`constraints/0/body/expr`,
+   `actions/2/def/default`, `on_conflict/set/0/1`). A `Statement` is a choice, so its fields follow
+   `/statement` (`/statement/rel`, `/statement/source`); a view's query is the node `/statement/query`
+   and its relation `/statement/query/rel`.
+2. **What a path names.** An error about a node, or about something in it that is not a node (a
+   binder, a name, a type, a duplicated item), has the path of that `Statement`, `Rel` or `Expr` node.
+   A decode error has the path of the innermost node whose header or payload was being read. An error
+   outside every node has the path of what was being read or is wrong: `/params/<i>` for the
+   declaration of parameter `i` (a type that does not decode, a parameter never referenced, `Q4002`),
+   `/params` for the list itself
+   (`Q6001`), `/spans/<i>` for a span. An error about the envelope as a whole (its version, octets
+   after it) has the empty path. A declaration's path has two steps and a bound value's at least
+   three, so the two never collide.
+3. **Order.** Paths are ordered by the pre-order of the tree: a path comes before every path it is a
+   prefix of, and siblings come in the order the schema lists them, which is the order of the
+   encoding (§12), so `/params` comes before `/statement`. Two errors with the same path are ordered
+   as what in the node each is about comes in the schema (a table's name before its columns); two
+   about the same thing come in either order.
+4. **Details.** Each key appears at most once, and the wire carries them sorted by key
+   (`wire-protocol.md` §8.1). The keys are `binder`, `column`, `field`, `tag`, `table`, `function`,
+   `cte` and `param` for the name an error is about, `expected` and `actual` for types in their §15
+   text form, and `missing_tags` for the tags a `Match` leaves uncovered, comma-separated in
+   declaration order. A key is given where the error has what it names; a client MUST NOT rely on any
+   key being present.
+
 ### 11.2 Order of checks
 
 Validation runs in phases: decode (`Q1…`), names (`Q2…`), types (`Q3…`), parameters and structure
 (`Q4…`, `Q5…`). A server MUST stop after the first phase that finds an error. Within that phase it MUST
 report the error whose path comes first in pre-order, and SHOULD report every other independent error
-in that phase, sorted by path.
+in that phase, sorted by path (§11.1 rule 3). An error is independent when it is not a consequence of
+another: a node that cannot be typed because a child could not be gets no error of its own.
 
 ### 11.3 Codes
 

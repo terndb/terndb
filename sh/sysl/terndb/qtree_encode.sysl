@@ -694,12 +694,26 @@ private[terndb] push_literal(out: Buf[u8], ty: Type, v: Value) -> Result[unit, C
                 push_uvar(out, u64(b.len()))
                 out.extend(b.view())
             _ -> return fail("Q3001", "a bytes literal's value is not bytes")
-        _ -> push_scalar(out, ty, v, ty.width(), 0) match
-            Ok(()) -> ()
-            Err(e) -> return fail(e.code, "a literal's value does not match its type")
+        _ ->
+            (ty, v) match
+                (Decimal(p, _), Int(n)) -> if !decimal_fits(n, p) then return fail("Q3011", s"a decimal literal has more than $p digits")
+                _ -> ()
+
+            push_scalar(out, ty, v, ty.width(), 0) match
+                Ok(()) -> ()
+                Err(e) -> return fail(e.code, "a literal's value does not match its type")
 
     Ok(())
 end push_literal
+
+/** Whether `n`, the unscaled value of a `decimal(p, s)`, has at most `p` digits (§2.1, §7.3). */
+private[terndb] decimal_fits(n: i128, p: u8) -> bool
+    var limit: i128 = 1
+
+    for _ in 0..<p
+        limit *= 10
+
+    n > -limit && n < limit
 
 private[terndb] join_ordinal(k: JoinKind) -> u64 = k match
     Inner -> 0

@@ -8,7 +8,11 @@ import sysl.buf.{Buf, buf}
 // kind or enum ordinal `Q1002`; a non-minimal `uvar`, a `bool` or `opt` tag other than 0 or 1, a
 // doubled nullable and spans out of order `Q1003`; bad UTF-8 `Q1004`; another tree version `Q1005`;
 // nesting past `MaxTreeDepth` `Q1006`; a `json` literal not in canonical form `Q1007`. A literal whose
-// type is not a non-null scalar is `Q3017`, found here because its value cannot be read without it.
+// type is not a non-null scalar is `Q3017`, and a decimal literal with more digits than its precision
+// `Q3011`, found here because its value cannot be read without its type.
+//
+// A refusal carries the §11.1 path of the innermost node whose header or payload was being read; one
+// outside every node has the path of what was being read (`/params/<i>`, `/spans/<i>`), or none.
 
 /** How deep nodes may nest, counting the statement as depth 0, before `Q1006` (`errors.md`: at
  * least 256). A type inside a node continues the count.
@@ -23,8 +27,26 @@ decode_envelope(bytes: []const u8) -> Result[Envelope, CodecError]
 
 /** The envelope that is the whole of `bytes`, decoded only: the `Q1…` phase of §11.2. */
 read_envelope(bytes: []const u8) -> Result[Envelope, CodecError]
+    var w = walk(false)
+
+    read_whole(bytes, &w) match
+        Ok(env) -> Ok(env)
+        Err(e) -> Err(e.at(w.position()))
+
+/** The §11.1 path of every `Statement`, `Rel` and `Expr` node of `env`, by the pre-order index that
+ * spans use (§12.2): the statement is index 0. Empty for a tree that has no encoding.
+ */
+private[terndb] node_paths(env: Envelope) -> Buf[string]
+    var w = walk(true)
+
+    encode_envelope(env) match
+        Ok(bytes) -> ignore(read_whole(bytes.view(), &w))
+        Err(_) -> ()
+
+    w.paths
+
+private read_whole(bytes: []const u8, w: *Walk) -> Result[Envelope, CodecError]
     var r = Reader(bytes, 0)
-    var nodes: u64 = 0
 
     val major = r.uvar()?
     val minor = r.uvar()?
@@ -34,60 +56,123 @@ read_envelope(bytes: []const u8) -> Result[Envelope, CodecError]
 
     val params = buf[ParamDecl]()
 
-    for _ in 0..<r.uvar()?
+    w.down(named("params"))
+
+    for i in 0..<r.uvar()?
+        w.down(nth(i))
         val name = opt_name(&r)?
         params.push(ParamDecl(name, read_tree_type(&r, 1)?))
+        w.up()
 
-    val statement = read_statement(&r, &nodes)?
-    val spans = read_spans(&r, nodes)?
+    w.up()
+
+    val statement = read_statement(&r, w)?
+    val spans = read_spans(&r, w)?
 
     if r.left() != 0 then return fail("Q1001", "octets follow the envelope")
 
     Ok(Envelope(major, minor, params, statement, spans))
-end read_envelope
+end read_whole
 
-private read_spans(r: *Reader, nodes: u64) -> Result[Option[Buf[Span]], CodecError]
+private read_spans(r: *Reader, w: *Walk) -> Result[Option[Buf[Span]], CodecError]
     if !r.flag()? then return Ok(None)
 
     val spans = buf[Span]()
 
-    for _ in 0..<r.uvar()?
+    w.down(named("spans"))
+
+    for i in 0..<r.uvar()?
+        w.down(nth(i))
         val node = r.uvar()?
         val start = r.uvar()?
         val end = r.uvar()?
 
-        if node >= nodes then return fail("Q1001", "a span names a node the statement does not have")
+        if node >= w.nodes then return fail("Q1001", "a span names a node the statement does not have")
         if start > end then return fail("Q1001", "a span ends before it starts")
         if spans.len() > 0 && node <= spans[spans.len() - 1].node then
             return fail("Q1003", "spans are not in increasing node order")
 
         spans.push(Span(node, start, end))
+        w.up()
 
+    w.up()
     Ok(Some(spans))
 end read_spans
 
+// -- where the decoder is -----------------------------------------------------------------------
+
+/** One step of a §11.1 path: a field name, or with an empty `name`, the index of a list element or
+ * of a tuple's component.
+ */
+private struct Step
+    name: string
+    index: u64
+
+private named(name: string) -> Step = Step(name, 0)
+
+private nth(i: u64) -> Step = Step("", i)
+
+/** How far the decoder has got: how many nodes it has opened, the steps from the envelope to what it
+ * is reading, and for each node still open how many of those steps are its path. With `record`, the
+ * path of each node as it is opened.
+ */
+private struct Walk
+    nodes: u64
+    steps: Buf[Step]
+    open: Buf[usize]
+    record: bool
+    paths: Buf[string]
+
+    down(*self, s: Step) = self.steps.push(s)
+
+    up(*self) = ignore(self.steps.pop())
+
+    /** The path of the innermost open node, or of what is being read when no node is open. */
+    position(self) -> string
+        val n = if self.open.len() > 0 then self.open[self.open.len() - 1] else self.steps.len()
+        rendered(self.steps.view()[0..<n])
+
+private walk(record: bool) -> Walk = Walk(0, buf[Step](), buf[usize](), record, buf[string]())
+
+private rendered(steps: []const Step) -> string
+    var out = ""
+
+    for s in steps
+        out = if s.name.len > 0 then s"$out/${s.name}" else s"$out/${s.index}"
+
+    out
+
 // -- nodes --------------------------------------------------------------------------------------
 
-/** A node's header: its kind, and a reader over exactly its payload. Counts the node. */
-private open_node(r: *Reader, nodes: *u64, depth: usize) -> Result[(u64, Reader), CodecError]
+/** A node's header: its kind, and a reader over exactly its payload. Counts the node, which is open,
+ * at the path the steps so far spell, until `close_node`.
+ */
+private open_node(r: *Reader, w: *Walk, depth: usize) -> Result[(u64, Reader), CodecError]
+    w.open.push(w.steps.len())
+
+    if w.record then w.paths.push(rendered(w.steps.view()))
     if depth >= MaxTreeDepth then return fail("Q1006", "the tree nests too deeply")
 
     val kind = r.uvar()?
     val len = r.uvar()?
     val body = Reader(r.take(len)?, 0)
-    *nodes += 1
+    w.nodes += 1
     Ok((kind, body))
 
-private close_node(body: Reader) -> Result[unit, CodecError]
+private close_node(body: Reader, w: *Walk) -> Result[unit, CodecError]
     if body.left() != 0 then return fail("Q1001", "a node's payload length does not match its contents")
+
+    ignore(w.open.pop())
     Ok(())
 
-private read_statement(r: *Reader, nodes: *u64) -> Result[Statement, CodecError]
-    var (kind, body) = open_node(r, nodes, 0)?
+private read_statement(r: *Reader, w: *Walk) -> Result[Statement, CodecError]
+    w.down(named("statement"))
+
+    var (kind, body) = open_node(r, w, 0)?
     val b = &body
 
     val s = kind match
-        1 -> Query(read_rel(b, nodes, 1)?)
+        1 -> Query(read_rel(b, w, named("rel"), 1)?)
         2 ->
             val table = qual_name(b)?
             val binder = b.str()?
@@ -97,35 +182,36 @@ private read_statement(r: *Reader, nodes: *u64) -> Result[Statement, CodecError]
             for _ in 0..<b.uvar()?
                 columns.push(b.str()?)
 
-            val source = read_rel(b, nodes, 1)?
-            val on_conflict = if b.flag()? then Some(read_on_conflict(b, nodes, 1)?) else None
-            Insert(table, binder, old, columns, source, on_conflict, read_items(b, nodes, 1)?)
+            val source = read_rel(b, w, named("source"), 1)?
+            val on_conflict = if b.flag()? then Some(read_on_conflict(b, w, 1)?) else None
+            Insert(table, binder, old, columns, source, on_conflict, read_items(b, w, "returning", 1)?)
         3 ->
             val table = qual_name(b)?
             val binder = b.str()?
             val old = opt_name(b)?
-            val from = opt_rel(b, nodes, 1)?
-            val filter = opt_expr(b, nodes, 1)?
-            val set = read_items(b, nodes, 1)?
-            Update(table, binder, old, from, filter, set, read_items(b, nodes, 1)?)
+            val from = opt_rel(b, w, "from", 1)?
+            val filter = opt_expr(b, w, "filter", 1)?
+            val set = read_items(b, w, "set", 1)?
+            Update(table, binder, old, from, filter, set, read_items(b, w, "returning", 1)?)
         4 ->
             val table = qual_name(b)?
             val binder = b.str()?
             val old = opt_name(b)?
-            val using = opt_rel(b, nodes, 1)?
-            val filter = opt_expr(b, nodes, 1)?
-            Delete(table, binder, old, using, filter, read_items(b, nodes, 1)?)
-        32..53 -> read_ddl(kind, b, nodes)?
+            val using = opt_rel(b, w, "using", 1)?
+            val filter = opt_expr(b, w, "filter", 1)?
+            Delete(table, binder, old, using, filter, read_items(b, w, "returning", 1)?)
+        32..53 -> read_ddl(kind, b, w)?
         _ -> return fail("Q1002", "unknown or reserved statement kind")
 
-    close_node(body)?
+    close_node(body, w)?
+    w.up()
     Ok(s)
 end read_statement
 
 // -- DDL, `ddl.md` §3 --------------------------------------------------------------------------
 
 /** The payload of a DDL statement of `kind`, one of 32–53; its contents are at depth 1. */
-private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecError]
+private read_ddl(kind: u64, b: *Reader, w: *Walk) -> Result[Statement, CodecError]
     val s = kind match
         32 ->
             val name = b.str()?
@@ -138,15 +224,26 @@ private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecE
             val table = qual_name(b)?
             val columns = buf[ColumnDef]()
 
-            for _ in 0..<b.uvar()?
-                columns.push(read_column_def(b, nodes)?)
+            w.down(named("columns"))
+
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                columns.push(read_column_def(b, w)?)
+                w.up()
+
+            w.up()
 
             val primary_key = read_strs(b)?
             val constraints = buf[ConstraintDef]()
 
-            for _ in 0..<b.uvar()?
-                constraints.push(read_constraint_def(b, nodes)?)
+            w.down(named("constraints"))
 
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                constraints.push(read_constraint_def(b, w)?)
+                w.up()
+
+            w.up()
             CreateTable(table, columns, primary_key, constraints, b.flag()?)
         35 ->
             val table = qual_name(b)?
@@ -156,13 +253,20 @@ private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecE
             val table = qual_name(b)?
             val actions = buf[AlterAction]()
 
-            for _ in 0..<b.uvar()?
-                actions.push(read_alter_action(b, nodes)?)
+            w.down(named("actions"))
 
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                actions.push(read_alter_action(b, w)?)
+                w.up()
+
+            w.up()
             AlterTable(table, actions)
         37 ->
             val name = b.str()?
-            val index = read_index_def(b, nodes)?
+            w.down(named("def"))
+            val index = read_index_def(b, w)?
+            w.up()
             CreateIndex(name, index, b.flag()?)
         38 ->
             val index = qual_name(b)?
@@ -173,7 +277,10 @@ private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecE
             CreateType(type_name, ty, b.flag()?)
         40 ->
             val type_name = qual_name(b)?
-            AlterType(type_name, read_type_change(b, nodes)?)
+            w.down(named("change"))
+            val change = read_type_change(b, w)?
+            w.up()
+            AlterType(type_name, change)
         41 ->
             val type_name = qual_name(b)?
             DropType(type_name, b.flag()?)
@@ -192,12 +299,15 @@ private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecE
             val view = qual_name(b)?
 
             // `query` is a `node Query`, which counts as a node of its own.
-            var (inner, q) = open_node(b, nodes, 1)?
+            w.down(named("query"))
+
+            var (inner, q) = open_node(b, w, 1)?
 
             if inner != 1 then return fail("Q1002", "a view's query is not a Query node")
 
-            val query = read_rel(&q, nodes, 2)?
-            close_node(q)?
+            val query = read_rel(&q, w, named("rel"), 2)?
+            close_node(q, w)?
+            w.up()
             CreateView(view, query, b.flag()?)
         46 ->
             val view = qual_name(b)?
@@ -228,20 +338,23 @@ private read_ddl(kind: u64, b: *Reader, nodes: *u64) -> Result[Statement, CodecE
     Ok(s)
 end read_ddl
 
-private read_column_def(r: *Reader, nodes: *u64) -> Result[ColumnDef, CodecError]
+private read_column_def(r: *Reader, w: *Walk) -> Result[ColumnDef, CodecError]
     val name = r.str()?
     val ty = read_tree_type(r, 1)?
-    val default = opt_expr(r, nodes, 1)?
-    val generated = opt_expr(r, nodes, 1)?
+    val default = opt_expr(r, w, "default", 1)?
+    val generated = opt_expr(r, w, "generated", 1)?
     val identity = identity_kind(ordinal(r, 3)?)
     val sequence = if r.flag()? then Some(read_sequence_def(r)?) else None
     Ok(ColumnDef(name, ty, default, generated, identity, sequence))
 
-private read_constraint_def(r: *Reader, nodes: *u64) -> Result[ConstraintDef, CodecError]
+private read_constraint_def(r: *Reader, w: *Walk) -> Result[ConstraintDef, CodecError]
     val name = r.str()?
 
+    // `body` holds a choice, whose alternative adds no step (§11.1): a check's expression is `body/expr`.
+    w.down(named("body"))
+
     val body = ordinal(r, 3)? match
-        0 -> Check(read_expr(r, nodes, 1)?)
+        0 -> Check(read_expr(r, w, named("expr"), 1)?)
         1 -> Unique(read_strs(r)?)
         _ ->
             val columns = read_strs(r)?
@@ -251,21 +364,32 @@ private read_constraint_def(r: *Reader, nodes: *u64) -> Result[ConstraintDef, Co
             val on_update = fk_action(ordinal(r, 5)?)
             ForeignKey(columns, ref_table, ref_columns, on_delete, on_update, r.flag()?)
 
+    w.up()
     Ok(ConstraintDef(name, body))
+end read_constraint_def
 
-private read_index_def(r: *Reader, nodes: *u64) -> Result[IndexDef, CodecError]
+private read_index_def(r: *Reader, w: *Walk) -> Result[IndexDef, CodecError]
     val table = qual_name(r)?
     val unique = r.flag()?
     val keys = buf[IndexKey]()
 
-    for _ in 0..<r.uvar()?
+    w.down(named("keys"))
+
+    for i in 0..<r.uvar()?
+        w.down(nth(i))
+        w.down(named("key"))
+
         val key = ordinal(r, 2)? match
             0 -> KeyColumn(r.str()?)
-            _ -> KeyExpr(read_expr(r, nodes, 1)?)
+            _ -> KeyExpr(read_expr(r, w, named("expr"), 1)?)
 
+        w.up()
         keys.push(IndexKey(key, r.flag()?))
+        w.up()
 
-    Ok(IndexDef(table, unique, keys, opt_expr(r, nodes, 1)?))
+    w.up()
+    Ok(IndexDef(table, unique, keys, opt_expr(r, w, "predicate", 1)?))
+end read_index_def
 
 private read_sequence_def(r: *Reader) -> Result[SequenceDef, CodecError]
     val ty = read_tree_type(r, 1)?
@@ -277,17 +401,22 @@ private read_sequence_def(r: *Reader) -> Result[SequenceDef, CodecError]
     val cache = if r.flag()? then Some(r.uvar()?) else None
     Ok(SequenceDef(ty, start, increment, min, max, cycle, cache))
 
-private read_type_change(r: *Reader, nodes: *u64) -> Result[TypeChange, CodecError]
+private read_type_change(r: *Reader, w: *Walk) -> Result[TypeChange, CodecError]
     val change = ordinal(r, 4)? match
         0 -> AppendVariants(read_fields(r, 1)?)
         1 ->
             val fs = buf[FieldFill]()
 
-            for _ in 0..<r.uvar()?
+            w.down(named("fields"))
+
+            for i in 0..<r.uvar()?
+                w.down(nth(i))
                 val name = r.str()?
                 val ty = read_tree_type(r, 1)?
-                fs.push(FieldFill(name, ty, opt_expr(r, nodes, 1)?))
+                fs.push(FieldFill(name, ty, opt_expr(r, w, "", 1)?))
+                w.up()
 
+            w.up()
             AppendFields(fs)
         2 ->
             val old_name = r.str()?
@@ -295,6 +424,7 @@ private read_type_change(r: *Reader, nodes: *u64) -> Result[TypeChange, CodecErr
         _ -> RenameType(r.str()?)
 
     Ok(change)
+end read_type_change
 
 private read_role_def(r: *Reader) -> Result[RoleDef, CodecError]
     val login = r.flag()?
@@ -318,9 +448,13 @@ private read_object_ref(r: *Reader) -> Result[ObjectRef, CodecError]
 
     Ok(o)
 
-private read_alter_action(r: *Reader, nodes: *u64) -> Result[AlterAction, CodecError]
+private read_alter_action(r: *Reader, w: *Walk) -> Result[AlterAction, CodecError]
     val a = ordinal(r, 14)? match
-        0 -> AddColumn(read_column_def(r, nodes)?)
+        0 ->
+            w.down(named("def"))
+            val c = read_column_def(r, w)?
+            w.up()
+            AddColumn(c)
         1 ->
             val name = r.str()?
             DropColumn(name, r.flag()?)
@@ -330,15 +464,17 @@ private read_alter_action(r: *Reader, nodes: *u64) -> Result[AlterAction, CodecE
         3 ->
             val name = r.str()?
             val ty = read_tree_type(r, 1)?
-            RetypeColumn(name, ty, opt_expr(r, nodes, 1)?)
+            RetypeColumn(name, ty, opt_expr(r, w, "using", 1)?)
         4 ->
             val name = r.str()?
-            SetColumnDefault(name, opt_expr(r, nodes, 1)?)
+            SetColumnDefault(name, opt_expr(r, w, "default", 1)?)
         5 ->
             val name = r.str()?
             SetNullable(name, r.flag()?)
         6 ->
-            val c = read_constraint_def(r, nodes)?
+            w.down(named("def"))
+            val c = read_constraint_def(r, w)?
+            w.up()
             AddConstraint(c, r.flag()?)
         7 ->
             val name = r.str()?
@@ -355,7 +491,7 @@ private read_alter_action(r: *Reader, nodes: *u64) -> Result[AlterAction, CodecE
     Ok(a)
 end read_alter_action
 
-private read_on_conflict(r: *Reader, nodes: *u64, depth: usize) -> Result[OnConflict, CodecError]
+private read_on_conflict(r: *Reader, w: *Walk, depth: usize) -> Result[OnConflict, CodecError]
     val target = ordinal(r, 2)? match
         0 ->
             val names = buf[string]()
@@ -368,17 +504,22 @@ private read_on_conflict(r: *Reader, nodes: *u64, depth: usize) -> Result[OnConf
 
     val excluded = r.str()?
 
+    w.down(named("on_conflict"))
+
     val action = ordinal(r, 2)? match
         0 -> Nothing
         _ ->
-            val set = read_items(r, nodes, depth)?
-            DoUpdate(set, opt_expr(r, nodes, depth)?)
+            val set = read_items(r, w, "set", depth)?
+            DoUpdate(set, opt_expr(r, w, "where", depth)?)
 
+    w.up()
     Ok(OnConflict(target, excluded, action))
 end read_on_conflict
 
-private read_rel(r: *Reader, nodes: *u64, depth: usize) -> Result[Rel, CodecError]
-    var (kind, body) = open_node(r, nodes, depth)?
+private read_rel(r: *Reader, w: *Walk, at: Step, depth: usize) -> Result[Rel, CodecError]
+    w.down(at)
+
+    var (kind, body) = open_node(r, w, depth)?
     val b = &body
     val d = depth + 1
 
@@ -391,157 +532,207 @@ private read_rel(r: *Reader, nodes: *u64, depth: usize) -> Result[Rel, CodecErro
             val columns = read_fields(b, d)?
             val rows = buf[Buf[Expr]]()
 
-            for _ in 0..<b.uvar()?
-                rows.push(read_exprs(b, nodes, d)?)
+            w.down(named("rows"))
 
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                rows.push(read_exprs(b, w, "", d)?)
+                w.up()
+
+            w.up()
             Values(binder, columns, rows)
         3 ->
             val binder = b.str()?
             ParamScan(binder, b.uvar()?)
         4 ->
-            val input = read_rel(b, nodes, d)?
-            Filter(input, read_expr(b, nodes, d)?)
+            val input = read_rel(b, w, named("input"), d)?
+            Filter(input, read_expr(b, w, named("predicate"), d)?)
         5 ->
-            val input = read_rel(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
             val binder = b.str()?
-            Project(input, binder, read_items(b, nodes, d)?)
+            Project(input, binder, read_items(b, w, "items", d)?)
         6 ->
             val kind = join_kind(ordinal(b, 8)?)
-            val left = read_rel(b, nodes, d)?
-            val right = read_rel(b, nodes, d)?
-            val on = opt_expr(b, nodes, d)?
+            val left = read_rel(b, w, named("left"), d)?
+            val right = read_rel(b, w, named("right"), d)?
+            val on = opt_expr(b, w, "on", d)?
             val mark = opt_name(b)?
             Join(kind, left, right, on, mark, opt_name(b)?)
         7 ->
             val kind = apply_kind(ordinal(b, 6)?)
-            val left = read_rel(b, nodes, d)?
-            val right = read_rel(b, nodes, d)?
-            val on = opt_expr(b, nodes, d)?
+            val left = read_rel(b, w, named("left"), d)?
+            val right = read_rel(b, w, named("right"), d)?
+            val on = opt_expr(b, w, "on", d)?
             val mark = opt_name(b)?
             Apply(kind, left, right, on, mark, opt_name(b)?)
         8 ->
-            val input = read_rel(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
             val binder = b.str()?
-            val keys = read_items(b, nodes, d)?
+            val keys = read_items(b, w, "keys", d)?
             val aggs = buf[NamedAgg]()
 
-            for _ in 0..<b.uvar()?
-                val name = b.str()?
-                aggs.push(NamedAgg(name, read_agg_call(b, nodes, d)?))
+            w.down(named("aggs"))
 
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                val name = b.str()?
+                w.down(nth(1))
+                aggs.push(NamedAgg(name, read_agg_call(b, w, d)?))
+                w.up()
+                w.up()
+
+            w.up()
             Aggregate(input, binder, keys, aggs)
         9 ->
-            val input = read_rel(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
             val binder = b.str()?
             val items = buf[NamedWin]()
 
-            for _ in 0..<b.uvar()?
-                val name = b.str()?
-                items.push(NamedWin(name, read_win_call(b, nodes, d)?))
+            w.down(named("items"))
 
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                val name = b.str()?
+                w.down(nth(1))
+                items.push(NamedWin(name, read_win_call(b, w, d)?))
+                w.up()
+                w.up()
+
+            w.up()
             Window(input, binder, items)
         10 ->
-            val input = read_rel(b, nodes, d)?
-            Sort(input, read_sort_keys(b, nodes, d)?)
+            val input = read_rel(b, w, named("input"), d)?
+            Sort(input, read_sort_keys(b, w, "keys", d)?)
         11 ->
-            val input = read_rel(b, nodes, d)?
-            val count = opt_expr(b, nodes, d)?
-            val offset = opt_expr(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
+            val count = opt_expr(b, w, "count", d)?
+            val offset = opt_expr(b, w, "offset", d)?
             val ties = b.flag()?
             Limit(input, count, offset, ties, b.flag()?)
-        12 -> Distinct(read_rel(b, nodes, d)?)
+        12 -> Distinct(read_rel(b, w, named("input"), d)?)
         13 ->
             val op = setop_kind(ordinal(b, 3)?)
             val all = b.flag()?
             val binder = b.str()?
             val inputs = buf[Rel]()
 
-            for _ in 0..<b.uvar()?
-                inputs.push(read_rel(b, nodes, d)?)
+            w.down(named("inputs"))
 
+            for i in 0..<b.uvar()?
+                inputs.push(read_rel(b, w, nth(i), d)?)
+
+            w.up()
             SetOp(op, all, binder, inputs)
         14 ->
             val recursive = b.flag()?
             val ctes = buf[CteDef]()
 
-            for _ in 0..<b.uvar()?
+            w.down(named("ctes"))
+
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
                 val name = b.str()?
                 val columns = if b.flag()? then Some(read_fields(b, d)?) else None
-                ctes.push(CteDef(name, columns, read_rel(b, nodes, d)?))
+                ctes.push(CteDef(name, columns, read_rel(b, w, named("rel"), d)?))
+                w.up()
 
-            With(recursive, ctes, read_rel(b, nodes, d)?)
+            w.up()
+            With(recursive, ctes, read_rel(b, w, named("body"), d)?)
         15 ->
             val name = b.str()?
             CteRef(name, b.str()?)
         16 ->
-            val input = read_rel(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
             val binder = b.str()?
-            val keys = read_items(b, nodes, d)?
+            val keys = read_items(b, w, "keys", d)?
             val name = b.str()?
-            val items = read_items(b, nodes, d)?
-            Nest(input, binder, keys, name, items, read_sort_keys(b, nodes, d)?)
+            val items = read_items(b, w, "items", d)?
+            Nest(input, binder, keys, name, items, read_sort_keys(b, w, "order", d)?)
         17 ->
-            val input = read_rel(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
             val binder = b.str()?
-            val value = read_expr(b, nodes, d)?
+            val value = read_expr(b, w, named("value"), d)?
             val outer = b.flag()?
             Unnest(input, binder, value, outer, opt_name(b)?)
         18 ->
-            val input = read_rel(b, nodes, d)?
+            val input = read_rel(b, w, named("input"), d)?
             val binder = b.str()?
             val ty = read_tree_type(b, d)?
             Tag(input, binder, ty, b.str()?)
         _ -> return fail("Q1002", "unknown or reserved relation kind")
 
-    close_node(body)?
+    close_node(body, w)?
+    w.up()
     Ok(rel)
 end read_rel
 
-private read_agg_call(r: *Reader, nodes: *u64, depth: usize) -> Result[AggCall, CodecError]
+private read_agg_call(r: *Reader, w: *Walk, depth: usize) -> Result[AggCall, CodecError]
     val function = r.str()?
-    val args = read_exprs(r, nodes, depth)?
+    val args = read_exprs(r, w, "args", depth)?
     val distinct = r.flag()?
-    val filter = opt_expr(r, nodes, depth)?
-    Ok(AggCall(function, args, distinct, filter, read_sort_keys(r, nodes, depth)?))
+    val filter = opt_expr(r, w, "filter", depth)?
+    Ok(AggCall(function, args, distinct, filter, read_sort_keys(r, w, "order", depth)?))
 
-private read_win_call(r: *Reader, nodes: *u64, depth: usize) -> Result[WinCall, CodecError]
+private read_win_call(r: *Reader, w: *Walk, depth: usize) -> Result[WinCall, CodecError]
     val function = r.str()?
-    val args = read_exprs(r, nodes, depth)?
-    val partition = read_exprs(r, nodes, depth)?
-    val order = read_sort_keys(r, nodes, depth)?
+    val args = read_exprs(r, w, "args", depth)?
+    val partition = read_exprs(r, w, "partition", depth)?
+    val order = read_sort_keys(r, w, "order", depth)?
 
     val frame = if r.flag()?
+        w.down(named("frame"))
         val unit = frame_unit(ordinal(r, 3)?)
-        val start = read_bound(r, nodes, depth)?
-        val end = read_bound(r, nodes, depth)?
+        val start = read_bound(r, w, "start", depth)?
+        val end = read_bound(r, w, "end", depth)?
+        w.up()
         Some(Frame(unit, start, end, frame_exclude(ordinal(r, 4)?)))
     else
         None
 
     Ok(WinCall(function, args, partition, order, frame))
+end read_win_call
 
-private read_bound(r: *Reader, nodes: *u64, depth: usize) -> Result[Bound, CodecError]
+private read_bound(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Bound, CodecError]
+    w.down(named(field))
     val kind = bound_kind(ordinal(r, 5)?)
-    Ok(Bound(kind, opt_expr(r, nodes, depth)?))
+    val b = Bound(kind, opt_expr(r, w, "offset", depth)?)
+    w.up()
+    Ok(b)
 
-private read_sort_keys(r: *Reader, nodes: *u64, depth: usize) -> Result[Buf[SortKey], CodecError]
+/** A list of sort keys in field `field`; each key's expression is at `<field>/<i>/expr`. */
+private read_sort_keys(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Buf[SortKey], CodecError]
     val keys = buf[SortKey]()
 
-    for _ in 0..<r.uvar()?
-        val e = read_expr(r, nodes, depth)?
+    w.down(named(field))
+
+    for i in 0..<r.uvar()?
+        w.down(nth(i))
+        val e = read_expr(r, w, named("expr"), depth)?
         val desc = r.flag()?
         keys.push(SortKey(e, desc, r.flag()?))
+        w.up()
 
+    w.up()
     Ok(keys)
+end read_sort_keys
 
-private read_items(r: *Reader, nodes: *u64, depth: usize) -> Result[Buf[Item], CodecError]
+/** A list of `(name, Expr)` pairs in field `field`; each expression is component 1 of its pair,
+ * `<field>/<i>/1`.
+ */
+private read_items(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Buf[Item], CodecError]
     val items = buf[Item]()
 
-    for _ in 0..<r.uvar()?
-        val name = r.str()?
-        items.push(Item(name, read_expr(r, nodes, depth)?))
+    w.down(named(field))
 
+    for i in 0..<r.uvar()?
+        w.down(nth(i))
+        val name = r.str()?
+        items.push(Item(name, read_expr(r, w, nth(1), depth)?))
+        w.up()
+
+    w.up()
     Ok(items)
+end read_items
 
 private read_fields(r: *Reader, depth: usize) -> Result[Buf[Field], CodecError]
     val fields = buf[Field]()
@@ -552,27 +743,41 @@ private read_fields(r: *Reader, depth: usize) -> Result[Buf[Field], CodecError]
 
     Ok(fields)
 
-private opt_rel(r: *Reader, nodes: *u64, depth: usize) -> Result[Option[Rel], CodecError] =
-    if r.flag()? then Ok(Some(read_rel(r, nodes, depth)?)) else Ok(None)
+/** An optional relation in field `field`. */
+private opt_rel(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Option[Rel], CodecError] =
+    if r.flag()? then Ok(Some(read_rel(r, w, named(field), depth)?)) else Ok(None)
 
 // -- expressions --------------------------------------------------------------------------------
 
-private read_exprs(r: *Reader, nodes: *u64, depth: usize) -> Result[Buf[Expr], CodecError]
+/** A list of expressions in field `field`, or with an empty `field`, the list the steps so far
+ * already reach (a row of `Values`).
+ */
+private read_exprs(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Buf[Expr], CodecError]
     val es = buf[Expr]()
 
-    for _ in 0..<r.uvar()?
-        es.push(read_expr(r, nodes, depth)?)
+    if field.len > 0 then w.down(named(field))
+
+    for i in 0..<r.uvar()?
+        es.push(read_expr(r, w, nth(i), depth)?)
+
+    if field.len > 0 then w.up()
 
     Ok(es)
+end read_exprs
 
-private opt_expr(r: *Reader, nodes: *u64, depth: usize) -> Result[Option[Expr], CodecError] =
-    if r.flag()? then Ok(Some(read_expr(r, nodes, depth)?)) else Ok(None)
+/** An optional expression in field `field`, or with an empty `field`, component 2 of the tuple the
+ * steps so far reach (an `append_fields` fill).
+ */
+private opt_expr(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Option[Expr], CodecError] =
+    if r.flag()? then Ok(Some(read_expr(r, w, if field.len > 0 then named(field) else nth(2), depth)?)) else Ok(None)
 
-private opt_boxed(r: *Reader, nodes: *u64, depth: usize) -> Result[Option[&Expr], CodecError] =
-    if r.flag()? then Ok(Some(read_expr(r, nodes, depth)?)) else Ok(None)
+private opt_boxed(r: *Reader, w: *Walk, field: string, depth: usize) -> Result[Option[&Expr], CodecError] =
+    if r.flag()? then Ok(Some(read_expr(r, w, named(field), depth)?)) else Ok(None)
 
-private read_expr(r: *Reader, nodes: *u64, depth: usize) -> Result[Expr, CodecError]
-    var (kind, body) = open_node(r, nodes, depth)?
+private read_expr(r: *Reader, w: *Walk, at: Step, depth: usize) -> Result[Expr, CodecError]
+    w.down(at)
+
+    var (kind, body) = open_node(r, w, depth)?
     val b = &body
     val d = depth + 1
 
@@ -585,50 +790,61 @@ private read_expr(r: *Reader, nodes: *u64, depth: usize) -> Result[Expr, CodecEr
         4 -> Null(read_tree_type(b, d)?)
         5 ->
             val function = b.str()?
-            Call(function, read_exprs(b, nodes, d)?)
+            Call(function, read_exprs(b, w, "args", d)?)
         6 ->
-            val inner = read_expr(b, nodes, d)?
+            val inner = read_expr(b, w, named("expr"), d)?
             val ty = read_tree_type(b, d)?
             Cast(inner, ty, if ordinal(b, 2)? == 0 then Strict else Try)
         7 ->
             val arms = buf[IfArm]()
 
-            for _ in 0..<b.uvar()?
-                val cond = read_expr(b, nodes, d)?
-                arms.push(IfArm(cond, read_expr(b, nodes, d)?))
+            w.down(named("arms"))
 
-            If(arms, opt_boxed(b, nodes, d)?)
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
+                val cond = read_expr(b, w, named("cond"), d)?
+                arms.push(IfArm(cond, read_expr(b, w, named("value"), d)?))
+                w.up()
+
+            w.up()
+            If(arms, opt_boxed(b, w, "else", d)?)
         8 ->
-            val scrutinee = read_expr(b, nodes, d)?
+            val scrutinee = read_expr(b, w, named("expr"), d)?
             val arms = buf[MatchArm]()
 
-            for _ in 0..<b.uvar()?
+            w.down(named("arms"))
+
+            for i in 0..<b.uvar()?
+                w.down(nth(i))
                 val tag = b.str()?
                 val binder = b.str()?
-                arms.push(MatchArm(tag, binder, read_expr(b, nodes, d)?))
+                arms.push(MatchArm(tag, binder, read_expr(b, w, nth(2), d)?))
+                w.up()
 
-            Match(scrutinee, arms, opt_boxed(b, nodes, d)?)
-        9 -> Record(read_items(b, nodes, d)?)
+            w.up()
+            Match(scrutinee, arms, opt_boxed(b, w, "else", d)?)
+        9 -> Record(read_items(b, w, "fields", d)?)
         10 ->
-            val inner = read_expr(b, nodes, d)?
+            val inner = read_expr(b, w, named("expr"), d)?
             Field(inner, b.str()?)
         11 ->
             val ty = read_tree_type(b, d)?
             val tag = b.str()?
-            Variant(ty, tag, read_expr(b, nodes, d)?)
-        12 -> Relation(read_rel(b, nodes, d)?)
-        13 -> Scalar(read_rel(b, nodes, d)?)
-        14 -> Exists(read_rel(b, nodes, d)?)
+            Variant(ty, tag, read_expr(b, w, named("expr"), d)?)
+        12 -> Relation(read_rel(b, w, named("rel"), d)?)
+        13 -> Scalar(read_rel(b, w, named("rel"), d)?)
+        14 -> Exists(read_rel(b, w, named("rel"), d)?)
         15 ->
-            val es = read_exprs(b, nodes, d)?
-            In(es, read_rel(b, nodes, d)?)
+            val es = read_exprs(b, w, "exprs", d)?
+            In(es, read_rel(b, w, named("rel"), d)?)
         16 -> Action
         17 ->
             val ty = read_tree_type(b, d)?
             Literal(ty, read_literal(b, ty)?)
         _ -> return fail("Q1002", "unknown or reserved expression kind")
 
-    close_node(body)?
+    close_node(body, w)?
+    w.up()
     Ok(e)
 end read_expr
 
@@ -649,6 +865,14 @@ private[terndb] read_literal(r: *Reader, ty: Type) -> Result[Value, CodecError]
             val n = r.uvar()?
             Ok(bytes_value(r.take(n)?))
         Bool -> Ok(Bool(r.flag()?))
+        Decimal(p, _) ->
+            val v = fixed_value(ty, r.take(u64(ty.width()))?)
+
+            v match
+                Int(n) -> if !decimal_fits(n, p) then return fail("Q3011", s"a decimal literal has more than $p digits")
+                _ -> ()
+
+            Ok(v)
         _ -> Ok(fixed_value(ty, r.take(u64(ty.width()))?))
 end read_literal
 

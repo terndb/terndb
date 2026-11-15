@@ -10,7 +10,12 @@ import sysl.container.{Set, set}
 // error (`Q4…`, `Q5…`, the other `Q6…`), and within a phase the one that comes first in pre-order.
 
 /** `env` checked as above; the first error of the first phase that has one. */
-check_envelope(env: Envelope) -> Result[unit, CodecError] = structural_phases(env).first()
+check_envelope(env: Envelope) -> Result[unit, CodecError] = structural_phases(env).first(env)
+
+/** `env` checked as above; every error of the first phase that has one, sorted by path (§11.2), and
+ * none when it passes.
+ */
+check_errors(env: Envelope) -> Buf[CodecError] = structural_phases(env).errors(env)
 
 /** What the structural checks find in `env`, phase by phase, for `type_envelope` to merge with what
  * the type checker finds.
@@ -29,12 +34,15 @@ private[terndb] structural_phases(env: Envelope) -> Phases
     var c = Checker(false, gather.all, set[string](), used, buf[string](), false, Unrestricted, no_phases(), FirstNode + 1, FirstNode)
     c.statement(env.statement)
 
-    // `/params/<i>` comes before `/statement` in pre-order: node 0, before every node of the statement.
+    // `/params` comes before `/statement` in pre-order: node 0, before every node of the statement;
+    // within it, the list before its declarations.
     if is_ddl(env.statement) && env.params.len() > 0 then
-        c.found.record(0, "Q6001", "a DDL statement declares parameters")
+        c.found.add_at(0, 0, refusal("Q6001", "a DDL statement declares parameters", []).at("/params"))
 
     for i in 0..<used.len()
-        if !used[i] then c.found.record(0, "Q4002", s"parameter $i is declared and never referenced")
+        if !used[i] then
+            val e = refusal("Q4002", s"parameter $i is declared and never referenced", [Detail("param", s"$i")])
+            c.found.add_at(0, u64(i) + 1, e.at(s"/params/$i"))
 
     c.found
 end structural_phases
@@ -42,55 +50,109 @@ end structural_phases
 // -- the phases of §11.2 ------------------------------------------------------------------------
 
 /** The pre-order index of the statement root; its `Rel` and `Expr` nodes follow it, and 0 stands for
- * `/params`.
+ * `/params`. A node's index is one more than its span index (§12.2), which `node_paths` is keyed by.
  */
 private[terndb] const FirstNode: u64 = 1
 
-/** An error, and the pre-order index of the `Rel` or `Expr` node it is about. */
+/** An error, the pre-order index of the node it is about, and the position within that node of what
+ * it is about when that is no node of its own (a parameter declaration under `/params`): the one
+ * order of §11.2, since a walk in the order of the encoding meets the nodes in the pre-order of their
+ * paths.
+ */
 private[terndb] struct Found
     node: u64
+    within: u64
     error: CodecError
 
-/** The first error of each phase of §11.2, by pre-order of the node it is about. */
+/** The errors of each phase of §11.2, each kept in pre-order of the node it is about, and those of
+ * one node in the order they were found.
+ */
 private[terndb] struct Phases
-    names: Option[Found]
-    types: Option[Found]
-    structure: Option[Found]
+    names: Buf[Found]
+    types: Buf[Found]
+    structure: Buf[Found]
 
-    /** `code` recorded in its phase (§11.2, `ddl.md` §3.1 rule 4), unless that phase holds an error
-     * about a node no later in pre-order.
-     */
-    record(*self, node: u64, code: string, message: string)
-        val f = Found(node, CodecError(code, message))
+    /** `code` recorded in its phase against `node`. */
+    record(*self, node: u64, code: string, message: string) = self.add(node, refusal(code, message, []))
+
+    /** `e` recorded in its phase against `node` itself. */
+    add(*self, node: u64, e: CodecError) = self.add_at(node, 0, e)
+
+    /** `e` recorded in its phase (§11.2, `ddl.md` §3.1 rule 4) against position `within` of `node`. */
+    add_at(*self, node: u64, within: u64, e: CodecError)
+        val f = Found(node, within, e)
+        val code = e.code
 
         if code.starts_with("Q2") || code == "Q6002" || code == "Q6004"
-            self.names = earlier(self.names, Some(f))
+            in_order(self.names, f)
         else if code.starts_with("Q3") || code == "Q6005"
-            self.types = earlier(self.types, Some(f))
+            in_order(self.types, f)
         else
-            self.structure = earlier(self.structure, Some(f))
+            in_order(self.structure, f)
 
-    /** Each phase's earlier error of `self` and `other`. */
-    merged(self, other: Phases) -> Phases =
-        Phases(earlier(self.names, other.names), earlier(self.types, other.types), earlier(self.structure, other.structure))
+    /** The errors of `self` and of `other`, phase by phase. */
+    merged(self, other: Phases) -> Phases
+        val out = no_phases()
+
+        for f in self.names
+            in_order(out.names, f)
+        for f in other.names
+            in_order(out.names, f)
+        for f in self.types
+            in_order(out.types, f)
+        for f in other.types
+            in_order(out.types, f)
+        for f in self.structure
+            in_order(out.structure, f)
+        for f in other.structure
+            in_order(out.structure, f)
+
+        out
+    end merged
+
+    /** Every error of the first phase that has one, in order, each with the path of its node in
+     * `env`; empty when no phase has one.
+     */
+    errors(self, env: Envelope) -> Buf[CodecError]
+        val out = buf[CodecError]()
+
+        for p in [self.names, self.types, self.structure]
+            if p.len() == 0 then continue
+
+            val paths = node_paths(env)
+
+            for f in p
+                val i = if f.node >= FirstNode then usize(f.node - FirstNode) else paths.len()
+                out.push(if i < paths.len() then f.error.at(paths[i]) else f.error)
+
+            return out
+
+        out
+    end errors
 
     /** The first error of the first phase that has one. */
-    first(self) -> Result[unit, CodecError]
-        for p in [self.names, self.types, self.structure]
-            p match
-                Some(f) -> return Err(f.error)
-                None -> ()
+    first(self, env: Envelope) -> Result[unit, CodecError]
+        val all = self.errors(env)
+
+        if all.len() > 0 then return Err(all[0])
 
         Ok(())
 end Phases
 
-private[terndb] no_phases() -> Phases = Phases(None, None, None)
+private[terndb] no_phases() -> Phases = Phases(buf[Found](), buf[Found](), buf[Found]())
 
-// The one of `a` and `b` about the node earlier in pre-order, `a` on a tie.
-private earlier(a: Option[Found], b: Option[Found]) -> Option[Found] = (a, b) match
-    (Some(x), Some(y)) -> if y.node < x.node then b else a
-    (None, _) -> b
-    _ -> a
+// `f` placed in `fs` after every error about an earlier place or the same one. A walk meets the fields
+// of a node in the schema's order, so the errors about one node stay in the order of what in it they
+// are about.
+private in_order(fs: Buf[Found], f: Found)
+    var i = fs.len()
+
+    while i > 0 && before(f, fs[i - 1])
+        i -= 1
+
+    fs.insert(i, f)
+
+private before(a: Found, b: Found) -> bool = a.node < b.node || a.node == b.node && a.within < b.within
 
 private struct Checker
     gathering: bool
@@ -107,10 +169,13 @@ private struct Checker
     // -- recording ----------------------------------------------------------------------------
 
     /** `code` recorded in its phase against the node being checked. */
-    report(*self, code: string, message: string)
+    report(*self, code: string, message: string) = self.report_on(code, message, [])
+
+    /** `code` recorded as `report` does, with the §11.1 details that name what it is about. */
+    report_on(*self, code: string, message: string, details: []const Detail)
         if self.gathering then return
 
-        self.found.record(self.node, code, message)
+        self.found.add(self.node, refusal(code, message, details))
 
     /** The pre-order index of a node being entered, which becomes the current one; the caller
      * restores the one it answers when it leaves.
@@ -128,7 +193,7 @@ private struct Checker
         if self.gathering then return ignore(self.all.add(b))
 
         if b.len == 0 then self.report("Q5009", "a binder is empty")
-        if !self.seen.add(b) then self.report("Q2004", s"binder '$b' is introduced twice")
+        if !self.seen.add(b) then self.report_on("Q2004", s"binder '$b' is introduced twice", [Detail("binder", b)])
 
     opt_intro(*self, b: Option[string]) = b match
         Some(x) -> self.intro(x)
@@ -140,16 +205,18 @@ private struct Checker
     refer(*self, b: string, visible: Buf[string], hidden: Buf[string])
         if holds(visible, b) then return
 
+        val about = [Detail("binder", b)]
+
         if holds(hidden, b)
-            self.report("Q5006", s"a join's right input refers to '$b' of its left input; that is an Apply")
+            self.report_on("Q5006", s"a join's right input refers to '$b' of its left input; that is an Apply", about)
         else if self.all.has(b)
-            self.report("Q2006", s"binder '$b' is not visible here")
+            self.report_on("Q2006", s"binder '$b' is not visible here", about)
         else
-            self.report("Q2002", s"binder '$b' is unknown")
+            self.report_on("Q2002", s"binder '$b' is unknown", about)
 
     param(*self, index: u64)
         if index >= u64(self.used.len())
-            self.report("Q4001", s"parameter $index is not declared")
+            self.report_on("Q4001", s"parameter $index is not declared", [Detail("param", s"$index")])
         else
             self.used[usize(index)] = true
 
@@ -157,7 +224,9 @@ private struct Checker
         val names = set[string]()
 
         for it in items
-            if !names.add(it.name) then self.report(code, s"$what '${it.name}' appears twice")
+            if !names.add(it.name) then
+                val key = if what == "record field" then "field" else "column"
+                self.report_on(code, s"$what '${it.name}' appears twice", [Detail(key, it.name)])
 
     // -- statements ---------------------------------------------------------------------------
 
@@ -330,7 +399,7 @@ private struct Checker
             one(binder)
         With(recursive, ctes, body) -> self.with(recursive, ctes, *body, outer, hidden)
         CteRef(name, binder) ->
-            if !holds(self.ctes, name) then self.report("Q2008", s"no enclosing With defines CTE '$name'")
+            if !holds(self.ctes, name) then self.report_on("Q2008", s"no enclosing With defines CTE '$name'", [Detail("cte", name)])
             self.intro(binder)
             one(binder)
         Nest(input, binder, keys, _, items, order) ->
@@ -596,6 +665,9 @@ private struct Checker
             self.sequence(options, true, restart)
         CreateView(view, query, _) ->
             self.target(view)
+
+            // `query` is a `node Query` (`ddl.md` §3.2 rule 6), which the encoding counts as a node.
+            self.next += 1
             ignore(self.rel(query, buf[string](), buf[string]()))
         CreateRole(name, role) -> self.role(name, role)
         AlterRole(name, role, new_name) ->
@@ -802,7 +874,7 @@ private with_old(a: []const string, extra: Option[string]) -> Buf[string]
 
     out
 
-private ignore[T](value: T) = ()
+private[terndb] ignore[T](value: T) = ()
 
 // -- DDL ----------------------------------------------------------------------------------------
 

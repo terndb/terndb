@@ -28,11 +28,29 @@ struct Typing derives Eq
  * checks only, and no types.
  */
 type_envelope(env: Envelope, catalog: &Catalog) -> Result[Typing, CodecError]
+    val (found, result, typed) = type_phases(env, catalog)
+
+    found.first(env)?
+
+    val nodes = buf[Type]()
+
+    for n in typed
+        nodes.push(n.unwrap())
+
+    Ok(Typing(result, nodes))
+end type_envelope
+
+/** `env` validated as `type_envelope` does it; every error of the first phase that has one, sorted by
+ * path (§11.2), and none when it passes.
+ */
+type_errors(env: Envelope, catalog: &Catalog) -> Buf[CodecError] = type_phases(env, catalog).0.errors(env)
+
+// What the structural checks and the type checks find, merged; the statement's result type, and the
+// type of each node, which are whole only when nothing is found.
+private type_phases(env: Envelope, catalog: &Catalog) -> (Phases, Option[Type], Buf[Option[Type]])
     val structural = structural_phases(env)
 
-    if is_ddl(env.statement)
-        structural.first()?
-        return Ok(Typing(None, buf[Type]()))
+    if is_ddl(env.statement) then return (structural, None, buf[Option[Type]]())
 
     var t = Typer(catalog, buf[Option[Type]](), no_phases(), FirstNode + 1, FirstNode, buf[Option[Type]](), buf[Cte]())
 
@@ -40,16 +58,8 @@ type_envelope(env: Envelope, catalog: &Catalog) -> Result[Typing, CodecError]
         t.params.push(t.resolve(p.ty))
 
     val result = t.statement(env.statement)
-
-    structural.merged(t.found).first()?
-
-    val nodes = buf[Type]()
-
-    for n in t.nodes
-        nodes.push(n.unwrap())
-
-    Ok(Typing(result, nodes))
-end type_envelope
+    (structural.merged(t.found), result, t.nodes)
+end type_phases
 
 // -- what a relation exposes --------------------------------------------------------------------
 
@@ -293,9 +303,18 @@ private struct Typer
 
     report(*self, code: string, message: string) = self.found.record(self.node, code, message)
 
+    /** `code` recorded against the current node with the §11.1 details that name what it is about. */
+    report_on(*self, code: string, message: string, details: []const Detail) =
+        self.found.add(self.node, refusal(code, message, details))
+
     /** `code` recorded against the current node; the node has no type. */
     refuse[T](*self, code: string, message: string) -> Option[T]
         self.report(code, message)
+        None
+
+    /** `code` recorded as `refuse` does, with details. */
+    refuse_on[T](*self, code: string, message: string, details: []const Detail) -> Option[T]
+        self.report_on(code, message, details)
         None
 
     /** Enters a node: it becomes the current one and gets the next slot of `nodes`. Answers the node
@@ -434,7 +453,7 @@ private struct Typer
 
         t match
             Some(info) -> if info.is_view then self.report("Q5003", s"'${q.schema}.${q.name}' is a view, not a table")
-            None -> self.report("Q2001", s"no table '${q.schema}.${q.name}'")
+            None -> self.report_on("Q2001", s"no table '${q.schema}.${q.name}'", [Detail("table", s"${q.schema}.${q.name}")])
 
         t
 
@@ -460,7 +479,7 @@ private struct Typer
 
                 return self.resolve(c.ty)
 
-        self.refuse("Q2003", s"the table has no column '$name'")
+        self.refuse_on("Q2003", s"the table has no column '$name'", [Detail("column", name)])
 
     /** A value of type `from` stored into a column of type `to` (§9.2 rule 1, §9.4 rule 1). */
     store(*self, from: Type, to: Type, what: string)
@@ -468,7 +487,8 @@ private struct Typer
         if from.is_nullable() && coerces(from.base(), to) then
             return self.report("Q3005", s"$what is nullable and its column is NOT NULL")
 
-        self.report("Q3001", s"$what does not coerce to its column's type")
+        val types = [Detail("expected", type_text(to)), Detail("actual", type_text(from))]
+        self.report_on("Q3001", s"$what does not coerce to its column's type", types)
 
     insert_source(*self, t: TableInfo, columns: Buf[string], source: Buf[Field])
         if source.len() != columns.len() then
@@ -552,7 +572,7 @@ private struct Typer
         Scan(table, binder) ->
             self.catalog.table(table) match
                 Some(t) -> Some(single(false, binding(binder, self.row_of(t)?), false))
-                None -> self.refuse("Q2001", s"no table or view '${table.schema}.${table.name}'")
+                None -> self.refuse_on("Q2001", s"no table or view '${table.schema}.${table.name}'", [Detail("table", s"${table.schema}.${table.name}")])
         Values(binder, columns, rows) ->
             val fs = self.resolve_members(columns, false)
 
@@ -881,7 +901,7 @@ private struct Typer
         if is_aggregate(f) || is_window_only(f) || is_rule_typed(f) || core_overloads(f).len() > 0 || self.catalog.functions(f).len() > 0 then
             return self.refuse("Q3002", s"'$f' is not $what")
 
-        self.refuse("Q2007", s"no function '$f'")
+        self.refuse_on("Q2007", s"no function '$f'", [Detail("function", f)])
 
     /** A core aggregate's result type (§6.7 rule 4). */
     aggregate(*self, f: string, args: Buf[Type], ordered: bool) -> Option[Type]
@@ -1024,7 +1044,7 @@ private struct Typer
 
     /** A condition: `bool` or `bool?` (`Q3004`). */
     condition(*self, t: Option[Type]) = t match
-        Some(x) -> if x.base() != Bool then self.report("Q3004", "a condition is not bool")
+        Some(x) -> if x.base() != Bool then self.report_on("Q3004", "a condition is not bool", [Detail("actual", type_text(x))])
         None -> ()
 
     expr(*self, e: Expr, sees: Buf[Binding]) -> Option[Type]
@@ -1040,7 +1060,7 @@ private struct Typer
             val b = find_binding(sees, binder)?
             val t = field_type(columns(b), name)
 
-            if t == None then self.refuse("Q2003", s"binder '$binder' has no column '$name'") else t
+            if t == None then self.refuse_on("Q2003", s"binder '$binder' has no column '$name'", [Detail("binder", binder), Detail("column", name)]) else t
         Row(binder) -> Some(row_type(find_binding(sees, binder)?))
         Param(index) -> self.param_type(index)
         Null(ty) -> self.resolve(ty).map(t -> nullable(t))
@@ -1089,7 +1109,7 @@ private struct Typer
                 Record(fs) ->
                     field_type(fs, name) match
                         Some(f) -> Some(null_if(t.is_nullable(), f))
-                        None -> self.refuse("Q2011", s"the record has no field '$name'")
+                        None -> self.refuse_on("Q2011", s"the record has no field '$name'", [Detail("field", name)])
                 _ -> self.refuse("Q3001", s"field '$name' is read from a value that is not a record")
         Variant(ty, tag, inner) ->
             val v = self.expr(*inner, sees)
@@ -1101,7 +1121,7 @@ private struct Typer
 
             val p = field_type(vs, tag)
 
-            if p == None then return self.refuse("Q2010", s"the union has no tag '$tag'")
+            if p == None then return self.refuse_on("Q2010", s"the union has no tag '$tag'", [Detail("tag", tag)])
             if !coerces(v?, p.unwrap()) then return self.refuse("Q3001", s"the value does not coerce to the payload of '$tag'")
 
             Some(t)
@@ -1207,7 +1227,7 @@ private struct Typer
 
                 if !covered then missing = if missing.len == 0 then t.name else missing + ", " + t.name
 
-            if missing.len > 0 then return self.refuse("Q3009", s"Match covers no arm for: $missing")
+            if missing.len > 0 then return self.refuse_on("Q3009", s"Match covers no arm for: $missing", [Detail("missing_tags", missing)])
 
         if !ok then return None
 
@@ -1316,7 +1336,7 @@ private struct Typer
         var sigs = core_overloads(f)
 
         if sigs.len() == 0 then sigs = self.catalog.functions(f)
-        if sigs.len() == 0 then return self.refuse("Q2007", s"no function '$f'")
+        if sigs.len() == 0 then return self.refuse_on("Q2007", s"no function '$f'", [Detail("function", f)])
 
         var best: Option[Signature] = None
         var fewest = 0

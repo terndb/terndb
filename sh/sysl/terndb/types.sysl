@@ -121,6 +121,48 @@ bag(elem: Type) -> Type = Bag(elem)
 
 list(elem: Type) -> Type = List(elem)
 
+/** `t` as the text form writes it (`query-tree.md` §15): `int64`, `text?`, `decimal(12, 2)`,
+ * `{a: int64}`, `bag<…>`, `union<t: {…}, …>`, and a named type as its qualified name.
+ */
+type_text(t: Type) -> string = t match
+    Bool -> "bool"
+    Int8 -> "int8"
+    Int16 -> "int16"
+    Int32 -> "int32"
+    Int64 -> "int64"
+    Int128 -> "int128"
+    UInt8 -> "uint8"
+    UInt16 -> "uint16"
+    UInt32 -> "uint32"
+    UInt64 -> "uint64"
+    Float32 -> "float32"
+    Float64 -> "float64"
+    Decimal(p, s) -> s"decimal($p, $s)"
+    Text -> "text"
+    Bytes -> "bytes"
+    Json -> "json"
+    Date -> "date"
+    Time -> "time"
+    DateTime -> "datetime"
+    Timestamp -> "timestamp"
+    Interval -> "interval"
+    Uuid -> "uuid"
+    Nullable(inner) -> type_text(*inner) + "?"
+    Record(fields) -> "{" + members_text(fields) + "}"
+    Union(variants) -> "union<" + members_text(variants) + ">"
+    Bag(elem) -> "bag<" + type_text(*elem) + ">"
+    List(elem) -> "list<" + type_text(*elem) + ">"
+    Named(schema, name) -> s"$schema.$name"
+
+private members_text(members: Buf[Field]) -> string
+    var out = ""
+
+    for i in 0..<members.len()
+        if i > 0 then out = out + ", "
+        out = out + members[i].name + ": " + type_text(members[i].ty)
+
+    out
+
 // -- the canonical encoding, query-tree.md §12.3 -------------------------------------------------
 
 /** `t` as a `Type` node, appended to `out`. */

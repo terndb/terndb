@@ -10,7 +10,7 @@ marshal, on aarch64-macos. Item numbers follow §14.
 | 3 | `const T *` in headers | gap | There is no read-only pointer type (p08-const) |
 | 4 | The `size_t`, `bool` and `float`/`double` spellings | gap | `usize` is printed as `uint64_t`, not `size_t`, and a `c type`'s C name is lost (p01-types) |
 | 5a | The header's file name | works | `build-c --header terndb.h` |
-| 5b | The include guard | **bug B3**, being fixed (fix-buildc-header-guard) | A `.` or bare-file build gets the guard `SYSL___H` (p03-guard) |
+| 5b | The include guard | works (bug B3 fixed in sysl 0.11.2) | A `.` or bare-file build now gets a guard named after its source and a hash (`SYSL_A_26A2D3A3_H`, `SYSL_LIB_A85427C4_H`), so two such headers can be included together and the program links and runs (p03-guard) |
 | 5c | `#define`s or enum constants from `val`s or enums | gap | p02-vals |
 | 5d | `extern "C"` | works | Always emitted |
 | 6 | A shared library with an exact export list and versions | gap, and a **bug** | There is no `--shared` mode; the user is deciding. `-o libterndb.dylib` silently writes an ar archive, and will be refused. By hand: `clang -dynamiclib -Wl,-all_load` plus `-exported_symbols_list`, since otherwise `_sysl_bounds_fail` and `_sysl_stdout_write` are exported too |

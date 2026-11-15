@@ -62,7 +62,7 @@ during the handshake.
 | `Q3008` | `order_required` | Order required but the relation is a bag (`Limit`, `ties`, `ordinality`). |
 | `Q3009` | `match_not_exhaustive` | Non-exhaustive or duplicated `Match` arm. |
 | `Q3010` | `setop_incompatible` | `SetOp` inputs incompatible. |
-| `Q3011` | `decimal_out_of_range` | Decimal precision or scale out of range. |
+| `Q3011` | `decimal_out_of_range` | Decimal precision or scale out of range, or a decimal literal with more than `p` digits (`query-tree.md` §7.3). |
 | `Q3012` | `cast_not_permitted` | Cast not permitted. |
 | `Q3013` | `misplaced_aggregate` | Aggregate or window function outside `Aggregate`/`Window`. |
 | `Q3014` | `invalid_member_type` | Union payload not a record, or relation element not a record, union or scalar. |

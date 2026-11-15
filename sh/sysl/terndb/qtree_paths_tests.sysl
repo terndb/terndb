@@ -1,0 +1,330 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Where a refusal says it is (`query-tree.md` §11.1): the path of the node it is about, in each phase
+// of §11.2 and for each family of error; the details that name what it is about; the order of §11.2
+// when errors compete; and the decimal literal precision of §7.3.
+
+private q(rel: Rel) -> Envelope = query([], rel)
+
+/** The refusal `bytes` are decoded with, which must be one. */
+private decode_error(bytes: []const u8) -> CodecError = read_envelope(bytes).unwrap_err()
+
+private check_error(env: Envelope) -> CodecError = check_envelope(env).unwrap_err()
+
+private type_error(env: Envelope) -> CodecError = type_envelope(env, fake()).unwrap_err()
+
+private codes_and_paths(errors: Buf[CodecError]) -> string
+    var out = ""
+
+    for e in errors
+        out = s"$out ${e.code}@${e.path}"
+
+    out
+
+// -- the decode phase -----------------------------------------------------------------------------
+
+@test
+a_decode_error_names_the_node_being_read()
+    val bytes = tree_bytes(worked())
+
+    // The version, outside every node, has no path.
+    val version = decode_error(bytes.view()[0..<1])
+    assert_eq(version.code, "Q1001")
+    assert_eq(version.path, "")
+
+    // Inside the parameter declarations, before any node.
+    assert_eq(decode_error(bytes.view()[0..<5]).path, "/params/0")
+
+    // A node whose header is cut short is the one named: past it, every cut is inside the
+    // statement's payload length.
+    assert_eq(decode_error(bytes.view()[0..<9]).path, "/statement")
+    assert_eq(decode_error(bytes.view()[0..<30]).path, "/statement")
+
+    // §12.7's offsets: the scan's table name, the column's binder, and the kinds of the scan and of
+    // the predicate's second argument, `$0`.
+    val name = decode_error(with_octet(tree_bytes(worked()), 20, 0xff).view())
+    assert_eq(name.code, "Q1004")
+    assert_eq(name.path, "/statement/rel/input")
+    assert_eq(decode_error(with_octet(tree_bytes(worked()), 32, 0xff).view()).path, "/statement/rel/predicate/args/0")
+    assert_eq(decode_error(with_octet(tree_bytes(worked()), 13, 0x63).view()).path, "/statement/rel/input")
+
+    val param = decode_error(with_octet(tree_bytes(worked()), 36, 0x63).view())
+    assert_eq(param.code, "Q1002")
+    assert_eq(param.path, "/statement/rel/predicate/args/1")
+
+    // Octets after the envelope are about the envelope as a whole.
+    val longer = tree_bytes(worked())
+    longer.push(0)
+    assert_eq(decode_error(longer.view()).path, "")
+
+@test
+a_decode_error_deep_in_a_values_row_has_the_spec_s_example_path()
+    val columns = items_of([Field("k", Text), Field("j", Json)])
+    val rows = items_of([items_of([Literal(Text, Text("a")), Literal(Json, Text("[1, 2]"))])])
+    val insert = Insert(qn("app", "t"), "t", None, items_of(["k", "j"]), Values("v", columns, rows), None, no_items())
+    val e = decode_error(tree_bytes(envelope([], insert)).view())
+    assert_eq(e.code, "Q1007")
+    assert_eq(e.path, "/statement/source/rows/0/1")
+
+@test
+a_span_error_names_the_span()
+    var env = worked()
+    env.spans = Some(items_of([Span(0, 0, 1), Span(0, 2, 3)]))
+    val e = decode_error(tree_bytes(env).view())
+    assert_eq(e.code, "Q1003")
+    assert_eq(e.path, "/spans/1")
+
+@test
+a_view_s_query_is_a_node_of_its_own_in_a_path()
+    val view = CreateView(qn("app", "v"), project(scan("app", "t", "t"), "p", [item("x", Literal(Json, Text("[1, 2]")))]), false)
+    assert_eq(decode_error(tree_bytes(ddl(view)).view()).path, "/statement/query/rel/items/0/1")
+
+    // The structural checks count it too, so their paths agree with the decoder's.
+    val unknown = CreateView(qn("app", "v"), filter(scan("app", "t", "t"), col("zz", "x")), false)
+    assert_eq(check_error(ddl(unknown)).path, "/statement/query/rel/predicate")
+
+@test
+every_node_of_a_tree_has_a_path_by_its_span_index()
+    val paths = node_paths(worked())
+    assert_eq(paths.len(), 6)
+    assert_eq(paths[0], "/statement")
+    assert_eq(paths[1], "/statement/rel")
+    assert_eq(paths[2], "/statement/rel/input")
+    assert_eq(paths[3], "/statement/rel/predicate")
+    assert_eq(paths[4], "/statement/rel/predicate/args/0")
+    assert_eq(paths[5], "/statement/rel/predicate/args/1")
+
+@test
+the_steps_of_tuples_choices_and_nested_calls()
+    // A `(name, AggCall)`'s call is component 1; its argument list follows.
+    val agg = Aggregate(scan("app", "t", "t"), "g", no_items(), items_of([NamedAgg("n", AggCall("sum", items_of([col("zz", "x")]), false, None, buf[SortKey]()))]))
+    assert_eq(check_error(q(agg)).path, "/statement/rel/aggs/0/1/args/0")
+
+    // `If`'s arms name their components; a `Match` arm's expression is component 2.
+    val arms = items_of([IfArm(Literal(Bool, Bool(true)), col("zz", "x"))])
+    assert_eq(check_error(q(project(scan("app", "t", "t"), "p", [item("x", If(arms, None))]))).path, "/statement/rel/items/0/1/arms/0/value")
+
+    // A check constraint's expression: `body` holds a choice, which adds no step.
+    val check = ConstraintDef("c", Check(Param(0)))
+    val table = CreateTable(qn("app", "t"), items_of([column("a", Int64)]), items_of(["a"]), items_of([check]), false)
+    assert_eq(check_error(ddl(table)).path, "/statement/constraints/0/body/expr")
+
+    // A column default, deep in an alter action.
+    val default = ColumnDef("b", Int64, Some(Param(0)), None, NoIdentity, None)
+    assert_eq(check_error(ddl(alter([AddColumn(default)]))).path, "/statement/actions/0/def/default")
+
+// -- the structural phases ------------------------------------------------------------------------
+
+@test
+a_name_error_names_its_node_and_its_binder()
+    val e = check_error(query([param("id", Int64)], filter(scan("app", "t", "t"), eq(col("zz", "id"), Param(0)))))
+    assert_eq(e.code, "Q2002")
+    assert_eq(e.path, "/statement/rel/predicate/args/0")
+    assert(e.detail("binder") == Some("zz"))
+
+    // A duplicate binder is about the node that introduces it the second time.
+    val twice = check_error(q(Join(Inner, scan("app", "t", "t"), scan("app", "u", "t"), None, None, None)))
+    assert_eq(twice.code, "Q2004")
+    assert_eq(twice.path, "/statement/rel/right")
+    assert(twice.detail("binder") == Some("t"))
+
+@test
+a_deep_name_error_has_its_whole_path()
+    val inner = project(filter(scan("app", "s", "s"), col("nope", "x")), "i", [item("y", col("s", "y"))])
+    val e = check_error(q(project(scan("app", "t", "t"), "p", [item("x", Scalar(inner))])))
+    assert_eq(e.code, "Q2002")
+    assert_eq(e.path, "/statement/rel/items/0/1/rel/input/predicate")
+
+@test
+parameter_errors_name_the_declaration_or_the_reference()
+    val unused = check_error(query([param("a", Int64)], Project(scan("app", "a", "a"), "p", items_of([item("x", col("a", "x"))]))))
+    assert_eq(unused.code, "Q4002")
+    assert_eq(unused.path, "/params/0")
+    assert(unused.detail("param") == Some("0"))
+
+    val undeclared = check_error(q(project(scan("app", "a", "a"), "p", [item("x", Param(3))])))
+    assert_eq(undeclared.code, "Q4001")
+    assert_eq(undeclared.path, "/statement/rel/items/0/1")
+    assert(undeclared.detail("param") == Some("3"))
+
+    val ddl_params = check_error(envelope([param("x", Int64)], CreateNamespace("n", false)))
+    assert_eq(ddl_params.code, "Q6001")
+    assert_eq(ddl_params.path, "/params")
+
+    // The list comes before its declarations, and they come in order, before the statement's nodes.
+    val two = envelope([param("x", Int64), param("y", Int64)], CreateNamespace("", false))
+    assert_eq(codes_and_paths(check_errors(two)), " Q6001@/params Q4002@/params/0 Q4002@/params/1 Q6019@/statement")
+
+@test
+a_structure_error_names_its_node()
+    val e = check_error(q(Project(scan("app", "a", "a"), "p", no_items())))
+    assert_eq(e.code, "Q5009")
+    assert_eq(e.path, "/statement/rel")
+
+    val dup = check_error(q(project(scan("app", "a", "a"), "p", [item("x", col("a", "x")), item("x", col("a", "y"))])))
+    assert_eq(dup.code, "Q2005")
+    assert(dup.detail("column") == Some("x"))
+
+// -- the type phase -------------------------------------------------------------------------------
+
+@test
+a_type_error_names_its_node_and_its_types()
+    val e = type_error(q(filter(scan("app", "t", "t"), col("t", "id"))))
+    assert_eq(e.code, "Q3004")
+    assert_eq(e.path, "/statement/rel")
+    assert(e.detail("actual") == Some("int64"))
+
+    val column = type_error(in_t(col("t", "nope")))
+    assert_eq(column.code, "Q2003")
+    assert_eq(column.path, "/statement/rel/items/0/1")
+    assert(column.detail("binder") == Some("t"))
+    assert(column.detail("column") == Some("nope"))
+
+    val table = type_error(q(project(scan("app", "nowhere", "n"), "p", [item("x", col("n", "x"))])))
+    assert_eq(table.code, "Q2001")
+    assert_eq(table.path, "/statement/rel/input")
+    assert(table.detail("table") == Some("app.nowhere"))
+
+    val function = type_error(in_t(call("nonesuch", [col("t", "id")])))
+    assert_eq(function.code, "Q2007")
+    assert(function.detail("function") == Some("nonesuch"))
+
+@test
+a_store_mismatch_names_both_types()
+    val source = Values("v", items_of([Field("u", Text)]), items_of([items_of([Literal(Text, Text("a"))])]))
+    val e = type_error(envelope([], Insert(qn("app", "t"), "t", None, items_of(["u"]), source, None, no_items())))
+    assert_eq(e.code, "Q3001")
+    assert_eq(e.path, "/statement")
+    assert(e.detail("expected") == Some("uint32"))
+    assert(e.detail("actual") == Some("text"))
+
+// -- order ----------------------------------------------------------------------------------------
+
+@test
+of_two_errors_in_a_phase_the_first_in_pre_order_is_reported_and_all_are_listed()
+    val env = q(project(scan("app", "a", "a"), "p", [item("x", col("yy", "x")), item("y", col("zz", "x"))]))
+    val e = check_error(env)
+    assert_eq(e.path, "/statement/rel/items/0/1")
+    assert(e.detail("binder") == Some("yy"))
+    assert_eq(codes_and_paths(check_errors(env)), " Q2002@/statement/rel/items/0/1 Q2002@/statement/rel/items/1/1")
+
+    // A parent comes before its children whatever order the walk found them in.
+    val nested = q(project(Project(scan("app", "a", "a"), "a", items_of([item("x", col("zz", "x"))])), "p", [item("x", col("a", "x"))]))
+    assert_eq(codes_and_paths(check_errors(nested)), " Q2004@/statement/rel/input Q2002@/statement/rel/input/items/0/1")
+
+    // A valid tree has none.
+    assert_eq(check_errors(worked()).len(), 0)
+
+@test
+the_structural_and_type_errors_of_a_phase_merge_by_path()
+    // The type checker's unknown column comes before the structural checks' unknown binder.
+    val env = in_t(col("t", "nope"))
+    val both = q(project(scan("app", "t", "t"), "r", [item("x", col("t", "nope")), item("y", col("zz", "x"))]))
+    assert_eq(type_error(env).code, "Q2003")
+    assert_eq(codes_and_paths(type_errors(both, fake())), " Q2003@/statement/rel/items/0/1 Q2002@/statement/rel/items/1/1")
+
+    // Only the first phase's errors are listed: a name error hides a later type error.
+    val mixed = q(project(filter(scan("app", "t", "t"), col("t", "id")), "r", [item("y", col("zz", "x"))]))
+    assert_eq(codes_and_paths(type_errors(mixed, fake())), " Q2002@/statement/rel/items/0/1")
+
+@test
+errors_at_one_path_keep_the_order_of_what_they_are_about()
+    var found = no_phases()
+    found.record(FirstNode + 1, "Q2005", "found first")
+    found.record(FirstNode + 1, "Q2004", "found second")
+    found.record(FirstNode, "Q2008", "first by path")
+    assert_eq(codes_and_paths(found.errors(worked())), " Q2008@/statement Q2005@/statement/rel Q2004@/statement/rel")
+
+    // A table's name comes before its columns in the schema, and they before its primary key, so
+    // their errors do too, though all three are about the statement.
+    val all = CreateTable(qn("app", ""), items_of([ColumnDef("a", Int64, Some(Literal(Int64, Int(1))), None, Always, None)]), no_strs(), buf[ConstraintDef](), false)
+    assert_eq(codes_and_paths(check_errors(ddl(all))), " Q6019@/statement Q6006@/statement Q6009@/statement")
+
+@test
+details_are_sorted_by_key_and_a_key_is_given_once()
+    val e = refusal("Q2003", "m", [Detail("column", "c"), Detail("binder", "b"), Detail("column", "d")])
+    assert_eq(e.details.len(), 2)
+    assert_eq(e.details[0].key, "binder")
+    assert_eq(e.details[1].key, "column")
+    assert_eq(e.details[1].value, "d")
+    assert(e.detail("table") == None)
+
+    // `at` gives a path only to an error that has none.
+    assert_eq(e.at("/a").at("/b").path, "/a")
+
+@test
+a_batch_error_has_no_path()
+    val e = as_bad_batch[unit](fail("Q1001", "short")).unwrap_err()
+    assert_eq(e.code, "W1008")
+    assert_eq(e.path, "")
+
+// -- type text ------------------------------------------------------------------------------------
+
+@test
+types_are_written_in_the_text_form()
+    assert_eq(type_text(Int64), "int64")
+    assert_eq(type_text(nullable(Text)), "text?")
+    assert_eq(type_text(Decimal(12, 2)), "decimal(12, 2)")
+    assert_eq(type_text(record([])), "{}")
+    assert_eq(type_text(bag(record([Field("a", Int64), Field("b", nullable(UInt8))]))), "bag<{a: int64, b: uint8?}>")
+    assert_eq(type_text(list(union_of([Field("x", record([])), Field("y", record([Field("z", Uuid)]))]))), "list<union<x: {}, y: {z: uuid}>>")
+    assert_eq(type_text(Named("app", "status")), "app.status")
+    assert_eq(type_text(Timestamp), "timestamp")
+
+// -- decimal literals, §7.3 -----------------------------------------------------------------------
+
+private decimal_query(p: u8, s: u8, n: i128) -> Envelope =
+    q(project(scan("app", "a", "a"), "p", [item("x", Literal(Decimal(p, s), Int(n)))]))
+
+// The code a decimal literal is encoded with, or "ok" when it round-trips.
+private decimal_encoding(p: u8, s: u8, n: i128) -> string = encode_envelope(decimal_query(p, s, n)) match
+    Ok(b) -> if read_envelope(b.view()).unwrap() == decimal_query(p, s, n) then "ok" else "changed"
+    Err(e) -> e.code
+
+// The bytes of a decimal literal of the largest value that fits, its unscaled value rewritten to `n`:
+// the literal is the last node, and its 16 value octets precede the envelope's absent spans.
+private decimal_bytes(p: u8, s: u8, n: i128) -> Buf[u8]
+    val b = tree_bytes(decimal_query(p, s, 1))
+    val at = b.len() - 17
+
+    for i in 0..<16
+        b[at + i] = u8.wrap(u128.wrap(n) >> (8 * i))
+
+    b
+
+@test
+a_decimal_literal_is_refused_past_its_precision()
+    assert_eq(decimal_encoding(5, 2, 99999), "ok")
+    assert_eq(decimal_encoding(5, 2, 100000), "Q3011")
+    assert_eq(decimal_encoding(5, 2, -99999), "ok")
+    assert_eq(decimal_encoding(5, 2, -100000), "Q3011")
+    assert_eq(decimal_encoding(5, 2, 0), "ok")
+
+    // Scale 0, and the scale never changes how many digits fit.
+    assert_eq(decimal_encoding(3, 0, 999), "ok")
+    assert_eq(decimal_encoding(3, 0, 1000), "Q3011")
+    assert_eq(decimal_encoding(3, 3, 999), "ok")
+    assert_eq(decimal_encoding(3, 3, -1000), "Q3011")
+    assert_eq(decimal_encoding(1, 0, 9), "ok")
+    assert_eq(decimal_encoding(1, 0, -10), "Q3011")
+
+    // 38 digits, the most an `int128` holds.
+    assert_eq(decimal_encoding(38, 10, 99999999999999999999999999999999999999i128), "ok")
+    assert_eq(decimal_encoding(38, 10, 100000000000000000000000000000000000000i128), "Q3011")
+    assert_eq(decimal_encoding(38, 0, -99999999999999999999999999999999999999i128), "ok")
+
+@test
+the_decoder_refuses_a_decimal_literal_past_its_precision()
+    assert_eq(tree_refusal(decimal_bytes(5, 2, 99999).view()), "ok")
+    assert_eq(tree_refusal(decimal_bytes(5, 2, -99999).view()), "ok")
+
+    val over = decode_error(decimal_bytes(5, 2, 100000).view())
+    assert_eq(over.code, "Q3011")
+    assert_eq(over.path, "/statement/rel/items/0/1")
+
+    assert_eq(tree_refusal(decimal_bytes(5, 2, -100000).view()), "Q3011")
+    assert_eq(tree_refusal(decimal_bytes(3, 0, 999).view()), "ok")
+    assert_eq(tree_refusal(decimal_bytes(3, 0, 1000).view()), "Q3011")

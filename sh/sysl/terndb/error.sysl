@@ -1,18 +1,60 @@
 module sh.sysl.terndb
 
-/** A refusal: the `errors.md` code a caller matches on, and a sentence a person reads.
+import sysl.buf.{Buf, buf}
+
+/** One entry of a refusal's `details` (`query-tree.md` §11.1): a stable key such as `binder`,
+ * `column`, `expected` or `actual`, and its text.
+ */
+struct Detail derives Eq
+    key: string
+    value: string
+
+/** A refusal: the `errors.md` code a caller matches on, where it is, a sentence a person reads, and
+ * the details that name what it is about.
  *
  * The code is the contract (`errors.md` §1 rule 3); the message is for the log and may change.
+ * `path` is the `query-tree.md` §11.1 path of what the error is about, such as
+ * `/statement/source/rows/0/1`, or empty when there is none (a batch, an envelope's version).
+ * `details` is sorted by key, and its keys are unique (`wire-protocol.md` §8.1).
  */
 struct CodecError derives Eq
     code: string
+    path: string
     message: string
+    details: Buf[Detail]
+
+    /** The refusal at `path`, unless it already has one. */
+    at(self, path: string) -> CodecError =
+        if self.path.len > 0 then self else CodecError(self.code, path, self.message, self.details)
+
+    /** The text of detail `key`, if it has one. */
+    detail(self, key: string) -> Option[string]
+        for d in self.details
+            if d.key == key then return Some(d.value)
+
+        None
 
 private[terndb] fail[T](code: string, message: string) -> Result[T, CodecError] =
-    Err(CodecError(code, message))
+    Err(CodecError(code, "", message, buf[Detail]()))
+
+/** A refusal with no path yet and `details` sorted by key; a later entry of a key replaces an
+ * earlier one.
+ */
+private[terndb] refusal(code: string, message: string, details: []const Detail) -> CodecError
+    val sorted = buf[Detail]()
+
+    for d in details
+        var i: usize = 0
+
+        while i < sorted.len() && sorted[i].key < d.key
+            i += 1
+
+        if i < sorted.len() && sorted[i].key == d.key then sorted[i] = d else sorted.insert(i, d)
+
+    CodecError(code, "", message, sorted)
 
 /** The same refusal reported under `W1008`, which is what every inconsistency in a batch is
- * (`wire-protocol.md` §6.4 rule 2), whatever primitive it was found in.
+ * (`wire-protocol.md` §6.4 rule 2), whatever primitive it was found in. A batch defines no path.
  */
 private[terndb] as_bad_batch[T](r: Result[T, CodecError]) -> Result[T, CodecError] = r match
     Ok(v) -> Ok(v)
