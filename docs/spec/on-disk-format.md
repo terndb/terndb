@@ -30,6 +30,7 @@ document defines only the stored fields those rules read.
 7. "Durable" means written and covered by a successful sync. On Linux the sync is `fdatasync` (or `O_DSYNC` writes);
    on macOS it MUST be `fcntl(F_FULLFSYNC)`, because plain `fsync` there does not flush the drive cache.
 8. A value of 0 in any LSN, page id, undo address or transaction id field means "none".
+9. The errors this document raises are the `D` codes of `errors.md` §6, cited here by name.
 
 ---
 
@@ -104,7 +105,7 @@ one with the higher `sequence`. If neither is valid, the open MUST fail.
 | 104 | 8  | `snapshot_lsn` | memory mode: the LSN at which the live generation was captured |
 | 112 | 1  | `state` | 0 = shut down cleanly, 1 = open, 2 = in recovery, 3 = replica |
 | 113 | 7  | reserved | |
-| 120 | 8  | `feature_flags` | bit 0 = columnar projections present (reserved, §3.10); others reserved |
+| 120 | 8  | `feature_flags` | bit 0 = columnar projections present (reserved, §3.10); bit 1 = encryption at rest (reserved, §3.1); others reserved |
 | 128 | 3968 | reserved | |
 
 *Rationale:* the two alternating slots give an atomic control update without a rename, as in InnoDB's doublewritten
@@ -137,11 +138,16 @@ Every page in either space begins with this header.
 | 7  | 1 | `flags` | type-specific, below |
 | 8  | 8 | `page_lsn` | LSN of the last WAL record applied to this page |
 | 16 | 8 | `pid` | this page's own PID |
-| 24 | 8 | `owner` | the object id of the tree or table this page belongs to; 0 = system |
+| 24 | 6 | `owner` | the object id (below 2⁴⁸, §3.9) of the tree or table this page belongs to; 0 = system |
+| 30 | 2 | `key_version` | reserved for encryption at rest: the key version that encrypted the page body. v1 writes 0 (not encrypted) |
 
 1. A reader MUST reject a page whose `crc` does not match, or whose `pid` differs from the PID it asked for (a
-   misdirected write), before using any other field.
-2. The CRC is computed when the page is written and checked when it is read. It is not maintained in memory.
+   misdirected write), before using any other field. A rejected page that cannot be rebuilt from the WAL is
+   reported as `data_corrupted`.
+2. **Encryption at rest is reserved, not designed.** CONTROL `feature_flags` bit 1, the page `key_version` and the
+   WAL segment `key_version` (§6.6) are held for it so that it needs no format bump. A v1 reader MUST refuse to
+   open a database whose bit 1 is set (`format_unsupported`).
+3. The CRC is computed when the page is written and checked when it is read. It is not maintained in memory.
 
 **The latch version is not persisted.** The optimistic latch word (version counter plus lock bits) and the
 eviction state live in the in-memory **frame descriptor** beside the page, never in the page's bytes. *Rationale:*
@@ -240,7 +246,7 @@ index payload (§4.9).
 | leaf entry inline (key + value) | 4,000 bytes | a leaf holds at least 3 entries |
 | inner fan-out | ≥ 13 | from the key limit |
 
-A key longer than 1,024 bytes MUST be refused with an error at insert time. It is never moved out of line.
+A key longer than 1,024 bytes MUST be refused at insert time with `key_too_long`. It is never moved out of line.
 
 ### 3.7 Allocation bitmap pages (the free-space map)
 
@@ -294,7 +300,8 @@ The catalog is a set of ordinary B+trees whose roots have fixed PIDs in data seg
 | 4–15 | reserved for later system trees |
 
 Catalog rows use the row format of §4 and are versioned by the undo log like any table, so DDL is transactional.
-Object ids 1–1023 are reserved for system objects.
+Object ids 1–1023 are reserved for system objects. Every object id is below 2⁴⁸, so that it fits the page
+header's `owner` (§3.1).
 
 `sys.objects` non-key columns, in order:
 
@@ -306,7 +313,7 @@ Object ids 1–1023 are reserved for system objects.
 | `parent_oid` | i64 | for an index, its table; else 0 |
 | `root_pid` | i64 | the tree's root PID; 0 when there is no tree |
 | `schema_version` | i16 | the current version of a table's columns |
-| `key_spec` | bytes | for a table or index: n × (`ordinal` u16, `flags` u8: bit 0 = descending, bit 1 = unique) |
+| `key_spec` | bytes | for a table or index: n × (`ordinal` u16, `flags` u8: bit 0 = descending, bit 1 = unique, bit 2 = collated, reserved: v1 writes 0, §4.6) |
 | `options` | bytes | reserved, empty in v1 |
 
 `sys.columns` non-key columns: `name` text, `type` bytes (a type descriptor, §4.3), `nullable` bool, `default`
@@ -318,7 +325,8 @@ Every column list (old versions included) stays in `sys.columns` while any store
 
 ### 3.10 The columnar hook
 
-v1 writes no columnar projection, and a v1 reader MUST refuse to open a database whose `feature_flags` bit 0 is set.
+v1 writes no columnar projection, and a v1 reader MUST refuse to open a database whose `feature_flags` bit 0 is set
+(`format_unsupported`).
 Page types 0x40–0x4F, object kinds 0x40–0x4F and WAL kinds 0x40–0x4F are reserved for projections. A projection's
 design MUST place its pages in the data space and log them through the WAL kinds of §6, so recovery, replication
 and backup need no new mechanism.
@@ -383,7 +391,7 @@ A column type is stored in `sys.columns.type` as a descriptor, a tag byte follow
 | 0x01 | `bool` | |
 | 0x02–0x06 | `i8`, `i16`, `i32`, `i64`, `i128` | |
 | 0x07, 0x08 | `f32`, `f64` | |
-| 0x09 | `decimal` | `precision` u8 (1–76), `scale` u8 |
+| 0x09 | `decimal` | `precision` u8 (1–38), `scale` u8 |
 | 0x0A | `text` | |
 | 0x0B | `bytes` | |
 | 0x0C | `date` | |
@@ -393,7 +401,10 @@ A column type is stored in `sys.columns.type` as a descriptor, a tag byte follow
 | 0x10 | `interval` | |
 | 0x11 | `uuid` | |
 | 0x12 | `enum` | `type_oid` u64 |
+| 0x13–0x16 | `u8`, `u16`, `u32`, `u64` | |
+| 0x17 | `json` | |
 | 0x20 | `relation` | `ordered` u8 (0 = bag, 1 = list), `n` u16, then n × (`name_len` u16, name UTF-8, `nullable` u8, descriptor) |
+| 0x22 | `scalar relation` | `ordered` u8, `nullable` u8 (the element's), then the element's scalar descriptor |
 | 0x21 | `union` | `n` u16, then n × (`name_len` u16, name UTF-8, descriptor) |
 
 The type set is owned by `query-tree.md`. A type it gains MUST get a tag and an encoding here before a value of
@@ -405,11 +416,12 @@ that type is stored.
 |------|------:|----------|
 | `bool` | 1 | 0 or 1; any other byte is corruption |
 | `iN` | N/8 | two's complement |
+| `uN` | N/8 | unsigned |
 | `f32`, `f64` | 4, 8 | IEEE 754 binary32 / binary64 bits |
 | `decimal` p ≤ 18 | 8 | `i64` unscaled value |
 | `decimal` 19 ≤ p ≤ 38 | 16 | `i128` unscaled value |
-| `decimal` p > 38 | variable | `i8` sign (−1, 0, 1), then base-10⁹ limbs as `u32`, most significant first |
 | `text` | variable | UTF-8. A writer MUST store valid UTF-8 and a reader MAY verify it |
+| `json` | variable | its canonical form (`query-tree.md` §3.5), UTF-8 |
 | `bytes` | variable | raw |
 | `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian) |
 | `time` | 8 | `i64` microseconds since midnight |
@@ -417,7 +429,7 @@ that type is stored.
 | `interval` | 16 | `i32` months, `i32` days, `i64` microseconds |
 | `uuid` | 16 | the 16 bytes in RFC 9562 order |
 | `enum` | 4 | `u32` label index in the type's declaration order |
-| `relation` | variable | §4.5 |
+| `relation`, `scalar relation` | variable | §4.5 |
 | `union` | variable | §4.5 |
 
 ### 4.5 Nested relations and unions
@@ -426,11 +438,11 @@ A **relation value** (a column of type `relation`, at any depth):
 
 | off | size | field |
 |----:|-----:|-------|
-| 0 | 1 | `form`: 0 = inline records; 1 reserved for an out-of-line subtree (Open question 2) |
+| 0 | 1 | `form`: 0 = inline records; 1 reserved for an out-of-line subtree, not written in v1 |
 | 1 | 3 | reserved |
 | 4 | 4 | `count` (u32) |
 | 8 | 4 × count | end offset of each element (u32), relative to the first element |
-| … | … | the elements, each a **record** (§4.2) of the element type |
+| … | … | the elements, each a **record** (§4.2) of the element type; in a `scalar relation`, each the scalar's §4.4 encoding, preceded by one byte (0 = null, 1 = value) when the element is nullable |
 
 1. A `list` relation keeps its elements in order. A `bag` relation stores them in insertion order and promises no
    order.
@@ -449,26 +461,27 @@ Keys MUST compare correctly with `memcmp`, so that prefix compression, `head` an
 
 | type | encoding |
 |------|----------|
-| `iN`, `date`, `time`, `timestamp*`, `decimal` ≤ 38 | big-endian with the sign bit inverted |
-| `bool`, `enum` | big-endian unsigned |
+| `iN`, `date`, `time`, `timestamp*`, `decimal` | big-endian with the sign bit inverted |
+| `bool`, `enum`, `uN` | big-endian unsigned |
 | `f32`, `f64` | big-endian bits; when the sign is 1 invert all bits, else invert the sign bit. −0 MUST be stored as +0, and every NaN as the one canonical quiet NaN, which sorts last |
 | `uuid` | the 16 bytes |
 | `interval` | months, days, microseconds, each as `iN` above |
-| `text`, `bytes`, `decimal` > 38 | the bytes with each 0x00 escaped as 0x00 0xFF, then the terminator 0x00 0x00 |
+| `text`, `bytes` | the bytes with each 0x00 escaped as 0x00 0xFF, then the terminator 0x00 0x00 |
 
 1. A nullable component of a secondary-index key is prefixed with 0x00 for NULL (nulls first) or 0x01 for a
    value. Primary-key columns are NOT NULL and have no prefix.
 2. A descending component has every byte of its encoding inverted, prefix included.
 3. A composite key is the concatenation of its components.
-4. `text` compares by binary UTF-8 in v1 (Open question 1). `relation` and `union` columns MUST NOT be key
-   columns.
+4. `text` compares by binary UTF-8 in v1; there are no collations. When collations come (`query-tree.md` §3.1),
+   a collated key component stores its ICU sort key in the `text` encoding above and sets `key_spec` flag bit 2.
+   `relation`, `scalar relation`, `union` and `json` columns MUST NOT be key columns.
 
 ### 4.7 In-place versus out-of-line
 
 1. When the key plus encoded value of an entry is at most **4,000 bytes**, the entry MUST be stored inline.
 2. Otherwise the writer MUST move variable columns out of line, **largest first**, considering only columns whose
    encoding is at least 256 bytes, until the entry is at most 4,000 bytes. If that cannot be achieved, the write
-   MUST fail. (Fixed areas alone cannot exceed the limit for any table the catalog accepts; `CREATE TABLE` MUST
+   MUST fail with `entry_too_large`. (Fixed areas alone cannot exceed the limit for any table the catalog accepts; `CREATE TABLE` MUST
    refuse a table whose fixed area plus maximum key exceeds 3,000 bytes.)
 3. An out-of-line column's bytes in the variable area are a 32-byte **stub**:
 
@@ -502,6 +515,11 @@ An overflow page:
    *Rationale:* an old version's stub in the undo log stays valid with no copy of the value, as with InnoDB's
    externally stored columns.
 3. A reader MUST verify `raw_crc` after decompression.
+4. **Large values go to the WAL in full.** v1 logs every overflow page of a new chain with `OVERFLOW_WRITE`
+   (§6.4), so a large value is written twice, as in Postgres and InnoDB. A chain is never synced directly in
+   place of its log records.
+5. A large nested relation is one such value: v1 has no per-element storage for it (form 1 of §4.5 is not
+   written), so updating one element writes a new chain for the whole value (`isolation.md` §4.5).
 
 ### 4.9 Secondary indexes
 
@@ -527,9 +545,9 @@ LeanStore). The extra lookup is the price, and rule 3 avoids it for cold data, a
 
 ### 5.1 The undo space
 
-The undo log is one append-only byte stream. An **undo address** is a `u64` byte position in it. Undo page n holds
-addresses [n × 16384 + 32, (n + 1) × 16384). An address whose low 14 bits are below 32 is invalid. Undo addresses
-increase monotonically and are never reused.
+The undo log is one append-only byte space, written through per-core **lanes** (rule 3). An **undo address** is a
+`u64` byte position in it. Undo page n holds addresses [n × 16384 + 32, (n + 1) × 16384). An address whose low 14
+bits are below 32 is invalid. Addresses increase within a lane's pages and are never reused.
 
 An undo page:
 
@@ -542,8 +560,11 @@ An undo page:
    one is covered by an `UNDO_APPEND` redo record (§6.4). **The undo log is never synced at commit**; it is
    recovered from the WAL. This is InnoDB's design, and it keeps one sync per commit group.
 2. A record MUST NOT span undo pages. The unused tail of a page MUST be covered by a PAD record (kind 0).
-3. Space is reserved by an atomic fetch-and-add on the undo high-water mark. A transaction's records need not be
-   contiguous.
+3. **Lanes.** Each core appends to its own lane: the undo page it currently owns, where it places records with no
+   synchronisation. A lane takes its next page from the global undo high-water mark by one atomic fetch-and-add of
+   a whole page, and covers the unused tail of the page it leaves with PAD (rule 2). A transaction's records need
+   not be contiguous and may lie in several lanes. The truncation horizon (§5.5) is therefore the minimum over the
+   lanes: `undo_low` advances past a page only when every lane's records below it qualify.
 
 ### 5.2 Undo record format
 
@@ -598,8 +619,11 @@ Reconstruction reads the undo log only. It never writes, and it never latches th
 
 `undo_low` is the lowest undo address the engine retains. The **horizon** is the commit point before which every
 live snapshot sees everything. The engine MAY advance `undo_low` to address A only when every record below A
-belongs to a committed transaction that every live snapshot sees, and, on a primary with feedback enabled, every
-replica snapshot (Open question 4).
+belongs to a committed transaction that every live snapshot sees, and, on a primary with replica feedback enabled,
+every replica snapshot. **Replica feedback is opt-in** (`replica_feedback`, default off): with it a replica reports
+its oldest snapshot and may hold back the primary's `undo_low`; without it the primary truncates regardless, and a
+replica transaction whose undo an `UNDO_TRUNCATE` removes is aborted with `replica_conflict` (§6.11,
+`isolation.md` §5.6).
 
 1. Truncation deletes whole undo segment files below `undo_low`. It is logged as `UNDO_TRUNCATE` and recorded in
    CONTROL at the next checkpoint.
@@ -610,7 +634,9 @@ replica snapshot (Open question 4).
 **A long transaction pins undo, not tables.** A snapshot that stays open holds `undo_low` back, so the undo space
 grows while it lives. The tables do not grow: old versions never sit in a leaf, so scans and index sizes are
 unaffected. When undo bytes held above `undo_low` exceed the setting `undo_retention_limit` (default 25% of free
-disk), the engine SHOULD cancel the oldest snapshot with a "snapshot too old" error rather than run out of space.
+disk), the engine SHOULD abort the transaction holding the oldest snapshot with `resource_exhausted`
+(`details.reason = "snapshot_too_old"`, `isolation.md` §5.5) rather than run out of space; `max_snapshot_age`
+bounds the same thing by time.
 This is the trade InnoDB and Oracle make, and it is why TernDB has no VACUUM.
 
 ### 5.6 Purge
@@ -735,10 +761,10 @@ Segment files are named `<timeline:08x>-<first lsn:016x>.twal` and are exactly 6
 | 0  | 4  | `crc`: CRC32C over [4, 4096) |
 | 4  | 8  | `magic`: ASCII `TERNWAL1` |
 | 12 | 2  | `wal_format` |
-| 14 | 2  | reserved |
+| 14 | 2  | `key_version`: reserved for encryption at rest (§3.1); v1 writes 0 |
 | 16 | 16 | `db_uuid` |
 | 32 | 4  | `timeline` |
-| 36 | 4  | reserved |
+| 36 | 4  | `term`: reserved for failover fencing (`isolation.md` §8); its rules are `replication.md`'s. v1 writes 0 |
 | 40 | 8  | `first_lsn` |
 | 48 | 8  | `prev_segment_crc`: the CRC of the previous segment's header (0 for the first) |
 | 56 | 4040 | reserved |
@@ -751,7 +777,9 @@ A segment MAY be recycled (renamed and rewritten) only once it is below every re
 1. Writers reserve WAL space by atomic fetch-and-add and copy their records into the shared buffer. A flusher
    writes the filled, contiguous prefix and syncs it. `durable_lsn` is the end of the longest contiguous prefix
    known to be synced.
-2. A commit MUST NOT be acknowledged until `durable_lsn` ≥ the end of its commit record.
+2. A commit at `synchronous = on` MUST NOT be acknowledged until `durable_lsn` ≥ the end of its commit record. At
+   `synchronous = off`, which is TernDB's asynchronous commit (`isolation.md` §6), it MAY be acknowledged before;
+   the flush rule is otherwise unchanged, so a crash loses only a WAL suffix.
 3. **No flush rewrites a durable block.** A flush that ends in the middle of a 4 KiB block MUST first pad to the
    block boundary with a PAD record, and the next flush starts in a fresh block. *Rationale:* a torn rewrite of a
    partly durable block would destroy commits already acknowledged, which Postgres and InnoDB risk by rewriting
@@ -825,8 +853,9 @@ All three consume the WAL defined above, with no second format.
    timeline with `TIMELINE_SWITCH`, so the abandoned future and the new history cannot be confused.
 3. **A replica** receives the WAL byte for byte, applies redo continuously and never runs the undo phase. A
    replica's snapshots read undo pages that redo produced, so a replica serves the same versions the primary did.
-   `UNDO_TRUNCATE` arrives in the stream. A replica that must keep a snapshot past it either has fed its horizon
-   back to the primary or cancels the snapshot.
+   `UNDO_TRUNCATE` arrives in the stream. By default a replica that must keep a snapshot past it waits up to
+   `max_replay_delay` and then aborts that snapshot's transaction with `replica_conflict`; only with opt-in
+   feedback (§5.5) does its horizon hold back the primary's undo.
 
 ---
 
@@ -847,11 +876,16 @@ The v1 format is 1. A format number increases with every change to any byte layo
 
 1. A release that writes format N MUST read every page in formats N, N−1 and N−2, and MUST replay WAL of formats N
    and N−1. That is enough to recover a crash of the previous release and upgrade in place.
-2. A release MUST refuse to open, even read-only, a database whose `format_current` is higher than it knows.
-3. A release opening a database with `format_current` < N MUST open it **read-only** unless the operator asked for
-   the upgrade (`terndb open --upgrade-format`, or the equivalent C-API flag). It is the operator, not the binary,
-   who decides when an old release can no longer open the data.
-4. There is never a dump and restore between formats.
+2. A release MUST refuse to open, even read-only, a database whose `format_current` is higher than it knows
+   (`format_unsupported`).
+3. A release that writes format N MUST also be able to **write format N−1**. It opens a database with
+   `format_current` = N−1 read-write and keeps writing pages and WAL in format N−1 until the operator asks for the
+   upgrade (`terndb open --upgrade-format`, or the equivalent C-API flag; §7.3). A binary upgrade and a format
+   upgrade can therefore be rolled back separately. It is the operator, not the binary, who decides when an old
+   release can no longer open the data.
+4. A database with `format_current` < N−1 opens **read-only** unless the upgrade is asked for; a write to it is
+   `format_read_only`.
+5. There is never a dump and restore between formats.
 
 ### 7.3 The in-place upgrade
 
@@ -951,8 +985,9 @@ fixture of any size.
 **On-disk mode clones in O(files).** An on-disk clone MUST take a checkpoint that leaves no dirty page, then
 reflink every segment, the WAL from `redo_lsn` and CONTROL into a new directory (`clonefile` on APFS, `FICLONE` on
 XFS and Btrfs), with a fresh `db_uuid` written into the clone's CONTROL and segment headers through ordinary logged
-page writes on its first open. This is milliseconds, not microseconds, and it fails with an error on a filesystem
-without reflink. A clone of a memory-mode database MAY be promoted like any other.
+page writes on its first open. This is milliseconds, not microseconds, and it fails with `clone_unsupported` on
+a filesystem without reflink. Reflink is the only on-disk clone mechanism: on-disk mode has no in-engine
+copy-on-write clone, so it keeps no reference counts on disk. A clone of a memory-mode database MAY be promoted like any other.
 
 ---
 
@@ -1031,26 +1066,11 @@ sync, and reorder writes issued before one sync. "Recover" means run §6.9 (or �
 
 ## 10. Open questions
 
-1. **Collations in keys.** v1 compares `text` keys by binary UTF-8. Should a collated key store an ICU sort key
-   (correct order, larger keys, and an ICU dependency that has to be sysl) or stay binary, with collation applied
-   only in the executor?
-2. **Large nested relations.** v1 stores an oversized nested relation as one immutable overflow chain, so updating
-   one element rewrites the whole value. Is form 1 (a private B+tree per value, keyed by element ordinal) wanted in
-   v1, or only once a workload shows the cost?
-3. **Overflow values in the WAL.** v1 logs overflow chains in full (`OVERFLOW_WRITE`), which doubles the writes of
-   a large value, as in Postgres and InnoDB. The alternative is to write the chain directly and sync it before the
-   commit record, logging only its PIDs. Which?
-4. **Replica feedback.** Should a replica's oldest snapshot hold back the primary's `undo_low` (the analogue of
-   Postgres's `hot_standby_feedback`), or should replica snapshots be cancelled on `UNDO_TRUNCATE`? This decides
-   whether a reporting replica can stall the primary's undo.
-5. **Writing the previous format.** §7.2 opens an un-upgraded database read-only. Should a release also be able to
-   *write* format N−1, so a binary upgrade and a format upgrade can be rolled back separately, at the cost of two
-   page writers per release?
-6. **The undo stream is one global append point.** Is a per-core undo lane (with the horizon taken as the minimum
-   over lanes) wanted in v1, or only once the fetch-and-add shows contention?
-7. **On-disk clones.** §8.4 gives on-disk mode reflink clones in milliseconds. Are in-engine copy-on-write clones
-   for on-disk mode wanted too? They would need reference counts on disk.
-8. **Asynchronous commit.** Should a session be able to accept commit without waiting for the sync (Postgres's
-   `synchronous_commit = off`), losing a bounded window on a crash but never consistency?
-9. **Encryption at rest.** Not designed. Reserving a CONTROL feature flag and a per-page key-version field now
-   would avoid a format bump later. Should v1 reserve them?
+The questions this section listed have been answered; the answers, and what to revert for each, are in
+`docs/decisions.md` (Q6, Q14, Q23–Q29). One remains:
+
+1. **The descriptor set against `query-tree.md`'s types.** §4.3 still differs from `query-tree.md` §2: it names
+   the two time types `timestamp`/`timestamptz` where the type system says `datetime`/`timestamp`, it has an
+   `enum` the type system lacks, and it has no record descriptor, so a record column, a union payload record and a
+   nullable record element of a relation (`query-tree.md` §2.2) have no stored form. Should §4.3 be rebuilt on the
+   `query-tree.md` §12.3 type kinds?

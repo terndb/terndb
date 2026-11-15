@@ -17,11 +17,13 @@ rule. Text marked *Informative* has no force.
 1. A **statement** is a tree of nodes. There are three families of node: **relational nodes** (`Rel`),
    which denote relations; **expressions** (`Expr`), which denote values; and **statement roots**
    (`Query`, `Insert`, `Update`, `Delete`).
-2. A tree contains **no literal values**. Every value a client supplies is a **parameter**: a typed
-   hole, declared in the statement's envelope and bound separately at execution (§10). The only
-   constant-like node is `Null(type)`, which carries a type and no data.
-   *Rationale: injection is impossible by construction, and two queries that differ only in values
-   share one plan.*
+2. A value that varies between executions is a **parameter**: a typed hole, declared in the
+   statement's envelope and bound separately at execution (§10). A constant of the statement itself
+   (`0`, `LIMIT 3`, a status tag) MAY be a **literal** node (§7.3), which carries a scalar type and its
+   value. A literal is part of the statement's shape (§10.2), so it shapes the plan; a parameter does not.
+   *Rationale: injection is impossible by construction either way, because a tree is structured data,
+   never text that is parsed; constants that steer the plan belong in the plan-cache key, and values that
+   vary belong in parameters so that their statements share one plan.*
 3. SQL (TernDB's own dialect) and GraphQL are **front ends**. Each produces a tree; neither has
    semantics of its own beyond the tree it produces. A server MUST validate a tree it receives exactly
    as it validates the tree its own SQL front end produces: the same checks, the same error codes.
@@ -41,7 +43,8 @@ rule. Text marked *Informative* has no force.
 | Type | Values | Justification |
 |---|---|---|
 | `bool` | `false`, `true` | Predicates. |
-| `int16`, `int32`, `int64`, `int128` | two's-complement integers of that width | 16/32/64 match every client language and SQL's `smallint`/`integer`/`bigint`; `int128` holds exact sums of `int64` without falling to decimal. |
+| `int8`, `int16`, `int32`, `int64`, `int128` | two's-complement integers of that width | 16/32/64 match SQL's `smallint`/`integer`/`bigint`; `int8` matches Substrait's `i8` and every client language's byte; `int128` holds exact sums of `int64` without falling to decimal. |
+| `uint8`, `uint16`, `uint32`, `uint64` | unsigned integers of that width | Counters, hashes, sizes and C interop, without a sign bit's halving of the range. |
 | `decimal(p, s)` | exact numbers with `p` significant digits, `s` of them after the point; `1 ≤ p ≤ 38`, `0 ≤ s ≤ p` | Money and exact arithmetic. 38 digits fit an `int128` unscaled value, so decimals are fixed-width and vectorisable. |
 | `float32`, `float64` | IEEE 754 binary32/binary64, including ±0, ±∞ and NaN | Measurements, scores, vectors' components. |
 | `text` | any sequence of Unicode scalar values, encoded UTF-8; NUL is allowed | Strings. Length-prefixed everywhere, so NUL needs no exclusion. |
@@ -52,9 +55,11 @@ rule. Text marked *Informative* has no force.
 | `timestamp` | an instant: microseconds since 1970-01-01T00:00:00Z | A point on the global timeline. |
 | `interval` | a triple (`months`: int32, `days`: int32, `micros`: int64) | Calendar arithmetic needs months and days kept apart from elapsed time. |
 | `uuid` | 128 bits | Identifiers. |
+| `json` | a JSON text (RFC 8259) in canonical form (§3.5) | Interop with schemaless documents. Nesting in TernDB's own data stays relational (§2.5); `json` is never how a nested result is encoded. |
 
-1. There is no unsigned integer type, no `int8`, no `char(n)`/`varchar(n)`, no `timetz`, no `money`
-   and no `json` type in version 1.0. A length or range limit is a constraint, not a type.
+1. There is no `char(n)`/`varchar(n)`, no `timetz`, no `money` and no arbitrary-precision `numeric`
+   in version 1.0; `decimal` takes at most 38 digits. A length or range limit is a constraint, not a
+   type.
    *Rationale: Postgres's `timestamp`/`timestamptz` split is the source of its most common time bug;
    TernDB names the two concepts `datetime` and `timestamp` and never converts between them
    implicitly. `timetz` has no coherent meaning.*
@@ -65,7 +70,8 @@ rule. Text marked *Informative* has no force.
 
 1. Nullability is part of the type. `T` does not admit null; `T?` admits every value of `T` and null.
    `T??` does not exist: making a nullable type nullable yields the same type.
-2. Any type may be nullable, including a record, a union and a relation type.
+2. Any type may be nullable, including a record, a union, a relation type and a relation's element
+   type (§2.5): in `list<{a: int64}?>` each element is a record or null.
 3. A table column declared `NOT NULL` has type `T`; otherwise `T?`.
 
 ### 2.3 Records
@@ -78,7 +84,8 @@ rule. Text marked *Informative* has no force.
 
 ### 2.4 Tagged unions
 
-1. `union<t₁: R₁, …, tₖ: Rₖ>` holds exactly one variant, identified by its **tag**. `k ≥ 1`. Tags are
+1. `union<t₁: R₁, …, tₖ: Rₖ>` holds exactly one variant, identified by its **tag**. `1 ≤ k ≤ 65,536`
+   (`Q3016`; the bound is what a 2-octet discriminant holds, `wire-protocol.md` §6.2). Tags are
    unique (`Q3015`). Each payload `Rᵢ` MUST be a record type (`Q3014`); a variant with no data has
    payload `{}`, so an enum is a union whose payloads are all `{}`.
 2. The **discriminant** of a variant is its tag's ordinal in the declaration (0-based). The encoding
@@ -92,8 +99,13 @@ rule. Text marked *Informative* has no force.
 
 1. A relation type is `bag<E>` (a multiset: no order, duplicates counted) or `list<E>` (a sequence:
    order is part of the value).
-2. The element type `E` MUST be a record type or a union whose payloads are records (`Q3014`).
-   Relation types may nest to any depth: `bag<{id: int64, posts: list<{id: int64}>}>` is legal.
+2. The element type `E` MUST be a record type, a union whose payloads are records, or a scalar
+   (§2.1), and MAY be nullable (§2.2); it MUST NOT itself be a relation type (`Q3014`). A null element
+   is one element whose value is null: it counts in the relation's length, and the wire marks it in the
+   element column's validity (`wire-protocol.md` §6.2). Relation types may nest to any depth through
+   record fields: `bag<{id: int64, posts: list<{id: int64}>}>` is legal.
+   A relation whose element is a scalar, such as `list<int64>`, is a **scalar relation**: under its
+   binder it exposes one column, `value`, of the element type, and `Row(binder)` is that value.
 3. Relation-valued columns are values like any other: they can be stored in a table column, passed as
    parameters, compared (§3), hashed, grouped on and indexed.
 4. A relation value is never null unless its type is `bag<E>?`/`list<E>?`; the absence of rows is the
@@ -118,7 +130,11 @@ constraints and hash indexes.
 2. Integers and decimals compare by numeric value after coercion to a common type (§4.2).
 3. Floats: `same(NaN, NaN)` is `true` for every NaN payload; `same(-0.0, +0.0)` is `true`; otherwise
    IEEE equality.
-4. `text` and `bytes` compare as octet sequences. (No collation applies in 1.0; see Open questions.)
+4. `text`, `bytes` and `json` (in canonical form, §3.5) compare as octet sequences. No collation
+   applies in version 1.0: `text` orders by binary UTF-8. *Reserved hook:* collations, when added, are a
+   property of the **comparison**, never of the type: a later minor (§13.2) appends an optional
+   `collation` field to `SortKey` and to the comparison calls, whose absence means binary order, and an
+   index on a collated key stores ICU sort keys (`on-disk-format.md` §4.6).
 5. `interval` compares **componentwise**: `same('1 month', '30 days')` is `false`.
    *Rationale: Postgres's normalisation makes equal intervals produce different dates.*
 6. Records: fieldwise `same`, all fields.
@@ -137,8 +153,8 @@ null.
 2. On records, `eq` is SQL row comparison: `false` if any field pair is `eq`-false; else null if any
    pair is null; else `true`. `lt` etc. compare lexicographically by field with the same rule.
 3. On unions, `eq` is `false` if the discriminants differ, otherwise `eq` of the payloads.
-4. `eq`/`ne` on a relation type, and `lt`/`le`/`gt`/`ge` on a relation type, a union type or
-   `interval`, MUST be refused with `Q3006` (relations) or `Q3007` (unions, intervals).
+4. `eq`/`ne` on a relation type, and `lt`/`le`/`gt`/`ge` on a relation type, a union type,
+   `interval` or `json`, MUST be refused with `Q3006` (relations) or `Q3007` (unions, intervals, `json`).
    *Rationale: three-valued multiset equality has no useful definition; use `same`. Intervals and
    unions have no natural order; `Sort` still orders them through `cmp`.*
 
@@ -150,8 +166,8 @@ null.
 1. Null sorts below every non-null value. (`Sort` keys override this at the top level, §6.9.)
 2. `false < true`. Integers and decimals by numeric value.
 3. Floats: −∞ < negative < −0 = +0 < positive < +∞ < NaN.
-4. `text` and `bytes`: unsigned octet-lexicographic (for valid UTF-8 this is code point order); a
-   proper prefix sorts first.
+4. `text`, `bytes` and `json` (canonical form): unsigned octet-lexicographic (for valid UTF-8 this is
+   code point order); a proper prefix sorts first.
 5. `date`, `time`, `datetime`, `timestamp`: chronologically. `uuid`: as a 128-bit big-endian unsigned
    number. `interval`: lexicographically on (`months`, `days`, `micros`).
 6. Records: lexicographic by field. Unions: by discriminant, then payload.
@@ -166,6 +182,32 @@ null.
 2. The hash function itself is not part of this specification. Where a hash is persisted, it is fixed
    by `on-disk-format.md`.
 
+### 3.5 Values: canonical text forms
+
+The text form of each scalar is what `Cast` to `text` prints and what `Cast` from `text` parses (§7.6).
+Printing MUST produce exactly the form below; parsing MUST accept it and the stated variants, and
+MUST raise `R0006` (or yield null under `try`) on anything else, including surrounding whitespace.
+
+| Type | Printed form | Also parsed |
+|---|---|---|
+| `bool` | `true`, `false` | — |
+| integers | `-`? then decimal digits, no leading zeros (`0`, `-42`); unsigned types have no sign | a leading `+` |
+| `decimal(p, s)` | `-`? digits, then `.` and exactly `s` digits when `s > 0` (`12.50` for `decimal(4, 2)`) | fewer or more fraction digits, rounded half away from zero to `s` |
+| floats | the shortest decimal that reads back to the same value, `e` exponent when it is outside 10⁻⁶ … 10²¹; `-0`, `inf`, `-inf`, `nan` | any decimal or exponent form; `Infinity`, `-Infinity`, `NaN` |
+| `text` | the value itself | — |
+| `bytes` | `\x` then two lowercase hex digits per octet | uppercase hex digits |
+| `date` | ISO 8601 `YYYY-MM-DD`, astronomical year numbering; a year outside 0000–9999 has a sign and at least five digits (`-04713-11-24`) | — |
+| `time` | `HH:MM:SS`, then `.` and 1–6 digits when the fraction is non-zero, trailing zeros removed | 0–6 fraction digits |
+| `datetime` | the `date` form, `T`, the `time` form; no zone | a space in place of `T` |
+| `timestamp` | the `datetime` form of the instant in UTC, then `Z` | an offset `±HH:MM` in place of `Z`, converted to UTC; no zone at all is refused |
+| `interval` | `P`, then `<n>M`, `<n>D` and `T<s>S` for each non-zero component, `n` a signed integer and `s` signed seconds with the `time` fraction rule; `PT0S` for zero (`P14M-3DT90.5S`) | — |
+| `uuid` | RFC 9562 `8-4-4-4-12` lowercase hex | uppercase hex |
+| `json` | its canonical form: the RFC 8785 serialisation of the parsed text | any RFC 8259 JSON text, canonicalised on parse |
+
+A `json` value is always held in canonical form, so `same` on `json` is octet equality of canonical
+forms. A `json` literal or parameter value that is not canonical is `Q1007`. Records, unions and
+relations have no text form in version 1.0.
+
 ## 4. Inference and coercion
 
 The tree is explicitly typed at its leaves: every column has a catalog type, every parameter a
@@ -177,9 +219,12 @@ inference of a parameter's type from its context: the front end that builds the 
 Only these coercions are applied implicitly, and only where an expected type is known (a function
 argument, a `SetOp` column, an insert or update target, an `If` arm, a `Values` column):
 
-1. **Integer widening**: `int16 → int32 → int64 → int128`.
-2. **Integer to decimal**: `intN → decimal(p, 0)` with `p` = 5, 10, 19, 38 for `int16`, `int32`,
-   `int64`, `int128`; and onward by decimal widening.
+1. **Integer widening**: `int8 → int16 → int32 → int64 → int128`; `uint8 → uint16 → uint32 →
+   uint64`; and `uintN → int(2N)` (`uint8 → int16`, …, `uint64 → int128`), each lossless. A signed
+   type never coerces to an unsigned one.
+2. **Integer to decimal**: `intN → decimal(p, 0)` with `p` = 3, 5, 10, 19, 38 for `int8`, `int16`,
+   `int32`, `int64`, `int128`, and `p` = 3, 5, 10, 20 for `uint8`, `uint16`, `uint32`, `uint64`; and
+   onward by decimal widening.
 3. **Decimal widening**: `decimal(p, s) → decimal(p', s')` when `s' ≥ s` and `p' − s' ≥ p − s`.
 4. **Float widening**: `float32 → float64`.
 5. **Null widening**: `T → T?`, at any depth (a record field, a relation's element).
@@ -188,7 +233,7 @@ argument, a `SetOp` column, an insert or update target, an `If` arm, a `Values` 
    order) when each component coerces.
 
 Everything else MUST be refused with `Q3001`, in particular: integer or decimal to float and back,
-any type to or from `text`, `bool` to or from integer, `datetime` to or from `timestamp`, `date` to
+any type to or from `text` or `json`, `bool` to or from integer, `datetime` to or from `timestamp`, `date` to
 `datetime`, `T?` to `T`, and `bag<E>` to `list<E>`. These are written as an explicit `Cast` (§7.6),
 an `assert_not_null` call, or a `Sort`.
 *Rationale: every implicit conversion Postgres performs has a known silent-wrong-answer case; the
@@ -212,8 +257,9 @@ Operators are functions with stable names (§7.12). A call `f(a₁…aₙ)` reso
 
 ### 4.4 Arithmetic result types
 
-1. Integer `add`, `sub`, `mul`, `div`, `mod`, `neg`: operands widen to the wider type; the result has
-   that type. Overflow is the runtime error `R0001`; integers never wrap. `div` truncates toward zero;
+1. Integer `add`, `sub`, `mul`, `div`, `mod`, `neg`: operands widen to their common type (§4.2; a
+   signed and an unsigned operand meet at the signed type that holds both); the result has that type.
+   `neg` of an unsigned value is refused (`Q3002`). Overflow is the runtime error `R0001`; integers never wrap. `div` truncates toward zero;
    `mod`'s sign follows the dividend; division by zero is `R0002`.
 2. Decimal `add`/`sub`: `s = max(s₁, s₂)`, `p = min(38, max(p₁ − s₁, p₂ − s₂) + s + 1)`. `mul`:
    `s = s₁ + s₂`, `p = min(38, p₁ + p₂)`; if `s > 38` the call is refused with `Q3011`. `div`:
@@ -344,7 +390,7 @@ conceptually. Output columns follow §6.5 with `cross` as `inner` and `outer` as
    `Filter` above the `Aggregate`.
 4. Core aggregates: `count()` (rows) and `count(x)` (non-null `x`) → `int64`; `sum` → `int128` for
    integer inputs, `decimal(38, s)` for `decimal(p, s)`, `float64` for floats; `min`, `max` (any type
-   with `cmp`); `bool_and`, `bool_or`; `collect(x)` where `x` is a record or union → `bag<X>`, or
+   with `cmp`); `bool_and`, `bool_or`; `collect(x)` where `x` is a record, union or scalar (§2.5) → `bag<X>`, or
    `list<X>` when `order` is non-empty. Over an empty set every core aggregate except `count` and
    `collect` (empty relation) yields null, so its result type is nullable.
 
@@ -373,7 +419,8 @@ relations.
    absent `offset` means 0.
 2. The input MUST be a list (`Q3008`) unless `arbitrary` is `true`, in which case any `count` rows of a
    bag are chosen. *Rationale: an unordered `LIMIT` is a nondeterminism bug far more often than a
-   wish; the flag makes the wish explicit.*
+   wish; the flag makes the wish explicit.* The GraphQL front end never sets `arbitrary`: a `first:`
+   without `orderBy` sorts by the table's primary key, so its pages are deterministic.
 3. `ties = true` also keeps every row equal on all sort keys to the last kept row; it requires the input
    to be a `Sort` node directly (`Q3008`).
 
@@ -413,7 +460,7 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
    `collect(Record(items))` with that `order`.
 2. `Unnest` evaluates `value`, a relation-typed expression that MAY reference the input's binders, per
    input row, and emits one row per element: the input's columns followed by the element's columns
-   under binder `as`. With `outer = true`, an input row whose relation is empty or null emits one row
+   (for a scalar relation, the one column `value`, §2.5) under binder `as`. With `outer = true`, an input row whose relation is empty or null emits one row
    with every element column null (so they are nullable). `ordinality` adds an `int64` column, 1-based,
    under `as`; it requires `value` to be a list (`Q3008`).
 
@@ -435,6 +482,7 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
 | `Row` | `binder` | the binder's element type |
 | `Param` | `index` | the declared type |
 | `Null` | `type` | `type?` |
+| `Literal` | `type, value` | `type` |
 | `Call` | `function, args: [Expr]` | per §4.3 |
 | `Cast` | `expr, type, mode: strict \| try` | `type` (`type?` for `try`) |
 | `If` | `arms: [(cond, value)], else: Expr?` | common type of values |
@@ -457,10 +505,13 @@ including nullability added by an outer join between the binder and this point.
 
 The whole current row of `binder` as a record (or, for a union-element relation, the union value).
 
-### 7.3 Param and Null
+### 7.3 Param, Null and Literal
 
 `Param` refers to the envelope's parameter `index` (0-based; `Q4001`). `Null(type)` is the null value
-of `type?`.
+of `type?`. `Literal(type, value)` is a constant: `type` MUST be a non-nullable scalar (§2.1; `Q3017`),
+and `value` is that type's §12.6 encoding (a `json` value in canonical form, `Q1007`). A literal is
+kept in the shape form (§10.2); a front end puts a value in a literal only when it is a constant of
+the statement, and in a parameter when it varies between executions.
 
 ### 7.4 Call
 
@@ -476,8 +527,7 @@ be evaluated, so their runtime errors do not occur.
 
 `strict` raises `R0006` on a value that does not convert; `try` yields null. Permitted casts: between
 any two numeric types (range-checked; rounding half away from zero into decimal and integer targets);
-between `text` and every scalar (parsing and printing the canonical literal forms, which are not yet
-fixed; see Open questions); `bytes` ↔ `uuid` (16 octets); records, unions and relations
+between `text` and every scalar (parsing and printing the forms of §3.5); `bytes` ↔ `uuid` (16 octets); records, unions and relations
 componentwise where shapes match; `list<E> → bag<E>`. Anything else, including `bag → list`,
 `timestamp ↔ datetime` and `T? → T`, is `Q3012`. The zone conversions are functions
 (`at_zone(timestamp, text) → datetime`, `from_zone(datetime, text) → timestamp`); a non-null value is
@@ -645,11 +695,13 @@ of the returning records.
 The **shape form** of a validated statement is its canonical encoding (§12) at the server's current
 schema version, after: (a) every `ParamDecl.name` is made absent; (b) `spans` is made absent; (c) every
 binder is replaced by `b<i>` and every CTE name by `c<i>`, numbered in order of first introduction in
-pre-order. Output column names, parameter types, table names and everything else are kept.
+pre-order. Output column names, parameter types, literal types and values, table names and everything
+else are kept.
 
 1. Two statements have the **same shape** iff their shape forms are byte-identical.
-2. A server's plan cache MUST key on the shape form (or a 256-bit-or-wider collision-resistant digest
-   of it) together with the catalog version the plan was made against. A server MAY re-plan for
+2. The **shape digest** is the SHA-256 of the shape form (32 octets); the wire carries it as is
+   (`wire-protocol.md` §4.3). A server's plan cache MUST key on the shape form or its shape digest,
+   together with the catalog version the plan was made against. A server MAY re-plan for
    particular parameter values, but MUST NOT give two statements of the same shape different
    validation results.
 3. `EXPLAIN` MUST report the shape digest, so a test can check that two trees share a plan.
@@ -664,7 +716,9 @@ fails, none take effect. Results are returned per tuple, in order, tagged with t
 
 A parameter of relation type, read through `ParamScan` or used as a `Relation`-typed expression, is
 the preferred form of bulk input: one execution, one plan, set-based. *Rationale: a batch of 10,000
-inserts is 10,000 executions; a `ParamScan` of 10,000 rows is one.*
+inserts is 10,000 executions; a `ParamScan` of 10,000 rows is one.* The wire MAY carry such a
+parameter in the columnar result layout instead of §12.6 (`wire-protocol.md` §4.2); the value bound
+is the same.
 
 ## 11. Validation and the error model
 
@@ -673,7 +727,9 @@ inserts is 10,000 executions; a `ParamScan` of 10,000 rows is one.*
 A validation error is `{ code, path, message, details }`. `code` is stable across releases and is what
 clients and tests match on; `message` is human text and not stable. `path` locates the node: a
 sequence of steps, each a field name from the schema with an index for list elements, written
-`/statement/source/rows/0/1`. `details` is a map from stable keys (`binder`, `column`, `expected`,
+`/statement/source/rows/0/1`. An error in a bound parameter value has the path
+`/params/<tuple>/<index>` (both 0-based: the tuple of the batch, §10.3, and the declaration), followed
+by one `/<field or element index>` step per level into a composite value. `details` is a map from stable keys (`binder`, `column`, `expected`,
 `actual`, `missing_tags`, …) to text. When `spans` is present, the error also carries the source span.
 
 ### 11.2 Order of checks
@@ -685,63 +741,10 @@ in that phase, sorted by path.
 
 ### 11.3 Codes
 
-| Code | Meaning |
-|---|---|
-| `Q1001` | Malformed encoding: truncated input, bad varint, payload length mismatch, trailing bytes. |
-| `Q1002` | Unknown or reserved node, type or enum ordinal for the negotiated version. |
-| `Q1003` | Non-canonical encoding (§12.1). |
-| `Q1004` | Invalid UTF-8 in a name or text value. |
-| `Q1005` | Envelope version not supported or above the negotiated one. |
-| `Q1006` | Nesting deeper than the server's limit (which MUST be at least 256). |
-| `Q2001` | Unknown table or view. |
-| `Q2002` | Unknown binder. |
-| `Q2003` | Unknown column of a binder. |
-| `Q2004` | Duplicate binder or duplicate CTE name. |
-| `Q2005` | Duplicate output name where unique names are required. |
-| `Q2006` | Binder exists but is not visible here. |
-| `Q2007` | Unknown function. |
-| `Q2008` | Unknown CTE. |
-| `Q2010` | Unknown union tag. |
-| `Q2011` | Unknown record field. |
-| `Q3001` | Type mismatch (`expected`, `actual`). |
-| `Q3002` | No overload matches. |
-| `Q3003` | Ambiguous overload. |
-| `Q3004` | Condition is not boolean. |
-| `Q3005` | Nullable value where a non-null one is required. |
-| `Q3006` | `eq`/`ne` on a relation type; use `same`. |
-| `Q3007` | Ordering comparison on an unorderable type. |
-| `Q3008` | Order required but the relation is a bag (`Limit`, `ties`, `ordinality`). |
-| `Q3009` | Non-exhaustive or duplicated `Match` arm. |
-| `Q3010` | `SetOp` inputs incompatible. |
-| `Q3011` | Decimal precision or scale out of range. |
-| `Q3012` | Cast not permitted. |
-| `Q3013` | Aggregate or window function outside `Aggregate`/`Window`. |
-| `Q3014` | Union payload or relation element is not a record. |
-| `Q3015` | Duplicate field or tag name in a type. |
-| `Q4001` | Parameter index out of range. |
-| `Q4002` | Declared parameter never referenced. |
-| `Q4003` | Bound value's type differs from the declaration. |
-| `Q4004` | Wrong number of bound values. |
-| `Q4005` | Null bound to a non-nullable parameter. |
-| `Q5001` | Invalid recursive CTE (non-linear, unstratified, mutual, missing column types). |
-| `Q5002` | Node not allowed here (DML not at root, `Action` outside `returning`). |
-| `Q5003` | DML target is not a table or column not writable. |
-| `Q5004` | Conflict target matches no unique constraint or index. |
-| `Q5005` | Column assigned or listed twice. |
-| `Q5006` | `Join` right input references the left input; use `Apply`. |
-| `Q5008` | Invalid window frame. |
-| `Q5009` | Arity or required-field violation (empty items, missing `mark`, row width, `Scalar` width). |
-| `Q7001` | Substrait relation not supported. |
-| `Q7002` | Substrait type not supported. |
-| `Q7003` | Substrait function not in the mapping. |
-| `Q7004` | Substrait plan version not supported. |
-
-Runtime errors referenced by this spec: `R0001` arithmetic overflow, `R0002` division by zero,
-`R0003` more than one row for a scalar subquery or `single` join, `R0004` `assert_not_null` on null,
-`R0005` recursion bound exceeded, `R0006` invalid value (cast failure, negative limit), `R0007` a
-target row affected twice. Constraint violations and transaction errors are defined in `isolation.md`.
-
-Codes are never reused. A code withdrawn in a later version stays reserved.
+The validation codes (`Q…`) and the runtime codes (`R…`) this spec raises, with their names, are
+registered in `errors.md` §2 and §3; that registry is the one list of them, and its rules (code form,
+names as aliases, no reuse) apply here. Constraint violations and transaction errors (`T…`) are raised
+under `isolation.md` and registered in `errors.md` §4.
 
 ## 12. Canonical binary encoding
 
@@ -791,7 +794,14 @@ Spans     := list<(uvar node_preorder_index, uvar start, uvar end)>   ordered by
 | 18 | `bag` | `Type` |
 | 19 | `list` | `Type` |
 | 20 | nullable | `Type` (not itself nullable) |
-| 21–63 | reserved (named catalog types, `ddl.md`) | |
+| 21 | `int8` | — |
+| 22–25 | `uint8`, `uint16`, `uint32`, `uint64` | — |
+| 26 | `json` | — |
+| 27–31 | reserved (scalar types) | |
+| 32–63 | reserved (named catalog types, `ddl.md`) | |
+
+A result type is always **structural**: a server MUST NOT send a named catalog type (kinds 32–63) in a
+statement's result type, and sends the structure the name denotes (`wire-protocol.md` §6.1).
 
 ### 12.4 Relational and expression kinds
 
@@ -803,7 +813,7 @@ Rel kinds: 1 `Scan`, 2 `Values`, 3 `ParamScan`, 4 `Filter`, 5 `Project`, 6 `Join
 8 `Aggregate`, 9 `Window`, 10 `Sort`, 11 `Limit`, 12 `Distinct`, 13 `SetOp`, 14 `With`, 15 `CteRef`,
 16 `Nest`, 17 `Unnest`, 18 `Tag`. Expr kinds: 1 `Col`, 2 `Row`, 3 `Param`, 4 `Null`, 5 `Call`, 6 `Cast`,
 7 `If`, 8 `Match`, 9 `Record`, 10 `Field`, 11 `Variant`, 12 `Relation`, 13 `Scalar`, 14 `Exists`, 15 `In`,
-16 `Action`. The auxiliary records `AggCall`, `WinCall`, `Frame`, `Bound`, `SortKey`, `CteDef`,
+16 `Action`, 17 `Literal` (payload `Type`, then the value's §12.6 encoding). The auxiliary records `AggCall`, `WinCall`, `Frame`, `Bound`, `SortKey`, `CteDef`,
 `OnConflict` are encoded inline as their fields in order (not as nodes); a choice inside them
 (`OnConflict.target`, `action`) is an `enum` followed by the chosen alternative's fields. Kind 0 and
 kinds 64 and above in every family are reserved.
@@ -812,7 +822,7 @@ kinds 64 and above in every family are reserved.
 
 1 `Query`, 2 `Insert`, 3 `Update`, 4 `Delete`; 32–63 reserved for DDL.
 
-### 12.6 Parameter values
+### 12.6 Parameter and literal values
 
 A parameter value is encoded by its declared type, with no tags (the type is known):
 
@@ -820,9 +830,10 @@ A parameter value is encoded by its declared type, with no tags (the type is kno
 |---|---|
 | `bool` | one octet |
 | `intN` | N/8 octets, little-endian two's complement |
+| `uintN` | N/8 octets, little-endian unsigned |
 | `decimal(p, s)` | 16 octets, little-endian unscaled `int128` |
 | `float32`/`float64` | IEEE 754, little-endian |
-| `text`, `bytes` | `uvar` length, octets |
+| `text`, `bytes`, `json` | `uvar` length, octets (`json`: its canonical form, §3.5) |
 | `date` | `int32` LE, days since 1970-01-01 |
 | `time`, `datetime`, `timestamp` | `int64` LE microseconds (since midnight; since 1970-01-01T00:00 civil; since the Unix epoch) |
 | `interval` | `int32` months, `int32` days, `int64` micros, each LE |
@@ -832,21 +843,25 @@ A parameter value is encoded by its declared type, with no tags (the type is kno
 | union | `uvar` discriminant, then the payload record |
 | `bag`/`list` | `uvar` count, then each element |
 
-Fixed-width scalars are fixed-width so a decoder can read a column without a varint loop.
-`wire-protocol.md` MUST fix how result rows are framed and streamed; it MUST encode each individual
-value as this table does, so one value decoder serves parameters, results, the wire and the C ABI. If
-the wire spec needs a different value encoding, it changes this table in the same commit.
+Fixed-width scalars are fixed-width so a decoder can read a column without a varint loop. This table
+is the encoding of parameter values and of `Literal` values. Results are not encoded this way: they
+use the columnar result encoding of `wire-protocol.md` §6, which holds each **fixed-width scalar
+payload** in exactly the octets this table gives that scalar, so one scalar decoder serves parameters,
+literals and result columns. If the wire spec needs a different fixed-width scalar encoding, it changes
+this table in the same commit.
 
 ## 13. Versioning and negotiation
 
 1. The tree schema has a version `major.minor`, published with every release as a machine-readable
-   schema file (format: see Open questions) together with the function catalog and error codes.
+   schema file together with the function catalog and error codes. The schema file is a JSON
+   description of every node kind, field, enum and type kind, **generated from the implementation's
+   source** at build time, so it cannot drift from what the server decodes.
 2. A **minor** version MAY add node kinds, enum values, functions, error codes and fields. An added
    field MUST be appended to the end of its node's payload and MUST have a default value under which the
    node means exactly what it meant before. A minor version MUST NOT change the meaning of any existing
    tree.
-3. A **major** version MAY change anything. A server MUST support its current major and SHOULD support
-   the previous one.
+3. A **major** version MAY change anything. A server MUST accept its current major and the two
+   previous majors.
 4. **Negotiation.** On the wire, the client offers the list of `(major, max_minor)` it supports; the
    server answers with the highest common major and, for it, `min(client max_minor, server max_minor)`.
    No common major ends the connection with `Q1005`. Through the C ABI, `terndb_tree_version()` reports
@@ -859,17 +874,18 @@ the wire spec needs a different value encoding, it changes this table in the sam
 
 ## 14. Substrait
 
-A server MUST accept a Substrait plan in place of a tree, for the Substrait versions it publishes
-(`Q7004` otherwise), and MUST translate it to a tree that is then validated as any other. Errors from
-the translation are `Q7…` with a path into the Substrait plan; errors from validation carry the tree
-path and the Substrait relation's anchor. Only inbound translation is required in 1.0.
+A server MUST accept a Substrait plan in place of a tree, in the one Substrait version pinned for its
+release (`Q7004` otherwise), and MUST translate it to a tree that is then validated as any other.
+Errors from the translation are `Q7…` with a path into the Substrait plan; errors from validation carry
+the tree path and the Substrait relation's anchor. Substrait is **import-only**: TernDB never exports
+its plans as Substrait.
 
 ### 14.1 What maps
 
 | Substrait | Tree |
 |---|---|
 | `ReadRel` named table | `Scan` |
-| `ReadRel` virtual table | `Values`, every literal hoisted to a new parameter |
+| `ReadRel` virtual table | `Values` of `Literal`s |
 | `FilterRel`, `SortRel` | `Filter`, `Sort` |
 | `ProjectRel` (+ `emit`) | `Project` listing the kept input fields and the new expressions |
 | `JoinRel` inner/left/right/outer/left_semi/left_anti/left_single/left_mark | `Join` inner/left/right/full/semi/anti/single/mark; the `right_*` kinds swap inputs |
@@ -881,26 +897,25 @@ path and the Substrait relation's anchor. Only inbound translation is required i
 | `ConsistentPartitionWindowRel`, window function expressions | `Window` |
 | `WriteRel` insert/delete/update | `Insert`/`Delete`/`Update`; output mode "modified records" becomes `returning` of every column |
 | field reference (ordinal, `outer_reference` steps) | `Col` by the referenced column's name; outer steps become correlated references |
-| literal | a new `Param` with the literal bound as its value |
+| literal of a mapped scalar type | `Literal`; a null literal is `Null` |
 | scalar function in a mapped extension URI | `Call` per the published mapping table |
 | `IfThen`, `SwitchExpression` | `If` |
 | `Cast` (throw / return null) | `Cast` strict / try |
 | scalar, in-predicate and `exists` subqueries | `Scalar`, `In`, `Exists` |
 | `SingularOrList`, `MultiOrList` | `In` over `Values` |
-| types `boolean i16 i32 i64 fp32 fp64 string binary date time uuid decimal(p≤38)` | the matching scalar |
+| types `boolean i8 i16 i32 i64 fp32 fp64 string binary date time uuid decimal(p≤38)` | the matching scalar |
 | `timestamp`, `timestamp_tz`, precision variants with precision ≤ 6 | `datetime`, `timestamp` |
 | `interval_year`, `interval_day`, `interval_compound` | `interval` |
 | `struct` (names from the enclosing `NamedStruct`, else `f0`, `f1`, …) | record |
-| `list<struct>` | `list<record>` |
+| `list<struct>`, `list<T>` of a mapped scalar `T` | `list<record>`, `list<T>` |
 
 ### 14.2 What does not map, and why
 
 | Substrait | Code | Why |
 |---|---|---|
-| `i8` | `Q7002` | No `int8`; widening would change overflow behaviour. |
 | `varchar<L>`, `fixed_char`, `fixed_binary` | `Q7002` | A length is a constraint in TernDB, not a type. |
 | precision > 6 timestamps | `Q7002` | Microsecond values cannot hold them losslessly. |
-| `map`, `list` of a non-struct, user-defined types | `Q7002` | No equivalent type in 1.0. |
+| `map`, `list` of a list, user-defined types | `Q7002` | No equivalent type in 1.0. |
 | multiple grouping sets, `ExpandRel` | `Q7001` | Grouping sets are not in 1.0. |
 | `ExtensionLeaf/Single/MultiRel`, `ExchangeRel`, `DdlRel`, local files | `Q7001` | Opaque, distributed or DDL: outside the tree. |
 | functions outside the mapping table | `Q7003` | No silent approximation of a function's semantics. |
@@ -919,11 +934,13 @@ produce.
 ```
 node    = "(" kind field* ")"
 field   = ":" fname value
-value   = node | "[" item* "]" | binder "." column | "$" index | name | type
+value   = node | "[" item* "]" | binder "." column | "$" index | literal | name | type
+literal = "'" text-form "'::" type
 item    = value | name ":" value
 ```
 
-A `Col(b, c)` prints as `b.c`; a `Param(i)` as `$i`; a pair list as `[name: value …]`; `SortKey` as
+A `Col(b, c)` prints as `b.c`; a `Param(i)` as `$i`; a `Literal` as its §3.5 text form quoted, with
+`'` doubled inside, then `::` and its type (`'3'::int64`); a pair list as `[name: value …]`; `SortKey` as
 `(asc|desc expr nulls_first|nulls_last)`; types as `int64`, `text?`, `{a: int64}`, `bag<…>`,
 `list<…>`, `union<T: {…}, …>`. A field holding its default is omitted.
 
@@ -1052,27 +1069,9 @@ the `set` nullable into a `NOT NULL` column and is refused with `Q3005`.
 
 ## 17. Open questions
 
-These need the user's decision; the spec above takes the stated provisional position.
+The questions this section listed have been answered; the answers, and what to revert for each, are in
+`docs/decisions.md` (Q1–Q12). One remains:
 
-1. **Unsigned integers and `int8`.** Excluded (§2.1) for SQL and Substrait alignment, although sysl
-   has every width. Should `uint8…uint64` exist?
-2. **Unbounded decimal.** Only `decimal(p ≤ 38)` exists. Is a Postgres-style arbitrary-precision
-   `numeric` needed?
-3. **Collation.** Text compares by octets only. Are collations (ICU or otherwise) in scope for v1, and
-   are they part of the type (`text collate x`) or of the comparison?
-4. **Scalar arrays.** A relation's element must be a record, so an array of integers is
-   `list<{value: int64}>`. Should `list<int64>` be allowed directly?
-5. **JSON.** No `json` type in 1.0. Is one wanted for documents that are genuinely schemaless?
-6. **Literals.** The tree has none, so even a constant `0` or a `LIMIT 3` is a parameter. Acceptable,
-   or should non-injectable compile-time constants (numbers, booleans) be allowed as literal nodes?
-7. **Schema file format** for the published tree schema: an own IDL, JSON Schema, or a sysl source the
-   others are generated from?
-8. **Support window**: how many previous majors must a server keep accepting?
-9. **Data-modifying CTEs** and **grouping sets**: deferred from 1.0 (§9, §14.2). Confirm.
-10. **Substrait outbound**: should TernDB export its plans as Substrait, and which Substrait versions
-    are the published range?
-11. **`Limit` over a bag** requires `arbitrary: true`. Is that strictness wanted, given that GraphQL
-    `first:` without `orderBy` then needs the flag from the front end?
-12. **Canonical text forms of values** (what `Cast` between `text` and each scalar parses and prints):
-    ISO 8601 for the time types and RFC 9562 for `uuid` are the obvious defaults. Should they be fixed
-    in this spec or in a separate value-format spec?
+1. **`int128`.** Decision Q2 lists the integer types as `int8…int64` and `uint8…uint64`, without
+   `int128`. This spec keeps `int128` (§2.1), because `sum` over `int64` (§6.7) and the `uint64`
+   coercion (§4.1) rely on it. Should it stay a user-visible type?

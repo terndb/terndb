@@ -12,7 +12,8 @@ checkable by a test that sends bytes and inspects the bytes, the error code or t
 lists the properties and the golden vectors. Text marked *Rationale* explains a choice and is not itself a rule.
 Text marked *Informative* has no force.
 
-References: `query-tree.md` is cited as **[QT]**, `isolation.md` as **[ISO]**. RFC 5802 and RFC 7677 (SCRAM),
+References: `query-tree.md` is cited as **[QT]**, `isolation.md` as **[ISO]**; every error code is registered in
+`errors.md`. RFC 5802 and RFC 7677 (SCRAM),
 RFC 9266 (TLS channel binding `tls-exporter`), RFC 8446 (TLS 1.3), RFC 7301 (ALPN).
 
 ## 0. Scope and relation to other protocols
@@ -26,22 +27,24 @@ RFC 9266 (TLS channel binding `tls-exporter`), RFC 8446 (TLS 1.3), RFC 7301 (ALP
 3. **Replication** (the WAL stream from a primary to its replicas) is deferred to its own specification,
    `replication.md`. This document reserves message types for it (§3.2) and says nothing else about it.
 4. **DDL** reaches the server only as SQL text until `ddl.md` exists ([QT] §1.5). The SQL front end is not part of
-   this protocol in version 1.0; see Open question 11.
+   this protocol: there is no request that carries SQL text, and DDL trees arrive with `ddl.md`.
 
 ## 1. Transport and framing
 
 ### 1.1 Transports
 
 1. A server MUST accept connections on TCP and SHOULD accept them on a Unix-domain stream socket. The default TCP
-   port is provisionally **7365** (Open question 1).
+   port is **7365**.
 2. On TCP the connection MUST be **direct TLS 1.3**: the client's first bytes are a TLS ClientHello, with ALPN
    protocol id `terndb`. There is no in-band upgrade request.
    *Rationale: direct TLS costs no extra round trip (Postgres's `SSLRequest` costs one) and leaves no plaintext
    prefix for a downgrade attack.*
-3. A server MAY be configured to accept **plaintext TCP**, but only on loopback addresses. It tells the two apart by
-   the first octet: `0x16` is a TLS record, `0x54` (`T`, the first octet of the preface, §1.2) is plaintext. Any
-   other first octet MUST close the connection without a response.
-4. A Unix-domain socket carries no TLS. Its security is the file system's.
+3. A server MUST NOT accept **plaintext TCP**, on any address, loopback included. A TCP connection whose first
+   octet is `0x54` (`T`, the first octet of the preface, §1.2) is a plaintext client: the server MUST answer it
+   with a plaintext `Error` `W3003` on stream 0 and close. Any first octet other than `0x16` (a TLS record) or
+   `0x54` MUST close the connection without a response.
+4. A Unix-domain socket carries no TLS. Its security is the file system's, and it is the one way to connect
+   without encryption: local unencrypted access uses it, typically with `peer` authentication (§2.4).
 5. A server MUST support at least 100,000 concurrently open connections. Connection state that is not in use (no
    open transaction, no in-flight request) SHOULD cost at most 16 KiB of server memory, so that clients need no
    connection pooler.
@@ -50,7 +53,7 @@ RFC 9266 (TLS channel binding `tls-exporter`), RFC 8446 (TLS 1.3), RFC 7301 (ALP
 
 ### 1.2 Preface
 
-Immediately after the TLS handshake (or at once on a plaintext or Unix connection), the client MUST send the
+Immediately after the TLS handshake (or at once on a Unix connection), the client MUST send the
 8-octet **preface** `54 45 52 4E 44 42 0D 0A` (`TERNDB\r\n`). The server MUST check it, and MUST close the
 connection without a response if it differs. The server sends no preface.
 *Rationale: a client that reached an HTTP server, a Postgres server or a stray port fails at once and visibly.*
@@ -186,7 +189,7 @@ client                                        server
    `-plus` binds the exchange to the TLS session, defeating a proxy that terminates TLS. A token covers services
    and short-lived credentials without a password at all. `peer` gives a local administrator a login with no
    secret to manage.*
-3. A client MUST NOT send a `token` over plaintext TCP, and MUST refuse a server that chooses `scram-sha-256`
+3. A client MUST refuse a server that chooses `scram-sha-256`
    (without `-plus`) on a TLS connection where the client offered `-plus`, unless the client is configured to
    allow it.
    *Rationale: the downgrade from `-plus` is the attack channel binding exists to stop.*
@@ -198,11 +201,14 @@ client                                        server
    sending any request; a failed verification MUST close the connection. If the server chose a method other than
    the client's first, it MUST ignore `initial`, and the client sends its first message for the chosen method in
    an `AuthResponse`.
-6. **Token.** The token's octets are `ClientHello.initial` (or the first `AuthResponse`). Its format is opaque to
-   this protocol: the server validates it against its own configured issuer (Open question 5).
+6. **Token.** The token's octets are `ClientHello.initial` (or the first `AuthResponse`). A token is an **opaque
+   random** string of at least 32 octets from a cryptographic generator, issued by the server and bound to one
+   user; the server stores only its SHA-256 hash and validates a token by hashing it and looking the hash up. There
+   are no signed tokens (JWT, PASETO) in 1.0.
 7. **Peer.** The server sends `ServerHello` with `auth_method = "peer"` and then `Ready` without waiting.
 8. `AuthChallenge` exists for methods with more than one server round; neither SCRAM nor token uses it in 1.0.
-9. TLS client certificates are not an authentication method in 1.0 (Open question 4).
+9. TLS client certificates are not an authentication method in 1.0. Mutual TLS (a certificate mapped to a user)
+   comes in Phase 2, as a new method name.
 
 ## 3. Message catalogue
 
@@ -249,7 +255,8 @@ The high bit of `type` is the direction: `0x00–0x7F` client to server, `0x80�
 | `0xA2` | `TxnStatus` | request | terminal |
 | `0xC0` | `Error` | request or 0 | terminal |
 
-Types `0x40–0x4F` and `0xD0–0xDF` are reserved for notifications (Open question 9); `0x60–0x6F` and
+Types `0x40–0x4F` and `0xD0–0xDF` are reserved for server-pushed notifications (LISTEN/NOTIFY, change feeds),
+which a later version adds; `0x60–0x6F` and
 `0xE0–0xEF` are reserved for `replication.md`. Every other unlisted type is reserved. In 1.0 all are `W1001`.
 
 ### 3.3 Responses per request
@@ -282,6 +289,7 @@ ClientHello   := list<(uvar major, uvar max_minor)> wire_versions     (non-empty
                  opt<bin>  initial                                    (first auth message for auth_methods[0])
                  uvar max_frame_size
                  SessionDefaults
+                 list<str> compression                               (codecs the client accepts; §6.4.7)
 
 SessionDefaults := opt<Isolation> isolation
                    opt<bool> synchronous
@@ -295,6 +303,7 @@ ServerHello   := uvar wire_major, uvar wire_minor
                  uvar max_frame_size
                  str  auth_method
                  bin  auth_data                                       (empty when the method sends none)
+                 str  compression                                     (the chosen codec; empty = none)
 
 AuthResponse  := bin data
 AuthChallenge := bin data
@@ -370,6 +379,7 @@ TxnOptions      := opt<Isolation> isolation
                    opt<uvar> after                                    ([ISO] §3.6 R3 causal token)
                    opt<uvar> lock_timeout_ms
                    opt<uvar> replica_wait_timeout_ms
+                   opt<uvar> max_lag_ms                               ([ISO] §3.6 R3a bounded staleness)
 
 Isolation       := enum { serializable, snapshot, read_committed }
 ```
@@ -420,18 +430,26 @@ Error         := §8.1
 
 ```
 params := uvar tuple_count                    (≥ 1)
-          tuple_count × ( for each ParamDecl in declaration order: the value, encoded per [QT] §12.6 )
+          list<uvar> columnar                 (indices of relation-typed parameters sent columnar; strictly ascending)
+          tuple_count × ( for each ParamDecl in declaration order: the value )
 ```
 
 1. Parameter values use [QT] §12.6 exactly: row-major, untagged, decoded by the declared types. A relation-valued
    parameter is its `uvar` count and its elements, as there.
-   *Rationale: parameters are small or are a single relation-valued parameter; one row encoding, already
-   specified, is enough. Columnar bulk input is Open question 3.*
-2. A statement with no parameters still sends `tuple_count = 1` and no values. `tuple_count = 0` is `Q4004`.
-3. Values that do not decode, or octets left over in `params`, are `Q1001`; a non-canonical value is `Q1003`;
+2. **Bulk input.** A relation-typed parameter whose index is in `columnar` is instead sent in the **result
+   encoding**: `uvar batch_count`, then `batch_count × bin`, each a §6.4 `Batch` payload whose column tree is
+   `Col(E)` for the parameter's element type `E` (§6.2) and whose `tuple` is 0. The value is the concatenation of
+   the batches' top-level rows, in order; `batch_count = 0` is the empty relation. A listed index that is out of
+   range, not ascending, or not of a relation type, and a batch inconsistent with §6, are `Q1001`.
+   *Rationale: a million-row parameter is then built and decoded column by column, with the decoder the client
+   already has for results.*
+3. A statement with no parameters still sends `tuple_count = 1`, an empty `columnar` and no values.
+   `tuple_count = 0` is `Q4004`.
+4. Values that do not decode, or octets left over in `params`, are `Q1001`; a non-canonical value is `Q1003`;
    invalid UTF-8 in a `text` value is `Q1004`; null in a non-nullable position is `Q4005`. The error's `path` is
-   `/params/<tuple>/<index>` (0-based), followed by `/<field or element index>` steps into a composite value.
-4. `tuple_count > 1` is a **parameter batch** ([QT] §10.3): the statement runs once per tuple, in order, within one
+   `/params/<tuple>/<index>` (0-based), followed by `/<field or element index>` steps into a composite value
+   ([QT] §11.1).
+5. `tuple_count > 1` is a **parameter batch** ([QT] §10.3): the statement runs once per tuple, in order, within one
    transaction, atomically. The results for each tuple are kept apart (§6.4 `tuple`) and `Complete.counts` has
    one entry per tuple.
 
@@ -468,9 +486,11 @@ params := uvar tuple_count                    (≥ 1)
    `W2005`. Before running, the server MUST re-validate the statement if the catalog version has changed since it
    was registered: a validation failure is reported with its [QT] code; a result type different from the one in
    `Prepared` is `W2007`, and the handle is released. The server MAY re-plan at any time.
-5. `ExecutePrepared` with `PlanRef.digest` runs the statement whose shape digest is given, **from the server-wide
-   plan cache**, on any connection. The server MUST either run it, exactly as if the client had sent a tree of that
-   shape, or refuse with `W2004` (`unknown_plan`, retryable) and run nothing. A client receiving `W2004` resends
+5. `ExecutePrepared` with `PlanRef.digest` runs the statement whose shape digest is given, **from the plan cache of
+   the connection's role**, on any connection of that role. The digest cache is keyed by (role, digest): a digest
+   that only another role has sent is unknown here, so a digest reveals nothing about other roles' queries. The
+   server MUST either run it, exactly as if the client had sent a tree of that shape, or refuse with `W2004`
+   (`unknown_plan`, retryable) and run nothing. A client receiving `W2004` resends
    the full tree with `Execute`.
    *Rationale: a client library keeps `digest → tree` and sends 32 octets in the common case; the server is free
    to evict, because the fallback is defined.*
@@ -499,7 +519,8 @@ params := uvar tuple_count                    (≥ 1)
 3. **Requests in implicit transactions, and requests on different transactions, are independent**: the server MAY
    run them concurrently and they MAY complete in any order. Each is atomic and isolated as [ISO] specifies; one
    pipelined behind another is not guaranteed to see its effects unless it starts after the other's terminal
-   message ([ISO] §3.5).
+   message ([ISO] §3.5). There is no option that orders implicit transactions; a client that needs
+   read-your-writes within a pipeline uses an explicit transaction.
 4. A request naming a prepared handle MUST be processed after every earlier request on the connection that
    registers that handle (`Prepare`, `Execute.prepare_as`) has completed. A request naming a transaction handle
    MUST likewise follow the `Begin` that opened it.
@@ -597,7 +618,7 @@ hands the same octets to its caller (§9). One decoder serves both.
    is fixed by the type; only lengths and contents vary.
 3. Nested relations are offsets into a child column, unions are a discriminant and an offset into a child per
    variant, and nullability is a validity bitmap — in each case Arrow's layout (§6.8).
-4. The result type MUST be **structural**: a server MUST NOT send a named catalog type (kinds 21–63 of [QT] §12.3);
+4. The result type MUST be **structural**: a server MUST NOT send a named catalog type (kinds 32–63 of [QT] §12.3);
    it sends the structure that name denotes.
 
 ### 6.2 The column tree
@@ -612,13 +633,14 @@ The column tree of a type is built by `Col(T)`, which yields one **column node**
 | `U` | Node kind | Buffers (after validity) | Children |
 |---|---|---|---|
 | `bool` | fixed, width 1 | `values` | — |
-| `int16`, `int32`, `int64`, `int128` | fixed, width 2, 4, 8, 16 | `values` | — |
+| `int8`, `int16`, `int32`, `int64`, `int128` | fixed, width 1, 2, 4, 8, 16 | `values` | — |
+| `uint8`, `uint16`, `uint32`, `uint64` | fixed, width 1, 2, 4, 8 | `values` | — |
 | `float32`, `float64` | fixed, width 4, 8 | `values` | — |
 | `decimal(p, s)` | fixed, width 16 | `values` | — |
 | `date` | fixed, width 4 | `values` | — |
 | `time`, `datetime`, `timestamp` | fixed, width 8 | `values` | — |
 | `interval`, `uuid` | fixed, width 16 | `values` | — |
-| `text`, `bytes` | varbin | `offsets`, `data` | — |
+| `text`, `bytes`, `json` | varbin | `offsets`, `data` | — |
 | `{n₁: T₁, …, nₖ: Tₖ}` | record | — | `Col(T₁)`, …, `Col(Tₖ)` |
 | `union<t₀: R₀, …, tₖ₋₁: Rₖ₋₁>` | union | `discriminants`, `offsets` | `Col(R₀)`, …, `Col(Rₖ₋₁)` |
 | `bag<E>`, `list<E>` | relation | `offsets` | `Col(E)` |
@@ -627,8 +649,10 @@ The column tree of a type is built by `Col(T)`, which yields one **column node**
 4. The **result's column tree** is `Col(E)` for the element type `E`. Its nodes are numbered in **pre-order**
    (node, then its children in order), and its buffers are numbered in the order of a pre-order walk, each node's
    buffers in the order of the table. Both numberings are what the batch uses.
-5. A union discriminant has width 1 octet when `k ≤ 256`, else 2 octets. A union with `k > 65,536` cannot be
-   encoded: a statement whose result type contains one is refused with `W2017` at validation.
+5. A union discriminant has width 1 octet when `k ≤ 256`, else 2 octets. A union has at most 65,536 variants
+   ([QT] §2.4, `Q3016`), so every result type is encodable.
+6. A relation's element type may be nullable or a scalar ([QT] §2.5): `Col(E)` handles both by rules 1 and 2, so a
+   null element is a slot of the element node with validity bit 0, and `list<int64>` has a fixed child.
 
 ### 6.3 Slots and column contents
 
@@ -686,6 +710,12 @@ Batch := uvar tuple                                (parameter tuple this batch b
    request's batches. A tuple that returns no rows sends no batch.
 6. `batch_rows`, when given, MUST NOT be exceeded. `batch_bytes`, when given, SHOULD NOT be exceeded except by a
    batch of one row. A server SHOULD default to batches of at most 1 MiB of payload.
+7. **Compression** is per batch, negotiated, and off by default. The only codec is `zstd`. A client that accepts it
+   lists it in `ClientHello.compression`; the server names it in `ServerHello.compression` only when it is
+   configured to compress (default: not), and otherwise sends the empty string. When `zstd` was chosen, the
+   payload of every server-to-client `Batch` message is one Zstandard frame whose decompressed content is the
+   payload above; credit (§7.2) counts the octets on the wire. A client decompresses into an 8-aligned buffer, so
+   rule 3 still holds. Nothing else is ever compressed.
 
 ### 6.5 Placeholders under nulls
 
@@ -854,7 +884,8 @@ The encoding is **Arrow-shaped but not Arrow IPC**.
    - An Arrow union has no validity bitmap; a nullable TernDB union needs one added (Arrow models it as a null
      variant).
    - Arrow type ids are `int8` (at most 128 variants); TernDB uses `u8` and, above 256 variants, `u16`.
-   - `date` ↔ `Date32`, `time` ↔ `Time64(us)`, `datetime` ↔ `Timestamp(us)` without zone, `timestamp` ↔
+   - `int8`/`uintN` ↔ `Int8`/`UIntN`, `json` ↔ `Utf8` (or the `arrow.json` extension),
+     `date` ↔ `Date32`, `time` ↔ `Time64(us)`, `datetime` ↔ `Timestamp(us)` without zone, `timestamp` ↔
      `Timestamp(us, "UTC")`, `decimal(p, s)` ↔ `Decimal128(p, s)`, `uuid` ↔ `FixedSizeBinary(16)` (or the
      `arrow.uuid` extension) map without conversion.
 2. *Rationale for not using Arrow IPC itself.* Arrow IPC carries its schema as Flatbuffers, so a client would need
@@ -862,7 +893,8 @@ The encoding is **Arrow-shaped but not Arrow IPC**.
    is in the type, `bag` versus `list`, union tags and record field order as part of identity), so the schema would
    need a side channel anyway; and its message framing duplicates this protocol's. Taking Arrow's buffer layouts
    and nothing else keeps conversion cheap and the decoder small.
-3. Whether the C ABI also offers the Arrow C Data Interface is Open question 12.
+3. Version 1.0 of the C ABI does not export the Arrow C Data Interface. A later version adds export of batches as
+   `ArrowArray`/`ArrowSchema`, with the conversions of rule 1.
 
 ## 7. Streaming, flow control and cancellation
 
@@ -925,64 +957,38 @@ ErrorEntry := str code
               opt<(uvar start, uvar end)> span                  (source span from the envelope's Spans)
 ```
 
-1. `code` is the stable code, written exactly as its defining spec writes it: a [QT] code (`Q2003`, `R0002`), an
-   [ISO] code (`serialization_failure`, `unique_violation`) or a code of this document (`W2004`). Clients and tests
-   match on `code` alone.
-2. `path` is the [QT] §11.1 path into the tree (`/statement/source/rows/0/1`), or the parameter path of §4.2.3. For
+1. `code` is the stable code from the registry in `errors.md`: one area letter and four digits (`Q2003`, `R0002`,
+   `T1001`, `W2004`, `D1001`). It is always the code, never its `snake_case` name (`serialization_failure` is
+   `T1001`). Clients and tests match on `code` alone.
+2. `path` is the [QT] §11.1 path into the tree (`/statement/source/rows/0/1`), or the parameter path of §4.2.4. For
    a runtime error the server SHOULD give the path of the node whose evaluation failed.
 3. A validation error MUST carry, as `entries`, every error [QT] §11.2 requires: the first phase's errors sorted by
    path, the pre-order-first one first.
 4. `span` is present when the envelope carried `spans` and one covers the node at `path` ([QT] §5.4).
-5. `retryable` is true iff `entries[0].code` is retryable under [ISO] §5.2 (`serialization_failure`,
-   `deadlock_detected`, `lock_timeout`, `schema_changed`, `replica_lag_timeout`, `replica_conflict`, `cancelled`,
-   `resource_exhausted`) or is `W2004` or `W2008`. A retryable error MUST guarantee that the request had no effect,
+5. `retryable` is true iff `entries[0].code` is marked retryable in `errors.md` (the `T1…` codes, `W2004`, `W2008`
+   and `W4001`). A retryable error MUST guarantee that the request had no effect,
    and for a transaction-aborting code that the transaction had no effect ([ISO] §5.2).
 6. `txn_state` says what became of the request's transaction: `unaffected` (an implicit transaction rolled back,
    or a request outside any transaction), `aborted` (an explicit transaction that now accepts only `Rollback`,
    `RollbackToSavepoint` or `Commit`), `closed` (the handle is released: a failed `Commit`, a `Begin` that failed).
 7. `txid` is present whenever a transaction id had been assigned; it is required for `commit_unknown`.
-8. A connection-fatal error is sent on stream 0 and the connection is then closed by its sender. Every `W1…` and
-   `W3…` code, `W1005` and a handshake-time `Q1005` or `W2011` is fatal; no other code is.
+8. A connection-fatal error is sent on stream 0 and the connection is then closed by its sender. The codes marked
+   fatal in `errors.md` (every `W1…` and `W3…` code), and a handshake-time `Q1005` or `W2011`, are fatal; no other
+   code is.
 
 ### 8.2 Codes of this document
 
-| Code | Meaning | Fatal | Retryable |
-|---|---|---|---|
-| `W1001` | Malformed frame or message: bad reserved field or flag, unknown or wrong-direction type, payload length mismatch, non-canonical primitive | yes | no |
-| `W1003` | Frame larger than `max_frame_size`, or message larger than `max_message_size` | yes | no |
-| `W1004` | Message out of order for the handshake state | yes | no |
-| `W1005` | No common wire protocol major version | yes | no |
-| `W1006` | Request id zero, or not greater than every earlier one | yes | no |
-| `W1007` | Fragmentation error: empty `MORE` frame, type change within a message | yes | no |
-| `W1008` | (client-side) The server sent a batch inconsistent with §6 | yes | no |
-| `W2001` | Unknown transaction handle | no | no |
-| `W2002` | Transaction handle already open | no | no |
-| `W2003` | Transaction is aborted; only `Rollback`, `RollbackToSavepoint`, `Commit` accepted | no | no |
-| `W2004` | `unknown_plan`: shape digest not in the plan cache; resend the tree | no | yes |
-| `W2005` | Unknown prepared handle | no | no |
-| `W2006` | Prepared handle already registered | no | no |
-| `W2007` | Prepared statement's result type changed after a catalog change; handle released | no | no |
-| `W2008` | Too many in-flight requests on the connection | no | yes |
-| `W2010` | `txid` older than `status_horizon` | no | no |
-| `W2011` | Invalid or misplaced option (out-of-range value, `implicit` with `txn ≠ 0`) | handshake only | no |
-| `W2012` | Unknown savepoint | no | no |
-| `W2014` | A single row exceeds an encoding limit (§6.3.8) or `max_message_size` | no | no |
-| `W2016` | Too many open transactions on the connection | no | no |
-| `W2017` | Result type not encodable (a union with more than 65,536 variants) | no | no |
-| `W3001` | Authentication failed | yes | no |
-| `W3002` | No acceptable authentication method | yes | no |
-| `W3003` | TLS required (plaintext connection from a non-loopback address) | yes | no |
-| `W3004` | Unknown database | yes | no |
-| `W4001` | Server shutting down (in `Goodbye`, and for a request after it) | no | yes |
-| `W4002` | Idle connection closed (in `Goodbye`) | no | no |
-
-Codes are never reused; a withdrawn code stays reserved. `W4001` is retryable on another connection.
+The `W` codes this document raises, with their names and their fatal and retryable marks, are registered in
+`errors.md` §5, which is the one list of them; this document cites them by code. `W2017` is withdrawn: a union
+too wide for a 2-octet discriminant is now refused by validation (`Q3016`). `W4001` is retryable on another
+connection.
 
 ### 8.3 Which code a failure gets
 
 1. A failure inside the tree envelope or the parameter block is a [QT] code (`Q…`), never a `W` code.
-2. A runtime error during execution is an `R…` code ([QT] §11.3) or an [ISO] §5.2 code.
-3. An abort is reported with exactly one [ISO] §5.2 code as `entries[0].code` ([ISO] §5.1).
+2. A runtime error during execution is an `R…` code, a `T…` code ([ISO] §5.2) or a `D…` code (storage).
+3. An abort is reported with exactly one [ISO] §5.2 code (a `T…` code, or `D1001`) as `entries[0].code`
+   ([ISO] §5.1).
 4. Everything about framing, sessions, handles and authentication is a `W` code.
 
 ## 9. The C ABI view of the same encoding
@@ -1135,37 +1141,11 @@ query and data, and compare `terndb_batch_bytes` to the vector.
 
 ## 11. Open questions
 
-These need the user's decision; the spec above takes the stated provisional position.
+The questions this section listed have been answered; the answers, and what to revert for each, are in
+`docs/decisions.md` (W1–W14). Two remain:
 
-1. **Port.** The default TCP port is provisionally 7365 (unassigned by IANA at the time of writing). Which number,
-   and should it be registered?
-2. **`bool` width in results.** One octet per value, because [QT] §12.6 fixes it and one value decoder then serves
-   parameters and results. Arrow packs bits. Should result columns pack `bool` (changing [QT] §12.6 for results
-   only)?
-3. **Columnar parameter input.** Parameters are row-major (§4.2). A relation-valued parameter of a million rows
-   would be cheaper to build and decode in the §6 layout. Should a parameter of relation type be sendable as
-   batches (a `ParamBatch` message), for bulk load?
-4. **Client certificates.** Is mutual TLS (certificate → user mapping) needed in 1.0, or is `token` enough for
-   service accounts?
-5. **Token format.** Opaque tokens validated by a server-side table, or signed tokens (JWT/PASETO) validated
-   against a configured issuer key, or both?
-6. **Plaintext TCP.** Allowed on loopback only (as specified), or never, with local unencrypted access only over
-   the Unix socket?
-7. **Plan-cache scope for digests.** Server-wide (as specified). Should it be per database, per user (a digest
-   could reveal that someone else ran a query of that shape via timing), or should `ExecutePrepared` by digest be
-   restricted to digests this user has prepared?
-8. **Compression.** No compression in 1.0. Should batches be compressible (per-buffer LZ4 or Zstandard, negotiated
-   in the handshake)?
-9. **Notifications.** Types are reserved for server-pushed notifications (LISTEN/NOTIFY, change feeds). Are they
-   wanted, and in which version?
-10. **Ordered implicit transactions.** Pipelined implicit transactions are independent (§4.6.3). Should there be an
-    option that makes a connection's implicit transactions start in arrival order, giving read-your-writes within a
-    pipeline without an explicit transaction?
-11. **SQL text over the native protocol.** Version 1.0 accepts only trees; DDL needs SQL ([QT] §1.5). Should there
-    be an `ExecuteSql` request (text in, same result format out) for DDL and tools, before `ddl.md` exists?
-12. **Arrow C Data Interface.** Should `libterndb` export batches as `ArrowArray`/`ArrowSchema` (with the
-    conversions of §6.8.1), so DuckDB, Polars and pandas consume them directly?
-13. **Union discriminant width.** Variable (1 or 2 octets, by arity) as specified, or a fixed 2 octets for
-    simplicity, or a fixed 1 octet with a 256-variant limit written into [QT] §2.4?
-14. **Error-code style.** [QT] uses `Qnnnn`/`Rnnnn`, [ISO] uses names (`serialization_failure`), this document
-    `Wnnnn`. The wire carries each as written. Should the three be unified before 1.0 freezes?
+1. **Registering the port.** The default port is 7365 (§1.1), unassigned by IANA at the time of writing. Should it
+   be registered?
+2. **DDL before `ddl.md`.** With no SQL text over this protocol (§0.4) and the Postgres wire layer in Phase 2, a
+   client of this protocol alone has no way to run DDL until `ddl.md` adds DDL trees. Is that acceptable for
+   Phase 1, with DDL run through the C ABI or a tool?

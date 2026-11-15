@@ -31,8 +31,9 @@ References used throughout:
 | Read committed | `READ COMMITTED` | PL-2, with each statement reading one real-time snapshot | none |
 
 On a replica every transaction is read-only and sees a consistent prefix of the primary's commit order (§3.6).
-`REPEATABLE READ` is accepted as a synonym of `SNAPSHOT`; `READ UNCOMMITTED` is accepted as a synonym of
-`READ COMMITTED`. No level ever exposes uncommitted data.
+Only the Postgres wire layer accepts `REPEATABLE READ` (as `SNAPSHOT`) and `READ UNCOMMITTED` (as
+`READ COMMITTED`), for compatibility with Postgres clients; TernDB's own dialect and the native protocol refuse
+them. No level ever exposes uncommitted data.
 
 The four choices that shape everything below:
 
@@ -73,7 +74,7 @@ A transaction `Ti` is a sequence of events:
 | Event | Meaning |
 |---|---|
 | `b_i` | begin; at snapshot and serializable this fixes the snapshot `s_i` (§4.1) |
-| `r_i(x_j)` | item read: `Ti` reads version `x_j` of object `x` |
+| `r_i(x_j)` | item read: `Ti` reads version `x_j` of object `x`; the read records the set `C` of columns it used |
 | `r_i(P: Vset(P))` | predicate read: `Ti` evaluates predicate `P` over tables `T(P)`; `Vset(P)` names, for every object of `T(P)`, the version selected (unborn and dead versions included) |
 | `w_i(x_i)` | write (insert, update or delete) of `x` |
 | `c_i` | commit; assigns the commit sequence number `c_i` (§4.1) |
@@ -93,8 +94,8 @@ For committed transactions `Ti ≠ Tj`, following [Adya]:
 - **ww (write-depends):** `Ti` installs `x_i` and `Tj` installs the next version `x_j` of `x` in `<<_x`.
 - **wr (read-depends):** item: `Tj` reads `x_i`. Predicate: `Tj` performs `r_j(P: Vset(P))`, `x_i ∈ Vset(P)`,
   and `x_i` changes the matches of `P` relative to the version preceding it in `<<_x`.
-- **rw (anti-depends):** item: `Ti` reads `x_k` and `Tj` installs the version of `x` that immediately follows
-  `x_k`. Predicate: `Ti` performs `r_i(P: Vset(P))`, `x_k ∈ Vset(P)`, and `Tj` installs a later version `x_j`
+- **rw (anti-depends):** item: `Ti` reads columns `C` of `x_k` and `Tj` installs the first version of `x` after
+  `x_k` that differs from `x_k` in visibility or in a column of `C` (reads are column-precise, §4.3). Predicate: `Ti` performs `r_i(P: Vset(P))`, `x_k ∈ Vset(P)`, and `Tj` installs a later version `x_j`
   (`x_k <<_x x_j`) that changes the matches of `P` relative to `x_k`.
 - **rt (real-time):** `Ti`'s commit was acknowledged to its client before `Tj`'s begin was invoked (§2.5). Not an
   Adya edge; used only for the strict and strong variants.
@@ -214,6 +215,10 @@ the primary's WAL in order and MUST satisfy:
   carry `after = n`; the replica MUST then wait until it has applied `c ≥ n` before taking the snapshot, or fail
   with `replica_lag_timeout` after `replica_wait_timeout`. A client that passes its session's highest observed
   `commit`/`snapshot` gets read-your-writes and monotonic reads across the primary and every replica.
+- **R3a bounded staleness (optional).** A begin MAY instead, or as well, carry `max_lag = t`; the replica MUST
+  then take a snapshot that includes every commit the primary had made durable at least `t` before the begin,
+  waiting for it, or fail with `replica_lag_timeout` after `replica_wait_timeout`. Without `max_lag` a replica
+  imposes no staleness bound.
 - **R4 no unflushed data.** A replica MUST NOT apply WAL that is not durable on the primary. A replica therefore
   never shows a transaction that a primary crash could lose.
 
@@ -247,8 +252,9 @@ of the commit order is serializable (§5.5). A replica transaction never aborts 
 The row header holds the write lock: the id of the uncommitted transaction that owns the in-place version, if
 any. When `Ti` writes object `x`:
 
-1. If `x` is locked by another live transaction `Tj`, `Ti` MUST wait until `Tj` commits or aborts (subject to
-   deadlock detection and `lock_timeout`, §5).
+1. If `x` is locked by another live transaction `Tj`, `Ti` MUST wait until `Tj` commits or aborts. This is the
+   only policy, at every level: the wait is bounded by `lock_timeout` (`lock_timeout`, §5.2) and by deadlock
+   detection over the wait-for graph (`deadlock_detected`). Waiting saves the abort when `Tj` rolls back.
 2. Let `x_k` be the newest committed version. At snapshot and serializable, if `c_k > s_i` (it is not in `Ti`'s
    snapshot), `Ti` MUST abort with `serialization_failure`. Otherwise `Ti` locks `x`, pushes `x_k` onto the undo
    chain and installs its version in place.
@@ -271,7 +277,9 @@ and `Ti`'s commit. So `<<_x` is the commit order of the writers, and for every w
 ### 4.3 Serializable: the predicate log and validation
 
 A serializable transaction `Ti` keeps a **predicate log** `L_i`: one entry per base-table access, each a table
-and a predicate `L` over that table's rows (§4.4). At commit, if `Ti` has written anything, it MUST validate:
+and a predicate `L` over that table's rows (§4.4), together with the set `C` of the table's columns the access
+used: every column its membership predicate or its result reads. At commit, if `Ti` has written anything, it
+MUST validate:
 
 ```
 validate(Ti):
@@ -279,21 +287,25 @@ validate(Ti):
     wait until every commit with c < c_i is published or aborted
     for each committed Tj with s_i < c_j < c_i:   -- committed during Ti's lifetime
         for each write w of Tj to a table of L_i:
-            for each entry (table, L) of L_i on that table:
-                if before(w) matches L or after(w) matches L:
+            for each entry (table, L, C) of L_i on that table:
+                if w changes visibility or a column of C,
+                   and (before(w) matches L or after(w) matches L):
                     abort Ti with serialization_failure
     publish Ti
 ```
 
 `before(w)` is the version `w` replaced (none for an insert), `after(w)` the version it installed (none for a
-delete); a dead or absent image matches nothing. Validation and publication of `Ti` MUST be equivalent to running
+delete); a dead or absent image matches nothing. An insert or a delete always changes visibility. Validation is
+**column-precise**: a write that changed only columns `Ti` never read does not abort it. Coarsening (§4.4) MAY
+widen `C`, up to every column of the table. Validation and publication of `Ti` MUST be equivalent to running
 atomically with respect to other committing transactions; an implementation MAY validate in parallel and MAY
 validate early against commits already published, provided the outcome equals the procedure above.
 
 - **Retention.** The write images of every committed `Tj` MUST be retained until no active serializable
   transaction has `s < c_j`. It MAY retain only the columns some logged predicate reads.
-- **Precision.** Only writes whose images match a logged predicate abort `Ti`; a concurrent write to a disjoint
-  part of a table, or one that touches neither image's match, never aborts it. This is the difference from
+- **Precision.** Only writes whose images match a logged predicate and that change a column the entry read abort
+  `Ti`; a concurrent write to a disjoint part of a table, to columns `Ti` did not read, or one that touches
+  neither image's match, never aborts it. This is the difference from
   [Cahill]'s SSI, which aborts on a dangerous structure of two rw edges whether or not a cycle closes, and
   tracks reads at page or relation granularity under memory pressure.
 - **A transaction with an empty write set** skips validation and is serialized at `s_i` (§5.5).
@@ -342,7 +354,9 @@ A column may hold a relation. The rules:
 Soundness of N3–N4: a write `w` to row `x` can change the read's result only if `x` is a member before or after
 `w`, or its nested content changes while it is a member; in each case `before(w)` or `after(w)` satisfies the
 membership predicate. The cost of N1 is granularity: two transactions that change different elements of the same
-row's nested relation conflict under §4.2 (see Open questions).
+row's nested relation conflict under §4.2. Version 1 has no element-level versioning or locking: a nested
+relation is one value of its row, stored whole (`on-disk-format.md` §4.7–§4.8). For validation (§4.3) it is one
+column: a read of any part of it reads that column.
 
 ### 4.6 Proof sketches
 
@@ -368,12 +382,17 @@ commit, the history is in the SI class of [Adya]/[Cerone], which forbids cycles 
 
 **Serializable forbids G2 (with predicates).** Claim: every DSG edge `Ti → Tj` among serializable transactions
 with writes has `c_i < c_j`. ww and wr: shown above. rw: let `Ti →rw Tj`. By Lemma B, `c_j > s_i`. Suppose
-`c_j < c_i`. Then `Tj` committed in `(s_i, c_i)`. *Item read* of `x_k`: `Tj`'s write `w` has `before(w) = x_k`.
-If `x_k` is visible it matches `key = k`; if it is dead or unborn, `w` is an insert and `after(w)` matches. *Predicate
-read*: `x_j` changes the matches of `P` relative to `x_k`. Let `x_m` be the first version after `x_k` in `<<_x`
-whose match differs from `x_k`'s; its writer `Tm` has `s_i < c_m ≤ c_j < c_i`, and exactly one of its images
-`x_{m-1}`, `x_m` matches `P`, hence (soundness, `P ⇒ L`) matches `L`. In both cases `validate(Ti)` examines that
-write and aborts `Ti`, contradicting its commit. So `c_j > c_i`. With every edge increasing in `c`, the DSG is
+`c_j < c_i`. Then `Tj` committed in `(s_i, c_i)`. *Item read* of columns `C` of `x_k`: by §2.3, `Tj`'s write `w`
+is the first after `x_k` to change visibility or a column of `C`, so validation examines it, and `before(w)`
+agrees with `x_k` on visibility and on `C`. If `x_k` is visible, `before(w)` therefore matches `key = k`; if it is
+dead or unborn, `w` changes visibility to visible and `after(w)` matches. *Predicate read*: `x_j` changes the
+matches of `P` relative to `x_k`. Let `x_m` be the first version after `x_k` in `<<_x` whose match differs from
+`x_k`'s; its writer `Tm` has `s_i < c_m ≤ c_j < c_i`. Its write changes visibility or a column `P` reads, which is
+in `C`, so validation examines it; and exactly one of its images `x_{m-1}`, `x_m` matches `P`, hence
+(soundness, `P ⇒ L`) matches `L`. In both cases `validate(Ti)` aborts `Ti`, contradicting its commit.
+*Column precision* is sound because a write that changes no column of `C` and no visibility changes nothing `Ti`
+observed: with objects taken at column granularity it creates no rw edge from `Ti`, and ww edges, still taken
+per row by first-updater-wins, only add edges that already increase in `c`. So `c_j > c_i`. With every edge increasing in `c`, the DSG is
 acyclic and the commit order is a serial order.
 
 **Read-only transactions.** A transaction `R` with an empty write set has no incoming rw edge (it installs
@@ -400,20 +419,10 @@ The mechanised version of these arguments is the model of §7.4.
 
 ### 5.2 Error codes
 
-| Code | Raised when | Levels | Retryable |
-|---|---|---|---|
-| `serialization_failure` | first-updater-wins conflict (§4.2 rule 2 or 4); validation failure (§4.3) | SI, SER | yes |
-| `deadlock_detected` | the wait-for graph of row locks has a cycle; the victim aborts | all | yes |
-| `lock_timeout` | a row-lock wait exceeded `lock_timeout` | all | yes |
-| `schema_changed` | a DDL on a table this transaction used committed during its lifetime (§5.6) | all | yes |
-| `replica_lag_timeout` | `after` not reached within `replica_wait_timeout` | replica | yes |
-| `replica_conflict` | WAL replay needed to remove a structure this replica transaction uses (§5.6) | replica | yes |
-| `cancelled` | the client, an administrator or a shutdown cancelled it before commit | all | yes |
-| `resource_exhausted` | memory, undo space or disk full; the transaction is aborted | all | yes, after back-off |
-| `commit_unknown` | the server cannot say whether the commit happened (e.g. it lost the WAL device mid-commit) | all | **no** — resolve first (§5.4) |
-| `unique_violation`, `check_violation`, `foreign_key_violation`, `not_null_violation` | a constraint fails on data visible to the transaction | all | no |
-| `read_only_transaction` | a write in a read-only transaction or on a replica | all | no |
-| `data_corrupted` | a checksum or structural check failed; the server stops serving the object | all | no |
+The codes of this document are the `T` codes of `errors.md` §4, which gives each one's code, name, the condition
+that raises it, the levels it applies at and whether it is retryable; that registry is the one list of them.
+This document refers to them by name (`serialization_failure` is `T1001`). Corruption is the storage code
+`data_corrupted` (`D1001`, `errors.md` §6).
 
 A retryable code MUST guarantee that the transaction is aborted and had no effect. `serialization_failure` MUST
 NOT be raised for a transaction with an empty write set at serializable or snapshot (§5.5), and MUST NOT be raised
@@ -432,7 +441,9 @@ same snapshot, because the new attempt's snapshot includes the conflicting commi
 A connection lost after the commit was sent, or `commit_unknown`, leaves the outcome unknown to the client. The
 server MUST answer `transaction_status(txid)` with `committed(c)`, `aborted` or `in_progress` for every `txid`
 younger than `status_horizon` (at least the last 24 hours of ids); after a crash, every transaction that was not
-recovered as committed MUST report `aborted`. A client MUST resolve an unknown outcome this way before retrying
+recovered as committed MUST report `aborted`. For a `txid` older than `status_horizon` the server MUST NOT guess:
+it answers with the error `status_horizon_passed` (`W2010`, `errors.md` §5), and the outcome stays unknown to
+the client. A client MUST resolve an unknown outcome this way before retrying
 a non-idempotent transaction. The harness uses the same query to resolve `info` records.
 
 ### 5.5 Read-only transactions
@@ -443,7 +454,9 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
   where the read-only anomaly of [Fekete] forces a read-only transaction to wait for a safe snapshot, here every
   snapshot is safe, because the serial order is the commit order and a snapshot is a prefix of it.
 - A long-running read-only transaction holds back undo garbage collection. TernDB MUST NOT abort a reader to
-  reclaim undo space unless `max_snapshot_age` is set, in which case it aborts with `resource_exhausted`.
+  reclaim undo space except in two cases, both with `resource_exhausted` (`details.reason = "snapshot_too_old"`):
+  its snapshot is older than `max_snapshot_age` (default 1 hour, configurable; 0 means no limit), or the undo
+  held exceeds `undo_retention_limit` and it holds the oldest snapshot (`on-disk-format.md` §5.5).
 
 ### 5.6 DDL
 
@@ -460,8 +473,12 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
   scan as a serializable read whatever the transaction's level, so that no concurrent commit can slip a row past
   the check.
 - On a replica, replay of a DDL that drops or rewrites a structure a replica transaction is using MUST wait up to
-  `max_replay_delay` and then abort that transaction with `replica_conflict`. DML replay never conflicts with
-  replica readers: a replica keeps its own undo chains for its own snapshots.
+  `max_replay_delay` and then abort that transaction with `replica_conflict`. Replay of row changes never
+  conflicts with replica readers, because replay rebuilds the primary's undo chains (`on-disk-format.md` §6.11).
+  Replay of an `UNDO_TRUNCATE` that removes undo a replica snapshot still needs is treated like such a DDL,
+  unless the replica feeds its oldest snapshot back to the primary, which is opt-in and off by default
+  (`on-disk-format.md` §5.5).
+- Online DDL (DDL that does not wait for the table's writers) is the subject of `ddl.md`.
 
 ## 6. Commit and replication
 
@@ -471,12 +488,16 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
   commit record. A read-only transaction at `on` MUST NOT be acknowledged until the WAL is durable through its
   snapshot `s`. Hence an acknowledged `on` transaction never depends on data a crash can lose.
 - **`synchronous = off`** (per transaction): the commit MAY be acknowledged once published, before the fsync.
+  This is TernDB's asynchronous commit; there is no separate feature for it.
   Publication before durability is allowed at both settings: an unflushed commit may be visible to other
   transactions, but none of those can be acknowledged at `on` before it is durable, because their commit records
   (or snapshots) follow it in the WAL.
 - An fsync error MUST be treated as a crash of the WAL: the server stops accepting commits and recovers from the
   last durable state. It MUST NOT retry the fsync and continue.
 - Replication streams WAL that is durable on the primary (R4), in WAL order.
+- **`synchronous = remote`** (acknowledge only once a replica also has the WAL durable through the commit record,
+  so that acknowledged commits survive failover) comes in Phase 3, with `replication.md`. Until then a server
+  MUST refuse it as an invalid option.
 
 ## 7. Checkable properties
 
@@ -573,7 +594,8 @@ failing seed is kept as a regression seed.
 
 ### 7.4 The model
 
-An executable model of §4 MUST be model-checked for the properties of §3: snapshots and the visible horizon,
+An executable model of §4, **written in sysl and run inside the simulator of §7.3 in CI** (its scheduler
+explores the interleavings), MUST be model-checked for the properties of §3: snapshots and the visible horizon,
 first-updater-wins with waits, the predicate log and `validate`, read committed's re-evaluation, `synchronous`
 and crash recovery to a WAL prefix, and a replica applying a durable prefix. The checked property is that every
 reachable history has an acyclic `DSG+rt` among serializable transactions, no forbidden SI cycle among snapshot
@@ -604,32 +626,16 @@ satisfies:
 A replica crash loses nothing the primary has; on restart the replica resumes applying from its last durable
 position, and its first snapshot after restart MAY be older than one it served before the crash (R2 is per
 connection). Failover to a replica (promotion) yields the replica's applied prefix: commits acknowledged on the
-primary but not yet applied on the promoted replica are lost, at every `synchronous` setting (see Open
-questions).
+primary but not yet applied on the promoted replica are lost, at every `synchronous` setting until
+`synchronous = remote` exists (§6). The old primary is **fenced** by a term number carried in the WAL: a
+promotion starts a higher term, and a primary that learns of a higher term MUST stop acknowledging commits. The
+details are `replication.md`'s.
 
 ## Open questions
 
-1. **Wait or abort on a locked row.** §4.2 waits for the lock holder and then aborts if it committed (as
-   Postgres does). HyPer aborts at once. Waiting saves the abort when the holder rolls back, at the cost of
-   blocked writers and a deadlock detector. Which should be the default, and should it be a setting?
-2. **Nested-element granularity.** N1 makes two writers of different elements of one row's nested relation
-   conflict. Should large nested relations get element-level versioning and locking, at the cost of a second
-   versioning scheme and a weaker meaning of "one read"?
-3. **Projection-aware validation.** Validation aborts on any matching image, even when the concurrent write
-   changed only columns the reader never looked at. Restricting the test to read columns would abort less, but
-   breaks the "all edges increase in `c`" argument of §4.6 and needs its own proof. Pursue it?
-4. **Synchronous replication.** Should there be `synchronous = remote` (acknowledge after a replica has the WAL
-   durable), so that acknowledged commits survive failover? Without it, failover can lose acknowledged `on`
-   commits.
-5. **Fencing on failover.** How is an old primary prevented from acknowledging commits after a replica is
-   promoted: an operator duty, a lease, or an epoch in the WAL?
-6. **Bounded staleness on replicas.** Should a replica begin accept `max_staleness = t` in addition to
-   `after = n`?
-7. **`max_snapshot_age` default.** Unlimited (as specified) protects readers; a limit protects undo space. Which
-   default, and is `resource_exhausted` the right code for it?
-8. **The model's language.** Is the §7.4 model written in TLA+ (checked with TLC or Apalache), or in sysl and
-   explored by the simulator's own scheduler? TLA+ is not database code, but the project rule is sysl only.
-9. **Online DDL.** §5.6 makes DDL wait for writers of the table. Rewrite-free DDL could avoid that; table-rewriting
-   DDL needs a design of its own.
-10. **Synonyms.** Should `REPEATABLE READ` and `READ UNCOMMITTED` be accepted as synonyms, or refused, since
-   TernDB's dialect is its own?
+The questions this section listed have been answered; the answers, and what to revert for each, are in
+`docs/decisions.md` (Q13–Q22). One remains:
+
+1. **The code for an aged-out snapshot.** §5.5 reports both snapshot limits as `resource_exhausted` with
+   `details.reason = "snapshot_too_old"`. Should "snapshot too old" be a `T` code of its own, so a client can tell
+   it from a full disk without reading `details`?
