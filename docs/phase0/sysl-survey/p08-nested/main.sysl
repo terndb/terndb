@@ -1,0 +1,49 @@
+// Need 8: nested result values: a recursive tagged union holding arrays of records holding arrays,
+// built and walked without a box per element.
+import sysl.buf.{Buf, buf}
+
+enum Value
+    Null
+    Int(v: i64)
+    Text(s: string)
+    List(items: Buf[Value])
+    Rec(fields: Buf[Field])
+
+struct Field
+    name: string
+    value: Value
+
+// Walk by reference into the buffer's storage: does reading an element take a count?
+weight(v: Value) -> i64 = v match
+    Null -> 0
+    Int(n) -> n
+    Text(s) -> i64(s.len)
+    List(items) -> sum_items(items)
+    Rec(fields) -> sum_fields(fields)
+
+sum_items(items: Buf[Value]) -> i64
+    var t: i64 = 0
+    for x in items do t += weight(x)
+    t
+
+sum_fields(fields: Buf[Field]) -> i64
+    var t: i64 = 0
+    for f in fields do t += weight(f.value)
+    t
+
+// a result set: 1000 rows, each a record of an id, a name and a list of 3 tags
+var rows: Buf[Value] = buf()
+
+for i in 0..<1000
+    var tags: Buf[Value] = buf()
+    for k in 0..<3 do tags.push(Int(k))
+
+    var fields: Buf[Field] = buf()
+    fields.push(Field("id", Int(i)))
+    fields.push(Field("name", Text("row")))
+    fields.push(Field("tags", List(tags)))
+    rows.push(Rec(fields))
+
+val result = List(rows)
+
+print(sizeof(Value), sizeof(Field), weight(result))

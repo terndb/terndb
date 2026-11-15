@@ -1,0 +1,60 @@
+// Need 5: positional I/O, fsync / fdatasync, bypassing the page cache, mmap.
+import sysl.fs.{create_update, map_file}
+import sysl.process.pid
+
+// What sysl.fs does not offer, reached through libc directly. Each is one line, and each is the
+// program writing an extern sysl.fs could have carried.
+@needs(os)
+extern fcntl(fd: i32, cmd: i32, ...) -> i32
+@needs(os)
+extern fsync(fd: i32) -> i32
+@needs(os)
+extern mmap(addr: *u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *u8
+@needs(os)
+extern msync(addr: *u8, len: usize, flags: i32) -> i32
+@needs(os)
+extern munmap(addr: *u8, len: usize) -> i32
+
+#if macos
+const F_NOCACHE = 48
+const F_FULLFSYNC = 51
+const MAP_SHARED = 1
+#else
+const F_NOCACHE = 0
+const F_FULLFSYNC = 0
+const MAP_SHARED = 1
+#endif
+const PROT_RW = 3
+const MS_SYNC = 16
+
+val name = "/tmp/dbsurvey-p05-{pid()}.db"
+var f = create_update(name).unwrap()
+
+var page: [16384]u8 = [0; 16384]
+page[0] = 0xDB
+page[16383] = 0x5A
+
+// pwrite / pread at page 3
+print("wrote", f.write_at(3 * 16384, page[..]).unwrap())
+var back: [16384]u8 = [0; 16384]
+val got = f.read_at(3 * 16384, back[..]).unwrap()
+print("read", got.len, got[0], got[16383])
+
+// fsync through the library; fdatasync and F_FULLFSYNC have no library form
+print("sync", f.sync().is_ok())
+
+val fd = i32(f.fd().unwrap())
+print("F_NOCACHE", fcntl(fd, i32(F_NOCACHE), 1))
+print("F_FULLFSYNC", fcntl(fd, i32(F_FULLFSYNC)))
+
+// a writable shared mapping, which sysl.fs.Mapped (private, read-only) cannot make
+val len = usize(4 * 16384)
+val at = mmap(null, len, i32(PROT_RW), i32(MAP_SHARED), fd, 0)
+print("mmap ok", usize(at) != usize::Max)
+at[3 * 16384 + 1] = 0x77
+print("msync", msync(at, len, i32(MS_SYNC)), munmap(at, len))
+
+val m = map_file(name).unwrap()
+print("mapped", m.len(), m.bytes()[3 * 16384], m.bytes()[3 * 16384 + 1])
+
+_ = f.close()

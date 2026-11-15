@@ -1,0 +1,21 @@
+// Reduction for p08/ref: the same, but the reader walks the nested buffer with `for`.
+import sysl.buf.{Buf, buf}
+
+enum V
+    I(n: int)
+    L(items: Buf[V])
+
+w(v: V) -> int = v match
+    I(n) -> n
+    L(items) -> total(items)
+
+total(items: Buf[V]) -> int
+    var t = 0
+    for x in items do t += w(x)
+    t
+
+var b: Buf[V] = buf()
+b.push(I(4))
+
+ref x = b[0]
+print(w(x))

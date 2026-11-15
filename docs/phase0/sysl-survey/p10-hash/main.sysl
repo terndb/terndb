@@ -1,0 +1,57 @@
+// Need 10: checksums and hashing: CRC32C (hardware instruction?) and a fast non-cryptographic hash.
+import sysl.checksum.crc32
+import sysl.{hash_str, hash_u64}
+
+// CRC32C (Castagnoli, the one storage engines use) has no library form: sysl.checksum has only
+// CRC-32 (IEEE, table-driven), and `llvm.aarch64.crc32cx` / `llvm.x86.sse42.crc32.64.64` are not
+// among the intrinsics an `extern "llvm.…"` may name. What is left is the instruction, in asm.
+crc32c_hw_step(crc: u32, word: u64) -> u32
+    var out: u32 = 0
+    asm
+        [aarch64]
+            "crc32cx {out}, {crc}, {word}"
+            in crc : reg
+            in word : reg
+            out out : reg
+        [x86_64]
+            "crc32q {word}, {crc}"
+            in word : reg
+            in crc : reg
+            out out : reg
+        [riscv64, riscv32, thumb, craft, wasm32] unavailable "no CRC32C instruction"
+    out
+
+// The portable software CRC32C, bitwise: what a program writes for itself today.
+crc32c_sw(data: []const u8) -> u32
+    var c: u32 = 0xffffffff
+
+    for b in data
+        c ^= u32(b)
+        for _ in 0..<8
+            c = if c & 1 == 1 then 0x82f63b78 ^ c >> 1 else c >> 1
+
+    ~c
+
+crc32c_hw(data: []const u8) -> u32
+    var c: u32 = 0xffffffff
+    var i = 0
+
+    while i + 8 <= data.len
+        var w: u64 = 0
+        for k in 0..<8 do w |= u64(data[i + k]) << u64(8 * k)
+        c = crc32c_hw_step(c, w)
+        i += 8
+
+    while i < data.len
+        c ^= u32(data[i])
+        for _ in 0..<8
+            c = if c & 1 == 1 then 0x82f63b78 ^ c >> 1 else c >> 1
+        i += 1
+
+    ~c
+
+val check = "123456789"
+print("crc32", crc32(check.bytes) == 0xcbf43926)
+print("crc32c sw", crc32c_sw(check.bytes) == 0xe3069283)
+print("crc32c hw", crc32c_hw("12345678abcdefgh9".bytes) == crc32c_sw("12345678abcdefgh9".bytes))
+print("hash", hash_u64(42) != hash_u64(43), hash_str("abc") != hash_str("abd"))

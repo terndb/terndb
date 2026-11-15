@@ -1,0 +1,6 @@
+// Need 6, the movemask question: a <16>bool mask as a u16 bitmask, for count-trailing-zeros.
+val a: <16>u8 = [1; 16]
+val b: <16>u8 = [1, 1, 1, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+val m = a != b
+val bits = u16(m)
+print(bits)

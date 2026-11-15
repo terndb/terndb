@@ -1,0 +1,39 @@
+// Need 1: atomics with explicit ordering, a 64-bit atomic inside a struct on a shared 16 KiB page.
+import sysl.sync.*
+import sysl.threads.scope
+
+@align(16384)
+struct Page
+    version: Atomic[u64]
+    lsn: Atomic[u64]
+    pins: Atomic[u32]
+    flags: Atomic[u8]
+    body: [16360]u8
+
+val page: &sync Page = Page(Atomic(0), Atomic(0), Atomic(0), Atomic(0), [0; 16360])
+
+print(sizeof(Page), alignof(Page), usize(&*page) % 16384)
+
+scope((s) ->
+    for t in 0..<4
+        s.spawn(() ->
+            for _ in 0..<10000
+                page.version.add(1, AcqRel)
+                page.pins.add(1, Relaxed)
+
+                // a CAS loop raising lsn to a monotone maximum
+                var seen = page.lsn.load(Acquire)
+
+                loop
+                    val want = seen + 1
+                    val got = page.lsn.cas(seen, want, AcqRel)
+                    if got == seen then break
+                    seen = got
+
+                page.flags.or(u8(1) << u8(t), Release)))
+
+atomic_fence(SeqCst)
+
+print(page.version.load(), page.pins.load(Relaxed), page.lsn.load(Acquire), page.flags.load())
+page.version.store(7, Release)
+print(page.version.swap(9, SeqCst))
