@@ -1,0 +1,9 @@
+module i04_arrays
+
+// (a) a by-value array parameter is refused: see FINDINGS for the diagnostic
+// (b) usize, f32, f64, bool, and a pointer-to-array: what the header says and whether C agrees
+@export("i04_cb")
+type SizeCb = *extern(usize) -> bool
+
+@export("i04_set")
+set(cb: SizeCb, digest: *[32]u8, out: *[16]u8, f: f32, d: f64) -> usize = 0

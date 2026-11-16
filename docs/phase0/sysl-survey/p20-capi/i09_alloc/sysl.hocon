@@ -1,0 +1,15 @@
+package {
+  name    = "ha"
+  version = "0.0.1"
+  sysl    = "0.11.8"
+}
+
+requires {
+  heap = true
+  libc = true
+}
+
+allocator {
+  alloc = "ha_alloc"
+  free  = "ha_free"
+}

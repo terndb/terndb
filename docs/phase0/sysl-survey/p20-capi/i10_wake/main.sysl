@@ -1,0 +1,21 @@
+import sysl.io.poll.{Event, Poller, Waker}
+import sysl.threads.scope
+import sysl.time.millis
+
+// item 10: a Poller wait on one thread is ended by a Waker signalled from another thread
+main()
+    val p = Poller.open().unwrap()
+    var w = p.waker()
+    var got = [Event.none; 4]
+    scope((s) ->
+        s.spawn(() ->
+            sysl.time.sleep(millis(300))
+            w.wake().unwrap()
+        )
+        val t0 = sysl.time.now()
+        val n = p.wait(got[..], None).unwrap()
+        print("woke, events:", n)
+    )
+
+// the descriptor form of §6.2 rule 4: a pipe's read end, level-triggered, signalled from another thread
+// and visible to a C poll(2): fd_probe exports it

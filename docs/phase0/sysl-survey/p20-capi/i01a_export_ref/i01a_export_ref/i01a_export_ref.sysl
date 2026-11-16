@@ -1,0 +1,11 @@
+module i01a_export_ref
+
+@export("i01a_db")
+opaque struct Db
+    n: i64
+
+@export("i01a_open")
+open() -> &Db = Db(5)
+
+@export("i01a_n")
+n(d: &Db) -> i64 = d.n
