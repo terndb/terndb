@@ -224,15 +224,9 @@ a_negative_or_nan_frame_offset_is_r0006()
     assert_eq(xc_code(xc_column(xc_fcols(), [xc_f(1.0)], [], [], minus_zero, 0)), "ok")
 
     // One part negative at a time: months, days, microseconds.
-    assert_eq(xc_interval_code(0, -1, 0), "R0006")
-    assert_eq(xc_interval_code(-1, 40, 0), "R0006")
-    assert_eq(xc_interval_code(0, 0, -1), "R0006")
-    assert_eq(xc_interval_code(0, 0, 0), "ok")
-
-/** The code of a `range` frame `interval(months, days, micros) preceding` over a timestamp key. */
-private xc_interval_code(months: i32, days: i32, micros: i64) -> string
-    val f = xc_count_over(col("t", "o"), false, false, Bound(Preceding, Some(Literal(Interval, Interval(months, days, micros)))), xw_cur())
-    xc_code(xc_column([Field("o", Timestamp)], [rec([Int(0)])], [], [], f, 0))
+    for (months, days, micros, code) in [(0, -1, 0, "R0006"), (-1, 40, 0, "R0006"), (0, 0, -1, "R0006"), (0, 0, 0, "ok")]
+        val f = xc_count_over(o, false, false, Bound(Preceding, Some(Literal(Interval, Interval(months, days, micros)))), xw_cur())
+        assert_eq(xc_code(xc_column([Field("o", Timestamp)], [rec([Int(0)])], [], [], f, 0)), code)
 
 @test
 a_frame_offset_is_evaluated_over_no_rows_but_not_for_a_call_ignoring_its_frame()
