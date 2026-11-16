@@ -36,9 +36,11 @@ impl Operator for ViewOp
                 self.inner = Some(op)
                 op
 
-        op.next_batch()? match
-            Some(b) -> Ok(Some(b.as_type(self.elem)))
-            None -> Ok(None)
+        // The stored query's nodes are none of the statement's, so its runtime errors name none.
+        op.next_batch() match
+            Ok(Some(b)) -> Ok(Some(b.as_type(self.elem)))
+            Ok(None) -> Ok(None)
+            Err(e) -> Err(e.nodeless())
 
 /** The operator reading view `name` of `d`'s store as rows of `elem`. A `next_value` in the view
  * draws as the view's owner (§2.9 rule 3).

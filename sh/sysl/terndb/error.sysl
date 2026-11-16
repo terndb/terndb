@@ -16,16 +16,34 @@ struct Detail derives Eq
  * `path` is the `query-tree.md` §11.1 path of what the error is about, such as
  * `/statement/source/rows/0/1`, or empty when there is none (a batch, an envelope's version).
  * `details` is sorted by key, and its keys are unique (`wire-protocol.md` §8.1).
+ *
+ * `node` is the pre-order index (`query-tree.md` §12.2, counted from `FirstNode`) of the node whose
+ * evaluation raised a runtime (`R…`) error, or 0 when it names none. The executor knows nodes only by
+ * index; the engine turns the index into the node's path, against the tree that was planned, when
+ * it reports the error (`wire-protocol.md` §8.1 rule 2).
  */
 struct CodecError derives Eq
     code: string
     path: string
     message: string
     details: Buf[Detail]
+    node: u64
 
     /** The refusal at `path`, unless it already has one. */
     at(self, path: string) -> CodecError =
-        if self.path.len > 0 then self else CodecError(self.code, path, self.message, self.details)
+        if self.path.len > 0 then self else CodecError(self.code, path, self.message, self.details, self.node)
+
+    /** A runtime error raised by node `node`, unless it already names one: an inner node's claim
+     * stands over its ancestors'. An error of another area names no node this way.
+     */
+    at_node(self, node: u64) -> CodecError
+        if self.node != 0 || self.path.len > 0 || !self.code.starts_with("R") then return self
+        CodecError(self.code, self.path, self.message, self.details, node)
+
+    /** The same refusal naming no node: what an error raised in a tree other than the one the
+     * client sent becomes (a view's stored query, a rewritten statement).
+     */
+    nodeless(self) -> CodecError = CodecError(self.code, self.path, self.message, self.details, 0)
 
     /** The text of detail `key`, if it has one. */
     detail(self, key: string) -> Option[string]
@@ -35,7 +53,11 @@ struct CodecError derives Eq
         None
 
 private[terndb] fail[T](code: string, message: string) -> Result[T, CodecError] =
-    Err(CodecError(code, "", message, buf[Detail]()))
+    Err(CodecError(code, "", message, buf[Detail](), 0))
+
+/** A runtime error raised by node `node` (`CodecError.node`). */
+private[terndb] fail_at[T](node: u64, code: string, message: string) -> Result[T, CodecError] =
+    Err(CodecError(code, "", message, buf[Detail](), node))
 
 /** A refusal with no path yet and `details` sorted by key; a later entry of a key replaces an
  * earlier one.
@@ -51,7 +73,7 @@ private[terndb] refusal(code: string, message: string, details: []const Detail) 
 
         if i < sorted.len() && sorted[i].key == d.key then sorted[i] = d else sorted.insert(i, d)
 
-    CodecError(code, "", message, sorted)
+    CodecError(code, "", message, sorted, 0)
 
 /** The same refusal reported under `W1008`, which is what every inconsistency in a batch is
  * (`wire-protocol.md` §6.4 rule 2), whatever primitive it was found in. A batch defines no path.

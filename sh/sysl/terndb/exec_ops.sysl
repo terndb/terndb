@@ -268,7 +268,7 @@ struct LimitOp
             Int(v) -> i64(v)
             _ -> panic("LimitOp: a count is int64")
 
-        if n < 0 then return fail("R0006", "a Limit count or offset is negative")
+        if n < 0 then return fail_at(x.node, "R0006", "a Limit count or offset is negative")
 
         Ok(n)
 

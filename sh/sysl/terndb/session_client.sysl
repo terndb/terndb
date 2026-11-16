@@ -241,7 +241,7 @@ struct ClientSession
         if self.phase == Shut then return self.step()
 
         a match
-            Refused(_, code) -> self.die(CodecError(code, "", "the reassembler refused a message", buf()))
+            Refused(_, code) -> self.die(CodecError(code, "", "the reassembler refused a message", buf(), 0))
             Whole(raw) ->
                 raw.decode(self.minor) match
                     Ok(m) ->
@@ -277,7 +277,7 @@ struct ClientSession
                 self.events.push(Departing(code, message, grace))
             ErrorReply(e) ->
                 val first = e.entries[0]
-                return Err(CodecError(first.code, first.path, first.message, first.details))
+                return Err(CodecError(first.code, first.path, first.message, first.details, 0))
             _ -> return malformed("a message that does not travel on stream 0 from the server")
 
         Ok(())

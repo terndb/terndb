@@ -9,13 +9,17 @@ import sysl.slices.sort_stable_by
 // together and so do every NaN and both zeros. The sort is stable, so a group's rows stay in input
 // order, which is the order an aggregate reads them in when its call has no `order`.
 
-/** An aggregate call with its expressions typed (§6.7 rule 2). */
+/** An aggregate call with its expressions typed (§6.7 rule 2). A call is no node of its own, so
+ * `node` is its `Aggregate`'s: the node a runtime error of the call itself (a `sum` that overflows)
+ * names, or 0 for a call the executor made up.
+ */
 struct TAgg
     function: string
     args: Buf[TExpr]
     distinct: bool
     filter: Option[TExpr]
     order: Buf[TKey]
+    node: u64
 
 /** The input's groups: `rows` is every input row in key order, and group `g` is
  * `rows[starts[g]..<starts[g + 1]]`.
@@ -167,7 +171,9 @@ private call_column(a: TAgg, ty: Type, groups: Groups, env: Env) -> Result[Colum
 
     if a.distinct then seen = distinct_of(seen, args, sub.n)
 
-    aggregate_column(a.function, ty, args, seen)
+    aggregate_column(a.function, ty, args, seen) match
+        Ok(c) -> Ok(c)
+        Err(e) -> Err(e.at_node(a.node))
 
 /** Each group of `seen` sorted by `orders`, stably. */
 private sort_groups(seen: Seen, orders: Buf[KeyOrder])

@@ -50,6 +50,11 @@ private[terndb] struct Planner
         self.action = Some(i)
         i
 
+    /** The pre-order index of the node whose type is taken next: `types` begins with the node after
+     * the statement root.
+     */
+    next_node(self) -> u64 = u64(self.at) + FirstNode + 1
+
     take_type(*self) -> Type
         val t = self.types[self.at]
         self.at += 1
@@ -71,23 +76,24 @@ private[terndb] struct Planner
         (s, self.rel(r))
 
     expr(*self, e: Expr) -> TExpr
+        val node = self.next_node()
         val ty = self.take_type()
         val kids = buf[TExpr]()
 
         e match
             Col(_, _) | Row(_) ->
                 outer_value(self.outer, e, ty) match
-                    Some(v) -> return TExpr(Param(self.bind(v)), ty, kids, None)
+                    Some(v) -> return TExpr(Param(self.bind(v)), ty, kids, None, node)
                     None -> ()
             Relation(r) | Scalar(r) | Exists(r) ->
                 val (s, _) = self.sub(*r)
-                return TExpr(e, ty, kids, Some(s))
+                return TExpr(e, ty, kids, Some(s), node)
             In(es, r) ->
                 for a in es
                     kids.push(self.expr(a))
 
                 val (s, _) = self.sub(*r)
-                return TExpr(e, ty, kids, Some(s))
+                return TExpr(e, ty, kids, Some(s), node)
             Param(_) | Null(_) | Literal(_, _) -> ()
             Call(_, args) ->
                 for a in args
@@ -113,9 +119,9 @@ private[terndb] struct Planner
             Record(fields) ->
                 for f in fields
                     kids.push(self.expr(f.expr))
-            Action -> return TExpr(Param(self.action_param()), ty, kids, None)
+            Action -> return TExpr(Param(self.action_param()), ty, kids, None, node)
 
-        TExpr(e, ty, kids, None)
+        TExpr(e, ty, kids, None, node)
     end expr
 
     opt_expr(*self, e: Option[Expr]) -> Option[TExpr] = e match
@@ -123,6 +129,7 @@ private[terndb] struct Planner
         None -> None
 
     rel(*self, r: Rel) -> Lowered
+        val node = self.next_node()
         val elem = self.take_type() match
             Bag(e) | List(e) -> *e
             _ -> panic("a relation's type is a bag or a list")
@@ -222,7 +229,7 @@ private[terndb] struct Planner
                     for k in c.order
                         order.push(TKey(self.expr(k.expr), k.desc, k.nulls_first))
 
-                    cs.push(TAgg(c.function, args, c.distinct, filter, order))
+                    cs.push(TAgg(c.function, args, c.distinct, filter, order, node))
 
                 Lowered(AggregateOp(inner.op, inner.binder, inner.elem, elem, ks, cs, self.ctx, None), binder, elem, none)
             Window(input, binder, items) ->
@@ -251,7 +258,7 @@ private[terndb] struct Planner
                             Some(TFrame(f.unit, TBound(f.start.kind, s), TBound(f.end.kind, e), f.exclude))
                         None -> None
 
-                    ws.push(TWin(c.function, args, part, order, frame))
+                    ws.push(TWin(c.function, args, part, order, frame, node))
 
                 plan_window(inner, binder, elem, ws, self.ctx)
             Nest(input, binder, keys, _, items, order) ->

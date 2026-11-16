@@ -145,6 +145,12 @@ connection against a server in the same process, turning its loop by hand on a `
 - **Credentials** are the server's own `Authority`: `CatalogAuthority` narrows it to the roles the newest committed
   catalog holds with `login`, but no SCRAM verifier or token hash is stored in the database, and nothing issues a
   token yet.
-- **Runtime errors name no node**: an `R…` error has an empty path (`wire-protocol.md` §8.1 rule 2's SHOULD), so
-  it carries no `span` either. Validation errors carry both: the engine maps each entry's path to its node's
-  pre-order index (`node_paths`) and copies that node's span from the envelope (§8.1 rule 4).
+- **Runtime errors name a node only where the tree the client sent was planned**: an `R…` error names the
+  innermost expression whose evaluation raised it (`wire-protocol.md` §8.1 rule 2); a frame, `lag`/`lead` or
+  `Limit` offset error names the offset expression; an aggregate or window call's own error (a `sum` that
+  overflows) names its `Aggregate` or `Window`, since a call is no node. Each compiled expression keeps its
+  pre-order index from planning, the error records it, and the engine turns it into a path (`node_paths`) only
+  when the statement fails; the span then follows as for validation errors (§8.1 rule 4). An error names no
+  node, and so carries no span, when it is raised in a tree the client did not send: a query that unnesting
+  rewrote (any decorrelated subquery), or a view's stored query. Operator errors with no expression to blame
+  (a single join's second match, a recursive CTE that does not end, a DML write of one row twice) name none.

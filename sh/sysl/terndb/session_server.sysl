@@ -269,7 +269,7 @@ struct ServerSession
         self.teardown()
         self.closing = true
 
-    private die_with(*self, code: string, message: string) = self.die(CodecError(code, "", message, buf()))
+    private die_with(*self, code: string, message: string) = self.die(CodecError(code, "", message, buf(), 0))
 
     /** Every started statement stopped and every open transaction rolled back; nothing more is sent. */
     private teardown(*self)
