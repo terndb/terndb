@@ -1,0 +1,211 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Sequences and identity columns at run time (`ddl.md` §2.7, `query-tree.md` §7.12): identity values
+// drawn for the rows an insert leaves them out of, across batches and interleaved transactions, never
+// reused after a rollback; an explicit value where `by_default` allows one; `next_value` in a query,
+// cycling, exhausted and given a next value again by `AlterSequence`; a default drawing from a
+// sequence; and the bound of an `int16` identity.
+
+/** `ticket(id int64 identity always, note)`, `tag(id int32 identity by_default, note)`,
+ * `small(id int16 identity always from 32766, note)`, `orders(id default next_value(app, counter),
+ * note)`, and the sequences `counter` (10 by 5 to 25), `ring` (1 to 3, cycling) and `down` (2 down
+ * to 1).
+ */
+private xq_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("ticket", [ColumnDef("id", Int64, None, None, Always, None), cat_col("note", Text)], ["id"]))
+    c = cat_ok(c, cat_table("tag", [ColumnDef("id", Int32, None, None, ByDefault, None), cat_col("note", Text)], ["id"]))
+    val from = SequenceDef(Int16, Some(32766), None, None, None, false, None)
+    c = cat_ok(c, cat_table("small", [ColumnDef("id", Int16, None, None, Always, Some(from)), cat_col("note", Text)], ["id"]))
+    c = cat_ok(c, CreateSequence(cat_q("counter"), SequenceDef(Int64, Some(10), Some(5), None, Some(25), false, None), false))
+    c = cat_ok(c, CreateSequence(cat_q("ring"), SequenceDef(Int64, None, None, Some(1), Some(3), true, None), false))
+    c = cat_ok(c, CreateSequence(cat_q("down"), SequenceDef(Int64, Some(2), Some(-1), Some(1), None, false, None), false))
+    val draw = call("next_value", [cat_text("app"), cat_text("counter")])
+    cat_ok(c, cat_table("orders", [ColumnDef("id", Int64, Some(draw), None, NoIdentity, None), cat_col("note", Text)], ["id"]))
+
+private xq_store() -> &Store = mem_store(xq_catalog())
+
+/** `insert into <table> (note) values <notes> returning id`. */
+private xq_insert(table: string, notes: []const string) -> Envelope
+    val rows = buf[Buf[Expr]]()
+
+    for n in notes
+        rows.push(items_of([cat_text(n)]))
+
+    envelope([], Insert(cat_q(table), "i", None, items_of(["note"]), Values("v", items_of([Field("note", Text)]), rows), None,
+        items_of([item("id", col("i", "id"))])))
+
+/** The first field of each row of `o`, an integer or -1 for null. */
+private xq_ints(o: Executed) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in xd_rows(o)
+        r match
+            Record(fs) -> out.push(if fs[0].is_null() then -1 else st_int(fs[0]))
+            _ -> ()
+
+    out
+
+private xq_are(got: Buf[i128], want: []const i128, file: string = __FILE__, line: long = __LINE__)
+    assert(got.len() == want.len, s"${got.len()} values, not ${want.len}", file, line)
+
+    for i in 0..<want.len
+        assert(got[i] == want[i], s"value $i is ${got[i]}, not ${want[i]}", file, line)
+
+/** `next_value('app', <name>)` drawn once for each of `n` rows. */
+private xq_draws(name: string, n: usize) -> Envelope
+    val rows = buf[Buf[Expr]]()
+
+    for i in 0..<n
+        rows.push(items_of([cat_int(i128(i))]))
+
+    query([], project(Values("v", items_of([Field("k", Int64)]), rows), "o", [item("n", call("next_value", [cat_text("app"), cat_text(name)]))]))
+
+// -- identity columns, §2.7 rule 3 -----------------------------------------------------------------
+
+@test
+an_insert_draws_identity_values_for_the_rows_it_leaves_them_out_of()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, t, xq_insert("ticket", ["a", "b", "c"]))), [1, 2, 3])
+    xq_are(xq_ints(xd_ran(s, t, xq_insert("ticket", ["d"]))), [4])
+    // An int32 identity draws the same way, from its own sequence.
+    xq_are(xq_ints(xd_ran(s, t, xq_insert("tag", ["x", "y"]))), [1, 2])
+    assert(s.commit(t).is_ok())
+
+    val all = query([], Sort(scan("app", "ticket", "k"), items_of([SortKey(col("k", "id"), false, false)])))
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), all)), [1, 2, 3, 4])
+
+@test
+an_insert_of_more_than_a_batch_draws_a_distinct_value_for_every_row()
+    val s = xq_store()
+    val rows = buf[Value]()
+
+    for i in 0..<1500
+        rows.push(rec([Text(s"n$i")]))
+
+    val env = envelope([param("rows", bag(record([Field("note", Text)])))], Insert(cat_q("ticket"), "i", None, items_of(["note"]), ParamScan("p", 0), None,
+        items_of([item("id", col("i", "id"))])))
+    val t = s.begin(Snapshot)
+    val ids = xq_ints(xd_ran(s, t, env, [rel(rows.view())]))
+    assert_eq(ids.len(), 1500)
+
+    for i in 0..<1500
+        assert_eq(ids[i], i128(i) + 1)
+
+    xq_are(xq_ints(xd_ran(s, t, xq_insert("ticket", ["last"]))), [1501])
+    assert(s.commit(t).is_ok())
+
+@test
+interleaved_transactions_draw_distinct_values()
+    val s = xq_store()
+    val one = s.begin(Snapshot)
+    val two = s.begin(Serializable)
+    xq_are(xq_ints(xd_ran(s, one, xq_insert("ticket", ["a", "b"]))), [1, 2])
+    xq_are(xq_ints(xd_ran(s, two, xq_insert("ticket", ["c", "d"]))), [3, 4])
+    xq_are(xq_ints(xd_ran(s, one, xq_insert("ticket", ["e"]))), [5])
+    assert(s.commit(two).is_ok())
+    assert(s.commit(one).is_ok())
+    assert_eq(xd_count(xd_ran(s, s.begin(Snapshot), query([], scan("app", "ticket", "k")))), 5)
+
+@test
+a_value_drawn_by_a_transaction_that_rolls_back_is_never_drawn_again()
+    val s = xq_store()
+    val lost = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, lost, xq_insert("ticket", ["a", "b"]))), [1, 2])
+    assert(s.abort(lost).is_ok())
+
+    // A statement that fails after drawing loses its values too: `tag` already holds key 3.
+    val t = s.begin(Snapshot)
+    val explicit = envelope([], Insert(cat_q("tag"), "i", None, items_of(["id", "note"]),
+        Values("v", items_of([Field("id", Int32), Field("note", Text)]), items_of([items_of([Literal(Int32, Int(3)), cat_text("x")])])), None, buf[Item]()))
+    assert_eq(xd_count(xd_ran(s, t, explicit)), 1)
+    assert(s.commit(t).is_ok())
+    val clash = s.begin(Snapshot)
+    assert_eq(xd_code(s, clash, xq_insert("tag", ["p", "q", "r"])), "T3001")
+
+    val next = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, next, xq_insert("ticket", ["c"]))), [3])
+    xq_are(xq_ints(xd_ran(s, next, xq_insert("tag", ["s"]))), [4])
+    assert(s.commit(next).is_ok())
+
+@test
+an_identity_column_takes_an_explicit_value_only_by_default()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    // `always`: naming the column is refused (§9.2 rule 2).
+    val named = envelope([], Insert(cat_q("ticket"), "i", None, items_of(["id", "note"]),
+        Values("v", items_of([Field("id", Int64), Field("note", Text)]), items_of([items_of([cat_int(100), cat_text("x")])])), None, buf[Item]()))
+    assert_eq(xd_code(s, t, named), "Q5003")
+
+    // `by_default`: the value given is stored and draws nothing.
+    val u = s.begin(Snapshot)
+    val given = envelope([], Insert(cat_q("tag"), "i", None, items_of(["id", "note"]),
+        Values("v", items_of([Field("id", Int32), Field("note", Text)]), items_of([items_of([Literal(Int32, Int(100)), cat_text("x")])])), None,
+        items_of([item("id", col("i", "id"))])))
+    xq_are(xq_ints(xd_ran(s, u, given)), [100])
+    xq_are(xq_ints(xd_ran(s, u, xq_insert("tag", ["y"]))), [1])
+    assert(s.commit(u).is_ok())
+
+@test
+an_int16_identity_is_exhausted_at_its_type_s_bound()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, t, xq_insert("small", ["a", "b"]))), [32766, 32767])
+    assert_eq(xd_code(s, t, xq_insert("small", ["c"])), "R0008")
+    // The failure aborted the transaction, and the sequence stays exhausted.
+    assert_eq(xd_code(s, s.begin(Snapshot), xq_insert("small", ["d"])), "R0008")
+
+@test
+a_default_that_calls_next_value_draws_once_per_row()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, t, xq_insert("orders", ["a", "b"]))), [10, 15])
+    // The query draws from the same sequence.
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("counter", 1))), [20])
+    assert(s.commit(t).is_ok())
+
+// -- next_value, §2.7 rule 4 -----------------------------------------------------------------------
+
+@test
+next_value_draws_once_per_row_cycles_and_is_exhausted()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("counter", 3))), [10, 15, 20])
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("ring", 5))), [1, 2, 3, 1, 2])
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("down", 2))), [2, 1])
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("counter", 1))), [25])
+    assert_eq(xd_code(s, t, xq_draws("counter", 1)), "R0008")
+    assert_eq(xd_code(s, s.begin(Snapshot), xq_draws("down", 1)), "R0008")
+
+@test
+an_exhausted_sequence_draws_again_once_altered()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("counter", 4))), [10, 15, 20, 25])
+    assert_eq(xd_code(s, t, xq_draws("counter", 1)), "R0008")
+
+    // A wider range continues after the last value drawn.
+    s.catalog = cat_ok(s.catalog, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, Some(40), false, None), None))
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 3))), [30, 35, 40])
+    assert_eq(xd_code(s, s.begin(Snapshot), xq_draws("counter", 1)), "R0008")
+
+    // Cycling wraps to the start of the range; a restart starts where it says.
+    s.catalog = cat_ok(s.catalog, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, true, None), None))
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 1))), [1])
+    s.catalog = cat_ok(s.catalog, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, false, None), Some(12)))
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 2))), [12, 17])
+
+@test
+next_value_by_a_name_computed_at_run_time()
+    val s = xq_store()
+    val env = query([param("name", nullable(Text))], project(Values("v", items_of([Field("k", Int64)]), items_of([items_of([cat_int(0)])])), "o",
+        [item("n", call("next_value", [cat_text("app"), Param(0)]))]))
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), env, [Text("ring")])), [1])
+    // A null argument draws nothing and answers null.
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), env, [Null])), [-1])
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), env, [Text("ring")])), [2])
+    assert_eq(xd_code(s, s.begin(Snapshot), env, [Text("nothing")]), "Q6003")

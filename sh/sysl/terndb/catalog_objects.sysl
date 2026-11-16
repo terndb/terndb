@@ -138,7 +138,8 @@ struct CatIndex derives Eq
     constraint: u64
 
 /** A sequence (§2.7 rule 4) with every option filled in, the next value it hands out, and the
- * identity column that owns it (`owner_table` 0 for a sequence of its own).
+ * identity column that owns it (`owner_table` 0 for a sequence of its own). An `exhausted` sequence
+ * has handed out the last value its range allows, which `next` then holds (§2.7 rule 6).
  */
 struct CatSequence derives Eq
     oid: u64
@@ -155,6 +156,7 @@ struct CatSequence derives Eq
     next: i64
     owner_table: u64
     owner_column: u32
+    exhausted: bool
 
 /** A named type (§2.8): its definition as declared, named references inside it kept. */
 struct CatType derives Eq

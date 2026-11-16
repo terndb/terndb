@@ -12,8 +12,8 @@ operators `Values`, `ParamScan`, `Filter`, `Project`, `Sort`, `Limit`, `Distinct
 (§4.3), `SetOp`, `With` and `CteRef` with recursive CTEs (§4.4), `Scan` over the in-memory MVCC
 store and the DML statements `Insert` (with upsert), `Update` and `Delete` run in a store
 transaction (§4.5), a source over in-memory batches standing in for `Scan` where no store is given,
-and the conversion of an operator's output into result batches. Views, identity columns, disk
-storage and the unnesting planner come later.
+and the conversion of an operator's output into result batches, views, sequences and identity
+columns, and the zone conversions. Disk storage and the unnesting planner come later.
 
 ## 1. Column vectors
 
@@ -392,9 +392,17 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
   keys then act and are checked (`fk_effects`, `ddl.md` §2.6 and `docs/design/store.md`): cascades
   write the referencing tables as further `write_rows` calls, and a statement that must wait part-way
   is taken back with `undo_statement`.
+- **Views** (`exec_view.sysl`, `ddl.md` §2.9): `scan_op` of a view answers a `ViewOp`, which types
+  and plans the stored query at its first pull with a planner of its own — its own binders, CTEs and
+  logged reads — over the same transaction. The privileges a query or DML statement needs are checked
+  there too, at the engine's validation (`statement_privileges`).
+- **Sequences** (`exec_sequence.sysl`, `ddl.md` §2.7): `Ctx.draws` holds the store and the role a
+  `next_value` by name is checked for; a draw changes the catalog's sequence in place, outside every
+  transaction. An insert draws identity values per row left without one. **Zones**
+  (`exec_zone.sysl`): `at_zone` and `from_zone` read the host's zone database through
+  `sysl.posix.time`.
 
-Not yet: views read through the store, identity columns (`next_value`), and translation of a row of an older schema version
-(`ddl.md` §5.3).
+Not yet: translation of a row of an older schema version (`ddl.md` §5.3).
 
 ## 5. What this note relies on in `query-tree.md`
 

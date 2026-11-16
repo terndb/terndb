@@ -192,6 +192,20 @@ Every constraint has a name unique in the table's namespace, and is one of:
    a committed transaction is never reissued, even after a crash.
    *Rationale: a transactional sequence serialises every inserter on one row; every database that ships sequences
    makes them non-transactional for that reason.*
+6. **A non-cycling sequence that hands out the last value of its range is exhausted**: it keeps that value as its
+   `next` with the flag `exhausted` (`sys.sequence_state`, [DISK] §3.9), and every draw from it is `R0008` until an
+   `AlterSequence` gives it a next value. A `restart` clears the flag; otherwise the next draw takes the value one
+   `increment` past the last one when the altered range holds it, and wraps when `cycle` has been set (§2.13
+   rule 8). A draw that wraps a cycling sequence takes `min` for a
+   positive `increment` and `max` for a negative one.
+7. **What draws, and when.** An insert draws an identity value for each row it leaves the column out of, in the
+   order of its source's rows, before any row is written; a statement that then fails, or is blocked on a row lock
+   and run again ([ISO] §4.2), has drawn them all the same. `next_value` in a query or DML expression draws once per
+   row it is evaluated for, in row order, and not for a row where either argument is null, where it is null
+   ([QT] §7.12). An identity column's draws need no privilege beyond the statement's own on the table, and a
+   stored default's draws none beyond those its owner was checked for when it was stored (§2.10 rule 8); a
+   `next_value` the statement itself writes needs `usage` on the sequence, checked at validation when it names the
+   sequence by two text literals and at the draw otherwise, where a sequence that does not exist is `Q6003`.
 
 ### 2.8 Named types
 
@@ -223,7 +237,16 @@ Every constraint has a name unique in the table's namespace, and is one of:
 2. Views are read-only: a DML target that is a view is `Q5003`. A view's stored tree names columns as
    `Col(binder, name)`, so renaming a column a view reads rewrites the view's stored tree in the same transaction
    (§8.4). Dropping or retyping a column a view reads is `Q6007` unless `cascade` drops the view.
-3. A view is checked with the privileges of its owner; reading it needs `select` on the view only.
+3. A view is checked with the privileges of its owner; reading it needs `select` on the view only. The owner's
+   privileges are checked again at each validation of a statement that reads the view, so a privilege revoked from
+   the owner takes the view away from every reader (`Q6015`). A `next_value` in a view's query draws as the view's
+   owner.
+4. **How a scan of a view reads.** The stored query is planned on its own, as a statement of its own would be: its
+   binders and CTE names are its own and never meet the reading statement's (a view may be scanned twice in one
+   statement), it sees no outer row and no parameter, and its rows reach the scan's binder as the view's row type.
+   It reads at the reading statement's snapshot, and a serializable read of it logs the reads of the scans inside
+   it ([ISO] §4.4) with every column of those tables, since what the reading statement uses of the view is not
+   traced through it. A view of a view expands the same way, as deep as views nest.
 
 ### 2.10 Roles and privileges
 
@@ -257,6 +280,11 @@ Every constraint has a name unique in the table's namespace, and is one of:
      or view a view scans. Every role may name objects of `sys` and `catalog` (rule 5).
    - `Grant` and `Revoke` of a privilege: ownership of the object, or that privilege held `grantable`. Revoking a
      privilege the grantee does not hold changes nothing.
+   - a `Query`, `Insert`, `Update` or `Delete`: `usage` on the namespace of every object it names; `select` on each
+     table or view it scans, but not on what a view scans, which is checked for the view's owner (§2.9 rule 3);
+     on its DML target `insert`, `update` or `delete`, an upsert whose action is `update` needing both `insert` and
+     `update`; and `usage` on each sequence a `next_value` of its own names (§2.7 rule 7). The target itself
+     needs no `select`, even where the statement's filter or `returning` reads it.
 9. A privilege that does not apply to its object's kind (rule 3) is `Q6021`. A `member_of` naming no role is
    `Q6003`, and a membership that would make a role a member of itself, directly or through others, is `Q6020`. A
    role that owns an object, holds or granted a privilege, or has members cannot be dropped (`Q6007`).

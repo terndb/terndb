@@ -18,11 +18,16 @@ struct TExpr
     sub: Option[SubPlan]
 
 /** What every expression of one execution reads: the parameter values (§10.1), each of its declared
- * type, and the statement's timestamp (§7.12), in microseconds since the Unix epoch.
+ * type, the statement's timestamp (§7.12), in microseconds since the Unix epoch, and the sequences
+ * `next_value` draws from (`exec_sequence.sysl`), absent where an expression may not draw.
  */
 struct Ctx
     params: Buf[Value]
     now: i64
+    draws: Option[Draws]
+
+    /** The same execution with parameters `params`. */
+    with_params(self, params: Buf[Value]) -> Ctx = Ctx(params, self.now, self.draws)
 
 /** A binder visible to an expression, with its rows: a vector of the binder's element type. */
 struct Binder
@@ -287,6 +292,7 @@ end eval_match
 private call_vector(f: string, x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
     if f == "coalesce" then return eval_coalesce(x, env)
     if f == "statement_timestamp" then return Ok(repeated(Timestamp, Int(i128(env.ctx.now)), env.n))
+    if f == "next_value" then return next_values(x, env)
 
     val args = buf[ColumnVector]()
 
@@ -306,6 +312,7 @@ private call_vector(f: string, x: TExpr, env: Env) -> Result[ColumnVector, Codec
 
             Ok(args[0].as_type(x.ty))
         "concat" | "length" | "lower" | "upper" | "contains" | "starts_with" | "like" -> text_function(f, args.view(), x.ty)
+        "at_zone" | "from_zone" -> zone_function(f, args[0], args[1], x.ty)
         _ -> panic(s"call_vector: the executor does not run '$f'")
 end call_vector
 

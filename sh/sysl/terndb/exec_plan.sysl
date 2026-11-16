@@ -60,7 +60,7 @@ private[terndb] struct Planner
         val ps = buf[Value]()
         ps.extend(self.ctx.params.view())
         ps.push(v)
-        self.ctx = Ctx(ps, self.ctx.now)
+        self.ctx = self.ctx.with_params(ps)
         u64(ps.len() - 1)
 
     /** `r` kept to be planned per outer row, and planned here once for its shape, which steps over
@@ -89,11 +89,7 @@ private[terndb] struct Planner
                 val (s, _) = self.sub(*r)
                 return TExpr(e, ty, kids, Some(s))
             Param(_) | Null(_) | Literal(_, _) -> ()
-            Call(f, args) ->
-                f match
-                    "at_zone" | "from_zone" | "next_value" -> panic(s"the executor does not run '$f'")
-                    _ -> ()
-
+            Call(_, args) ->
                 for a in args
                     kids.push(self.expr(a))
             Cast(inner, _, _) | Field(inner, _) | Variant(_, _, inner) -> kids.push(self.expr(*inner))

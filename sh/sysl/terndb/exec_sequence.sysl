@@ -1,0 +1,108 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Sequences at run time (`ddl.md` §2.7): `next_value` (`query-tree.md` §7.12) and the values an
+// insert draws for an identity column. A draw changes the sequence in place, outside the store's
+// transactions, so nothing undoes it: a value drawn by a statement that rolls back is never handed
+// out again, and identity values have gaps (§2.7 rule 5).
+
+/** Where `next_value` draws from: the store's sequences, and the role whose `usage` a draw by name
+ * needs (§2.10 rule 8). It is absent for a stored definition's draws, whose owner was checked when
+ * the definition was stored, and for a statement run outside a connection.
+ */
+struct Draws
+    store: &Store
+    role: Option[u64]
+
+/** `d` for a definition expression's draws (a default's `next_value`), which need no privilege of
+ * the statement's role (§2.10 rule 8).
+ */
+as_definer(d: Option[Draws]) -> Option[Draws] = d match
+    Some(x) -> Some(Draws(x.store, None))
+    None -> None
+
+/** The value after `v` in `q`: past its bound, the bound at the other end when it cycles and none
+ * when it does not.
+ */
+private step(q: CatSequence, v: i64) -> Option[i64]
+    val n = i128(v) + i128(q.increment)
+    if n >= i128(q.min) && n <= i128(q.max) then return Some(i64(n))
+    if !q.cycle then return None
+
+    Some(if q.increment > 0 then q.min else q.max)
+
+/** The next value of sequence `i` of `s`'s catalog, which is never handed out again. A sequence that
+ * has handed out the last value of its range is exhausted, and each draw from it is `R0008` until a
+ * change of its options gives it a next value (§2.7 rule 6).
+ */
+draw(s: &Store, i: usize) -> Result[i64, CodecError]
+    var q = s.catalog.sequences[i]
+    var v = q.next
+
+    if q.exhausted
+        v = step(q, q.next) match
+            Some(x) -> x
+            None -> return fail("R0008", s"sequence '${q.name}' has handed out its last value")
+
+    step(q, v) match
+        Some(n) ->
+            q.next = n
+            q.exhausted = false
+        None ->
+            q.next = v
+            q.exhausted = true
+
+    s.catalog.sequences[i] = q
+    Ok(v)
+
+/** The next value of sequence `q`, drawn for `d`'s role: one that exists (`Q6003`) and that the role
+ * may use (`Q6015`).
+ */
+private draw_named(d: Draws, q: QualName) -> Result[i64, CodecError]
+    val c = d.store.catalog
+    val i = c.sequence_at(q) match
+        Some(i) -> i
+        None -> return fail("Q6003", s"no sequence '${q.schema}.${q.name}'")
+
+    d.role match
+        Some(who) ->
+            c.need_usage(who, q.schema)?
+            c.need(who, c.sequence_target(i), PrivUsage)?
+        None -> ()
+
+    draw(d.store, i)
+
+/** `next_value(schema, name)` over the rows of `env`: one value drawn per row, in row order, and null
+ * where either argument is.
+ */
+private[terndb] next_values(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
+    val schemas = eval(x.kids[0], env)?
+    val names = eval(x.kids[1], env)?
+
+    val d = env.ctx.draws match
+        Some(d) -> d
+        None -> panic("next_value is evaluated outside a statement of the store")
+
+    val out = buf[Value]()
+
+    for i in 0..<env.n
+        (value_at(schemas, i), value_at(names, i)) match
+            (Text(schema), Text(name)) -> out.push(Int(i128(draw_named(d, QualName(schema, name))?)))
+            _ -> out.push(Null)
+
+    Ok(vector_of(x.ty, out.view()))
+
+/** `n` values drawn from the identity sequence `oid`, as a vector of its column's type `ty`. */
+private[terndb] identity_values(s: &Store, oid: u64, ty: Type, n: usize) -> Result[ColumnVector, CodecError]
+    var at: usize = 0
+
+    for i in 0..<s.catalog.sequences.len()
+        if s.catalog.sequences[i].oid == oid then at = i
+
+    val out = buf[Value]()
+
+    for _ in 0..<n
+        out.push(Int(i128(draw(s, at)?)))
+
+    Ok(vector_of(ty, out.view()))

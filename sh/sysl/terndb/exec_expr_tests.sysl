@@ -17,7 +17,7 @@ xe_catalog(cols: []const Field) -> FakeCatalog
 
     FakeCatalog(items_of([fake_table("t", cs.view(), [])]), buf[FakeType](), buf[FakeFunction]())
 
-xe_ctx(params: []const Value) -> Ctx = Ctx(items_of(params), 1700000000000000)
+xe_ctx(params: []const Value) -> Ctx = Ctx(items_of(params), 1700000000000000, None)
 
 /** `items` of a `Project` over `app.t` holding `rows`, executed; each output row's values. */
 private xe_run(cols: []const Field, rows: []const Value, decls: []const ParamDecl, params: []const Value, items: []const Item) -> Result[Buf[Value], CodecError]

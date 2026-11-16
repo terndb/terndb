@@ -24,8 +24,9 @@ enum Executed
  */
 run_statement(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
     s.statement(t)
+    val c = if ctx.draws.is_some() then ctx else Ctx(ctx.params, ctx.now, Some(Draws(s, None)))
 
-    run_in(env, s, t, ctx) match
+    run_in(env, s, t, c) match
         Ok(o) -> Ok(o)
         Err(e) -> Err(s.abort_with(t, e))
 
@@ -197,7 +198,7 @@ private eval_defs(s: &Store, ctx: Ctx, rows: ColumnVector, exprs: Buf[Expr]) -> 
 
     val env = envelope([ParamDecl(None, bag(rows.ty))], Query(Project(ParamScan("row", 0), "d", items)))
     val typing = type_envelope(env, s.catalog)?
-    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now), buf[MemTable]())
+    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now, as_definer(ctx.draws)), buf[MemTable]())
     val r = drain_rows(plan.op, plan.elem)?
 
     for j in 0..<exprs.len()
@@ -338,7 +339,7 @@ private returning_rows(result: Option[Type], items: Buf[TExpr], env: Env, action
                 None -> ()
 
             val group = env.take(idx.view())
-            val genv = Env(group.n, group.binders, Ctx(ps, env.ctx.now))
+            val genv = Env(group.n, group.binders, env.ctx.with_params(ps))
             val cs = buf[ColumnVector]()
 
             for x in items
@@ -696,6 +697,7 @@ private insert_rows(s: &Store, ctx: Ctx, tg: Target, columns: Buf[string], src: 
     val fs = fields_of_type(tg.row)
     val defaults = buf[Expr]()
     val at = buf[usize]()
+    val drawn = buf[usize]()
 
     for j in 0..<tg.table.columns.len()
         val c = tg.table.columns[j]
@@ -706,8 +708,8 @@ private insert_rows(s: &Store, ctx: Ctx, tg: Target, columns: Buf[string], src: 
                     defaults.push(e)
                     at.push(j)
                 None ->
-                    if c.identity != NoIdentity then panic("the executor draws no identity value yet")
-                    if !fs[j].ty.is_nullable() then return fail("Q3005", s"column '${c.name}' is NOT NULL and has no default")
+                    if c.identity != NoIdentity then drawn.push(j)
+                    else if !fs[j].ty.is_nullable() then return fail("Q3005", s"column '${c.name}' is NOT NULL and has no default")
 
     val dv = eval_defs(s, ctx, src, defaults)?
     val cs = buf[ColumnVector]()
@@ -720,6 +722,8 @@ private insert_rows(s: &Store, ctx: Ctx, tg: Target, columns: Buf[string], src: 
 
         for k in 0..<at.len()
             if at[k] == j then v = coerce_vector(dv[k], fs[j].ty)?
+
+        if contains(drawn.view(), j) then v = identity_values(s, tg.table.columns[j].sequence, fs[j].ty, src.len)?
 
         cs.push(v)
 

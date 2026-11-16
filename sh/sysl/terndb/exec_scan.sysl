@@ -50,6 +50,7 @@ private[terndb] struct Uses
         self.refs.scans.extend(rr.scans.view())
         self.refs.cols.extend(rr.cols.view())
         self.refs.rows.extend(rr.rows.view())
+        self.refs.sequences.extend(rr.sequences.view())
 
     db(self, s: &Store, t: &Txn) -> Db = Db(s, t, self.refs, self.whole)
 end Uses
@@ -140,12 +141,13 @@ private row_passes(p: TExpr, binder: string, elem: Type, version: u64, ctx: Ctx,
         Err(_) -> true
 
 /** The operator reading `table` under `binder` from `d`'s store at its transaction's snapshot, its
- * read logged with `filter` as its predicate.
+ * read logged with `filter` as its predicate. A view reads its stored query in its place
+ * (`exec_view.sysl`), whose scans log their own reads.
  */
 private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filter: Option[TExpr], ctx: Ctx) -> &Operator
     val i = d.store.catalog.table_at(table) match
         Some(i) -> i
-        None -> panic(s"the executor reads no view from the store: '${table.schema}.${table.name}'")
+        None -> return view_op(d, table, elem, ctx)
 
     val ct = d.store.catalog.tables[i]
     ScanOp(d.store, d.txn, ct.oid, elem, read_pred(d, ct, items_of([binder]), elem, filter, ctx), buf[ColumnVector](), false, 0)

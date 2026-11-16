@@ -443,7 +443,7 @@ filled_sequence(oid: u64, ns: u64, name: string, owner: u64, def: SequenceDef) -
     val min = def.min.unwrap_or(if increment < 0 then lo else 1)
     val max = def.max.unwrap_or(hi)
     val start = def.start.unwrap_or(1)
-    val s = CatSequence(oid, ns, name, owner, def.ty, start, increment, min, max, def.cycle, def.cache.unwrap_or(32), start, 0, 0)
+    val s = CatSequence(oid, ns, name, owner, def.ty, start, increment, min, max, def.cycle, def.cache.unwrap_or(32), start, 0, 0, false)
     check_sequence(s)?
     Ok(s)
 

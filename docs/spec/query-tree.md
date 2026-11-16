@@ -704,6 +704,14 @@ whatever `type` says, so `try` takes a nullable value to any permitted base. The
 (`at_zone(timestamp, text) → datetime`, `from_zone(datetime, text) → timestamp`); a non-null value is
 obtained from a nullable one with `assert_not_null(x) → T` (`R0004` on null).
 
+The zone conversions are strict. A zone is a name of the IANA time zone database (`Europe/Paris`), `UTC`, or a
+fixed offset written `+HH:MM` or `-HH:MM`; the database is the host's, so its version is the server's. Any other
+text is `R0006`. `at_zone` reads the instant on the zone's wall clocks at the offset in force then. `from_zone`
+finds the instant the reading names there: a reading the zone shows twice (its clocks set back) is the **earlier**
+of the two instants, and a reading the zone skips (its clocks set forward) is read at the offset in force before
+the gap, so `02:30` in a skipped hour is `03:30` in the hour after. A value within two days of either end of the
+`int64` range is `R0001`.
+
 ### 7.7 Match
 
 1. `expr` MUST have a union type (`Q3001`). Each arm names a tag (`Q2010`; a tag twice is `Q3009`) and a
