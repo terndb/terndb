@@ -320,12 +320,30 @@ binders and the window's record, one member per call.
   comparison placing nulls per `nulls_first`; the value is computed exactly in `i256` for integers and
   decimals, in `float64` for floats, and by the calendar `add_interval` for date and time keys.
   `exclude` cuts a frame into at most three runs of positions.
-- **Aggregates over a frame** reuse `Aggregate`'s kernels unchanged: each row's frame, as input row
-  numbers in the partition's order, is one group of a `Seen`, and `aggregate_column` computes every
-  group at once. The frames are handed over in runs of about 65 536 positions, so memory stays
-  bounded, but the work is the sum of the frames' sizes, quadratic in a partition for an unbounded or
-  running frame. Removable accumulators for `count`, `sum`, `avg`, `bool_and`/`bool_or` and a
-  segment tree for `min`/`max` are what would make that linear; they are not written yet.
+- **Aggregates over a frame slide** (`exec_window_slide.sysl`). Within a partition a frame's start
+  and end never move back from one position to the next, and an exclusion leaves at most two runs
+  (before and after the excluded row or peers) and the current row `exclude ties` keeps, each run's
+  bounds moving forward too. Each run keeps an accumulator that the positions passed by its end enter
+  and the positions passed by its start leave; a run that moves back or jumps past its own end, as at
+  a partition's first position, is emptied and refilled. So the work is linear in the rows, whatever
+  the frames' width:
+  - `count`, an exact `sum` or `avg` (an `i256` sum and a count) and `bool_and`/`bool_or` (counts of
+    values and of trues) are removable; the runs' states and the kept row add, and `avg` rounds the
+    total once, with `Aggregate`'s own rounding and `R0001` bounds.
+  - `min`/`max` keep a monotonic deque of positions per run: a value entering pops the candidates it
+    strictly beats, equal ones stay, and the start passing a candidate drops it, so the front is the
+    earliest of the best, the pick `Aggregate` makes. The runs' fronts and the kept row combine in
+    frame order.
+  - a float `sum`/`avg` adds in the frame's order from its first value, as `Aggregate` does, and IEEE
+    addition can not be taken back exactly: it slides only by adding, and sums the frame again
+    whenever its start passes a value. A running or `unbounded preceding` frame is linear; a sliding
+    one costs the sum of its frames' sizes, as from scratch. Under an exclusion a float sum, and
+    `collect` and `string_agg` always (whose results are as large as the frames), take the scratch
+    path: each row's frame, as input row numbers in the partition's order, is one group of a `Seen`
+    for `aggregate_column`, handed over in runs of about 65 536 positions.
+
+  Every sliding result is bit for bit the scratch path's, which the tests check slot by slot over
+  every frame shape and exclusion, and the work is counted in positions moved.
 - **first_value/last_value** take the first or last position of the frame's runs, or a null.
 
 Hash partitioning, which would need no sort of the partition values, waits on a fast seeded hash

@@ -1,0 +1,326 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{infinity, nan}
+
+// Window aggregates by sliding accumulators (`exec_window_slide.sysl`) against the same aggregates
+// from scratch (`scratch_aggregate`), slot for slot and bit for bit: every aggregate that slides,
+// over every value type it takes, with nulls, ties, overflow and IEEE corner values, over frames of
+// every shape — sliding, running, following, empty, peer-group, whole-partition, and frames that move
+// back — under every exclusion; and the work, counted in positions taken in or given up, linear.
+
+// -- layouts and frames ------------------------------------------------------------------------------
+
+/** A step of a 64-bit LCG. */
+xs_next(s: u64) -> u64 = s *% 6364136223846793005 +% 1442695040888963407
+
+/** A layout of partitions of `sizes` in turn, position `k` holding input row `n − 1 − k`, with a new
+ * peer group wherever `seed`'s draws say, as well as at each partition's first position.
+ */
+private xs_layout(sizes: []const usize, seed: u64) -> Layout
+    var n: usize = 0
+
+    for z in sizes
+        n += z
+
+    val rows = buf[usize]()
+    val part_lo = buf[usize]()
+    val part_hi = buf[usize]()
+    val group = buf[usize]()
+    val group_lo = buf[usize]()
+    val group_hi = buf[usize]()
+    var s = seed
+    var at: usize = 0
+
+    for z in sizes
+        for k in at..<at + z
+            rows.push(n - 1 - k)
+            part_lo.push(at)
+            part_hi.push(at + z)
+            s = xs_next(s)
+
+            if k == at || (s >> 33) % 3 == 0
+                if group_lo.len() > 0 then group_hi.push(k)
+                group_lo.push(k)
+
+            group.push(group_lo.len() - 1)
+
+        at += z
+
+    if n > 0 then group_hi.push(n)
+
+    Layout(rows, part_lo, part_hi, group, group_lo, group_hi, buf[KeyOrder]())
+end xs_layout
+
+xs_clamp(t: i64, lo: usize, hi: usize) -> usize =
+    if t < i64(lo) then lo elif t > i64(hi) then hi else usize(t)
+
+/** Frames of shape `shape` with offsets `a` and `b` over `lay`, excluding `ex`. */
+private xs_frames(lay: Layout, shape: int, a: i64, b: i64, ex: FrameExclude) -> Frames
+    val los = buf[usize]()
+    val his = buf[usize]()
+    var s: u64 = 99
+
+    for k in 0..<lay.rows.len()
+        val (plo, phi) = (lay.part_lo[k], lay.part_hi[k])
+        val g = lay.group[k]
+        val (g0, g1) = (lay.group[plo], lay.group[phi - 1])
+        s = xs_next(s)
+        val r = usize(s >> 33)
+
+        val (lo, hi) = shape match
+            // `rows between a preceding and b following`
+            0 -> (xs_clamp(i64(k) - a, plo, phi), xs_clamp(i64(k) + b + 1, plo, phi))
+            // `rows between unbounded preceding and current row`
+            1 -> (plo, k + 1)
+            // `range between unbounded preceding and current row`
+            2 -> (plo, lay.peer_hi(k))
+            // `rows between unbounded preceding and unbounded following`
+            3 -> (plo, phi)
+            // `rows between a following and b following`
+            4 -> (xs_clamp(i64(k) + a, plo, phi), xs_clamp(i64(k) + b + 1, plo, phi))
+            // `rows between a following and b preceding`: empty but at a partition's end
+            5 -> (xs_clamp(i64(k) + a, plo, phi), xs_clamp(i64(k) - b + 1, plo, phi))
+            // `groups between a preceding and b following`
+            6 ->
+                val gl = if i64(g) - a < i64(g0) then g0 else usize(i64(g) - a)
+                val gh = if i64(g) + b > i64(g1) then g1 else usize(i64(g) + b)
+                (lay.group_lo[gl], lay.group_hi[gh])
+            // `rows between current row and unbounded following`
+            7 -> (k, phi)
+            // anywhere in the partition, moving back and forth
+            _ ->
+                val x = plo + r % (phi - plo + 1)
+                (x, x + (r / 7) % (phi - x + 1))
+
+        los.push(lo)
+        his.push(if hi < lo then lo else hi)
+
+    Frames(los, his, ex)
+end xs_frames
+
+// -- agreement ----------------------------------------------------------------------------------------
+
+/** Two slots alike to the bit: a float by its encoding, so `-0.0`, `0.0` and NaN payloads differ. */
+xs_alike(a: Value, b: Value) -> bool = (a, b) match
+    (Float(x), Float(y)) -> x.bits() == y.bits()
+    _ -> a == b
+
+/** Aggregate `f` slides over `frames` and agrees with it from scratch: every slot, or the same error. */
+private xs_agree(f: string, ty: Type, args: Buf[ColumnVector], lay: Layout, frames: Frames, what: string)
+    assert(slides(f, ty, frames.exclude), s"$what: '$f' slides")
+
+    (scratch_aggregate(f, ty, args, lay, frames), slide_aggregate(f, ty, args, lay, frames)) match
+        (Ok(want), Ok((got, _))) ->
+            assert(got.ty == want.ty, s"$what: the type")
+            val (ws, gs) = (values_of(want), values_of(got))
+            assert_eq(gs.len(), ws.len())
+
+            for i in 0..<ws.len()
+                assert(xs_alike(gs[i], ws[i]), s"$what: position $i is ${gs[i]}, from scratch ${ws[i]}")
+        (Err(want), Err(got)) -> assert(got == want, s"$what: the error ${got.code}, from scratch ${want.code}")
+        (Ok(_), Err(e)) -> panic(s"$what: slides to ${e.code}, from scratch a value")
+        (Err(e), Ok(_)) -> panic(s"$what: from scratch ${e.code}, slides to a value")
+
+/** One argument. */
+xs_args(v: ColumnVector) -> Buf[ColumnVector]
+    val out = buf[ColumnVector]()
+    out.push(v)
+    out
+
+/** `n` values drawn from `seed`, a null where `nulls` of 8 draws say, each `pick`ed from a draw. */
+xs_values(n: usize, seed: u64, nulls: u64, pick: &Fn(u64) -> Value) -> Buf[Value]
+    val out = buf[Value]()
+    var s = seed
+
+    for _ in 0..<n
+        s = xs_next(s)
+        out.push(if (s >> 40) % 8 < nulls then Null else pick(s >> 20))
+
+    out
+
+/** Frames to check, and what they are. */
+private struct XsCase
+    fr: Frames
+    what: string
+
+xs_excludes() -> Buf[FrameExclude] = items_of([ExcludeNone, ExcludeCurrent, ExcludeGroup, ExcludeTies])
+
+/** Every frame shape with every pair of offsets over `lay`, under the exclusions `excludes`. */
+private xs_cases(lay: Layout, excludes: []const FrameExclude) -> Buf[XsCase]
+    val out = buf[XsCase]()
+    val offsets = [(0, 0), (1, 2), (3, 1), (6, 6)]
+
+    for e in 0..<excludes.len
+        for shape in 0..<9
+            for o in offsets
+                val (a, b) = o
+                out.push(XsCase(xs_frames(lay, shape, a, b, excludes[e]), s"shape $shape ($a, $b) exclusion $e"))
+
+    out
+
+/** A layout of partitions of sizes 1, 9, 2, 33, 1, 17 and 40. */
+private xs_lay(seed: u64) -> Layout = xs_layout([1, 9, 2, 33, 1, 17, 40], seed)
+
+// -- the tests -------------------------------------------------------------------------------------------
+
+@test
+exact_counts_sums_and_averages_slide_as_they_sum_from_scratch()
+    val lay = xs_lay(7)
+    val n = lay.rows.len()
+    val ints = vector_of(nullable(Int64), xs_values(n, 1, 2, d -> Int(i128(d % 11) - 5)).view())
+    val decs = vector_of(nullable(Decimal(10, 2)), xs_values(n, 2, 3, d -> Int(i128(d % 200001) - 100000)).view())
+    // Values near `int128`'s limits, so that some frames' sums overflow and others do not.
+    val bigs = vector_of(nullable(Int128), xs_values(n, 3, 1, d -> Int(if d % 2 == 0 then i128(1) << 125 else -(i128(1) << 125) + i128(d % 5))).view())
+
+    for c in xs_cases(lay, xs_excludes().view())
+        xs_agree("count", Int64, buf[ColumnVector](), lay, c.fr, s"count() ${c.what}")
+        xs_agree("count", Int64, xs_args(ints), lay, c.fr, s"count(int) ${c.what}")
+        xs_agree("sum", nullable(Int128), xs_args(ints), lay, c.fr, s"sum(int) ${c.what}")
+        xs_agree("avg", nullable(Decimal(38, 6)), xs_args(ints), lay, c.fr, s"avg(int) ${c.what}")
+        xs_agree("sum", nullable(Decimal(38, 2)), xs_args(decs), lay, c.fr, s"sum(decimal) ${c.what}")
+        xs_agree("avg", nullable(Decimal(38, 6)), xs_args(decs), lay, c.fr, s"avg(decimal) ${c.what}")
+        xs_agree("sum", nullable(Int128), xs_args(bigs), lay, c.fr, s"sum(int128) ${c.what}")
+        xs_agree("avg", nullable(Decimal(38, 6)), xs_args(bigs), lay, c.fr, s"avg(int128) ${c.what}")
+
+@test
+an_overflowing_frame_is_r0001_sliding_as_from_scratch()
+    val lay = xs_layout([6], 1)
+    val v = vector_of(nullable(Int128), [Int(i128(1) << 126), Int(i128(1) << 126), Null, Int(0), Int(1), Int(2)])
+    // `rows between 1 preceding and current row`: rows 4 and 5 of the input hold the two halves, side
+    // by side in the reversed layout.
+    val fr = xs_frames(lay, 0, 1, 0, ExcludeNone)
+    xs_agree("sum", nullable(Int128), xs_args(v), lay, fr, "overflow")
+    assert(slide_aggregate("sum", nullable(Int128), xs_args(v), lay, fr).is_err())
+
+@test
+bool_and_and_bool_or_slide_as_counts_of_their_values()
+    val lay = xs_lay(8)
+    val n = lay.rows.len()
+    val mostly = vector_of(nullable(Bool), xs_values(n, 4, 2, d -> Bool(d % 9 != 0)).view())
+    val rarely = vector_of(nullable(Bool), xs_values(n, 5, 5, d -> Bool(d % 9 == 0)).view())
+
+    for c in xs_cases(lay, xs_excludes().view())
+        for v in [mostly, rarely]
+            xs_agree("bool_and", nullable(Bool), xs_args(v), lay, c.fr, s"bool_and ${c.what}")
+            xs_agree("bool_or", nullable(Bool), xs_args(v), lay, c.fr, s"bool_or ${c.what}")
+
+/** A float the draw `d` picks: small and huge magnitudes, so the order of addition shows in the
+ * rounding, both zeros, both infinities and NaN payloads.
+ */
+xs_float(d: u64) -> Value = Float(d % 12 match
+    0 -> 1e16
+    1 -> -1e16
+    2 -> 0.1
+    3 -> -0.0
+    4 -> 0.0
+    5 -> nan()
+    6 -> -nan()
+    7 -> infinity()
+    8 -> -infinity()
+    9 -> 3.0
+    10 -> 1e-300
+    _ -> real(d % 1000) / 7.0)
+
+@test
+min_and_max_keep_the_first_of_equal_values_as_from_scratch()
+    val lay = xs_lay(9)
+    val n = lay.rows.len()
+    val ints = vector_of(nullable(Int64), xs_values(n, 6, 2, d -> Int(i128(d % 5))).view())
+    val floats = vector_of(nullable(Float64), xs_values(n, 7, 2, d -> xs_float(d)).view())
+    val texts = vector_of(nullable(Text), xs_values(n, 8, 3, d -> Text(if d % 3 == 0 then "a" elif d % 3 == 1 then "ab" else "b")).view())
+
+    for c in xs_cases(lay, xs_excludes().view())
+        for f in ["min", "max"]
+            xs_agree(f, nullable(Int64), xs_args(ints), lay, c.fr, s"$f(int) ${c.what}")
+            xs_agree(f, nullable(Float64), xs_args(floats), lay, c.fr, s"$f(float) ${c.what}")
+            xs_agree(f, nullable(Text), xs_args(texts), lay, c.fr, s"$f(text) ${c.what}")
+
+@test
+float_sums_slide_only_without_an_exclusion_and_add_in_the_frames_order()
+    assert(!slides("sum", nullable(Float64), ExcludeCurrent))
+    assert(!slides("avg", nullable(Float64), ExcludeTies))
+    assert(slides("sum", nullable(Float64), ExcludeNone))
+    assert(!slides("collect", nullable(Int64), ExcludeNone))
+    assert(!slides("string_agg", nullable(Text), ExcludeNone))
+    val lay = xs_lay(10)
+    val n = lay.rows.len()
+    val floats = vector_of(nullable(Float64), xs_values(n, 9, 2, d -> xs_float(d)).view())
+    // Finite values only, so a wrong order of addition shows in the rounding rather than in a NaN.
+    val finite = vector_of(nullable(Float64), xs_values(n, 10, 3, d -> Float(if d % 3 == 0 then 1e16 elif d % 3 == 1 then 0.7 else -1e16 + 3.0)).view())
+
+    for c in xs_cases(lay, [ExcludeNone])
+        for v in [floats, finite]
+            xs_agree("sum", nullable(Float64), xs_args(v), lay, c.fr, s"sum(float) ${c.what}")
+            xs_agree("avg", nullable(Float64), xs_args(v), lay, c.fr, s"avg(float) ${c.what}")
+
+@test
+no_rows_and_frames_that_are_all_empty_slide_to_nulls_and_zeros()
+    val none = xs_layout(buf[usize]().view(), 1)
+    val fr = xs_frames(none, 0, 1, 1, ExcludeNone)
+    xs_agree("sum", nullable(Int128), xs_args(vector_of(nullable(Int64), buf[Value]().view())), none, fr, "no rows")
+    val lay = xs_layout([12, 5], 2)
+    val n = lay.rows.len()
+    val ints = vector_of(nullable(Int64), xs_values(n, 11, 1, d -> Int(i128(d % 7))).view())
+    // `rows between 3 following and 3 preceding`: every frame empty.
+    val empty = xs_frames(lay, 5, 3, 3, ExcludeNone)
+
+    for k in 0..<n
+        assert_eq(empty.lo[k], empty.hi[k])
+
+    for f in ["count", "sum", "min", "max"]
+        xs_agree(f, if f == "count" then Int64 elif f == "sum" then nullable(Int128) else nullable(Int64), xs_args(ints), lay, empty, s"$f over empty frames")
+
+    val (counts, ops) = slide_aggregate("count", Int64, xs_args(ints), lay, empty).unwrap()
+    assert_eq(ops, 0)
+
+    for v in values_of(counts)
+        assert(v == Int(0))
+
+/** The positions the sliding `f` took in or gave up over `fr`. */
+private xs_ops(f: string, ty: Type, v: ColumnVector, lay: Layout, fr: Frames) -> usize
+    val (_, ops) = slide_aggregate(f, ty, xs_args(v), lay, fr).unwrap()
+    ops
+
+/** The positions `fr`'s frames hold all told: the work from scratch. */
+private xs_frame_work(fr: Frames) -> usize
+    var w: usize = 0
+
+    for k in 0..<fr.lo.len()
+        w += fr.hi[k] - fr.lo[k]
+
+    w
+
+@test
+the_work_is_linear_in_the_rows_whatever_the_frames_width()
+    val n: usize = 4000
+    val lay = xs_layout([n], 3)
+    val ints = vector_of(nullable(Int64), xs_values(n, 12, 1, d -> Int(i128(d % 1000))).view())
+    val bools = vector_of(nullable(Bool), xs_values(n, 13, 1, d -> Bool(d % 2 == 0)).view())
+    val floats = vector_of(nullable(Float64), xs_values(n, 14, 1, d -> Float(real(d % 1000))).view())
+
+    for ex in xs_excludes()
+        // `rows between 500 preceding and 500 following`: about a thousand positions a frame.
+        val fr = xs_frames(lay, 0, 500, 500, ex)
+        assert(xs_frame_work(fr) > 900 * n)
+
+        // Each of the two runs takes every position in once and gives it up once; a kept current
+        // row is one more.
+        for f in ["count", "sum", "avg", "min", "max"]
+            val ops = xs_ops(f, if f == "count" then Int64 elif f == "avg" then nullable(Decimal(38, 6)) elif f == "sum" then nullable(Int128) else nullable(Int64), ints, lay, fr)
+            assert(ops <= 5 * n, s"$f: $ops positions moved for $n rows")
+
+        assert(xs_ops("bool_and", nullable(Bool), bools, lay, fr) <= 5 * n)
+
+    // A running float sum only adds.
+    val running = xs_frames(lay, 1, 0, 0, ExcludeNone)
+    assert_eq(xs_ops("sum", nullable(Float64), floats, lay, running), n)
+    assert_eq(xs_ops("avg", nullable(Float64), floats, lay, xs_range_running(lay)), n)
+
+    // A sliding float sum sums each frame again once its start passes a value: the scratch work.
+    val sliding = xs_frames(lay, 0, 500, 500, ExcludeNone)
+    assert(xs_ops("sum", nullable(Float64), floats, lay, sliding) > xs_frame_work(sliding) / 2)
+
+/** `range between unbounded preceding and current row` over `lay`. */
+private xs_range_running(lay: Layout) -> Frames = xs_frames(lay, 2, 0, 0, ExcludeNone)

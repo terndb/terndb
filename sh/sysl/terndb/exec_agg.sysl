@@ -268,23 +268,29 @@ private sum_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector
 
         return Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), F64s(out)))
 
-    // The result type's bounds: `int128`'s, or a `decimal(38, s)`'s unscaled `10³⁸ − 1`.
-    val (lo, hi) = ty.base() match
-        Decimal(_, _) -> (1 - pow10(38), pow10(38) - 1)
-        _ -> int_range(Int128)
-
+    val (lo, hi) = sum_bounds(ty)
     val v = wide_of(x.lanes)
     val out = buf[i128]()
 
     for g in 0..<seen.groups()
         val (acc, n) = exact_sum(x, v, seen.of(g))
 
-        if acc < i256(lo) || acc > i256(hi) then return overflow()
+        if acc < lo || acc > hi then return overflow()
 
         out.push(i128.wrap(acc))
         valid.push(n > 0)
 
     Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), I128s(out)))
+
+/** The bounds of an exact `sum` of result type `ty`: `int128`'s, or a `decimal(38, s)`'s unscaled
+ * `10³⁸ − 1`.
+ */
+private[terndb] sum_bounds(ty: Type) -> (i256, i256)
+    val (lo, hi) = ty.base() match
+        Decimal(_, _) -> (1 - pow10(38), pow10(38) - 1)
+        _ -> int_range(Int128)
+
+    (i256(lo), i256(hi))
 
 /** `avg` of each group's non-null values, null where there are none. An integer or a decimal is the
  * exact sum over the count, rounded half away from zero to the result's scale, and `R0001` where that
@@ -304,16 +310,7 @@ private avg_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector
 
         return Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), F64s(out)))
 
-    val from = x.ty.base() match
-        Decimal(_, s) -> s
-        _ -> 0
-
-    val to = ty.base() match
-        Decimal(_, s) -> s
-        _ -> panic("avg of an exact number is a decimal")
-
-    val bound = i256(pow10(38))
-    val up = i256(pow10(to - from))
+    val up = avg_up(x, ty)
     val v = wide_of(x.lanes)
     val out = buf[i128]()
 
@@ -325,22 +322,41 @@ private avg_column(x: ColumnVector, ty: Type, seen: Seen) -> Result[ColumnVector
             valid.push(false)
             continue
 
-        // The sum of at most 2⁶⁴ values of 128 bits, scaled by at most 10⁶, fits in 256 bits.
-        val num = acc * up
-        val d = i256(n)
-        val q = num / d
-        val rem = num % d
-        val twice = if rem < 0 then -2 * rem else 2 * rem
-
-        // Half away from zero, as decimal `div` rounds (§4.4 rule 2).
-        val r = if twice >= d then (if num < 0 then q - 1 else q + 1) else q
-
-        if r >= bound || r <= -bound then return overflow()
-
-        out.push(i128.wrap(r))
+        out.push(exact_avg(acc, n, up)?)
         valid.push(true)
 
     Ok(ColumnVector(ty, seen.groups(), bits_of(valid.view()), I128s(out)))
+
+/** What an exact `avg` of `x` scales its sum by to reach the scale of its result type `ty`. */
+private[terndb] avg_up(x: ColumnVector, ty: Type) -> i256
+    val from = x.ty.base() match
+        Decimal(_, s) -> s
+        _ -> 0
+
+    val to = ty.base() match
+        Decimal(_, s) -> s
+        _ -> panic("avg of an exact number is a decimal")
+
+    i256(pow10(to - from))
+
+/** The unscaled `avg` of `n > 0` values summing exactly to `acc`, scaled by `up`: rounded half away
+ * from zero, and `R0001` outside `decimal(38, s)`.
+ */
+private[terndb] exact_avg(acc: i256, n: i64, up: i256) -> Result[i128, CodecError]
+    // The sum of at most 2⁶⁴ values of 128 bits, scaled by at most 10⁶, fits in 256 bits.
+    val bound = i256(pow10(38))
+    val num = acc * up
+    val d = i256(n)
+    val q = num / d
+    val rem = num % d
+    val twice = if rem < 0 then -2 * rem else 2 * rem
+
+    // Half away from zero, as decimal `div` rounds (§4.4 rule 2).
+    val r = if twice >= d then (if num < 0 then q - 1 else q + 1) else q
+
+    if r >= bound || r <= -bound then return overflow()
+
+    Ok(i128.wrap(r))
 
 /** The exact sum of the non-null values of `x` at the positions `at`, and how many there are. */
 private exact_sum(x: ColumnVector, v: Buf[i128], at: []const usize) -> (i256, i64)

@@ -44,7 +44,7 @@ private const ChunkPositions: usize = 65536
  * positions `part_lo[k]..<part_hi[k]` and its peer group the global group `group[k]`, whose positions
  * are `group_lo[g]..<group_hi[g]`.
  */
-private struct Layout
+private[terndb] struct Layout
     rows: Buf[usize]
     part_lo: Buf[usize]
     part_hi: Buf[usize]
@@ -221,7 +221,7 @@ end offset_column
 // -- frames -----------------------------------------------------------------------------------------
 
 /** Each position's frame before its exclusion: positions `lo[k]..<hi[k]`, with `lo[k] <= hi[k]`. */
-private struct Frames
+private[terndb] struct Frames
     lo: Buf[usize]
     hi: Buf[usize]
     exclude: FrameExclude
@@ -472,8 +472,8 @@ private edge_column(w: TWin, ty: Type, lay: Layout, frames: Frames, env: Env) ->
 
     Ok(take(src, at.view()))
 
-/** An aggregate over each row's frame (§6.8 rule 5): each frame is a group of `aggregate_column`,
- * its rows in the partition's order, handed over a run of rows at a time.
+/** An aggregate over each row's frame (§6.8 rule 5), by sliding accumulators where the aggregate
+ * admits them (`slides`), and otherwise from scratch.
  */
 private frame_aggregate(w: TWin, ty: Type, lay: Layout, frames: Frames, env: Env) -> Result[ColumnVector, CodecError]
     val n = env.n
@@ -482,6 +482,29 @@ private frame_aggregate(w: TWin, ty: Type, lay: Layout, frames: Frames, env: Env
     for x in w.args
         args.push(eval(x, env)?)
 
+    val by_position = if slides(w.function, ty, frames.exclude)
+        val (col, _) = slide_aggregate(w.function, ty, args, lay, frames)?
+        col
+    else
+        scratch_aggregate(w.function, ty, args, lay, frames)?
+
+    // Position `k`'s value is slot `k`; input row `rows[k]` takes it.
+    val slot = buf[usize]()
+
+    for _ in 0..<n
+        slot.push(0)
+
+    for k in 0..<n
+        slot[lay.rows[k]] = k
+
+    Ok(take(by_position, slot.view()))
+
+/** Aggregate `f` of `args` over each position's frame, slot `k` position `k`'s, from scratch: each
+ * frame is a group of `aggregate_column`, its rows in the partition's order, handed over a run of rows
+ * at a time. The work is the sum of the frames' sizes.
+ */
+private[terndb] scratch_aggregate(f: string, ty: Type, args: Buf[ColumnVector], lay: Layout, frames: Frames) -> Result[ColumnVector, CodecError]
+    val n = lay.rows.len()
     val chunks = buf[ColumnVector]()
     var at = buf[usize]()
     var bounds = buf[usize]()
@@ -495,20 +518,10 @@ private frame_aggregate(w: TWin, ty: Type, lay: Layout, frames: Frames, env: Env
         bounds.push(at.len())
 
         if at.len() >= ChunkPositions || k + 1 == n
-            chunks.push(aggregate_column(w.function, ty, args, Seen(at, bounds))?)
+            chunks.push(aggregate_column(f, ty, args, Seen(at, bounds))?)
             at = buf[usize]()
             bounds = buf[usize]()
             bounds.push(0)
 
-    // Position `k`'s value is slot `k`; input row `rows[k]` takes it.
-    val by_position = concat(ty, chunks.view())
-    val slot = buf[usize]()
-
-    for _ in 0..<n
-        slot.push(0)
-
-    for k in 0..<n
-        slot[lay.rows[k]] = k
-
-    Ok(take(by_position, slot.view()))
-end frame_aggregate
+    Ok(concat(ty, chunks.view()))
+end scratch_aggregate

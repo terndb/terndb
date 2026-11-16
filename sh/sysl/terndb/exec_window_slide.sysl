@@ -1,0 +1,335 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Window aggregates by sliding accumulators (`docs/design/executor.md` §4.3). Within a partition a
+// frame's start and end only move forward from one position to the next (§6.8 rule 4), so an
+// aggregate that admits removal keeps one accumulator per run of its frame and moves it: the
+// positions the end passes enter, the ones the start passes leave. An exclusion leaves at most two
+// runs and one position (`Split`), and each run's start and end move forward too. A window that moves
+// back, or jumps past its own end, as at a partition's first position, is emptied and refilled, so the
+// results never depend on that order; only the work does. Each result is the one `aggregate_column`
+// gives the same frame from scratch, bit for bit.
+
+/** Whether `slide_aggregate` computes aggregate `f` of result type `ty` under exclusion `ex`. An exact
+ * count, sum or average is removable, and `bool_and`/`bool_or` are counts of their values; `min` and
+ * `max` keep the candidates for the pick. A float sum is not removable, since IEEE addition does not
+ * round the same way backwards, so it slides only while its frame's start keeps still, and an
+ * exclusion, which would add its runs out of order, keeps it on the scratch path.
+ */
+private[terndb] slides(f: string, ty: Type, ex: FrameExclude) -> bool = f match
+    "count" | "min" | "max" | "bool_and" | "bool_or" -> true
+    "sum" | "avg" -> ty.base() != Float64 || ex == ExcludeNone
+    _ -> false
+
+/** Position `k`'s frame with its exclusion applied: the runs `left_lo..<left_hi` and
+ * `right_lo..<right_hi`, either possibly empty, with `mid` between them, the current row that
+ * `exclude ties` keeps. Every bound is non-decreasing in `k` within a partition.
+ */
+private struct Split
+    left_lo: usize
+    left_hi: usize
+    right_lo: usize
+    right_hi: usize
+    mid: Option[usize]
+
+private larger(a: usize, b: usize) -> usize = if a > b then a else b
+
+private smaller(a: usize, b: usize) -> usize = if a < b then a else b
+
+private split_at(frames: Frames, k: usize, lay: Layout) -> Split
+    val (s, e) = (frames.lo[k], frames.hi[k])
+
+    val (xs, xe) = frames.exclude match
+        ExcludeNone -> return Split(s, e, e, e, None)
+        ExcludeCurrent -> (k, k + 1)
+        _ -> (lay.peer_lo(k), lay.peer_hi(k))
+
+    val mid = if frames.exclude == ExcludeTies && s <= k && k < e then Some(k) else None
+    val r = larger(s, xe)
+    Split(s, larger(s, smaller(e, xs)), r, larger(r, e), mid)
+
+/** How a window of positions moves from `lo..<hi` to a new one: emptied first (`reset`), then the
+ * positions `drop_lo..<drop_hi` leave and `add_lo..<add_hi` enter.
+ */
+private struct Move
+    reset: bool
+    drop_lo: usize
+    drop_hi: usize
+    add_lo: usize
+    add_hi: usize
+
+    /** How many positions enter or leave. */
+    ops(self) -> usize = (self.drop_hi - self.drop_lo) + (self.add_hi - self.add_lo)
+
+private move_of(lo: usize, hi: usize, to_lo: usize, to_hi: usize) -> Move =
+    if to_lo < lo || to_hi < hi || to_lo >= hi
+        Move(true, to_lo, to_lo, to_lo, to_hi)
+    else
+        Move(false, lo, to_lo, hi, to_hi)
+
+// -- exact counts and sums -------------------------------------------------------------------------
+
+/** What a removable accumulator counts of each position. */
+private enum Counted
+    CountRows
+    CountValues(x: ColumnVector)
+    CountSums(x: ColumnVector, v: Buf[i128])
+    CountTruths(x: ColumnVector, v: Buf[bool])
+
+/** A removable accumulator's state: the positions, the non-null values, their exact sum, and how
+ * many of them are true.
+ */
+private struct Counts
+    rows: i64
+    vals: i64
+    sum: i256
+    trues: i64
+
+private no_counts() -> Counts = Counts(0, 0, 0, 0)
+
+/** `c` with input row `p` entering (`d` 1) or leaving (`d` −1). */
+private counted(c: Counts, p: usize, d: i64, what: Counted) -> Counts = what match
+    CountRows -> Counts(c.rows + d, c.vals, c.sum, c.trues)
+    CountValues(x) -> Counts(c.rows + d, if x.is_valid(p) then c.vals + d else c.vals, c.sum, c.trues)
+    CountSums(x, v) ->
+        if !x.is_valid(p) then return Counts(c.rows + d, c.vals, c.sum, c.trues)
+
+        Counts(c.rows + d, c.vals + d, if d > 0 then c.sum + i256(v[p]) else c.sum - i256(v[p]), c.trues)
+    CountTruths(x, v) ->
+        if !x.is_valid(p) then return Counts(c.rows + d, c.vals, c.sum, c.trues)
+
+        Counts(c.rows + d, c.vals + d, c.sum, if v[p] then c.trues + d else c.trues)
+
+private both(a: Counts, b: Counts) -> Counts = Counts(a.rows + b.rows, a.vals + b.vals, a.sum + b.sum, a.trues + b.trues)
+
+/** A removable accumulator over the window `lo..<hi` of positions. */
+private struct Tally
+    lo: usize
+    hi: usize
+    c: Counts
+
+    /** Move the window to `lo..<hi`; the positions that entered or left. */
+    move_to(*self, lo: usize, hi: usize, lay: Layout, what: Counted) -> usize
+        val m = move_of(self.lo, self.hi, lo, hi)
+
+        if m.reset then self.c = no_counts()
+
+        for t in m.drop_lo..<m.drop_hi
+            self.c = counted(self.c, lay.rows[t], -1, what)
+
+        for t in m.add_lo..<m.add_hi
+            self.c = counted(self.c, lay.rows[t], 1, what)
+
+        self.lo = lo
+        self.hi = hi
+        m.ops()
+
+/** `count`, an exact `sum` or `avg`, `bool_and` or `bool_or` over each position's frame. */
+private slide_counts(f: string, ty: Type, args: Buf[ColumnVector], lay: Layout, frames: Frames) -> Result[(ColumnVector, usize), CodecError]
+    val n = lay.rows.len()
+
+    val what = if args.len() == 0
+        CountRows
+    else
+        val x = args[0]
+
+        f match
+            "count" -> CountValues(x)
+            "sum" | "avg" -> CountSums(x, wide_of(x.lanes))
+            _ ->
+                x.lanes match
+                    Bools(b) -> CountTruths(x, b)
+                    _ -> panic("bool_and and bool_or take a bool")
+
+    var left = Tally(0, 0, no_counts())
+    var right = Tally(0, 0, no_counts())
+    var ops: usize = 0
+    val (lo, hi) = sum_bounds(ty)
+    val up = if f == "avg" then avg_up(args[0], ty) else i256(1)
+    val counts = buf[i64]()
+    val wides = buf[i128]()
+    val truths = buf[bool]()
+    val valid = buf[bool]()
+
+    for k in 0..<n
+        val sp = split_at(frames, k, lay)
+        ops += left.move_to(sp.left_lo, sp.left_hi, lay, what)
+        ops += right.move_to(sp.right_lo, sp.right_hi, lay, what)
+        var c = both(left.c, right.c)
+
+        if sp.mid.is_some()
+            c = counted(c, lay.rows[sp.mid.unwrap()], 1, what)
+            ops += 1
+
+        f match
+            "count" -> counts.push(if args.len() == 0 then c.rows else c.vals)
+            "sum" ->
+                if c.sum < lo || c.sum > hi then return overflow()
+
+                wides.push(i128.wrap(c.sum))
+                valid.push(c.vals > 0)
+            "avg" ->
+                wides.push(if c.vals > 0 then exact_avg(c.sum, c.vals, up)? else 0)
+                valid.push(c.vals > 0)
+            "bool_and" ->
+                truths.push(c.trues == c.vals)
+                valid.push(c.vals > 0)
+            _ ->
+                truths.push(c.trues > 0)
+                valid.push(c.vals > 0)
+
+    val col = f match
+        "count" -> ColumnVector(Int64, n, buf[u8](), I64s(counts))
+        "sum" | "avg" -> ColumnVector(ty, n, bits_of(valid.view()), I128s(wides))
+        _ -> ColumnVector(ty, n, bits_of(valid.view()), Bools(truths))
+
+    Ok((col, ops))
+end slide_counts
+
+// -- float sums --------------------------------------------------------------------------------------
+
+/** A float sum over the window `lo..<hi`, added in order from its first value, as `float_sum` adds.
+ * A value leaving can not be taken back out exactly, so the window is summed again whenever its start
+ * passes a value; positions that only enter are added on.
+ */
+private struct FloatSum
+    lo: usize
+    hi: usize
+    acc: real
+    vals: i64
+
+    /** Input row `p` entering. */
+    add(*self, p: usize, x: ColumnVector, v: Buf[real])
+        if x.is_valid(p)
+            self.acc = if self.vals > 0 then self.acc + v[p] else v[p]
+            self.vals += 1
+
+    /** Move the window to `lo..<hi`; the positions that entered, left or were summed again. */
+    move_to(*self, lo: usize, hi: usize, lay: Layout, x: ColumnVector, v: Buf[real]) -> usize
+        val m = move_of(self.lo, self.hi, lo, hi)
+        var again = m.reset
+
+        for t in m.drop_lo..<m.drop_hi
+            if x.is_valid(lay.rows[t]) then again = true
+
+        var from = m.add_lo
+        var ops = m.drop_hi - m.drop_lo
+
+        if again
+            self.acc = 0.0
+            self.vals = 0
+            from = lo
+
+        for t in from..<hi
+            self.add(lay.rows[t], x, v)
+
+        self.lo = lo
+        self.hi = hi
+        ops + (hi - from)
+end FloatSum
+
+/** A float `sum` or `avg` over each position's frame, which has no exclusion. */
+private slide_floats(f: string, ty: Type, x: ColumnVector, lay: Layout, frames: Frames) -> (ColumnVector, usize)
+    val n = lay.rows.len()
+    val v = reals_of(x.lanes)
+    var s = FloatSum(0, 0, 0.0, 0)
+    var ops: usize = 0
+    val out = buf[real]()
+    val valid = buf[bool]()
+
+    for k in 0..<n
+        ops += s.move_to(frames.lo[k], frames.hi[k], lay, x, v)
+        val some = s.vals > 0
+        out.push(if f == "sum" then s.acc elif some then s.acc / real(s.vals) else 0.0)
+        valid.push(some)
+
+    (ColumnVector(ty, n, bits_of(valid.view()), F64s(out)), ops)
+
+// -- min and max ---------------------------------------------------------------------------------------
+
+/** The candidates for the pick of the window `lo..<hi`: its positions whose value no later position
+ * beats, oldest first, so each is no better than the one before it and the first is the earliest of
+ * the best (`at[head..]`).
+ */
+private struct Picks
+    lo: usize
+    hi: usize
+    at: Buf[usize]
+    head: usize
+
+    /** Move the window to `lo..<hi`; the positions that entered or left. */
+    move_to(*self, lo: usize, hi: usize, lay: Layout, x: ColumnVector, order: &Fn(usize, usize) -> i8, want: i8) -> usize
+        val m = move_of(self.lo, self.hi, lo, hi)
+
+        if m.reset
+            self.at.truncate(0)
+            self.head = 0
+
+        while self.head < self.at.len() && self.at[self.head] < lo
+            self.head += 1
+
+        for t in m.add_lo..<m.add_hi
+            val p = lay.rows[t]
+
+            if x.is_valid(p)
+                while self.at.len() > self.head && order(p, lay.rows[self.at[self.at.len() - 1]]) == want
+                    self.at.truncate(self.at.len() - 1)
+
+                self.at.push(t)
+
+        self.lo = lo
+        self.hi = hi
+        m.ops()
+
+    /** The input row of the window's pick, or `none` when it holds no value. */
+    best(self, lay: Layout, none: usize) -> usize = if self.head < self.at.len() then lay.rows[self.at[self.head]] else none
+end Picks
+
+/** Input row `p` where it holds a value that beats `best`, a pick of earlier positions; else `best`. */
+private better(p: usize, best: usize, x: ColumnVector, order: &Fn(usize, usize) -> i8, want: i8, none: usize) -> usize =
+    if p != none && x.is_valid(p) && (best == none || order(p, best) == want) then p else best
+
+/** `min` (`want` −1) or `max` (`want` 1) over each position's frame, the first of equal ones in the
+ * frame's order, as `pick_column` picks.
+ */
+private slide_picks(x: ColumnVector, ty: Type, lay: Layout, frames: Frames, want: i8) -> (ColumnVector, usize)
+    val n = lay.rows.len()
+    val order = slot_order(x)
+    // Slot `x.len` of the padded vector below is null: the pick of a frame with no value.
+    val none = x.len
+    var left = Picks(0, 0, buf[usize](), 0)
+    var right = Picks(0, 0, buf[usize](), 0)
+    var ops: usize = 0
+    val picks = buf[usize]()
+
+    for k in 0..<n
+        val sp = split_at(frames, k, lay)
+        ops += left.move_to(sp.left_lo, sp.left_hi, lay, x, order, want)
+        ops += right.move_to(sp.right_lo, sp.right_hi, lay, x, order, want)
+        // The runs' picks and the kept current row, in the frame's order.
+        var best = left.best(lay, none)
+
+        if sp.mid.is_some()
+            best = better(lay.rows[sp.mid.unwrap()], best, x, order, want, none)
+            ops += 1
+
+        picks.push(better(right.best(lay, none), best, x, order, want, none))
+
+    val parts = buf[ColumnVector]()
+    parts.push(x.as_type(ty))
+    parts.push(vector_of(ty, [Null]))
+    (take(concat(ty, parts.view()), picks.view()), ops)
+end slide_picks
+
+/** Aggregate `f` of `args` over each position's frame, slot `k` position `k`'s, by sliding
+ * accumulators (`slides` says which), and the positions they took in or gave up: at most two per
+ * position for each run of the frame, and one for an `exclude ties` current row, besides a float
+ * sum's sums again.
+ */
+private[terndb] slide_aggregate(f: string, ty: Type, args: Buf[ColumnVector], lay: Layout, frames: Frames) -> Result[(ColumnVector, usize), CodecError] = f match
+    "min" -> Ok(slide_picks(args[0], ty, lay, frames, -1))
+    "max" -> Ok(slide_picks(args[0], ty, lay, frames, 1))
+    "sum" | "avg" ->
+        if ty.base() == Float64 then Ok(slide_floats(f, ty, args[0], lay, frames)) else slide_counts(f, ty, args, lay, frames)
+    _ -> slide_counts(f, ty, args, lay, frames)
