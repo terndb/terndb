@@ -119,7 +119,7 @@ Raised during evaluation. None is retryable or fatal.
 | `R0003` | `more_than_one_row` | More than one row for a scalar subquery or `single` join. |
 | `R0004` | `null_asserted` | `assert_not_null` on null. |
 | `R0005` | `recursion_limit` | Recursion bound exceeded. |
-| `R0006` | `invalid_value` | A value does not convert (cast failure), or is out of a node's domain (negative limit). |
+| `R0006` | `invalid_value` | A value does not convert (cast failure), or is out of a node's domain (negative limit, a null or negative window frame offset, a negative `lag`/`lead` offset). |
 | `R0007` | `row_affected_twice` | A target row affected twice by one statement. |
 | `R0008` | `sequence_exhausted` | `next_value` would pass a non-cycling sequence's bound (`ddl.md` §2.7). |
 

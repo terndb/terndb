@@ -1,0 +1,255 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{infinity, nan}
+
+// `Window` (`query-tree.md` §6.8) case by case: empty input, the output's types and binders, calls
+// with no partition or no order, `lag`/`lead` offsets per row, `range` over decimal, float and
+// calendar keys, and every runtime error.
+
+/** Column `j` of the window binder over `rows` of `cols`, the window being `items` with params. */
+private xc_column(cols: []const Field, rows: []const Value, decls: []const ParamDecl, params: []const Value, items: []const NamedWin, j: usize) -> Result[Buf[Value], CodecError]
+    val (_, out) = xw_exec(cols, rows, [2], decls, params, xw_window(items))?
+    val got = buf[Value]()
+
+    for w in xw_cols(cols, rows, out)
+        got.push(xe_field(w, j))
+
+    Ok(got)
+
+private xc_code(r: Result[Buf[Value], CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+private xc_ints(xs: []const i128) -> Buf[Value]
+    val out = buf[Value]()
+
+    for x in xs
+        out.push(Int(x))
+
+    out
+
+private xc_one(f: string, args: []const Expr, order: []const SortKey, frame: Option[Frame]) -> [1]NamedWin =
+    [xw_w("x", f, args, [], order, frame)]
+
+private xc_count_over(o: Expr, desc: bool, nf: bool, s: Bound, e: Bound) -> [1]NamedWin =
+    xc_one("count", [], [SortKey(o, desc, nf)], Some(Frame(Range, s, e, ExcludeNone)))
+
+private xc_f(x: real) -> Value = rec([Float(x)])
+
+private xc_fcols() -> [1]Field = [Field("o", nullable(Float64))]
+
+// -- shape -----------------------------------------------------------------------------------------
+
+@test
+an_empty_input_has_no_rows_and_the_type_checkers_types()
+    val cols = [Field("v", nullable(Int64))]
+    val items = [
+        xw_w("rn", "row_number", [], [], [], None),
+        xw_w("lg", "lag", [col("t", "v")], [], [], None),
+        xw_w("s", "sum", [col("t", "v")], [], [], None),
+        xw_w("vs", "collect", [col("t", "v")], [], [], None)]
+    val (elem, out) = xw_exec(cols, [], [], [], [], xw_window(items)).unwrap()
+    assert_eq(out.len(), 0)
+    val w = record([Field("rn", Int64), Field("lg", nullable(Int64)), Field("s", nullable(Int128)), Field("vs", bag(nullable(Int64)))])
+    assert(elem == record([Field("t", record(cols)), Field("w", w)]))
+
+@test
+with_no_partition_and_no_order_every_row_is_a_peer_in_input_order()
+    val cols = [Field("v", Int64)]
+    val rows = [rec([Int(5)]), rec([Int(3)]), rec([Int(9)])]
+    val items = [
+        xw_w("rn", "row_number", [], [], [], None),
+        xw_w("rk", "rank", [], [], [], None),
+        xw_w("dr", "dense_rank", [], [], [], None),
+        xw_w("s", "sum", [col("t", "v")], [], [], None),
+        xw_w("fv", "first_value", [col("t", "v")], [], [], None),
+        xw_w("lv", "last_value", [col("t", "v")], [], [], None)]
+    val (_, out) = xw_exec(cols, rows, [], [], [], xw_window(items)).unwrap()
+    val got = xw_cols(cols, rows, out)
+    // The default frame without an order is the whole partition (§6.8 rule 4).
+    assert(got[0] == rec([Int(1), Int(1), Int(1), Int(17), Int(5), Int(9)]), s"${got[0]}")
+    assert(got[1] == rec([Int(2), Int(1), Int(1), Int(17), Int(5), Int(9)]), s"${got[1]}")
+    assert(got[2] == rec([Int(3), Int(1), Int(1), Int(17), Int(5), Int(9)]), s"${got[2]}")
+
+@test
+calls_partition_and_order_each_on_their_own()
+    val cols = [Field("k", Int64), Field("v", Int64)]
+    val rows = [rec([Int(1), Int(30)]), rec([Int(2), Int(10)]), rec([Int(1), Int(20)]), rec([Int(2), Int(40)])]
+    val items = [
+        xw_w("a", "row_number", [], [col("t", "k")], [SortKey(col("t", "v"), false, false)], None),
+        xw_w("b", "row_number", [], [], [SortKey(col("t", "v"), true, false)], None)]
+    val (_, out) = xw_exec(cols, rows, [], [], [], xw_window(items)).unwrap()
+    val got = xw_cols(cols, rows, out)
+    assert(got[0] == rec([Int(2), Int(2)]) && got[1] == rec([Int(1), Int(4)]), s"$got")
+    assert(got[2] == rec([Int(1), Int(3)]) && got[3] == rec([Int(2), Int(1)]), s"$got")
+
+@test
+a_window_over_a_window_and_a_project_above_see_every_binder()
+    val cols = [Field("v", Int64)]
+    val rows = [rec([Int(4)]), rec([Int(4)]), rec([Int(7)])]
+    val inner = Window(scan("app", "t", "t"), "w1", items_of([xw_w("r", "rank", [], [], [SortKey(col("t", "v"), false, false)], None)]))
+    val outer = Window(inner, "w2", items_of([xw_w("n", "count", [], [col("w1", "r")], [], None)]))
+    val top = Project(outer, "out", items_of([item("v", col("t", "v")), item("r", col("w1", "r")), item("n", col("w2", "n"))]))
+    val (_, out) = xw_exec(cols, rows, [], [], [], top).unwrap()
+    assert(out.len() == 3)
+    assert(out[0] == rec([Int(4), Int(1), Int(2)]) && out[1] == rec([Int(4), Int(1), Int(2)]), s"$out")
+    assert(out[2] == rec([Int(7), Int(3), Int(1)]), s"$out")
+
+// -- lag and lead ----------------------------------------------------------------------------------
+
+@test
+lag_and_lead_take_their_offset_per_row()
+    // `n` is an int32 column, coerced to int64.
+    val cols = [Field("v", Int64), Field("n", Int32)]
+    val rows = [rec([Int(10), Int(0)]), rec([Int(20), Int(1)]), rec([Int(30), Int(1)]), rec([Int(40), Int(3)]), rec([Int(50), Int(9)])]
+    val order = [SortKey(col("t", "v"), false, false)]
+    val v = col("t", "v")
+    val lag = [xw_w("x", "lag", [v, col("t", "n"), xw_i(-7)], [], order, None)]
+    // 0 is the current row; past the partition is the default, or null without one.
+    assert(xc_column(cols, rows, [], [], lag, 0).unwrap() == items_of([Int(10), Int(10), Int(20), Int(10), Int(-7)]))
+    val lead = [xw_w("x", "lead", [v, col("t", "n")], [], order, None)]
+    assert(xc_column(cols, rows, [], [], lead, 0).unwrap() == items_of([Int(10), Int(30), Int(40), Null, Null]))
+    // A nullable offset does not coerce to int64.
+    val ncols = [Field("v", Int64), Field("n", nullable(Int64))]
+    assert_eq(xc_code(xc_column(ncols, [], [], [], [xw_w("x", "lag", [v, col("t", "n")], [], order, None)], 0)), "Q3002")
+
+@test
+a_negative_lag_offset_is_r0006()
+    val cols = [Field("v", Int64)]
+    val items = [xw_w("x", "lag", [col("t", "v"), xw_i(-1)], [], [], None)]
+    assert_eq(xc_code(xc_column(cols, [rec([Int(1)])], [], [], items, 0)), "R0006")
+    // With no row the offset is never read.
+    assert_eq(xc_code(xc_column(cols, [], [], [], items, 0)), "ok")
+
+@test
+lag_coerces_its_value_and_default_to_their_common_type()
+    val cols = [Field("v", Int32)]
+    val items = [xw_w("x", "lag", [col("t", "v"), xw_i(1), xw_i(100000000000)], [], [], None)]
+    val (elem, out) = xw_exec(cols, [rec([Int(1)]), rec([Int(2)])], [], [], [], xw_window(items)).unwrap()
+    assert(fields_of_type(fields_of_type(elem)[1].ty)[0].ty == Int64)
+    assert(xe_field(xe_field(out[0], 1), 0) == Int(100000000000) && xe_field(xe_field(out[1], 1), 0) == Int(1))
+
+// -- range over keys of each kind --------------------------------------------------------------------
+
+@test
+a_range_offset_over_a_decimal_key_is_exact()
+    val cols = [Field("o", nullable(Decimal(10, 2)))]
+    val rows = [rec([Int(100)]), rec([Int(250)]), rec([Int(199)]), rec([Int(300)]), rec([Null])]
+    val one = Literal(Decimal(3, 2), Int(100))
+    val order = [SortKey(col("t", "o"), false, false)]
+    val frame = Some(Frame(Range, Bound(Preceding, Some(one)), xw_cur(), ExcludeNone))
+    assert(xc_column(cols, rows, [], [], xc_one("count", [], order, frame), 0).unwrap() == xc_ints([1, 2, 2, 2, 1]))
+    assert(xc_column(cols, rows, [], [], xc_one("sum", [col("t", "o")], order, frame), 0).unwrap() == items_of([Int(100), Int(449), Int(299), Int(550), Null]))
+
+@test
+a_range_offset_over_integers_never_overflows()
+    val cols = [Field("o", Int64)]
+    val rows = [rec([Int(9223372036854775807)]), rec([Int(9223372036854775806)]), rec([Int(-9223372036854775808)])]
+    val big = xw_i(9223372036854775807)
+    val items = xc_count_over(col("t", "o"), false, false, Bound(Preceding, Some(big)), Bound(Following, Some(big)))
+    assert(xc_column(cols, rows, [], [], items, 0).unwrap() == xc_ints([2, 2, 1]))
+
+@test
+a_range_offset_over_floats_orders_zeros_infinities_and_nan()
+    val rows = [xc_f(1.0), xc_f(-infinity()), xc_f(nan()), xc_f(0.0), xc_f(-0.0), xc_f(infinity()), rec([Null]), xc_f(2.5)]
+    val o = col("t", "o")
+    val one = Some(Literal(Float64, Float(1.0)))
+    val inf = Some(Literal(Float64, Float(infinity())))
+    // ±1: −0 and +0 are peers; a NaN or null current row is bounded by its peers.
+    val near = xc_count_over(o, false, false, Bound(Preceding, one), Bound(Following, one))
+    assert(xc_column(xc_fcols(), rows, [], [], near, 0).unwrap() == xc_ints([3, 1, 1, 3, 3, 1, 1, 1]))
+    // inf − inf is −∞ toward the start, so the +∞ row reaches back to −∞, never to NaN.
+    val back = xc_count_over(o, false, false, Bound(Preceding, inf), xw_cur())
+    assert(xc_column(xc_fcols(), rows, [], [], back, 0).unwrap() == xc_ints([4, 1, 1, 3, 3, 6, 1, 5]))
+    val ahead = xc_count_over(o, false, false, xw_cur(), Bound(Following, inf))
+    assert(xc_column(xc_fcols(), rows, [], [], ahead, 0).unwrap() == xc_ints([3, 6, 1, 5, 5, 1, 1, 2]))
+    // Descending, nulls first: `2 preceding` reaches up to v + 2.
+    val two = Some(Literal(Float64, Float(2.0)))
+    val desc = xc_count_over(o, true, true, Bound(Preceding, two), xw_cur())
+    assert(xc_column(xc_fcols(), rows, [], [], desc, 0).unwrap() == xc_ints([2, 1, 1, 3, 3, 1, 1, 1]))
+
+@test
+a_range_offset_over_a_timestamp_is_an_interval()
+    val day: i128 = 86400000000
+    val cols = [Field("o", nullable(Timestamp))]
+    val rows = [rec([Int(0)]), rec([Int(day)]), rec([Int(day + 1)]), rec([Int(3 * day)]), rec([Null])]
+    val iv = Some(Literal(Interval, Interval(0, 1, 0)))
+    val items = xc_count_over(col("t", "o"), false, false, Bound(Preceding, iv), xw_cur())
+    assert(xc_column(cols, rows, [], [], items, 0).unwrap() == xc_ints([1, 2, 2, 1, 1]))
+
+@test
+a_range_offset_over_a_date_adds_months_with_clamping()
+    // 2024-01-31, 2024-02-29, 2024-03-01, 2024-03-31 as days since 1970-01-01.
+    val cols = [Field("o", Date)]
+    val rows = [rec([Int(19753)]), rec([Int(19782)]), rec([Int(19783)]), rec([Int(19813)])]
+    val month = Some(Literal(Interval, Interval(1, 0, 0)))
+    val items = xc_count_over(col("t", "o"), false, false, Bound(Preceding, month), xw_cur())
+    // 2024-03-31 less a month is 2024-02-29 (clamped), which it reaches.
+    assert(xc_column(cols, rows, [], [], items, 0).unwrap() == xc_ints([1, 2, 2, 3]))
+
+@test
+a_calendar_bound_past_int64_is_r0001()
+    val cols = [Field("o", Timestamp)]
+    val items = xc_count_over(col("t", "o"), false, false, xw_cur(), Bound(Following, Some(Literal(Interval, Interval(0, 1, 0)))))
+    assert_eq(xc_code(xc_column(cols, [rec([Int(9223372036854775000)])], [], [], items, 0)), "R0001")
+    assert_eq(xc_code(xc_column(cols, [rec([Int(0)])], [], [], items, 0)), "ok")
+
+// -- offsets out of their domain -------------------------------------------------------------------------
+
+@test
+a_negative_or_nan_frame_offset_is_r0006()
+    val icols = [Field("o", Int64)]
+    val irows = [rec([Int(1)])]
+    val o = col("t", "o")
+    val order = [SortKey(o, false, false)]
+
+    for u in [Rows, Groups, Range]
+        val start = xc_one("count", [], order, Some(Frame(u, xw_p(-1), xw_cur(), ExcludeNone)))
+        assert_eq(xc_code(xc_column(icols, irows, [], [], start, 0)), "R0006")
+        val end = xc_one("count", [], order, Some(Frame(u, xw_cur(), xw_fo(-1), ExcludeNone)))
+        assert_eq(xc_code(xc_column(icols, irows, [], [], end, 0)), "R0006")
+
+    // A parameter is evaluated as the literal is.
+    val by_param = xc_one("count", [], order, Some(Frame(Groups, Bound(Preceding, Some(Param(0))), xw_cur(), ExcludeNone)))
+    assert_eq(xc_code(xc_column(icols, irows, [ParamDecl(None, Int64)], [Int(-2)], by_param, 0)), "R0006")
+    assert(xc_column(icols, irows, [ParamDecl(None, Int64)], [Int(2)], by_param, 0).unwrap() == xc_ints([1]))
+
+    for bad in [nan(), -0.5]
+        val f = xc_count_over(o, false, false, Bound(Preceding, Some(Literal(Float64, Float(bad)))), xw_cur())
+        assert_eq(xc_code(xc_column(xc_fcols(), [xc_f(1.0)], [], [], f, 0)), "R0006")
+
+    val minus_zero = xc_count_over(o, false, false, Bound(Preceding, Some(Literal(Float64, Float(-0.0)))), xw_cur())
+    assert_eq(xc_code(xc_column(xc_fcols(), [xc_f(1.0)], [], [], minus_zero, 0)), "ok")
+
+    // One part negative at a time: months, days, microseconds.
+    assert_eq(xc_interval_code(0, -1, 0), "R0006")
+    assert_eq(xc_interval_code(-1, 40, 0), "R0006")
+    assert_eq(xc_interval_code(0, 0, -1), "R0006")
+    assert_eq(xc_interval_code(0, 0, 0), "ok")
+
+/** The code of a `range` frame `interval(months, days, micros) preceding` over a timestamp key. */
+private xc_interval_code(months: i32, days: i32, micros: i64) -> string
+    val f = xc_count_over(col("t", "o"), false, false, Bound(Preceding, Some(Literal(Interval, Interval(months, days, micros)))), xw_cur())
+    xc_code(xc_column([Field("o", Timestamp)], [rec([Int(0)])], [], [], f, 0))
+
+@test
+a_frame_offset_is_evaluated_over_no_rows_but_not_for_a_call_ignoring_its_frame()
+    // The offsets of a frame a call uses are evaluated once, before any row, also when there is none.
+    val cols = [Field("o", Int64)]
+    val frame = Some(Frame(Rows, xw_p(-1), xw_cur(), ExcludeNone))
+    val order = [SortKey(col("t", "o"), false, false)]
+    assert_eq(xc_code(xc_column(cols, [], [], [], xc_one("count", [], order, frame), 0)), "R0006")
+    assert_eq(xc_code(xc_column(cols, [], [], [], xc_one("first_value", [col("t", "o")], order, frame), 0)), "R0006")
+    // The ranking functions and lag and lead ignore the frame (§6.8 rule 2).
+    assert_eq(xc_code(xc_column(cols, [rec([Int(1)])], [], [], xc_one("rank", [], order, frame), 0)), "ok")
+    assert_eq(xc_code(xc_column(cols, [rec([Int(1)])], [], [], xc_one("lag", [col("t", "o")], order, frame), 0)), "ok")
+
+@test
+an_aggregate_over_a_frame_overflows_per_frame()
+    // Each frame sums on its own: the running sum of two int64 maxima fits int128, never R0001.
+    val cols = [Field("v", Int64)]
+    val rows = [rec([Int(9223372036854775807)]), rec([Int(9223372036854775807)])]
+    val items = xc_one("sum", [col("t", "v")], [], Some(Frame(Rows, xw_p(1), xw_cur(), ExcludeNone)))
+    assert(xc_column(cols, rows, [], [], items, 0).unwrap() == xc_ints([9223372036854775807, 18446744073709551614]))
