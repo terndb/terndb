@@ -1,0 +1,172 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Unnesting operator by operator (`plan_unnest.sysl`): each operator the executor runs, correlated,
+// inside a `Relation` (whose rows show the per-group meaning, a list in order), run per row and
+// unnested; and the cases the rewrite keeps per row, which must still agree.
+
+private ut_rel_of(r: Rel) -> Rel = Project(ut_a("a"), "r", items_of([item("v", col("a", "v")), item("x", Relation(r))]))
+
+private ut_w(b: string) -> Expr = col(b, "w")
+
+private ut_desc(e: Expr) -> SortKey = SortKey(e, true, false)
+
+private ut_asc(e: Expr) -> SortKey = SortKey(e, false, true)
+
+/** b's rows whose key is not a's, so that every group but the null one has rows, ordered by `w`
+ * descending.
+ */
+private ut_others_sorted() -> Rel = Sort(Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")])), items_of([ut_desc(ut_w("b"))]))
+
+@test
+values_correlated_on_the_outer_row_unnests_in_row_order()
+    val cols = items_of([Field("x", nullable(Int64)), Field("y", Text)])
+    val rows = items_of([items_of([col("a", "ak"), Literal(Text, Text("one"))]), items_of([call("add", [col("a", "ak"), Literal(Int64, Int(10))]), col("a", "v")])])
+    ut_unnests(ut_run([], [], ut_rel_of(Values("vv", cols, rows))), "two rows")
+
+    val one = items_of([items_of([col("a", "ak"), col("a", "v")])])
+    ut_unnests(ut_run([], [], ut_rel_of(Values("vv", cols, one))), "one row")
+
+@test
+a_parameter_scan_under_correlation_unnests()
+    val e = record([Field("k", Int64), Field("s", Text)])
+    val decls = [param("t", list(e))]
+    val params: [1]Value = [rel([rec([Int(2), Text("p")]), rec([Int(1), Text("q")]), rec([Int(2), Text("r")])])]
+    val per = Filter(ParamScan("t", 0), ut_eq(col("t", "k"), col("a", "ak")))
+    ut_unnests(ut_run(decls, params, ut_rel_of(per)), "ParamScan, a list kept in order")
+
+@test
+filter_and_project_under_correlation_unnest()
+    val per = Project(Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")])), "q", items_of([item("w", ut_w("b")), item("k", call("add", [col("b", "bk"), col("a", "ak")]))]))
+    ut_unnests(ut_run([], [], ut_rel_of(per)), "Project over Filter")
+
+@test
+sort_under_correlation_unnests_in_order()
+    ut_unnests(ut_run([], [], ut_rel_of(ut_others_sorted())), "Sort")
+    // A key read from the outer row.
+    val k = Sort(ut_b("b"), items_of([ut_asc(call("sub", [col("b", "bk"), col("a", "ak")])), ut_desc(ut_w("b"))]))
+    ut_unnests(ut_run([], [], ut_rel_of(k)), "Sort on a correlated key")
+
+@test
+limit_under_correlation_unnests_per_group()
+    val counts: [4]i128 = [0, 1, 2, 9]
+
+    for n in counts
+        ut_unnests(ut_run([], [], ut_rel_of(Limit(ut_others_sorted(), Some(Literal(Int64, Int(n))), None, false, false))), s"Limit $n")
+        ut_unnests(ut_run([], [], ut_rel_of(Limit(ut_others_sorted(), Some(Literal(Int64, Int(n))), Some(Literal(Int64, Int(1))), false, false))), s"Limit $n offset 1")
+
+    ut_unnests(ut_run([], [], ut_rel_of(Limit(ut_others_sorted(), None, Some(Literal(Int64, Int(2))), false, false))), "offset only")
+
+@test
+limit_with_ties_under_correlation_unnests()
+    // Sorted by key only, so equal keys tie.
+    val by_key = Sort(Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")])), items_of([ut_asc(col("b", "bk"))]))
+
+    val counts: [4]i128 = [0, 1, 2, 3]
+    val offsets: [2]i128 = [0, 1]
+
+    for n in counts
+        for o in offsets
+            val l = Limit(by_key, Some(Literal(Int64, Int(n))), Some(Literal(Int64, Int(o))), true, false)
+            val r = ut_run([], [], Project(ut_a("a"), "r", items_of([item("v", col("a", "v")), item("n", Scalar(Aggregate(l, "c", buf[Item](), items_of([ut_count("n")]))))])))
+            ut_unnests(r, s"ties, $n offset $o")
+
+@test
+distinct_under_correlation_unnests()
+    val ws = Project(Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")])), "q", items_of([item("k", col("b", "bk"))]))
+    ut_unnests(ut_run([], [], ut_rel_of(Distinct(ws))), "Distinct")
+
+@test
+joins_under_correlation_unnest()
+    for k in [Inner, Left, Right, Semi, Anti]
+        // Only the left input correlated, then both.
+        val l = Join(k, ut_matching("b", "a"), ut_b("c"), Some(call("ne", [ut_w("b"), ut_w("c")])), None, None)
+        ut_unnests(ut_run([], [], Project(ut_a("a"), "r", items_of([item("n", Scalar(Aggregate(l, "g", buf[Item](), items_of([ut_count("n")]))))]))), "left correlated")
+
+        val both = Join(k, ut_matching("b", "a"), Filter(ut_b("c"), call("ne", [col("c", "bk"), col("a", "ak")])), Some(ut_eq(col("b", "bk"), col("c", "bk"))), None, None)
+        ut_unnests(ut_run([], [], Project(ut_a("a"), "r", items_of([item("n", Scalar(Aggregate(both, "g", buf[Item](), items_of([ut_count("n")]))))]))), "both correlated")
+
+    // `on` alone reads the outer row.
+    val on = Join(Inner, ut_b("b"), ut_b("c"), Some(call("and", [ut_eq(col("b", "bk"), col("a", "ak")), ut_eq(col("c", "bk"), col("a", "ak"))])), None, None)
+    ut_unnests(ut_run([], [], Project(ut_a("a"), "r", items_of([item("n", Scalar(Aggregate(on, "g", buf[Item](), items_of([ut_count("n")]))))]))), "on correlated")
+
+@test
+a_window_under_correlation_numbers_each_group()
+    val ws = items_of([NamedWin("rn", WinCall("row_number", buf[Expr](), buf[Expr](), items_of([ut_asc(ut_w("b"))]), None)),
+        NamedWin("tot", WinCall("count", buf[Expr](), buf[Expr](), buf[SortKey](), None))])
+    val per = Window(Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")])), "wn", ws)
+    ut_unnests(ut_run([], [], ut_rel_of(per)), "Window")
+    // Over a sorted input, whose order a window with no order of its own reads.
+    val first = NamedWin("f", WinCall("first_value", items_of([ut_w("b")]), buf[Expr](), buf[SortKey](), None))
+    ut_unnests(ut_run([], [], ut_rel_of(Window(ut_others_sorted(), "wf", items_of([first])))), "Window over a Sort")
+
+@test
+nest_under_correlation_unnests_with_and_without_keys()
+    val src = Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")]))
+    val keyed = Nest(src, "n", items_of([item("k", col("b", "bk"))]), "ws", items_of([item("w", ut_w("b"))]), items_of([ut_desc(ut_w("b"))]))
+    ut_unnests(ut_run([], [], ut_rel_of(keyed)), "Nest with keys")
+
+    // With no keys every group is one row, also an empty one (the null key's).
+    val keyless = Nest(src, "n", buf[Item](), "ws", items_of([item("w", ut_w("b"))]), buf[SortKey]())
+    ut_unnests(ut_run([], [], ut_rel_of(keyless)), "Nest without keys")
+
+@test
+unnest_of_a_correlated_relation_unnests()
+    val one = ut_values("o", [Field("z", Int64)], [rec([Int(0)])])
+    val value: Expr = Relation(Project(ut_matching("b", "a"), "bb", items_of([item("w", ut_w("b"))])))
+
+    for outer in [false, true]
+        val per = Unnest(one, "u", value, outer, None)
+        ut_unnests(ut_run([], [], ut_rel_of(Project(per, "q", items_of([item("w", col("u", "w"))])))), s"Unnest, outer $outer")
+
+@test
+an_outer_unnest_whose_value_is_correlated_unnests()
+    // The value read straight from the outer row, a relation-valued column.
+    val inner = Project(ut_a("a2"), "rs", items_of([item("k", col("a2", "ak")), item("ws", Relation(ut_bw2("b", "a2")))]))
+    val per = Unnest(Filter(inner, ut_eq(col("rs", "k"), col("a", "ak"))), "u", col("rs", "ws"), true, Some("i"))
+    ut_unnests(ut_run([], [], ut_rel_of(Project(per, "q", items_of([item("w", col("u", "w")), item("i", col("u", "i"))])))), "Unnest of a column")
+
+private ut_bw2(b: string, a: string) -> Rel = Project(ut_matching(b, a), "bb2", items_of([item("w", col(b, "w"))]))
+
+@test
+a_list_outer_side_keeps_its_order_through_a_subquery()
+    // The outer side is a list (Values in row order): the joins a subquery becomes must not reorder it.
+    val r = ut_run([], [], Project(ut_a("a"), "r", items_of([item("v", col("a", "v")), item("n", Exists(ut_matching("b", "a")))])))
+    ut_unnests(r, "Values order", true)
+    val s = Project(Sort(ut_a("a"), items_of([ut_desc(col("a", "v"))])), "r", items_of([item("v", col("a", "v")), item("w", Relation(ut_bw("b", "a")))]))
+    ut_unnests(ut_run([], [], s), "Sort order", true)
+
+// -- what is kept per row ---------------------------------------------------------------------------
+
+@test
+a_subquery_in_an_unselected_if_arm_stays_per_row()
+    // Key 2 meets two rows, R0003, but the If selects the subquery only for key 1 (§7.5).
+    val pick = If(items_of([IfArm(ut_eq(col("a", "ak"), Literal(Int64, Int(1))), Scalar(ut_bw("b", "a")))]), None)
+    val r = ut_run([], [], Project(ut_a("a"), "r", items_of([item("w", pick)])))
+    ut_falls_back(r, "If arm")
+    assert_eq(xn_code(r.unnested), "ok")
+
+@test
+a_full_join_under_correlation_stays_per_row()
+    val full = Join(Full, ut_matching("b", "a"), ut_b("c"), Some(ut_eq(col("b", "w"), col("c", "w"))), None, None)
+    val out = items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("w2", col("c", "w"))])
+    ut_falls_back(ut_run([], [], Project(Apply(Cross, ut_a("a"), full, None, None, None), "r", out)), "Full")
+
+@test
+a_tag_under_correlation_stays_per_row()
+    val u = union_of([Field("hit", record([Field("bk", nullable(Int64)), Field("w", Text)]))])
+    ut_falls_back(ut_run([], [], ut_rel_of(Tag(ut_matching("b", "a"), "t", u, "hit"))), "Tag")
+
+@test
+a_correlated_limit_count_stays_per_row()
+    val l = Limit(Sort(ut_b("b"), items_of([ut_desc(ut_w("b"))])), Some(call("coalesce", [col("a", "ak"), Literal(Int64, Int(0))])), None, false, false)
+    ut_falls_back(ut_run([], [], ut_rel_of(l)), "a count read from the outer row")
+
+@test
+a_row_of_a_binder_the_domain_would_change_stays_per_row()
+    // Row(q) reads q whole, so q cannot be given the domain's columns.
+    val q = Project(ut_matching("b", "a"), "q", items_of([item("w", ut_w("b"))]))
+    val per = Project(q, "q2", items_of([item("whole", Row("q"))]))
+    ut_falls_back(ut_run([], [], ut_rel_of(per)), "Row")

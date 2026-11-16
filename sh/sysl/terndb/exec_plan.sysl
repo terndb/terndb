@@ -269,11 +269,13 @@ private[terndb] plan_sub(s: SubPlan, ctx: Ctx, outer: Buf[Binder]) -> Lowered
     var p = Planner(s.types, s.at, ctx, s.tables, outer)
     p.rel(s.rel)
 
-/** `env` type-checked against `catalog`, run with `ctx` over `tables`, and its output as the result
- * format's batches for parameter tuple 0: what an `Execute` of the query sends after its header.
+/** `env` type-checked against `catalog`, unnested (`plan_unnest.sysl`), run with `ctx` over `tables`,
+ * and its output as the result format's batches for parameter tuple 0: what an `Execute` of the query
+ * sends after its header.
  */
 run_query(env: Envelope, catalog: &Catalog, ctx: Ctx, tables: Buf[MemTable]) -> Result[(Type, Buf[Buf[u8]]), CodecError]
     val typing = type_envelope(env, catalog)?
     val result = typing.result.unwrap()
-    val root = plan_query(env, typing, ctx, tables)
+    val plan = unnest_plan(env, typing, catalog, ctx.params)
+    val root = plan_query(plan.env, plan.typing, ctx, tables)
     Ok((result, result_batches(result, flat_input(root), 0)?))

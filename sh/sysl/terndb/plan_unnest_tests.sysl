@@ -1,0 +1,335 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Unnesting (`plan_unnest.sysl`, `query-tree.md` §6.6 rule 2). The oracle is the per-row meaning
+// (§6.6 rule 3), which the executor runs when handed the tree as it is: every query here runs both ways
+// and must give one result — the same error code, or the same rows as a multiset (in order where the
+// result is a list, and nested lists always in order). The unnested tree is also checked to hold no
+// `Apply` and no subquery expression, and the rewrite to have kept nothing per row.
+
+// -- running a query both ways ------------------------------------------------------------------
+
+/** A query run per row and unnested, and what unnesting made of it. */
+struct UtRun
+    plan: UnnestPlan
+    per_row: Result[(Type, Buf[Value]), CodecError]
+    unnested: Result[(Type, Buf[Value]), CodecError]
+
+private ut_catalog() -> FakeCatalog = FakeCatalog(buf[FakeTable](), buf[FakeType](), buf[FakeFunction]())
+
+/** `q`, typed `typing`, planned as it is and run with `params` over `ts`: its result type and rows. */
+ut_exec(q: Envelope, typing: Typing, params: []const Value, ts: []const XnTable) -> Result[(Type, Buf[Value]), CodecError]
+    val root = plan_query(q, typing, xe_ctx(params), xn_mem(ts))
+    val out = buf[Value]()
+
+    for b in drain(root.op)?
+        assert(b.len > 0 && b.len <= BatchSize)
+        out.extend(values_of(if root.binder == Composite then flatten(b) else b).view())
+
+    Ok((typing.result.unwrap(), out))
+
+/** The query `q` over the tables `ts`, run per row and unnested. */
+ut_run_over(q: Envelope, params: []const Value, ts: []const XnTable) -> UtRun
+    val catalog = xn_catalog(ts)
+    val typing = type_envelope(q, catalog).unwrap()
+    val plan = unnest_plan(q, typing, catalog, items_of(params))
+    UtRun(plan, ut_exec(q, typing, params, ts), ut_exec(plan.env, plan.typing, params, ts))
+
+/** `r` with parameters `params` of types `decls`, over no table, run per row and unnested. */
+ut_run(decls: []const ParamDecl, params: []const Value, r: Rel) -> UtRun
+    val q = envelope(decls, Query(r))
+    val typing = type_envelope(q, ut_catalog()).unwrap()
+    val plan = unnest_plan(q, typing, ut_catalog(), items_of(params))
+    val none = buf[XnTable]()
+    UtRun(plan, ut_exec(q, typing, params, none.view()), ut_exec(plan.env, plan.typing, params, none.view()))
+
+private ut_root(p: UnnestPlan) -> Rel = p.env.statement match
+    Query(r) -> r
+    _ -> panic("not a query")
+
+/** Both runs agree, with one error code or one result (`ordered`: rows compared in order). */
+ut_agree(r: UtRun, what: string, ordered: bool = false, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(xn_code(r.unnested), xn_code(r.per_row), s"$what: the outcome", file, line)
+
+    if xn_code(r.per_row) == "ok"
+        val (t, want) = r.per_row.unwrap()
+        val (gt, got) = r.unnested.unwrap()
+        assert(gt == t, s"$what: the types differ", file, line)
+        val same_rows = if ordered then same(t, Relation(got), Relation(want)) else xn_same(t, got, want)
+        assert(same_rows, s"$what: ${got.len()} rows unnested, ${want.len()} per row", file, line)
+
+/** Both runs agree, and nothing was kept per row: the unnested tree holds no `Apply` and no subquery. */
+ut_unnests(r: UtRun, what: string, ordered: bool = false, file: string = __FILE__, line: long = __LINE__)
+    assert(r.plan.fallbacks.len() == 0, s"$what: kept per row: ${ut_reasons(r.plan)}", file, line)
+    assert_eq(correlated_nodes(ut_root(r.plan)), 0usize, s"$what: correlated nodes left", file, line)
+    ut_agree(r, what, ordered, file, line)
+
+/** Both runs agree, and some part was kept per row. */
+ut_falls_back(r: UtRun, what: string, file: string = __FILE__, line: long = __LINE__)
+    assert(r.plan.fallbacks.len() > 0, s"$what: nothing was kept per row", file, line)
+    ut_agree(r, what, false, file, line)
+
+private ut_reasons(p: UnnestPlan) -> string
+    var out = ""
+
+    for f in p.fallbacks
+        out = out + f + "; "
+
+    out
+
+// -- relations held in Values ---------------------------------------------------------------------
+
+/** A `Values` under `binder` of `cols` holding `rows`, each a record value; a null cell is `Null`. */
+ut_values(binder: string, cols: []const Field, rows: []const Value) -> Rel
+    val out = buf[Buf[Expr]]()
+
+    for row in rows
+        val cells = buf[Expr]()
+
+        row match
+            Record(vs) ->
+                for j in 0..<vs.len()
+                    val t = cols[j].ty.base()
+                    cells.push(if vs[j].is_null() then Null(cols[j].ty) else Literal(t, vs[j]))
+            _ -> panic("a row is a record")
+
+        out.push(cells)
+
+    Values(binder, items_of(cols), out)
+
+/** `{ak: int64?, v: text}` under `binder`: keys 1, 2, 2, 3 and null, valued `a0` to `a4`. */
+ut_a(binder: string) -> Rel = ut_values(binder, [Field("ak", nullable(Int64)), Field("v", Text)],
+    [rec([Int(1), Text("a0")]), rec([Int(2), Text("a1")]), rec([Int(2), Text("a2")]), rec([Int(3), Text("a3")]), rec([Null, Text("a4")])])
+
+/** `{bk: int64?, w: text}` under `binder`: keys 2, 2, 3, 4 and null, valued `b0` to `b4`. Key 1 meets
+ * none of them, 2 two, 3 one.
+ */
+ut_b(binder: string) -> Rel = ut_values(binder, [Field("bk", nullable(Int64)), Field("w", Text)],
+    [rec([Int(2), Text("b0")]), rec([Int(2), Text("b1")]), rec([Int(3), Text("b2")]), rec([Int(4), Text("b3")]), rec([Null, Text("b4")])])
+
+/** An empty relation of `ut_a`'s columns. */
+ut_none(binder: string) -> Rel = ut_values(binder, [Field("ak", nullable(Int64)), Field("v", Text)], [])
+
+ut_eq(a: Expr, b: Expr) -> Expr = call("eq", [a, b])
+
+ut_count(name: string) -> NamedAgg = NamedAgg(name, AggCall("count", buf[Expr](), false, None, buf[SortKey]()))
+
+ut_agg(name: string, f: string, arg: Expr) -> NamedAgg = NamedAgg(name, AggCall(f, items_of([arg]), false, None, buf[SortKey]()))
+
+ut_kinds() -> [6](ApplyKind, string) = [(Cross, "cross"), (Outer, "outer"), (SemiApply, "semi"), (AntiApply, "anti"), (MarkApply, "mark"), (SingleApply, "single")]
+
+private ut_mark(k: ApplyKind) -> Option[string] = if k == MarkApply then Some("m") else None
+
+private ut_mark_binder(k: ApplyKind) -> Option[string] = if k == MarkApply then Some("mk") else None
+
+/** The `b` rows whose key is `a`'s key: the correlated right input of most tests. */
+ut_matching(b: string, a: string) -> Rel = Filter(ut_b(b), ut_eq(col(b, "bk"), col(a, "ak")))
+
+// -- Apply ----------------------------------------------------------------------------------------
+
+@test
+every_apply_kind_correlated_on_a_column_unnests()
+    for (k, what) in ut_kinds()
+        if k == SingleApply then continue
+
+        ut_unnests(ut_run([], [], Apply(k, ut_a("a"), ut_matching("b", "a"), None, ut_mark(k), ut_mark_binder(k))), what)
+
+@test
+a_single_apply_unnests_and_raises_where_a_row_meets_two()
+    // Key 2 meets two rows: R0003 both ways. Over keys meeting at most one, the rows agree.
+    ut_unnests(ut_run([], [], Apply(SingleApply, ut_a("a"), ut_matching("b", "a"), None, None, None)), "single, R0003")
+    val one = Filter(ut_matching("b", "a"), ut_eq(col("b", "w"), Literal(Text, Text("b0"))))
+    val r = ut_run([], [], Apply(SingleApply, ut_a("a"), one, None, None, None))
+    assert_eq(xn_code(r.per_row), "ok")
+    ut_unnests(r, "single")
+
+@test
+every_apply_kind_with_an_on_beside_the_correlation_unnests()
+    val on = Some(call("ne", [col("b", "w"), Literal(Text, Text("b1"))]))
+
+    for (k, what) in ut_kinds()
+        if k == SingleApply then continue
+
+        ut_unnests(ut_run([], [], Apply(k, ut_a("a"), ut_matching("b", "a"), on, ut_mark(k), ut_mark_binder(k))), s"$what with on")
+
+@test
+an_apply_correlated_through_a_parameter_unnests()
+    // The correlation reads a parameter beside the outer column; a parameter alone correlates nothing.
+    val decls = [param("off", Int64), param("not", Text)]
+    val params: [2]Value = [Int(1), Text("b2")]
+    val cond = call("and", [ut_eq(col("b", "bk"), call("add", [col("a", "ak"), Param(0)])), call("ne", [col("b", "w"), Param(1)])])
+
+    for (k, what) in ut_kinds()
+        if k == SingleApply then continue
+
+        val apply = Apply(k, ut_a("a"), Filter(ut_b("b"), cond), None, ut_mark(k), ut_mark_binder(k))
+        ut_unnests(ut_run(decls, params, apply), s"parameter $what")
+
+@test
+an_uncorrelated_apply_unnests_and_never_runs_its_right_input_over_an_empty_left()
+    // The right input divides by zero; it runs only when there is a left row (§6.6 rule 4).
+    val boom = Project(ut_b("b"), "q", items_of([item("x", call("div", [Literal(Int64, Int(1)), Literal(Int64, Int(0))]))]))
+
+    for (k, what) in ut_kinds()
+        val empty = ut_run([], [], Apply(k, ut_none("a"), boom, None, ut_mark(k), ut_mark_binder(k)))
+        assert_eq(xn_code(empty.unnested), "ok", what)
+        ut_unnests(empty, s"$what over nothing")
+        ut_unnests(ut_run([], [], Apply(k, ut_a("a"), boom, None, ut_mark(k), ut_mark_binder(k))), s"$what over rows")
+
+@test
+an_apply_inside_an_apply_reads_the_outermost_binder()
+    // c is correlated to both b (the inner left) and a (the outer left), two levels up.
+    val inner_right = Filter(ut_b("c"), call("and", [ut_eq(col("c", "bk"), col("a", "ak")), call("ne", [col("c", "w"), col("b", "w")])]))
+
+    for (k, what) in ut_kinds()
+        if k == SingleApply then continue
+
+        val inner = Apply(k, ut_matching("b", "a"), inner_right, None, ut_mark(k), ut_mark_binder(k))
+        // The output names its columns apart: b and c both have bk and w.
+        val out = items_of([item("v", col("a", "v")), item("w", col("b", "w"))])
+
+        if k == Cross || k == Outer then out.push(item("w2", col("c", "w")))
+        if k == MarkApply then out.push(item("m", col("mk", "m")))
+
+        ut_unnests(ut_run([], [], Project(Apply(Cross, ut_a("a"), inner, None, None, None), "r", out)), s"nested $what")
+
+@test
+three_levels_of_apply_unnest()
+    val d = Filter(ut_b("d"), call("and", [ut_eq(col("d", "bk"), col("a", "ak")), call("ne", [col("d", "w"), col("c", "w")])]))
+    val c = Apply(Outer, Filter(ut_b("c"), ut_eq(col("c", "bk"), col("b", "bk"))), d, None, None, None)
+    val b = Apply(Cross, ut_matching("b", "a"), c, None, None, None)
+    val out = items_of([item("v", col("a", "v")), item("w", col("b", "w")), item("w2", col("c", "w")), item("w3", col("d", "w"))])
+    ut_unnests(ut_run([], [], Project(Apply(Outer, ut_a("a"), b, None, None, None), "r", out)), "three levels")
+
+@test
+an_apply_whose_left_side_has_duplicates_and_nulls_keeps_every_left_row()
+    // The domain holds each binding once; the join back gives each left row, duplicates and the
+    // null key included, its own copy of the right rows.
+    val r = ut_run([], [], Apply(Outer, ut_a("a"), Filter(ut_b("b"), call("same", [col("b", "bk"), col("a", "ak")])), None, None, None))
+    ut_unnests(r, "outer, null meets null")
+    // a's null key meets b's null key under `same`: 2 rows for each key 2, 1 for 3, 1 for null, and
+    // key 1 padded.
+    assert_eq(r.unnested.unwrap().1.len(), 7usize)
+
+// -- the subquery expressions ---------------------------------------------------------------------
+
+private ut_over_a(items: []const Item) -> Rel = Project(ut_a("a"), "r", items_of(items))
+
+ut_bw(b: string, a: string) -> Rel = Project(ut_matching(b, a), "bb", items_of([item("w", col(b, "w"))]))
+
+@test
+exists_and_its_negation_unnest()
+    ut_unnests(ut_run([], [], Filter(ut_a("a"), Exists(ut_matching("b", "a")))), "Exists")
+    ut_unnests(ut_run([], [], Filter(ut_a("a"), call("not", [Exists(ut_matching("b", "a"))]))), "not Exists")
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("e", Exists(ut_matching("b", "a")))])), "Exists as a column")
+
+@test
+in_unnests_with_sql_null_semantics()
+    // Not In over a relation holding a null is null, never true (§7.11).
+    val keys = Project(ut_b("b"), "bb", items_of([item("bk", col("b", "bk"))]))
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("m", In(items_of([col("a", "ak")]), keys))])), "In, uncorrelated")
+
+    val near = Project(Filter(ut_b("b"), call("ne", [col("b", "w"), col("a", "v")])), "bb", items_of([item("bk", col("b", "bk"))]))
+    val in_near = In(items_of([col("a", "ak")]), near)
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("m", in_near)])), "In, correlated")
+    ut_unnests(ut_run([], [], Filter(ut_a("a"), call("not", [in_near]))), "not In")
+
+@test
+scalar_unnests_null_for_no_row_and_r0003_for_two()
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("w", Scalar(ut_bw("b", "a")))])), "Scalar, R0003")
+
+    val first = Project(Filter(ut_matching("b", "a"), ut_eq(col("b", "w"), Literal(Text, Text("b0")))), "bb", items_of([item("w", col("b", "w"))]))
+    val r = ut_run([], [], ut_over_a([item("v", col("a", "v")), item("w", Scalar(first))]))
+    assert_eq(xn_code(r.per_row), "ok")
+    ut_unnests(r, "Scalar")
+
+@test
+relation_unnests_with_an_empty_relation_for_no_row()
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("ws", Relation(ut_bw("b", "a")))])), "Relation")
+
+@test
+a_subquery_in_a_filter_beside_others_unnests()
+    // Two subqueries in one predicate, and one inside the other's relation.
+    val inner = Exists(Filter(ut_b("c"), call("and", [ut_eq(col("c", "bk"), col("b", "bk")), call("ne", [col("c", "w"), col("b", "w")])])))
+    val pred = call("or", [Exists(Filter(ut_matching("b", "a"), inner)), call("gt", [Scalar(ut_bw("d", "a")), Literal(Text, Text("b9"))])])
+    val r = ut_run([], [], Filter(ut_a("a"), pred))
+    ut_unnests(r, "two subqueries and a nested one")
+
+// -- aggregates over correlated groups ------------------------------------------------------------
+
+@test
+a_count_over_an_empty_correlated_group_is_zero()
+    // The count bug: key 1 and the null key have no rows, and must count 0, not vanish.
+    val count = Aggregate(ut_matching("b", "a"), "c", buf[Item](), items_of([ut_count("n")]))
+    val r = ut_run([], [], ut_over_a([item("v", col("a", "v")), item("n", Scalar(count))]))
+    ut_unnests(r, "count")
+    val (t, rows) = r.unnested.unwrap()
+    assert(t == list(record([Field("v", Text), Field("n", Int64)])), "a keyless Aggregate's Scalar is not null")
+    val want = rows_of([rec([Text("a0"), Int(0)]), rec([Text("a1"), Int(2)]), rec([Text("a2"), Int(2)]), rec([Text("a3"), Int(1)]), rec([Text("a4"), Int(0)])])
+    assert(xn_same(t, rows, want))
+
+@test
+every_aggregate_over_an_empty_correlated_group_takes_its_empty_value()
+    val aggs = items_of([ut_count("n"), ut_agg("nk", "count", col("b", "bk")), ut_agg("s", "sum", col("b", "bk")),
+        ut_agg("lo", "min", col("b", "w")), ut_agg("all", "bool_and", call("gt", [col("b", "bk"), Literal(Int64, Int(0))])),
+        ut_agg("ws", "collect", col("b", "w"))])
+    val per = Aggregate(ut_matching("b", "a"), "c", buf[Item](), aggs)
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("g", Relation(per))])), "every aggregate")
+
+@test
+a_grouped_aggregate_under_correlation_unnests()
+    val per = Aggregate(Filter(ut_b("b"), call("ne", [col("b", "bk"), col("a", "ak")])), "g", items_of([item("w1", call("lower", [col("b", "w")]))]), items_of([ut_count("n")]))
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("g", Relation(per))])), "grouped")
+
+@test
+a_count_with_a_correlated_filter_in_the_call_unnests()
+    val f = Some(ut_eq(col("b", "bk"), col("a", "ak")))
+    val per = Aggregate(ut_b("b"), "c", buf[Item](), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, f, buf[SortKey]()))]))
+    ut_unnests(ut_run([], [], ut_over_a([item("v", col("a", "v")), item("n", Scalar(per))])), "correlated aggregate filter")
+
+@test
+the_domain_meets_a_null_binding_under_same()
+    // The correlation is `same`, so a's null key has b's null-keyed row; a domain built with `eq`
+    // would lose that group.
+    val count = Aggregate(Filter(ut_b("b"), call("same", [col("b", "bk"), col("a", "ak")])), "c", buf[Item](), items_of([ut_count("n")]))
+    val mine = Filter(ut_b("e"), call("same", [col("e", "bk"), col("a", "ak")]))
+    val r = ut_run([], [], ut_over_a([item("v", col("a", "v")), item("n", Scalar(count)), item("ws", Relation(Project(mine, "bb", items_of([item("w", col("e", "w"))]))))]))
+    ut_unnests(r, "null keys")
+    val (_, rows) = r.unnested.unwrap()
+
+    for row in rows
+        row match
+            Record(vs) -> if vs[0] == Text("a4") then assert(vs[1] == Int(1), "the null key counts the null-keyed row")
+            _ -> panic("a row is a record")
+
+    assert(rows.len() == 5)
+
+// -- query-tree.md §16.1 --------------------------------------------------------------------------
+
+private ut_users() -> [3]XnTable = [
+    xn_table("users", [Field("id", Int64), Field("name", Text)], rows_of([rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")]), rec([Int(3), Text("cy")])]), 2),
+    xn_table("posts", [Field("id", Int64), Field("author_id", Int64), Field("title", Text), Field("created_at", Timestamp)], rows_of([
+        rec([Int(10), Int(1), Text("a"), Int(100)]), rec([Int(11), Int(1), Text("b"), Int(300)]), rec([Int(12), Int(1), Text("c"), Int(200)]),
+        rec([Int(13), Int(1), Text("d"), Int(400)]), rec([Int(14), Int(3), Text("e"), Int(50)]), rec([Int(15), Int(1), Text("f"), Int(300)])]), 4),
+    xn_table("comments", [Field("id", Int64), Field("post_id", Int64), Field("body", Text)], rows_of([
+        rec([Int(100), Int(13), Text("x")]), rec([Int(101), Int(13), Text("y")]), rec([Int(102), Int(11), Text("z")]), rec([Int(103), Int(10), Text("w")]),
+        rec([Int(104), Int(14), Text("q")])]), 3)]
+
+@test
+the_users_posts_and_comments_query_unnests_completely()
+    // §16.1 as written: two Relations and a Scalar, the posts per user limited and sorted. Its golden
+    // rows are checked through `run_query` in `exec_nest_end_to_end_tests.sysl`.
+    val cases: [4](i128, i128) = [(50, 3), (2, 3), (3, 1), (3, 0)]
+
+    for (first, posts) in cases
+        val r = ut_run_over(users_and_posts(), [Int(first), Int(posts)], ut_users())
+        ut_unnests(r, s"§16.1, first $first, $posts posts", true)
+
+@test
+a_negative_limit_keeps_the_limit_per_row()
+    // R0006 is raised once per outer row; unnested, it would be raised only for a non-empty group.
+    val r = ut_run_over(users_and_posts(), [Int(50), Int(-1)], ut_users())
+    ut_falls_back(r, "a negative count")
+    assert_eq(xn_code(r.unnested), "R0006")

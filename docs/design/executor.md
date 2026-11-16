@@ -250,6 +250,11 @@ never when a side is empty (the merge join evaluates no key then), and a conjunc
 on a pair another conjunct already makes not `true` — which is what lets the merge join skip the
 pairs whose keys differ.
 
+**An empty right input ends an `inner` or `semi` join** before its left input is read, since neither
+can emit a row (§6.5 rule 10). The unnester relies on it: it joins each uncorrelated subtree to the
+outer side's domain with the domain on the right, so over an empty outer side the subtree is never
+evaluated and raises nothing (§6.6 rule 4).
+
 **Hash join is the intended equi-join** once sysl has a fast seeded hash (the survey's gap, §6):
 build on the smaller side, probe streaming, with the same composite batches and the same per-row
 bookkeeping. Until then the merge join is the equi-join; it is blocking on both sides, where a hash
@@ -259,7 +264,12 @@ join would block on the build side only.
 
 The code is `exec_nest.sysl`.
 
-**Correlation is per row, by re-planning.** A correlated subtree — an `Apply`'s right input, the
+**Correlation is unnested first.** `run_query` hands every query to the unnester (`plan_unnest.sysl`,
+`docs/design/unnesting.md`) before planning it, which replaces each `Apply` and subquery expression it
+can decorrelate by joins against the outer side's distinct bindings (§6.6 rule 2). The executor meets
+rule 2 except for the cases `unnesting.md` §3 lists, which keep the per-row form below.
+
+**What is kept is per row, by re-planning.** A correlated subtree — an `Apply`'s right input, the
 `rel` of a `Relation`, `Scalar`, `Exists` or `In` — is kept as a `SubPlan`: the `Rel`, the position
 of its types in `Typing.nodes`, and the outer rows already bound where it stands. The planner plans it
 once where it stands, only to step over its types and learn its output's shape. At run time it is
@@ -267,8 +277,8 @@ planned again for every outer row, with that row's binders (one-row vectors, a c
 member) as `Planner.outer`; every `Col` or `Row` of one of them becomes a `Param` whose value is
 appended to that plan's own copy of the parameters. The subtree's operators therefore never see a
 binder they do not expose, and a nested subquery captures the outer rows of every level above it.
-This is §6.6 rule 3's per-row meaning, the reference an unnesting planner (§6.6 rule 2, Neumann–Kemper)
-will be checked against; until that planner exists the executor does not meet rule 2.
+This is §6.6 rule 3's per-row meaning, the reference the unnester is checked against: its tests run
+every query both ways.
 
 - **Apply** (§6.6): per left row, the right input re-planned for the row and joined to that one row
   by the nested-loop `JoinOp` of the corresponding kind (`cross` as `inner`, `outer` as `left`), so

@@ -1,0 +1,1404 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.contains
+
+// Unnesting (`query-tree.md` §6.6 rule 2, `docs/design/unnesting.md`): a query tree rewritten so that
+// an `Apply` or a subquery expression (`Relation`, `Scalar`, `Exists`, `In`) no longer evaluates its
+// correlated side once per outer row. This is Neumann and Kemper's general unnesting ("Unnesting
+// Arbitrary Queries", BTW 2015): the outer side's distinct bindings, the **domain**, are pushed down
+// through the correlated side, operator by operator, until no operator references the outer side; each
+// operator carries the domain's columns, and the correlated side is joined back to the outer one on
+// them under `same`, so a null binding meets its own rows.
+//
+// The rewrite is a tree-to-tree one and its result is an ordinary query tree, type-checked again before
+// it is planned. It walks the tree in the type checker's pre-order, so the type of every node of the
+// original is at hand. Where an operator cannot be decorrelated it keeps its per-row form and says why.
+
+/** What unnesting made of a statement: the statement to plan, its types, and why any part of it is
+ * still evaluated once per outer row (empty when nothing is).
+ */
+struct UnnestPlan
+    env: Envelope
+    typing: Typing
+    fallbacks: Buf[string]
+
+/** `env`, typed by `typing`, unnested and type-checked again against `catalog`; `params` are the
+ * values a `Limit` reads its count from. If the unnested tree does not type to the original's result
+ * type, the original is kept whole and the reason is among the fallbacks.
+ */
+unnest_plan(env: Envelope, typing: Typing, catalog: &Catalog, params: Buf[Value]) -> UnnestPlan
+    val (out, fallbacks) = unnest_query(env, typing, params)
+
+    if out.statement == env.statement then return UnnestPlan(env, typing, fallbacks)
+
+    type_envelope(out, catalog) match
+        Ok(t) ->
+            if t.result == typing.result then return UnnestPlan(out, t, fallbacks)
+
+            val got = t.result.map(x -> type_text(x)).unwrap_or("none")
+            val want = typing.result.map(x -> type_text(x)).unwrap_or("none")
+            fallbacks.push(s"the unnested tree's type $got differs from the query's $want")
+        Err(e) -> fallbacks.push(s"the unnested tree is refused: ${e.code} ${e.message}")
+
+    UnnestPlan(env, typing, fallbacks)
+end unnest_plan
+
+/** The query `env`, whose types are `typing`, with every `Apply` and subquery expression that can be
+ * decorrelated replaced by joins, and why each one that is kept is kept. A statement other than a
+ * query is returned as it is.
+ */
+unnest_query(env: Envelope, typing: Typing, params: Buf[Value]) -> (Envelope, Buf[string])
+    val r = env.statement match
+        Query(x) -> x
+        _ -> return (env, buf[string]())
+
+    var g = un_mapper()
+    un_drop(g.rel(r))
+    var prefix = "__u"
+
+    while un_prefixes(g.names, prefix)
+        prefix = prefix + "_"
+
+    var u = Unnester(typing.nodes, 0, params, g.rows, prefix, 0, buf[string](), false)
+    val w = u.rel(r)
+
+    if u.at != typing.nodes.len() then panic("unnest_query: the tree and its types do not line up")
+
+    // The root's own columns, without those the rewrite added beside them.
+    val root = if un_plain(w) then w.rel else Project(w.rel, u.fresh(), un_items(un_all_cols(w.orig), w.orig))
+    (Envelope(env.major, env.minor, env.params, Query(root), None), u.fallbacks)
+end unnest_query
+
+/** How many `Apply` nodes and subquery expressions `r` holds, at any depth. */
+correlated_nodes(r: Rel) -> usize
+    var m = un_mapper()
+    un_drop(m.rel(r))
+    m.nested
+
+// -- what a rewritten relation is ---------------------------------------------------------------
+
+/** A binder of the original tree and its columns there. */
+private struct UnBind
+    name: string
+    cols: Buf[Field]
+
+/** A relation rewritten. `orig` is what the original exposed; `names` every binder the rewritten one
+ * exposes, which may be more (the domain's, a mark's, a row number's). `list` is whether the original
+ * is a list. Under a domain, `dref` reads each domain column from the output, and `order`, when the
+ * original is a list, holds the keys that put each domain group's rows back in its order, the
+ * rewritten relation being a bag. `positional` says an exposed column tells equal rows apart (a row
+ * number), and `polluted` names the original binders the domain's columns were added to.
+ */
+private struct UnRw
+    rel: Rel
+    orig: Buf[UnBind]
+    names: Buf[string]
+    list: bool
+    dref: Buf[Expr]
+    order: Option[Buf[SortKey]]
+    positional: bool
+    polluted: Buf[string]
+
+/** The distinct bindings of an outer side: `Distinct` of a `Project` of a copy of it, with one column
+ * per outer reference `keys[i]`, named `cols[i]`, under `binder`.
+ */
+private struct UnDomain
+    rel: Rel
+    binder: string
+    cols: Buf[string]
+    keys: Buf[Expr]
+
+/** The outer references to replace in a node's expressions, and what replaces them. */
+private struct UnSubst
+    keys: Buf[Expr]
+    vals: Buf[Expr]
+
+    get(self, e: Expr) -> Expr
+        for i in 0..<self.keys.len()
+            if self.keys[i] == e then return self.vals[i]
+
+        e
+
+/** A node's input, rewritten, and the joins its subquery expressions have become, laid over it. With
+ * no domain (`pushing` false) a list input keeps its order: a row number taken before the first join
+ * (`position`) sorts the rows back.
+ */
+private struct UnLifter
+    base: UnRw
+    cur: Rel
+    names: Buf[string]
+    pushing: bool
+    position: Option[Expr]
+
+private enum UnSub
+    SubRelation
+    SubScalar
+    SubExists
+    SubIn
+
+/** A value computed for what computing it gathers, and not needed itself. */
+private un_drop[T](x: T) = ()
+
+private un_no_subst() -> UnSubst = UnSubst(buf[Expr](), buf[Expr]())
+
+private un_subst_of(keys: Buf[Expr], vals: Buf[Expr]) -> UnSubst = UnSubst(keys, vals)
+
+private un_cols(elem: Type) -> Buf[Field] = element_columns(elem)
+
+/** The columns of `elem` after the first `skip`: what a `Window` or `Unnest` adds. */
+private un_tail(elem: Type, skip: usize) -> Buf[Field]
+    val all = un_cols(elem)
+    val out = buf[Field]()
+
+    for i in skip..<all.len()
+        out.push(all[i])
+
+    out
+
+private un_one(name: string, cols: Buf[Field]) -> Buf[UnBind] = items_of([UnBind(name, cols)])
+
+private un_names(bs: Buf[UnBind]) -> Buf[string]
+    val out = buf[string]()
+
+    for b in bs
+        out.push(b.name)
+
+    out
+
+private un_width(bs: Buf[UnBind]) -> usize
+    var n: usize = 0
+
+    for b in bs
+        n += b.cols.len()
+
+    n
+
+private un_cat[T](a: Buf[T], b: Buf[T]) -> Buf[T]
+    val out = buf[T]()
+    out.extend(a.view())
+    out.extend(b.view())
+    out
+
+private un_plus[T](a: Buf[T], x: T) -> Buf[T]
+    val out = buf[T]()
+    out.extend(a.view())
+    out.push(x)
+    out
+
+/** Every column of `bs`, read through its binder. */
+private un_all_cols(bs: Buf[UnBind]) -> Buf[Expr]
+    val out = buf[Expr]()
+
+    for b in bs
+        for c in b.cols
+            out.push(Col(b.name, c.name))
+
+    out
+
+/** `e`, of a type that is `ty` but for a null-supplying join, back at `ty`: it is read only on the rows
+ * that came from that join's other side, where it is never null.
+ */
+private un_strict(e: Expr, ty: Type) -> Expr = if ty.is_nullable() then e else call("assert_not_null", [e])
+
+/** The record of `bs`'s columns, each at its original type. */
+private un_whole(bs: Buf[UnBind]) -> Expr
+    val out = buf[Item]()
+
+    for b in bs
+        for c in b.cols
+            out.push(Item(c.name, un_strict(Col(b.name, c.name), c.ty)))
+
+    Record(out)
+
+/** `exprs` as items named by the columns of `bs`, in order. */
+private un_items(exprs: Buf[Expr], bs: Buf[UnBind]) -> Buf[Item]
+    val out = buf[Item]()
+    var i: usize = 0
+
+    for b in bs
+        for c in b.cols
+            out.push(Item(c.name, exprs[i]))
+            i += 1
+
+    out
+
+/** Whether `w` exposes what the original did and nothing else. */
+private un_plain(w: UnRw) -> bool = w.names == un_names(w.orig) && w.polluted.len() == 0
+
+private un_prefixes(names: Buf[string], prefix: string) -> bool
+    for n in names
+        if n.starts_with(prefix) then return true
+
+    false
+
+private un_and(a: Expr, b: Expr) -> Expr = call("and", [a, b])
+
+private un_and_opt(a: Option[Expr], b: Expr) -> Expr = a match
+    Some(x) -> un_and(x, b)
+    None -> b
+
+/** `same(outer[i], inner[i])` for every `i`, conjoined: the join condition back to a domain. */
+private un_keys_on(outer: Buf[Expr], inner: Buf[Expr]) -> Expr
+    var out = call("same", [outer[0], inner[0]])
+
+    for i in 1..<outer.len()
+        out = un_and(out, call("same", [outer[i], inner[i]]))
+
+    out
+
+private un_int(n: i128) -> Expr = Literal(Int64, Int(n))
+
+private un_asc(e: Expr) -> SortKey = SortKey(e, false, false)
+
+private un_row_number(name: string, partition: Buf[Expr], order: Buf[SortKey]) -> NamedWin =
+    NamedWin(name, WinCall("row_number", buf[Expr](), partition, order, None))
+
+private un_marked(r: Rel, w: string, m: string) -> Rel = Window(r, w, items_of([un_row_number(m, buf[Expr](), buf[SortKey]())]))
+
+private un_present(w: string, m: string) -> Expr = call("is_not_null", [Col(w, m)])
+
+private un_join_kind(k: ApplyKind) -> JoinKind = k match
+    Cross -> Inner
+    Outer -> Left
+    SemiApply -> Semi
+    AntiApply -> Anti
+    MarkApply -> MarkJoin
+    SingleApply -> SingleJoin
+
+/** The outer references a domain is built from, or one constant column when there are none: the
+ * domain is then one row when the outer side has rows and none when it is empty.
+ */
+private un_keys(found: Buf[Expr]) -> Buf[Expr] = if found.len() > 0 then found else items_of([Literal(Bool, Bool(true))])
+
+/** Whether `r` is cardinality-one as §7.10 rule 1 has it. */
+private un_card_one(r: Rel) -> bool = r match
+    Aggregate(_, _, keys, _) -> keys.len() == 0
+    Project(input, _, _) | Window(input, _, _) -> un_card_one(*input)
+    _ -> false
+
+/** `r` with the outer references of `m` replaced, at any depth. */
+private un_subst(r: Rel, m: UnSubst) -> Rel
+    if m.keys.len() == 0 then return r
+
+    var w = un_mapper()
+    w.keys = m.keys
+    w.vals = m.vals
+    w.rel(r)
+
+/** Whether `r` references any of `keys`, at any depth. */
+private un_mentions(r: Rel, keys: Buf[Expr]) -> bool
+    var w = un_mapper()
+    w.keys = keys
+    w.vals = keys
+    un_drop(w.rel(r))
+    w.hits > 0
+
+/** The distinct `Col` and `Row` references `r` makes to any of the binders `names`, at any depth. */
+private un_refs(r: Rel, names: Buf[string]) -> Buf[Expr]
+    var w = un_mapper()
+    w.seen = names
+    un_drop(w.rel(r))
+    w.found
+
+private un_count(r: Rel) -> usize
+    var w = un_mapper()
+    un_drop(w.rel(r))
+    w.nodes
+
+private un_has_subquery(e: Expr) -> bool
+    var w = un_mapper()
+    un_drop(w.expr(e))
+    w.nested > 0
+
+// -- a structural map over a tree -----------------------------------------------------------------
+
+/** One pass over a tree that renames the binders `from[i]` to `to[i]` where introduced and where
+ * read, replaces each `Col` or `Row` equal to `keys[i]` by `vals[i]`, and gathers what it meets: the
+ * nodes, the binders introduced and the names used, the binders read whole, the references to the
+ * binders `seen`, and the `Apply` nodes and subquery expressions.
+ */
+private struct UnMapper
+    from: Buf[string]
+    to: Buf[string]
+    keys: Buf[Expr]
+    vals: Buf[Expr]
+    seen: Buf[string]
+    found: Buf[Expr]
+    rows: Buf[string]
+    binders: Buf[string]
+    names: Buf[string]
+    nodes: usize
+    hits: usize
+    nested: usize
+
+private un_mapper() -> UnMapper =
+    UnMapper(buf[string](), buf[string](), buf[Expr](), buf[Expr](), buf[string](), buf[Expr](), buf[string](), buf[string](), buf[string](), 0, 0, 0)
+
+impl UnMapper
+    refer(self, b: string) -> string
+        for i in 0..<self.from.len()
+            if self.from[i] == b then return self.to[i]
+
+        b
+
+    intro(*self, b: string) -> string
+        self.binders.push(b)
+        self.names.push(b)
+        self.refer(b)
+
+    intro_opt(*self, b: Option[string]) -> Option[string] = b match
+        Some(x) -> Some(self.intro(x))
+        None -> None
+
+    named(*self, n: string) -> string
+        self.names.push(n)
+        n
+
+    named_opt(*self, n: Option[string]) = n match
+        Some(x) -> self.names.push(x)
+        None -> ()
+
+    reference(*self, e: Expr, b: string, renamed: Expr) -> Expr
+        for i in 0..<self.keys.len()
+            if self.keys[i] == e
+                self.hits += 1
+                return self.vals[i]
+
+        if contains(self.seen.view(), b) && !contains(self.found.view(), e) then self.found.push(e)
+
+        renamed
+
+    opt(*self, e: Option[Expr]) -> Option[Expr] = e match
+        Some(x) -> Some(self.expr(x))
+        None -> None
+
+    boxed(*self, e: Option[&Expr]) -> Option[&Expr] = e match
+        Some(x) -> Some(self.expr(*x))
+        None -> None
+
+    exprs(*self, es: Buf[Expr]) -> Buf[Expr]
+        val out = buf[Expr]()
+
+        for e in es
+            out.push(self.expr(e))
+
+        out
+
+    items(*self, is: Buf[Item]) -> Buf[Item]
+        val out = buf[Item]()
+
+        for i in is
+            out.push(Item(self.named(i.name), self.expr(i.expr)))
+
+        out
+
+    sort_keys(*self, ks: Buf[SortKey]) -> Buf[SortKey]
+        val out = buf[SortKey]()
+
+        for k in ks
+            out.push(SortKey(self.expr(k.expr), k.desc, k.nulls_first))
+
+        out
+
+    sub(*self, r: Rel) -> Rel
+        self.nested += 1
+        self.rel(r)
+
+    expr(*self, e: Expr) -> Expr
+        self.nodes += 1
+
+        e match
+            Col(b, n) ->
+                un_drop(self.named(n))
+                self.reference(e, b, Col(self.refer(b), n))
+            Row(b) ->
+                self.rows.push(b)
+                self.reference(e, b, Row(self.refer(b)))
+            Param(_) | Null(_) | Literal(_, _) | Action -> e
+            Call(f, args) -> Call(f, self.exprs(args))
+            Cast(x, t, mode) -> Cast(self.expr(*x), t, mode)
+            If(arms, otherwise) ->
+                val out = buf[IfArm]()
+
+                for a in arms
+                    out.push(IfArm(self.expr(a.cond), self.expr(a.value)))
+
+                If(out, self.boxed(otherwise))
+            Match(x, arms, otherwise) ->
+                val scrutinee = self.expr(*x)
+                val out = buf[MatchArm]()
+
+                for a in arms
+                    out.push(MatchArm(a.tag, self.intro(a.binder), self.expr(a.expr)))
+
+                Match(scrutinee, out, self.boxed(otherwise))
+            Record(fs) -> Record(self.items(fs))
+            Field(x, name) -> Field(self.expr(*x), name)
+            Variant(t, tag, x) -> Variant(t, tag, self.expr(*x))
+            Relation(r) -> Relation(self.sub(*r))
+            Scalar(r) -> Scalar(self.sub(*r))
+            Exists(r) -> Exists(self.sub(*r))
+            In(es, r) ->
+                val xs = self.exprs(es)
+                In(xs, self.sub(*r))
+    end expr
+
+    agg(*self, a: AggCall) -> AggCall
+        val args = self.exprs(a.args)
+        val filter = self.opt(a.filter)
+        AggCall(a.function, args, a.distinct, filter, self.sort_keys(a.order))
+
+    win(*self, w: WinCall) -> WinCall
+        val args = self.exprs(w.args)
+        val part = self.exprs(w.partition)
+        val order = self.sort_keys(w.order)
+
+        val frame = w.frame match
+            Some(f) ->
+                val s = Bound(f.start.kind, self.opt(f.start.offset))
+                Some(Frame(f.unit, s, Bound(f.end.kind, self.opt(f.end.offset)), f.exclude))
+            None -> None
+
+        WinCall(w.function, args, part, order, frame)
+
+    rel(*self, r: Rel) -> Rel
+        self.nodes += 1
+
+        r match
+            Scan(table, binder) -> Scan(table, self.intro(binder))
+            Values(binder, columns, rows) ->
+                val b = self.intro(binder)
+                val out = buf[Buf[Expr]]()
+
+                for c in columns
+                    un_drop(self.named(c.name))
+
+                for row in rows
+                    out.push(self.exprs(row))
+
+                Values(b, columns, out)
+            ParamScan(binder, param) -> ParamScan(self.intro(binder), param)
+            CteRef(name, binder) -> CteRef(name, self.intro(binder))
+            Filter(input, predicate) ->
+                val i = self.rel(*input)
+                Filter(i, self.expr(predicate))
+            Project(input, binder, items) ->
+                val i = self.rel(*input)
+                Project(i, self.intro(binder), self.items(items))
+            Join(kind, left, right, on, mark, binder) ->
+                val l = self.rel(*left)
+                val x = self.rel(*right)
+                val o = self.opt(on)
+                self.named_opt(mark)
+                Join(kind, l, x, o, mark, self.intro_opt(binder))
+            Apply(kind, left, right, on, mark, binder) ->
+                self.nested += 1
+                val l = self.rel(*left)
+                val x = self.rel(*right)
+                val o = self.opt(on)
+                self.named_opt(mark)
+                Apply(kind, l, x, o, mark, self.intro_opt(binder))
+            Aggregate(input, binder, keys, aggs) ->
+                val i = self.rel(*input)
+                val ks = self.items(keys)
+                val out = buf[NamedAgg]()
+
+                for a in aggs
+                    out.push(NamedAgg(self.named(a.name), self.agg(a.call)))
+
+                Aggregate(i, self.intro(binder), ks, out)
+            Window(input, binder, items) ->
+                val i = self.rel(*input)
+                val out = buf[NamedWin]()
+
+                for w in items
+                    out.push(NamedWin(self.named(w.name), self.win(w.call)))
+
+                Window(i, self.intro(binder), out)
+            Sort(input, keys) ->
+                val i = self.rel(*input)
+                Sort(i, self.sort_keys(keys))
+            Limit(input, count, offset, ties, arbitrary) ->
+                val i = self.rel(*input)
+                val c = self.opt(count)
+                Limit(i, c, self.opt(offset), ties, arbitrary)
+            Distinct(input) -> Distinct(self.rel(*input))
+            SetOp(op, all, binder, inputs) ->
+                val out = buf[Rel]()
+
+                for x in inputs
+                    out.push(self.rel(x))
+
+                SetOp(op, all, self.intro(binder), out)
+            With(recursive, ctes, body) ->
+                val out = buf[CteDef]()
+
+                for c in ctes
+                    out.push(CteDef(c.name, c.columns, self.rel(c.rel)))
+
+                With(recursive, out, self.rel(*body))
+            Nest(input, binder, keys, name, items, order) ->
+                val i = self.rel(*input)
+                val ks = self.items(keys)
+                val xs = self.items(items)
+                val os = self.sort_keys(order)
+                Nest(i, self.intro(binder), ks, self.named(name), xs, os)
+            Unnest(input, binder, value, outer, ordinality) ->
+                val i = self.rel(*input)
+                val v = self.expr(value)
+                self.named_opt(ordinality)
+                Unnest(i, self.intro(binder), v, outer, ordinality)
+            Tag(input, binder, t, tag) ->
+                val i = self.rel(*input)
+                Tag(i, self.intro(binder), t, tag)
+    end rel
+end UnMapper
+
+// -- the rewrite ----------------------------------------------------------------------------------
+
+/** The rewrite's state: the original's types in pre-order and how many have been taken, the
+ * parameters, the binders some `Row` reads whole (whose columns must not change), the prefix and
+ * counter that make fresh names, and the reasons for each part kept per row.
+ */
+private struct Unnester
+    types: Buf[Type]
+    at: usize
+    params: Buf[Value]
+    rows: Buf[string]
+    prefix: string
+    next: usize
+    fallbacks: Buf[string]
+    /** Set by a parent that does not read the next relation pushed into's order (`push_body`). */
+    unordered: bool
+
+    take(*self) -> Type
+        val t = self.types[self.at]
+        self.at += 1
+        t
+
+    /** The next relation's element type, and whether it is a list. */
+    elem(*self) -> (Type, bool) = self.take() match
+        Bag(e) -> (*e, false)
+        List(e) -> (*e, true)
+        _ -> panic("a relation's type is a bag or a list")
+
+    fresh(*self) -> string
+        val n = s"${self.prefix}${self.next}"
+        self.next += 1
+        n
+
+    skip(*self, r: Rel)
+        self.at += un_count(r)
+
+    /** `r` with every binder it introduces renamed afresh, and the renaming. */
+    copy(*self, r: Rel) -> (Rel, Buf[string], Buf[string])
+        var g = un_mapper()
+        un_drop(g.rel(r))
+        val to = buf[string]()
+
+        for _ in g.binders
+            to.push(self.fresh())
+
+        var w = un_mapper()
+        w.from = g.binders
+        w.to = to
+        (w.rel(r), g.binders, to)
+
+    /** The domain of the outer side `base` for the outer references `keys`. */
+    domain(*self, base: Rel, keys: Buf[Expr]) -> UnDomain
+        val (copied, from, to) = self.copy(base)
+        var w = un_mapper()
+        w.from = from
+        w.to = to
+        val b = self.fresh()
+        val cols = buf[string]()
+        val items = buf[Item]()
+
+        for k in keys
+            val c = self.fresh()
+            cols.push(c)
+            items.push(Item(c, w.expr(k)))
+
+        UnDomain(Distinct(Project(copied, b, items)), b, cols, keys)
+
+    /** A fresh copy of `d`'s relation to use once, its binder, and where its columns are read. */
+    instance(*self, d: UnDomain) -> (Rel, string, Buf[Expr])
+        val (copied, from, to) = self.copy(d.rel)
+        var b = d.binder
+
+        for i in 0..<from.len()
+            if from[i] == d.binder then b = to[i]
+
+        val dref = buf[Expr]()
+
+        for c in d.cols
+            dref.push(Col(b, c))
+
+        (copied, b, dref)
+
+    idle(*self) -> UnLifter
+        val w = UnRw(Values("", buf[Field](), buf[Buf[Expr]]()), buf[UnBind](), buf[string](), false, buf[Expr](), None, false, buf[string]())
+        UnLifter(w, w.rel, buf[string](), true, None)
+
+    lifter(*self, base: UnRw, pushing: bool) -> UnLifter = UnLifter(base, base.rel, base.names, pushing, None)
+
+    /** What `l` has become: its input with the joins laid over it, in the input's order. */
+    finish(*self, l: UnLifter) -> UnRw
+        val b = l.base
+
+        l.position match
+            Some(p) -> UnRw(Sort(l.cur, items_of([un_asc(p)])), b.orig, l.names, b.list, b.dref, b.order, true, b.polluted)
+            None -> UnRw(l.cur, b.orig, l.names, b.list, b.dref, b.order, b.positional, b.polluted)
+
+    /** `right` joined to what `l` has so far by `kind` on `on`, exposing `names` beside it. */
+    join_in(*self, l: *UnLifter, kind: JoinKind, right: Rel, on: Expr, mark: Option[string], binder: Option[string], names: Buf[string])
+        if !l.pushing && l.base.list && l.position.is_none()
+            val w = self.fresh()
+            val p = self.fresh()
+            l.cur = un_marked(l.cur, w, p)
+            l.names.push(w)
+            l.position = Some(Col(w, p))
+
+        l.cur = Join(kind, l.cur, right, Some(on), mark, binder)
+        l.names.extend(names.view())
+
+    // -- expressions --------------------------------------------------------------------------
+
+    /** `e` with the references of `m` replaced. Where `live`, a subquery expression it holds is
+     * evaluated on every row of the node's input, and becomes a join laid over `l`.
+     */
+    expr(*self, e: Expr, m: UnSubst, l: *UnLifter, live: bool) -> Expr
+        un_drop(self.take())
+
+        e match
+            Col(_, _) | Row(_) -> m.get(e)
+            Param(_) | Null(_) | Literal(_, _) | Action -> e
+            Call(f, args) ->
+                val out = buf[Expr]()
+
+                // `coalesce` evaluates an argument only where the earlier ones were null (§7.12 rule 1).
+                for i in 0..<args.len()
+                    out.push(self.expr(args[i], m, l, live && (f != "coalesce" || i == 0)))
+
+                Call(f, out)
+            Cast(x, t, mode) -> Cast(self.expr(*x, m, l, live), t, mode)
+            Field(x, name) -> Field(self.expr(*x, m, l, live), name)
+            Variant(t, tag, x) -> Variant(t, tag, self.expr(*x, m, l, live))
+            Record(fs) -> Record(self.items(fs, m, l, live))
+            If(arms, otherwise) ->
+                // Only the first condition is evaluated on every row (§7.5).
+                val out = buf[IfArm]()
+
+                for i in 0..<arms.len()
+                    val c = self.expr(arms[i].cond, m, l, live && i == 0)
+                    out.push(IfArm(c, self.expr(arms[i].value, m, l, false)))
+
+                If(out, self.boxed(otherwise, m, l))
+            Match(x, arms, otherwise) ->
+                val scrutinee = self.expr(*x, m, l, live)
+                val out = buf[MatchArm]()
+
+                for a in arms
+                    out.push(MatchArm(a.tag, a.binder, self.expr(a.expr, m, l, false)))
+
+                Match(scrutinee, out, self.boxed(otherwise, m, l))
+            Relation(r) -> self.subquery(SubRelation, *r, buf[Expr](), m, l, live)
+            Scalar(r) -> self.subquery(SubScalar, *r, buf[Expr](), m, l, live)
+            Exists(r) -> self.subquery(SubExists, *r, buf[Expr](), m, l, live)
+            In(es, r) ->
+                val xs = buf[Expr]()
+
+                for x in es
+                    xs.push(self.expr(x, m, l, live))
+
+                self.subquery(SubIn, *r, xs, m, l, live)
+    end expr
+
+    boxed(*self, e: Option[&Expr], m: UnSubst, l: *UnLifter) -> Option[&Expr] = e match
+        Some(x) -> Some(self.expr(*x, m, l, false))
+        None -> None
+
+    opt(*self, e: Option[Expr], m: UnSubst, l: *UnLifter, live: bool) -> Option[Expr] = e match
+        Some(x) -> Some(self.expr(x, m, l, live))
+        None -> None
+
+    items(*self, xs: Buf[Item], m: UnSubst, l: *UnLifter, live: bool) -> Buf[Item]
+        val out = buf[Item]()
+
+        for x in xs
+            out.push(Item(x.name, self.expr(x.expr, m, l, live)))
+
+        out
+
+    keys(*self, ks: Buf[SortKey], m: UnSubst, l: *UnLifter, live: bool) -> Buf[SortKey]
+        val out = buf[SortKey]()
+
+        for k in ks
+            out.push(SortKey(self.expr(k.expr, m, l, live), k.desc, k.nulls_first))
+
+        out
+
+    /** An expression with no input to lay joins over: its subqueries are kept. */
+    cold(*self, e: Option[Expr], m: UnSubst) -> Option[Expr]
+        var idle = self.idle()
+        self.opt(e, m, &idle, false)
+
+    /** `aggs` with `m` applied, the filters lifted into `l`, each filter conjoined with `present`. */
+    aggs(*self, aggs: Buf[NamedAgg], m: UnSubst, l: *UnLifter, present: Option[Expr]) -> Buf[NamedAgg]
+        val out = buf[NamedAgg]()
+
+        for a in aggs
+            val c = a.call
+            val args = buf[Expr]()
+
+            // The arguments and order are evaluated only on the rows the call sees (§6.7 rule 5);
+            // behind the count bug's left join (`present`) an argument keeps its original type.
+            for x in c.args
+                val t = self.types[self.at]
+                val e = self.expr(x, m, l, false)
+                args.push(if present.is_some() then un_strict(e, t) else e)
+
+            val f = self.opt(c.filter, m, l, true)
+            val order = self.keys(c.order, m, l, false)
+
+            val filter = (f, present) match
+                (Some(x), Some(p)) -> Some(un_and(x, p))
+                (None, Some(p)) -> Some(p)
+                _ -> f
+
+            out.push(NamedAgg(a.name, AggCall(c.function, args, c.distinct, filter, order)))
+
+        out
+    end aggs
+
+    /** `items` with `m` applied and `part` put before each call's partition. */
+    wins(*self, items: Buf[NamedWin], m: UnSubst, part: Buf[Expr]) -> Buf[NamedWin]
+        var idle = self.idle()
+        val out = buf[NamedWin]()
+
+        for it in items
+            val c = it.call
+            val args = buf[Expr]()
+            val ps = buf[Expr]()
+            ps.extend(part.view())
+
+            for x in c.args
+                args.push(self.expr(x, m, &idle, false))
+
+            for x in c.partition
+                ps.push(self.expr(x, m, &idle, false))
+
+            val order = self.keys(c.order, m, &idle, false)
+
+            val frame = c.frame match
+                Some(f) ->
+                    val s = Bound(f.start.kind, self.opt(f.start.offset, m, &idle, false))
+                    Some(Frame(f.unit, s, Bound(f.end.kind, self.opt(f.end.offset, m, &idle, false)), f.exclude))
+                None -> None
+
+            out.push(NamedWin(it.name, WinCall(c.function, args, ps, order, frame)))
+
+        out
+    end wins
+
+    /** A subquery expression of kind `k` over `r` (with `es`, an `In`'s values), its outer references
+     * replaced by `m`: a column of a join laid over `l` where `live`, or else kept, to be evaluated per
+     * row.
+     */
+    subquery(*self, k: UnSub, r: Rel, es: Buf[Expr], m: UnSubst, l: *UnLifter, live: bool) -> Expr
+        val rs = un_subst(r, m)
+
+        if live
+            self.lift(l, k, rs, es) match
+                Some(v) -> return v
+                None -> self.fallbacks.push("a subquery expression whose relation cannot be decorrelated")
+        else
+            self.fallbacks.push("a subquery expression evaluated only on some rows (an If or Match arm, a later coalesce argument, an aggregate's argument, a join's on, a Window, a Values row or a Limit)")
+
+        val kept = self.kept(rs)
+
+        k match
+            SubRelation -> Relation(kept)
+            SubScalar -> Scalar(kept)
+            SubExists -> Exists(kept)
+            SubIn -> In(es, kept)
+    end subquery
+
+    /** `r` rewritten where that leaves its output as it was, else `r` as it is. */
+    kept(*self, r: Rel) -> Rel
+        val start = self.at
+        val noted = self.fallbacks.len()
+        val x = self.rel(r)
+
+        if un_plain(x) then return x.rel
+
+        self.at = start
+        self.skip(r)
+
+        while self.fallbacks.len() > noted
+            un_drop(self.fallbacks.pop())
+
+        r
+
+    /** The subquery `rs` of kind `k` decorrelated against `l`'s input and joined to it: the
+     * expression that reads its value, or `None` with nothing taken.
+     */
+    lift(*self, l: *UnLifter, k: UnSub, rs: Rel, es: Buf[Expr]) -> Option[Expr]
+        val start = self.at
+        val keys = un_keys(un_refs(rs, l.base.names))
+        val d = self.domain(l.base.rel, keys)
+        val x = self.push(d, rs)?
+        val on = un_keys_on(keys, x.dref)
+        val cols = un_all_cols(x.orig)
+
+        k match
+            SubExists | SubIn ->
+                var cond = on
+
+                if k == SubIn
+                    if cols.len() != es.len()
+                        self.at = start
+                        return None
+
+                    for i in 0..<es.len()
+                        cond = un_and(cond, call("eq", [es[i], cols[i]]))
+
+                val (b, mk) = (self.fresh(), self.fresh())
+                self.join_in(l, MarkJoin, x.rel, cond, Some(mk), Some(b), items_of([b]))
+                Some(Col(b, mk))
+            SubScalar ->
+                if cols.len() != 1
+                    self.at = start
+                    return None
+
+                // A cardinality-one relation has a row for every domain row (the count bug is
+                // handled where its Aggregate was pushed), so an inner join keeps every outer row.
+                val kind = if un_card_one(rs) then Inner else SingleJoin
+                self.join_in(l, kind, x.rel, on, None, None, x.names)
+                Some(cols[0])
+            SubRelation ->
+                if x.list && x.order.is_none()
+                    self.at = start
+                    return None
+
+                // An element is the binder's row, or, where the domain's columns were added to it or
+                // there are several binders, the record of the original's columns; either at its
+                // original type, which the left join below makes nullable.
+                val one = x.orig.len() == 1 && !contains(x.polluted.view(), x.orig[0].name)
+                val whole = if one then call("assert_not_null", [Row(x.orig[0].name)]) else un_whole(x.orig)
+                val (w, mc, ra, rv) = (self.fresh(), self.fresh(), self.fresh(), self.fresh())
+                val (dr, _, dref) = self.instance(d)
+                val j = Join(Left, dr, un_marked(x.rel, w, mc), Some(un_keys_on(dref, x.dref)), None, None)
+                val ks = buf[Item]()
+                val reads = buf[Expr]()
+
+                for i in 0..<dref.len()
+                    val c = self.fresh()
+                    ks.push(Item(c, dref[i]))
+                    reads.push(Col(ra, c))
+
+                val order = x.order.unwrap_or(buf[SortKey]())
+                val collect = AggCall("collect", items_of([whole]), false, Some(un_present(w, mc)), order)
+                val agg = Aggregate(j, ra, ks, items_of([NamedAgg(rv, collect)]))
+                self.join_in(l, Inner, agg, un_keys_on(keys, reads), None, None, items_of([ra]))
+                Some(Col(ra, rv))
+    end lift
+
+    // -- relations, with no domain ------------------------------------------------------------
+
+    /** `r` rewritten where it stands: every `Apply` and subquery expression within it decorrelated
+     * where it can be. Its output is the original's, with extra binders or columns beside it.
+     */
+    rel(*self, r: Rel) -> UnRw
+        val start = self.at
+        val (elem, list) = self.elem()
+        val none = buf[Expr]()
+        val unchanged = buf[string]()
+
+        r match
+            Scan(_, b) -> UnRw(r, un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+            ParamScan(b, _) -> UnRw(r, un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+            Values(b, cols, rows) ->
+                val out = buf[Buf[Expr]]()
+
+                for row in rows
+                    val xs = buf[Expr]()
+
+                    for e in row
+                        xs.push(self.cold(Some(e), un_no_subst()).unwrap())
+
+                    out.push(xs)
+
+                UnRw(Values(b, cols, out), un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+            Filter(input, p) ->
+                var l = self.lifter(self.rel(*input), false)
+                val p2 = self.expr(p, un_no_subst(), &l,true)
+                val f = self.finish(l)
+                un_over(f, Filter(f.rel, p2))
+            Project(input, b, items) ->
+                var l = self.lifter(self.rel(*input), false)
+                val xs = self.items(items, un_no_subst(), &l,true)
+                val f = self.finish(l)
+                UnRw(Project(f.rel, b, xs), un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+            Sort(input, keys) ->
+                var l = self.lifter(self.rel(*input), false)
+                val ks = self.keys(keys, un_no_subst(), &l,true)
+                val f = self.finish(l)
+                UnRw(Sort(f.rel, ks), f.orig, f.names, true, none, None, f.positional, f.polluted)
+            Limit(input, count, offset, ties, arbitrary) ->
+                val i = self.rel(*input)
+                val c = self.cold(count, un_no_subst())
+                un_over(i, Limit(i.rel, c, self.cold(offset, un_no_subst()), ties, arbitrary))
+            Distinct(input) ->
+                val from = self.at
+                val i = self.rel(*input)
+
+                if i.positional
+                    // A row number beside the rows would make every row distinct.
+                    self.at = from
+                    self.skip(*input)
+                    self.fallbacks.push("a Distinct over an input whose decorrelation numbers its rows")
+                    return UnRw(r, i.orig, un_names(i.orig), false, none, None, false, unchanged)
+
+                UnRw(Distinct(i.rel), i.orig, i.names, false, none, None, false, i.polluted)
+            Tag(input, b, t, tag) ->
+                val from = self.at
+                val i = self.rel(*input)
+
+                if un_plain(i) then return UnRw(Tag(i.rel, b, t, tag), un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+
+                // The input's element becomes the payload, so it must keep exactly its columns.
+                self.at = from
+                self.skip(*input)
+                self.fallbacks.push("a Tag over an input whose decorrelation adds columns")
+                UnRw(r, un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+            Join(kind, left, right, on, mark, b) ->
+                val lw = self.rel(*left)
+                val rw = self.rel(*right)
+                val o = self.cold(on, un_no_subst())
+                un_joined(Join(kind, lw.rel, rw.rel, o, mark, b), kind, lw, rw, mark, b, none)
+            Apply(kind, left, right, on, mark, b) ->
+                val lw = self.rel(*left)
+                self.apply(kind, lw, *right, on, mark, b, un_no_subst())
+            Aggregate(input, b, keys, aggs) ->
+                var l = self.lifter(self.rel(*input), false)
+                val ks = self.items(keys, un_no_subst(), &l,true)
+                val cs = self.aggs(aggs, un_no_subst(), &l,None)
+                val f = self.finish(l)
+                UnRw(Aggregate(f.rel, b, ks, cs), un_one(b, un_cols(elem)), items_of([b]), false, none, None, false, unchanged)
+            Window(input, b, items) ->
+                val i = self.rel(*input)
+                val ws = self.wins(items, un_no_subst(), none)
+                val orig = un_plus(i.orig, UnBind(b, un_tail(elem, un_width(i.orig))))
+                UnRw(Window(i.rel, b, ws), orig, un_plus(i.names, b), list, none, None, i.positional, i.polluted)
+            Nest(input, b, keys, name, items, order) ->
+                var l = self.lifter(self.rel(*input), false)
+                val ks = self.items(keys, un_no_subst(), &l,true)
+                val xs = self.items(items, un_no_subst(), &l,true)
+                val os = self.keys(order, un_no_subst(), &l,true)
+                val f = self.finish(l)
+                UnRw(Nest(f.rel, b, ks, name, xs, os), un_one(b, un_cols(elem)), items_of([b]), false, none, None, false, unchanged)
+            Unnest(input, b, value, outer, ordinality) ->
+                var l = self.lifter(self.rel(*input), false)
+                val v = self.expr(value, un_no_subst(), &l,true)
+                val f = self.finish(l)
+                val orig = un_plus(f.orig, UnBind(b, un_tail(elem, un_width(f.orig))))
+                UnRw(Unnest(f.rel, b, v, outer, ordinality), orig, un_plus(f.names, b), false, none, None, f.positional, f.polluted)
+            _ ->
+                // SetOp, With and CteRef, which the executor does not run, are left as they are.
+                self.at = start
+                self.skip(r)
+                UnRw(r, buf[UnBind](), buf[string](), list, none, None, false, unchanged)
+    end rel
+
+    /** `Apply(kind, lw, right, on)` decorrelated, `m` replacing the outer references of an enclosing
+     * domain; or, where its right input cannot be, still an `Apply`.
+     */
+    apply(*self, kind: ApplyKind, lw: UnRw, right: Rel, on: Option[Expr], mark: Option[string], b: Option[string], m: UnSubst) -> UnRw
+        val rs = un_subst(right, m)
+        val keys = un_keys(un_refs(rs, lw.names))
+        val d = self.domain(lw.rel, keys)
+        val jk = un_join_kind(kind)
+        val start = self.at
+
+        self.push(d, rs) match
+            Some(x) ->
+                val o = self.cold(on, m)
+                val cond = un_and_opt(o, un_keys_on(keys, x.dref))
+                return un_joined(Join(jk, lw.rel, x.rel, Some(cond), mark, b), jk, lw, x, mark, b, lw.dref)
+            None -> ()
+
+        self.at = start
+        self.fallbacks.push("an Apply whose right input cannot be decorrelated")
+        val x = self.rel(rs)
+        val o = self.cold(on, m)
+        un_joined(Apply(kind, lw.rel, x.rel, o, mark, b), jk, lw, x, mark, b, lw.dref)
+    end apply
+
+    // -- relations under a domain -------------------------------------------------------------
+
+    /** `r` with the domain `d` pushed into it: one evaluation of `r` for every domain row at once,
+     * with no reference to the outer side left; or `None`, with nothing taken, where it cannot be.
+     */
+    push(*self, d: UnDomain, r: Rel) -> Option[UnRw]
+        val start = self.at
+        val got = self.push_body(d, r)
+
+        if got.is_none() then self.at = start
+
+        got
+
+    /** `t`, which references no domain column, beside every domain row; a list is numbered first. */
+    cross(*self, d: UnDomain, t: UnRw, ordered: bool) -> UnRw
+        var r = t.rel
+        var names = t.names
+        var order: Option[Buf[SortKey]] = None
+        var positional = t.positional
+
+        if t.list && ordered
+            val (w, p) = (self.fresh(), self.fresh())
+            r = un_marked(r, w, p)
+            names = un_plus(names, w)
+            order = Some(items_of([un_asc(Col(w, p))]))
+            positional = true
+
+        // The domain on the right: an inner join with no right row never reads its left input, so
+        // `t` is evaluated only when the outer side has rows (§6.6 rule 4).
+        val (dr, db, dref) = self.instance(d)
+        UnRw(Join(Inner, r, dr, None, None, None), t.orig, un_plus(names, db), t.list, dref, order, positional, t.polluted)
+
+    push_body(*self, d: UnDomain, r: Rel) -> Option[UnRw]
+        // Whether the parent reads this relation's order. A `Distinct` above (through operators that
+        // pass rows through) does not, and must not be given a row number that would tell its rows
+        // apart.
+        val ordered = !self.unordered
+        self.unordered = false
+
+        if !un_mentions(r, d.keys) then return Some(self.cross(d, self.rel(r), ordered))
+
+        val (elem, list) = self.elem()
+
+        r match
+            Values(b, cols, rows) -> self.push_values(d, b, cols, rows, elem, ordered)
+            Filter(input, p) ->
+                self.unordered = !ordered
+                val i = self.push(d, *input)?
+                var l = self.lifter(i, true)
+                val p2 = self.expr(p, un_subst_of(d.keys, i.dref), &l, true)
+                val f = self.finish(l)
+                Some(un_over(f, Filter(f.rel, p2)))
+            Project(input, b, items) ->
+                self.unordered = !ordered
+                val i = self.push(d, *input)?
+
+                if contains(self.rows.view(), b) then return None
+
+                var l = self.lifter(i, true)
+                val xs = self.items(items, un_subst_of(d.keys, i.dref), &l, true)
+                val f = self.finish(l)
+                val dref = buf[Expr]()
+
+                for x in f.dref
+                    val c = self.fresh()
+                    xs.push(Item(c, x))
+                    dref.push(Col(b, c))
+
+                val order = if ordered then self.carry(f.order, b, xs) else None
+                Some(UnRw(Project(f.rel, b, xs), un_one(b, un_cols(elem)), items_of([b]), list, dref, order, f.positional && order.is_some(), items_of([b])))
+            Sort(input, keys) ->
+                self.unordered = !ordered
+                val i = self.push(d, *input)?
+                var l = self.lifter(i, true)
+                val ks = self.keys(keys, un_subst_of(d.keys, i.dref), &l, true)
+                val f = self.finish(l)
+                // A stable sort: rows equal on the keys keep the input's order.
+                val order = un_cat(ks, f.order.unwrap_or(buf[SortKey]()))
+                Some(UnRw(Sort(f.rel, ks), f.orig, f.names, true, f.dref, Some(order), f.positional, f.polluted))
+            Limit(input, count, offset, ties, _) -> self.push_limit(d, *input, count, offset, ties)
+            Distinct(input) ->
+                self.unordered = true
+                val i = self.push(d, *input)?
+
+                if i.positional then return None
+
+                Some(UnRw(Distinct(un_sorted(i)), i.orig, i.names, false, i.dref, None, false, i.polluted))
+            Join(kind, left, right, on, mark, b) -> self.push_join(d, kind, *left, *right, on, mark, b)
+            Apply(kind, left, right, on, mark, b) ->
+                val lw = self.push(d, *left)?
+                Some(self.apply(kind, lw, *right, on, mark, b, un_subst_of(d.keys, lw.dref)))
+            Aggregate(input, b, keys, aggs) -> self.push_aggregate(d, *input, b, keys, aggs, elem)
+            Window(input, b, items) ->
+                val i = self.push(d, *input)?
+                val ws = self.wins(items, un_subst_of(d.keys, i.dref), i.dref)
+                val orig = un_plus(i.orig, UnBind(b, un_tail(elem, un_width(i.orig))))
+                Some(UnRw(Window(un_sorted(i), b, ws), orig, un_plus(i.names, b), list, i.dref, i.order, i.positional, i.polluted))
+            Nest(input, b, keys, name, items, order) -> self.push_nest(d, *input, b, keys, name, items, order, elem)
+            Unnest(input, b, value, outer, ordinality) ->
+                val i = self.push(d, *input)?
+                var l = self.lifter(i, true)
+                val v = self.expr(value, un_subst_of(d.keys, i.dref), &l, true)
+                val f = self.finish(l)
+                val orig = un_plus(f.orig, UnBind(b, un_tail(elem, un_width(f.orig))))
+                Some(UnRw(Unnest(f.rel, b, v, outer, ordinality), orig, un_plus(f.names, b), false, f.dref, None, f.positional, f.polluted))
+            // A Tag's payload is its input's element, which a domain's columns would change; the
+            // executor runs no SetOp, With or CteRef.
+            _ -> None
+    end push_body
+
+    /** `order`'s keys carried as columns of the `Project` items `xs` under `b`, and the keys reading
+     * them there.
+     */
+    carry(*self, order: Option[Buf[SortKey]], b: string, xs: Buf[Item]) -> Option[Buf[SortKey]] = order match
+        Some(ks) ->
+            val out = buf[SortKey]()
+
+            for k in ks
+                val c = self.fresh()
+                xs.push(Item(c, k.expr))
+                out.push(SortKey(Col(b, c), k.desc, k.nulls_first))
+
+            Some(out)
+        None -> None
+
+    /** A correlated `Values`: one row of an index per row, beside every domain row, and each column the
+     * row's expression the index selects (§7.5 evaluates only that one).
+     */
+    push_values(*self, d: UnDomain, b: string, cols: Buf[Field], rows: Buf[Buf[Expr]], elem: Type, ordered: bool) -> Option[UnRw]
+        for row in rows
+            for e in row
+                if un_has_subquery(e) then return None
+
+        if contains(self.rows.view(), b) then return None
+
+        val (dr, _, dref) = self.instance(d)
+        val (vi, ix) = (self.fresh(), self.fresh())
+        val index = buf[Buf[Expr]]()
+
+        for i in 0..<rows.len()
+            index.push(items_of([un_int(i128(i))]))
+
+        val src = Join(Inner, Values(vi, items_of([Field(ix, Int64)]), index), dr, None, None, None)
+        val m = un_subst_of(d.keys, dref)
+        var idle = self.idle()
+        val grid = buf[Buf[Expr]]()
+
+        for row in rows
+            val out = buf[Expr]()
+
+            for j in 0..<row.len()
+                val t = self.types[self.at]
+                val e = self.expr(row[j], m, &idle, false)
+                // A row's expression coerces to its column's type (§6.2 rule 1); the If needs it to.
+                out.push(if t == cols[j].ty then e else Cast(e, cols[j].ty, Strict))
+
+            grid.push(out)
+
+        val xs = buf[Item]()
+        val n = rows.len()
+
+        for j in 0..<cols.len()
+            if n == 1
+                xs.push(Item(cols[j].name, grid[0][j]))
+            else
+                val arms = buf[IfArm]()
+
+                for i in 0..<(n - 1)
+                    arms.push(IfArm(call("eq", [Col(vi, ix), un_int(i128(i))]), grid[i][j]))
+
+                xs.push(Item(cols[j].name, If(arms, Some(grid[n - 1][j]))))
+
+        val reads = buf[Expr]()
+
+        for x in dref
+            val c = self.fresh()
+            xs.push(Item(c, x))
+            reads.push(Col(b, c))
+
+        if !ordered then return Some(UnRw(Project(src, b, xs), un_one(b, un_cols(elem)), items_of([b]), true, reads, None, false, items_of([b])))
+
+        val oc = self.fresh()
+        xs.push(Item(oc, Col(vi, ix)))
+        val order = items_of([un_asc(Col(b, oc))])
+        Some(UnRw(Project(src, b, xs), un_one(b, un_cols(elem)), items_of([b]), true, reads, Some(order), true, items_of([b])))
+    end push_values
+
+    /** A `Limit` per domain group: each row numbered within its group in the group's order, and kept by
+     * its number (and, with ties, its rank). The count and offset must be constants that raise no
+     * error (§6.10 rule 1), since they are evaluated per row here and once per outer row there.
+     */
+    push_limit(*self, d: UnDomain, input: Rel, count: Option[Expr], offset: Option[Expr], ties: bool) -> Option[UnRw]
+        val i = self.push(d, input)?
+        val m = un_subst_of(d.keys, i.dref)
+        val c = self.cold(count, m)
+        val o = self.cold(offset, m)
+
+        if !self.constant(c) || !self.constant(o) then return None
+        if c.is_none() && o.is_none() then return Some(i)
+
+        val (w, rn, rk) = (self.fresh(), self.fresh(), self.fresh())
+        val order = i.order.unwrap_or(buf[SortKey]())
+        val calls = items_of([un_row_number(rn, i.dref, order)])
+
+        if ties
+            // `ties` requires a Sort directly below (§6.10 rule 3): its own keys lead the order.
+            val n = input match
+                Sort(_, ks) -> ks.len()
+                _ -> return None
+
+            val sk = buf[SortKey]()
+
+            for j in 0..<n
+                sk.push(order[j])
+
+            calls.push(NamedWin(rk, WinCall("rank", buf[Expr](), i.dref, sk, None)))
+
+        val off = o.unwrap_or(un_int(0))
+        val conds = buf[Expr]()
+
+        if o.is_some() then conds.push(call("gt", [Col(w, rn), off]))
+
+        c match
+            Some(n) ->
+                val kept = call("le", [call("sub", [Col(w, rn), off]), n])
+                // A row past the last kept one is kept with it when its rank, among the sort keys, is
+                // within the count; a count of 0 keeps nothing to tie with.
+                val tied = un_and(call("gt", [n, un_int(0)]), call("le", [call("sub", [Col(w, rk), off]), n]))
+                conds.push(if ties then call("or", [kept, tied]) else kept)
+            None -> ()
+
+        var pred = conds[0]
+
+        for j in 1..<conds.len()
+            pred = un_and(pred, conds[j])
+
+        Some(UnRw(Filter(Window(i.rel, w, calls), pred), i.orig, un_plus(i.names, w), i.list, i.dref, i.order, true, i.polluted))
+    end push_limit
+
+    /** Whether `e` is absent, a non-negative `int64` literal, or a parameter bound to one. */
+    constant(self, e: Option[Expr]) -> bool = e match
+        None -> true
+        Some(Literal(_, Int(n))) -> n >= 0
+        Some(Param(k)) ->
+            if usize(k) >= self.params.len() then return false
+
+            self.params[usize(k)] match
+                Int(n) -> n >= 0
+                _ -> false
+        _ -> false
+
+    /** A `Join` under a domain: the domain goes into the left input, and into the right one too when it
+     * is correlated or a right join keeps its unmatched rows, with the domain columns then equated. A
+     * full join's rows unmatched on either side lose one side's domain columns, so it is not pushed.
+     */
+    push_join(*self, d: UnDomain, kind: JoinKind, left: Rel, right: Rel, on: Option[Expr], mark: Option[string], b: Option[string]) -> Option[UnRw]
+        if kind == Full then return None
+
+        val lw = self.push(d, left)?
+        val both = kind == Right || un_mentions(right, d.keys)
+        val rw = if both then self.push(d, right)? else self.rel(right)
+        val o = self.cold(on, un_subst_of(d.keys, lw.dref))
+        val cond = if both then Some(un_and_opt(o, un_keys_on(lw.dref, rw.dref))) else o
+        val dref = if kind == Right then rw.dref else lw.dref
+        Some(un_joined(Join(kind, lw.rel, rw.rel, cond, mark, b), kind, lw, rw, mark, b, dref))
+
+    /** An `Aggregate` under a domain groups by the domain columns first. Without keys it must still emit
+     * one row for every domain row, also one whose group is empty (the count bug): the domain is
+     * left-joined to its input, and each call sees only the rows that came from the input.
+     */
+    push_aggregate(*self, d: UnDomain, input: Rel, b: string, keys: Buf[Item], aggs: Buf[NamedAgg], elem: Type) -> Option[UnRw]
+        val i = self.push(d, input)?
+
+        if contains(self.rows.view(), b) then return None
+
+        var l = self.lifter(i, true)
+        val m = un_subst_of(d.keys, i.dref)
+        val ks = self.items(keys, m, &l, true)
+        val (w, mc) = (self.fresh(), self.fresh())
+        val present = if keys.len() == 0 then Some(un_present(w, mc)) else None
+        val cs = self.aggs(aggs, m, &l, present)
+        val f = self.finish(l)
+        val (src, from) = self.grouped(d, f, keys.len() == 0, w, mc)
+        val (dk, reads) = self.domain_keys(from, b)
+        dk.extend(ks.view())
+        Some(UnRw(Aggregate(src, b, dk, cs), un_one(b, un_cols(elem)), items_of([b]), false, reads, None, false, items_of([b])))
+
+    /** A `Nest` under a domain, the `Aggregate` §6.14 rule 1 says it equals where it has no keys. */
+    push_nest(*self, d: UnDomain, input: Rel, b: string, keys: Buf[Item], name: string, items: Buf[Item], order: Buf[SortKey], elem: Type) -> Option[UnRw]
+        val i = self.push(d, input)?
+
+        if contains(self.rows.view(), b) then return None
+
+        var l = self.lifter(i, true)
+        val m = un_subst_of(d.keys, i.dref)
+        val ks = self.items(keys, m, &l, true)
+        val xs = buf[Item]()
+        // Behind the count bug's left join, each item at its original type.
+        val strict = buf[Item]()
+
+        for x in items
+            val t = self.types[self.at]
+            val e = self.expr(x.expr, m, &l, true)
+            xs.push(Item(x.name, e))
+            strict.push(Item(x.name, un_strict(e, t)))
+
+        val os = self.keys(order, m, &l, true)
+        val f = self.finish(l)
+        val (w, mc) = (self.fresh(), self.fresh())
+        val (src, from) = self.grouped(d, f, keys.len() == 0, w, mc)
+        val (dk, reads) = self.domain_keys(from, b)
+        val out = un_one(b, un_cols(elem))
+
+        if keys.len() > 0
+            dk.extend(ks.view())
+            return Some(UnRw(Nest(src, b, dk, name, xs, os), out, items_of([b]), false, reads, None, false, items_of([b])))
+
+        val collect = AggCall("collect", items_of([Record(strict)]), false, Some(un_present(w, mc)), os)
+        Some(UnRw(Aggregate(src, b, dk, items_of([NamedAgg(name, collect)])), out, items_of([b]), false, reads, None, false, items_of([b])))
+    end push_nest
+
+    /** The input a grouping under `d` reads, in its order, and where it reads the domain columns: `f`
+     * itself, or, for a grouping with no keys, a fresh domain left-joined to `f` marked by `w.mc`.
+     */
+    grouped(*self, d: UnDomain, f: UnRw, keyless: bool, w: string, mc: string) -> (Rel, Buf[Expr])
+        if !keyless then return (un_sorted(f), f.dref)
+
+        val (dr, _, dref) = self.instance(d)
+        val j = Join(Left, dr, un_marked(f.rel, w, mc), Some(un_keys_on(dref, f.dref)), None, None)
+
+        val src = f.order match
+            Some(ks) -> Sort(j, ks)
+            None -> j
+
+        (src, dref)
+
+    /** The domain columns `from` as grouping keys under fresh names, and how `b` reads them. */
+    domain_keys(*self, from: Buf[Expr], b: string) -> (Buf[Item], Buf[Expr])
+        val ks = buf[Item]()
+        val reads = buf[Expr]()
+
+        for x in from
+            val c = self.fresh()
+            ks.push(Item(c, x))
+            reads.push(Col(b, c))
+
+        (ks, reads)
+end Unnester
+
+/** `w`'s relation in its order, where it has one to restore: what an operator that reads its input in
+ * order (a window, a first row, a float sum) is given.
+ */
+private un_sorted(w: UnRw) -> Rel = w.order match
+    Some(ks) -> if ks.len() > 0 then Sort(w.rel, ks) else w.rel
+    None -> w.rel
+
+/** `w` with its relation replaced by `r`, which passes its binders through. */
+private un_over(w: UnRw, r: Rel) -> UnRw = UnRw(r, w.orig, w.names, w.list, w.dref, w.order, w.positional, w.polluted)
+
+/** A join of `l` and `r` of `kind`, as it exposes them (§6.5 rules 3–5), reading the domain at `dref`. */
+private un_joined(rel: Rel, kind: JoinKind, l: UnRw, r: UnRw, mark: Option[string], b: Option[string], dref: Buf[Expr]) -> UnRw = kind match
+    Semi | Anti -> UnRw(rel, l.orig, l.names, false, dref, None, l.positional, l.polluted)
+    MarkJoin ->
+        val n = b.unwrap()
+        UnRw(rel, un_plus(l.orig, UnBind(n, items_of([Field(mark.unwrap(), Bool)]))), un_plus(l.names, n), false, dref, None, l.positional, l.polluted)
+    _ -> UnRw(rel, un_cat(l.orig, r.orig), un_cat(l.names, r.names), false, dref, None, l.positional || r.positional, un_cat(l.polluted, r.polluted))
