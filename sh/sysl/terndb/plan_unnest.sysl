@@ -1006,9 +1006,17 @@ private struct Unnester
                 val orig = un_plus(f.orig, UnBind(b, un_tail(elem, un_width(f.orig))))
                 UnRw(Unnest(f.rel, b, v, outer, ordinality), orig, un_plus(f.names, b), false, none, None, f.positional, f.polluted)
             _ ->
-                // SetOp, With and CteRef, which the executor does not run, are left as they are.
+                // SetOp, With and CteRef are left as they are, with what correlation they hold.
                 self.at = start
                 self.skip(r)
+
+                if correlated_nodes(r) > 0 then self.fallbacks.push("an Apply or subquery inside a SetOp, With or CteRef")
+
+                r match
+                    SetOp(_, _, b, _) -> return UnRw(r, un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+                    CteRef(_, b) -> return UnRw(r, un_one(b, un_cols(elem)), items_of([b]), list, none, None, false, unchanged)
+                    _ -> ()
+
                 UnRw(r, buf[UnBind](), buf[string](), list, none, None, false, unchanged)
     end rel
 

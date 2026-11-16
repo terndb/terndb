@@ -93,7 +93,8 @@ statement is still unnested around it.
    domain: the domain's columns would change the row.
 6. A `Distinct` over an input whose rewrite exposes a row number (a list numbered to keep its order),
    which would make every row distinct.
-7. `SetOp`, `With` and `CteRef`, which the executor does not run.
+7. Anything inside a `SetOp`, `With` or `CteRef`, which the rewrite does not enter; one under a domain
+   keeps the whole correlated side per row.
 
 A kept `Apply` still has its left input unnested and its right input rewritten where that leaves its
 output unchanged; a kept subquery likewise.
