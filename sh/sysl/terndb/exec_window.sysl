@@ -21,13 +21,16 @@ struct TFrame
     end: TBound
     exclude: FrameExclude
 
-/** A window call with its expressions typed (§6.8). */
+/** A window call with its expressions typed (§6.8). A call is no node of its own, so `node` is its
+ * `Window`'s: the node a runtime error of the call itself names, where no expression of it does.
+ */
 struct TWin
     function: string
     args: Buf[TExpr]
     partition: Buf[TExpr]
     order: Buf[TKey]
     frame: Option[TFrame]
+    node: u64
 
 /** The frame of a call that gives none (§6.8 rule 4). */
 private default_frame() -> TFrame =
@@ -132,7 +135,10 @@ impl Operator for WindowOp
             val cs = buf[ColumnVector]()
 
             for j in 0..<self.items.len()
-                cs.push(window_column(self.items[j], wfs[j].ty, env)?)
+                val w = self.items[j]
+                cs.push(window_column(w, wfs[j].ty, env) match
+                    Ok(c) -> c
+                    Err(e) -> return Err(e.at_node(w.node)))
 
             val parts = parts_of(self.binder, all)
             val members = buf[ColumnVector]()
@@ -210,7 +216,7 @@ private offset_column(w: TWin, ty: Type, lay: Layout, env: Env) -> Result[Column
         val r = lay.rows[k]
         val step = steps.map(s -> s[r]).unwrap_or(1)
 
-        if step < 0 then return fail("R0006", s"the offset of '${w.function}' is negative")
+        if step < 0 then return fail_at(w.args[1].node, "R0006", s"the offset of '${w.function}' is negative")
 
         val t = if w.function == "lag" then i128(k) - step else i128(k) + step
         at[r] = if t >= i128(lay.part_lo[k]) && t < i128(lay.part_hi[k]) then lay.rows[usize(t)] else n + r
@@ -250,7 +256,8 @@ private enum Point
     AtReal(b: real)
     AtMicros(b: i64)
 
-private negative_offset[T]() -> Result[T, CodecError] = fail("R0006", "a frame offset is null or negative")
+/** The error of frame offset `x`, which is null or negative. */
+private negative_offset[T](x: TExpr) -> Result[T, CodecError] = fail_at(x.node, "R0006", "a frame offset is null or negative")
 
 /** Bound `b`'s offset, evaluated once with no rows in sight, in the terms of `unit` and of the
  * `range` key `key`.
@@ -262,27 +269,27 @@ private reach_of(b: TBound, unit: FrameUnit, key: Option[KeyOrder], ctx: Ctx) ->
 
     val raw = eval(e, rows_env(ctx, 1))?
 
-    if !raw.is_valid(0) then return negative_offset()
+    if !raw.is_valid(0) then return negative_offset(e)
 
     if unit != Range
         val n = wide_of(raw.lanes)[0]
-        return if n < 0 then negative_offset() else Ok(Count(n))
+        return if n < 0 then negative_offset(e) else Ok(Count(n))
 
     val kt = key.unwrap().v.ty.base()
 
     raw.lanes match
         Intervals(x) ->
             val iv = x[0]
-            if iv.months < 0 || iv.days < 0 || iv.micros < 0 then negative_offset() else Ok(Span(iv))
+            if iv.months < 0 || iv.days < 0 || iv.micros < 0 then negative_offset(e) else Ok(Span(iv))
         _ ->
             val v = coerce_vector(raw, kt)?
 
             if kt == Float32 || kt == Float64
                 val k = reals_of(v.lanes)[0]
-                return if k.is_nan() || k < 0.0 then negative_offset() else Ok(Approx(k))
+                return if k.is_nan() || k < 0.0 then negative_offset(e) else Ok(Approx(k))
 
             val k = wide_of(v.lanes)[0]
-            if k < 0 then negative_offset() else Ok(Exact(i256(k)))
+            if k < 0 then negative_offset(e) else Ok(Exact(i256(k)))
 end reach_of
 
 private key_lane(v: ColumnVector) -> KeyLane = v.lanes match

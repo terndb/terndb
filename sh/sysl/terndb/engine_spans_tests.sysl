@@ -146,10 +146,119 @@ a_malformed_span_is_refused_at_its_own_path_with_no_span()
     assert_eq(e.path, "/spans/1")
     assert(e.span.is_none(), "no span")
 
+// -- runtime errors (§8.1 rule 2): the node whose evaluation failed ---------------------------------
+
+/** The primary entry executing `env` (spanned) with parameters `values` gives, which must be `code`
+ * at `path`, carrying that node's span.
+ */
+sp_runtime(env: Envelope, values: []const Value, code: string, path: string)
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env), values)))).entries[0]
+    assert_eq(e.code, code)
+    assert_eq(e.path, path)
+    assert(e.span == sp_span_of(env, path), s"the span of $path")
+
+/** `sum(v)` over the `int128` rows `vs`, then `s` projected from it. */
+sp_sum_of(arg: Expr, vs: []const i128) -> Envelope
+    val rows = buf[Buf[Expr]]()
+    for v in vs
+        rows.push(items_of([Literal(Int128, Int(v))]))
+
+    val values = Values("v", items_of([Field("v", Int128)]), rows)
+    val agg = Aggregate(values, "a", buf[Item](), items_of([NamedAgg("s", AggCall("sum", items_of([arg]), false, None, buf[SortKey]()))]))
+    query([], project(agg, "r", [item("s", col("a", "s"))]))
+
+val sp_max: i128 = 170141183460469231731687303715884105727
+
 @test
-a_runtime_error_of_a_spanned_statement_names_no_node_and_carries_no_span()
+a_division_by_zero_deep_in_an_expression_names_the_inner_call()
+    val inner = call("div", [col("u", "id"), ew_lit(0)])
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", call("add", [ew_lit(1), call("mul", [ew_lit(2), inner])]))]))
+    sp_runtime(env, [], "R0002", "/statement/rel/items/0/1/args/1/args/1")
+
+@test
+an_overflow_in_an_aggregate_names_the_aggregate()
+    // The call is no node of its own, so the sum's overflow is its `Aggregate`'s.
+    sp_runtime(sp_sum_of(col("v", "v"), [sp_max, 1]), [], "R0001", "/statement/rel/input")
+
+@test
+an_overflow_in_an_aggregates_argument_names_the_argument()
+    val arg = call("mul", [col("v", "v"), Literal(Int128, Int(2))])
+    sp_runtime(sp_sum_of(arg, [sp_max]), [], "R0001", "/statement/rel/input/aggs/0/1/args/0")
+
+@test
+a_runtime_error_inside_a_subquery_names_its_node_inside_the_subquery()
+    // In an `If` arm the subquery is evaluated per row, in the tree the client sent (§6.6 rule 2).
+    val sub = project(filter(scan("app", "posts", "p"), eq(call("div", [col("p", "id"), ew_lit(0)]), ew_lit(1))), "s", [item("t", col("p", "id"))])
+    val x = If(items_of([IfArm(eq(col("u", "id"), ew_lit(1)), Scalar(sub))]), None)
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", x)]))
+    sp_runtime(env, [], "R0002", "/statement/rel/items/0/1/arms/0/value/rel/input/predicate/args/0")
+
+@test
+a_negative_frame_offset_names_the_offset()
+    val frame = Frame(Rows, Bound(Preceding, Some(ew_lit(-1))), Bound(CurrentRow, None), ExcludeNone)
+    val w = NamedWin("n", WinCall("count", buf[Expr](), buf[Expr](), items_of([SortKey(col("u", "id"), false, false)]), Some(frame)))
+    val env = query([], Window(scan("app", "users", "u"), "w", items_of([w])))
+    sp_runtime(env, [], "R0006", "/statement/rel/items/0/1/frame/start/offset")
+
+@test
+a_negative_lag_offset_names_the_offset_argument()
+    val w = NamedWin("x", WinCall("lag", items_of([col("u", "id"), ew_lit(-1)]), buf[Expr](), items_of([SortKey(col("u", "id"), false, false)]), None))
+    val env = query([], Window(scan("app", "users", "u"), "w", items_of([w])))
+    sp_runtime(env, [], "R0006", "/statement/rel/items/0/1/args/1")
+
+@test
+a_negative_limit_count_names_the_count()
+    val sorted = Sort(scan("app", "users", "u"), items_of([SortKey(col("u", "id"), false, false)]))
+    val env = query([ParamDecl(Some("n"), Int64)], Limit(sorted, Some(Param(0)), None, false, false))
+    sp_runtime(env, [Int(-1)], "R0006", "/statement/rel/count")
+
+@test
+a_runtime_error_in_an_update_names_its_node()
+    val env = envelope([], Update(cat_q("users"), "u", None, None, Some(eq(col("u", "id"), ew_lit(1))), items_of([item("id", call("div", [col("u", "id"), ew_lit(0)]))]), buf[Item]()))
+    sp_runtime(env, [], "R0002", "/statement/set/0/1")
+
+@test
+a_runtime_error_inside_an_explicit_transaction_carries_its_span()
     val env = query([], project(scan("app", "users", "u"), "r", [item("x", call("div", [col("u", "id"), ew_lit(0)]))]))
     var d = ew_duo(ew_blog())
-    val e = ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env))))).entries[0]
-    assert(e.code.starts_with("R"), s"a runtime code: ${e.code}")
-    assert(e.span == (if e.path.len == 0 then None else sp_span_of(env, e.path)), "a span only with a node's path")
+    assert_eq(ew_kinds(d.seen(d.send(Begin(1, no_txn_options())))), "begun")
+    val err = ew_error(d.seen(d.send(ew_exec(1, sp_spanned(env)))))
+    assert_eq(err.entries[0].code, "R0002")
+    assert_eq(err.entries[0].path, "/statement/rel/items/0/1")
+    assert(err.entries[0].span == sp_span_of(env, "/statement/rel/items/0/1"), "the call's span")
+    assert(err.txn_state == Aborted, "aborted")
+
+@test
+a_runtime_error_without_spans_names_its_node_and_carries_no_span()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", call("div", [col("u", "id"), ew_lit(0)]))]))
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, env)))).entries[0]
+    assert_eq(e.code, "R0002")
+    assert_eq(e.path, "/statement/rel/items/0/1")
+    assert(e.span.is_none(), "no spans, no span")
+
+@test
+a_runtime_error_of_a_node_without_a_span_of_its_own_carries_none()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", call("div", [col("u", "id"), ew_lit(0)]))]))
+    var only_root = env
+    only_root.spans = Some(items_of([Span(0, 0, 40), Span(1, 0, 40)]))
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, only_root)))).entries[0]
+    assert_eq(e.code, "R0002")
+    assert_eq(e.path, "/statement/rel/items/0/1")
+    assert(e.span.is_none(), "an ancestor's span does not stand in")
+
+@test
+a_runtime_error_of_an_unnested_subquery_carries_a_span_only_with_a_path()
+    // Unnesting plans a tree the client did not send; its nodes name none of the client's, so an
+    // error never names a node of the rewritten tree as if it were the client's.
+    val correlated = filter(scan("app", "posts", "p"), eq(col("p", "author_id"), call("div", [col("u", "id"), ew_lit(0)])))
+    val uncorrelated = filter(scan("app", "posts", "p"), eq(call("div", [col("p", "id"), ew_lit(0)]), ew_lit(1)))
+
+    for sub in [correlated, uncorrelated]
+        val env = query([], Filter(scan("app", "users", "u"), Exists(sub)))
+        var d = ew_duo(ew_blog())
+        val e = ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env))))).entries[0]
+        assert_eq(e.code, "R0002")
+        assert(e.span == (if e.path.len == 0 then None else sp_span_of(env, e.path)), "a span only with a node's path")

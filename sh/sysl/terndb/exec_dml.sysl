@@ -36,7 +36,7 @@ private run_in(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, 
 
     env.statement match
         // Correlation is unnested before planning (`query-tree.md` §6.6 rule 2), as `run_query` does.
-        Query(_) -> run_unnested(unnest_plan(env, typing, s.catalog, ctx.params), s, t, ctx)
+        Query(_) -> run_unnested(env, unnest_plan(env, typing, s.catalog, ctx.params), s, t, ctx)
         Insert(table, binder, old, columns, source, on_conflict, returning) ->
             run_insert(s, t, ctx, typing, table, binder, old, columns, source, on_conflict, returning)
         Update(table, binder, old, from, filter, set, returning) ->
@@ -46,8 +46,8 @@ private run_in(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, 
         _ -> panic("the executor runs no DDL statement")
 end run_in
 
-/** The query of `plan` run over the store, its scans logging what they read. */
-private run_unnested(plan: UnnestPlan, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
+/** The query of `plan`, made of `env`'s, run over the store, its scans logging what they read. */
+private run_unnested(env: Envelope, plan: UnnestPlan, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
     val r = plan.env.statement match
         Query(q) -> q
         _ -> panic("unnesting keeps a query a query")
@@ -55,7 +55,13 @@ private run_unnested(plan: UnnestPlan, s: &Store, t: &Txn, ctx: Ctx) -> Result[E
     var u = no_uses()
     u.add_rel(r, true)
     var p = Planner(plan.typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), buf[CteFrame](), Some(u.db(s, t)), None)
-    ran(plan.typing.result, drain(flat_input(p.rel(r)))?)
+
+    // A rewritten tree's nodes are not the ones the client sent, so its runtime errors name none.
+    val rows = drain(flat_input(p.rel(r))) match
+        Ok(rows) -> rows
+        Err(e) -> return Err(if plan.env.statement != env.statement then e.nodeless() else e)
+
+    ran(plan.typing.result, rows)
 
 /** A statement that ran and returned `rows` as its result of type `result`, or nothing. */
 private ran(result: Option[Type], rows: Buf[ColumnVector]) -> Result[Executed, CodecError]

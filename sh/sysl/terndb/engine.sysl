@@ -239,7 +239,7 @@ struct Engine
     private aborting(*self, t: Option[&Txn], f: Failure) -> Failure
         t match
             Some(x) ->
-                val _ = self.store.abort_with(x, CodecError(f.entries[0].code, "", f.entries[0].message, buf()))
+                val _ = self.store.abort_with(x, CodecError(f.entries[0].code, "", f.entries[0].message, buf(), 0))
                 Failure(f.entries, Some(x.id), f.tuple)
             None -> f
 
@@ -290,7 +290,7 @@ struct EngineConn
 
         self.drop(r.cursor)
         val tuple = if r.params.tuples.len() > 1 then Some(u64(r.tuple)) else None
-        val e = CodecError("T1003", "", s"waited $waited ms for a lock transaction ${r.holder} holds", buf())
+        val e = CodecError("T1003", "", s"waited $waited ms for a lock transaction ${r.holder} holds", buf(), 0)
         Err(failure_in(self.engine.store.abort_with(r.txn, e), r.txn, tuple))
 
     /** Runs `r`'s next tuple, answering the holder of the row lock it is parked on, if it must wait.
@@ -324,7 +324,7 @@ struct EngineConn
                         Ok(b) -> b
                         Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
                     r.at = 0
-                Err(e) -> return Err(failure_in(e, r.txn, tuple))
+                Err(e) -> return Err(failure_in(located(r.env, e), r.txn, tuple))
 
         r.tuple += 1
         Ok(None)
@@ -360,13 +360,12 @@ impl Executor for EngineConn
         explicit match
             Some(x) ->
                 store.statement(x)
-                val seen = read_envelope(s.envelope.view()) match
-                    Ok(env) -> store.check_reads(x, env)
-                    Err(_) -> Ok(())
-
-                seen match
-                    Ok(_) -> ()
-                    Err(e) -> return Err(self.engine.aborting(explicit, failure_of(e)))
+                read_envelope(s.envelope.view()) match
+                    Ok(env) ->
+                        store.check_reads(x, env) match
+                            Ok(_) -> ()
+                            Err(e) -> return Err(self.engine.aborting(explicit, spanned(env, failure_of(e))))
+                    Err(_) -> ()
 
                 store.enter(x) match
                     Ok(_) -> ()
@@ -441,7 +440,7 @@ impl Executor for EngineConn
                 if r.implicit
                     val _ = self.engine.store.abort(r.txn)
                 else
-                    val _ = self.engine.store.abort_with(r.txn, CodecError("T1007", "", "the statement was cancelled", buf()))
+                    val _ = self.engine.store.abort_with(r.txn, CodecError("T1007", "", "the statement was cancelled", buf(), 0))
             None -> ()
 
     commit(*self, txid: u64) -> Result[Option[u64], Failure]
@@ -492,6 +491,17 @@ private spanned(env: Envelope, f: Failure) -> Failure
         val span = if e.span.is_some() then e.span else span_at(paths, spans, e.path)
         entries.push(ErrorEntry(e.code, e.message, e.path, e.details, span))
     Failure(entries, f.txid, f.tuple)
+
+/** `e` at the path of the node of `env` it names (`CodecError.node`), when it names one and has no
+ * path yet: the path a runtime error gives (`wire-protocol.md` §8.1 rule 2), which `spanned` then
+ * gives a span. The paths are walked only here, when a statement has failed.
+ */
+private located(env: Envelope, e: CodecError) -> CodecError
+    if e.node < FirstNode || e.path.len > 0 then return e
+
+    val paths = node_paths(env)
+    val i = usize(e.node - FirstNode)
+    if i < paths.len() then e.at(paths[i]) else e
 
 /** The range of the span `spans` gives the node whose path is `at` among `paths` (by span index). */
 private span_at(paths: Buf[string], spans: Buf[Span], at: string) -> Option[SourceRange]

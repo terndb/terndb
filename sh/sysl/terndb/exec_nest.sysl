@@ -168,7 +168,7 @@ private[terndb] plan_nest(inner: Lowered, binder: string, elem: Type, keys: Buf[
         _ -> panic("a Nest's last column is a relation")
 
     val row: Expr = Record(items)
-    val call = TAgg("collect", items_of([TExpr(row, nested, xs, None)]), false, None, order)
+    val call = TAgg("collect", items_of([TExpr(row, nested, xs, None, 0)]), false, None, order, 0)
     Lowered(AggregateOp(inner.op, inner.binder, inner.elem, elem, keys, items_of([call]), ctx, None), binder, elem, buf[TKey]())
 
 // -- Unnest, §6.14 rule 2 -------------------------------------------------------------------------

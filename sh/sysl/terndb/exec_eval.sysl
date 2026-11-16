@@ -9,13 +9,15 @@ import sysl.buf.{Buf, buf}
  * checker walks them (`Typing.nodes`): a call's arguments; a cast's, a field's or a variant's operand;
  * an `If`'s conditions and values in turn, then its `else`; a `Match`'s scrutinee, its arms, then its
  * `else`; a record's fields; an `In`'s values. A subquery expression's `rel` is `sub`, planned per
- * row (`exec_nest.sysl`).
+ * row (`exec_nest.sysl`). `node` is the expression's pre-order index in the planned tree, which a
+ * runtime error it raises names (`CodecError.node`), or 0 for one the executor made up itself.
  */
 struct TExpr
     e: Expr
     ty: Type
     kids: Buf[TExpr]
     sub: Option[SubPlan]
+    node: u64
 
 /** What every expression of one execution reads: the parameter values (§10.1), each of its declared
  * type, the statement's timestamp (§7.12), in microseconds since the Unix epoch, and the sequences
@@ -80,8 +82,12 @@ env_of(ctx: Ctx, name: string, rows: ColumnVector) -> Env
 /** An environment of `n` rows and no binders: what a `Values` row and a `Limit` count see. */
 rows_env(ctx: Ctx, n: usize) -> Env = Env(n, buf[Binder](), ctx)
 
-/** `x` over the rows of `env`. */
-eval(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
+/** `x` over the rows of `env`. A runtime error names the innermost node that raised it. */
+eval(x: TExpr, env: Env) -> Result[ColumnVector, CodecError] = eval_node(x, env) match
+    Ok(v) -> Ok(v)
+    Err(e) -> Err(e.at_node(x.node))
+
+private eval_node(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
     val n = env.n
 
     x.e match
@@ -121,7 +127,7 @@ eval(x: TExpr, env: Env) -> Result[ColumnVector, CodecError]
             Ok(ColumnVector(x.ty, n, buf[u8](), Tags(tags, offsets, cs)))
         Relation(_) | Scalar(_) | Exists(_) | In(_, _) -> eval_subquery(x, env)
         _ -> panic("eval: the executor does not evaluate this expression")
-end eval
+end eval_node
 
 private[terndb] fields_of_type(t: Type) -> Buf[Field] = t.base() match
     Record(fs) | Union(fs) -> fs
