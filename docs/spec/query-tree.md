@@ -419,6 +419,10 @@ rows (§10.4).
    hashing on the `eq` conjuncts) never forms the pairs whose keys differ.*
 9. `single` raises `R0003` once a second right row makes `on` `true` for one left row; which of a
    statement's runtime errors is raised first, when there are several, is not specified.
+10. An `inner` or `semi` join whose right input is empty MAY leave its left input unevaluated, and a
+    runtime error the left input would raise then does not occur. *Rationale: neither can emit a row;
+    an unnested `Apply` joins its correlated side to the outer side's bindings this way round, so that
+    over an empty outer side the correlated side raises nothing (§6.6 rule 4).*
 
 ### 6.6 Apply (correlated source form)
 

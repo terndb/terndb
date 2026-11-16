@@ -1,0 +1,30 @@
+module sh.sysl.terndb
+@tests
+
+// A query run over the store is unnested before it is planned (`query-tree.md` §6.6 rule 2): its
+// correlated subquery is read once for all outer rows, not once per row, which shows in the reads
+// a serializable transaction logs. Fixtures are `exec_scan_tests.sysl`'s.
+
+/** `select a.id, (select b.note from acct b where b.id = a.id) from acct a` in a serializable
+ * transaction over `n` accounts: the rows it returns and the reads it logged.
+ */
+xu_correlated(n: i128) -> (usize, usize)
+    val s = xd_store()
+
+    for id in 1..n
+        xd_put(s, id, 10)
+
+    val inner = project(filter(scan("app", "acct", "b"), call("eq", [col("b", "id"), col("a", "id")])), "q",
+        [item("note", col("b", "note"))])
+    val read = query([], project(scan("app", "acct", "a"), "r", [item("id", col("a", "id")), item("notes", Relation(inner))]))
+    val t = s.begin(Serializable)
+    val rows = xd_rows(xd_ran(s, t, read)).len()
+    (rows, s.logged(t))
+
+@test
+a_correlated_subquery_over_the_store_is_read_once_not_once_per_outer_row()
+    val (few_rows, few_reads) = xu_correlated(2)
+    val (many_rows, many_reads) = xu_correlated(6)
+    assert_eq(few_rows, 2)
+    assert_eq(many_rows, 6)
+    assert_eq(many_reads, few_reads, "the reads logged do not grow with the outer rows")

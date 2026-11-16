@@ -1,0 +1,435 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The engine behind the server sessions (`docs/design/engine.md`): one in-memory database, a
+// `MemCatalog` and the MVCC `Store` that holds it, shared by every connection of a server, and an
+// `EngineConn` per connection that a `ServerSession` drives as its `Executor`. A statement is
+// validated when it starts — decoded, structurally checked and type-checked against the catalog, its
+// parameters decoded by their declared types — and run when its first batch is asked for: a query or
+// DML statement through `run_statement`, a DDL statement through `MemCatalog.apply`. A statement that
+// must wait for another transaction's row lock is parked, answering `NotYet`, and run again once the
+// holder has ended (`wire-protocol.md` §7.5).
+
+/** A transaction that committed through the engine, and its commit number, absent when its write
+ * set was empty (`wire-protocol.md` §5.4 rule 1).
+ */
+private struct Ended
+    txid: u64
+    commit: Option[u64]
+
+/** A statement in a role's plan cache (`wire-protocol.md` §4.4 rule 5): the tree of shape `shape`, the
+ * catalog version it was last validated against, and its result type then.
+ */
+private struct Cached
+    role: string
+    shape: [32]u8
+    envelope: Buf[u8]
+    catalog_version: u64
+    result: Option[Type]
+
+/** The most statements a server keeps in its plan cache; the oldest is evicted first. */
+const PlanCacheSize: usize = 256
+
+/** What validation makes of a tree envelope: the statement, its shape digest and its result type. */
+private struct Checked
+    env: Envelope
+    shape: [32]u8
+    result: Option[Type]
+
+/** A started statement: its transaction (its own when `implicit`), the statement and its bound
+ * parameter tuples, the next tuple to run, the row count of each tuple run so far, the batches of
+ * the last tuple run and how many of them are handed out, and the transaction whose row lock it is
+ * parked on (0 for none).
+ */
+private struct Running
+    cursor: u64
+    txn: &Txn
+    implicit: bool
+    env: Envelope
+    params: Params
+    options: ExecOptions
+    result: Option[Type]
+    tuple: usize
+    counts: Buf[u64]
+    ready: Buf[Buf[u8]]
+    at: usize
+    holder: u64
+
+/** The database a server serves: its store (which holds the catalog), the statement time `now()`
+ * answers, in microseconds since the epoch, which the server sets, the explicit transactions open on
+ * any connection, the commits made through it, and the plan cache.
+ */
+struct Engine
+    store: &Store
+    now: i64
+    private next_cursor: u64
+    private open: Buf[&Txn]
+    private ended: Buf[Ended]
+    private cache: Buf[Cached]
+
+    /** A connection of role `role`, as a server session drives it. */
+    connect(&self, role: string) -> &EngineConn = EngineConn(self, role, buf())
+
+    /** The catalog version now. */
+    catalog_version(self) -> u64 = self.store.catalog.version
+
+    /** `bytes` validated against the catalog as `role` (§4.4 rule 1). A validation error carries every
+     * error of the first phase that has one ([QT] §11.2).
+     */
+    private validate(self, bytes: []const u8, role: string) -> Result[Checked, Failure]
+        val env = read_envelope(bytes) match
+            Ok(e) -> e
+            Err(e) -> return Err(failure_of(e))
+
+        val structural = check_errors(env)
+        if structural.len() > 0 then return Err(failure_all(structural))
+
+        var result: Option[Type] = None
+
+        if is_ddl(env.statement)
+            // A DDL statement's names, types and structure are checked by applying it to a copy.
+            var trial = self.store.catalog.clone()
+            trial.apply(env, role) match
+                Ok(_) -> ()
+                Err(e) -> return Err(failure_of(e))
+        else
+            val typed = type_errors(env, self.store.catalog)
+            if typed.len() > 0 then return Err(failure_all(typed))
+            result = type_envelope(env, self.store.catalog) match
+                Ok(t) -> t.result
+                Err(e) -> return Err(failure_of(e))
+
+        shape_digest(env) match
+            Ok(shape) -> Ok(Checked(env, shape, result))
+            Err(e) -> Err(failure_of(e))
+
+    /** Keeps a validated statement in `role`'s plan cache; a DDL statement is not kept (`ddl.md` §3.1
+     * rule 6).
+     */
+    private remember(*self, role: string, c: Checked, envelope: Buf[u8])
+        if is_ddl(c.env.statement) then return
+
+        for i in 0..<self.cache.len()
+            if self.cache[i].role == role && self.cache[i].shape == c.shape
+                self.cache[i] = Cached(role, c.shape, envelope.copy(), self.catalog_version(), c.result)
+                return
+
+        if self.cache.len() == PlanCacheSize then self.cache.remove(0)
+        self.cache.push(Cached(role, c.shape, envelope.copy(), self.catalog_version(), c.result))
+
+    /** The tree of shape `shape` in `role`'s plan cache. One validated against an older catalog is
+     * validated again, and dropped if it now fails or its result type changed (§4.4 rule 6).
+     */
+    private cached(*self, role: string, shape: [32]u8) -> Option[Buf[u8]]
+        for i in 0..<self.cache.len()
+            val k = self.cache[i]
+            if k.role == role && k.shape == shape
+                if k.catalog_version == self.catalog_version() then return Some(k.envelope.copy())
+
+                self.validate(k.envelope.view(), role) match
+                    Ok(c) ->
+                        if c.result == k.result
+                            self.cache[i] = Cached(role, shape, k.envelope, self.catalog_version(), k.result)
+                            return Some(k.envelope.copy())
+                    Err(_) -> ()
+
+                self.cache.remove(i)
+                return None
+
+        None
+
+    /** A transaction with `options`, already filled from the connection's defaults; the server's
+     * defaults are serializable and not read-only (§5.2 rule 2). On a primary every `after` this
+     * server acknowledged is within its horizon, so a larger one names a commit it never made
+     * (`token_not_in_history`).
+     */
+    private begin(*self, options: TxnOptions) -> Result[&Txn, Failure]
+        val after = options.after.unwrap_or(0)
+        if after > self.store.horizon then
+            return Err(failure("T2003", s"commit $after is not in this server's history"))
+
+        Ok(self.store.begin(options.isolation.unwrap_or(Serializable), options.read_only.unwrap_or(false)))
+
+    /** The open explicit transaction `txid`. */
+    private explicit(self, txid: u64) -> Result[&Txn, Failure]
+        for t in self.open
+            if t.id == txid then return Ok(t)
+
+        Err(failure("W2001", s"no transaction $txid is open"))
+
+    private close(*self, txid: u64)
+        val left = buf[&Txn]()
+        for t in self.open
+            if t.id != txid then left.push(t)
+        self.open = left
+
+    /** Whether transaction `txid` is live: a parked statement waits while its holder is. */
+    private is_live(self, txid: u64) -> bool
+        for t in self.store.active
+            if t.id == txid then return true
+
+        false
+
+    /** Commits `t`, answering its commit number, absent for an empty write set. */
+    private commit(*self, t: &Txn) -> Result[Option[u64], Failure]
+        val wrote = t.writes.len() > 0
+
+        self.store.commit(t) match
+            Ok(c) ->
+                val commit = if wrote then Some(c) else None
+                self.ended.push(Ended(t.id, commit))
+                Ok(commit)
+            Err(e) -> Err(failure_in(e, t, None))
+
+    /** `f`, which happened in explicit transaction `t` if there is one, which it aborts (§5.3 rule 1). */
+    private aborting(*self, t: Option[&Txn], f: Failure) -> Failure
+        t match
+            Some(x) ->
+                val _ = self.store.abort_with(x, CodecError(f.entries[0].code, "", f.entries[0].message, buf()))
+                Failure(f.entries, Some(x.id), f.tuple)
+            None -> f
+
+    /** DDL statement `env` applied as `role` in `t`. It changes the catalog at once and the store's
+     * tables with it: the catalog is not yet versioned under MVCC (`docs/design/engine.md`).
+     */
+    private apply(*self, t: &Txn, env: Envelope, role: string) -> Result[unit, CodecError]
+        self.store.usable(t)?
+        if t.read_only then return fail("T4001", "a DDL statement in a read-only transaction")
+        self.store.catalog.apply(env, role)?
+
+        // The rows of a dropped table go with it.
+        val kept = buf[&TableData]()
+        for d in self.store.tables
+            if self.store.catalog.table_by_oid(d.oid).is_some() then kept.push(d)
+        self.store.tables = kept
+
+        Ok(())
+
+    private status(self, txid: u64) -> Outcome
+        for e in self.ended
+            if e.txid == txid then return Outcome(Committed, e.commit)
+
+        // Every transaction not live and not committed was aborted ([ISO] §5.4).
+        if self.is_live(txid) then Outcome(InProgress, None) else Outcome(Aborted, None)
+end Engine
+
+/** An engine over a database whose catalog is `catalog` and which holds no rows yet. */
+engine(catalog: MemCatalog, now: i64) -> &Engine = Engine(mem_store(catalog), now, 1, buf(), buf(), buf())
+
+/** One connection to an engine, of role `role`: the `Executor` its server session drives. */
+struct EngineConn
+    engine: &Engine
+    role: string
+    private running: Buf[&Running]
+
+    private find(self, cursor: u64) -> Option[&Running]
+        for r in self.running
+            if r.cursor == cursor then return Some(r)
+
+        None
+
+    private drop(*self, cursor: u64)
+        val left = buf[&Running]()
+        for r in self.running
+            if r.cursor != cursor then left.push(r)
+        self.running = left
+
+    /** Runs `r`'s next tuple, answering the holder of the row lock it is parked on, if it must wait.
+     * A failure aborts its transaction (§5.3 rule 1; an implicit one is rolled back).
+     */
+    private run_tuple(*self, r: &Running) -> Result[Option[u64], Failure]
+        val i = r.tuple
+        val store = self.engine.store
+        val tuple = if r.params.tuples.len() > 1 then Some(u64(i)) else None
+
+        if is_ddl(r.env.statement)
+            self.engine.apply(r.txn, r.env, self.role) match
+                Ok(_) -> r.counts.push(0)
+                Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
+        else
+            run_statement(r.env, store, r.txn, Ctx(r.params.tuples[i], self.engine.now)) match
+                Ok(Blocked(h)) -> return Ok(Some(h))
+                Ok(Ran(n, _, batches)) ->
+                    r.counts.push(n)
+                    r.ready = rebatch(r.result, batches, u64(i), r.options) match
+                        Ok(b) -> b
+                        Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
+                    r.at = 0
+                Err(e) -> return Err(failure_in(e, r.txn, tuple))
+
+        r.tuple += 1
+        Ok(None)
+end EngineConn
+
+impl Executor for EngineConn
+    horizon(self) -> u64 = self.engine.store.horizon
+
+    catalog_version(self) -> u64 = self.engine.catalog_version()
+
+    describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
+        val c = self.engine.validate(envelope.view(), self.role)?
+        Ok(Described(c.shape, self.engine.catalog_version(), c.result))
+
+    cached(*self, shape: [32]u8) -> Option[Buf[u8]] = self.engine.cached(self.role, shape)
+
+    begin(*self, options: TxnOptions) -> Result[Begun, Failure]
+        val t = self.engine.begin(options)?
+        self.engine.open.push(t)
+        Ok(Begun(t.id, t.snapshot, t.level))
+
+    start(*self, s: Invocation) -> Result[Started, Failure]
+        var explicit: Option[&Txn] = None
+        if s.txid != 0 then explicit = Some(self.engine.explicit(s.txid)?)
+
+        val c = self.engine.validate(s.envelope.view(), self.role) match
+            Ok(c) -> c
+            Err(f) -> return Err(self.engine.aborting(explicit, f))
+
+        val params = bind(c.env, self.engine.store.catalog, s.params.view()) match
+            Ok(p) -> p
+            Err(e) -> return Err(self.engine.aborting(explicit, failure_of(e)))
+
+        val t = explicit match
+            Some(x) -> x
+            None -> self.engine.begin(s.implicit)?
+
+        // At read committed the statement's snapshot is taken now (§4.3 rule 2).
+        self.engine.store.statement(t)
+        self.engine.remember(self.role, c, s.envelope)
+
+        val cursor = self.engine.next_cursor
+        self.engine.next_cursor += 1
+        self.running.push(Running(cursor, t, s.txid == 0, c.env, params, s.options, c.result, 0, buf(), buf(), 0, 0))
+        Ok(Started(cursor, ResultHeader(t.id, t.snapshot, c.shape, c.result)))
+
+    next(*self, cursor: u64) -> Result[Produced, Failure]
+        val r = self.find(cursor) match
+            Some(r) -> r
+            None -> return Ok(NoMore)
+
+        loop
+            if r.at < r.ready.len()
+                r.at += 1
+                return Ok(BatchReady(r.ready[r.at - 1]))
+
+            if r.tuple == r.params.tuples.len() then return Ok(NoMore)
+
+            // A parked statement stays parked while the holder of its row lock is live (§7.5).
+            if r.holder != 0 && self.engine.is_live(r.holder) then return Ok(NotYet)
+            r.holder = 0
+
+            self.run_tuple(r) match
+                Ok(Some(h)) ->
+                    r.holder = h
+                    return Ok(NotYet)
+                Ok(None) -> ()
+                Err(f) ->
+                    self.drop(cursor)
+                    return Err(f)
+
+    finish(*self, cursor: u64) -> Result[Finished, Failure]
+        val r = self.find(cursor) match
+            Some(r) -> r
+            None -> return Err(failure("W2001", s"no statement $cursor is running"))
+
+        self.drop(cursor)
+        val commit = if r.implicit then self.engine.commit(r.txn)? else None
+        Ok(Finished(r.counts, commit))
+
+    cancel(*self, cursor: u64)
+        self.find(cursor) match
+            Some(r) ->
+                self.drop(cursor)
+                // An implicit transaction is rolled back; an explicit one is aborted (§7.3 rule 1).
+                if r.implicit
+                    val _ = self.engine.store.abort(r.txn)
+                else
+                    val _ = self.engine.store.abort_with(r.txn, CodecError("T1007", "", "the statement was cancelled", buf()))
+            None -> ()
+
+    commit(*self, txid: u64) -> Result[Option[u64], Failure]
+        val t = self.engine.explicit(txid)?
+        self.engine.close(txid)
+        self.engine.commit(t)
+
+    rollback(*self, txid: u64)
+        self.engine.explicit(txid) match
+            Ok(t) ->
+                self.engine.close(txid)
+                val _ = self.engine.store.abort(t)
+            Err(_) -> ()
+
+    // The in-memory store keeps no savepoints (`docs/design/store.md`), so a savepoint request is
+    // refused with `unsupported_request`, which aborts the transaction like any error (§5.3 rule 1).
+    savepoint(*self, txid: u64, name: string) -> Result[unit, Failure] = Err(no_savepoints())
+
+    rollback_to(*self, txid: u64, name: string) -> Result[unit, Failure] = Err(no_savepoints())
+
+    release(*self, txid: u64, name: string) -> Result[unit, Failure] = Err(no_savepoints())
+
+    status(*self, txid: u64) -> Result[Outcome, Failure] = Ok(self.engine.status(txid))
+
+private no_savepoints() -> Failure = failure("W2018", "this server keeps no savepoints")
+
+/** The failure of every error in `es`, in their order. */
+private failure_all(es: Buf[CodecError]) -> Failure
+    val entries = buf[ErrorEntry]()
+    for e in es
+        entries.push(entry_of(e, None))
+    Failure(entries, None, None)
+
+/** The failure that reports `e`, raised in `t` while it ran parameter tuple `tuple`. */
+private failure_in(e: CodecError, t: &Txn, tuple: Option[u64]) -> Failure
+    val f = failure_of(e)
+    Failure(f.entries, Some(t.id), tuple)
+
+/** The parameter block `bytes`, decoded by `env`'s parameter types resolved in `c` (§4.2). A DDL
+ * statement binds exactly one tuple (`ddl.md` §3.1 rule 2).
+ */
+private bind(env: Envelope, c: MemCatalog, bytes: []const u8) -> Result[Params, CodecError]
+    val types = buf[Type]()
+    for p in env.params
+        types.push(resolve_type(c, p.ty)?)
+
+    val p = decode_params(types.view(), bytes)?
+    if is_ddl(env.statement) && p.tuples.len() != 1 then return fail("Q6001", "a DDL statement binds exactly one empty tuple")
+    Ok(p)
+
+/** The batches of one tuple's result as the request asked for them: labelled with tuple `tuple`, of
+ * at most `batch_rows` rows each and, but for a batch of one row, at most `batch_bytes` octets
+ * (§6.4 rules 5–6). Batches the executor made are passed through when nothing asks otherwise.
+ */
+private rebatch(result: Option[Type], batches: Buf[Buf[u8]], tuple: u64, o: ExecOptions) -> Result[Buf[Buf[u8]], CodecError]
+    if result.is_none() || (tuple == 0 && o.batch_rows.is_none() && o.batch_bytes.is_none()) then return Ok(batches)
+
+    val ty = result.unwrap()
+    val tree = column_tree(ty)?
+    val rows = buf[Value]()
+
+    for b in batches
+        rows.extend(decode_batch(tree, b.view())?.rows().view())
+
+    val most = o.batch_rows match
+        Some(n) -> if n == 0 then 1 else usize(n)
+        None -> rows.len()
+
+    val out = buf[Buf[u8]]()
+    var at: usize = 0
+
+    while at < rows.len()
+        var n = if most < rows.len() - at then most else rows.len() - at
+        var payload = encode_batch(ty, rows.view()[at..<at + n], tuple)?
+
+        o.batch_bytes match
+            Some(limit) ->
+                while n > 1 && u64(payload.len()) > limit
+                    n = n / 2
+                    payload = encode_batch(ty, rows.view()[at..<at + n], tuple)?
+            None -> ()
+
+        out.push(payload)
+        at += n
+
+    Ok(out)
+end rebatch
