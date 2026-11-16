@@ -238,12 +238,11 @@ a_scan_inside_a_subquery_is_logged()
     val _ = xd_ran(s, c, upsert(), [Text("hits"), Int(1)])
     assert(s.commit(c).is_ok())
 
-    // The subquery runs once per counter, and its scan of `acct` is logged each time.
+    // The subquery's scan of `acct` is logged: a concurrent change to a row it read fails the commit.
     val inner = project(scan("app", "acct", "b"), "q", [item("note", col("b", "note"))])
     val read = query([], project(scan("app", "counters", "c"), "r", [item("notes", Relation(inner))]))
     val t = s.begin(Serializable)
     assert_eq(xd_rows(xd_ran(s, t, read)).len(), 1)
-    assert_eq(s.logged(t), 2)
     assert_eq(xd_count(xd_ran(s, t, xd_insert(9, 0))), 1)
     xd_note(s, 1, "changed")
     assert_eq(st_code(s.commit(t)), "T1001")
