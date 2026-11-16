@@ -876,7 +876,10 @@ set: [(name, Expr)], where: Expr? } }`
    updated by `set`, evaluated with `as` (the existing row) and `excluded` (the proposed row) visible;
    else it is skipped. Skipped rows produce no `returning` row and are not counted. Both `as` and
    `excluded` have the table's row type; `target`'s columns match a unique key's in any order, and a
-   constraint name matches a unique constraint's or a unique index's name.
+   constraint name matches a unique constraint's or a unique index's name. The existing row is found
+   through `target` alone: a source row with a null in `target`'s columns conflicts with no row and is
+   inserted (`ddl.md` §2.5 rule 2), and a row inserted or updated by the upsert that conflicts on
+   another unique key is `T3001`, as an insert's would be.
 3. A statement that would insert or update the same target row twice is `R0007`. Source rows are
    taken in source order, and a row whose key an earlier row of the same statement inserted or
    updated conflicts with that row: with `nothing`, or with a `where` that is not `true`, it is

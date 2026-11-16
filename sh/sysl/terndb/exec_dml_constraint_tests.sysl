@@ -1,0 +1,510 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Secondary unique keys and foreign keys through DML (`ddl.md` §2.5–§2.6, `query-tree.md` §9.3,
+// `isolation.md` §4.2–§4.4): violations on insert and update, nulls and multi-column keys, two
+// concurrent inserts of one value, upserts on a secondary key, every foreign-key action on delete and
+// on update, deferred keys, a self-referencing key, cascades over more than a batch, and a concurrent
+// delete of a referenced row against an insert referencing it at snapshot and serializable.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+private xc_fk(name: string, column: string, target: string, ref_column: string, on_delete: FkAction, on_update: FkAction, deferred: bool = false) -> ConstraintDef =
+    ConstraintDef(name, ForeignKey(items_of([column]), cat_q(target), items_of([ref_column]), on_delete, on_update, deferred))
+
+/** `users(id, email text?, a?, b?, n default 0)` unique on `email` and on `(a, b)`; `parent(id,
+ * code?)` unique on `code`; one referencing table per action, each `(id, pid?)` referencing
+ * `parent(id)` for delete and update alike (`c_default`'s `pid` defaulting to 0); `c_deferred`, a
+ * deferred `no_action` key; `c_code(id, pcode?)` referencing `parent(code)` with `cascade`; and
+ * `tree(id, up?)` referencing itself, deleting in cascade.
+ */
+private xc_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    val n = ColumnDef("n", Int64, Some(Literal(Int64, Int(0))), None, NoIdentity, None)
+    c = cat_ok(c, cat_table("users", [cat_col("id", Int64), cat_col("email", nullable(Text)), cat_col("a", nullable(Int64)), cat_col("b", nullable(Int64)), n], ["id"],
+        [cat_unique("users_email", ["email"]), cat_unique("users_ab", ["a", "b"])]))
+    c = cat_ok(c, cat_table("parent", [cat_col("id", Int64), cat_col("code", nullable(Int64))], ["id"], [cat_unique("parent_code", ["code"])]))
+    val pid = [cat_col("id", Int64), cat_col("pid", nullable(Int64))]
+    c = cat_ok(c, cat_table("c_none", pid, ["id"], [xc_fk("c_none_fk", "pid", "parent", "id", FkNoAction, FkNoAction)]))
+    c = cat_ok(c, cat_table("c_restrict", pid, ["id"], [xc_fk("c_restrict_fk", "pid", "parent", "id", FkRestrict, FkRestrict)]))
+    c = cat_ok(c, cat_table("c_cascade", pid, ["id"], [xc_fk("c_cascade_fk", "pid", "parent", "id", FkCascade, FkCascade)]))
+    c = cat_ok(c, cat_table("c_null", pid, ["id"], [xc_fk("c_null_fk", "pid", "parent", "id", FkSetNull, FkSetNull)]))
+    val zero = ColumnDef("pid", nullable(Int64), Some(Literal(Int64, Int(0))), None, NoIdentity, None)
+    c = cat_ok(c, cat_table("c_default", [cat_col("id", Int64), zero], ["id"], [xc_fk("c_default_fk", "pid", "parent", "id", FkSetDefault, FkSetDefault)]))
+    c = cat_ok(c, cat_table("c_deferred", pid, ["id"], [xc_fk("c_deferred_fk", "pid", "parent", "id", FkNoAction, FkNoAction, true)]))
+    c = cat_ok(c, cat_table("c_code", [cat_col("id", Int64), cat_col("pcode", nullable(Int64))], ["id"], [xc_fk("c_code_fk", "pcode", "parent", "code", FkCascade, FkCascade)]))
+    cat_ok(c, cat_table("tree", [cat_col("id", Int64), cat_col("up", nullable(Int64))], ["id"], [xc_fk("tree_up", "up", "tree", "id", FkCascade, FkNoAction)]))
+
+private xc_store() -> &Store = mem_store(xc_catalog())
+
+private xc_opt(v: Option[i128]) -> Value = v match
+    Some(n) -> Int(n)
+    None -> Null
+
+/** `insert into <table> (<columns>) select * from <rows>`, the rows a parameter of the types given. */
+private xc_insert(table: string, columns: []const string, types: []const Type, conflict: Option[OnConflict] = None) -> Envelope
+    val fs = buf[Field]()
+
+    for i in 0..<columns.len
+        fs.push(Field(columns[i], types[i]))
+
+    envelope([param("rows", bag(record(fs.view())))], Insert(cat_q(table), "a", None, items_of(columns), ParamScan("p", 0), conflict, buf[Item]()))
+
+/** The outcome of inserting `rows` into a `(id, pid?)` table. */
+private xc_pairs(s: &Store, t: &Txn, table: string, rows: []const Value) -> string
+    val second = if table == "c_code" then "pcode" elif table == "tree" then "up" else "pid"
+    xd_code(s, t, xc_insert(table, ["id", second], [Int64, nullable(Int64)]), [rel(rows)])
+
+private xc_pair(id: i128, up: Option[i128]) -> Value = rec([Int(id), xc_opt(up)])
+
+private xc_parents(s: &Store, t: &Txn, rows: []const Value) -> string =
+    xd_code(s, t, xc_insert("parent", ["id", "code"], [Int64, nullable(Int64)]), [rel(rows)])
+
+private xc_users(s: &Store, t: &Txn, rows: []const Value) -> string =
+    xd_code(s, t, xc_insert("users", ["id", "email", "a", "b"], [Int64, nullable(Text), nullable(Int64), nullable(Int64)]), [rel(rows)])
+
+private xc_user(id: i128, email: Option[string], a: Option[i128] = None, b: Option[i128] = None) -> Value
+    val e: Value = email match
+        Some(x) -> Text(x)
+        None -> Null
+
+    rec([Int(id), e, xc_opt(a), xc_opt(b)])
+
+/** Commits `t`, which must succeed. */
+private xc_commit(s: &Store, t: &Txn, file: string = __FILE__, line: long = __LINE__)
+    s.commit(t) match
+        Ok(_) -> ()
+        Err(e) -> assert(false, s"the commit fails with ${e.code}: ${e.message}", file, line)
+
+/** Runs `code`-returning `f` in a new snapshot transaction and commits it; `f` must answer "ok". */
+private xc_setup(s: &Store, f: &Fn(@keeps &Txn) -> string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    assert_eq(f(t), "ok", "setup statement", file, line)
+    xc_commit(s, t, file, line)
+
+private xc_where(id: i128) -> Option[Expr] = Some(call("eq", [col("a", "id"), xd_int(id)]))
+
+private xc_delete(table: string, id: i128) -> Envelope = envelope([], Delete(cat_q(table), "a", None, None, xc_where(id), buf[Item]()))
+
+private xc_set(table: string, id: i128, column: string, e: Expr) -> Envelope =
+    envelope([], Update(cat_q(table), "a", None, None, xc_where(id), items_of([item(column, e)]), buf[Item]()))
+
+/** The rows of `table` a new transaction sees, as records of their first two columns, in key order. */
+private xc_rows(s: &Store, table: string, second: string) -> Buf[Value] =
+    xd_rows(xd_ran(s, s.begin(Snapshot), query([], project(scan("app", table, "a"), "r", [item("id", col("a", "id")), item("x", col("a", second))]))))
+
+private xc_count(s: &Store, table: string) -> usize = xc_rows(s, table, "id").len()
+
+/** Column `second` of the row of `table` keyed `id`, as a new transaction sees it; `Text("absent")`
+ * when there is no such row.
+ */
+private xc_at(s: &Store, table: string, second: string, id: i128) -> Value
+    for r in xc_rows(s, table, second)
+        r match
+            Record(fs) -> if fs[0] == Int(id) then return fs[1]
+            _ -> ()
+
+    Text("absent")
+
+/** A store whose `parent` holds `(1, 10)`, `(2, 20)` and `(0, 0)`, committed. */
+private xc_parented() -> &Store
+    val s = xc_store()
+    xc_setup(s, t -> xc_parents(s, t, [rec([Int(0), Int(0)]), rec([Int(1), Int(10)]), rec([Int(2), Int(20)])]))
+    s
+
+/** Whether every row of every referencing table has its referenced row, as a new transaction sees
+ * them: no orphan committed.
+ */
+private xc_no_orphans(s: &Store) -> bool
+    val ids = buf[Value]()
+
+    for r in xc_rows(s, "parent", "code")
+        r match
+            Record(fs) -> ids.push(fs[0])
+            _ -> ()
+
+    for table in ["c_none", "c_restrict", "c_cascade", "c_null", "c_default", "c_deferred"]
+        for r in xc_rows(s, table, "pid")
+            r match
+                Record(fs) -> if !fs[1].is_null()
+                    var found = false
+
+                    for id in ids
+                        if id == fs[1] then found = true
+
+                    if !found then return false
+                _ -> ()
+
+    true
+
+// -- unique keys -----------------------------------------------------------------------------------
+
+@test
+a_secondary_unique_key_refuses_a_duplicate_on_insert_and_on_update()
+    val s = xc_store()
+    xc_setup(s, t -> xc_users(s, t, [xc_user(1, Some("x")), xc_user(2, Some("y"))]))
+
+    assert_eq(xc_users(s, s.begin(Snapshot), [xc_user(3, Some("x"))]), "T3001")
+    assert_eq(xd_code(s, s.begin(Snapshot), xc_set("users", 1, "email", Literal(Text, Text("y")))), "T3001")
+
+    // Two rows of one value in one statement, and the statement's other rows go with it.
+    val t = s.begin(Snapshot)
+    assert_eq(xc_users(s, t, [xc_user(4, Some("z")), xc_user(5, Some("w")), xc_user(6, Some("z"))]), "T3001")
+    assert_eq(st_code(s.commit(t)), "T3001")
+    assert_eq(xc_count(s, "users"), 2)
+
+    // An update to the value the row already holds is no conflict with itself.
+    val u = s.begin(Snapshot)
+    assert_eq(xd_code(s, u, xc_set("users", 1, "email", Literal(Text, Text("x")))), "ok")
+    xc_commit(s, u)
+
+@test
+a_value_a_transaction_frees_is_free_for_it_and_for_later_ones()
+    val s = xc_store()
+    xc_setup(s, t -> xc_users(s, t, [xc_user(1, Some("x")), xc_user(2, Some("y"))]))
+
+    val t = s.begin(Snapshot)
+    assert_eq(xd_code(s, t, xc_delete("users", 1)), "ok")
+    assert_eq(xc_users(s, t, [xc_user(3, Some("x"))]), "ok")
+    // A value moved away by an update is free too.
+    assert_eq(xd_code(s, t, xc_set("users", 2, "email", Literal(Text, Text("v")))), "ok")
+    assert_eq(xc_users(s, t, [xc_user(4, Some("y"))]), "ok")
+    // A row moving to a new primary key keeps its value: the old version is the mover's own.
+    assert_eq(xd_code(s, t, xc_set("users", 3, "id", xd_int(30))), "ok")
+    xc_commit(s, t)
+
+    assert(xc_at(s, "users", "email", 30) == Text("x"))
+    assert(xc_at(s, "users", "email", 4) == Text("y"))
+    assert_eq(xc_users(s, s.begin(Snapshot), [xc_user(5, Some("v"))]), "T3001")
+
+@test
+nulls_never_conflict_and_a_multi_column_key_compares_every_column()
+    val s = xc_store()
+    val t = s.begin(Snapshot)
+    assert_eq(xc_users(s, t, [xc_user(1, None, Some(1), None), xc_user(2, None, Some(1), None), xc_user(3, None, None, None)]), "ok")
+    assert_eq(xc_users(s, t, [xc_user(4, None, Some(1), Some(2)), xc_user(5, None, Some(1), Some(3)), xc_user(6, None, Some(2), Some(2))]), "ok")
+    xc_commit(s, t)
+
+    assert_eq(xc_users(s, s.begin(Snapshot), [xc_user(7, None, Some(1), Some(2))]), "T3001")
+    assert_eq(xc_users(s, s.begin(Snapshot), [xc_user(8, None, Some(1), None)]), "ok")
+    assert_eq(xc_count(s, "users"), 6)
+
+@test
+a_second_insert_of_a_value_another_transaction_inserted_waits_then_follows_its_outcome()
+    // The first commits: a race at snapshot, a duplicate at read committed.
+    for level in [Snapshot, ReadCommitted, Serializable]
+        val s = xc_store()
+        val first = s.begin(Snapshot)
+        val second = s.begin(level)
+        assert_eq(xc_users(s, first, [xc_user(1, Some("x"))]), "ok")
+
+        val env = xc_insert("users", ["id", "email", "a", "b"], [Int64, nullable(Text), nullable(Int64), nullable(Int64)])
+        assert_eq(xd_holder(xd_ran(s, second, env, [rel([xc_user(2, Some("x")), xc_user(3, Some("q"))])])), first.id)
+        // The waiting statement left nothing, not even its row without a conflict.
+        assert(s.get(second, cat_table_of(s.catalog, "users").oid, st_key(3)).unwrap().is_none())
+
+        xc_commit(s, first)
+        val again = xc_users(s, second, [xc_user(2, Some("x")), xc_user(3, Some("q"))])
+        assert_eq(again, if level == ReadCommitted then "T3001" else "T1001")
+
+    // The first rolls back: the second goes ahead.
+    val s = xc_store()
+    val first = s.begin(Snapshot)
+    val second = s.begin(Snapshot)
+    assert_eq(xc_users(s, first, [xc_user(1, Some("x"))]), "ok")
+    assert_eq(xc_users(s, second, [xc_user(2, Some("x"))]), "wait")
+    assert(s.abort(first).is_ok())
+    assert_eq(xc_users(s, second, [xc_user(2, Some("x"))]), "ok")
+    xc_commit(s, second)
+    assert(xc_at(s, "users", "email", 2) == Text("x"))
+
+@test
+an_upsert_on_a_secondary_unique_key_updates_or_inserts()
+    val s = xc_store()
+    xc_setup(s, t -> xc_users(s, t, [xc_user(1, Some("x"), Some(1), Some(1))]))
+    val cols = ["id", "email", "n"]
+    val types = [Int64, nullable(Text), Int64]
+    val bump = DoUpdate(items_of([item("n", col("x", "n"))]), None)
+
+    // The conflict branch updates the row holding the value, whatever its key.
+    val t = s.begin(Snapshot)
+    val by_columns = xc_insert("users", cols, types, Some(OnConflict(Columns(items_of(["email"])), "x", bump)))
+    assert_eq(xd_count(xd_ran(s, t, by_columns, [rel([rec([Int(9), Text("x"), Int(5)])])])), 1)
+    // The insert branch.
+    assert_eq(xd_count(xd_ran(s, t, by_columns, [rel([rec([Int(8), Text("q"), Int(6)])])])), 1)
+    // A null in the key conflicts with nothing, so the row is inserted.
+    assert_eq(xd_count(xd_ran(s, t, by_columns, [rel([rec([Int(7), Null, Int(7)])])])), 1)
+    xc_commit(s, t)
+
+    assert(xc_at(s, "users", "n", 1) == Int(5))
+    assert(xc_at(s, "users", "id", 9) == Text("absent"))
+    assert(xc_at(s, "users", "n", 8) == Int(6))
+    assert(xc_at(s, "users", "n", 7) == Int(7))
+
+    // By the constraint's name, over two columns, and `nothing` skipping.
+    val u = s.begin(Snapshot)
+    val ab = xc_insert("users", ["id", "a", "b"], [Int64, nullable(Int64), nullable(Int64)], Some(OnConflict(Constraint("users_ab"), "x", Nothing)))
+    assert_eq(xd_count(xd_ran(s, u, ab, [rel([rec([Int(20), Int(1), Int(1)]), rec([Int(21), Int(1), Int(2)])])])), 1)
+    xc_commit(s, u)
+    assert_eq(xc_count(s, "users"), 4)
+
+    // Two source rows of one value: the second conflicts with the first's write (§9.3 rule 3).
+    assert_eq(xd_code(s, s.begin(Snapshot), by_columns, [rel([rec([Int(30), Text("z"), Int(1)]), rec([Int(31), Text("z"), Int(2)])])]), "R0007")
+
+    // A conflict on a unique key other than the target is a violation.
+    assert_eq(xd_code(s, s.begin(Snapshot), by_columns, [rel([rec([Int(1), Text("new"), Int(1)])])]), "T3001")
+
+// -- foreign keys ------------------------------------------------------------------------------------
+
+@test
+a_referencing_row_needs_its_referenced_row()
+    val s = xc_parented()
+    assert_eq(xc_pairs(s, s.begin(Snapshot), "c_none", [xc_pair(1, Some(99))]), "T3003")
+    assert_eq(xc_pairs(s, s.begin(Snapshot), "c_code", [xc_pair(1, Some(99))]), "T3003")
+
+    val t = s.begin(Snapshot)
+    // A null referencing value is not checked; a referenced row inserted by the same transaction is found.
+    assert_eq(xc_pairs(s, t, "c_none", [xc_pair(1, None), xc_pair(2, Some(1))]), "ok")
+    assert_eq(xc_parents(s, t, [rec([Int(5), Int(50)])]), "ok")
+    assert_eq(xc_pairs(s, t, "c_none", [xc_pair(3, Some(5))]), "ok")
+    assert_eq(xc_pairs(s, t, "c_code", [xc_pair(1, Some(50))]), "ok")
+    // An update to a missing value fails, one leaving the value alone is not checked again.
+    assert_eq(xd_code(s, t, xc_set("c_none", 2, "pid", xd_int(77))), "T3003")
+
+@test
+each_action_runs_when_a_referenced_row_is_deleted()
+    for table in ["c_none", "c_restrict", "c_cascade", "c_null", "c_default"]
+        val s = xc_parented()
+        xc_setup(s, t -> xc_pairs(s, t, table, [xc_pair(1, Some(1)), xc_pair(2, Some(2))]))
+        val t = s.begin(Snapshot)
+        val code = xd_code(s, t, xc_delete("parent", 1))
+
+        if table == "c_none" || table == "c_restrict"
+            assert_eq(code, "T3003")
+            assert_eq(xc_count(s, "parent"), 3)
+        else
+            assert_eq(code, "ok")
+            xc_commit(s, t)
+            assert_eq(xc_count(s, "parent"), 2)
+            val left = xc_at(s, table, "pid", 1)
+
+            if table == "c_cascade" then assert(left == Text("absent"))
+            if table == "c_null" then assert(left.is_null())
+            if table == "c_default" then assert(left == Int(0))
+
+            // The other referencing row is untouched.
+            assert(xc_at(s, table, "pid", 2) == Int(2))
+
+        assert(xc_no_orphans(s))
+
+    // Deleting the referencing row first frees the referenced one, within one transaction.
+    val s = xc_parented()
+    xc_setup(s, t -> xc_pairs(s, t, "c_restrict", [xc_pair(1, Some(1))]))
+    val t = s.begin(Snapshot)
+    assert_eq(xd_code(s, t, xc_delete("c_restrict", 1)), "ok")
+    assert_eq(xd_code(s, t, xc_delete("parent", 1)), "ok")
+    xc_commit(s, t)
+
+@test
+each_action_runs_when_a_referenced_key_is_updated()
+    for table in ["c_none", "c_restrict", "c_cascade", "c_null", "c_default"]
+        val s = xc_parented()
+        xc_setup(s, t -> xc_pairs(s, t, table, [xc_pair(1, Some(1))]))
+
+        // A change to a column the key does not use runs no action.
+        val u = s.begin(Snapshot)
+        assert_eq(xd_code(s, u, xc_set("parent", 1, "code", xd_int(11))), "ok")
+        xc_commit(s, u)
+        assert(xc_at(s, table, "pid", 1) == Int(1))
+
+        val t = s.begin(Snapshot)
+        val code = xd_code(s, t, xc_set("parent", 1, "id", xd_int(5)))
+
+        if table == "c_none" || table == "c_restrict"
+            assert_eq(code, "T3003")
+        else
+            assert_eq(code, "ok")
+            xc_commit(s, t)
+            val now = xc_at(s, table, "pid", 1)
+            if table == "c_cascade" then assert(now == Int(5))
+            if table == "c_null" then assert(now.is_null())
+            if table == "c_default" then assert(now == Int(0))
+
+        assert(xc_no_orphans(s))
+
+    // A key referenced through a secondary unique key cascades too.
+    val s = xc_parented()
+    xc_setup(s, t -> xc_pairs(s, t, "c_code", [xc_pair(1, Some(10)), xc_pair(2, Some(20))]))
+    val t = s.begin(Snapshot)
+    assert_eq(xd_code(s, t, xc_set("parent", 1, "code", xd_int(15))), "ok")
+    xc_commit(s, t)
+    assert(xc_at(s, "c_code", "pcode", 1) == Int(15))
+    assert(xc_at(s, "c_code", "pcode", 2) == Int(20))
+
+@test
+set_default_to_a_value_with_no_referenced_row_fails()
+    val s = xc_parented()
+    xc_setup(s, t -> xc_pairs(s, t, "c_default", [xc_pair(1, Some(1))]))
+    xc_setup(s, t -> xd_code(s, t, xc_delete("parent", 0)))
+    assert_eq(xd_code(s, s.begin(Snapshot), xc_delete("parent", 1)), "T3003")
+    assert(xc_at(s, "c_default", "pid", 1) == Int(1))
+
+@test
+a_deferred_foreign_key_is_checked_at_commit()
+    val s = xc_parented()
+
+    // Missing at commit.
+    val t = s.begin(Snapshot)
+    assert_eq(xc_pairs(s, t, "c_deferred", [xc_pair(1, Some(7))]), "ok")
+    assert_eq(st_code(s.commit(t)), "T3003")
+    assert_eq(xc_count(s, "c_deferred"), 0)
+
+    // Referencing first, referenced later in the same transaction.
+    val u = s.begin(Snapshot)
+    assert_eq(xc_pairs(s, u, "c_deferred", [xc_pair(1, Some(7))]), "ok")
+    assert_eq(xc_parents(s, u, [rec([Int(7), Int(70)])]), "ok")
+    xc_commit(s, u)
+
+    // A referenced row deleted and put back before commit; then deleted for good.
+    val v = s.begin(Snapshot)
+    assert_eq(xd_code(s, v, xc_delete("parent", 7)), "ok")
+    assert_eq(xc_parents(s, v, [rec([Int(7), Int(71)])]), "ok")
+    xc_commit(s, v)
+
+    val w = s.begin(Snapshot)
+    assert_eq(xd_code(s, w, xc_delete("parent", 7)), "ok")
+    assert_eq(st_code(s.commit(w)), "T3003")
+    assert_eq(xc_count(s, "parent"), 4)
+
+    // A referencing row deleted again before commit owes nothing.
+    val x = s.begin(Snapshot)
+    assert_eq(xc_pairs(s, x, "c_deferred", [xc_pair(2, Some(99))]), "ok")
+    assert_eq(xd_code(s, x, xc_delete("c_deferred", 2)), "ok")
+    xc_commit(s, x)
+    assert(xc_no_orphans(s))
+
+@test
+a_self_referencing_key_sees_the_rows_of_its_own_statement()
+    val s = xc_store()
+    val t = s.begin(Snapshot)
+    assert_eq(xc_pairs(s, t, "tree", [xc_pair(1, None), xc_pair(2, Some(1)), xc_pair(3, Some(2)), xc_pair(7, Some(7))]), "ok")
+    assert_eq(xc_pairs(s, t, "tree", [xc_pair(5, Some(6))]), "T3003")
+
+    val u = s.begin(Snapshot)
+    assert_eq(xc_pairs(s, u, "tree", [xc_pair(1, None), xc_pair(2, Some(1)), xc_pair(3, Some(2)), xc_pair(4, Some(3)), xc_pair(7, Some(7))]), "ok")
+    xc_commit(s, u)
+
+    // A delete cascades down the chain; a row referencing itself goes with itself.
+    val v = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, v, xc_delete("tree", 2))), 1)
+    assert_eq(xd_count(xd_ran(s, v, xc_delete("tree", 7))), 1)
+    xc_commit(s, v)
+    assert_eq(xc_count(s, "tree"), 1)
+
+    // `no_action` on update: the referenced key may not move while referenced.
+    xc_setup(s, t2 -> xc_pairs(s, t2, "tree", [xc_pair(2, Some(1))]))
+    assert_eq(xd_code(s, s.begin(Snapshot), xc_set("tree", 1, "id", xd_int(9))), "T3003")
+
+@test
+cascades_reach_more_than_a_batch_of_rows()
+    val s = xc_parented()
+    val rows = buf[Value]()
+
+    for i in 0..<1500
+        rows.push(xc_pair(i128(i), Some(1)))
+
+    xc_setup(s, t -> xc_pairs(s, t, "c_cascade", rows.view()))
+    xc_setup(s, t -> xc_pairs(s, t, "c_null", rows.view()))
+
+    // An update cascades to every referencing row.
+    xc_setup(s, t -> xd_code(s, t, xc_set("parent", 1, "id", xd_int(4))))
+    assert(xc_at(s, "c_cascade", "pid", 1499) == Int(4))
+    assert(xc_at(s, "c_null", "pid", 1499).is_null())
+    assert(xc_at(s, "c_null", "pid", 0).is_null())
+
+    // A delete removes every one.
+    xc_setup(s, t -> xd_code(s, t, xc_delete("parent", 4)))
+    assert_eq(xc_count(s, "c_cascade"), 0)
+    assert_eq(xc_count(s, "c_null"), 1500)
+
+    // A chain of more than a batch, each row referencing the one before.
+    val chain = buf[Value]()
+    chain.push(xc_pair(0, None))
+
+    for i in 1..<1100
+        chain.push(xc_pair(i128(i), Some(i128(i) - 1)))
+
+    xc_setup(s, t -> xc_pairs(s, t, "tree", chain.view()))
+    xc_setup(s, t -> xd_code(s, t, xc_delete("tree", 0)))
+    assert_eq(xc_count(s, "tree"), 0)
+
+@test
+a_cascade_that_must_wait_undoes_its_whole_statement()
+    val s = xc_parented()
+    xc_setup(s, t -> xc_pairs(s, t, "c_cascade", [xc_pair(1, Some(1))]))
+    val holder = s.begin(Snapshot)
+    assert_eq(xd_code(s, holder, envelope([], Update(cat_q("c_cascade"), "a", None, None, xc_where(1), items_of([item("id", xd_int(1))]), buf[Item]()))), "ok")
+
+    val t = s.begin(ReadCommitted)
+    assert_eq(xd_holder(xd_ran(s, t, xc_delete("parent", 1))), holder.id)
+    // The delete of the referenced row is undone with the cascade that waited.
+    assert(s.get(t, cat_table_of(s.catalog, "parent").oid, st_key(1)).unwrap().is_some())
+
+    xc_commit(s, holder)
+    assert_eq(xd_count(xd_ran(s, t, xc_delete("parent", 1))), 1)
+    xc_commit(s, t)
+    assert_eq(xc_count(s, "c_cascade"), 0)
+
+// -- foreign keys under concurrency (`ddl.md` §2.6 rule 3) ------------------------------------------
+
+@test
+a_concurrent_delete_of_a_referenced_row_never_leaves_an_orphan()
+    for child_level in [Snapshot, Serializable, ReadCommitted]
+        for parent_level in [Snapshot, Serializable, ReadCommitted]
+            // The referencing insert first: the delete waits for it, then fails.
+            var s = xc_parented()
+            var child = s.begin(child_level)
+            var deleter = s.begin(parent_level)
+            assert_eq(xc_pairs(s, child, "c_none", [xc_pair(1, Some(1))]), "ok")
+            assert_eq(xd_code(s, deleter, xc_delete("parent", 1)), "wait")
+            xc_commit(s, child)
+            val late = xd_code(s, deleter, xc_delete("parent", 1))
+            assert(late == "T3003" || late == "T1001", s"the delete after the insert committed answers $late")
+            assert(xc_no_orphans(s))
+            assert_eq(xc_count(s, "c_none"), 1)
+
+            // The delete first: the insert waits for it, then fails.
+            s = xc_parented()
+            deleter = s.begin(parent_level)
+            child = s.begin(child_level)
+            assert_eq(xd_code(s, deleter, xc_delete("parent", 1)), "ok")
+            assert_eq(xc_pairs(s, child, "c_none", [xc_pair(1, Some(1))]), "wait")
+            xc_commit(s, deleter)
+            val after = xc_pairs(s, child, "c_none", [xc_pair(1, Some(1))])
+            assert(after == "T3003" || after == "T1001", s"the insert after the delete committed answers $after")
+            assert(xc_no_orphans(s))
+
+            // Both statements run before either commits: whichever commits second fails.
+            s = xc_parented()
+            child = s.begin(child_level)
+            deleter = s.begin(parent_level)
+            assert_eq(xc_pairs(s, child, "c_cascade", [xc_pair(1, Some(2))]), "ok")
+            val d = xd_code(s, deleter, xc_delete("parent", 2))
+            assert(d == "wait", s"a delete of a row a live insert references answers $d")
+            xc_commit(s, child)
+            assert(xc_no_orphans(s))
+
+@test
+a_deferred_reference_to_a_row_being_deleted_fails_at_commit()
+    val s = xc_parented()
+    val child = s.begin(Snapshot)
+    val deleter = s.begin(Snapshot)
+    assert_eq(xc_pairs(s, child, "c_deferred", [xc_pair(1, Some(1))]), "ok")
+    assert_eq(xd_code(s, deleter, xc_delete("parent", 1)), "ok")
+    // The deleter's statement found no committed referencing row; the commit of the referencing
+    // transaction finds the referenced row locked and does not wait.
+    assert_eq(st_code(s.commit(child)), "T1003")
+    xc_commit(s, deleter)
+    assert(xc_no_orphans(s))

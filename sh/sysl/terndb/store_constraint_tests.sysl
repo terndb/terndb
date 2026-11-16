@@ -1,0 +1,166 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The store's secondary unique indexes and foreign-key primitives (`ddl.md` §2.5–§2.6,
+// `isolation.md` §4.2–§4.4): a batch checked as a whole, a batch that must wait leaving nothing, a
+// unique lookup logged for validation, a key added after rows exist, and the `LOCK_ONLY` lock a
+// reference check takes, held to the end of the transaction and undone with its statement.
+
+/** `u(id, email text?, n)` unique on `email`; `p(id)` and `c(id, pid?)` referencing it. */
+private sc_store() -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("email", nullable(Text)), cat_col("n", Int64)], ["id"], [cat_unique("u_email", ["email"])]))
+    c = cat_ok(c, cat_table("p", [cat_col("id", Int64)], ["id"]))
+    c = cat_ok(c, cat_table("c", [cat_col("id", Int64), cat_col("pid", nullable(Int64))], ["id"], [cat_fk("c_fk", ["pid"], "p", ["id"])]))
+    mem_store(c)
+
+private sc_user(s: &Store, id: i128, email: string, n: i128 = 0) -> StoredRow =
+    store_row(s, st_oid(s, "u"), rec([Int(id), Value.Text(email), Int(n)]))
+
+private sc_email(s: &Store, t: &Txn, id: i128) -> Value = s.get(t, st_oid(s, "u"), st_key(id)) match
+    Ok(Some(r)) -> r.at(1)
+    _ -> Null
+
+private sc_fk(s: &Store) -> ForeignKey = foreign_keys(s.catalog, st_oid(s, "c"), false)[0]
+
+@test
+a_batch_is_checked_once_every_change_is_applied()
+    val s = sc_store()
+    val u = st_oid(s, "u")
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.insert(t, u, sc_user(s, 1, "x"))), 1)
+    assert_eq(st_done(s.insert(t, u, sc_user(s, 2, "y"))), 1)
+    st_commit(s, t)
+
+    // Two rows exchange their values in one batch.
+    val w = s.begin(Snapshot)
+    val swap = buf[RowChange]()
+    swap.push(Replace(st_key(1), sc_user(s, 1, "y")))
+    swap.push(Replace(st_key(2), sc_user(s, 2, "x")))
+    assert_eq(st_done(s.write_rows(w, u, swap)), 2)
+    st_commit(s, w)
+
+    val r = s.begin(Snapshot)
+    assert(sc_email(s, r, 1) == Value.Text("y"))
+    assert(sc_email(s, r, 2) == Value.Text("x"))
+
+@test
+a_batch_that_must_wait_on_a_unique_value_leaves_nothing()
+    val s = sc_store()
+    val u = st_oid(s, "u")
+    val first = s.begin(Snapshot)
+    val second = s.begin(Snapshot)
+    assert_eq(st_done(s.insert(first, u, sc_user(s, 1, "x"))), 1)
+
+    val batch = buf[RowChange]()
+    batch.push(Put(sc_user(s, 2, "y")))
+    batch.push(Put(sc_user(s, 3, "x")))
+    assert_eq(st_waits(s.write_rows(second, u, batch)), first.id)
+    assert(sc_email(s, second, 2).is_null())
+
+    // The holder rolls back: the batch runs.
+    assert(s.abort(first).is_ok())
+    assert_eq(st_done(s.write_rows(second, u, batch)), 2)
+    st_commit(s, second)
+
+@test
+a_unique_lookup_is_logged_found_or_not()
+    for same_value in [true, false]
+        val s = sc_store()
+        val u = st_oid(s, "u")
+        val email = buf[u32]()
+        email.push(st_col(s, "u", "email"))
+
+        val t = s.begin(Serializable)
+        val before = s.logged(t)
+        assert(s.lookup_unique(t, u, email, rec([Value.Text("x")])).unwrap().is_none())
+        assert_eq(s.logged(t), before + 1)
+
+        val other = s.begin(Serializable)
+        assert_eq(st_done(s.insert(other, u, sc_user(s, 1, if same_value then "x" else "w"))), 1)
+        st_commit(s, other)
+
+        // `t` writes elsewhere; the concurrent insert of the value it looked up aborts it.
+        assert_eq(st_done(s.insert(t, u, sc_user(s, 5, "z"))), 1)
+        assert_eq(st_code(s.commit(t)), if same_value then "T1001" else "ok")
+
+@test
+a_unique_key_added_after_rows_exist_covers_them()
+    val s = sc_store()
+    val u = st_oid(s, "u")
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.insert(t, u, sc_user(s, 1, "x", 7))), 1)
+    st_commit(s, t)
+
+    s.catalog = cat_ok(s.catalog, cat_alter("u", [AddConstraint(cat_unique("u_n", ["n"]), false)]))
+    assert_eq(st_code(s.insert(s.begin(Snapshot), u, sc_user(s, 2, "y", 7))), "T3001")
+    assert_eq(st_code(s.insert(s.begin(Snapshot), u, sc_user(s, 3, "z", 8))), "ok")
+
+@test
+a_reference_check_locks_the_referenced_row_to_the_end_of_the_transaction()
+    for level in [ReadCommitted, Snapshot, Serializable]
+        val s = sc_store()
+        val p = st_oid(s, "p")
+        val setup = s.begin(Snapshot)
+        st_insert(s, setup, p, [Int(1)])
+        st_commit(s, setup)
+
+        val t = s.begin(level)
+        assert(s.check_reference(t, sc_fk(s), rec([Int(1)])).unwrap().is_none())
+        val deleter = s.begin(Snapshot)
+        assert_eq(st_waits(s.delete_where(deleter, p, all_rows())), t.id)
+
+        // A missing referenced value is a violation.
+        assert_eq(st_code(s.check_reference(s.begin(level), sc_fk(s), rec([Int(9)]))), "T3003")
+
+        st_commit(s, t)
+        assert_eq(st_done(s.delete_where(deleter, p, all_rows())), 1)
+
+    // Released by a rollback, and by undoing the statement that took it.
+    val s = sc_store()
+    val p = st_oid(s, "p")
+    val setup = s.begin(Snapshot)
+    st_insert(s, setup, p, [Int(1)])
+    st_commit(s, setup)
+
+    val t = s.begin(Snapshot)
+    s.statement(t)
+    assert(s.check_reference(t, sc_fk(s), rec([Int(1)])).unwrap().is_none())
+    s.undo_statement(t)
+    val deleter = s.begin(Snapshot)
+    assert_eq(st_done(s.delete_where(deleter, p, all_rows())), 1)
+    assert(s.abort(deleter).is_ok())
+
+    assert(s.check_reference(t, sc_fk(s), rec([Int(1)])).unwrap().is_none())
+    assert(s.abort(t).is_ok())
+    assert_eq(st_done(s.delete_where(s.begin(Snapshot), p, all_rows())), 1)
+
+@test
+referencing_rows_are_the_writers_own_and_the_newest_committed()
+    val s = sc_store()
+    val c = st_oid(s, "c")
+    val setup = s.begin(Snapshot)
+    st_insert(s, setup, c, [Int(1), Int(5)])
+    st_commit(s, setup)
+
+    val values = buf[Value]()
+    values.push(rec([Int(5)]))
+    values.push(rec([Int(6)]))
+
+    // At read committed a referencing row committed after the snapshot is found; at snapshot it is a race.
+    val rc = s.begin(ReadCommitted)
+    val si = s.begin(Snapshot)
+    val late = s.begin(Snapshot)
+    st_insert(s, late, c, [Int(2), Int(6)])
+    st_commit(s, late)
+    assert_eq(s.referencing(rc, sc_fk(s), values).unwrap().len(), 2)
+    assert_eq(st_code(s.referencing(si, sc_fk(s), values)), "T1001")
+
+    // The writer's own uncommitted row, and not another's.
+    val own = s.begin(Snapshot)
+    val other = s.begin(Snapshot)
+    st_insert(s, own, c, [Int(3), Int(6)])
+    st_insert(s, other, c, [Int(4), Int(5)])
+    assert_eq(s.referencing(own, sc_fk(s), values).unwrap().len(), 3)

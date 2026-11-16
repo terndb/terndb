@@ -1,7 +1,7 @@
 module sh.sysl.terndb
 
 import sysl.buf.{Buf, buf}
-import sysl.slices.contains
+import sysl.slices.{contains, sort_by}
 
 // Statements run in a transaction of the in-memory store (`query-tree.md` §5, §9,
 // `docs/design/executor.md` §4.5): a query reads the store at the transaction's snapshot, and a DML
@@ -96,10 +96,60 @@ private struct Target
             if self.table.columns[j].name == name then return j
 
         panic(s"the table has no column '$name'")
+
+    /** The positions of columns `ids` in the row. */
+    positions(self, ids: Buf[u32]) -> Buf[usize]
+        val out = buf[usize]()
+
+        for id in ids
+            for j in 0..<self.table.columns.len()
+                if self.table.columns[j].id == id then out.push(j)
+
+        out
+
+    /** The record type of columns `ids`. */
+    type_of(self, ids: Buf[u32]) -> Type
+        val fs = fields_of_type(self.row)
+        val out = buf[Field]()
+
+        for j in self.positions(ids)
+            out.push(fs[j])
+
+        record(out.view())
+
+    /** Columns `ids` of the row `v` as a record, or none when one of them is null: a key that cannot
+     * conflict (`ddl.md` §2.5 rule 2), a referencing value that is not checked (§2.6 rule 2).
+     */
+    values_of(self, ids: Buf[u32], v: Value) -> Option[Value]
+        val fs = v match
+            Record(fs) -> fs
+            _ -> return None
+
+        val parts = buf[Value]()
+
+        for j in self.positions(ids)
+            if fs[j].is_null() then return None
+            parts.push(fs[j])
+
+        Some(rec(parts.view()))
+
+    /** The primary key of the row `v`, as the store keys it. */
+    pk_of(self, v: Value) -> Value
+        val parts = buf[Value]()
+
+        v match
+            Record(fs) ->
+                for j in self.key
+                    parts.push(fs[j])
+            _ -> ()
+
+        rec(parts.view())
 end Target
 
-private target_of(s: &Store, q: QualName) -> Result[Target, CodecError]
-    val ct = s.catalog.tables[s.catalog.table_at(q).unwrap()]
+private target_of(s: &Store, q: QualName) -> Result[Target, CodecError] = target_by_oid(s, s.catalog.tables[s.catalog.table_at(q).unwrap()].oid)
+
+private target_by_oid(s: &Store, oid: u64) -> Result[Target, CodecError]
+    val ct = s.catalog.tables[s.catalog.table_by_oid(oid).unwrap()]
     val fs = buf[Field]()
 
     for c in ct.columns
@@ -189,7 +239,7 @@ end with_generated
 
 /** The constraints `rows`, about to be written, must meet (`ddl.md` §2.6): every check constraint of
  * the table for inserted rows (`changed` absent), else those reading a column of `changed`, and NOT
- * NULL for every top-level column. The primary key's uniqueness is the store's (`T3001`).
+ * NULL for every top-level column. Unique keys are the store's (`T3001`), foreign keys `fk_effects`'.
  */
 private check_rows(s: &Store, ctx: Ctx, tg: Target, rows: ColumnVector, changed: Option[Buf[string]]) -> Result[unit, CodecError]
     val checks = buf[Expr]()
@@ -300,15 +350,286 @@ private returning_rows(result: Option[Type], items: Buf[TExpr], env: Env, action
     Ok(Some(take(concat(elem, parts.view()), back.view())))
 end returning_rows
 
-/** The store's answer to a statement's writes, and its outcome: `rows` rows written, and its
- * `returning` rows `ret` as its result.
+/** The store's answer to a statement's writes, `deltas` being the rows they change, and its outcome:
+ * `rows` rows written, and its `returning` rows `ret` as its result. The foreign keys the writes
+ * touch act and are checked at the end of the statement (`fk_effects`); a statement that must wait
+ * for a row lock part-way is undone and answers `Blocked`.
  */
-private written(s: &Store, t: &Txn, tg: Target, changes: Buf[RowChange], rows: usize, result: Option[Type], ret: Option[ColumnVector]) -> Result[Executed, CodecError]
+private written(s: &Store, t: &Txn, c: Ctx, tg: Target, changes: Buf[RowChange], deltas: Buf[Delta], rows: usize, result: Option[Type], ret: Option[ColumnVector]) -> Result[Executed, CodecError]
     s.write_rows(t, tg.oid, changes)? match
-        Wait(h) -> Ok(Blocked(h))
-        Done(_) -> ret match
-            Some(r) -> ran(result, batches_of(r))
-            None -> Ok(Ran(u64(rows), None, buf[Buf[u8]]()))
+        Wait(h) -> return Ok(Blocked(h))
+        Done(_) -> ()
+
+    fk_effects(s, t, c, tg, deltas)? match
+        Some(h) ->
+            s.undo_statement(t)
+            return Ok(Blocked(h))
+        None -> ()
+
+    ret match
+        Some(r) -> ran(result, batches_of(r))
+        None -> Ok(Ran(u64(rows), None, buf[Buf[u8]]()))
+
+// -- foreign keys, `ddl.md` §2.6 -----------------------------------------------------------------------
+
+/** One row a statement changed, in its table's row type: the row before (none for an insert) and
+ * after (none for a delete).
+ */
+private struct Delta
+    before: Option[Value]
+    after: Option[Value]
+
+/** Rows of table `tg` a statement or one of its cascades changed, whose foreign keys are yet to act. */
+private struct Pending
+    tg: Target
+    deltas: Buf[Delta]
+
+/** Referencing values whose referenced rows must exist at the end of the statement, or referenced
+ * values removed under `no_action` that no row may reference then.
+ */
+private struct FkValues
+    fk: ForeignKey
+    values: Buf[Value]
+
+/** The foreign keys a statement's changes `deltas` to `tg` touch (`ddl.md` §2.6 rule 2), acting in
+ * turn on every table a cascade reaches: each referenced value removed or changed runs its key's
+ * action (`restrict` checked at once; `cascade`, `set_null` and `set_default` changing the
+ * referencing rows, whose own foreign keys then act; `no_action` checked at the end), and each
+ * referencing value written is checked at the end of the statement, or at commit for a deferred key.
+ * The answer is a transaction to wait for, or none.
+ */
+private fk_effects(s: &Store, t: &Txn, c: Ctx, tg: Target, deltas: Buf[Delta]) -> Result[Option[u64], CodecError]
+    val work = buf[Pending]()
+    work.push(Pending(tg, deltas))
+    val referencing = buf[FkValues]()
+    val removed = buf[FkValues]()
+    var i: usize = 0
+
+    while i < work.len()
+        val p = work[i]
+        i += 1
+
+        for fk in foreign_keys(s.catalog, p.tg.oid, false)
+            val ty = p.tg.type_of(fk.columns)
+            val vs = buf[Value]()
+
+            for dl in p.deltas
+                dl.after match
+                    Some(a) -> p.tg.values_of(fk.columns, a) match
+                        Some(v) ->
+                            // A row whose referencing value an update left as it was is not checked.
+                            val unchanged = dl.before match
+                                Some(b) -> p.tg.values_of(fk.columns, b) match
+                                    Some(w) -> same(ty, w, v)
+                                    None -> false
+                                None -> false
+
+                            if !unchanged
+                                if fk.deferred then s.defer_check(t, ChildCheck(fk, p.tg.pk_of(a))) else vs.push(v)
+                        None -> ()
+                    None -> ()
+
+            if vs.len() > 0 then referencing.push(FkValues(fk, vs))
+
+        for fk in foreign_keys(s.catalog, p.tg.oid, true)
+            fk_actions(s, t, c, p.tg, fk, p.deltas, work, removed)? match
+                Some(h) -> return Ok(Some(h))
+                None -> ()
+
+    for r in referencing
+        for v in r.values
+            s.check_reference(t, r.fk, v)? match
+                Some(h) -> return Ok(Some(h))
+                None -> ()
+
+    for r in removed
+        val gone = buf[Value]()
+
+        for v in r.values
+            if !s.holds_key(t, r.fk.ref_table, r.fk.ref_columns, v)? then gone.push(v)
+
+        if gone.len() > 0 && s.referencing(t, r.fk, gone)?.len() > 0
+            return fail("T3003", s"a row still references a removed row through foreign key '${r.fk.name}'")
+
+    Ok(None)
+end fk_effects
+
+/** The actions of `fk`, which references `ptg`, for the changes `deltas` to `ptg`: `on_delete` for
+ * each referenced value a deleted row held, `on_update` for each an update changed.
+ */
+private fk_actions(s: &Store, t: &Txn, c: Ctx, ptg: Target, fk: ForeignKey, deltas: Buf[Delta], work: Buf[Pending], removed: Buf[FkValues]) -> Result[Option[u64], CodecError]
+    val ty = ptg.type_of(fk.ref_columns)
+    val deleted = buf[Value]()
+    val olds = buf[Value]()
+    val news = buf[Value]()
+
+    for dl in deltas
+        dl.before match
+            Some(b) -> ptg.values_of(fk.ref_columns, b) match
+                Some(ov) -> dl.after match
+                    None -> deleted.push(ov)
+                    Some(a) -> ptg.values_of(fk.ref_columns, a) match
+                        Some(nv) -> if !same(ty, nv, ov)
+                            olds.push(ov)
+                            news.push(nv)
+                        None ->
+                            olds.push(ov)
+                            news.push(Null)
+                None -> ()
+            None -> ()
+
+    fk_act(s, t, c, fk, fk.on_delete, deleted, None, work, removed)? match
+        Some(h) -> return Ok(Some(h))
+        None -> ()
+
+    fk_act(s, t, c, fk, fk.on_update, olds, Some(news), work, removed)
+end fk_actions
+
+/** `action` of `fk` for the referenced values `olds`, removed by a delete (`news` absent) or changed
+ * to `news` by an update.
+ */
+private fk_act(s: &Store, t: &Txn, c: Ctx, fk: ForeignKey, action: FkAction, olds: Buf[Value], news: Option[Buf[Value]], work: Buf[Pending], removed: Buf[FkValues]) -> Result[Option[u64], CodecError]
+    if olds.len() == 0 then return Ok(None)
+
+    action match
+        FkNoAction ->
+            if fk.deferred
+                for v in olds
+                    s.defer_check(t, ParentCheck(fk, v))
+            else
+                removed.push(FkValues(fk, olds))
+
+            return Ok(None)
+        FkRestrict ->
+            if s.referencing(t, fk, olds)?.len() > 0
+                return fail("T3003", s"a row references a removed row through foreign key '${fk.name}', whose action is restrict")
+
+            return Ok(None)
+        _ -> ()
+
+    val ctg = target_by_oid(s, fk.table)?
+    val hits = s.referencing(t, fk, olds)?
+    if hits.len() == 0 then return Ok(None)
+
+    val befores = buf[Value]()
+    val keys = buf[Option[Value]]()
+
+    for h in hits
+        befores.push(h.row.value)
+        keys.push(Some(h.key))
+
+    val deltas = buf[Delta]()
+
+    val deleting = action match
+        FkCascade -> news.is_none()
+        _ -> false
+
+    if deleting
+        val changes = buf[RowChange]()
+
+        for i in 0..<hits.len()
+            changes.push(Remove(hits[i].key))
+            deltas.push(Delta(Some(befores[i]), None))
+
+        s.write_rows(t, ctg.oid, changes)? match
+            Wait(h) -> return Ok(Some(h))
+            Done(_) -> ()
+
+        work.push(Pending(ctg, deltas))
+        return Ok(None)
+
+    // Every other action rewrites the referencing columns of each referencing row.
+    val at = ctg.positions(fk.columns)
+    val fs = fields_of_type(ctg.row)
+    var rows = vector_of(ctg.row, befores.view())
+    val names = buf[string]()
+
+    for j in at
+        names.push(fs[j].name)
+
+    val defaults = buf[Expr]()
+    val has_default = buf[bool]()
+
+    action match
+        FkSetDefault ->
+            for j in at
+                ctg.table.columns[j].default match
+                    Some(e) ->
+                        defaults.push(e)
+                        has_default.push(true)
+                    None -> has_default.push(false)
+        _ -> ()
+
+    val dv = eval_defs(s, c, rows, defaults)?
+    val ref_ty = ctg.type_of(fk.columns)
+    val order = sorted_order(ref_ty, olds)
+    var d: usize = 0
+
+    for k in 0..<at.len()
+        val j = at[k]
+        val vals = buf[Value]()
+        val dcol = if has_default.len() > k && has_default[k] then Some(coerce_vector(dv[d], fs[j].ty)?) else None
+
+        for i in 0..<hits.len()
+            val v = action match
+                FkCascade ->
+                    val nv = news.unwrap()[matching(ref_ty, olds, order, ctg.values_of(fk.columns, befores[i]))]
+                    nv match
+                        Record(parts) -> parts[k]
+                        _ -> Null
+                FkSetDefault -> dcol match
+                    Some(col) -> value_at(col, i)
+                    None -> Null
+                _ -> Null
+
+            if v.is_null() && !fs[j].ty.is_nullable()
+                return fail("T3004", s"a null is written to the NOT NULL column '${fs[j].name}' by foreign key '${fk.name}'")
+
+            vals.push(v)
+
+        if has_default.len() > k && has_default[k] then d += 1
+        rows = with_column(rows, j, vector_of(fs[j].ty, vals.view()))
+
+    val (after, regenerated) = with_generated(s, c, ctg, rows, Some(names))?
+    names.extend(regenerated.view())
+    check_rows(s, c, ctg, after, Some(names))?
+
+    for i in 0..<hits.len()
+        deltas.push(Delta(Some(befores[i]), Some(value_at(after, i))))
+
+    s.write_rows(t, ctg.oid, ordered_changes(ctg, after, keys))? match
+        Wait(h) -> return Ok(Some(h))
+        Done(_) -> ()
+
+    work.push(Pending(ctg, deltas))
+    Ok(None)
+end fk_act
+
+/** The positions of `values`, sorted by `cmp` of their values. */
+private sorted_order(ty: Type, values: Buf[Value]) -> Buf[usize]
+    var order = buf[usize]()
+
+    for i in 0..<values.len()
+        order.push(i)
+
+    sort_by(order.view_mut(), (a, b) -> cmp(ty, values[a], values[b]) < 0)
+    order
+
+/** The position in `values` (sorted through `order`) of the value `v` holds; a referencing row found
+ * for one of `values` holds one of them.
+ */
+private matching(ty: Type, values: Buf[Value], order: Buf[usize], v: Option[Value]) -> usize
+    val x = v.unwrap()
+    var lo: usize = 0
+    var hi = order.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        val c = cmp(ty, values[order[mid]], x)
+        if c == 0 then return order[mid]
+        if c < 0 then lo = mid + 1 else hi = mid
+
+    panic("a referencing row holds none of the values it was found for")
 
 /** The binders `returning` sees (§9.5): the written row as `binder`, the row before the statement as
  * `old`, and any `from`/`using` binders in the composite `joined`.
@@ -397,25 +718,6 @@ private insert_rows(s: &Store, ctx: Ctx, tg: Target, columns: Buf[string], src: 
     Ok(with_generated(s, ctx, tg, ColumnVector(tg.row, src.len, buf[u8](), Members(cs)), None)?.0)
 end insert_rows
 
-/** Whether an upsert's `target` is the table's primary key: the one unique key the store enforces. */
-private is_primary_key(s: &Store, tg: Target, target: ConflictTarget) -> bool
-    target match
-        Columns(names) ->
-            if names.len() != tg.key.len() then return false
-
-            for j in tg.key
-                if !contains(names.view(), tg.table.columns[j].name) then return false
-
-            true
-        Constraint(name) ->
-            for c in s.catalog.constraints
-                if c.table == tg.oid && c.name == name
-                    c.kind match
-                        ConPrimaryKey(_) -> return true
-                        _ -> ()
-
-            false
-
 private run_insert(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName, binder: string, old: Option[string], columns: Buf[string], source: Rel, on_conflict: Option[OnConflict], returning: Buf[Item]) -> Result[Executed, CodecError]
     val tg = target_of(s, table)?
     var u = no_uses()
@@ -465,35 +767,45 @@ private run_insert(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
             check_rows(s, c, tg, proposed, None)?
             val acts = buf[u16]()
             val changes = buf[RowChange]()
+            val deltas = buf[Delta]()
 
             for i in 0..<proposed.len
                 acts.push(0)
                 changes.push(Put(tg.stored(proposed, i)))
+                deltas.push(Delta(None, Some(value_at(proposed, i))))
 
             val env = returning_env(c, binder, proposed, old, repeated(olds_ty, Null, proposed.len), None)
-            return written(s, t, tg, changes, proposed.len, typing.result, returning_rows(typing.result, rets, env, p.action, acts)?)
+            return written(s, t, c, tg, changes, deltas, proposed.len, typing.result, returning_rows(typing.result, rets, env, p.action, acts)?)
 
-    if !is_primary_key(s, tg, oc.target) then panic("the executor upserts only on the primary key")
-
-    // §9.3 rule 2, row by row in source order. A row whose key this statement has already written
-    // conflicts with that write: skipped by `nothing`, `R0007` for an update (rule 3).
-    var seen = key_set(tg.key_type())
+    // §9.3 rule 2, row by row in source order, on the unique key `target` names. A row whose key this
+    // statement has already written conflicts with that write: skipped by `nothing`, `R0007` for an
+    // update (rule 3). A row with a null in the key conflicts with none (`ddl.md` §2.5 rule 2).
+    val cids = conflict_columns(s, tg, oc.target)?
+    var seen = key_set(tg.type_of(cids))
     val rows = buf[Value]()
     val olds = buf[Value]()
     val keys = buf[Option[Value]]()
     val acts = buf[u16]()
 
     for i in 0..<proposed.len
-        val k = tg.key_at(proposed, i)
-        val mine = seen.get(k)
+        val ck = tg.values_of(cids, value_at(proposed, i))
+
+        val mine = ck match
+            Some(k) -> seen.get(k)
+            None -> None
 
         val existing = mine match
             Some(at) -> Some(rows[at])
-            None -> s.get(t, tg.oid, k)?.map(r -> r.value)
+            None -> ck match
+                Some(k) -> s.lookup_unique(t, tg.oid, cids, k)?.map(h -> h.row.value)
+                None -> None
 
         existing match
             None ->
-                seen.put(k, rows.len())
+                ck match
+                    Some(k) -> seen.put(k, rows.len())
+                    None -> ()
+
                 rows.push(value_at(proposed, i))
                 olds.push(Null)
                 keys.push(None)
@@ -509,10 +821,10 @@ private run_insert(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
 
                     if passes(cond, one)?
                         if mine.is_some() then return fail("R0007", "the statement would write one row twice")
-                        seen.put(k, rows.len())
+                        seen.put(ck.unwrap(), rows.len())
                         rows.push(value_at(apply_set(tg, before, set, values, one)?, 0))
                         olds.push(e)
-                        keys.push(Some(k))
+                        keys.push(Some(tg.pk_of(e)))
                         acts.push(1)
 
     val names = buf[string]()
@@ -535,8 +847,42 @@ private run_insert(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
 
     val env = returning_env(c, binder, all, old, vector_of(olds_ty, olds.view()), None)
     val ret = returning_rows(typing.result, rets, env, p.action, acts)?
-    written(s, t, tg, ordered_changes(tg, all, keys), all.len, typing.result, ret)
+    val deltas = buf[Delta]()
+
+    for i in 0..<all.len
+        deltas.push(Delta(if acts[i] == 0 then None else Some(olds[i]), Some(value_at(all, i))))
+
+    written(s, t, c, tg, ordered_changes(tg, all, keys), deltas, all.len, typing.result, ret)
 end run_insert
+
+/** The columns, by id and in the key's own order, of the unique key an upsert's `target` names
+ * (§9.3 rules 1–2): the primary key, a `unique` constraint, or a unique index over columns with no
+ * predicate, matched by its columns in any order or by its name.
+ */
+private conflict_columns(s: &Store, tg: Target, target: ConflictTarget) -> Result[Buf[u32], CodecError]
+    val keys = buf[KeyColumns]()
+
+    s.catalog.primary_key_of(tg.oid) match
+        Some(pk) -> keys.push(KeyColumns(pk.name, tg.table.primary_key))
+        None -> ()
+
+    keys.extend(unique_keys(s.catalog, tg.oid).view())
+
+    for k in keys
+        val hit = target match
+            Columns(names) ->
+                val mine = s.catalog.column_names(tg.table, k.columns)
+                var all = names.len() == mine.len()
+
+                for n in mine
+                    if !contains(names.view(), n) then all = false
+
+                all
+            Constraint(name) -> k.name == name
+
+        if hit then return Ok(k.columns)
+
+    fail("Q5004", "the conflict target names no unique key of the table")
 
 /** The store's changes for `rows`, each a new row (`keys[i]` absent) or one replacing the row keyed
  * `keys[i]`: removals of rows whose key changes first, then replacements, then new rows, so that a
@@ -644,12 +990,14 @@ private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
 
     if deleting
         val changes = buf[RowChange]()
+        val gone = buf[Delta]()
 
-        for k in keys
-            changes.push(Remove(k.unwrap()))
+        for i in 0..<keys.len()
+            changes.push(Remove(keys[i].unwrap()))
+            gone.push(Delta(Some(value_at(rows, i)), None))
 
         val ret = returning_rows(typing.result, rets, returning_env(c, binder, rows, old, olds, composite), p.action, acts)?
-        return written(s, t, tg, changes, rows.len, typing.result, ret)
+        return written(s, t, c, tg, changes, gone, rows.len, typing.result, ret)
 
     val names = buf[string]()
 
@@ -661,5 +1009,10 @@ private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
     check_rows(s, c, tg, after, Some(names))?
 
     val ret = returning_rows(typing.result, rets, returning_env(c, binder, after, old, olds, composite), p.action, acts)?
-    written(s, t, tg, ordered_changes(tg, after, keys), after.len, typing.result, ret)
+    val deltas = buf[Delta]()
+
+    for i in 0..<after.len
+        deltas.push(Delta(Some(value_at(rows, i)), Some(value_at(after, i))))
+
+    written(s, t, c, tg, ordered_changes(tg, after, keys), deltas, after.len, typing.result, ret)
 end run_update

@@ -377,10 +377,13 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
   row (`T3004`). Definition expressions run as a `Project` over the rows passed as a relation-valued
   parameter, type-checked against the catalog. `returning` runs before the writes, grouped by action
   so that `Action()` is one parameter per group, and is put back in statement order with one `take`.
-  The writes go to the store as one `write_rows` call, removals first (§9.4 rule 4).
+  The writes go to the store as one `write_rows` call, removals first (§9.4 rule 4). An upsert's
+  target may be any unique key; its conflict is looked up with `lookup_unique`. The statement's foreign
+  keys then act and are checked (`fk_effects`, `ddl.md` §2.6 and `docs/design/store.md`): cascades
+  write the referencing tables as further `write_rows` calls, and a statement that must wait part-way
+  is taken back with `undo_statement`.
 
-Not yet: views read through the store, identity columns (`next_value`), unique constraints other than
-the primary key as an upsert target, foreign keys, and translation of a row of an older schema version
+Not yet: views read through the store, identity columns (`next_value`), and translation of a row of an older schema version
 (`ddl.md` §5.3).
 
 ## 5. What this note relies on in `query-tree.md`

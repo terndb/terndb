@@ -271,7 +271,9 @@ any. When `Ti` writes object `x`:
    `unique_violation`; one that finds `k` only through rule 2 (committed after `s_i`) fails with
    `serialization_failure`, because the conflict is a race, not a duplicate. At read committed the check reads
    the newest committed version of `k`, as rule 3 does, so a live one fails with `unique_violation` whenever it
-   committed (`serialization_failure` is never raised there, §5.2).
+   committed (`serialization_failure` is never raised there, §5.2). A value of a secondary unique key, and the
+   referenced value a foreign-key check reads, are checked by the same rules, rule 1 included: a row holding
+   the value that another live transaction is writing is waited for (`ddl.md` §2.6 rules 3 and 5).
 
 **Why first-updater-wins rather than first-committer-wins.** Undo-based MVCC keeps exactly one in-place newest
 version per row, so two uncommitted writers of one row cannot both have installed their version; first-committer-
@@ -339,7 +341,9 @@ contributes to the result), then `P ⇒ L`. `L` MAY be wider than `P`; it MUST N
 | join, semi-join or anti-join | each input's own scan predicate; an index-nested-loop probe logs each probe key, or the probed side's restriction |
 | catalog lookup of table `t` (every access to `t`) | the catalog entry of `t` (§5.6) |
 | an `Update`'s or `Delete`'s target rows | its `filter` (`true` with `from`/`using`, whose own scans are logged as inputs of a join) |
-| an upsert's conflict check of key `k` | `key = k`, found or not |
+| an upsert's conflict check of key `k` | `key = k`, found or not; for a secondary unique key, the rows holding `k` in its columns |
+| a foreign-key check of referenced value `v` | the rows of the referenced table holding `v` in the referenced columns (`key = v` for a primary key), found or not |
+| the referencing rows of a deleted or changed referenced value `v` | the rows holding `v` in the referencing columns |
 
 A read's `C` is every column of the table the statement names through the read's binder (or the
 target's `old`); a scan whose rows reach the statement's result, a whole-row comparison (`Distinct`,
