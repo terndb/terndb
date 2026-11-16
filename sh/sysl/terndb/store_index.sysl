@@ -1,0 +1,578 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort_by
+
+// The store's constraint machinery beyond the primary key (`ddl.md` §2.5–§2.6, `isolation.md`
+// §4.2–§4.4): a secondary unique index per unique key of a table, kept as a sorted buffer of entries
+// and checked once a batch of a statement's writes is applied; the lookups a foreign key needs (the
+// referenced row of a referencing value, under a `LOCK_ONLY` lock, and the referencing rows of a
+// referenced value); the foreign-key checks deferred to commit; and the statement undo log that lets
+// a statement wait part-way and leave no trace (`docs/design/store.md`).
+
+// -- unique indexes ---------------------------------------------------------------------------------
+
+/** One entry of a unique index: a non-null key value some version of `slot` holds. Entries are
+ * sorted by value, then by the slot's primary key, and never removed: a lookup reads the slot's
+ * versions to decide whether the value is still there, as a purge would otherwise.
+ */
+struct IxEntry
+    value: Value
+    slot: &Slot
+
+/** A secondary unique key of a table (a `unique` constraint, or a ready unique index over columns
+ * with no predicate): its name, its columns by id, their record type, and its entries.
+ */
+struct UniqueIx
+    name: string
+    columns: Buf[u32]
+    ty: Type
+    entries: Buf[IxEntry]
+
+/** A unique key as the catalog defines it: its name and its columns. */
+struct KeyColumns
+    name: string
+    columns: Buf[u32]
+
+/** The secondary unique keys of table `oid`: its `unique` constraints, and every ready unique index
+ * over columns alone with no predicate that backs no constraint — the keys a statement may name as
+ * an upsert target (`MemCatalog.table_info`) apart from the primary key.
+ */
+unique_keys(c: MemCatalog, oid: u64) -> Buf[KeyColumns]
+    val out = buf[KeyColumns]()
+
+    for k in c.constraints
+        if k.table == oid
+            k.kind match
+                ConUnique(ids) -> out.push(KeyColumns(k.name, ids))
+                _ -> ()
+
+    for x in c.indexes
+        if x.table == oid && x.unique && x.constraint == 0 && x.state == IndexReady && x.predicate.is_none()
+            val ids = buf[u32]()
+            var plain = true
+
+            for k in x.keys
+                k.key match
+                    KeyOn(id) -> ids.push(id)
+                    KeyOver(_) -> plain = false
+
+            if plain then out.push(KeyColumns(x.name, ids))
+
+    out
+end unique_keys
+
+/** The schema versions of table `oid`, through which a stored row's columns are read. */
+table_versions(c: MemCatalog, oid: u64) -> Buf[SchemaVersion] = c.table_by_oid(oid) match
+    Some(i) -> c.tables[i].versions
+    None -> buf[SchemaVersion]()
+
+/** The record type of columns `ids` of table `oid`, in their current types. */
+columns_type(c: MemCatalog, oid: u64, ids: Buf[u32]) -> Type
+    val fs = buf[Field]()
+
+    c.table_by_oid(oid) match
+        Some(i) ->
+            for id in ids
+                c.tables[i].column_by_id(id) match
+                    Some(col) -> fs.push(Field(col.name, col.ty))
+                    None -> ()
+        None -> ()
+
+    record(fs.view())
+
+/** Columns `ids` of `r`, read through `r`'s own schema version, as a record; none when one is null
+ * or absent, since a key with a null component never conflicts (`ddl.md` §2.5 rule 2) and a
+ * referencing value with one is not checked (§2.6 rule 2).
+ */
+image_values(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32]) -> Option[Value]
+    val fields = r.value match
+        Record(fs) -> fs
+        _ -> return None
+
+    for v in versions
+        if v.number == r.schema
+            val parts = buf[Value]()
+
+            for id in ids
+                var found = false
+
+                for j in 0..<v.columns.len()
+                    if v.columns[j].id == id && j < fields.len()
+                        if fields[j].is_null() then return None
+                        parts.push(fields[j])
+                        found = true
+
+                if !found then return None
+
+            return Some(Record(parts))
+
+    None
+end image_values
+
+/** Whether `r` holds `u` in columns `ids` (compared by `same`, through `cmp`). */
+row_holds(versions: Buf[SchemaVersion], ids: Buf[u32], ty: Type, u: Value, r: StoredRow) -> bool = image_values(versions, r, ids) match
+    Some(x) -> cmp(ty, x, u) == 0
+    None -> false
+
+/** As `row_holds`, for an image that may be absent or deleted. */
+image_holds(versions: Buf[SchemaVersion], ids: Buf[u32], ty: Type, u: Value, img: Option[StoredRow]) -> bool = img match
+    Some(r) -> row_holds(versions, ids, ty, u, r)
+    None -> false
+
+// The first entry of `ix` whose value is not below `u`.
+private ix_first(ix: &UniqueIx, u: Value) -> usize
+    var lo: usize = 0
+    var hi = ix.entries.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if cmp(ix.ty, ix.entries[mid].value, u) < 0 then lo = mid + 1 else hi = mid
+
+    lo
+
+// Adds the entry `(u, s)` to `ix` unless it is there already.
+private ix_add(ix: &UniqueIx, key_type: Type, u: Value, s: &Slot)
+    var lo: usize = 0
+    var hi = ix.entries.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        val e = ix.entries[mid]
+        var c = cmp(ix.ty, e.value, u)
+        if c == 0 then c = cmp(key_type, e.slot.key, s.key)
+        if c == 0 then return
+        if c < 0 then lo = mid + 1 else hi = mid
+
+    ix.entries.insert(lo, IxEntry(u, s))
+
+/** Enters the image `img` of `s` in every unique index of `d`. */
+private[terndb] index_image(c: MemCatalog, d: &TableData, s: &Slot, img: Option[StoredRow])
+    if d.uniques.len() == 0 then return
+
+    val r = img match
+        Some(r) -> r
+        None -> return
+
+    val versions = table_versions(c, d.oid)
+
+    for ix in d.uniques
+        image_values(versions, r, ix.columns) match
+            Some(u) -> ix_add(ix, d.key_type, u, s)
+            None -> ()
+
+/** The slots whose versions may hold `value` in columns `ids` of `d`: the slot of that key when
+ * `ids` is the primary key, else the entries of the unique index over `ids`.
+ */
+private slots_holding(d: &TableData, ids: Buf[u32], value: Value) -> Result[Buf[&Slot], CodecError]
+    val out = buf[&Slot]()
+
+    if same_ids(ids, d.key_columns)
+        val (found, at) = locate(d, value)
+        if found then out.push(d.slots[at])
+        return Ok(out)
+
+    for ix in d.uniques
+        if same_ids(ix.columns, ids)
+            var i = ix_first(ix, value)
+
+            while i < ix.entries.len() && cmp(ix.ty, ix.entries[i].value, value) == 0
+                out.push(ix.entries[i].slot)
+                i += 1
+
+            return Ok(out)
+
+    fail("D1001", "no unique key of the table is over these columns")
+
+private unique_fail[T](name: string) -> Result[T, CodecError] =
+    fail("T3001", s"a row with this value of unique key '$name' is visible to the transaction")
+
+// -- foreign keys -----------------------------------------------------------------------------------
+
+/** A foreign key (`ddl.md` §2.6): `columns` of `table` referencing `ref_columns` of `ref_table`,
+ * which are a unique or primary key of it, with its actions and whether it is deferred.
+ */
+struct ForeignKey
+    name: string
+    table: u64
+    columns: Buf[u32]
+    ref_table: u64
+    ref_columns: Buf[u32]
+    on_delete: FkAction
+    on_update: FkAction
+    deferred: bool
+
+/** The foreign keys of table `oid` (`to` false) or referencing it (`to` true). */
+foreign_keys(c: MemCatalog, oid: u64, to: bool) -> Buf[ForeignKey]
+    val out = buf[ForeignKey]()
+
+    for k in c.constraints
+        k.kind match
+            ConForeignKey(cols, ref_table, ref_cols, on_delete, on_update, deferred) ->
+                if (!to && k.table == oid) || (to && ref_table == oid)
+                    out.push(ForeignKey(k.name, k.table, cols, ref_table, ref_cols, on_delete, on_update, deferred))
+            _ -> ()
+
+    out
+
+/** A foreign-key check deferred to commit: that the row of `fk.table` keyed `key` still has its
+ * referenced row, or that no row references `value`, a referenced value the transaction removed
+ * (`no_action` on a deferred foreign key).
+ */
+enum Deferred
+    ChildCheck(fk: ForeignKey, key: Value)
+    ParentCheck(fk: ForeignKey, value: Value)
+
+private fk_fail[T](name: string, what: string) -> Result[T, CodecError] = fail("T3003", s"$what foreign key '$name'")
+
+// Whether the sorted `values` hold `x`.
+private holds_sorted(ty: Type, values: Buf[Value], x: Value) -> bool
+    var lo: usize = 0
+    var hi = values.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        val c = cmp(ty, values[mid], x)
+        if c == 0 then return true
+        if c < 0 then lo = mid + 1 else hi = mid
+
+    false
+
+// Whether `img` holds, in columns `ids`, one of the sorted `values`.
+private within(versions: Buf[SchemaVersion], ids: Buf[u32], ty: Type, values: Buf[Value], img: Option[StoredRow]) -> bool = img match
+    Some(r) -> image_values(versions, r, ids) match
+        Some(x) -> holds_sorted(ty, values, x)
+        None -> false
+    None -> false
+
+// -- the statement undo log ---------------------------------------------------------------------------
+
+private[terndb] mark_of(t: &Txn) -> Mark = Mark(t.undo.len(), t.writes.len(), t.locks.len(), t.deferred.len())
+
+/** Whether the newest version of `s` is the uncommitted one of transaction `id`. */
+private[terndb] owns(s: &Slot, id: u64) -> bool
+    val n = s.versions.len()
+    s.lock == id && n > 0 && s.versions[n - 1].writer == id && s.versions[n - 1].commit == 0
+
+/** Releases the `LOCK_ONLY` locks `t` holds. */
+private[terndb] release_locks(t: &Txn)
+    for s in t.locks
+        if s.lock == t.id then s.lock = 0
+
+    t.locks.clear()
+
+/** Undoes what `t` installed, locked and deferred since `m`, newest first. */
+private[terndb] undo_to(t: &Txn, m: Mark)
+    var i = t.undo.len()
+
+    while i > m.undo
+        i -= 1
+        val u = t.undo[i]
+        val s = u.slot
+
+        if u.pushed
+            val _ = s.versions.pop()
+            s.lock = 0
+        else
+            s.versions[s.versions.len() - 1] = u.prev
+            val w = t.writes[u.write_at]
+            t.writes[u.write_at] = Write(w.table, w.slot, w.before, u.prev_after)
+
+    t.undo.truncate(m.undo)
+    t.writes.truncate(m.writes)
+
+    for j in m.locks..<t.locks.len()
+        val s = t.locks[j]
+        if s.lock == t.id then s.lock = 0
+
+    t.locks.truncate(m.locks)
+
+    // A lock-only row the statement then wrote lost its lock with the version undone.
+    for s in t.locks
+        s.lock = t.id
+
+    t.deferred.truncate(m.deferred)
+end undo_to
+
+impl Store
+    /** The visible row of `table` whose columns `ids` (a unique or primary key, in its own order)
+     * hold `value`, if any; logged as a read of that value, found or not, reading every column
+     * (`isolation.md` §4.4, an upsert's conflict check).
+     */
+    lookup_unique(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[Option[Hit], CodecError]
+        val r = self.lookup_in(t, table, ids, value)
+        self.guard(t, r)
+
+    /** Checks that a row of `fk.ref_table` holds `value`, a non-null referencing value written by
+     * `t` (`ddl.md` §2.6 rule 3). The referenced row is locked `LOCK_ONLY` to the end of `t`, at
+     * every level, and the read is logged at serializable. A row another live transaction is writing
+     * answers its id to wait for (`Some`); none is `foreign_key_violation`, and a referenced row
+     * changed or found only by a commit after `t`'s snapshot is `serialization_failure` at snapshot
+     * and serializable, as an insert's key is (§4.2 rule 4).
+     */
+    check_reference(*self, t: &Txn, fk: ForeignKey, value: Value) -> Result[Option[u64], CodecError]
+        val r = self.reference_in(t, fk, value, false)
+        self.guard(t, r)
+
+    /** The rows of `fk.table` referencing one of `values` through `fk`: `t`'s own version of a row it
+     * wrote, else the newest committed version, as a read committed write sees it (`ddl.md` §2.6
+     * rule 3), so that a referencing row committed after the snapshot is not missed; at snapshot and
+     * serializable such a row is `serialization_failure` unless its version in the snapshot
+     * references the value too. The scan is logged at serializable.
+     */
+    referencing(*self, t: &Txn, fk: ForeignKey, values: Buf[Value]) -> Result[Buf[Hit], CodecError]
+        val r = self.referencing_in(t, fk, values)
+        self.guard(t, r)
+
+    /** Whether a row `t` sees holds `value` in columns `ids` of `table`. */
+    holds_key(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
+        val r = self.holds_in(t, table, ids, value)
+        self.guard(t, r)
+
+    /** Defers `check` to `t`'s commit; it is undone with the statement that deferred it. */
+    defer_check(*self, t: &Txn, check: Deferred) = t.deferred.push(check)
+
+    // The secondary unique checks of the rows a batch of writes installed since `m` (`write_rows`).
+    private[terndb] checked(*self, t: &Txn, table: u64, m: Mark, r: Result[WriteOutcome, CodecError]) -> Result[WriteOutcome, CodecError]
+        val outcome = r?
+
+        val n = outcome match
+            Wait(h) -> return Ok(Wait(h))
+            Done(n) -> n
+
+        val d = self.table_data(table)?
+        self.sync_uniques(d)
+        if d.uniques.len() == 0 then return Ok(Done(n))
+
+        for i in m.undo..<t.undo.len()
+            self.unique_check(t, d, t.undo[i].slot)? match
+                Some(h) ->
+                    undo_to(t, m)
+                    return self.wait_on(t, h)
+                None -> ()
+
+        t.waits_for = 0
+        Ok(Done(n))
+
+    // Brings `d`'s unique indexes in line with the catalog: a key added since is built from every
+    // version of every row, and a key dropped is forgotten.
+    private sync_uniques(*self, d: &TableData)
+        val keys = unique_keys(self.catalog, d.oid)
+        if keys.len() == 0 && d.uniques.len() == 0 then return
+
+        val kept = buf[&UniqueIx]()
+
+        for k in keys
+            var found = false
+
+            for ix in d.uniques
+                if !found && ix.name == k.name && same_ids(ix.columns, k.columns)
+                    kept.push(ix)
+                    found = true
+
+            if !found
+                val ix: &UniqueIx = UniqueIx(k.name, k.columns, columns_type(self.catalog, d.oid, k.columns), buf())
+                val versions = table_versions(self.catalog, d.oid)
+
+                for s in d.slots
+                    for v in s.versions
+                        v.row match
+                            Some(r) -> image_values(versions, r, ix.columns) match
+                                Some(u) -> ix_add(ix, d.key_type, u, s)
+                                None -> ()
+                            None -> ()
+
+                kept.push(ix)
+
+        d.uniques = kept
+    end sync_uniques
+
+    // Whether `t`'s version of `s` conflicts on a secondary unique key of `d` with another row
+    // (`isolation.md` §4.2 rules 1 and 4, applied to the key's value): an error, the id of a live
+    // transaction writing a row that holds the value (`Some`, to wait for), or none.
+    private unique_check(*self, t: &Txn, d: &TableData, s: &Slot) -> Result[Option[u64], CodecError]
+        if !owns(s, t.id) then return Ok(None)
+
+        val r = s.versions[s.versions.len() - 1].row match
+            Some(r) -> r
+            None -> return Ok(None)
+
+        val versions = table_versions(self.catalog, d.oid)
+
+        for ix in d.uniques
+            image_values(versions, r, ix.columns) match
+                Some(u) ->
+                    var i = ix_first(ix, u)
+
+                    while i < ix.entries.len() && cmp(ix.ty, ix.entries[i].value, u) == 0
+                        val o = ix.entries[i].slot
+                        i += 1
+
+                        if o.key != s.key
+                            unique_conflict(t, versions, ix, o, u)? match
+                                Some(h) -> return Ok(Some(h))
+                                None -> ()
+                None -> ()
+
+        Ok(None)
+    end unique_check
+
+    private lookup_in(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[Option[Hit], CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+
+        if same_ids(ids, d.key_columns)
+            return Ok(self.get_in(t, table, value)?.map(r -> Hit(value, r)))
+
+        self.sync_uniques(d)
+        val versions = table_versions(self.catalog, table)
+        val ty = columns_type(self.catalog, table, ids)
+        self.log_read(t, table, pred_all(r -> row_holds(versions, ids, ty, value, r)), None)
+
+        for o in slots_holding(d, ids, value)?
+            visible_row(o, t.snapshot, t.id) match
+                Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, r)))
+                None -> ()
+
+        Ok(None)
+
+    // `check_reference`; at commit (`at_commit`) a referenced row another transaction is writing is
+    // `lock_timeout` instead of a wait, since a commit does not wait.
+    private reference_in(*self, t: &Txn, fk: ForeignKey, value: Value, at_commit: bool) -> Result[Option[u64], CodecError]
+        live(t)?
+        val d = self.table_data(fk.ref_table)?
+        self.sync_uniques(d)
+        val ids = fk.ref_columns
+        val versions = table_versions(self.catalog, fk.ref_table)
+        val ty = columns_type(self.catalog, fk.ref_table, ids)
+        val key = if same_ids(ids, d.key_columns) then Some(value) else None
+        self.log_read(t, fk.ref_table, pred(ids.view(), r -> row_holds(versions, ids, ty, value, r)), key)
+
+        for o in slots_holding(d, ids, value)?
+            val n = o.versions.len()
+
+            if n > 0
+                val top = o.versions[n - 1]
+                val committed = newest_committed(o)
+                val held = committed.is_some() && image_holds(versions, ids, ty, value, committed.unwrap().row)
+
+                if owns(o, t.id)
+                    if image_holds(versions, ids, ty, value, top.row) then return Ok(None)
+                elif o.lock != 0 && o.lock != t.id && (held || image_holds(versions, ids, ty, value, top.row))
+                    if at_commit then return fail("T1003", s"the row foreign key '${fk.name}' references is locked by a live transaction, and a commit does not wait")
+
+                    val _ = self.wait_on(t, o.lock)?
+                    return Ok(Some(o.lock))
+                elif held
+                    if t.level != ReadCommitted && committed.unwrap().commit > t.snapshot
+                        return fail("T1001", s"the row foreign key '${fk.name}' references was committed after the snapshot")
+
+                    if o.lock == 0
+                        o.lock = t.id
+                        t.locks.push(o)
+
+                    return Ok(None)
+                elif t.level != ReadCommitted && image_holds(versions, ids, ty, value, visible_row(o, t.snapshot, t.id))
+                    return fail("T1001", s"the row foreign key '${fk.name}' references was changed after the snapshot")
+
+        fk_fail(fk.name, "no row of the referenced table holds the value of")
+    end reference_in
+
+    private referencing_in(*self, t: &Txn, fk: ForeignKey, values: Buf[Value]) -> Result[Buf[Hit], CodecError]
+        live(t)?
+        val d = self.table_data(fk.table)?
+        val ids = fk.columns
+        val versions = table_versions(self.catalog, fk.table)
+        val ty = columns_type(self.catalog, fk.table, ids)
+        var sorted = buf[Value]()
+        sorted.extend(values.view())
+        sort_by(sorted.view_mut(), (x, y) -> cmp(ty, x, y) < 0)
+
+        self.log_read(t, fk.table, pred(ids.view(), r -> within(versions, ids, ty, sorted, Some(r))), None)
+        val out = buf[Hit]()
+
+        for s in d.slots
+            val n = s.versions.len()
+
+            if owns(s, t.id)
+                val top = s.versions[n - 1]
+                if within(versions, ids, ty, sorted, top.row) then out.push(Hit(s.key, top.row.unwrap()))
+            else
+                newest_committed(s) match
+                    Some(v) -> if within(versions, ids, ty, sorted, v.row)
+                        if t.level != ReadCommitted && v.commit > t.snapshot && !within(versions, ids, ty, sorted, visible_row(s, t.snapshot, t.id))
+                            return fail("T1001", s"a row referencing through foreign key '${fk.name}' was committed after the snapshot")
+
+                        out.push(Hit(s.key, v.row.unwrap()))
+                    None -> ()
+
+        Ok(out)
+    end referencing_in
+
+    private holds_in(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+        self.sync_uniques(d)
+        val versions = table_versions(self.catalog, table)
+        val ty = columns_type(self.catalog, table, ids)
+
+        for o in slots_holding(d, ids, value)?
+            if image_holds(versions, ids, ty, value, visible_row(o, t.snapshot, t.id)) then return Ok(true)
+
+        Ok(false)
+
+    // The foreign-key checks `t` deferred to its commit (`ddl.md` §2.6 rule 2).
+    private[terndb] check_deferred(*self, t: &Txn) -> Result[unit, CodecError]
+        for x in t.deferred
+            x match
+                ChildCheck(fk, key) ->
+                    val d = self.table_data(fk.table)?
+                    val (found, at) = locate(d, key)
+
+                    if found
+                        visible_row(d.slots[at], t.snapshot, t.id) match
+                            Some(r) -> image_values(table_versions(self.catalog, fk.table), r, fk.columns) match
+                                Some(v) ->
+                                    val _ = self.reference_in(t, fk, v, true)?
+                                None -> ()
+                            None -> ()
+                ParentCheck(fk, value) ->
+                    if !self.holds_in(t, fk.ref_table, fk.ref_columns, value)?
+                        val one = buf[Value]()
+                        one.push(value)
+                        if self.referencing_in(t, fk, one)?.len() > 0 then return fk_fail(fk.name, "a row still references a removed row through")
+
+        Ok(())
+    end check_deferred
+end Store
+
+// Whether row `o`, another than the one `t` wrote, conflicts with `u` on `ix`: `t`'s own version of
+// it holding `u` is `unique_violation`; a version another live transaction is writing, or the
+// committed one under it, holding `u` answers that transaction to wait for, its outcome deciding
+// (§4.2 rule 1); else the version in `t`'s snapshot holding `u` is `unique_violation`, and the newest
+// committed one holding it is a race (`serialization_failure`) at snapshot and serializable and
+// `unique_violation` at read committed (rule 4). A row another transaction only holds `LOCK_ONLY`
+// is judged by its committed version, which that lock does not change.
+private unique_conflict(t: &Txn, versions: Buf[SchemaVersion], ix: &UniqueIx, o: &Slot, u: Value) -> Result[Option[u64], CodecError]
+    val n = o.versions.len()
+    if n == 0 then return Ok(None)
+    val top = o.versions[n - 1]
+    val committed = newest_committed(o)
+    val held = committed.is_some() && image_holds(versions, ix.columns, ix.ty, u, committed.unwrap().row)
+
+    if top.commit == 0
+        if top.writer == t.id
+            if image_holds(versions, ix.columns, ix.ty, u, top.row) then return unique_fail(ix.name)
+            return Ok(None)
+
+        if held || image_holds(versions, ix.columns, ix.ty, u, top.row) then return Ok(Some(top.writer))
+        return Ok(None)
+
+    if image_holds(versions, ix.columns, ix.ty, u, visible_row(o, t.snapshot, t.id)) then return unique_fail(ix.name)
+
+    if held
+        if t.level == ReadCommitted then return unique_fail(ix.name)
+        return fail("T1001", s"a row with this value of unique key '${ix.name}' was committed after the snapshot")
+
+    Ok(None)
+end unique_conflict

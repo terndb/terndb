@@ -334,6 +334,13 @@ private struct JoinOp
         // With no left batch at all, the null-extended right rows still need the left binders' shape.
         self.lparts = parts_of(self.spec.lbinder, self.rows)
 
+        // An inner or semi join with no right row has no output, so its left input is never read: a
+        // decorrelated `Apply` relies on it to leave its right input unevaluated over an empty outer
+        // side (`plan_unnest.sysl`, §6.6 rule 4).
+        if self.rights.len == 0 && (self.spec.kind == Inner || self.spec.kind == Semi)
+            self.left_done = true
+            return Ok(())
+
         if self.merge()
             self.open(drain_rows(self.left, self.spec.lelem)?)
             self.left_done = true

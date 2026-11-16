@@ -3,7 +3,9 @@
 `sh/sysl/terndb/store.sysl` is the table store of the in-memory mode and its multi-version concurrency control:
 `isolation.md` §4.1–§4.5 and the abort rules and codes of §5. The executor runs statements against it
 (`executor.md` §4.5) through `scan_rows`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
-workloads at each level, and each forbidden anomaly again on a fault-injected store).
+workloads at each level, and each forbidden anomaly again on a fault-injected store); the unique keys and
+foreign keys of `store_index.sysl` are tested in `store_constraint_tests.sysl` and, through DML, in
+`exec_dml_constraint_tests.sysl`.
 
 ## Structure
 
@@ -19,6 +21,12 @@ workloads at each level, and each forbidden anomaly again on a fault-injected st
 - **`RowVersion`** carries its writer's id, its commit sequence number (0 while uncommitted) and its image, a
   `StoredRow` (schema version plus the `Value` record of that version's columns) or `None` for a delete. Every
   stored row carries its schema version (`ddl.md` §5.2).
+- **`UniqueIx`** (`store_index.sysl`) is one secondary unique key of a table — a `unique` constraint, or a ready
+  unique index over columns with no predicate: a `Buf[IxEntry]` sorted by the key's value (then by primary key),
+  each entry a non-null value some version of a slot holds. An entry is added whenever a version is installed and
+  never removed; a lookup reads the slot's versions to decide whether the value is still there. `sync_uniques`
+  brings a table's indexes in line with the catalog before each check, building a key added since from every
+  version of every row.
 
 ## Version chains and visibility
 
@@ -47,6 +55,47 @@ version older than the newest committed image's aborts with `schema_changed` (`d
   removals first, so a key a row leaves is free for the row moving into it.
 - **`usable(t)`** refuses a statement in an ended transaction, and **`abort_with(t, e)`** aborts `t` with the
   code of an error raised outside the store (validation, a runtime error, a check constraint).
+- **`statement(t)`** begins a statement: a new snapshot at read committed, and a fresh **statement undo log**.
+  Every version `install` pushes or overwrites is recorded there, with every `LOCK_ONLY` lock and deferred check
+  the statement takes, so **`undo_statement(t)`** can take the statement back when it must wait part-way (a
+  cascade meeting a locked row, a foreign-key check meeting a locked referenced row). `write_rows` uses the same
+  log to undo its own batch.
+- **`lookup_unique(t, table, ids, value)`** finds the visible row holding `value` in a unique or primary key, for
+  an upsert's conflict check (logged as a read of every column).
+- **`check_reference(t, fk, value)`**, **`referencing(t, fk, values)`**, **`holds_key`** and **`defer_check`** are
+  the foreign-key primitives (below); the actions themselves are the executor's (`exec_dml.sysl`, `fk_effects`),
+  since they compute defaults and generated columns and check the rows they change.
+
+## Unique keys and foreign keys
+
+A batch of writes (`write_rows`, `insert`, `update_where`) is checked against the table's secondary unique keys
+once every change is applied, so a statement may exchange values among its rows (`ddl.md` §2.6 rule 5). For each
+row the batch wrote, every other slot with an entry for its value is judged: a version another live transaction
+is writing that holds it answers `Wait` (the batch is undone first); `t`'s own version or its snapshot's holding it
+is `unique_violation`; the newest committed one holding it is `serialization_failure` at snapshot and serializable,
+`unique_violation` at read committed. A row another transaction only holds `LOCK_ONLY` is judged by its committed
+version.
+
+A **`LOCK_ONLY` lock** is the slot's ordinary row lock held by a transaction whose version is not on top: it is
+listed in `Txn.locks`, released at commit and rollback, and anyone else writing the row waits for it as for any
+lock. `owns(s, t)` — the newest version is `t`'s uncommitted one — is what decides an in-place rewrite, since the
+lock alone no longer says so.
+
+`check_reference` takes the referenced row `LOCK_ONLY` at every level and logs the read at serializable
+(`ddl.md` §2.6 rule 3); a referenced row another live transaction is writing answers its id to wait for.
+`referencing` scans the referencing table, reading `t`'s own versions and otherwise the newest committed ones,
+logged at serializable; at snapshot and serializable a match found only through a commit after the snapshot is
+`serialization_failure`. A deferred check is a `Deferred` in `Txn.deferred`, run by `commit` before validation:
+`ChildCheck` re-reads the referencing row as `t` sees it then and checks it (a referenced row locked by another
+live transaction is `lock_timeout`, since a commit does not wait), `ParentCheck` fails if a removed referenced value
+is still referenced and no row holds it again.
+
+The executor runs a statement's foreign keys after its writes (`fk_effects`): for every changed row of every table
+the statement or a cascade wrote, the referencing values it wrote are checked (or deferred), and the referenced
+values it removed or changed run their key's action — `restrict` at once, `cascade`, `set_null` and
+`set_default` as writes of the referencing rows (their generated columns recomputed and constraints checked) that
+join the work list, so a cascade reaches any depth; `no_action` is checked once every action has run. The
+referencing scan is one pass over the referencing table for all of a batch's values, binary-searched.
 
 `update_where` and `delete_where`, which take the change as a closure, serve the store's own tests: a closure
 cannot fail, and the executor's changes can.
@@ -88,6 +137,9 @@ per-row latches and a real wait) is the next slice of this work.
 - Translation of a row of an older schema version into the reader's (`ddl.md` §5.3): the store returns each image
   in its own version, and the executor reads it as the current one until it translates it. Catalog versioning under MVCC and `schema_changed` from
   catalog validation (§5.6).
-- Secondary indexes, unique constraints other than the primary key (so an upsert's target must be the primary
-  key) and foreign keys. Check and NOT NULL constraints are checked by the executor (`executor.md` §4.5).
+- Non-unique secondary indexes, and unique indexes with a predicate or an expression component: those need the
+  executor's evaluator inside the store, so such an index enforces nothing in the in-memory store yet. A
+  referencing scan is therefore a full scan of the referencing table. Check and NOT NULL constraints are checked
+  by the executor (`executor.md` §4.5).
+- A shared `LOCK_ONLY` mode (`ddl.md` §11 question 2): concurrent inserts referencing one row serialize on it.
 - Term bits in transaction ids and commit numbers (`replication.md` §1.4).

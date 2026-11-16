@@ -252,6 +252,11 @@ never when a side is empty (the merge join evaluates no key then), and a conjunc
 on a pair another conjunct already makes not `true` — which is what lets the merge join skip the
 pairs whose keys differ.
 
+**An empty right input ends an `inner` or `semi` join** before its left input is read, since neither
+can emit a row (§6.5 rule 10). The unnester relies on it: it joins each uncorrelated subtree to the
+outer side's domain with the domain on the right, so over an empty outer side the subtree is never
+evaluated and raises nothing (§6.6 rule 4).
+
 **Hash join is the intended equi-join** once sysl has a fast seeded hash (the survey's gap, §6):
 build on the smaller side, probe streaming, with the same composite batches and the same per-row
 bookkeeping. Until then the merge join is the equi-join; it is blocking on both sides, where a hash
@@ -261,7 +266,12 @@ join would block on the build side only.
 
 The code is `exec_nest.sysl`.
 
-**Correlation is per row, by re-planning.** A correlated subtree — an `Apply`'s right input, the
+**Correlation is unnested first.** `run_query` hands every query to the unnester (`plan_unnest.sysl`,
+`docs/design/unnesting.md`) before planning it, which replaces each `Apply` and subquery expression it
+can decorrelate by joins against the outer side's distinct bindings (§6.6 rule 2). The executor meets
+rule 2 except for the cases `unnesting.md` §3 lists, which keep the per-row form below.
+
+**What is kept is per row, by re-planning.** A correlated subtree — an `Apply`'s right input, the
 `rel` of a `Relation`, `Scalar`, `Exists` or `In` — is kept as a `SubPlan`: the `Rel`, the position
 of its types in `Typing.nodes`, and the outer rows already bound where it stands. The planner plans it
 once where it stands, only to step over its types and learn its output's shape. At run time it is
@@ -269,8 +279,8 @@ planned again for every outer row, with that row's binders (one-row vectors, a c
 member) as `Planner.outer`; every `Col` or `Row` of one of them becomes a `Param` whose value is
 appended to that plan's own copy of the parameters. The subtree's operators therefore never see a
 binder they do not expose, and a nested subquery captures the outer rows of every level above it.
-This is §6.6 rule 3's per-row meaning, the reference an unnesting planner (§6.6 rule 2, Neumann–Kemper)
-will be checked against; until that planner exists the executor does not meet rule 2.
+This is §6.6 rule 3's per-row meaning, the reference the unnester is checked against: its tests run
+every query both ways.
 
 - **Apply** (§6.6): per left row, the right input re-planned for the row and joined to that one row
   by the nested-loop `JoinOp` of the corresponding kind (`cross` as `inner`, `outer` as `left`), so
@@ -377,7 +387,11 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
   row (`T3004`). Definition expressions run as a `Project` over the rows passed as a relation-valued
   parameter, type-checked against the catalog. `returning` runs before the writes, grouped by action
   so that `Action()` is one parameter per group, and is put back in statement order with one `take`.
-  The writes go to the store as one `write_rows` call, removals first (§9.4 rule 4).
+  The writes go to the store as one `write_rows` call, removals first (§9.4 rule 4). An upsert's
+  target may be any unique key; its conflict is looked up with `lookup_unique`. The statement's foreign
+  keys then act and are checked (`fk_effects`, `ddl.md` §2.6 and `docs/design/store.md`): cascades
+  write the referencing tables as further `write_rows` calls, and a statement that must wait part-way
+  is taken back with `undo_statement`.
 - **Views** (`exec_view.sysl`, `ddl.md` §2.9): `scan_op` of a view answers a `ViewOp`, which types
   and plans the stored query at its first pull with a planner of its own — its own binders, CTEs and
   logged reads — over the same transaction. The privileges a query or DML statement needs are checked
@@ -388,9 +402,7 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
   (`exec_zone.sysl`): `at_zone` and `from_zone` read the host's zone database through
   `sysl.posix.time`.
 
-Not yet: unique constraints other than
-the primary key as an upsert target, foreign keys, and translation of a row of an older schema version
-(`ddl.md` §5.3).
+Not yet: translation of a row of an older schema version (`ddl.md` §5.3).
 
 ## 5. What this note relies on in `query-tree.md`
 

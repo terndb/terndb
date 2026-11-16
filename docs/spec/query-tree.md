@@ -419,6 +419,10 @@ rows (§10.4).
    hashing on the `eq` conjuncts) never forms the pairs whose keys differ.*
 9. `single` raises `R0003` once a second right row makes `on` `true` for one left row; which of a
    statement's runtime errors is raised first, when there are several, is not specified.
+10. An `inner` or `semi` join whose right input is empty MAY leave its left input unevaluated, and a
+    runtime error the left input would raise then does not occur. *Rationale: neither can emit a row;
+    an unnested `Apply` joins its correlated side to the outer side's bindings this way round, so that
+    over an empty outer side the correlated side raises nothing (§6.6 rule 4).*
 
 ### 6.6 Apply (correlated source form)
 
@@ -884,7 +888,10 @@ set: [(name, Expr)], where: Expr? } }`
    updated by `set`, evaluated with `as` (the existing row) and `excluded` (the proposed row) visible;
    else it is skipped. Skipped rows produce no `returning` row and are not counted. Both `as` and
    `excluded` have the table's row type; `target`'s columns match a unique key's in any order, and a
-   constraint name matches a unique constraint's or a unique index's name.
+   constraint name matches a unique constraint's or a unique index's name. The existing row is found
+   through `target` alone: a source row with a null in `target`'s columns conflicts with no row and is
+   inserted (`ddl.md` §2.5 rule 2), and a row inserted or updated by the upsert that conflicts on
+   another unique key is `T3001`, as an insert's would be.
 3. A statement that would insert or update the same target row twice is `R0007`. Source rows are
    taken in source order, and a row whose key an earlier row of the same statement inserted or
    updated conflicts with that row: with `nothing`, or with a `where` that is not `true`, it is

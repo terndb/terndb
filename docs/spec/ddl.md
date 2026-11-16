@@ -125,15 +125,48 @@ Every constraint has a name unique in the table's namespace, and is one of:
    `set_default`, with SQL's meanings; `set_null` requires every referencing column to be nullable (`Q6013`). A
    foreign key is **immediate** (checked at the end of each statement) unless declared **deferred** (checked at
    commit). `restrict` is always checked at the end of the statement, even when deferred.
+   - **What is checked.** A row inserted, or updated so that its referencing value changed, is checked for its
+     referenced row; an update that leaves the referencing value as it was is not checked again. A row deleted,
+     or updated so that its referenced value changed, runs `on_delete` or `on_update` for that value.
+   - **When the actions run.** `cascade`, `set_null` and `set_default` run in the statement, after the statement's
+     own writes of the referenced table, whether or not the key is deferred; the rows they change are written as
+     if by the statement, so their own foreign keys act and are checked in turn (a cascade may reach any depth,
+     and a self-referencing key acts on its own table). `restrict` is checked at that point, against the
+     referencing rows that exist then. `no_action` is checked after every action of the statement has run (or at
+     commit when deferred), and is satisfied when the removed value is held again by a row the transaction sees.
+   - **Referencing checks see the statement's own rows**: a statement may insert a row and a row referencing it,
+     in either order, or a row referencing itself. A deferred check reads the referencing row as it is at commit;
+     a row deleted again before commit owes nothing.
+   - `set_default` writes each referencing column's default (null when it has none); a default that no
+     referenced row holds fails the check (`T3003`), and a null in a column that is not nullable is `T3004`.
 3. **Foreign keys under isolation.** A check that a referenced row exists MUST hold at commit against concurrent
-   deletes. At serializable the check is a point read, logged and validated ([ISO] §4.3). At snapshot and read
-   committed the check MUST take the referenced row's write lock as `LOCK_ONLY` ([DISK] §4.1), held to the end of the
-   transaction, so a concurrent delete or key update of that row waits or fails under [ISO] §4.2. A delete or key
-   update of a referenced row checks for referencing rows by a scan of the referencing table that is validated at
-   serializable and, at the other levels, sees the newest committed versions as a read committed write does ([ISO]
-   §4.2 rule 3), so that a referencing row committed after the snapshot is not missed.
+   deletes. At every level the check MUST take the referenced row's write lock as `LOCK_ONLY` ([DISK] §4.1), held to
+   the end of the transaction, so a concurrent delete or key update of that row waits or fails under [ISO] §4.2; at
+   serializable the check is in addition a point read of the referenced value, logged and validated ([ISO] §4.3).
+   *Rationale: a log alone does not protect a serializable referencing transaction from a snapshot or read
+   committed delete, which validates nothing and may commit after it (§3.4 allows weaker transactions to cause
+   anomalies, but not to break a constraint).* The check reads the referenced value as an insert reads its key
+   ([ISO] §4.2 rules 1, 2 and 4): a referenced row another live transaction is writing (other than by `LOCK_ONLY`)
+   is waited for; one that holds the value only through a commit after the snapshot, or that held it in the
+   snapshot and no longer does, is `serialization_failure` at snapshot and serializable; none is
+   `foreign_key_violation`. A deferred check runs at commit, where a referenced row locked by another live
+   transaction is `lock_timeout` at every level, a wait whose budget is already spent, since a commit does not wait. A delete or key update of
+   a referenced row checks for referencing rows by a scan of the referencing table that is validated at
+   serializable and sees the transaction's own rows and, for the rest, the newest committed versions, as a read
+   committed write does ([ISO] §4.2 rule 3), so that a referencing row committed after the snapshot is not missed;
+   at snapshot and serializable a referencing row found only through such a commit is `serialization_failure`. A
+   referencing row another live transaction is inserting holds `LOCK_ONLY` on the referenced row, so the delete
+   waits for it.
 4. Constraint violations are the `T3…` codes ([ERR] §4): `T3001` unique, `T3002` check, `T3003` foreign key,
    `T3004` not null.
+5. **Unique keys under isolation.** A row written with a non-null value of a unique key (a `unique` constraint or a
+   unique index; the primary key is [ISO] §4.2 rule 4 itself) is checked as an insert of that value would be: a row
+   holding the value that another live transaction is writing (other than by `LOCK_ONLY`) is waited for, its
+   outcome deciding; one holding it in the transaction's own version or in its snapshot is `unique_violation`; one
+   holding it only through a commit after the snapshot is `serialization_failure` at snapshot and serializable and
+   `unique_violation` at read committed. The check runs once every write of a statement to the table has been
+   applied (and again after each cascade's writes to it), so a statement may exchange or shift values among its
+   rows, and a value a statement or an earlier statement of the transaction freed is free.
 
 ### 2.7 Defaults, generated columns, identity and sequences
 
@@ -1090,7 +1123,7 @@ of §8, with crashes injected at every WAL record) and checks:
    table (§8.5, §8.11), because [DISK] §4.6 encodes each width differently. An order-preserving encoding shared by
    every integer width (a length-prefixed magnitude) would make that widening metadata-only for keys as well, at a
    byte or two per key. Should keys use it?
-2. **Shared row locks for foreign keys.** At snapshot and read committed, a foreign-key check locks the referenced
+2. **Shared row locks for foreign keys.** At every level, a foreign-key check locks the referenced
    row exclusively as `LOCK_ONLY` (§2.6 rule 3), so concurrent inserts of children of one parent serialize on it.
    Should v1 add a shared lock mode to the row header, or accept the contention?
 3. **Multi-valued indexes.** Indexing the elements of a nested relation or a scalar list (the GIN-shaped index of

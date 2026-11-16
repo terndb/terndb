@@ -75,6 +75,7 @@ struct TableData
     key_columns: Buf[u32]
     key_type: Type
     slots: Buf[&Slot]
+    uniques: Buf[&UniqueIx]
 
 /** One row a transaction wrote: the newest committed image it replaced and the image it installed
  * (§4.3 `before(w)` and `after(w)`); `None` is absent or deleted.
@@ -93,9 +94,31 @@ struct LogEntry
     pred: Pred
     key: Option[Value]
 
+/** A change `install` made to a slot, kept so that a statement that must wait can be undone: a
+ * version it pushed, or `t`'s own version it overwrote, with the version and the `after` of the
+ * write at `write_at` before it.
+ */
+struct Undo
+    slot: &Slot
+    pushed: bool
+    prev: RowVersion
+    write_at: usize
+    prev_after: Option[StoredRow]
+
+/** How much of a transaction's undo log, writes, lock-only locks and deferred checks existed when a
+ * statement (or one batch of its writes) began.
+ */
+struct Mark
+    undo: usize
+    writes: usize
+    locks: usize
+    deferred: usize
+
 /** A transaction: its id, level, whether it was declared read-only, its snapshot (at read committed,
  * the current statement's), its state, its predicate log (serializable only), its writes, one per
- * row, and the transaction whose row lock it is waiting for (0 for none).
+ * row, and the transaction whose row lock it is waiting for (0 for none); the rows it holds a
+ * lock on without having written them (`LOCK_ONLY`, `ddl.md` §2.6 rule 3), the foreign-key checks
+ * deferred to its commit, and the undo log and mark of its current statement.
  */
 struct Txn
     id: u64
@@ -106,6 +129,10 @@ struct Txn
     log: Buf[LogEntry]
     writes: Buf[Write]
     waits_for: u64
+    locks: Buf[&Slot]
+    deferred: Buf[Deferred]
+    undo: Buf[Undo]
+    mark: Mark
 
 /** A row a read returned: its key and its version visible to the reader. */
 struct Hit
@@ -153,7 +180,7 @@ struct Store
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
-        val t: &Txn = Txn(self.next_txid, level, read_only, self.horizon, Live, buf(), buf(), 0)
+        val t: &Txn = Txn(self.next_txid, level, read_only, self.horizon, Live, buf(), buf(), 0, buf(), buf(), buf(), Mark(0, 0, 0, 0))
         self.next_txid += 1
         self.active.push(t)
         t
@@ -163,6 +190,14 @@ struct Store
      */
     statement(*self, t: &Txn)
         if t.state == Live && t.level == ReadCommitted then t.snapshot = self.horizon
+        t.undo.clear()
+        t.mark = mark_of(t)
+
+    /** Undoes everything the current statement (begun by `statement`) wrote, locked and deferred, so
+     * that a statement answering `Wait` part-way leaves no trace and is simply run again (§4.2 rule
+     * 1). Its reads stay logged: logging only widens.
+     */
+    undo_statement(*self, t: &Txn) = undo_to(t, t.mark)
 
     /** The rows of `table` visible to `t` that satisfy `p`, logged under serializable (§4.4). */
     scan(*self, t: &Txn, table: u64, p: Pred) -> Result[Buf[Hit], CodecError]
@@ -180,16 +215,20 @@ struct Store
      * is `serialization_failure` at snapshot and serializable (§4.2 rule 4).
      */
     insert(*self, t: &Txn, table: u64, row: StoredRow) -> Result[WriteOutcome, CodecError]
+        val m = mark_of(t)
         val r = self.insert_in(t, table, row)
-        self.guard(t, r)
+        val checked = self.checked(t, table, m, r)
+        self.guard(t, checked)
 
     /** `UPDATE table SET … WHERE p`: every row visible to `t` that satisfies `p` is replaced by
      * `change` of it, encoded in schema version `version` (0: the table's current one). `p` must
      * name the columns `change` reads.
      */
     update_where(*self, t: &Txn, table: u64, p: Pred, change: &Fn(StoredRow) -> Value, version: u64 = 0) -> Result[WriteOutcome, CodecError]
+        val m = mark_of(t)
         val r = self.modify_in(t, table, p, Some(change), version)
-        self.guard(t, r)
+        val checked = self.checked(t, table, m, r)
+        self.guard(t, checked)
 
     /** `DELETE FROM table WHERE p`. */
     delete_where(*self, t: &Txn, table: u64, p: Pred) -> Result[WriteOutcome, CodecError]
@@ -207,11 +246,16 @@ struct Store
     /** One write statement's changes to `table`, which the executor computed from rows it read at
      * `t`'s snapshot: each a new row, a row replaced or a row removed, by key, applied in order under
      * §4.2. A statement answers `Wait` before writing any of them if one of their keys is locked by
-     * another transaction. A `Put` of a key visible to `t` is `unique_violation`.
+     * another transaction. A `Put` of a key visible to `t` is `unique_violation`. Once every change
+     * is applied, each row written is checked against the table's secondary unique keys
+     * (`unique_check`); a conflict with a row another live transaction is writing undoes the batch
+     * and answers `Wait`.
      */
     write_rows(*self, t: &Txn, table: u64, changes: Buf[RowChange]) -> Result[WriteOutcome, CodecError]
+        val m = mark_of(t)
         val r = self.write_rows_in(t, table, changes)
-        self.guard(t, r)
+        val checked = self.checked(t, table, m, r)
+        self.guard(t, checked)
 
     /** Whether `t` may run a statement: `W2001` once it has committed, `W2003` once it is aborted. */
     usable(self, t: &Txn) -> Result[unit, CodecError] = live(t)
@@ -236,7 +280,16 @@ struct Store
                 if code.len == 0 then return fail("W2003", "the transaction was rolled back")
                 return fail(code, "the transaction was aborted")
 
+        // The deferred foreign-key checks run first, so that a serializable transaction's reads
+        // among them are validated with the rest (`ddl.md` §2.6 rule 2).
+        self.check_deferred(t) match
+            Ok(_) -> ()
+            Err(e) ->
+                self.rollback(t, e.code)
+                return Err(e)
+
         if t.writes.len() == 0
+            release_locks(t)
             t.state = CommittedAt(t.snapshot)
             self.retire(t)
             return Ok(t.snapshot)
@@ -254,6 +307,7 @@ struct Store
             s.versions[top] = RowVersion(v.writer, c, v.row)
             s.lock = 0
 
+        release_locks(t)
         self.horizon = c
         t.state = CommittedAt(c)
         self.history.push(CommittedWrites(c, t.writes))
@@ -292,7 +346,7 @@ struct Store
         self.log_read(t, table, p, None)
         Ok(out)
 
-    private get_in(*self, t: &Txn, table: u64, key: Value) -> Result[Option[StoredRow], CodecError]
+    private[terndb] get_in(*self, t: &Txn, table: u64, key: Value) -> Result[Option[StoredRow], CodecError]
         live(t)?
         val d = self.table_data(table)?
         self.log_read(t, table, all_rows(), Some(key))
@@ -314,7 +368,7 @@ struct Store
         Ok(out)
 
     // A read is logged only by a serializable transaction not declared read-only (§4.3, §5.5).
-    private log_read(*self, t: &Txn, table: u64, p: Pred, key: Option[Value])
+    private[terndb] log_read(*self, t: &Txn, table: u64, p: Pred, key: Option[Value])
         if t.level == Serializable && !t.read_only then t.log.push(LogEntry(table, p, key))
 
     // -- writing ------------------------------------------------------------------------------------
@@ -336,7 +390,7 @@ struct Store
         if visible_row(s, t.snapshot, t.id).is_some() then return duplicate()
 
         // A key this transaction deleted is free for it again.
-        if s.lock == t.id then return self.install(t, d, s, Some(row))
+        if owns(s, t.id) then return self.install(t, d, s, Some(row))
 
         // A live key committed after the snapshot is a race at snapshot and serializable (rule 4); at
         // read committed the check reads the newest committed version, as rule 3 does.
@@ -371,7 +425,7 @@ struct Store
         var n: usize = 0
 
         for s in targets
-            val base = if s.lock == t.id
+            val base = if owns(s, t.id)
                 s.versions[s.versions.len() - 1].row
             elif t.level == ReadCommitted
                 // Rule 3: re-read the newest committed version and re-evaluate the predicate on it.
@@ -437,14 +491,20 @@ struct Store
     private install(*self, t: &Txn, d: &TableData, s: &Slot, after: Option[StoredRow]) -> Result[WriteOutcome, CodecError]
         t.waits_for = 0
 
-        if s.lock == t.id
+        // `t`'s own version is replaced in place; a row `t` only holds `LOCK_ONLY` gets its first
+        // version of `t` below, as any other row does.
+        if owns(s, t.id)
             val top = s.versions.len() - 1
-            s.versions[top] = RowVersion(t.id, 0, after)
 
             for i in 0..<t.writes.len()
                 val w = t.writes[i]
-                if w.table == d.oid && w.slot.key == s.key then t.writes[i] = Write(w.table, w.slot, w.before, after)
 
+                if w.table == d.oid && w.slot.key == s.key
+                    t.undo.push(Undo(s, false, s.versions[top], i, w.after))
+                    t.writes[i] = Write(w.table, w.slot, w.before, after)
+
+            s.versions[top] = RowVersion(t.id, 0, after)
+            index_image(self.catalog, d, s, after)
             return Ok(Done(1))
 
         var c: u64 = 0
@@ -468,12 +528,14 @@ struct Store
         s.versions.push(RowVersion(t.id, 0, after))
         s.lock = t.id
         t.writes.push(Write(d.oid, s, before, after))
+        t.undo.push(Undo(s, true, RowVersion(0, 0, None), 0, None))
+        index_image(self.catalog, d, s, after)
         Ok(Done(1))
     end install
 
     // `t` waits for `holder`. A wait that would close a cycle in the wait-for graph aborts `t`, the
     // transaction that closed it (§4.2 rule 1).
-    private wait_on(*self, t: &Txn, holder: u64) -> Result[WriteOutcome, CodecError]
+    private[terndb] wait_on(*self, t: &Txn, holder: u64) -> Result[WriteOutcome, CodecError]
         var h = holder
 
         while h != 0
@@ -523,7 +585,7 @@ struct Store
 
     // -- the catalog ------------------------------------------------------------------------------
 
-    private table_data(*self, oid: u64) -> Result[&TableData, CodecError]
+    private[terndb] table_data(*self, oid: u64) -> Result[&TableData, CodecError]
         for d in self.tables
             if d.oid == oid then return Ok(d)
 
@@ -539,7 +601,7 @@ struct Store
                 Some(c) -> fields.push(Field(c.name, c.ty))
                 None -> ()
 
-        val d: &TableData = TableData(oid, ct.primary_key.copy(), record(fields.view()), buf())
+        val d: &TableData = TableData(oid, ct.primary_key.copy(), record(fields.view()), buf(), buf())
         self.tables.push(d)
         Ok(d)
 
@@ -582,20 +644,21 @@ struct Store
     // -- ending -----------------------------------------------------------------------------------
 
     // Wraps an operation: any error inside a transaction aborts it with that error's code (§5.1).
-    private guard[T](*self, t: &Txn, r: Result[T, CodecError]) -> Result[T, CodecError] = r match
+    private[terndb] guard[T](*self, t: &Txn, r: Result[T, CodecError]) -> Result[T, CodecError] = r match
         Ok(v) -> Ok(v)
         Err(e) ->
             if t.state == Live then self.rollback(t, e.code)
             Err(e)
 
     // Undoes `t`'s writes, newest version of each of its rows first; none was ever visible.
-    private rollback(*self, t: &Txn, code: string)
+    private[terndb] rollback(*self, t: &Txn, code: string)
         for w in t.writes
             val s = w.slot
             if s.lock == t.id
                 val _ = s.versions.pop()
                 s.lock = 0
 
+        release_locks(t)
         t.state = AbortedWith(code)
         self.retire(t)
 
@@ -636,7 +699,7 @@ store_row(s: &Store, table: u64, value: Value) -> StoredRow
 
     StoredRow(v, value)
 
-private live(t: &Txn) -> Result[unit, CodecError] = t.state match
+private[terndb] live(t: &Txn) -> Result[unit, CodecError] = t.state match
     Live -> Ok(())
     CommittedAt(_) -> fail("W2001", "the transaction has already committed")
     AbortedWith(_) -> fail("W2003", "the transaction is aborted")
@@ -645,7 +708,7 @@ private duplicate[T]() -> Result[T, CodecError] = fail("T3001", "a row with this
 
 // The image of `s` that a reader with snapshot `snap` and id `me` sees: its own uncommitted version,
 // else the newest version committed at or before `snap` (§4.1). A deleted image is none.
-private visible_row(s: &Slot, snap: u64, me: u64) -> Option[StoredRow]
+private[terndb] visible_row(s: &Slot, snap: u64, me: u64) -> Option[StoredRow]
     var i = s.versions.len()
 
     while i > 0
@@ -659,7 +722,7 @@ private visible_row(s: &Slot, snap: u64, me: u64) -> Option[StoredRow]
 
     None
 
-private newest_committed(s: &Slot) -> Option[RowVersion]
+private[terndb] newest_committed(s: &Slot) -> Option[RowVersion]
     var i = s.versions.len()
 
     while i > 0
@@ -669,7 +732,7 @@ private newest_committed(s: &Slot) -> Option[RowVersion]
     None
 
 // Where `key` is among `d`'s slots, or where it would go.
-private locate(d: &TableData, key: Value) -> (bool, usize)
+private[terndb] locate(d: &TableData, key: Value) -> (bool, usize)
     var lo: usize = 0
     var hi = d.slots.len()
 
