@@ -1,0 +1,111 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `query-tree.md` §16.3, "Upsert with returning", run end to end against the store: type-checked,
+// planned, executed in a transaction, its result encoded as the result format's batches and decoded
+// again; and its refusals. The fixtures are in `exec_scan_tests.sysl`.
+
+private xu_inserted() -> Value = variant(0, rec([]))
+
+private xu_updated() -> Value = variant(1, rec([]))
+
+/** §16.3's statement with `($0, $1)`, committed in its own transaction. */
+private xu_run(s: &Store, key: string, n: i128) -> Executed
+    val t = s.begin(Serializable)
+    val o = xd_ran(s, t, upsert(), [Text(key), Int(n)])
+    assert(s.commit(t).is_ok())
+    o
+
+@test
+the_upsert_with_returning_inserts_then_updates()
+    val s = xd_store()
+    val first = xu_run(s, "hits", 1)
+    val action = union_of([Field("inserted", record([])), Field("updated", record([])), Field("deleted", record([]))])
+    val row = record([Field("key", Text), Field("n", Int64), Field("previous", nullable(Int64)), Field("action", action)])
+
+    first match
+        Ran(n, result, batches) ->
+            assert_eq(n, 1)
+            assert(result == Some(bag(row)), "§16.3's result type")
+            assert_eq(batches.len(), 1)
+        Blocked(_) -> assert(false, "the statement is blocked")
+
+    assert(xd_rows(first)[0] == rec([Text("hits"), Int(1), Null, xu_inserted()]))
+    assert(xd_rows(xu_run(s, "hits", 5))[0] == rec([Text("hits"), Int(6), Int(1), xu_updated()]))
+    // Another key is a new row again.
+    assert(xd_rows(xu_run(s, "misses", 2))[0] == rec([Text("misses"), Int(2), Null, xu_inserted()]))
+
+@test
+a_nullable_parameter_into_the_not_null_column_is_refused()
+    // §16.3: `$1: int64?` carried by a `Values` column `n: int64?` is `Q3005`; with the column left
+    // `int64`, the parameter is refused where it meets it, with `Q3001`.
+    val s = xd_store()
+    assert_eq(xd_code(s, s.begin(Snapshot), xu_nullable_delta(nullable(Int64)), [Text("hits"), Int(1)]), "Q3005")
+    assert_eq(xd_code(s, s.begin(Snapshot), xu_nullable_delta(Int64), [Text("hits"), Int(1)]), "Q3001")
+
+/** §16.3 with `$1: int64?` and the `Values` column `n` of type `column`. */
+private xu_nullable_delta(column: Type) -> Envelope
+    val env = upsert()
+    val source = Values("v", items_of([Field("key", Text), Field("n", column)]), items_of([items_of([Param(0), Param(1)])]))
+    val params = items_of([param("key", Text), param("delta", nullable(Int64))])
+
+    env.statement match
+        Insert(table, b, old, cols, _, oc, ret) -> Envelope(env.major, env.minor, params, Insert(table, b, old, cols, source, oc, ret), None)
+        _ -> env
+
+/** §16.3's upsert of many source rows, with `action` as given. */
+private xu_many(action: ConflictAction, keys: []const string) -> Envelope
+    val rows = buf[Buf[Expr]]()
+
+    for k in keys
+        rows.push(items_of([Literal(Text, Text(k)), Literal(Int64, Int(1))]))
+
+    val source = Values("v", items_of([Field("key", Text), Field("n", Int64)]), rows)
+    envelope([], Insert(cat_q("counters"), "t", Some("o"), items_of(["key", "n"]), source, Some(OnConflict(Columns(items_of(["key"])), "x", action)),
+        items_of([item("key", col("t", "key")), item("action", Action)])))
+
+@test
+do_nothing_skips_a_conflicting_row_and_does_not_count_it()
+    val s = xd_store()
+    val _ = xu_run(s, "a", 1)
+    val t = s.begin(Snapshot)
+    val o = xd_ran(s, t, xu_many(Nothing, ["a", "b", "b"]))
+    // `a` exists and `b`'s second row conflicts with its first: both are skipped.
+    assert_eq(xd_count(o), 1)
+    assert(xd_rows(o)[0] == rec([Text("b"), xu_inserted()]))
+
+@test
+an_upsert_updating_a_row_it_wrote_is_row_affected_twice()
+    val s = xd_store()
+    val set = items_of([item("n", call("add", [col("t", "n"), col("x", "n")]))])
+    val t = s.begin(Snapshot)
+    assert_eq(xd_code(s, t, xu_many(DoUpdate(set, None), ["a", "a"])), "R0007")
+    assert_eq(xd_rows(xd_ran(s, s.begin(Snapshot), query([], scan("app", "counters", "c")))).len(), 0)
+
+@test
+an_upsert_s_where_false_skips_the_row()
+    val s = xd_store()
+    val _ = xu_run(s, "a", 1)
+    val set = items_of([item("n", xd_int(99))])
+    val t = s.begin(Snapshot)
+    val o = xd_ran(s, t, xu_many(DoUpdate(set, Some(call("gt", [col("t", "n"), xd_int(5)]))), ["a"]))
+    assert_eq(xd_count(o), 0)
+
+    // A row this statement inserted, met again with a `where` that is not true, is skipped, not R0007.
+    val u = s.begin(Snapshot)
+    val again = xd_ran(s, u, xu_many(DoUpdate(set, Some(call("gt", [col("t", "n"), xd_int(5)]))), ["b", "b"]))
+    assert_eq(xd_count(again), 1)
+
+@test
+the_returning_rows_keep_the_statement_s_order_across_actions()
+    val s = xd_store()
+    val _ = xu_run(s, "b", 1)
+    val set = items_of([item("n", call("add", [col("t", "n"), col("x", "n")]))])
+    val t = s.begin(Snapshot)
+    val rows = xd_rows(xd_ran(s, t, xu_many(DoUpdate(set, None), ["a", "b", "c"])))
+    assert_eq(rows.len(), 3)
+    assert(rows[0] == rec([Text("a"), xu_inserted()]))
+    assert(rows[1] == rec([Text("b"), xu_updated()]))
+    assert(rows[2] == rec([Text("c"), xu_inserted()]))

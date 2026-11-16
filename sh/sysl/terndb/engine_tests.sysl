@@ -1,0 +1,315 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The engine driven through the wire: a real client and a real server session, joined by real
+// frames (the session tests' `Duo`), with an `EngineConn` behind the server. Every statement is sent
+// as an encoded tree envelope with an encoded parameter block, and every result is read back from
+// the `Batch` payloads the client accepted.
+
+/** An engine with an empty catalog: every table a test uses is made by DDL over the wire. */
+ew_engine() -> &Engine = engine(mem_catalog(), 1700000000000000)
+
+/** A connected client whose server session runs on `e`, as the bootstrap role. The `Duo`'s own fake
+ * engine is left unused.
+ */
+ew_duo(e: &Engine) -> Duo
+    val authority = sx_authority()
+    val pre = buf[u8]()
+    push_preface(pre)
+
+    var d = Duo(client_session(sx_client_config("alice", [ScramPlus]), 0), server_session(sx_server_config(), e.connect(BootstrapRole), authority, 0),
+        sx_engine(), authority, reassembler(Client), reassembler(Server), pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(),
+        false, false, None, None)
+    d.connect()
+    assert(d.connected(), "connected")
+    d
+
+/** The parameter block of one tuple, `values`, for `env`'s parameters. */
+ew_params(env: Envelope, tuples: []const Buf[Value]) -> Buf[u8]
+    val types = buf[Type]()
+    for p in env.params
+        types.push(p.ty)
+
+    val ts = buf[Buf[Value]]()
+    ts.extend(tuples)
+    encode_params(types.view(), Params(buf(), ts)).unwrap()
+
+/** `Execute` of `env` with one parameter tuple `values`, in `txn` (0: implicit). */
+ew_exec(txn: u64, env: Envelope, values: []const Value = [], options: ExecOptions = no_exec_options(), implicit: Option[TxnOptions] = None) -> Message
+    val tuple = buf[Value]()
+    tuple.extend(values)
+    ExecuteMsg(Execute(txn, implicit, options, encode_envelope(env).unwrap(), ew_params(env, [tuple]), None))
+
+/** What a response is, as one word: `header`, `batch`, `complete`, `begun`, `committed`, `ok`, or an
+ * error's code.
+ */
+ew_kind(m: Message) -> string = m match
+    ResultHeaderMsg(_) -> "header"
+    BatchReply(_) -> "batch"
+    Complete(_, _) -> "complete"
+    TxnBegun(_, _, _) -> "begun"
+    TxnCommitted(_, _) -> "committed"
+    OkReply -> "ok"
+    ErrorReply(e) -> e.entries[0].code
+    _ -> s"type ${m.type_code()}"
+
+/** The kinds of `ms`, space-separated, with a run of batches written once as `batch`. */
+ew_kinds(ms: Buf[Message]) -> string
+    var out = ""
+    var last = ""
+
+    for m in ms
+        val k = ew_kind(m)
+        if k == "batch" && last == "batch" then continue
+        last = k
+        out = if out.len == 0 then k else s"$out $k"
+
+    out
+
+/** The result type the `ResultHeader` among `ms` names. */
+ew_type(ms: Buf[Message]) -> Option[Type]
+    for m in ms
+        m match
+            ResultHeaderMsg(h) -> return h.result_type
+            _ -> ()
+
+    None
+
+/** The batch payloads among `ms`. */
+ew_batches(ms: Buf[Message]) -> Buf[Buf[u8]]
+    val out = buf[Buf[u8]]()
+    for m in ms
+        m match
+            BatchReply(p) -> out.push(p)
+            _ -> ()
+    out
+
+/** The rows of the result among `ms`, decoded from its batches by its header's type. */
+ew_rows(ms: Buf[Message]) -> Buf[Value]
+    val out = buf[Value]()
+    val ty = ew_type(ms)
+    if ty.is_none() then return out
+
+    val tree = column_tree(ty.unwrap()).unwrap()
+    for b in ew_batches(ms)
+        out.extend(decode_batch(tree, b.view()).unwrap().rows().view())
+
+    out
+
+/** `Complete`'s counts and commit among `ms`. */
+ew_complete(ms: Buf[Message]) -> (Buf[u64], Option[u64])
+    for m in ms
+        m match
+            Complete(counts, commit) -> return (counts, commit)
+            _ -> ()
+
+    assert(false, "a Complete")
+    (buf(), None)
+
+/** The `Error` among `ms`. */
+ew_error(ms: Buf[Message]) -> WireError
+    for m in ms
+        m match
+            ErrorReply(e) -> return e
+            _ -> ()
+
+    assert(false, "an Error")
+    WireError(buf(), false, Unaffected, None, None)
+
+/** `{f, …}` columns of a table. */
+ew_cols(fields: []const Field) -> Buf[ColumnDef]
+    val out = buf[ColumnDef]()
+    for f in fields
+        out.push(cat_col(f.name, f.ty))
+    out
+
+/** `insert into app.<table> (<fields>) values <rows>`, each row a record of `fields`' types. */
+ew_insert(table: string, fields: []const Field, rows: []const Value) -> Envelope
+    val names = buf[string]()
+    val cols = buf[Field]()
+
+    for f in fields
+        names.push(f.name)
+        cols.push(f)
+
+    val exprs = buf[Buf[Expr]]()
+
+    for r in rows
+        val row = buf[Expr]()
+        r match
+            Record(vs) ->
+                for i in 0..<fields.len
+                    row.push(Literal(fields[i].ty, vs[i]))
+            _ -> ()
+        exprs.push(row)
+
+    envelope([], Insert(cat_q(table), "t", None, names, Values("v", cols, exprs), None, buf[Item]()))
+
+/** Each of `envs` sent over a connection of its own to `e`, in an implicit transaction, each of which
+ * must complete.
+ */
+ew_setup(e: &Engine, envs: []const Envelope, file: string = __FILE__, line: long = __LINE__)
+    var d = ew_duo(e)
+
+    for env in envs
+        val kinds = ew_kinds(d.seen(d.send(ew_exec(0, env))))
+        assert(kinds == "header complete" || kinds == "header batch complete", s"the statement completes: $kinds", file, line)
+
+/** `create table app.<name> (<fields>) primary key (<key>)`. */
+ew_table(name: string, fields: []const Field, key: string) -> Envelope =
+    envelope([], CreateTable(cat_q(name), ew_cols(fields), items_of([key]), buf(), false))
+
+ew_app() -> Envelope = envelope([], CreateNamespace("app", false))
+
+// -- the §16.1 schema, made by DDL --------------------------------------------------------------
+
+ew_users() -> [2]Field = [Field("id", Int64), Field("name", Text)]
+
+ew_posts() -> [4]Field = [Field("id", Int64), Field("author_id", Int64), Field("title", Text), Field("created_at", Timestamp)]
+
+ew_comments() -> [3]Field = [Field("id", Int64), Field("post_id", Int64), Field("body", Text)]
+
+/** An engine holding namespace `app` and §16.1's three tables, created over the wire, then three
+ * users; ann has five posts, two made at one instant, bo none and cy one.
+ */
+ew_blog() -> &Engine
+    val e = ew_engine()
+    ew_setup(e, [ew_app(), ew_table("users", ew_users(), "id"), ew_table("posts", ew_posts(), "id"), ew_table("comments", ew_comments(), "id"),
+        ew_insert("users", ew_users(), [rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")]), rec([Int(3), Text("cy")])]),
+        ew_insert("posts", ew_posts(), [
+            ew_post(10, 1, "a", 100), ew_post(11, 1, "b", 300), ew_post(12, 1, "c", 200), ew_post(13, 1, "d", 400),
+            ew_post(14, 3, "e", 50), ew_post(15, 1, "f", 300)]),
+        ew_insert("comments", ew_comments(), [
+            ew_comment(100, 13, "x"), ew_comment(101, 13, "y"), ew_comment(102, 11, "z"), ew_comment(103, 10, "w"), ew_comment(104, 14, "q")])])
+    e
+
+ew_post(id: i128, author: i128, title: string, at: i128) -> Value = rec([Int(id), Int(author), Text(title), Int(at)])
+
+ew_comment(id: i128, post: i128, body: string) -> Value = rec([Int(id), Int(post), Text(body)])
+
+ew_p(id: i128, title: string, comments: []const Value) -> Value
+    val cs = buf[Value]()
+    cs.extend(comments)
+    rec([Int(id), Text(title), Relation(cs)])
+
+ew_c(id: i128, body: string) -> Value = rec([Int(id), Text(body)])
+
+@test
+ddl_inserts_and_the_nested_query_run_over_the_wire()
+    var d = ew_duo(ew_blog())
+
+    val s = d.send(ew_exec(0, users_and_posts(), [Int(3), Int(3)]))
+    val got = d.seen(s)
+    assert_eq(ew_kinds(got), "header batch complete")
+
+    val comment = record([Field("id", Int64), Field("body", Text)])
+    val post = record([Field("id", Int64), Field("title", Text), Field("comments", bag(comment))])
+    val user = record([Field("id", Int64), Field("name", Text), Field("post_count", Int64), Field("posts", list(post))])
+    assert(ew_type(got) == Some(list(user)), "§16.1's result type")
+
+    // ann's posts newest first, ties by id descending: 13 (400), 15 and 11 (300).
+    val ann = rec([Int(1), Text("ann"), Int(5), rel([ew_p(13, "d", [ew_c(100, "x"), ew_c(101, "y")]), ew_p(15, "f", []), ew_p(11, "b", [ew_c(102, "z")])])])
+    val bo = rec([Int(2), Text("bo"), Int(0), rel([])])
+    val cy = rec([Int(3), Text("cy"), Int(1), rel([ew_p(14, "e", [ew_c(104, "q")])])])
+    assert(same(list(user), Relation(ew_rows(got)), rel([ann, bo, cy])), "the nested result")
+
+    val (counts, commit) = ew_complete(got)
+    assert(counts.len() == 1 && counts[0] == 3, "three top-level rows")
+    assert(commit.is_none(), "a read commits nothing")
+
+@test
+ddl_answers_no_result_and_a_count_of_zero()
+    var d = ew_duo(ew_engine())
+    val s = d.send(ew_exec(0, envelope([], CreateNamespace("app", false))))
+    val got = d.seen(s)
+    assert_eq(ew_kinds(got), "header complete")
+    assert(ew_type(got).is_none(), "no result type")
+    assert(ew_complete(got).0[0] == 0, "count 0")
+
+    // The catalog moved, and a second create of the name is refused with its DDL code.
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, envelope([], CreateNamespace("app", false)))))), "Q6002")
+
+@test
+a_dropped_table_takes_its_rows_with_it()
+    val e = ew_blog()
+    var d = ew_duo(e)
+    val before = e.store.tables.len()
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, envelope([], DropTable(cat_q("comments"), false, false)))))), "header complete")
+    assert_eq(e.store.tables.len(), before - 1)
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, users_and_posts(), [Int(3), Int(3)])))), "Q2001")
+
+// -- §16.3 ------------------------------------------------------------------------------------
+
+/** A connection to an engine holding §16.3's `counters (key text, n int64)`. */
+ew_counters() -> Duo
+    val e = ew_engine()
+    ew_setup(e, [ew_app(), ew_table("counters", [Field("key", Text), Field("n", Int64)], "key")])
+    ew_duo(e)
+
+ew_inserted() -> Value = variant(0, rec([]))
+
+ew_updated() -> Value = variant(1, rec([]))
+
+@test
+the_upsert_with_returning_inserts_then_updates_over_the_wire()
+    var d = ew_counters()
+
+    val first = d.seen(d.send(ew_exec(0, upsert(), [Text("hits"), Int(1)])))
+    assert_eq(ew_kinds(first), "header batch complete")
+    assert(ew_rows(first)[0] == rec([Text("hits"), Int(1), Null, ew_inserted()]), "inserted")
+    val (counts, commit) = ew_complete(first)
+    assert(counts[0] == 1 && commit.is_some(), "one row, committed")
+
+    val second = d.seen(d.send(ew_exec(0, upsert(), [Text("hits"), Int(5)])))
+    assert(ew_rows(second)[0] == rec([Text("hits"), Int(6), Int(1), ew_updated()]), "updated")
+    assert(ew_complete(second).1.unwrap() > commit.unwrap(), "a later commit")
+
+@test
+a_parameter_batch_runs_each_tuple_and_keeps_their_results_apart()
+    var d = ew_counters()
+    val env = upsert()
+    val t0 = buf[Value]()
+    t0.extend([Text("a"), Int(1)])
+    val t1 = buf[Value]()
+    t1.extend([Text("a"), Int(2)])
+    val m = ExecuteMsg(Execute(0, None, no_exec_options(), encode_envelope(env).unwrap(), ew_params(env, [t0, t1]), None))
+
+    val got = d.seen(d.send(m))
+    assert_eq(ew_kinds(got), "header batch complete")
+    val batches = ew_batches(got)
+    assert_eq(batches.len(), 2)
+    // Each batch's leading `uvar` is its tuple (§6.4).
+    assert(batches[0][0] == 0 && batches[1][0] == 1, "labelled by tuple")
+    assert(ew_rows(got)[1] == rec([Text("a"), Int(3), Int(1), ew_updated()]), "the second tuple sees the first")
+    val counts = ew_complete(got).0
+    assert(counts.len() == 2 && counts[0] == 1 && counts[1] == 1, "one count per tuple")
+
+@test
+a_parameter_block_that_does_not_decode_is_refused_before_the_header()
+    var d = ew_counters()
+    // One tuple and no columnar list, but neither of the two values.
+    val block = buf[u8]()
+    block.extend([1u8, 0u8])
+    val m = ExecuteMsg(Execute(0, None, no_exec_options(), encode_envelope(upsert()).unwrap(), block, None))
+    val e = ew_error(d.seen(d.send(m)))
+    assert_eq(e.entries[0].code, "Q1001")
+    assert(e.entries[0].path.starts_with("/params"), "at the parameters")
+    assert(e.txn_state == Unaffected, "nothing ran")
+
+@test
+a_prepared_statement_runs_again_by_its_handle()
+    var d = ew_counters()
+    val tree = encode_envelope(upsert()).unwrap()
+    assert_eq(ew_kinds(d.seen(d.send(Prepare(7, tree)))), "type 144")
+
+    val t = buf[Value]()
+    t.extend([Text("k"), Int(4)])
+    val m = ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByHandle(7), ew_params(upsert(), [t])))
+    assert(ew_rows(d.seen(d.send(m)))[0] == rec([Text("k"), Int(4), Null, ew_inserted()]), "ran by handle")
+
+    // By digest, from the role's plan cache, which the first run filled.
+    val shape = shape_digest(upsert()).unwrap()
+    val by_digest = ExecutePreparedMsg(ExecutePrepared(0, None, no_exec_options(), ByDigest(shape), ew_params(upsert(), [t])))
+    assert(ew_rows(d.seen(d.send(by_digest)))[0] == rec([Text("k"), Int(8), Int(4), ew_updated()]), "ran by digest")

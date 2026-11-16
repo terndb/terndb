@@ -1,0 +1,185 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The shape a recursive `With` must have (`query-tree.md` §6.13 rule 3): every CTE a `union` whose
+// seed does not reference it and whose other inputs reference it exactly once, never where a step's
+// rows could not be computed from the previous step's alone, and no CTE reaching itself through
+// another.
+
+/** The references to CTE `name` in a tree, and whether one stands where recursion may not reach. */
+private struct RefCount
+    name: string
+    count: usize
+    banned: bool
+
+    rel(*self, r: Rel, banned: bool)
+        r match
+            Scan(_, _) | ParamScan(_, _) -> ()
+            Values(_, _, rows) ->
+                for row in rows
+                    self.exprs(row)
+            Filter(input, p) ->
+                self.rel(*input, banned)
+                self.expr(p)
+            Project(input, _, items) ->
+                self.rel(*input, banned)
+                self.items(items)
+            Join(kind, left, right, on, _, _) ->
+                self.rel(*left, banned || kind == Right || kind == Full)
+                self.rel(*right, banned || kind == Left || kind == Full || kind == Anti || kind == SingleJoin)
+                self.opt(on)
+            Apply(kind, left, right, on, _, _) ->
+                self.rel(*left, banned)
+                self.rel(*right, banned || kind == Outer || kind == AntiApply || kind == SingleApply)
+                self.opt(on)
+            Aggregate(input, _, keys, aggs) ->
+                self.rel(*input, true)
+                self.items(keys)
+
+                for a in aggs
+                    self.exprs(a.call.args)
+                    self.opt(a.call.filter)
+                    self.keys(a.call.order)
+            Window(input, _, items) ->
+                self.rel(*input, banned)
+
+                for it in items
+                    self.exprs(it.call.args)
+                    self.exprs(it.call.partition)
+                    self.keys(it.call.order)
+
+                    it.call.frame match
+                        Some(f) ->
+                            self.opt(f.start.offset)
+                            self.opt(f.end.offset)
+                        None -> ()
+            Sort(input, keys) ->
+                self.rel(*input, banned)
+                self.keys(keys)
+            Limit(input, count, offset, _, _) ->
+                self.rel(*input, banned)
+                self.opt(count)
+                self.opt(offset)
+            Distinct(input) -> self.rel(*input, true)
+            SetOp(_, _, _, inputs) ->
+                for i in inputs
+                    self.rel(i, banned)
+            With(recursive, ctes, body) ->
+                // A With that defines the name hides it: everywhere if recursive, and after the
+                // defining CTE otherwise (§6.13 rule 1).
+                for c in ctes
+                    if recursive && c.name == self.name then return
+
+                for c in ctes
+                    self.rel(c.rel, banned)
+
+                    if c.name == self.name then return
+
+                self.rel(*body, banned)
+            CteRef(n, _) ->
+                if n == self.name
+                    self.count += 1
+
+                    if banned then self.banned = true
+            Nest(input, _, keys, _, items, order) ->
+                self.rel(*input, true)
+                self.items(keys)
+                self.items(items)
+                self.keys(order)
+            Unnest(input, _, value, _, _) ->
+                self.rel(*input, banned)
+                self.expr(value)
+            Tag(input, _, _, _) -> self.rel(*input, banned)
+    end rel
+
+    /** A reference inside an expression is inside a subquery, which recursion may not reach. */
+    expr(*self, e: Expr)
+        e match
+            Call(_, args) -> self.exprs(args)
+            Cast(x, _, _) | Field(x, _) | Variant(_, _, x) -> self.expr(*x)
+            If(arms, otherwise) ->
+                for a in arms
+                    self.expr(a.cond)
+                    self.expr(a.value)
+
+                self.opt_ref(otherwise)
+            Match(x, arms, otherwise) ->
+                self.expr(*x)
+
+                for a in arms
+                    self.expr(a.expr)
+
+                self.opt_ref(otherwise)
+            Record(fields) -> self.items(fields)
+            Relation(r) | Scalar(r) | Exists(r) -> self.rel(*r, true)
+            In(es, r) ->
+                self.exprs(es)
+                self.rel(*r, true)
+            _ -> ()
+
+    exprs(*self, es: Buf[Expr])
+        for e in es
+            self.expr(e)
+
+    items(*self, items: Buf[Item])
+        for it in items
+            self.expr(it.expr)
+
+    keys(*self, keys: Buf[SortKey])
+        for k in keys
+            self.expr(k.expr)
+
+    opt(*self, e: Option[Expr])
+        e match
+            Some(x) -> self.expr(x)
+            None -> ()
+
+    opt_ref(*self, e: Option[&Expr])
+        e match
+            Some(x) -> self.expr(*x)
+            None -> ()
+end RefCount
+
+/** The references to `name` in `r`, and whether one is banned (§6.13 rule 3). */
+private refs_to(r: Rel, name: string) -> (usize, bool)
+    var c = RefCount(name, 0, false)
+    c.rel(r, false)
+    (c.count, c.banned)
+
+/** Why the CTEs of a recursive `With` do not have §6.13 rule 3's shape, or `None` if they do. */
+private[terndb] recursion_problem(ctes: Buf[CteDef]) -> Option[string]
+    val n = ctes.len()
+
+    for c in ctes
+        val inputs = c.rel match
+            SetOp(Union, _, _, inputs) -> inputs
+            _ -> return Some(s"recursive CTE '${c.name}' is not a union")
+
+        if inputs.len() == 0 then return Some(s"recursive CTE '${c.name}' has no seed")
+
+        if refs_to(inputs[0], c.name).0 > 0 then return Some(s"the seed of recursive CTE '${c.name}' references it")
+
+        for k in 1..<inputs.len()
+            val (count, banned) = refs_to(inputs[k], c.name)
+
+            if count != 1 then return Some(s"input $k of recursive CTE '${c.name}' references it $count times, not once")
+            if banned then return Some(s"input $k of recursive CTE '${c.name}' references it under an aggregate, a distinct, an outer join's null side, an anti join's right side or a subquery")
+
+    // Mutual recursion: a CTE reaching itself through others.
+    val reach = buf[bool]()
+
+    for i in 0..<n
+        for j in 0..<n
+            reach.push(i != j && refs_to(ctes[i].rel, ctes[j].name).0 > 0)
+
+    for k in 0..<n
+        for i in 0..<n
+            for j in 0..<n
+                if reach[i * n + k] && reach[k * n + j] then reach[i * n + j] = true
+
+    for i in 0..<n
+        if reach[i * n + i] then return Some(s"recursive CTE '${ctes[i].name}' is mutually recursive")
+
+    None
+end recursion_problem

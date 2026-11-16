@@ -13,7 +13,7 @@ import sysl.buf.{Buf, buf}
 
 /** A correlated subtree, kept to be planned once per outer row: the relation, the type checker's
  * types and where the subtree's own begin, the tables, and the outer rows already bound where the
- * subtree was found, one row per binder.
+ * subtree was found, one row per binder, and the store it reads, if the statement runs in one.
  */
 struct SubPlan
     rel: Rel
@@ -21,6 +21,9 @@ struct SubPlan
     at: usize
     tables: Buf[MemTable]
     outer: Buf[Binder]
+    /** The CTEs in scope where the subtree stands (`exec_setop.sysl`). */
+    ctes: Buf[CteFrame]
+    db: Option[Db]
 
 // -- correlated references ----------------------------------------------------------------------
 

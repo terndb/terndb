@@ -1,0 +1,80 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `query-tree.md` §16.2 — a search over posts and photos as a list of union elements — type-checked,
+// planned, executed, encoded as the result format's batches and decoded again; and its projection
+// that reads variant fields through `Match`.
+
+private xu_tables() -> [2]XnTable = [
+    xn_table("posts", [Field("id", Int64), Field("created_at", Timestamp), Field("title", Text)], rows_of([
+        rec([Int(1), Int(100), Text("sql tips")]), rec([Int(2), Int(300), Text("cats")]), rec([Int(3), Int(200), Text("more sql")])]), 2),
+    xn_table("photos", [Field("id", Int64), Field("created_at", Timestamp), Field("url", Text), Field("caption", Text)], rows_of([
+        rec([Int(4), Int(300), Text("u4"), Text("a sql cat")]), rec([Int(5), Int(50), Text("u5"), Text("dog")]),
+        rec([Int(6), Int(200), Text("u6"), Text("sql")])]), 2)]
+
+private xu_post(id: i128, at: i128, title: string) -> Value = variant(0, rec([Int(id), Int(at), Text(title)]))
+
+private xu_photo(id: i128, at: i128, url: string) -> Value = variant(1, rec([Int(id), Int(at), Text(url)]))
+
+/** What §16.2 means over `xu_tables` for "sql": newest first, ties by id ascending, the first `first`. */
+private xu_expected(first: usize) -> Buf[Value]
+    val all = [xu_photo(4, 300, "u4"), xu_post(3, 200, "more sql"), xu_photo(6, 200, "u6"), xu_post(1, 100, "sql tips")]
+    val out = buf[Value]()
+
+    for i in 0..<first
+        out.push(all[i])
+
+    out
+
+@test
+the_search_query_runs_and_its_result_decodes()
+    for (first, want) in [(10i128, 4usize), (2i128, 2usize)]
+        val (result, batches) = run_query(search(), xn_catalog(xu_tables()), xe_ctx([Text("sql"), Int(first)]), xn_mem(xu_tables())).unwrap()
+        val rows = buf[Value]()
+
+        for payload in batches
+            rows.extend(decode_batch(column_tree(result).unwrap(), payload.view()).unwrap().rows().view())
+
+        assert(result == list(search_result()), "§16.2's result type, list<SR>")
+        assert_eq(batches.len(), 1)
+        // A list compares in order.
+        assert(same(result, Relation(rows), Relation(xu_expected(want))), s"the first $first results")
+
+@test
+the_search_query_runs_against_the_type_checker_s_catalog()
+    val q = search()
+    val typing = type_envelope(q, fake()).unwrap()
+    val root = plan_query(q, typing, xe_ctx([Text("sql"), Int(10)]), xn_mem(xu_tables()))
+    val rows = values_of(drain_rows(root.op, root.elem).unwrap())
+    assert(same(typing.result.unwrap(), Relation(rows), Relation(xu_expected(4))))
+
+/** §16.2's projection over the search: each result's id and its title or url. */
+private xu_labels(arms: []const MatchArm) -> Envelope
+    val inner = search()
+    val r = inner.statement match
+        Query(x) -> x
+        _ -> panic("§16.2 is a query")
+
+    query([param("q", Text), param("first", Int64)], project(r, "out", [item("id", col("s", "id")), item("label", Match(Row("s"), items_of(arms), None))]))
+
+@test
+the_match_projection_reads_each_variant_s_field()
+    val env = xu_labels([MatchArm("Post", "x", col("x", "title")), MatchArm("Photo", "y", col("y", "url"))])
+    val (result, batches) = run_query(env, xn_catalog(xu_tables()), xe_ctx([Text("sql"), Int(10)]), xn_mem(xu_tables())).unwrap()
+    val rows = buf[Value]()
+
+    for payload in batches
+        rows.extend(decode_batch(column_tree(result).unwrap(), payload.view()).unwrap().rows().view())
+
+    val want = rows_of([rec([Int(4), Text("u4")]), rec([Int(3), Text("more sql")]), rec([Int(6), Text("u6")]), rec([Int(1), Text("sql tips")])])
+    assert(result == list(record([Field("id", Int64), Field("label", Text)])))
+    assert(rows == want)
+
+@test
+the_match_projection_without_the_photo_arm_is_q3009()
+    val env = xu_labels([MatchArm("Post", "x", col("x", "title"))])
+    type_envelope(env, xn_catalog(xu_tables())) match
+        Ok(_) -> assert(false, "a Match missing an arm is refused")
+        Err(e) -> assert_eq(e.code, "Q3009")

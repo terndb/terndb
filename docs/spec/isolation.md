@@ -338,6 +338,13 @@ contributes to the result), then `P ⇒ L`. `L` MAY be wider than `P`; it MUST N
 | aggregate over a scan | the scan's predicate |
 | join, semi-join or anti-join | each input's own scan predicate; an index-nested-loop probe logs each probe key, or the probed side's restriction |
 | catalog lookup of table `t` (every access to `t`) | the catalog entry of `t` (§5.6) |
+| an `Update`'s or `Delete`'s target rows | its `filter` (`true` with `from`/`using`, whose own scans are logged as inputs of a join) |
+| an upsert's conflict check of key `k` | `key = k`, found or not |
+
+A read's `C` is every column of the table the statement names through the read's binder (or the
+target's `old`); a scan whose rows reach the statement's result, a whole-row comparison (`Distinct`,
+a set operation, `Tag`) or a subquery's result whole, or that is named whole (`Row`), uses every
+column.
 
 When `L_i` exceeds `max_predicate_log` entries, the implementation MAY coarsen entries (merge ranges, drop
 residual filters, widen to `true` on a table). Coarsening MUST only widen.

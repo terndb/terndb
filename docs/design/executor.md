@@ -6,12 +6,14 @@ executor computes it. Where it states a rule of meaning it cites the section it 
 `query-tree.md` was silent about something the executor has to decide at run time, the rule was
 written into `query-tree.md` itself, and this note points at it.
 
-The code is `sh/sysl/terndb/exec_*.sysl`. This first slice covers what does not depend on storage:
-column vectors, expression evaluation, and the operators `Values`, `ParamScan`, `Filter`,
-`Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Tag`, `Join` (§4.1), and `Nest`, `Unnest`,
-`Apply` with the subquery expressions (§4.2), `Window` (§4.3), a source over in-memory batches
-standing in for `Scan`, and the conversion of an operator's output into result batches. Set
-operations, DML, storage, MVCC and the unnesting planner come later.
+The code is `sh/sysl/terndb/exec_*.sysl`. It covers column vectors, expression evaluation, and the
+operators `Values`, `ParamScan`, `Filter`, `Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`,
+`Tag`, `Join` (§4.1), and `Nest`, `Unnest`, `Apply` with the subquery expressions (§4.2), `Window`
+(§4.3), `SetOp`, `With` and `CteRef` with recursive CTEs (§4.4), `Scan` over the in-memory MVCC
+store and the DML statements `Insert` (with upsert), `Update` and `Delete` run in a store
+transaction (§4.5), a source over in-memory batches standing in for `Scan` where no store is given,
+and the conversion of an operator's output into result batches. Views, identity columns, disk
+storage and the unnesting planner come later.
 
 ## 1. Column vectors
 
@@ -329,10 +331,72 @@ binders and the window's record, one member per call.
 Hash partitioning, which would need no sort of the partition values, waits on a fast seeded hash
 (the survey's gap, as for `Distinct` and `Aggregate`).
 
+### 4.4 Set operations and CTEs
+
+The code is `exec_setop.sysl`, with the shape check for recursion in `qtree_recursion.sysl`.
+
+- **SetOp** (§6.12) coerces every input's batches positionally to the output element type
+  (`drain_coerced`). `union all` streams its inputs in order, one batch at a time. Every other
+  combination is sort-based and blocking: the inputs are drained and laid end to end, the rows are
+  ordered by `Sort`'s stable comparator over every column (`row_orders`, shared with `Distinct`), and
+  each run of `same` rows keeps a count of its first rows computed from how many each input holds
+  (`copies_of`). Because the sort is stable and the inputs are laid in order, the rows kept by
+  `intersect` and `except` are the first input's. Hashing waits on the survey's fast seeded hash.
+- **With** frames each CTE as a `CteStore` in scope while its later CTEs (or, for a recursive `With`,
+  all of them) and its body are planned. A store holds the CTE's planned operator and drains it on the
+  first read only, so every `CteRef` sees one value (§6.13 rule 2) and an unread CTE is never run.
+  **CteRef** is a `CteScanOp` over its store's batches, coerced to the reference's element type.
+- **Recursive CTEs** are a `RecursiveOp`: the seed is planned once; each recursive input is kept as a
+  `SubPlan` and planned again at every step, with the CTE's frame bound to a store holding only the
+  previous step's new rows. Without `all`, a step's rows are cut by a set `except` against every row
+  found so far. The loop ends on a step with no new rows, and the 10001st step that yields new rows is
+  `R0005` (`RecursionSteps`).
+- **Operators keep what they read.** A store is an `&Operator` reachable from a `SubPlan`, so the
+  `Operator` trait's `next_batch` carries `@keeps(self)`: an operator keeps the children and stores it
+  reads through `self` beyond the call.
+
+### 4.5 The store: Scan and DML
+
+The code is `exec_scan.sysl` and `exec_dml.sysl`; `run_statement` runs an envelope in a store
+transaction (`docs/design/store.md`) and answers `Ran` (the row count and, with a result, its batches)
+or `Blocked` on a row lock. At read committed it first takes the statement's snapshot. Any error —
+validation, runtime, a constraint, the store's — aborts the transaction with its code
+(`isolation.md` §5.1); a statement on an ended transaction is `W2001` or `W2003`.
+
+- **Scan** (§6.1): `ScanOp` reads every row visible at the snapshot from the store on its first pull,
+  in key order, and hands it up in `BatchSize` batches. A correlated scan is planned again per outer
+  row (§4.2) and so read and logged once per row.
+- **The logged predicate** (`isolation.md` §4.4). A `Filter` directly over a `Scan` is the scan's
+  logged predicate unless it holds a subquery: the store keeps it as a closure that evaluates the
+  typed filter on a one-row vector of a write image, counting an error or an image of another schema
+  version as a match, which only widens it. The filter itself still runs vectorised as a `FilterOp`.
+  Before planning, the statement is walked once for what each binder reads (`Uses`): the columns
+  named through it (`C`), and whether its rows reach a result, a whole-row operator or a subquery
+  whole, which reads every column. A projection, aggregate or nest above a scan narrows it to the
+  columns their expressions name.
+- **DML** (§9). A statement reads everything first and writes last (§9.1). `Update`/`Delete` scan the
+  target (logging `filter` when there is no `from`/`using`), join `from`/`using` by `filter` with
+  `plan_join` or filter the scan, refuse a target key matched twice (`R0007`), evaluate `set` over the
+  matched rows vectorised, and coerce each value into its column. `Insert` drains its source, places
+  each column by name with its default (evaluated per row) or null (`Q3005` for a NOT NULL column with
+  neither). An upsert walks the source rows in order: a key this statement already wrote conflicts with
+  that write, any other is looked up in the store (a logged point read), and `where` and `set` are
+  evaluated over the one row with `as` and `excluded` bound. Generated columns are computed for
+  inserted rows and for updated rows when they read a set column; check constraints run on inserted
+  rows and on updated rows when they read a changed column (`T3002`), and NOT NULL on every written
+  row (`T3004`). Definition expressions run as a `Project` over the rows passed as a relation-valued
+  parameter, type-checked against the catalog. `returning` runs before the writes, grouped by action
+  so that `Action()` is one parameter per group, and is put back in statement order with one `take`.
+  The writes go to the store as one `write_rows` call, removals first (§9.4 rule 4).
+
+Not yet: views read through the store, identity columns (`next_value`), unique constraints other than
+the primary key as an upsert target, foreign keys, and translation of a row of an older schema version
+(`ddl.md` §5.3).
+
 ## 5. What this note relies on in `query-tree.md`
 
 §3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
-the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.11, §6.14 and §6.15 for
+the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.15 for
 the operators; §7.1–§7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
 its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
 `and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the calendar `add`
@@ -342,7 +406,13 @@ group's key, `filter`, `distinct`, and the values of `sum`, `min`, `max` and `st
 rows, and an `Unnest` without `outer` of an empty or null relation (§6.14 rules 1 and 2); and a
 window's partitions, peers, ranking, `lag`/`lead` offsets, default frame, the meaning of each frame
 unit and exclusion, `range` offsets over every key type, and when offsets are evaluated and refused
-(§6.8 rules 1–5).
+(§6.8 rules 1–5); a set operation's left fold and its nulls as duplicates (§6.12); that an unread
+CTE is never evaluated, the places a recursive reference may not stand, and the 10000-step bound
+(§6.13 rules 2–4); and a DML statement's visibility of its own writes and when it waits (§9.1), an
+upsert's conflict with a row the same statement wrote (§9.3 rule 3), a primary-key update (§9.4 rule
+4), and when `returning` is evaluated (§9.5). From `isolation.md`: §4.1–§4.4 for scans and their
+logged predicates, to whose §4.4 table this work added a DML statement's target rows and an upsert's
+conflict check, and the columns `C` a read uses.
 
 ## 6. Where the survey's sysl gaps cost speed
 

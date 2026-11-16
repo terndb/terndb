@@ -1,8 +1,8 @@
 # The in-memory store
 
 `sh/sysl/terndb/store.sysl` is the table store of the in-memory mode and its multi-version concurrency control:
-`isolation.md` §4.1–§4.5 and the abort rules and codes of §5. It is a library; nothing in the executor calls it
-yet. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
+`isolation.md` §4.1–§4.5 and the abort rules and codes of §5. The executor runs statements against it
+(`executor.md` §4.5) through `scan_rows`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
 workloads at each level, and each forbidden anomaly again on a fault-injected store).
 
 ## Structure
@@ -36,6 +36,20 @@ waiter with `deadlock_detected`. At snapshot and serializable a write over a new
 the snapshot aborts with `serialization_failure` (rule 2); at read committed the statement re-reads the newest
 committed version, re-evaluates its predicate on it and applies its change to it (rule 3). A write in a schema
 version older than the newest committed image's aborts with `schema_changed` (`ddl.md` §5.4 rule 3).
+
+## What the executor calls
+
+- **`scan_rows(t, table, logged)`** answers every row visible to `t` and logs `logged`; the executor filters the
+  rows itself, vectorised, so the predicate's closure runs only in validation.
+- **`write_rows(t, table, changes)`** applies one statement's writes, each a `RowChange`: `Put` a new row (an
+  insert, under §4.2 rule 4), `Replace` or `Remove` the row of a key the statement read. It answers `Wait`
+  before writing any of them if one key is locked, so a waited statement leaves no trace. The executor orders
+  removals first, so a key a row leaves is free for the row moving into it.
+- **`usable(t)`** refuses a statement in an ended transaction, and **`abort_with(t, e)`** aborts `t` with the
+  code of an error raised outside the store (validation, a runtime error, a check constraint).
+
+`update_where` and `delete_where`, which take the change as a closure, serve the store's own tests: a closure
+cannot fail, and the executor's changes can.
 
 ## The predicate log and validation
 
@@ -72,7 +86,8 @@ per-row latches and a real wait) is the next slice of this work.
 - `lock_timeout` (no clock seam yet), savepoints, `max_predicate_log` coarsening, `max_snapshot_age` and undo
   purge.
 - Translation of a row of an older schema version into the reader's (`ddl.md` §5.3): the store returns each image
-  in its own version, and the executor will translate it. Catalog versioning under MVCC and `schema_changed` from
+  in its own version, and the executor reads it as the current one until it translates it. Catalog versioning under MVCC and `schema_changed` from
   catalog validation (§5.6).
-- Secondary indexes, unique constraints other than the primary key, and constraint checks.
+- Secondary indexes, unique constraints other than the primary key (so an upsert's target must be the primary
+  key) and foreign keys. Check and NOT NULL constraints are checked by the executor (`executor.md` §4.5).
 - Term bits in transaction ids and commit numbers (`replication.md` §1.4).

@@ -167,7 +167,7 @@ stx_a_lost_connection_leaves_commits_and_implicit_writes_unresolved()
     d.send(sx_execute(0, 3))
 
     // The Commit goes out, and the connection is lost before any answer.
-    d.c.request(Commit(1), 0)
+    assert(d.c.request(Commit(1), 0).is_ok(), "the commit request is accepted")
     val st = d.c.lost()
     d.take_client(st)
 

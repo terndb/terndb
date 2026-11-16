@@ -500,7 +500,8 @@ params := uvar tuple_count                    (≥ 1)
 1. `Execute` validates the envelope, binds the parameters and runs the statement. Its first response, if
    validation and binding succeed, MUST be a `ResultHeader`; then the result `Batch`es (§6); then `Complete`.
 2. `ResultHeader.txid` is the id of the transaction the statement runs in (explicit or implicit), and
-   `ResultHeader.snapshot` the snapshot it reads ([ISO] §4.1; at read committed, the statement's own snapshot).
+   `ResultHeader.snapshot` the snapshot it reads ([ISO] §4.1; at read committed, the statement's own snapshot,
+   of its first run when it waited for a row lock, §7.5 rule 2).
    The server MUST send `ResultHeader` before it begins to commit an implicit transaction.
    *Rationale: a client that loses the connection during an implicit commit already holds the txid it needs for
    `TransactionStatus` (§5.6).*
@@ -1001,6 +1002,24 @@ The encoding is **Arrow-shaped but not Arrow IPC**.
 
 A client SHOULD send `Ping` on an idle connection at least every 60 seconds if it expects to keep it, and a
 server MAY close a connection with no traffic for a configured idle time after sending `Goodbye` with `W4002`.
+
+### 7.5 Waiting for a row lock
+
+1. A statement that must write a row locked by another live transaction waits for it ([ISO] §4.2 rule 1). It
+   has sent its `ResultHeader` and nothing more, and has written nothing: the server **parks** it, holding its
+   transaction and snapshot, and goes on serving the connection's other streams (§4.6 rule 3).
+2. Once the holder has committed or aborted, the server runs the parked statement again from its start, as if
+   it had just been started. At read committed the new run takes a new statement snapshot ([ISO] §3.3), so the
+   statement reads the holder's commit; `ResultHeader.snapshot` remains the snapshot of its first run. At
+   snapshot and serializable it keeps its snapshot, so a holder that committed a write of the row makes it fail
+   with `serialization_failure`, and one that aborted lets it run. A server MUST resume a parked statement no
+   later than its next processing of that connection — an arrival on it or the passage of time — after the
+   holder ended.
+3. The wait counts toward `statement_timeout_ms`, unlike a wait for credit (§7.2 rule 4): a statement parked
+   longer ends with `cancelled` (§7.3 rule 3), and `Cancel` stops it like any running statement. Its
+   transaction is then rolled back if implicit, and aborted if explicit (§7.3 rule 1).
+4. A wait that would close a cycle of waiting transactions is not parked: the statement fails with
+   `deadlock_detected` and its transaction aborts ([ISO] §4.2 rule 1), which ends the holder's wait on it.
 
 ## 8. Errors
 

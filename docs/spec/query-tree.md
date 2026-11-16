@@ -581,7 +581,10 @@ Removes duplicates under `same`. The output is a bag with the input's binders.
 `op` is `union`, `intersect` or `except`; `all` selects multiset (`true`) or set (`false`) semantics.
 `inputs` holds at least two relations (`Q5009`), each with the same number of columns (`Q3010`);
 columns unify positionally to their common type (§4.2, `Q3010`); output names are the first input's.
-Duplicates are judged by `same`. The output is a bag; `union all` of lists is a bag.
+Duplicates are judged by `same`, so two nulls in one column are duplicates. The output is a bag;
+`union all` of lists is a bag. More than two inputs fold from the left: `op(a, b, c)` is
+`op(op(a, b), c)`, so `except` keeps the rows of the first input that no later input has, and an
+`intersect`/`except` with `all = true` counts a row's copies the same way, one fold at a time.
 
 ### 6.13 With and CteRef
 
@@ -591,16 +594,25 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
    own `rel`; in a recursive one, every CTE of the `With` is in scope in every `rel` and the body. The
    nearest enclosing `With` that defines a name is the one a reference names.
 2. Every `CteRef` of a non-recursive CTE observes one and the same value within a statement. The
-   planner MAY inline a CTE whose body is free of volatile functions.
+   planner MAY inline a CTE whose body is free of volatile functions. A CTE is evaluated at most once,
+   on its first read; a CTE no reference reads is never evaluated, so an error its `rel` would raise
+   (a division by zero, `R0005`) is never raised.
 3. With `recursive = true`, each CTE MUST declare `columns` (`Q5001`) and its `rel` MUST be a `SetOp`
    with `op = union` whose first input does not reference the CTE (the seed) and whose remaining inputs
-   each reference it exactly once (linear recursion), never inside an `Aggregate`, `Distinct`, the
-   null-supplying side of an outer join, an `anti` join's right input, or a `Relation` subquery
-   (`Q5001`). Mutual recursion is refused (`Q5001`).
+   each reference it exactly once (linear recursion) (`Q5001`). The reference MUST NOT stand where a
+   step's rows could not be computed from the previous step's new rows alone (`Q5001`): under an
+   `Aggregate`, a `Distinct` or a `Nest`; on the null-supplying side of an outer join (the right of
+   `left`, the left of `right`, either side of `full`); the right input of an `anti` or `single` join;
+   the right input of an `outer`, `anti` or `single` `Apply`; or anywhere inside an expression's
+   subquery (`Relation`, `Scalar`, `Exists`, `In`). The preserved side of an outer join, `Window`,
+   `Sort`, `Limit`, `Unnest` and `Tag` are allowed. A nested `With` that defines the same name hides
+   the outer CTE from the count. A CTE that reaches itself through another is mutual recursion and is
+   refused (`Q5001`).
 4. Evaluation iterates: the working set is the seed; each step evaluates the recursive inputs against
    the previous step's new rows; with `all = false`, rows `same` as any earlier row are discarded. It
    ends when a step yields no new rows. A server MAY bound the number of steps; exceeding the bound is
-   `R0005`.
+   `R0005`. TernDB's bound is 10000 steps that yield new rows: the step after the 10000th that still
+   yields new rows is `R0005`.
 
 ### 6.14 Nest and Unnest
 
@@ -833,6 +845,18 @@ and the conflict action, `as` denotes the existing row. In `returning`, `as` den
 written (or, for `Delete`, as it was removed), and `old` denotes the row as it was before the
 statement, with every column nullable (null for a newly inserted row).
 
+**Visibility of a statement's own writes.** Every read a DML statement makes — its `source`,
+`from`/`using`, its target rows and `filter`, an upsert's conflict check, and every subquery of a
+`set`, conflict action or `returning` item — sees the transaction's state as of the statement's start
+(its snapshot, `isolation.md` §4.1, with the transaction's earlier statements' writes), and none sees
+the statement's own writes. A statement's writes are applied together after those reads; a
+statement that must wait for a row lock (`isolation.md` §4.2 rule 1) has written nothing, and is run
+again whole once the holder has ended. Constraints (`ddl.md` §2.6) are judged on what the statement
+writes: two rows of one statement with one key are a `unique_violation` (`T3001`), as two
+statements' would be.
+*Rationale: statement-level visibility is what SQL gives, and it makes a statement's meaning
+independent of the order it visits rows in.*
+
 ### 9.2 Insert
 
 `Insert { table, as, old: binder?, columns: [name], source: Rel, on_conflict: OnConflict?, returning:
@@ -857,7 +881,10 @@ set: [(name, Expr)], where: Expr? } }`
    else it is skipped. Skipped rows produce no `returning` row and are not counted. Both `as` and
    `excluded` have the table's row type; `target`'s columns match a unique key's in any order, and a
    constraint name matches a unique constraint's or a unique index's name.
-3. A statement that would insert or update the same target row twice is `R0007`.
+3. A statement that would insert or update the same target row twice is `R0007`. Source rows are
+   taken in source order, and a row whose key an earlier row of the same statement inserted or
+   updated conflicts with that row: with `nothing`, or with a `where` that is not `true`, it is
+   skipped; otherwise it is `R0007`.
 
 ### 9.4 Update and Delete
 
@@ -870,12 +897,16 @@ set: [(name, Expr)], where: Expr? } }`
    `returning`. A target row matched by more than one `from` row MUST raise `R0007` (Postgres picks one
    arbitrarily; TernDB refuses).
 3. Absent `filter` means every row.
+4. An `Update` that sets a primary-key column moves the row to its new key. Every moved row leaves
+   its old key before any takes its new one, so keys may be exchanged or shifted within one
+   statement; a new key that another row still holds is `T3001`.
 
 ### 9.5 Returning and Action
 
 `returning` items see `as`, `old`, and the `from`/`using` binders. `Action()` is valid only in
 `returning` (`Q5002`), outside any subquery of a returning item, and has type `union<inserted: {}, updated: {}, deleted: {}>`. The result is a bag
-of the returning records.
+of the returning records, one per row the statement wrote. `returning` is evaluated before the
+statement's writes are applied (§9.1), so a subquery in it does not see them.
 
 ## 10. Parameters, shape and batches
 

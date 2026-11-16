@@ -100,7 +100,10 @@ trait Executor
     /** Validates, binds and starts a statement, answering its header (§4.3 rules 1–2). */
     start(*self, s: Invocation) -> Result[Started, Failure]
 
-    /** The next step of a started statement. */
+    /** The next step of a started statement. An engine runs the statement here, and the plan it
+     * runs keeps what it reads through `self` (its store), so implementations may keep `self`.
+     */
+    @keeps(self)
     next(*self, cursor: u64) -> Result[Produced, Failure]
 
     /** Ends a statement that produced `NoMore`, committing its implicit transaction if it has one. */

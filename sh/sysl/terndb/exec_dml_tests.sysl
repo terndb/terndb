@@ -1,0 +1,281 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// DML over the store (`query-tree.md` §9): insert, update and delete of one row and of more than a
+// batch, defaults, generated columns and constraints, upsert's branches, `returning` with `old` and
+// `Action`, `from`/`using` and `R0007`, row-lock waits, and an aborted transaction leaving nothing.
+// The fixtures are in `exec_scan_tests.sysl`.
+
+/** `acct` as `{id, bal}` pairs, in key order, as a new transaction sees it. */
+private xd_accts(s: &Store) -> Buf[[2]i128]
+    val out = buf[[2]i128]()
+
+    for r in xd_rows(xd_ran(s, s.begin(Snapshot), xd_ids()))
+        r match
+            Record(fs) -> out.push([st_int(fs[0]), st_int(fs[1])])
+            _ -> ()
+
+    out
+
+private xd_where_id(id: i128) -> Option[Expr] = Some(call("eq", [col("a", "id"), xd_int(id)]))
+
+private xd_update(filter: Option[Expr], set: []const Item, returning: []const Item = []) -> Envelope =
+    envelope([], Update(cat_q("acct"), "a", Some("o"), None, filter, items_of(set), items_of(returning)))
+
+private xd_delete(filter: Option[Expr], returning: []const Item = []) -> Envelope =
+    envelope([], Delete(cat_q("acct"), "a", Some("o"), None, filter, items_of(returning)))
+
+private xd_plus(delta: i128) -> Item = item("bal", call("add", [col("a", "bal"), xd_int(delta)]))
+
+// -- insert ---------------------------------------------------------------------------------------
+
+@test
+an_insert_writes_its_row_with_defaults_and_generated_columns()
+    val s = xd_store()
+    val t = s.begin(Snapshot)
+    val env = envelope([], Insert(cat_q("acct"), "a", None, items_of(["id", "bal", "note"]),
+        Values("v", items_of([Field("id", Int64), Field("bal", Int64), Field("note", Text)]),
+            items_of([items_of([xd_int(1), xd_int(5), Literal(Text, Text("hi"))])])),
+        None, items_of([item("row", Row("a"))])))
+    val o = xd_ran(s, t, env)
+    assert_eq(xd_count(o), 1)
+    assert(xd_rows(o)[0] == rec([rec([Int(1), Int(5), Text("hi"), Text("new"), Int(10)])]))
+    assert(s.commit(t).is_ok())
+    assert(s.get(s.begin(Snapshot), cat_table_of(s.catalog, "acct").oid, st_key(1)).unwrap().unwrap().value == rec([Int(1), Int(5), Text("hi"), Text("new"), Int(10)]))
+
+@test
+an_insert_of_more_than_a_batch_writes_every_row()
+    val s = xd_store()
+    val rows = buf[Value]()
+
+    for i in 0..<1500
+        rows.push(rec([Int(i128(i)), Int(i128(i) % 7)]))
+
+    val pair = record([Field("id", Int64), Field("bal", Int64)])
+    val env = envelope([param("rows", bag(pair))], Insert(cat_q("acct"), "a", None, items_of(["id", "bal"]), ParamScan("p", 0), None, buf[Item]()))
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, env, [rel(rows.view())])), 1500)
+    assert(s.commit(t).is_ok())
+
+    val all = xd_accts(s)
+    assert_eq(all.len(), 1500)
+    assert_eq(all[1499][0], 1499)
+    assert_eq(all[1499][1], 1499 % 7)
+
+    // Update and delete more than a batch too.
+    val u = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, u, xd_update(None, [xd_plus(100)]))), 1500)
+    assert_eq(xd_count(xd_ran(s, u, xd_delete(Some(call("gt", [col("a", "id"), xd_int(299)]))))), 1200)
+    assert(s.commit(u).is_ok())
+
+    val left = xd_accts(s)
+    assert_eq(left.len(), 300)
+    assert_eq(left[299][1], 299 % 7 + 100)
+
+@test
+an_insert_of_a_visible_key_is_a_unique_violation_and_aborts()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(2, 20))), 1)
+    assert_eq(xd_code(s, t, xd_insert(1, 30)), "T3001")
+    assert_eq(xd_code(s, t, xd_ids()), "W2003")
+    assert_eq(st_code(s.commit(t)), "T3001")
+    // The aborted transaction's earlier insert is gone with it.
+    assert_eq(xd_accts(s).len(), 1)
+
+@test
+two_rows_of_one_key_in_one_insert_are_a_unique_violation_and_leave_nothing()
+    val s = xd_store()
+    val t = s.begin(Snapshot)
+    val env = envelope([], Insert(cat_q("acct"), "a", None, items_of(["id", "bal"]), xd_values([[1, 1], [2, 2], [1, 3]]), None, buf[Item]()))
+    assert_eq(xd_code(s, t, env), "T3001")
+    assert_eq(xd_accts(s).len(), 0)
+
+@test
+a_check_constraint_and_not_null_are_enforced()
+    val s = xd_store()
+    val t = s.begin(Snapshot)
+    assert_eq(xd_code(s, t, xd_insert(1, -5)), "T3002")
+
+    // `n` is NOT NULL and has no default, so an insert must name it (`ddl.md` §2.7 rule 1).
+    val u = s.begin(Snapshot)
+    val env = envelope([], Insert(cat_q("counters"), "c", None, items_of(["key"]),
+        Values("v", items_of([Field("key", Text)]), items_of([items_of([Literal(Text, Text("k"))])])), None, buf[Item]()))
+    assert_eq(xd_code(s, u, env), "Q3005")
+
+    // An update is checked on the constraints that read what it sets.
+    xd_put(s, 1, 10)
+    val w = s.begin(Snapshot)
+    assert_eq(xd_code(s, w, xd_update(xd_where_id(1), [xd_plus(-11)])), "T3002")
+    assert_eq(xd_accts(s)[0][1], 10)
+
+@test
+dml_in_an_aborted_transaction_leaves_nothing()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(2, 20))), 1)
+    assert_eq(xd_count(xd_ran(s, t, xd_update(xd_where_id(1), [xd_plus(5)]))), 1)
+    assert_eq(xd_count(xd_ran(s, t, xd_delete(xd_where_id(2)))), 1)
+    assert(s.abort(t).is_ok())
+
+    val all = xd_accts(s)
+    assert_eq(all.len(), 1)
+    assert_eq(all[0][1], 10)
+
+@test
+dml_in_a_read_only_transaction_is_refused()
+    val s = xd_store()
+    assert_eq(xd_code(s, s.begin(Snapshot, true), xd_insert(1, 1)), "T4001")
+
+// -- update and delete ----------------------------------------------------------------------------
+
+@test
+an_update_returns_the_row_as_written_and_as_it_was()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 20)
+    val t = s.begin(Snapshot)
+    val ret = [item("id", col("a", "id")), item("bal", col("a", "bal")), item("twice", col("a", "twice")), item("was", col("o", "bal")), item("did", Action)]
+    val o = xd_ran(s, t, xd_update(xd_where_id(2), [xd_plus(5)], ret))
+    assert_eq(xd_count(o), 1)
+    // The generated column follows the column it reads.
+    assert(xd_rows(o)[0] == rec([Int(2), Int(25), Int(50), Int(20), variant(1, rec([]))]))
+    assert(s.commit(t).is_ok())
+    assert_eq(xd_accts(s)[1][1], 25)
+
+@test
+an_update_of_no_row_writes_nothing()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    val t = s.begin(Snapshot)
+    val o = xd_ran(s, t, xd_update(xd_where_id(7), [xd_plus(5)], [item("id", col("a", "id"))]))
+    assert_eq(xd_count(o), 0)
+    assert_eq(xd_rows(o).len(), 0)
+
+@test
+an_update_of_the_key_moves_the_row()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 20)
+    // Every key shifts up by one: row 1 takes row 2's old key within the one statement.
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, xd_update(None, [item("id", call("add", [col("a", "id"), xd_int(1)]))]))), 2)
+    assert(s.commit(t).is_ok())
+    val all = xd_accts(s)
+    assert_eq(all.len(), 2)
+    assert_eq(all[0][0], 2)
+    assert_eq(all[0][1], 10)
+    assert_eq(all[1][0], 3)
+
+    // A new key another row keeps is a unique violation (§9.4 rule 4).
+    val u = s.begin(Snapshot)
+    assert_eq(xd_code(s, u, xd_update(xd_where_id(2), [item("id", xd_int(3))])), "T3001")
+    assert_eq(xd_accts(s)[0][0], 2)
+
+@test
+a_delete_returns_the_removed_row()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 20)
+    val t = s.begin(Snapshot)
+    val o = xd_ran(s, t, xd_delete(xd_where_id(1), [item("id", col("a", "id")), item("was", col("o", "bal")), item("did", Action)]))
+    assert(xd_rows(o)[0] == rec([Int(1), Int(10), variant(2, rec([]))]))
+    assert(s.commit(t).is_ok())
+    assert_eq(xd_accts(s).len(), 1)
+
+@test
+an_update_from_another_relation_and_a_row_matched_twice()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 20)
+    val pair = record([Field("id", Int64), Field("bal", Int64)])
+    val from = ParamScan("d", 0)
+    val env = envelope([param("deltas", bag(pair))], Update(cat_q("acct"), "a", None, Some(from), Some(call("eq", [col("a", "id"), col("d", "id")])),
+        items_of([item("bal", call("add", [col("a", "bal"), col("d", "bal")]))]), items_of([item("id", col("a", "id")), item("by", col("d", "bal"))])))
+
+    val t = s.begin(Snapshot)
+    val o = xd_ran(s, t, env, [rel([rec([Int(2), Int(7)])])])
+    assert(xd_rows(o)[0] == rec([Int(2), Int(7)]))
+    assert(s.commit(t).is_ok())
+    assert_eq(xd_accts(s)[1][1], 27)
+
+    // Two `from` rows for target row 1 (§9.4 rule 2).
+    val u = s.begin(Snapshot)
+    assert_eq(xd_code(s, u, env, [rel([rec([Int(1), Int(1)]), rec([Int(1), Int(2)])])]), "R0007")
+    assert_eq(xd_accts(s)[0][1], 10)
+
+@test
+a_nested_relation_column_is_updated_whole()
+    val s = xd_store()
+    val items = bag(xd_item())
+    val ins = envelope([param("items", items)], Insert(cat_q("nest"), "n", None, items_of(["k", "items"]),
+        Values("v", items_of([Field("k", Int64), Field("items", items)]), items_of([items_of([xd_int(1), Param(0)])])), None, buf[Item]()))
+    val t = s.begin(Snapshot)
+    val _ = xd_ran(s, t, ins, [rel([rec([Int(1), Int(5)]), rec([Int(2), Int(9)])])])
+    assert(s.commit(t).is_ok())
+
+    // Keep the items priced over 6: a subquery over the row's own nested relation.
+    val kept = filter(Unnest(Values("one", buf[Field](), items_of([buf[Expr]()])), "i", col("n", "items"), false, None), call("gt", [col("i", "price"), xd_int(6)]))
+    val upd = envelope([], Update(cat_q("nest"), "n", None, None, Some(call("eq", [col("n", "k"), xd_int(1)])),
+        items_of([item("items", Relation(project(kept, "x", [item("e", col("i", "e")), item("price", col("i", "price"))])))]), items_of([item("items", col("n", "items"))])))
+    val u = s.begin(Snapshot)
+    val o = xd_ran(s, u, upd)
+    assert(same(record([Field("items", items)]), xd_rows(o)[0], rec([rel([rec([Int(2), Int(9)])])])))
+    assert(s.commit(u).is_ok())
+
+// -- row locks (isolation.md §4.2) ----------------------------------------------------------------
+
+@test
+a_statement_on_a_locked_row_is_blocked_and_writes_nothing()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 20)
+    val holder = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, holder, xd_update(xd_where_id(2), [xd_plus(1)]))), 1)
+
+    // The waiter's update would write rows 1 and 2; row 2 is locked, so it writes neither.
+    val waiter = s.begin(Snapshot)
+    assert_eq(xd_holder(xd_ran(s, waiter, xd_update(None, [xd_plus(100)]))), holder.id)
+    assert(s.abort(holder).is_ok())
+    assert_eq(xd_count(xd_ran(s, waiter, xd_update(None, [xd_plus(100)]))), 2)
+    assert(s.commit(waiter).is_ok())
+    assert_eq(xd_accts(s)[0][1], 110)
+
+@test
+a_blocked_statement_run_again_follows_its_level()
+    for level in [Snapshot, ReadCommitted]
+        val s = xd_store()
+        xd_put(s, 1, 10)
+        val holder = s.begin(Snapshot)
+        val waiter = s.begin(level)
+        assert_eq(xd_count(xd_ran(s, holder, xd_update(xd_where_id(1), [xd_plus(1)]))), 1)
+        assert_eq(xd_holder(xd_ran(s, waiter, xd_update(xd_where_id(1), [xd_plus(100)]))), holder.id)
+        assert(s.commit(holder).is_ok())
+
+        // Snapshot: the row changed after the snapshot (§4.2 rule 2). Read committed: the statement
+        // reads the newest version again and applies its change to it (rule 3).
+        if level == Snapshot
+            assert_eq(xd_code(s, waiter, xd_update(xd_where_id(1), [xd_plus(100)])), "T1001")
+        else
+            assert_eq(xd_count(xd_ran(s, waiter, xd_update(xd_where_id(1), [xd_plus(100)]))), 1)
+            assert(s.commit(waiter).is_ok())
+            assert_eq(xd_accts(s)[0][1], 111)
+
+@test
+a_serializable_update_s_filter_is_logged()
+    val s = xd_store()
+    xd_put(s, 1, 60)
+    val t = s.begin(Serializable)
+    assert_eq(xd_count(xd_ran(s, t, xd_update(Some(call("gt", [col("a", "bal"), xd_int(50)])), [xd_plus(1)]))), 1)
+    // A row the filter would have matched, committed concurrently.
+    xd_put(s, 2, 70)
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+    val u = s.begin(Serializable)
+    assert_eq(xd_count(xd_ran(s, u, xd_update(Some(call("gt", [col("a", "bal"), xd_int(50)])), [xd_plus(1)]))), 2)
+    xd_put(s, 3, 5)
+    assert(s.commit(u).is_ok())

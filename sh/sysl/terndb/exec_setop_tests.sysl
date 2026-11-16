@@ -1,0 +1,155 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `SetOp` (`query-tree.md` §6.12) through the type checker and the planner: every operation with and
+// without `all`, over several batches, with nulls, empty inputs, coercion to the common type and
+// inputs of several binders; and the inputs the checker refuses.
+
+/** `{k: int64?, v: text?}`. */
+private xs_kv() -> [2]Field = [Field("k", nullable(Int64)), Field("v", nullable(Text))]
+
+private xs_r(k: i128, v: string) -> Value = rec([Int(k), Text(v)])
+
+private xs_null() -> Value = rec([Null, Null])
+
+/** `n` copies of `v`. */
+private xs_n(n: usize, v: Value) -> Buf[Value]
+    val out = buf[Value]()
+
+    for _ in 0..<n
+        out.push(v)
+
+    out
+
+private xs_join(parts: []const Buf[Value]) -> Buf[Value]
+    val out = buf[Value]()
+
+    for p in parts
+        out.extend(p.view())
+
+    out
+
+/** A: 1a twice, 2b, 3c, the null row twice. */
+private xs_a() -> Buf[Value] = xs_join([xs_n(2, xs_r(1, "a")), xs_n(1, xs_r(2, "b")), xs_n(1, xs_r(3, "c")), xs_n(2, xs_null())])
+
+/** B: 1a three times, 2b twice, the null row, 4d. */
+private xs_b() -> Buf[Value] = xs_join([xs_n(3, xs_r(1, "a")), xs_n(2, xs_r(2, "b")), xs_n(1, xs_null()), xs_n(1, xs_r(4, "d"))])
+
+/** Tables a and b, cut into batches of 2 and 3; c holding one 1a; e empty; w `{n: int32, label}`. */
+private xs_tables() -> [5]XnTable = [
+    xn_table("a", xs_kv(), xs_a(), 2),
+    xn_table("b", xs_kv(), xs_b(), 3),
+    xn_table("c", xs_kv(), rows_of([xs_r(1, "a")]), 1),
+    xn_table("e", xs_kv(), buf[Value](), 1),
+    xn_table("w", [Field("n", Int32), Field("label", Text)], rows_of([rec([Int(1), Text("one")]), rec([Int(5), Text("five")])]), 1)]
+
+private xs_set(op: SetOpKind, all: bool, inputs: []const Rel) -> Rel = SetOp(op, all, "s", items_of(inputs))
+
+private xs_run(r: Rel) -> Result[(Type, Buf[Value]), CodecError] = xn_run(xs_tables(), [], [], r)
+
+/** Scans of the named tables, each under its own binder. */
+private xs_scans(names: []const string) -> Buf[Rel]
+    val out = buf[Rel]()
+
+    for i in 0..<names.len
+        out.push(scan("app", names[i], s"x$i"))
+
+    out
+
+private xs_of(op: SetOpKind, all: bool, names: []const string) -> Result[(Type, Buf[Value]), CodecError] =
+    xs_run(SetOp(op, all, "s", xs_scans(names)))
+
+@test
+union_intersect_and_except_with_and_without_all()
+    xn_check(xs_of(Union, true, ["a", "b"]), xs_join([xs_a(), xs_b()]), "union all")
+    xn_check(xs_of(Union, false, ["a", "b"]), rows_of([xs_r(1, "a"), xs_r(2, "b"), xs_r(3, "c"), xs_null(), xs_r(4, "d")]), "union")
+    // 1a: min(2, 3); 2b: min(1, 2); the null row: min(2, 1), nulls being `same` (§3.1).
+    xn_check(xs_of(Intersect, true, ["a", "b"]), rows_of([xs_r(1, "a"), xs_r(1, "a"), xs_r(2, "b"), xs_null()]), "intersect all")
+    xn_check(xs_of(Intersect, false, ["a", "b"]), rows_of([xs_r(1, "a"), xs_r(2, "b"), xs_null()]), "intersect")
+    // 3c: 1 - 0; the null row: 2 - 1; 1a and 2b: fewer in a than in b.
+    xn_check(xs_of(Except, true, ["a", "b"]), rows_of([xs_r(3, "c"), xs_null()]), "except all")
+    xn_check(xs_of(Except, false, ["a", "b"]), rows_of([xs_r(3, "c")]), "except")
+
+@test
+except_is_not_symmetric()
+    xn_check(xs_of(Except, true, ["b", "a"]), rows_of([xs_r(1, "a"), xs_r(2, "b"), xs_r(4, "d")]), "b except all a")
+    xn_check(xs_of(Except, false, ["b", "a"]), rows_of([xs_r(4, "d")]), "b except a")
+
+@test
+three_inputs_fold_from_the_left()
+    xn_check(xs_of(Union, true, ["a", "b", "c"]), xs_join([xs_a(), xs_b(), rows_of([xs_r(1, "a")])]), "union all")
+    xn_check(xs_of(Union, false, ["c", "a", "b"]), rows_of([xs_r(1, "a"), xs_r(2, "b"), xs_r(3, "c"), xs_null(), xs_r(4, "d")]), "union")
+    xn_check(xs_of(Intersect, true, ["a", "b", "c"]), rows_of([xs_r(1, "a")]), "intersect all")
+    xn_check(xs_of(Intersect, false, ["a", "b", "e"]), buf[Value](), "intersect with an empty input")
+    // (a except all c) except all c: 1a's two copies are both taken away.
+    xn_check(xs_of(Except, true, ["a", "c", "c"]), rows_of([xs_r(2, "b"), xs_r(3, "c"), xs_null(), xs_null()]), "except all twice")
+    xn_check(xs_of(Except, false, ["a", "c", "b"]), rows_of([xs_r(3, "c")]), "except twice")
+
+@test
+a_set_operation_with_an_empty_input_on_either_side()
+    for all in [true, false]
+        val a = if all then xs_a() else rows_of([xs_r(1, "a"), xs_r(2, "b"), xs_r(3, "c"), xs_null()])
+        xn_check(xs_of(Union, all, ["a", "e"]), a, "a union e")
+        xn_check(xs_of(Union, all, ["e", "a"]), a, "e union a")
+        xn_check(xs_of(Intersect, all, ["a", "e"]), buf[Value](), "a intersect e")
+        xn_check(xs_of(Intersect, all, ["e", "a"]), buf[Value](), "e intersect a")
+        xn_check(xs_of(Except, all, ["a", "e"]), a, "a except e")
+        xn_check(xs_of(Except, all, ["e", "a"]), buf[Value](), "e except a")
+        xn_check(xs_of(Union, all, ["e", "e"]), buf[Value](), "e union e")
+
+@test
+columns_unify_positionally_and_take_the_first_input_s_names()
+    val ks = project(scan("app", "a", "x"), "p", [item("k", col("x", "k"))])
+    val ns = project(scan("app", "w", "y"), "q", [item("other", col("y", "n"))])
+    val (t, rows) = xs_run(xs_set(Union, false, [ns, ks])).unwrap()
+
+    // The first input names the column; int32 and int64? meet at int64?.
+    assert(t == bag(record([Field("other", nullable(Int64))])), "the common type under the first input's name")
+    assert(xn_same(t, rows, rows_of([rec([Int(1)]), rec([Int(5)]), rec([Int(2)]), rec([Int(3)]), rec([Null])])), "the rows")
+
+@test
+inputs_of_several_binders_are_flattened()
+    val joined = Join(Inner, scan("app", "a", "x"), scan("app", "w", "z"), Some(eq(col("x", "k"), col("z", "n"))), None, None)
+    val wide = project(scan("app", "a", "y"), "p", [item("k", col("y", "k")), item("v", col("y", "v")), item("n", col("y", "k")), item("label", col("y", "v"))])
+    val want = rows_of([
+        rec([Int(1), Text("a"), Int(1), Text("one")]), rec([Int(1), Text("a"), Int(1), Text("a")]),
+        rec([Int(2), Text("b"), Int(2), Text("b")]), rec([Int(3), Text("c"), Int(3), Text("c")]), rec([Null, Null, Null, Null])])
+
+    xn_check(xs_run(xs_set(Union, false, [joined, wide])), want, "a join's rows and a projection's")
+    xn_check(xs_run(xs_set(Intersect, true, [wide, joined])), buf[Value](), "nothing in common")
+
+@test
+union_all_streams_across_batches()
+    val big = buf[Value]()
+
+    for i in 0..<1500
+        big.push(rec([Int(i128(i % 10)), if i % 7 == 0 then Null else Text(s"v${i % 10}")]))
+
+    val ts = [xn_table("big", xs_kv(), big, 700)]
+    val all = SetOp(Union, true, "s", items_of([scan("app", "big", "b1"), scan("app", "big", "b2")]))
+    xn_check(xn_run(ts, [], [], all), xs_join([big, big]), "3000 rows")
+
+    // Twenty distinct rows: each k with its text and, for some, a null text.
+    val (_, rows) = xn_run(ts, [], [], SetOp(Union, false, "s", items_of([scan("app", "big", "b1"), scan("app", "big", "b2")]))).unwrap()
+    val (_, once) = xn_run(ts, [], [], Distinct(scan("app", "big", "b3"))).unwrap()
+    assert_eq(rows.len(), once.len())
+    assert(xn_same(bag(record(xs_kv())), rows, once), "union is distinct of the union all")
+
+@test
+set_operations_of_mismatched_shapes_are_refused()
+    val one = project(scan("app", "w", "y"), "q", [item("n", col("y", "n"))])
+    assert_eq(xn_code(xs_run(xs_set(Union, true, [scan("app", "a", "x"), one]))), "Q3010")
+
+    val texts = project(scan("app", "a", "x"), "p", [item("v", col("x", "v"))])
+    assert_eq(xn_code(xs_run(xs_set(Except, false, [texts, one]))), "Q3010")
+
+    assert_eq(xn_code(xs_run(xs_set(Intersect, false, [scan("app", "a", "x")]))), "Q5009")
+
+@test
+a_set_operation_feeds_the_nodes_above_it()
+    val top = limit(Literal(Int64, Int(2)), sort([asc(col("s", "k"))], xs_set(Except, true, [scan("app", "b", "x0"), scan("app", "c", "x1")])))
+    val (_, rows) = xs_run(top).unwrap()
+    // b except all c leaves 1a twice, 2b twice, the null row and 4d; ascending, nulls last.
+    assert(rows == rows_of([xs_r(1, "a"), xs_r(1, "a")]))

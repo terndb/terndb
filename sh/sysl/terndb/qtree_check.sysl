@@ -439,6 +439,10 @@ private struct Checker
             for c in ctes
                 self.ctes.push(c.name)
 
+            recursion_problem(ctes) match
+                Some(why) -> self.report("Q5001", why)
+                None -> ()
+
         for c in ctes
             if recursive && c.columns.is_none() then self.report("Q5001", s"recursive CTE '${c.name}' declares no columns")
 

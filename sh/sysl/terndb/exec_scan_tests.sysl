@@ -1,0 +1,266 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `Scan` over the store (`query-tree.md` §6.1, `isolation.md` §4.1, §4.4): what a query sees at its
+// transaction's snapshot, read committed's statement snapshots, and the reads a serializable query
+// logs — its filter and the columns it uses — tested by the commits they make fail or let through.
+
+// -- fixtures (shared with exec_dml_tests.sysl) ---------------------------------------------------
+
+/** `acct(id, bal, note text?, tag text default 'new', twice generated bal * 2)` with the check
+ * `bal_ok: bal > -1`; `nest(k, items bag<{e, price}>)`; `counters(key text, n)` (§16.3).
+ */
+xd_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    val tag = ColumnDef("tag", Text, Some(Literal(Text, Text("new"))), None, NoIdentity, None)
+    val twice = ColumnDef("twice", Int64, None, Some(call("mul", [cat_row("bal"), Literal(Int64, Int(2))])), NoIdentity, None)
+    c = cat_ok(c, cat_table("acct", [cat_col("id", Int64), cat_col("bal", Int64), cat_col("note", nullable(Text)), tag, twice], ["id"],
+        [cat_check("bal_ok", call("gt", [cat_row("bal"), Literal(Int64, Int(-1))]))]))
+    c = cat_ok(c, cat_table("nest", [cat_col("k", Int64), cat_col("items", bag(xd_item()))], ["k"]))
+    cat_ok(c, cat_table("counters", [cat_col("key", Text), cat_col("n", Int64)], ["key"]))
+
+xd_item() -> Type = record([Field("e", Int64), Field("price", Int64)])
+
+xd_store() -> &Store = mem_store(xd_catalog())
+
+xd_int(n: i128) -> Expr = Literal(Int64, Int(n))
+
+/** The outcome of `env` in `t`, which must run. */
+xd_ran(s: &Store, t: &Txn, env: Envelope, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Executed
+    run_statement(env, s, t, xe_ctx(params)) match
+        Ok(o) -> o
+        Err(e) ->
+            assert(false, s"the statement fails with ${e.code}: ${e.message}", file, line)
+            Blocked(0)
+
+/** The code `env` fails with in `t`, "ok" when it runs and "wait" when it is blocked. */
+xd_code(s: &Store, t: &Txn, env: Envelope, params: []const Value = []) -> string
+    run_statement(env, s, t, xe_ctx(params)) match
+        Ok(Ran(_, _, _)) -> "ok"
+        Ok(Blocked(_)) -> "wait"
+        Err(e) -> e.code
+
+xd_count(o: Executed) -> u64 = o match
+    Ran(n, _, _) -> n
+    Blocked(_) -> 1000000
+
+/** The transaction a blocked statement waits for; 0 when it ran. */
+xd_holder(o: Executed) -> u64 = o match
+    Ran(_, _, _) -> 0
+    Blocked(h) -> h
+
+/** The rows of a statement's result, decoded from its batches. */
+xd_rows(o: Executed) -> Buf[Value]
+    val out = buf[Value]()
+
+    o match
+        Ran(_, Some(ty), batches) ->
+            val tree = column_tree(ty).unwrap()
+
+            for b in batches
+                out.extend(decode_batch(tree, b.view()).unwrap().rows().view())
+        _ -> ()
+
+    out
+
+/** `insert into acct (id, bal) values (id, bal)`. */
+xd_insert(id: i128, bal: i128) -> Envelope =
+    envelope([], Insert(cat_q("acct"), "a", None, items_of(["id", "bal"]), xd_values([[id, bal]]), None, buf[Item]()))
+
+/** A `Values` of `{id, bal}` rows. */
+xd_values(rows: []const [2]i128) -> Rel
+    val out = buf[Buf[Expr]]()
+
+    for r in rows
+        out.push(items_of([xd_int(r[0]), xd_int(r[1])]))
+
+    Values("v", items_of([Field("id", Int64), Field("bal", Int64)]), out)
+
+xd_put(s: &Store, id: i128, bal: i128)
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(id, bal))), 1)
+    assert(s.commit(t).is_ok())
+
+/** `select id, bal from acct [where bal > min]`, as `{id, bal}` records. */
+xd_ids(min: Option[i128] = None) -> Envelope
+    val src = min match
+        Some(m) -> filter(scan("app", "acct", "a"), call("gt", [col("a", "bal"), xd_int(m)]))
+        None -> scan("app", "acct", "a")
+
+    query([], project(src, "r", [item("id", col("a", "id")), item("bal", col("a", "bal"))]))
+
+/** The ids a query of `xd_ids` returns, in its order. */
+xd_id_list(o: Executed) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in xd_rows(o)
+        r match
+            Record(fs) -> out.push(st_int(fs[0]))
+            _ -> ()
+
+    out
+
+xd_ids_are(got: Buf[i128], want: []const i128, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(got.len(), want.len, "row count", file, line)
+
+    for i in 0..<want.len
+        if i < got.len() then assert_eq(got[i], want[i], "row", file, line)
+
+// -- snapshots ------------------------------------------------------------------------------------
+
+@test
+a_scan_sees_its_snapshot_and_its_own_writes_only()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 20)
+
+    val reader = s.begin(Snapshot)
+    val pending = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, pending, xd_insert(3, 30))), 1)
+    xd_put(s, 4, 40)
+
+    // Committed before the snapshot: seen. Uncommitted, or committed after it: not.
+    xd_ids_are(xd_id_list(xd_ran(s, reader, xd_ids())), [1, 2])
+    // The writer sees its own row, and not the one committed after its snapshot.
+    xd_ids_are(xd_id_list(xd_ran(s, pending, xd_ids())), [1, 2, 3])
+    // A transaction begun now sees the committed rows.
+    xd_ids_are(xd_id_list(xd_ran(s, s.begin(Snapshot), xd_ids())), [1, 2, 4])
+
+@test
+a_full_scan_s_result_reads_every_row_and_counts_them()
+    val s = xd_store()
+    xd_put(s, 2, 20)
+    xd_put(s, 1, 10)
+
+    val o = xd_ran(s, s.begin(Snapshot), query([], scan("app", "acct", "a")))
+    assert_eq(xd_count(o), 2)
+    val rows = xd_rows(o)
+    // Every column in catalog order, the default and generated ones filled in by the insert.
+    assert(rows[0] == rec([Int(1), Int(10), Null, Text("new"), Int(20)]))
+    assert(rows[1] == rec([Int(2), Int(20), Null, Text("new"), Int(40)]))
+
+@test
+read_committed_takes_a_snapshot_per_statement()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+
+    val rc = s.begin(ReadCommitted)
+    val si = s.begin(Snapshot)
+    xd_ids_are(xd_id_list(xd_ran(s, rc, xd_ids())), [1])
+    xd_ids_are(xd_id_list(xd_ran(s, si, xd_ids())), [1])
+    xd_put(s, 2, 20)
+
+    xd_ids_are(xd_id_list(xd_ran(s, rc, xd_ids())), [1, 2])
+    xd_ids_are(xd_id_list(xd_ran(s, si, xd_ids())), [1])
+
+@test
+a_filter_over_a_scan_filters()
+    val s = xd_store()
+    xd_put(s, 1, 10)
+    xd_put(s, 2, 60)
+    xd_put(s, 3, 70)
+    xd_ids_are(xd_id_list(xd_ran(s, s.begin(Snapshot), xd_ids(Some(50)))), [2, 3])
+
+@test
+a_statement_in_an_ended_transaction_is_refused()
+    val s = xd_store()
+    val t = s.begin(Snapshot)
+    assert(s.commit(t).is_ok())
+    assert_eq(xd_code(s, t, xd_ids()), "W2001")
+
+    val a = s.begin(Snapshot)
+    assert(s.abort(a).is_ok())
+    assert_eq(xd_code(s, a, xd_ids()), "W2003")
+    // A query that reads no table is refused as well.
+    assert_eq(xd_code(s, a, query([], xd_values([[1, 1]]))), "W2003")
+
+@test
+a_validation_error_aborts_the_transaction()
+    val s = xd_store()
+    val t = s.begin(Snapshot)
+    assert_eq(xd_code(s, t, query([], scan("app", "nowhere", "a"))), "Q2001")
+    assert_eq(xd_code(s, t, xd_ids()), "W2003")
+    assert_eq(st_code(s.commit(t)), "Q2001")
+
+// -- the predicate log (§4.3, §4.4) ---------------------------------------------------------------
+
+@test
+a_concurrent_insert_matching_a_scan_s_filter_fails_the_serializable_commit()
+    val s = xd_store()
+    xd_put(s, 1, 60)
+    val t = s.begin(Serializable)
+    xd_ids_are(xd_id_list(xd_ran(s, t, xd_ids(Some(50)))), [1])
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(9, 0))), 1)
+    assert_eq(s.logged(t), 1)
+
+    xd_put(s, 2, 70)
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+a_concurrent_insert_outside_a_scan_s_filter_lets_it_commit()
+    val s = xd_store()
+    xd_put(s, 1, 60)
+    val t = s.begin(Serializable)
+    val _ = xd_ran(s, t, xd_ids(Some(50)))
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(9, 0))), 1)
+
+    // The filter is logged, not the whole table: a row it does not match is no conflict.
+    xd_put(s, 2, 10)
+    assert(s.commit(t).is_ok())
+
+@test
+a_scan_logs_only_the_columns_the_statement_reads()
+    val s = xd_store()
+    xd_put(s, 1, 60)
+
+    // `select id from acct` reads `id` alone: a concurrent change of `note` is no conflict, a new row is.
+    val only_id = query([], project(scan("app", "acct", "a"), "r", [item("id", col("a", "id"))]))
+    val t = s.begin(Serializable)
+    val _ = xd_ran(s, t, only_id)
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(9, 0))), 1)
+    xd_note(s, 1, "changed")
+    assert(s.commit(t).is_ok())
+
+    // A scan whose rows reach the result whole reads every column.
+    val whole = s.begin(Serializable)
+    val _ = xd_ran(s, whole, query([], scan("app", "acct", "a")))
+    assert_eq(xd_count(xd_ran(s, whole, xd_insert(8, 0))), 1)
+    xd_note(s, 1, "again")
+    assert_eq(st_code(s.commit(whole)), "T1001")
+
+@test
+a_scan_inside_a_subquery_is_logged()
+    val s = xd_store()
+    xd_put(s, 1, 60)
+    val c = s.begin(Snapshot)
+    val _ = xd_ran(s, c, upsert(), [Text("hits"), Int(1)])
+    assert(s.commit(c).is_ok())
+
+    // The subquery runs once per counter, and its scan of `acct` is logged each time.
+    val inner = project(scan("app", "acct", "b"), "q", [item("note", col("b", "note"))])
+    val read = query([], project(scan("app", "counters", "c"), "r", [item("notes", Relation(inner))]))
+    val t = s.begin(Serializable)
+    assert_eq(xd_rows(xd_ran(s, t, read)).len(), 1)
+    assert_eq(s.logged(t), 2)
+    assert_eq(xd_count(xd_ran(s, t, xd_insert(9, 0))), 1)
+    xd_note(s, 1, "changed")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+/** Commits `update acct set note = note where id = id`. */
+xd_note(s: &Store, id: i128, note: string)
+    val t = s.begin(Snapshot)
+    val env = envelope([], Update(cat_q("acct"), "a", None, None, Some(call("eq", [col("a", "id"), xd_int(id)])),
+        items_of([item("note", Literal(Text, Text(note)))]), buf[Item]()))
+    assert_eq(xd_count(xd_ran(s, t, env)), 1)
+    assert(s.commit(t).is_ok())
+
+@test
+a_read_only_or_non_serializable_transaction_logs_nothing()
+    val s = xd_store()
+    xd_put(s, 1, 60)
+
+    for t in [s.begin(Snapshot), s.begin(ReadCommitted), s.begin(Serializable, true)]
+        val _ = xd_ran(s, t, xd_ids(Some(50)))
+        assert_eq(s.logged(t), 0)

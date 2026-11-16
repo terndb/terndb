@@ -9,6 +9,8 @@ import sysl.slices.sort_stable_by
 
 trait Operator
     /** The next batch of at least one row, or `None` once every row has been handed up. */
+    // An operator keeps the children and stores it reads through self, so they outlive the call.
+    @keeps(self)
     next_batch(*self) -> Result[Option[ColumnVector], CodecError]
 
 /** A sort key with its expression typed (§6.9). */
@@ -339,6 +341,23 @@ end LimitOp
 
 // -- Distinct, §6.11 ----------------------------------------------------------------------------
 
+/** How whole rows of `all` order by `cmp` (§3.3), which is zero exactly where they are `same`: a
+ * record's rows field by field (on the typed lanes when no row is null), any other element as itself.
+ */
+private[terndb] row_orders(all: ColumnVector) -> Buf[KeyOrder]
+    val orders = buf[KeyOrder]()
+
+    all.ty.base() match
+        Record(fs) ->
+            if all.has_nulls()
+                orders.push(key_order(all, false, true))
+            else
+                for j in 0..<fs.len()
+                    orders.push(key_order(all.member(j), false, true))
+        _ -> orders.push(key_order(all, false, true))
+
+    orders
+
 /** One row of each set of rows that are `same` (§3.1). The rows are sorted by `cmp` (§3.3) over
  * every column, which is zero exactly where `same` holds, and the first of each run kept; the output
  * is a bag, handed up in that order.
@@ -352,18 +371,7 @@ impl Operator for DistinctOp
     next_batch(*self) -> Result[Option[ColumnVector], CodecError]
         if self.out.is_none()
             val all = drain_rows(self.input, self.elem)?
-            val orders = buf[KeyOrder]()
-
-            // A record's rows order field by field; any other element orders as itself.
-            all.ty.base() match
-                Record(fs) ->
-                    if all.has_nulls()
-                        orders.push(key_order(all, false, true))
-                    else
-                        for j in 0..<fs.len()
-                            orders.push(key_order(all.member(j), false, true))
-                _ -> orders.push(key_order(all, false, true))
-
+            val orders = row_orders(all)
             val rows = sorted_rows(orders, all.len)
             val kept = buf[usize]()
 

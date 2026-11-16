@@ -172,6 +172,7 @@ Raised under the rules of `wire-protocol.md`. Section references below are to th
 | `W2012` | `unknown_savepoint` | Unknown savepoint | | |
 | `W2014` | `row_not_encodable` | A single row exceeds an encoding limit (§6.3.8) or `max_message_size` | | |
 | `W2016` | `too_many_transactions` | Too many open transactions on the connection | | |
+| `W2018` | `unsupported_request` | A request this server does not support: savepoints, on a server whose store keeps none (§5.5); like any error in a transaction it aborts it (§5.3) | | |
 | `W2017` | `union_not_encodable` | *Withdrawn*: a union wider than 65,536 variants is now refused by validation (`Q3016`) | | |
 | `W3001` | `authentication_failed` | Authentication failed | yes | |
 | `W3002` | `no_auth_method` | No acceptable authentication method | yes | |

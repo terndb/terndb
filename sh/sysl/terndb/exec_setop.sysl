@@ -1,0 +1,242 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Set operations and common table expressions (`query-tree.md` §6.12 and §6.13,
+// `docs/design/executor.md` §4.3). `union all` streams its inputs; every other set operation is
+// sort-based, like `Distinct`: the inputs are drained, sorted together by `cmp` over whole rows, and
+// each run of rows that compare equal — which is `same` by §3.3 — is counted per input. A CTE is
+// evaluated once, the first time one of its references is read, and every reference reads those
+// rows; a recursive CTE iterates its recursive inputs over the previous step's new rows.
+
+/** The most recursive steps that may yield new rows (§6.13 rule 4); a step past it is `R0005`. */
+val RecursionSteps: usize = 10000
+
+// -- SetOp, §6.12 -------------------------------------------------------------------------------
+
+/** How many rows of one run of `same` rows a set operation keeps, given how many of them each
+ * input holds (§6.12 rule 2). The inputs fold from the left, so `except` keeps the first input's
+ * rows that no later input matches.
+ */
+private copies_of(op: SetOpKind, all: bool, counts: Buf[usize]) -> usize
+    val first = counts[0]
+    var total: usize = 0
+    var least = first
+    var rest: usize = 0
+
+    for p in 0..<counts.len()
+        total += counts[p]
+
+        if counts[p] < least then least = counts[p]
+        if p > 0 then rest += counts[p]
+
+    op match
+        Union -> if all then total else 1
+        Intersect -> if all then least else if least > 0 then 1 else 0
+        Except ->
+            if all
+                if first > rest then first - rest else 0
+            else
+                if first > 0 && rest == 0 then 1 else 0
+
+/** `op` over the rows of `parts`, each already of `elem`. The rows kept of a run are its first ones;
+ * the sort is stable and the parts are laid end to end, so where only the first input's rows can
+ * be kept (`intersect`, `except`) they are its rows.
+ */
+private[terndb] set_rows(op: SetOpKind, all: bool, parts: []const ColumnVector, elem: Type) -> ColumnVector
+    val whole = concat(elem, parts)
+    val src = buf[usize]()
+    val counts = buf[usize]()
+
+    for p in 0..<parts.len
+        counts.push(0)
+
+        for _ in 0..<parts[p].len
+            src.push(p)
+
+    val orders = row_orders(whole)
+    val rows = sorted_rows(orders, whole.len)
+    val kept = buf[usize]()
+    var start: usize = 0
+
+    for k in 1..<rows.len() + 1
+        if k < rows.len() && compare_rows(orders, rows[k - 1], rows[k]) == 0 then continue
+
+        for p in 0..<counts.len()
+            counts[p] = 0
+
+        for r in start..<k
+            counts[src[rows[r]]] += 1
+
+        for r in start..<start + copies_of(op, all, counts)
+            kept.push(rows[r])
+
+        start = k
+
+    take(whole, kept.view())
+end set_rows
+
+/** Every row `op` hands up, each batch coerced to `elem`, as one vector. */
+private[terndb] drain_coerced(op: &Operator, elem: Type) -> Result[ColumnVector, CodecError]
+    val parts = buf[ColumnVector]()
+
+    for b in drain(op)?
+        parts.push(coerce_vector(b, elem)?)
+
+    Ok(concat(elem, parts.view()))
+
+/** A `SetOp` (§6.12): its inputs, flat, with their rows coerced positionally to the output `elem`. */
+struct SetOperator
+    op: SetOpKind
+    all: bool
+    elem: Type
+    inputs: Buf[&Operator]
+    at: usize
+    out: Option[&Operator]
+
+impl Operator for SetOperator
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if self.op == Union && self.all
+            while self.at < self.inputs.len()
+                self.inputs[self.at].next_batch()? match
+                    Some(b) -> return Ok(Some(coerce_vector(b, self.elem)?))
+                    None -> self.at += 1
+
+            return Ok(None)
+
+        if self.out.is_none()
+            val parts = buf[ColumnVector]()
+
+            for i in self.inputs
+                parts.push(drain_coerced(i, self.elem)?)
+
+            self.out = Some(mem_source(batches_of(set_rows(self.op, self.all, parts.view(), self.elem))))
+
+        self.out.unwrap().next_batch()
+
+// -- With and CteRef, §6.13 ---------------------------------------------------------------------
+
+/** The rows of one CTE, shared by every reference to it: drained from `source` on the first read
+ * (§6.13 rule 2), or given outright (a recursive step's working set).
+ */
+struct CteStore
+    name: string
+    source: Option[&Operator]
+    batches: Option[Buf[ColumnVector]]
+    busy: bool
+
+/** A CTE in scope while planning: the name a `CteRef` reads and the rows it reads. */
+struct CteFrame
+    name: string
+    store: &CteStore
+
+/** The CTE's rows, evaluated on the first call. */
+private cte_batches(s: &CteStore) -> Result[Buf[ColumnVector], CodecError]
+    s.batches match
+        Some(b) -> return Ok(b)
+        None -> ()
+
+    if s.busy then panic(s"CTE '${s.name}' is read while it is being evaluated")
+
+    val source = s.source match
+        Some(op) -> op
+        None -> panic(s"CTE '${s.name}' has no query")
+
+    s.busy = true
+    val b = drain(source)?
+    s.batches = Some(b)
+    s.busy = false
+    Ok(b)
+
+/** `fs` with the CTE `name` in scope after the others: a new buffer, so that a subtree kept for later
+ * (`SubPlan`) still sees the scope it was planned in.
+ */
+private[terndb] with_frame(fs: Buf[CteFrame], name: string, store: &CteStore) -> Buf[CteFrame]
+    val out = buf[CteFrame]()
+    out.extend(fs.view())
+    out.push(CteFrame(name, store))
+    out
+
+/** The store of the nearest CTE named `name` (§6.13 rule 1). */
+private[terndb] cte_store(fs: Buf[CteFrame], name: string) -> &CteStore
+    var i = fs.len()
+
+    while i > 0
+        i -= 1
+
+        if fs[i].name == name then return fs[i].store
+
+    panic(s"no CTE '$name' is in scope")
+
+/** A `CteRef`: the CTE's rows, coerced to the reference's element type. */
+struct CteScanOp
+    store: &CteStore
+    elem: Type
+    at: usize
+
+impl Operator for CteScanOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        val bs = cte_batches(self.store)?
+
+        while self.at < bs.len()
+            val b = bs[self.at]
+            self.at += 1
+
+            if b.len > 0 then return Ok(Some(coerce_vector(b, self.elem)?))
+
+        Ok(None)
+
+/** A recursive CTE (§6.13 rule 4): the seed, then each step's rows of the recursive inputs, each
+ * input re-planned per step with its reference to the CTE (frame `slot`) reading the previous step's
+ * new rows. Without `all` a row `same` as an earlier one is not new. The rows are of `elem`, the
+ * union's element type.
+ */
+struct RecursiveOp
+    name: string
+    seed: &Operator
+    steps: Buf[SubPlan]
+    slot: usize
+    elem: Type
+    all: bool
+    ctx: Ctx
+    out: Option[&Operator]
+
+impl Operator for RecursiveOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if self.out.is_none()
+            var fresh = drain_coerced(self.seed, self.elem)?
+
+            if !self.all then fresh = set_rows(Union, false, [fresh], self.elem)
+
+            val found = buf[ColumnVector]()
+            found.push(fresh)
+            var step: usize = 0
+
+            while fresh.len > 0
+                val working: &CteStore = CteStore(self.name, None, Some(batches_of(fresh)), false)
+                val made = buf[ColumnVector]()
+
+                for s in self.steps
+                    val frames = buf[CteFrame]()
+                    frames.extend(s.ctes.view())
+                    frames[self.slot] = CteFrame(self.name, working)
+
+                    val l = plan_sub(SubPlan(s.rel, s.types, s.at, s.tables, s.outer, frames, s.db), self.ctx, s.outer)
+                    made.push(drain_coerced(flat_input(l), self.elem)?)
+
+                var next = concat(self.elem, made.view())
+
+                if !self.all then next = set_rows(Except, false, [next, concat(self.elem, found.view())], self.elem)
+
+                if next.len == 0 then break
+
+                step += 1
+
+                if step > RecursionSteps then return fail("R0005", s"recursive CTE '${self.name}' has not ended after $RecursionSteps steps")
+
+                found.push(next)
+                fresh = next
+
+            self.out = Some(mem_source(batches_of(concat(self.elem, found.view()))))
+
+        self.out.unwrap().next_batch()
