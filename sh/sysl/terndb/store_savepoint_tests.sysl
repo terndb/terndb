@@ -1,0 +1,199 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Savepoints in the store (`store_savepoint.sysl`): nesting, a rollback to a savepoint undoing the
+// versions written after it (a row first written in the span, and one written before it and again
+// in it), the locks of the span let go and the earlier ones kept, release, shadowed names, an error
+// inside a span held for a rollback to the savepoint unless its code is retryable, and the
+// predicate log kept. The fixtures are `store_tests.sysl`'s.
+
+private ss_acct(s: &Store) -> u64 = st_oid(s, "acct")
+
+/** Every row of `acct` as `t` sees it, as `id:bal` pairs in key order; "W…" if the read fails. */
+private ss_rows(s: &Store, t: &Txn) -> string
+    s.scan(t, ss_acct(s), all_rows()) match
+        Ok(hits) ->
+            var out = ""
+
+            for h in hits
+                val p = s"${st_int(h.row.at(0))}:${st_int(h.row.at(1))}"
+                out = if out.len == 0 then p else s"$out $p"
+
+            out
+        Err(e) -> e.code
+
+@test
+a_rollback_to_a_savepoint_undoes_what_came_after_it_and_keeps_what_came_before()
+    val s = st_bank()
+    val a = ss_acct(s)
+    val t = s.begin(Snapshot)
+    st_done(st_bump(s, t, 1, 10))
+    assert_eq(st_code(s.savepoint(t, "a")), "ok")
+    // Row 1 again (its own version overwritten), row 2 first written, row 3 inserted.
+    st_done(st_bump(s, t, 1, 5))
+    st_done(st_bump(s, t, 2, 1))
+    st_insert(s, t, a, [Int(3), Int(7)])
+    assert_eq(st_code(s.savepoint(t, "b")), "ok")
+    st_done(s.delete_where(t, a, st_key_is(2, [st_col(s, "acct", "id")])))
+    assert_eq(ss_rows(s, t), "1:115 3:7")
+
+    assert_eq(st_code(s.rollback_to(t, "b")), "ok")
+    assert_eq(ss_rows(s, t), "1:115 2:101 3:7")
+    assert_eq(st_code(s.rollback_to(t, "a")), "ok")
+    assert_eq(ss_rows(s, t), "1:110 2:100")
+    // `b` was set after `a`, and went with the rollback to `a`, which is kept.
+    assert_eq(st_code(s.rollback_to(t, "b")), "W2012")
+    assert_eq(s.savepoints(t), 1)
+    assert_eq(t.writes.len(), 1)
+
+    // The key the rollback freed may be inserted again.
+    st_insert(s, t, a, [Int(3), Int(8)])
+    st_commit(s, t)
+    assert_eq(ss_rows(s, s.begin(Snapshot)), "1:110 2:100 3:8")
+
+@test
+release_forgets_a_savepoint_and_every_later_one_and_a_reused_name_shadows()
+    val s = st_bank()
+    val t = s.begin(Snapshot)
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    st_done(st_bump(s, t, 1, 1))
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    st_done(st_bump(s, t, 1, 1))
+    assert_eq(st_code(s.savepoint(t, "inner")), "ok")
+    assert_eq(s.savepoints(t), 3)
+
+    assert_eq(st_code(s.rollback_to(t, "s")), "ok")
+    assert_eq(ss_rows(s, t), "1:101 2:100")
+    assert_eq(st_code(s.release(t, "s")), "ok")
+    assert_eq(s.savepoints(t), 1)
+    assert_eq(st_code(s.release(t, "inner")), "W2012")
+    assert_eq(st_code(s.rollback_to(t, "s")), "ok")
+    assert_eq(ss_rows(s, t), "1:100 2:100")
+    assert_eq(st_code(s.release(t, "s")), "ok")
+    assert_eq(s.savepoints(t), 0)
+
+@test
+a_rollback_to_a_savepoint_lets_the_spans_row_locks_go_and_keeps_the_earlier_ones()
+    val s = st_bank()
+    val t = s.begin(Snapshot)
+    val u = s.begin(Snapshot)
+    st_done(st_bump(s, t, 2, 1))
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    st_done(st_bump(s, t, 1, 1))
+    assert_eq(st_waits(st_bump(s, u, 1, 5)), t.id)
+
+    val before = s.released
+    assert_eq(st_code(s.rollback_to(t, "s")), "ok")
+    assert(s.released == before + 1, "the release is counted, for a parked statement")
+    assert(u.waits_for == 0, "the waiter's edge is dropped")
+    st_done(st_bump(s, u, 1, 5))
+    assert_eq(st_waits(st_bump(s, u, 2, 5)), t.id)
+    st_commit(s, t)
+    st_commit(s, u)
+    assert_eq(ss_rows(s, s.begin(Snapshot)), "1:105 2:101")
+
+@test
+an_error_inside_a_span_holds_the_transaction_for_a_rollback_to_the_savepoint()
+    val s = st_bank()
+    val a = ss_acct(s)
+    val t = s.begin(Snapshot)
+    val u = s.begin(Snapshot)
+    st_done(st_bump(s, t, 2, 1))
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    st_done(st_bump(s, t, 1, 1))
+    assert_eq(st_code(s.insert(t, a, store_row(s, a, rec([Int(1), Int(0)])))), "T3001")
+
+    // Aborted, and still holding its rows.
+    assert_eq(ss_rows(s, t), "W2003")
+    assert_eq(st_code(s.savepoint(t, "t")), "W2003")
+    assert_eq(st_waits(st_bump(s, u, 1, 5)), t.id)
+    assert_eq(st_waits(st_bump(s, u, 2, 5)), t.id)
+
+    assert_eq(st_code(s.rollback_to(t, "s")), "ok")
+    assert_eq(ss_rows(s, t), "1:100 2:101")
+    st_done(st_bump(s, u, 1, 5))
+    st_commit(s, t)
+    st_commit(s, u)
+    assert_eq(ss_rows(s, s.begin(Snapshot)), "1:105 2:101")
+
+@test
+an_error_outside_the_store_is_held_the_same_way()
+    val s = st_bank()
+    val t = s.begin(Snapshot)
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    st_done(st_bump(s, t, 1, 1))
+    val _ = s.abort_with(t, CodecError("R0002", "", "division by zero", buf()))
+    assert_eq(st_code(s.usable(t)), "W2003")
+    assert_eq(st_code(s.rollback_to(t, "s")), "ok")
+    assert_eq(st_code(s.usable(t)), "ok")
+
+    // Without a savepoint the error rolls the transaction back at once.
+    val v = s.begin(Snapshot)
+    st_done(st_bump(s, v, 2, 1))
+    val _ = s.abort_with(v, CodecError("R0002", "", "division by zero", buf()))
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 2, 1))
+
+@test
+a_held_transaction_rolled_back_or_committed_lets_everything_go()
+    val s = st_bank()
+    val a = ss_acct(s)
+    for commit in [false, true]
+        val t = s.begin(Snapshot)
+        assert_eq(st_code(s.savepoint(t, "s")), "ok")
+        st_done(st_bump(s, t, 1, 1))
+        assert_eq(st_code(s.insert(t, a, store_row(s, a, rec([Int(2), Int(0)])))), "T3001")
+        if commit then assert_eq(st_code(s.commit(t)), "T3001") else assert_eq(st_code(s.abort(t)), "ok")
+        assert_eq(st_code(s.rollback_to(t, "s")), "W2003")
+        val u = s.begin(Snapshot)
+        st_done(st_bump(s, u, 1, 1))
+        st_commit(s, u)
+
+    assert_eq(ss_rows(s, s.begin(Snapshot)), "1:102 2:100")
+
+@test
+a_retryable_error_inside_a_span_rolls_the_transaction_back_whole()
+    val s = st_bank()
+    val t = s.begin(Snapshot)
+    st_done(st_bump(s, t, 2, 1))
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    val u = s.begin(Snapshot)
+    st_done(st_bump(s, u, 1, 5))
+    st_commit(s, u)
+
+    assert_eq(st_code(st_bump(s, t, 1, 1)), "T1001")
+    assert_eq(s.savepoints(t), 0)
+    assert_eq(st_code(s.rollback_to(t, "s")), "W2003")
+    // Its write before the savepoint is gone, and its lock with it.
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 2, 1))
+    st_commit(s, w)
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+the_predicate_log_keeps_the_reads_of_a_span_rolled_back()
+    val s = st_bank()
+    val t = s.begin(Serializable)
+    st_done(st_bump(s, t, 2, 1))
+    val n = s.logged(t)
+    assert_eq(st_code(s.savepoint(t, "s")), "ok")
+    assert_eq(st_read(s, t, ss_acct(s), 1, 1), 100)
+    assert_eq(s.logged(t), n + 1)
+    assert_eq(st_code(s.rollback_to(t, "s")), "ok")
+    assert_eq(s.logged(t), n + 1)
+
+    val u = s.begin(Snapshot)
+    st_done(st_bump(s, u, 1, 5))
+    st_commit(s, u)
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+a_savepoint_on_an_ended_transaction_is_refused()
+    val s = st_bank()
+    val t = s.begin(Snapshot)
+    st_commit(s, t)
+    assert_eq(st_code(s.savepoint(t, "s")), "W2001")
+    assert_eq(st_code(s.rollback_to(t, "s")), "W2001")
+    assert_eq(st_code(s.release(t, "s")), "W2001")

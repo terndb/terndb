@@ -611,7 +611,8 @@ params := uvar tuple_count                    (≥ 1)
 ### 5.3 Errors inside a transaction
 
 1. Any error in a request on an open transaction — a validation error, a runtime error, an abort — aborts the
-   transaction ([ISO] §5.1) unless it occurred after a savepoint that the client then rolls back to. The `Error`
+   transaction ([ISO] §5.1) unless it occurred after a savepoint that the client then rolls back to and its code
+   is not retryable (§5.5 rule 6). The `Error`
    reports `txn_state = aborted` (§8.1). The session's own refusals count: `W2005`, `W2006`, `W2007` and
    `W2012` abort it too. Three do not: `W2004`, which ran nothing and is retried in the same transaction with
    `Execute`; `W2002` (§5.1 rule 2); and `W2003`, which finds it aborted already. Since no savepoint can be set
@@ -642,12 +643,27 @@ params := uvar tuple_count                    (≥ 1)
 ### 5.5 Savepoints
 
 1. `Savepoint` sets a savepoint named `name` in the transaction; a name already set replaces the older one with the
-   same name for the purposes of rules 2 and 3 (the older one becomes unreachable by name).
+   same name for the purposes of rules 2 and 3 (the older one becomes unreachable by name) until the newer one is
+   released or rolled back past, which makes the older one the newest of its name again.
 2. `RollbackToSavepoint` undoes everything after the named savepoint, keeps the savepoint, and clears the aborted
-   state if the error that caused it came after the savepoint. An unknown name is `W2012`.
+   state if the error that caused it came after the savepoint. An unknown name is `W2012`. What it undoes is every
+   row inserted, updated or deleted after the savepoint (with what cascades and the other foreign-key actions
+   wrote), the unique-key values those writes installed, the foreign-key checks deferred to commit, and the DDL
+   statements run after it (`ddl.md` §9 rule 1). What it keeps: every read, which at serializable stays in the
+   predicate log and the catalog read and is validated at commit ([ISO] §4.3, §5.6), since the client has
+   observed it; and every sequence value drawn, since sequences are not transactional (`ddl.md` §2.7 rule 5).
 3. `ReleaseSavepoint` forgets the named savepoint and every one set after it, keeping their effects. An unknown
    name is `W2012`.
 4. Savepoints are valid on an aborted transaction only through `RollbackToSavepoint`.
+5. **Locks.** `RollbackToSavepoint` releases every lock the transaction took after the savepoint — row write
+   locks, `LOCK_ONLY` locks (`ddl.md` §2.6 rule 3) and catalog locks (`ddl.md` §6.1) — since nothing it keeps
+   depends on them, and a statement waiting for one of them runs. The locks taken before the savepoint are kept to
+   the end of the transaction.
+6. **Errors inside a span.** A transaction aborted by an error after a savepoint keeps its writes and locks until
+   it is rolled back, to a savepoint or whole (`Rollback`, or the `Commit` of §5.3 rule 3). An error whose code is
+   retryable is the exception: a retryable code guarantees that the transaction is aborted and had no effect
+   ([ISO] §5.2), so it rolls the transaction back whole at once, past every savepoint, and a
+   `RollbackToSavepoint` after it is `W2003`, leaving it aborted.
 
 ### 5.6 Unknown outcomes
 

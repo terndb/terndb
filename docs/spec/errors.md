@@ -161,7 +161,7 @@ Raised under the rules of `wire-protocol.md`. Section references below are to th
 | `W1008` | `bad_batch` | (client-side) The server sent a batch or a result type inconsistent with §6, including a truncated or non-canonical batch | yes | |
 | `W2001` | `unknown_transaction` | Unknown transaction handle | | |
 | `W2002` | `transaction_already_open` | Transaction handle already open | | |
-| `W2003` | `transaction_aborted` | Transaction is aborted; only `Rollback`, `RollbackToSavepoint`, `Commit` accepted | | |
+| `W2003` | `transaction_aborted` | Transaction is aborted; only `Rollback`, `RollbackToSavepoint`, `Commit` accepted; also a `RollbackToSavepoint` after a retryable error, which rolled the transaction back past every savepoint (§5.5 rule 6) | | |
 | `W2004` | `unknown_plan` | Shape digest not in the role's plan cache; resend the tree | | yes |
 | `W2005` | `unknown_prepared` | Unknown prepared handle | | |
 | `W2006` | `prepared_already_registered` | Prepared handle already registered | | |
@@ -172,7 +172,7 @@ Raised under the rules of `wire-protocol.md`. Section references below are to th
 | `W2012` | `unknown_savepoint` | Unknown savepoint | | |
 | `W2014` | `row_not_encodable` | A single row exceeds an encoding limit (§6.3.8) or `max_message_size` | | |
 | `W2016` | `too_many_transactions` | Too many open transactions on the connection | | |
-| `W2018` | `unsupported_request` | A request this server does not support: savepoints, on a server whose store keeps none (§5.5); like any error in a transaction it aborts it (§5.3) | | |
+| `W2018` | `unsupported_request` | A request this server does not support; like any error in a transaction it aborts it (§5.3). No request of this protocol version raises it: every server implements savepoints (§5.5) | | |
 | `W2017` | `union_not_encodable` | *Withdrawn*: a union wider than 65,536 variants is now refused by validation (`Q3016`) | | |
 | `W3001` | `authentication_failed` | Authentication failed | yes | |
 | `W3002` | `no_auth_method` | No acceptable authentication method | yes | |

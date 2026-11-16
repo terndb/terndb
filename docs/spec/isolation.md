@@ -323,7 +323,7 @@ validate early against commits already published, provided the outcome equals th
   tracks reads at page or relation granularity under memory pressure.
 - **A transaction with an empty write set** skips validation and is serialized at `s_i` (§5.5).
 - **Savepoints.** Rolling back to a savepoint undoes the writes after it, but the reads after it stay in `L_i`:
-  the client has already observed them.
+  the client has already observed them. The locks taken after it are released ([WIRE] §5.5 rule 5).
 
 ### 4.4 What is logged
 
@@ -434,7 +434,8 @@ The mechanised version of these arguments is the model of §7.4.
 ### 5.1 Rules
 
 - Any error inside a transaction aborts the whole transaction unless it occurred inside a savepoint that the
-  client rolls back to. A statement never commits partially.
+  client rolls back to and its code is not retryable (§5.2): an error with a retryable code rolls the transaction
+  back whole at once, past every savepoint ([WIRE] §5.5 rule 6). A statement never commits partially.
 - An aborted transaction's writes MUST never have been visible to any other transaction (G1a), and MUST NOT
   survive a crash (I22, I24).
 - An abort MUST be reported to the client with exactly one code from §5.2.

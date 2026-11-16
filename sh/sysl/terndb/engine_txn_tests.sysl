@@ -237,13 +237,6 @@ a_write_in_a_read_only_transaction_is_refused()
     assert_eq(ew_kinds(d.seen(d.send(ew_exec(1, envelope([], CreateNamespace("other", false)))))), "header T4001")
 
 @test
-a_savepoint_is_refused_and_aborts_its_transaction()
-    var d = ew_duo(ew_doctors())
-    d.send(Begin(1, no_txn_options()))
-    assert_eq(ew_kinds(d.seen(d.send(Savepoint(1, "s")))), "W2018")
-    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "W2018")
-
-@test
 transaction_status_answers_what_became_of_a_transaction()
     val e = ew_doctors()
     var d = ew_duo(e)
