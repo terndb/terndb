@@ -179,7 +179,7 @@ end like
 
 // -- the calendar `add`, §7.12 ------------------------------------------------------------------
 
-private const DayMicros: i64 = 86400000000
+private[terndb] const DayMicros: i64 = 86400000000
 
 private floor_div(a: i64, b: i64) -> i64 = if a % b < 0 then a / b - 1 else a / b
 

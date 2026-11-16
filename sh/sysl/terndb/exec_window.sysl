@@ -1,0 +1,514 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.math.infinity
+
+// `Window` (`query-tree.md` §6.8, `docs/design/executor.md` §4.3), sort-based. The input is read
+// whole; each call orders its rows by its partition values (`cmp`, nulls first) and then its own
+// `order`, with `Sort`'s stable comparator, so each partition is a run of positions and each peer
+// group a run within it. A call's value is computed position by position and gathered back into the
+// input's order, which the output keeps.
+
+/** A frame bound with its offset typed (§6.8). */
+struct TBound
+    kind: BoundKind
+    offset: Option[TExpr]
+
+/** A window frame with its offsets typed (§6.8). */
+struct TFrame
+    unit: FrameUnit
+    start: TBound
+    end: TBound
+    exclude: FrameExclude
+
+/** A window call with its expressions typed (§6.8). */
+struct TWin
+    function: string
+    args: Buf[TExpr]
+    partition: Buf[TExpr]
+    order: Buf[TKey]
+    frame: Option[TFrame]
+
+/** The frame of a call that gives none (§6.8 rule 4). */
+private default_frame() -> TFrame =
+    TFrame(Range, TBound(UnboundedPreceding, None), TBound(CurrentRow, None), ExcludeNone)
+
+/** How many frame positions an aggregate is handed at once: the frames of consecutive rows are
+ * cut into runs of about this many positions, so a long partition's frames are never all held.
+ */
+private const ChunkPositions: usize = 65536
+
+// -- the layout of one call's rows ----------------------------------------------------------------
+
+/** One call's rows in its order. Position `k` holds input row `rows[k]`; its partition is the
+ * positions `part_lo[k]..<part_hi[k]` and its peer group the global group `group[k]`, whose positions
+ * are `group_lo[g]..<group_hi[g]`.
+ */
+private struct Layout
+    rows: Buf[usize]
+    part_lo: Buf[usize]
+    part_hi: Buf[usize]
+    group: Buf[usize]
+    group_lo: Buf[usize]
+    group_hi: Buf[usize]
+    /** The `order` keys, which a `range` offset compares by. */
+    keys: Buf[KeyOrder]
+
+    peer_lo(self, k: usize) -> usize = self.group_lo[self.group[k]]
+
+    peer_hi(self, k: usize) -> usize = self.group_hi[self.group[k]]
+
+private layout_of(w: TWin, env: Env) -> Result[Layout, CodecError]
+    val n = env.n
+    val parts = buf[KeyOrder]()
+
+    for e in w.partition
+        parts.push(key_order(eval(e, env)?, false, true))
+
+    val keys = buf[KeyOrder]()
+
+    for k in w.order
+        keys.push(key_order(eval(k.expr, env)?, k.desc, k.nulls_first))
+
+    val both = buf[KeyOrder]()
+    both.extend(parts.view())
+    both.extend(keys.view())
+
+    val rows = sorted_rows(both, n)
+    val part_lo = buf[usize]()
+    val group = buf[usize]()
+    val group_lo = buf[usize]()
+    val group_hi = buf[usize]()
+
+    for k in 0..<n
+        val new_part = k == 0 || compare_rows(parts, rows[k - 1], rows[k]) != 0
+
+        if new_part || compare_rows(keys, rows[k - 1], rows[k]) != 0
+            if group_lo.len() > 0 then group_hi.push(k)
+            group_lo.push(k)
+
+        part_lo.push(if new_part then k else part_lo[k - 1])
+        group.push(group_lo.len() - 1)
+
+    if n > 0 then group_hi.push(n)
+
+    // Each position's partition end, filled from the back.
+    val part_hi = buf[usize]()
+
+    for _ in 0..<n
+        part_hi.push(n)
+
+    var k = n
+
+    while k > 0
+        k -= 1
+        part_hi[k] = if k + 1 < n && part_lo[k + 1] == part_lo[k] then part_hi[k + 1] else k + 1
+
+    Ok(Layout(rows, part_lo, part_hi, group, group_lo, group_hi, keys))
+end layout_of
+
+// -- the operator ---------------------------------------------------------------------------------
+
+/** The input's rows in input order with one column per call under the window's binder: the input's
+ * binders and the window's as one composite. It reads its whole input on the first call.
+ */
+struct WindowOp
+    input: &Operator
+    binder: string
+    input_elem: Type
+    elem: Type
+    items: Buf[TWin]
+    ctx: Ctx
+    out: Option[&Operator]
+
+impl Operator for WindowOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if self.out.is_none()
+            val all = drain_rows(self.input, self.input_elem)?
+            val env = env_of(self.ctx, self.binder, all)
+            val fs = fields_of_type(self.elem)
+            val wty = fs[fs.len() - 1].ty
+            val wfs = fields_of_type(wty)
+            val cs = buf[ColumnVector]()
+
+            for j in 0..<self.items.len()
+                cs.push(window_column(self.items[j], wfs[j].ty, env)?)
+
+            val parts = parts_of(self.binder, all)
+            val members = buf[ColumnVector]()
+            members.extend(parts.view())
+            members.push(ColumnVector(wty, all.len, buf[u8](), Members(cs)))
+            self.out = Some(mem_source(batches_of(ColumnVector(self.elem, all.len, buf[u8](), Members(members)))))
+
+        self.out.unwrap().next_batch()
+
+/** `Window` over `inner`: `flat` is the type checker's element type (every exposed column, the
+ * window's last), from which each call's column type is read.
+ */
+private[terndb] plan_window(inner: Lowered, binder: string, flat: Type, items: Buf[TWin], ctx: Ctx) -> Lowered
+    val fs = fields_of_type(flat)
+    val wfs = buf[Field]()
+
+    for j in (fs.len() - items.len())..<fs.len()
+        wfs.push(fs[j])
+
+    val out = buf[Field]()
+    out.extend(exposed(inner).view())
+    out.push(Field(binder, Record(wfs)))
+    val elem = record(out.view())
+    Lowered(WindowOp(inner.op, inner.binder, inner.elem, elem, items, ctx, None), Composite, elem, buf[TKey]())
+
+// -- one call -------------------------------------------------------------------------------------
+
+/** Call `w`'s column, of type `ty`, one slot per input row in input order. */
+private window_column(w: TWin, ty: Type, env: Env) -> Result[ColumnVector, CodecError]
+    val lay = layout_of(w, env)?
+
+    w.function match
+        "row_number" | "rank" | "dense_rank" -> Ok(rank_column(w.function, lay))
+        "lag" | "lead" -> offset_column(w, ty, lay, env)
+        "first_value" | "last_value" ->
+            val frames = frames_of(w, lay, env.ctx)?
+            edge_column(w, ty, lay, frames, env)
+        _ ->
+            val frames = frames_of(w, lay, env.ctx)?
+            frame_aggregate(w, ty, lay, frames, env)
+
+/** `row_number`, `rank` or `dense_rank` (§6.8 rule 2). */
+private rank_column(f: string, lay: Layout) -> ColumnVector
+    val n = lay.rows.len()
+    val out = buf[i64]()
+
+    for _ in 0..<n
+        out.push(0)
+
+    for k in 0..<n
+        val lo = lay.part_lo[k]
+
+        out[lay.rows[k]] = f match
+            "row_number" -> i64(k - lo + 1)
+            "rank" -> i64(lay.peer_lo(k) - lo + 1)
+            _ -> i64(lay.group[k] - lay.group[lo] + 1)
+
+    ColumnVector(Int64, n, buf[u8](), I64s(out))
+
+/** `lag` or `lead` (§6.8 rule 3). */
+private offset_column(w: TWin, ty: Type, lay: Layout, env: Env) -> Result[ColumnVector, CodecError]
+    val n = env.n
+    val x = coerce_vector(eval(w.args[0], env)?, ty)?
+    // `n` is never null: `int64?` does not coerce to its `int64` (§6.8 rule 3).
+    val steps = if w.args.len() >= 2 then Some(wide_of(eval(w.args[1], env)?.lanes)) else None
+    val d = if w.args.len() == 3 then coerce_vector(eval(w.args[2], env)?, ty)? else repeated(ty, Null, n)
+    // Slot `i` of `src` is `x` on row `i`, slot `n + i` the default on row `i`.
+    val src = concat(ty, [x, d])
+    val at = buf[usize]()
+
+    for _ in 0..<n
+        at.push(0)
+
+    for k in 0..<n
+        val r = lay.rows[k]
+        val step = steps.map(s -> s[r]).unwrap_or(1)
+
+        if step < 0 then return fail("R0006", s"the offset of '${w.function}' is negative")
+
+        val t = if w.function == "lag" then i128(k) - step else i128(k) + step
+        at[r] = if t >= i128(lay.part_lo[k]) && t < i128(lay.part_hi[k]) then lay.rows[usize(t)] else n + r
+
+    Ok(take(src, at.view()))
+end offset_column
+
+// -- frames -----------------------------------------------------------------------------------------
+
+/** Each position's frame before its exclusion: positions `lo[k]..<hi[k]`, with `lo[k] <= hi[k]`. */
+private struct Frames
+    lo: Buf[usize]
+    hi: Buf[usize]
+    exclude: FrameExclude
+
+/** A frame offset, evaluated once (§6.8 rule 4): a count of rows or of peer groups, or how far a
+ * `range` key reaches, in the key's own terms.
+ */
+private enum Reach
+    NoReach
+    Count(n: i128)
+    Exact(k: i256)
+    Approx(k: real)
+    Span(iv: Ival)
+
+/** The `range` order key's values, as `Reach` compares them: exact integers (an integer or a
+ * decimal's unscaled value), floats, or microseconds (a `date` as its midnight).
+ */
+private enum KeyLane
+    Wides(x: Buf[i128])
+    Reals(x: Buf[real])
+    Micros(x: Buf[i64])
+
+/** A `range` bound's value: where the bound lies among the key's values. */
+private enum Point
+    AtExact(b: i256)
+    AtReal(b: real)
+    AtMicros(b: i64)
+
+private negative_offset[T]() -> Result[T, CodecError] = fail("R0006", "a frame offset is null or negative")
+
+/** Bound `b`'s offset, evaluated once with no rows in sight, in the terms of `unit` and of the
+ * `range` key `key`.
+ */
+private reach_of(b: TBound, unit: FrameUnit, key: Option[KeyOrder], ctx: Ctx) -> Result[Reach, CodecError]
+    val e = b.offset match
+        Some(x) -> x
+        None -> return Ok(NoReach)
+
+    val raw = eval(e, rows_env(ctx, 1))?
+
+    if !raw.is_valid(0) then return negative_offset()
+
+    if unit != Range
+        val n = wide_of(raw.lanes)[0]
+        return if n < 0 then negative_offset() else Ok(Count(n))
+
+    val kt = key.unwrap().v.ty.base()
+
+    raw.lanes match
+        Intervals(x) ->
+            val iv = x[0]
+            if iv.months < 0 || iv.days < 0 || iv.micros < 0 then negative_offset() else Ok(Span(iv))
+        _ ->
+            val v = coerce_vector(raw, kt)?
+
+            if kt == Float32 || kt == Float64
+                val k = reals_of(v.lanes)[0]
+                return if k.is_nan() || k < 0.0 then negative_offset() else Ok(Approx(k))
+
+            val k = wide_of(v.lanes)[0]
+            if k < 0 then negative_offset() else Ok(Exact(i256(k)))
+end reach_of
+
+private key_lane(v: ColumnVector) -> KeyLane = v.lanes match
+    F32s(_) | F64s(_) -> Reals(reals_of(v.lanes))
+    I32s(x) ->
+        if v.ty.base() == Date
+            val out = buf[i64]()
+
+            for d in x
+                out.push(i64(d) * DayMicros)
+
+            Micros(out)
+        else
+            Wides(wide_of(v.lanes))
+    I64s(x) -> if v.ty.base() == Int64 then Wides(wide_of(v.lanes)) else Micros(x)
+    _ -> Wides(wide_of(v.lanes))
+
+/** Each position's frame for call `w` (§6.8 rule 4). */
+private frames_of(w: TWin, lay: Layout, ctx: Ctx) -> Result[Frames, CodecError]
+    val fr = w.frame.unwrap_or(default_frame())
+    val ranged = fr.unit == Range && (fr.start.offset.is_some() || fr.end.offset.is_some())
+    val key = if ranged then Some(lay.keys[0]) else None
+    val lane = key.map(k -> key_lane(k.v))
+    val sr = reach_of(fr.start, fr.unit, key, ctx)?
+    val er = reach_of(fr.end, fr.unit, key, ctx)?
+    val los = buf[usize]()
+    val his = buf[usize]()
+
+    for k in 0..<lay.rows.len()
+        val lo = bound_at(fr.unit, fr.start.kind, sr, true, k, lay, key, lane)?
+        val hi = bound_at(fr.unit, fr.end.kind, er, false, k, lay, key, lane)?
+        los.push(lo)
+        his.push(if hi < lo then lo else hi)
+
+    Ok(Frames(los, his, fr.exclude))
+
+/** Where a bound of `kind` puts position `k`'s frame: as a `start`, its first position; as an end, one
+ * past its last.
+ */
+private bound_at(unit: FrameUnit, kind: BoundKind, reach: Reach, start: bool, k: usize, lay: Layout, key: Option[KeyOrder], lane: Option[KeyLane]) -> Result[usize, CodecError]
+    val (lo, hi) = (lay.part_lo[k], lay.part_hi[k])
+
+    kind match
+        UnboundedPreceding -> return Ok(lo)
+        UnboundedFollowing -> return Ok(hi)
+        CurrentRow ->
+            if unit == Rows then return Ok(if start then k else k + 1)
+
+            return Ok(if start then lay.peer_lo(k) else lay.peer_hi(k))
+        _ -> ()
+
+    val back = kind == Preceding
+
+    unit match
+        Rows ->
+            val n = reach_count(reach)
+            // The row `n` away, and for an end one past it, clamped to the partition.
+            val t = (if back then i128(k) - n else i128(k) + n) + (if start then 0 else 1)
+            Ok(clamp(t, lo, hi))
+        Groups ->
+            val n = reach_count(reach)
+            val g = i128(lay.group[k])
+            val (g0, g1) = (i128(lay.group[lo]), i128(lay.group[hi - 1]))
+            val t = if back then g - n else g + n
+
+            if t < g0 then return Ok(lo)
+            if t > g1 then return Ok(hi)
+
+            Ok(if start then lay.group_lo[usize(t)] else lay.group_hi[usize(t)])
+        Range -> range_bound(back, reach, start, k, lay, key.unwrap(), lane.unwrap())
+end bound_at
+
+private reach_count(r: Reach) -> i128 = r match
+    Count(n) -> n
+    _ -> panic("a rows or groups offset is a count")
+
+private clamp(t: i128, lo: usize, hi: usize) -> usize =
+    if t < i128(lo) then lo elif t > i128(hi) then hi else usize(t)
+
+/** A `range` offset bound: the first position of the partition not before the bound's value (a
+ * start), or the first after it (an end). A current row whose key is null or NaN bounds at its peers.
+ */
+private range_bound(back: bool, reach: Reach, start: bool, k: usize, lay: Layout, key: KeyOrder, lane: KeyLane) -> Result[usize, CodecError]
+    val r = lay.rows[k]
+    val (lo, hi) = (lay.part_lo[k], lay.part_hi[k])
+    val edge = if start then lay.peer_lo(k) else lay.peer_hi(k)
+
+    if !key.v.is_valid(r) then return Ok(edge)
+
+    // Moving toward the start of the order lowers an ascending key and raises a descending one.
+    val minus = back != key.desc
+
+    val at = (lane, reach) match
+        (Wides(x), Exact(d)) -> AtExact(if minus then i256(x[r]) - d else i256(x[r]) + d)
+        (Reals(x), Approx(d)) ->
+            if x[r].is_nan() then return Ok(edge)
+
+            val b = if minus then x[r] - d else x[r] + d
+            AtReal(if b.is_nan() then (if minus then -infinity() else infinity()) else b)
+        (Micros(x), Span(iv)) ->
+            AtMicros(add_interval(x[r], if minus then Ival(-iv.months, -iv.days, -iv.micros) else iv)?)
+        _ -> panic("a range offset fits its key")
+
+    // The position's place relative to the bound in the order: -1 before, 0 at, 1 after.
+    val place: &Fn(usize) -> i8 = t ->
+        val row = lay.rows[t]
+
+        if !key.v.is_valid(row)
+            if key.nulls_first then -1 else 1
+        else
+            val c = (lane, at) match
+                (Wides(x), AtExact(b)) -> sign(i256(x[row]), b)
+                (Reals(x), AtReal(b)) -> float_order(x[row], b)
+                (Micros(x), AtMicros(b)) -> sign(x[row], b)
+                _ -> panic("a range bound has its key's terms")
+
+            if key.desc then -c else c
+
+    Ok(if start then first_where(lo, hi, t -> place(t) >= 0) else first_where(lo, hi, t -> place(t) > 0))
+end range_bound
+
+/** The first position in `lo..<hi` that `holds`, which is false before it and true from it on; `hi`
+ * when none does.
+ */
+private first_where(lo: usize, hi: usize, holds: &Fn(usize) -> bool) -> usize
+    var a = lo
+    var b = hi
+
+    while a < b
+        val m = a + (b - a) / 2
+
+        if holds(m)
+            b = m
+        else
+            a = m + 1
+
+    a
+
+/** The positions `lo..<hi` of a frame. */
+private struct Run
+    lo: usize
+    hi: usize
+
+/** The runs of positions of position `k`'s frame once its exclusion is applied (§6.8 rule 4), in
+ * order, each non-empty.
+ */
+private frame_runs(frames: Frames, k: usize, lay: Layout) -> Buf[Run]
+    val (s, e) = (frames.lo[k], frames.hi[k])
+    val out = buf[Run]()
+    val add = (a: usize, b: usize) ->
+        if a < b then out.push(Run(a, b))
+
+    frames.exclude match
+        ExcludeNone -> add(s, e)
+        ExcludeCurrent ->
+            add(s, if e < k then e else k)
+            add(if s > k + 1 then s else k + 1, e)
+        _ ->
+            val (ps, pe) = (lay.peer_lo(k), lay.peer_hi(k))
+            add(s, if e < ps then e else ps)
+
+            if frames.exclude == ExcludeTies && s <= k && k < e then add(k, k + 1)
+
+            add(if s > pe then s else pe, e)
+
+    out
+
+/** `first_value` or `last_value` (§6.8 rule 5). */
+private edge_column(w: TWin, ty: Type, lay: Layout, frames: Frames, env: Env) -> Result[ColumnVector, CodecError]
+    val n = env.n
+    val src = concat(ty, [coerce_vector(eval(w.args[0], env)?, ty)?, repeated(ty, Null, 1)])
+    val at = buf[usize]()
+
+    for _ in 0..<n
+        at.push(0)
+
+    for k in 0..<n
+        val runs = frame_runs(frames, k, lay)
+        val first = w.function == "first_value"
+
+        if runs.len() == 0
+            at[lay.rows[k]] = n
+        elif first
+            at[lay.rows[k]] = lay.rows[runs[0].lo]
+        else
+            at[lay.rows[k]] = lay.rows[runs[runs.len() - 1].hi - 1]
+
+    Ok(take(src, at.view()))
+
+/** An aggregate over each row's frame (§6.8 rule 5): each frame is a group of `aggregate_column`,
+ * its rows in the partition's order, handed over a run of rows at a time.
+ */
+private frame_aggregate(w: TWin, ty: Type, lay: Layout, frames: Frames, env: Env) -> Result[ColumnVector, CodecError]
+    val n = env.n
+    val args = buf[ColumnVector]()
+
+    for x in w.args
+        args.push(eval(x, env)?)
+
+    val chunks = buf[ColumnVector]()
+    var at = buf[usize]()
+    var bounds = buf[usize]()
+    bounds.push(0)
+
+    for k in 0..<n
+        for run in frame_runs(frames, k, lay)
+            for t in run.lo..<run.hi
+                at.push(lay.rows[t])
+
+        bounds.push(at.len())
+
+        if at.len() >= ChunkPositions || k + 1 == n
+            chunks.push(aggregate_column(w.function, ty, args, Seen(at, bounds))?)
+            at = buf[usize]()
+            bounds = buf[usize]()
+            bounds.push(0)
+
+    // Position `k`'s value is slot `k`; input row `rows[k]` takes it.
+    val by_position = concat(ty, chunks.view())
+    val slot = buf[usize]()
+
+    for _ in 0..<n
+        slot.push(0)
+
+    for k in 0..<n
+        slot[lay.rows[k]] = k
+
+    Ok(take(by_position, slot.view()))
+end frame_aggregate

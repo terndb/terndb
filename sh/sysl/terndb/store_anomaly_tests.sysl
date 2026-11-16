@@ -1,0 +1,344 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `isolation.md` §7.2's workloads run on the store as fixed interleavings, each checked for the
+// outcome §7.1 gives its level: the anomaly forbidden (F) is prevented, the one permitted (P)
+// occurs. Each forbidden anomaly is also run on the fault-injected store of §7.1 "prove the checker
+// can fail" (validation, or first-updater-wins, switched off), where it must occur.
+
+// -- W1/W3 lost update (I6) ---------------------------------------------------------------------------
+
+// `t` reads account `k`'s balance, then writes back what it read plus `delta`: a client-side
+// read-modify-write, the shape a lost update needs.
+private an_rmw(s: &Store, t: &Txn, k: i128, seen: i128, delta: i128) -> Result[WriteOutcome, CodecError]
+    val a = st_oid(s, "acct")
+    val set: &Fn(StoredRow) -> Value = r -> rec([r.at(0), Int(seen + delta)])
+    s.update_where(t, a, st_key_is(k, [st_col(s, "acct", "id")]), set)
+
+// Two transactions at `level` each add 1 to account 1 from what they read; answers the final
+// balance and the code the second one ended with.
+private an_lost_update(s: &Store, level: Isolation) -> (i128, string)
+    val a = st_oid(s, "acct")
+    val t1 = s.begin(level)
+    val t2 = s.begin(level)
+    val x1 = st_read(s, t1, a, 1, 1)
+    val x2 = st_read(s, t2, a, 1, 1)
+    st_done(an_rmw(s, t1, 1, x1, 1))
+    st_waits(an_rmw(s, t2, 1, x2, 1))
+    st_commit(s, t1)
+
+    val code = an_rmw(s, t2, 1, x2, 1) match
+        Ok(Done(_)) -> st_code(s.commit(t2))
+        Ok(Wait(_)) -> "wait"
+        Err(e) -> e.code
+
+    (st_read(s, s.begin(Snapshot), a, 1, 1), code)
+
+@test
+a_lost_update_is_prevented_at_serializable_and_snapshot()
+    for level in [Serializable, Snapshot]
+        val (bal, code) = an_lost_update(st_bank(), level)
+        assert_eq(code, "T1001")
+        assert_eq(bal, 101)
+
+@test
+a_lost_update_is_permitted_at_read_committed_across_statements()
+    val (bal, code) = an_lost_update(st_bank(), ReadCommitted)
+    assert_eq(code, "ok")
+    assert_eq(bal, 101)
+
+@test
+without_first_updater_wins_a_snapshot_transaction_loses_an_update()
+    val s = st_bank()
+    s.faults = Faults(false, true)
+    val (bal, code) = an_lost_update(s, Snapshot)
+    assert_eq(code, "ok")
+    assert_eq(bal, 101)
+
+// -- W3b write skew (I8) ----------------------------------------------------------------------------
+
+// `t` reads both accounts and withdraws `amount` from account `k` if their sum stays non-negative.
+private an_withdraw(s: &Store, t: &Txn, k: i128, amount: i128)
+    val hits = s.scan(t, st_oid(s, "acct"), all_rows()).unwrap()
+    var sum: i128 = 0
+
+    for h in hits
+        sum += st_int(h.row.at(1))
+
+    if sum - amount >= 0 then st_done(st_bump(s, t, k, -amount))
+
+// Two withdrawals of 150 from a pair holding 100 each; answers the second commit's code and the
+// final sum.
+private an_write_skew(s: &Store, level: Isolation) -> (string, i128)
+    val a = st_oid(s, "acct")
+    val t1 = s.begin(level)
+    val t2 = s.begin(level)
+    an_withdraw(s, t1, 1, 150)
+    an_withdraw(s, t2, 2, 150)
+    st_commit(s, t1)
+    val code = st_code(s.commit(t2))
+    val r = s.begin(Snapshot)
+    (code, st_read(s, r, a, 1, 1) + st_read(s, r, a, 2, 1))
+
+@test
+write_skew_aborts_at_serializable()
+    val (code, sum) = an_write_skew(st_bank(), Serializable)
+    assert_eq(code, "T1001")
+    assert_eq(sum, 50)
+
+@test
+write_skew_is_permitted_at_snapshot()
+    val (code, sum) = an_write_skew(st_bank(), Snapshot)
+    assert_eq(code, "ok")
+    assert_eq(sum, -100)
+
+@test
+without_validation_a_serializable_transaction_commits_write_skew()
+    val s = st_bank()
+    s.faults = Faults(true, false)
+    val (code, sum) = an_write_skew(s, Serializable)
+    assert_eq(code, "ok")
+    assert_eq(sum, -100)
+
+// -- W6 the read-only anomaly (I15, I16) ------------------------------------------------------------
+
+// Fekete's history: checking `x` (account 1) and savings `y` (account 2), both 0. `t1` withdraws 10
+// from `x`, charging 1 more if `x + y` would go negative, judged on its snapshot; `t2` deposits 20 into
+// `y` and commits first; two readers, one declared read-only, read both after `t2` and before `t1`.
+// Answers `t1`'s commit code and what the readers saw.
+private an_fekete(s: &Store, level: Isolation) -> (string, i128, i128)
+    val a = st_oid(s, "acct")
+    val setup = s.begin(Snapshot)
+    st_insert(s, setup, a, [Int(1), Int(0)])
+    st_insert(s, setup, a, [Int(2), Int(0)])
+    st_commit(s, setup)
+
+    val t1 = s.begin(level)
+    val x = st_read(s, t1, a, 1, 1)
+    val y = st_read(s, t1, a, 2, 1)
+    val t2 = s.begin(level)
+    st_done(st_bump(s, t2, 2, 20))
+    st_commit(s, t2)
+
+    val t3 = s.begin(level, true)
+    val t4 = s.begin(level)
+    val seen_x = st_read(s, t3, a, 1, 1)
+    val seen_y = st_read(s, t4, a, 2, 1)
+    assert_eq(st_read(s, t4, a, 1, 1), seen_x)
+    st_commit(s, t3)
+    st_commit(s, t4)
+
+    val penalty: i128 = if x + y - 10 < 0 then 1 else 0
+    st_done(st_bump(s, t1, 1, -10 - penalty))
+    (st_code(s.commit(t1)), seen_x, seen_y)
+
+@test
+the_read_only_anomaly_aborts_the_writer_at_serializable_and_never_a_reader()
+    val (code, x, y) = an_fekete(st_store(), Serializable)
+    assert_eq(code, "T1001")
+    assert_eq(x, 0)
+    assert_eq(y, 20)
+
+@test
+the_read_only_anomaly_is_permitted_at_snapshot()
+    val (code, _, _) = an_fekete(st_store(), Snapshot)
+    assert_eq(code, "ok")
+
+@test
+without_validation_the_read_only_anomaly_commits_at_serializable()
+    val s = st_store()
+    s.faults = Faults(true, false)
+    val (code, _, _) = an_fekete(s, Serializable)
+    assert_eq(code, "ok")
+
+// -- W4 phantoms through a predicate (I9) ------------------------------------------------------------
+
+private an_groups(s: &Store)
+    val g = st_oid(s, "grp")
+    val t = s.begin(Snapshot)
+    st_insert(s, t, g, [Int(1), Int(1), Int(0)])
+    st_insert(s, t, g, [Int(2), Int(1), Int(0)])
+    st_commit(s, t)
+
+private an_count(s: &Store, t: &Txn, group: i128) -> usize =
+    s.scan(t, st_oid(s, "grp"), pred([st_col(s, "grp", "k"), st_col(s, "grp", "g")], r -> st_int(r.at(1)) == group)).unwrap().len()
+
+// The on-call shape: each of two transactions leaves group 1 only if it has at least two members.
+// Answers the second commit's code and the members left.
+private an_on_call(s: &Store, level: Isolation) -> (string, usize)
+    an_groups(s)
+    val g = st_oid(s, "grp")
+    val k = st_col(s, "grp", "k")
+    val t1 = s.begin(level)
+    val t2 = s.begin(level)
+    assert_eq(an_count(s, t1, 1), 2)
+    assert_eq(an_count(s, t2, 1), 2)
+    st_done(s.delete_where(t1, g, st_key_is(1, [k])))
+    st_done(s.delete_where(t2, g, st_key_is(2, [k])))
+    st_commit(s, t1)
+    val code = st_code(s.commit(t2))
+    (code, an_count(s, s.begin(Snapshot), 1))
+
+@test
+an_emptied_group_is_prevented_at_serializable()
+    val (code, left) = an_on_call(st_store(), Serializable)
+    assert_eq(code, "T1001")
+    assert_eq(left, 1)
+
+@test
+an_emptied_group_is_permitted_at_snapshot()
+    val (code, left) = an_on_call(st_store(), Snapshot)
+    assert_eq(code, "ok")
+    assert_eq(left, 0)
+
+@test
+without_validation_a_serializable_pair_empties_the_group()
+    val s = st_store()
+    s.faults = Faults(true, false)
+    val (code, left) = an_on_call(s, Serializable)
+    assert_eq(code, "ok")
+    assert_eq(left, 0)
+
+// `t1` counts group 1 and inserts into group 2; `t2` inserts a row into group `into` and commits
+// first. Answers `t1`'s commit code.
+private an_phantom(into: i128) -> string
+    val s = st_store()
+    an_groups(s)
+    val g = st_oid(s, "grp")
+    val t1 = s.begin(Serializable)
+    assert_eq(an_count(s, t1, 1), 2)
+    val t2 = s.begin(Serializable)
+    st_insert(s, t2, g, [Int(9), Int(into), Int(0)])
+    st_commit(s, t2)
+    st_insert(s, t1, g, [Int(10), Int(2), Int(0)])
+    st_code(s.commit(t1))
+
+@test
+an_insert_into_a_group_read_is_a_phantom_and_aborts_the_reader()
+    assert_eq(an_phantom(1), "T1001")
+
+@test
+an_insert_into_another_group_does_not_abort_the_reader()
+    assert_eq(an_phantom(3), "ok")
+
+// -- W5 nested relations (§4.5, I17, I18) -----------------------------------------------------------
+
+private an_items(r: StoredRow) -> Buf[Value] = r.at(2) match
+    Relation(es) -> es
+    _ -> buf[Value]()
+
+// The elements `e` of a row's items, in order.
+private an_elems(r: StoredRow) -> string
+    var out = ""
+
+    for it in an_items(r)
+        val e = it match
+            Record(fs) -> st_int(fs[0])
+            _ -> -1
+
+        out = out + s"$e,"
+
+    out
+
+private an_append(e: i128, price: i128) -> &Fn(StoredRow) -> Value = r ->
+    val items = an_items(r).copy()
+    items.push(rec([Int(e), Int(price)]))
+    rec([r.at(0), r.at(1), Relation(items)])
+
+private an_retag(tag: string) -> &Fn(StoredRow) -> Value = r -> rec([r.at(0), Text(tag), r.at(2)])
+
+private an_over(r: StoredRow, p: i128) -> bool
+    for it in an_items(r)
+        it match
+            Record(fs) -> if st_int(fs[1]) > p then return true
+            _ -> ()
+
+    false
+
+// Rows 1 and 2 of `nest`, each holding one element priced 5.
+private an_nest() -> &Store
+    val s = st_store()
+    val n = st_oid(s, "nest")
+    val t = s.begin(Snapshot)
+    st_insert(s, t, n, [Int(1), Text("a"), rel([rec([Int(1), Int(5)])])])
+    st_insert(s, t, n, [Int(2), Text("b"), rel([rec([Int(1), Int(5)])])])
+    st_commit(s, t)
+    s
+
+private an_row(s: &Store, k: i128) -> Pred = st_key_is(k, [st_col(s, "nest", "k"), st_col(s, "nest", "items")])
+
+@test
+two_appends_to_one_rows_nested_relation_conflict_as_writes_of_the_row()
+    val s = an_nest()
+    val n = st_oid(s, "nest")
+    val t1 = s.begin(Snapshot)
+    val t2 = s.begin(Snapshot)
+    st_done(s.update_where(t1, n, an_row(s, 1), an_append(2, 5)))
+    assert_eq(st_waits(s.update_where(t2, n, an_row(s, 1), an_append(3, 5))), t1.id)
+    st_commit(s, t1)
+    assert_eq(st_code(s.update_where(t2, n, an_row(s, 1), an_append(3, 5))), "T1001")
+
+    // Appends to different rows do not conflict.
+    val t3 = s.begin(Snapshot)
+    val t4 = s.begin(Snapshot)
+    st_done(s.update_where(t3, n, an_row(s, 1), an_append(4, 5)))
+    st_done(s.update_where(t4, n, an_row(s, 2), an_append(4, 5)))
+    st_commit(s, t3)
+    st_commit(s, t4)
+
+@test
+read_committed_appends_to_one_nested_relation_keep_both_in_commit_order()
+    val s = an_nest()
+    val n = st_oid(s, "nest")
+    val t1 = s.begin(ReadCommitted)
+    val t2 = s.begin(ReadCommitted)
+    st_done(s.update_where(t1, n, an_row(s, 1), an_append(2, 5)))
+    st_waits(s.update_where(t2, n, an_row(s, 1), an_append(3, 5)))
+    st_commit(s, t1)
+    st_done(s.update_where(t2, n, an_row(s, 1), an_append(3, 5)))
+    st_commit(s, t2)
+    assert_eq(an_elems(s.get(s.begin(Snapshot), n, st_key(1)).unwrap().unwrap()), "1,2,3,")
+
+@test
+a_read_of_a_row_returns_one_whole_version_of_its_nested_relation()
+    val s = an_nest()
+    val n = st_oid(s, "nest")
+    val w = s.begin(Snapshot)
+    val r = s.begin(Snapshot)
+    st_done(s.update_where(w, n, an_row(s, 1), an_append(2, 5)))
+    st_done(s.update_where(w, n, an_row(s, 1), an_append(3, 5)))
+    assert_eq(an_elems(s.get(r, n, st_key(1)).unwrap().unwrap()), "1,")
+    assert_eq(an_elems(s.get(w, n, st_key(1)).unwrap().unwrap()), "1,2,3,")
+    st_commit(s, w)
+    assert_eq(an_elems(s.get(r, n, st_key(1)).unwrap().unwrap()), "1,")
+    assert_eq(an_elems(s.get(s.begin(Snapshot), n, st_key(1)).unwrap().unwrap()), "1,2,3,")
+
+// `t1` reads the rows having an item priced over 10, reading `k` and `items`, then retags row 2;
+// `t2` changes row 1 with `change` and commits first. Answers `t1`'s commit code.
+private an_nested_predicate(s: &Store, change: &Fn(StoredRow) -> Value) -> string
+    val n = st_oid(s, "nest")
+    val t1 = s.begin(Serializable)
+    val over = pred([st_col(s, "nest", "k"), st_col(s, "nest", "items")], r -> an_over(r, 10))
+    assert_eq(s.scan(t1, n, over).unwrap().len(), 0)
+    val t2 = s.begin(Serializable)
+    st_done(s.update_where(t2, n, an_row(s, 1), change))
+    st_commit(s, t2)
+    st_done(s.update_where(t1, n, an_row(s, 2), an_retag("z")))
+    st_code(s.commit(t1))
+
+@test
+a_predicate_over_a_nested_level_catches_an_append_that_makes_a_row_a_member()
+    assert_eq(an_nested_predicate(an_nest(), an_append(2, 20)), "T1001")
+
+@test
+a_change_the_nested_predicate_did_not_read_does_not_abort_it()
+    assert_eq(an_nested_predicate(an_nest(), an_append(2, 7)), "ok")
+    assert_eq(an_nested_predicate(an_nest(), an_retag("q")), "ok")
+
+@test
+without_validation_the_nested_phantom_commits()
+    val s = an_nest()
+    s.faults = Faults(true, false)
+    assert_eq(an_nested_predicate(s, an_append(2, 20)), "ok")

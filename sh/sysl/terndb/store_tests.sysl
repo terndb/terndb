@@ -1,0 +1,455 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The in-memory store's mechanism (`isolation.md` §4.1–§4.2, §5): snapshots and the horizon, version
+// chains and abort, read committed's statement snapshots and re-evaluation, first-updater-wins with
+// waits and deadlock detection, and every error code the store raises. The §7.2 workloads are in
+// `store_anomaly_tests.sysl`. Transactions interleave in the order the test calls them.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+/** Tables `acct(id, bal)`, `grp(k, g, v)` and `nest(k, tag, items bag<{e, price}>)`, each keyed on
+ * its first column.
+ */
+st_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("acct", [cat_col("id", Int64), cat_col("bal", Int64)], ["id"]))
+    c = cat_ok(c, cat_table("grp", [cat_col("k", Int64), cat_col("g", Int64), cat_col("v", Int64)], ["k"]))
+    val item = record([Field("e", Int64), Field("price", Int64)])
+    cat_ok(c, cat_table("nest", [cat_col("k", Int64), cat_col("tag", Text), cat_col("items", bag(item))], ["k"]))
+
+st_store() -> &Store = mem_store(st_catalog())
+
+st_oid(s: &Store, name: string) -> u64 = cat_table_of(s.catalog, name).oid
+
+st_col(s: &Store, table: string, column: string) -> u32 = cat_table_of(s.catalog, table).column_named(column).unwrap().id
+
+st_int(v: Value) -> i128 = v match
+    Int(n) -> n
+    _ -> -1000000
+
+st_key(n: i128) -> Value = rec([Int(n)])
+
+st_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** The rows a write statement changed, which must have run. */
+st_done(r: Result[WriteOutcome, CodecError], file: string = __FILE__, line: long = __LINE__) -> usize = r match
+    Ok(Done(n)) -> n
+    Ok(Wait(h)) ->
+        assert(false, s"the statement waits for $h", file, line)
+        0
+    Err(e) ->
+        assert(false, s"the statement fails with ${e.code}: ${e.message}", file, line)
+        0
+
+/** The transaction a write statement waits for, which it must. */
+st_waits(r: Result[WriteOutcome, CodecError], file: string = __FILE__, line: long = __LINE__) -> u64 = r match
+    Ok(Wait(h)) -> h
+    Ok(Done(_)) ->
+        assert(false, "the statement ran instead of waiting", file, line)
+        0
+    Err(e) ->
+        assert(false, s"the statement fails with ${e.code}", file, line)
+        0
+
+st_commit(s: &Store, t: &Txn, file: string = __FILE__, line: long = __LINE__) -> u64 = s.commit(t) match
+    Ok(c) -> c
+    Err(e) ->
+        assert(false, s"the commit fails with ${e.code}: ${e.message}", file, line)
+        0
+
+st_insert(s: &Store, t: &Txn, table: u64, fields: []const Value, file: string = __FILE__, line: long = __LINE__)
+    assert(st_done(s.insert(t, table, store_row(s, table, rec(fields))), file, line) == 1, "one row is inserted", file, line)
+
+/** The row of `table` keyed `k` and its column `i`, as `t` sees it; -1 where there is none. */
+st_read(s: &Store, t: &Txn, table: u64, k: i128, i: usize) -> i128 = s.get(t, table, st_key(k)) match
+    Ok(Some(r)) -> st_int(r.at(i))
+    _ -> -1
+
+/** Rows whose first column is `k`; the predicate reads `columns`. */
+st_key_is(k: i128, columns: []const u32) -> Pred = pred(columns, r -> st_int(r.at(0)) == k)
+
+/** `SET <column 1> = <column 1> + delta` over a two-column row. */
+st_add(delta: i128) -> &Fn(StoredRow) -> Value = r -> rec([r.at(0), Int(st_int(r.at(1)) + delta)])
+
+/** A store whose `acct` holds `(1, 100)` and `(2, 100)`, committed. */
+st_bank() -> &Store
+    val s = st_store()
+    val t = s.begin(Snapshot)
+    st_insert(s, t, st_oid(s, "acct"), [Int(1), Int(100)])
+    st_insert(s, t, st_oid(s, "acct"), [Int(2), Int(100)])
+    st_commit(s, t)
+    s
+
+st_bump(s: &Store, t: &Txn, k: i128, delta: i128) -> Result[WriteOutcome, CodecError]
+    val a = st_oid(s, "acct")
+    s.update_where(t, a, st_key_is(k, [st_col(s, "acct", "id"), st_col(s, "acct", "bal")]), st_add(delta))
+
+// -- snapshots and the horizon (§4.1) ------------------------------------------------------------------
+
+@test
+a_snapshot_sees_the_commits_at_or_before_it_and_its_own_writes()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t1 = s.begin(Snapshot)
+    val t2 = s.begin(Snapshot)
+    st_done(st_bump(s, t2, 1, 50))
+    assert_eq(st_read(s, t2, a, 1, 1), 150)
+    assert_eq(st_read(s, t1, a, 1, 1), 100)
+    st_commit(s, t2)
+    assert_eq(st_read(s, t1, a, 1, 1), 100)
+    val t3 = s.begin(Snapshot)
+    assert_eq(st_read(s, t3, a, 1, 1), 150)
+    st_done(st_bump(s, t1, 2, 1))
+    assert_eq(st_read(s, t1, a, 2, 1), 101)
+
+@test
+commit_numbers_follow_commit_order_and_a_reader_commits_at_its_snapshot()
+    val s = st_bank()
+    assert_eq(s.horizon, 1)
+    val t1 = s.begin(Snapshot)
+    val t2 = s.begin(Snapshot)
+    val r = s.begin(Serializable)
+    st_done(st_bump(s, t2, 2, 1))
+    st_done(st_bump(s, t1, 1, 1))
+    assert_eq(st_commit(s, t2), 2)
+    assert_eq(st_commit(s, t1), 3)
+    assert(t1.id < t2.id)
+    assert_eq(st_read(s, r, st_oid(s, "acct"), 1, 1), 100)
+    assert_eq(st_commit(s, r), 1)
+    assert(r.state == CommittedAt(1))
+
+@test
+an_uncommitted_version_is_never_read_and_an_abort_leaves_no_trace()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 1, 10))
+    st_done(st_bump(s, w, 1, 10))
+    st_insert(s, w, a, [Int(3), Int(7)])
+    val r = s.begin(ReadCommitted)
+    assert_eq(st_read(s, r, a, 1, 1), 100)
+    assert_eq(st_read(s, r, a, 3, 1), -1)
+    assert_eq(s.scan(r, a, all_rows()).unwrap().len(), 2)
+    s.abort(w).unwrap()
+    assert(w.state == AbortedWith(""))
+    s.statement(r)
+    assert_eq(st_read(s, r, a, 1, 1), 100)
+    assert_eq(st_read(s, r, a, 3, 1), -1)
+    assert_eq(s.horizon, 1)
+
+    // The rolled-back row lock is free: a new writer neither waits nor conflicts.
+    val t = s.begin(Snapshot)
+    st_done(st_bump(s, t, 1, 1))
+    st_commit(s, t)
+    assert_eq(st_read(s, s.begin(Snapshot), a, 1, 1), 101)
+
+@test
+read_committed_takes_a_new_snapshot_at_each_statement_and_snapshot_does_not()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val rc = s.begin(ReadCommitted)
+    val si = s.begin(Snapshot)
+    assert_eq(st_read(s, rc, a, 1, 1), 100)
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 1, 50))
+    st_commit(s, w)
+
+    // Within one statement the snapshot holds; the next statement sees the commit.
+    assert_eq(st_read(s, rc, a, 1, 1), 100)
+    s.statement(rc)
+    assert_eq(st_read(s, rc, a, 1, 1), 150)
+    s.statement(si)
+    assert_eq(st_read(s, si, a, 1, 1), 100)
+
+// -- first-updater-wins (§4.2) -----------------------------------------------------------------------
+
+@test
+a_second_writer_waits_for_the_first_and_fails_when_it_commits()
+    val s = st_bank()
+    val t1 = s.begin(Snapshot)
+    val t2 = s.begin(Snapshot)
+    st_done(st_bump(s, t1, 1, 10))
+    assert_eq(st_waits(st_bump(s, t2, 1, 20)), t1.id)
+    assert(t2.state == Live)
+    st_commit(s, t1)
+    assert_eq(st_code(st_bump(s, t2, 1, 20)), "T1001")
+    assert(t2.state == AbortedWith("T1001"))
+    assert_eq(st_code(st_bump(s, t2, 2, 1)), "W2003")
+    assert_eq(st_code(s.commit(t2)), "T1001")
+
+@test
+waiting_saves_the_abort_when_the_first_writer_rolls_back()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t1 = s.begin(Serializable)
+    val t2 = s.begin(Serializable)
+    st_done(st_bump(s, t1, 1, 10))
+    st_waits(st_bump(s, t2, 1, 20))
+    s.abort(t1).unwrap()
+    assert_eq(st_done(st_bump(s, t2, 1, 20)), 1)
+    st_commit(s, t2)
+    assert_eq(st_read(s, s.begin(Snapshot), a, 1, 1), 120)
+
+@test
+a_write_to_a_row_committed_after_the_snapshot_fails_without_waiting()
+    val s = st_bank()
+    val t1 = s.begin(Serializable)
+    val t2 = s.begin(Snapshot)
+    st_done(st_bump(s, t2, 1, 1))
+    st_commit(s, t2)
+    assert_eq(st_code(st_bump(s, t1, 1, 1)), "T1001")
+
+    // The delete of a row is a write of it like any other.
+    val t3 = s.begin(Snapshot)
+    val t4 = s.begin(Snapshot)
+    st_done(s.delete_where(t4, st_oid(s, "acct"), st_key_is(2, [st_col(s, "acct", "id")])))
+    st_commit(s, t4)
+    assert_eq(st_code(st_bump(s, t3, 2, 1)), "T1001")
+
+@test
+a_wait_that_closes_a_cycle_aborts_the_waiter_with_deadlock_detected()
+    val s = st_bank()
+    val t1 = s.begin(ReadCommitted)
+    val t2 = s.begin(ReadCommitted)
+    st_done(st_bump(s, t1, 1, 1))
+    st_done(st_bump(s, t2, 2, 1))
+    assert_eq(st_waits(st_bump(s, t1, 2, 1)), t2.id)
+    assert_eq(st_code(st_bump(s, t2, 1, 1)), "T1002")
+    assert(t2.state == AbortedWith("T1002"))
+    assert_eq(st_done(st_bump(s, t1, 2, 1)), 1)
+    st_commit(s, t1)
+
+@test
+read_committed_reapplies_its_change_to_the_newest_committed_version()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t1 = s.begin(ReadCommitted)
+    val t2 = s.begin(ReadCommitted)
+    st_done(st_bump(s, t1, 1, 1))
+    st_waits(st_bump(s, t2, 1, 1))
+    st_commit(s, t1)
+
+    // Retried within the same statement: the change applies to t1's version, not t2's snapshot's.
+    assert_eq(st_done(st_bump(s, t2, 1, 1)), 1)
+    st_commit(s, t2)
+    assert_eq(st_read(s, s.begin(Snapshot), a, 1, 1), 102)
+
+@test
+read_committed_skips_a_row_whose_newest_version_no_longer_matches()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val bal = st_col(s, "acct", "bal")
+    val t1 = s.begin(ReadCommitted)
+    val t2 = s.begin(ReadCommitted)
+    st_done(st_bump(s, t1, 1, 50))
+    val rich = pred([bal], r -> st_int(r.at(1)) == 100)
+    st_waits(s.update_where(t2, a, rich, st_add(1000)))
+    st_commit(s, t1)
+    assert_eq(st_done(s.update_where(t2, a, rich, st_add(1000))), 1)
+    st_commit(s, t2)
+    val r = s.begin(Snapshot)
+    assert_eq(st_read(s, r, a, 1, 1), 150)
+    assert_eq(st_read(s, r, a, 2, 1), 1100)
+
+// -- inserts and keys (§4.2 rule 4) ------------------------------------------------------------------
+
+@test
+an_insert_of_a_visible_key_is_unique_violation_and_aborts_the_transaction()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t = s.begin(Serializable)
+    assert_eq(st_code(s.insert(t, a, store_row(s, a, rec([Int(1), Int(5)])))), "T3001")
+    assert(t.state == AbortedWith("T3001"))
+
+    // A key inserted twice by one transaction is visible to it the second time.
+    val u = s.begin(Snapshot)
+    st_insert(s, u, a, [Int(9), Int(5)])
+    assert_eq(st_code(s.insert(u, a, store_row(s, a, rec([Int(9), Int(6)])))), "T3001")
+
+@test
+an_insert_of_a_key_committed_after_the_snapshot_is_a_race_except_at_read_committed()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val si = s.begin(Snapshot)
+    val rc = s.begin(ReadCommitted)
+    val w = s.begin(Snapshot)
+    st_insert(s, w, a, [Int(5), Int(1)])
+    assert_eq(st_waits(s.insert(si, a, store_row(s, a, rec([Int(5), Int(2)])))), w.id)
+    st_commit(s, w)
+    assert_eq(st_code(s.insert(si, a, store_row(s, a, rec([Int(5), Int(2)])))), "T1001")
+    assert_eq(st_code(s.insert(rc, a, store_row(s, a, rec([Int(5), Int(2)])))), "T3001")
+
+@test
+a_key_deleted_by_the_transaction_may_be_inserted_again()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.delete_where(t, a, st_key_is(1, [st_col(s, "acct", "id")]))), 1)
+    assert_eq(st_read(s, t, a, 1, 1), -1)
+    st_insert(s, t, a, [Int(1), Int(7)])
+    st_commit(s, t)
+    assert_eq(st_read(s, s.begin(Snapshot), a, 1, 1), 7)
+
+@test
+rows_are_kept_in_key_order_whatever_order_they_were_inserted_in()
+    val s = st_store()
+    val a = st_oid(s, "acct")
+    val t = s.begin(Snapshot)
+
+    for k in [5, 1, 9, 3, 7]
+        st_insert(s, t, a, [Int(k), Int(k * 10)])
+
+    st_commit(s, t)
+    val hits = s.scan(s.begin(Snapshot), a, all_rows()).unwrap()
+    var keys = ""
+
+    for h in hits
+        keys = keys + s"${st_int(h.row.at(0))},"
+
+    assert_eq(keys, "1,3,5,7,9,")
+    assert_eq(st_read(s, s.begin(Snapshot), a, 7, 1), 70)
+
+// -- error codes and ended transactions (§5) ---------------------------------------------------------
+
+@test
+a_write_in_a_read_only_transaction_is_read_only_transaction()
+    val s = st_bank()
+    val t = s.begin(Snapshot, true)
+    assert_eq(st_code(st_bump(s, t, 1, 1)), "T4001")
+    assert(t.state == AbortedWith("T4001"))
+    val u = s.begin(Serializable, true)
+    assert_eq(st_code(s.insert(u, st_oid(s, "acct"), store_row(s, st_oid(s, "acct"), rec([Int(8), Int(0)])))), "T4001")
+
+@test
+an_ended_transaction_refuses_every_operation()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val c = s.begin(Snapshot)
+    st_commit(s, c)
+    assert_eq(st_code(s.scan(c, a, all_rows())), "W2001")
+    assert_eq(st_code(s.commit(c)), "W2001")
+    assert_eq(st_code(s.abort(c)), "W2001")
+    assert(c.state == CommittedAt(1))
+    val r = s.begin(Snapshot)
+    s.abort(r).unwrap()
+    assert_eq(st_code(s.get(r, a, st_key(1))), "W2003")
+    assert_eq(st_code(s.commit(r)), "W2003")
+    assert_eq(st_code(s.abort(r)), "ok")
+    assert_eq(st_code(s.scan(s.begin(Snapshot), 999999, all_rows())), "Q2001")
+
+@test
+a_write_over_a_row_of_a_newer_schema_version_is_schema_changed()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val rc = s.begin(ReadCommitted)
+    s.catalog = cat_ok(s.catalog, cat_alter("acct", [AddColumn(cat_col("note", nullable(Text)))]))
+    assert_eq(s.catalog.tables[s.catalog.table_by_oid(a).unwrap()].schema_version(), 2)
+    val w = s.begin(Snapshot)
+    val set_note: &Fn(StoredRow) -> Value = r -> rec([r.at(0), r.at(1), Text("x")])
+    st_done(s.update_where(w, a, st_key_is(1, [st_col(s, "acct", "id")]), set_note))
+    st_commit(s, w)
+    assert_eq(s.get(s.begin(Snapshot), a, st_key(1)).unwrap().unwrap().schema, 2)
+
+    // `rc` planned against version 1; the newest committed row is encoded in version 2.
+    assert_eq(st_code(s.update_where(rc, a, st_key_is(1, [st_col(s, "acct", "id")]), st_add(1), 1)), "T1004")
+
+    // A row still in version 1 is rewritten in version 1 as before.
+    val old = s.begin(ReadCommitted)
+    assert_eq(st_done(s.update_where(old, a, st_key_is(2, [st_col(s, "acct", "id")]), st_add(1), 1)), 1)
+    st_commit(s, old)
+
+@test
+read_committed_never_raises_serialization_failure()
+    val s = st_bank()
+    val rc = s.begin(ReadCommitted)
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 1, 1))
+    st_commit(s, w)
+    st_done(st_bump(s, rc, 1, 1))
+    st_insert(s, rc, st_oid(s, "acct"), [Int(3), Int(0)])
+    st_commit(s, rc)
+    assert_eq(st_read(s, s.begin(Snapshot), st_oid(s, "acct"), 1, 1), 102)
+
+// -- the predicate log and retention (§4.3) ----------------------------------------------------------
+
+@test
+only_a_serializable_writer_keeps_a_predicate_log()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val ser = s.begin(Serializable)
+    val si = s.begin(Snapshot)
+    val ro = s.begin(Serializable, true)
+
+    for t in [ser, si, ro]
+        assert_eq(s.scan(t, a, all_rows()).unwrap().len(), 2)
+        assert(s.get(t, a, st_key(1)).unwrap().is_some())
+
+    assert_eq(s.logged(ser), 2)
+    assert_eq(s.logged(si), 0)
+    assert_eq(s.logged(ro), 0)
+
+@test
+committed_writes_are_retained_only_while_a_serializable_transaction_could_need_them()
+    val s = st_bank()
+    assert_eq(s.retained(), 0)
+    val old = s.begin(Serializable)
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 1, 1))
+    st_commit(s, w)
+    assert_eq(s.retained(), 1)
+    val young = s.begin(Serializable)
+    s.abort(old).unwrap()
+    assert_eq(s.retained(), 0)
+    st_done(st_bump(s, young, 2, 1))
+    st_commit(s, young)
+    assert_eq(s.retained(), 0)
+
+@test
+a_point_read_of_a_missing_key_is_logged_and_catches_its_insert()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t1 = s.begin(Serializable)
+    assert(s.get(t1, a, st_key(5)).unwrap().is_none())
+    val t2 = s.begin(Serializable)
+    st_insert(s, t2, a, [Int(5), Int(1)])
+    st_commit(s, t2)
+    st_done(st_bump(s, t1, 1, 1))
+    assert_eq(st_code(s.commit(t1)), "T1001")
+    assert(t1.state == AbortedWith("T1001"))
+    assert_eq(st_read(s, s.begin(Snapshot), a, 1, 1), 100)
+
+@test
+validation_is_column_precise()
+    val s = st_store()
+    val g = st_oid(s, "grp")
+    val k = st_col(s, "grp", "k")
+    val gc = st_col(s, "grp", "g")
+    val v = st_col(s, "grp", "v")
+    val setup = s.begin(Snapshot)
+    st_insert(s, setup, g, [Int(1), Int(1), Int(0)])
+    st_insert(s, setup, g, [Int(2), Int(2), Int(0)])
+    st_commit(s, setup)
+    val set_v: &Fn(StoredRow) -> Value = r -> rec([r.at(0), r.at(1), Int(st_int(r.at(2)) + 1)])
+
+    // t1 reads k and g of group 1; a change to v only does not abort it.
+    val t1 = s.begin(Serializable)
+    assert_eq(s.scan(t1, g, pred([k, gc], r -> st_int(r.at(1)) == 1)).unwrap().len(), 1)
+    val t2 = s.begin(Snapshot)
+    st_done(s.update_where(t2, g, st_key_is(1, [k]), set_v))
+    st_commit(s, t2)
+    st_done(s.update_where(t1, g, st_key_is(2, [k]), set_v))
+    st_commit(s, t1)
+
+    // t3 also read v, so the same change aborts it.
+    val t3 = s.begin(Serializable)
+    assert_eq(s.scan(t3, g, pred([k, gc, v], r -> st_int(r.at(1)) == 1)).unwrap().len(), 1)
+    val t4 = s.begin(Snapshot)
+    st_done(s.update_where(t4, g, st_key_is(1, [k]), set_v))
+    st_commit(s, t4)
+    st_done(s.update_where(t3, g, st_key_is(2, [k]), set_v))
+    assert_eq(st_code(s.commit(t3)), "T1001")

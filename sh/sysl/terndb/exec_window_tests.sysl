@@ -1,0 +1,390 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `Window` (`query-tree.md` §6.8) against a value-at-a-time reference: every window function, over
+// every frame unit with offsets, unbounded and current bounds and every exclusion, in both key
+// directions and null placements, over generated rows with null and tied partition and order keys.
+// The reference decides each row's frame by the definitions of §6.8 rule 4, one row against every
+// other, with no sorting machinery of the executor's.
+
+// -- running a window -------------------------------------------------------------------------------
+
+/** `rows` cut into batches of the sizes in `sizes`, as far as the rows reach, the rest in one more. */
+xw_batches(elem: Type, rows: []const Value, sizes: []const usize) -> Buf[ColumnVector]
+    val out = buf[ColumnVector]()
+    var at: usize = 0
+
+    for s in sizes
+        val end = if at + s < rows.len then at + s else rows.len
+        out.push(vector_of(elem, rows[at..<end]))
+        at = end
+
+    if at < rows.len then out.push(vector_of(elem, rows[at..]))
+
+    out
+
+/** `r` run over `app.t` of `cols` holding `rows` in batches of `sizes`: the root's element type and
+ * every row handed up.
+ */
+xw_exec(cols: []const Field, rows: []const Value, sizes: []const usize, decls: []const ParamDecl, params: []const Value, r: Rel) -> Result[(Type, Buf[Value]), CodecError]
+    val q = envelope(decls, Query(r))
+    val typing = type_envelope(q, xe_catalog(cols))?
+    val table = MemTable(QualName("app", "t"), xw_batches(record(cols), rows, sizes))
+    val root = plan_query(q, typing, xe_ctx(params), items_of([table]))
+    val out = buf[Value]()
+
+    for b in drain(root.op)?
+        assert(b.len > 0 && b.len <= BatchSize)
+        assert(b.ty == root.elem)
+        out.extend(values_of(b).view())
+
+    Ok((root.elem, out))
+
+/** A `Window` with binder `w` over `app.t` scanned as `t`. */
+xw_window(items: []const NamedWin) -> Rel = Window(scan("app", "t", "t"), "w", items_of(items))
+
+xw_w(name: string, f: string, args: []const Expr, part: []const Expr, order: []const SortKey, frame: Option[Frame]) -> NamedWin =
+    NamedWin(name, WinCall(f, items_of(args), items_of(part), items_of(order), frame))
+
+/** The window binder's row of each output row, checking that the input's rows come out unchanged and
+ * in input order (§6.8).
+ */
+xw_cols(cols: []const Field, rows: []const Value, out: Buf[Value]) -> Buf[Value]
+    assert_eq(out.len(), rows.len)
+    val res = buf[Value]()
+
+    for i in 0..<out.len()
+        out[i] match
+            Record(fs) ->
+                assert(same(record(cols), fs[0], rows[i]), s"input row $i changed: ${fs[0]}")
+                res.push(fs[1])
+            _ -> panic("a window's output row is a composite")
+
+    res
+
+xw_i(n: i128) -> Expr = Literal(Int64, Int(n))
+
+xw_up() -> Bound = Bound(UnboundedPreceding, None)
+
+xw_uf() -> Bound = Bound(UnboundedFollowing, None)
+
+xw_cur() -> Bound = Bound(CurrentRow, None)
+
+xw_p(n: i128) -> Bound = Bound(Preceding, Some(xw_i(n)))
+
+xw_fo(n: i128) -> Bound = Bound(Following, Some(xw_i(n)))
+
+// -- the reference ----------------------------------------------------------------------------------
+
+private xw_ocols() -> [5]Field = [
+    Field("p", nullable(Int64)), Field("o", nullable(Int64)), Field("v", nullable(Int64)), Field("b", nullable(Bool)),
+    Field("g", nullable(Text))]
+
+/** Generated row `i`: partition key `p` among `parts` values or null, order key `o` with ties and
+ * nulls, and nullable values.
+ */
+private xw_orow(i: usize, parts: usize) -> Value
+    val p = if i % 11 == 3 then Null else Int(i128((i * 7) % parts))
+    val o = if i % 9 == 4 then Null else Int(i128(((i * 5) % 13) / 2))
+    val v = if i % 6 == 1 then Null else Int(i128((i * 37) % 23) - 11)
+    rec([p, o, v, if i % 5 == 2 then Null else Bool(i % 3 != 0), if i % 4 == 0 then Null else Text(s"g${i % 7}")])
+
+private xw_orows(n: usize, parts: usize) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 0..<n
+        out.push(xw_orow(i, parts))
+
+    out
+
+/** Every call, partitioned by `p` and ordered by `o`; `wide` adds `collect` and `string_agg`. */
+private xw_oitems(frame: Option[Frame], desc: bool, nf: bool, wide: bool) -> Buf[NamedWin]
+    val part = [col("t", "p")]
+    val order = [SortKey(col("t", "o"), desc, nf)]
+    val v = col("t", "v")
+    val out = buf[NamedWin]()
+    out.push(xw_w("rn", "row_number", [], part, order, frame))
+    out.push(xw_w("rk", "rank", [], part, order, frame))
+    out.push(xw_w("dr", "dense_rank", [], part, order, frame))
+    out.push(xw_w("lg", "lag", [v], part, order, frame))
+    out.push(xw_w("ld", "lead", [v, xw_i(2), xw_i(-1)], part, order, frame))
+    out.push(xw_w("fv", "first_value", [v], part, order, frame))
+    out.push(xw_w("lv", "last_value", [v], part, order, frame))
+    out.push(xw_w("n", "count", [], part, order, frame))
+    out.push(xw_w("nv", "count", [v], part, order, frame))
+    out.push(xw_w("s", "sum", [v], part, order, frame))
+    out.push(xw_w("lo", "min", [v], part, order, frame))
+    out.push(xw_w("hi", "max", [v], part, order, frame))
+    out.push(xw_w("all", "bool_and", [col("t", "b")], part, order, frame))
+    out.push(xw_w("any", "bool_or", [col("t", "b")], part, order, frame))
+    out.push(xw_w("av", "avg", [v], part, order, frame))
+
+    if wide
+        out.push(xw_w("vs", "collect", [v], part, order, frame))
+        out.push(xw_w("gs", "string_agg", [col("t", "g"), Literal(Text, Text(","))], part, order, frame))
+
+    out
+
+private xw_int(v: Value) -> i128 = v match
+    Int(n) -> n
+    _ -> panic("an integer value was expected")
+
+/** How two order-key values compare in a sort key's order, nulls placed per `nf` (§6.9). */
+private xw_order_cmp(a: Value, b: Value, desc: bool, nf: bool) -> int
+    if a.is_null() || b.is_null()
+        if a.is_null() && b.is_null() then return 0
+
+        return if a.is_null() == nf then -1 else 1
+
+    val c = cmp(Int64, a, b)
+    if desc then -c else c
+
+/** The rows in partition-then-order order, by a stable insertion sort; each position's partition
+ * start; and each position's peer group number.
+ */
+private xw_layout(rows: []const Value, desc: bool, nf: bool) -> (Buf[usize], Buf[usize], Buf[usize])
+    val sorted = buf[usize]()
+    val before = (i: usize, j: usize) ->
+        val c = xw_order_cmp(xe_field(rows[i], 0), xe_field(rows[j], 0), false, true)
+        c < 0 || (c == 0 && xw_order_cmp(xe_field(rows[i], 1), xe_field(rows[j], 1), desc, nf) < 0)
+
+    for i in 0..<rows.len
+        sorted.push(i)
+        var at = sorted.len() - 1
+
+        while at > 0 && before(i, sorted[at - 1])
+            sorted[at] = sorted[at - 1]
+            at -= 1
+
+        sorted[at] = i
+
+    val pstart = buf[usize]()
+    val grp = buf[usize]()
+    var g: usize = 0
+
+    for k in 0..<rows.len
+        val (r, q) = (sorted[k], if k > 0 then sorted[k - 1] else 0)
+        val new_part = k == 0 || xw_order_cmp(xe_field(rows[r], 0), xe_field(rows[q], 0), false, true) != 0
+
+        if k > 0 && (new_part || xw_order_cmp(xe_field(rows[r], 1), xe_field(rows[q], 1), desc, nf) != 0) then g += 1
+
+        pstart.push(if new_part then k else pstart[k - 1])
+        grp.push(g)
+
+    (sorted, pstart, grp)
+
+/** Whether position `t` is on the inside of bound `b` of position `k`'s frame (§6.8 rule 4). */
+private xw_side(unit: FrameUnit, b: Bound, start: bool, k: usize, t: usize, keys: Buf[Value], grp: Buf[usize], desc: bool, nf: bool) -> bool
+    val within = (d: i128, s: i128) -> if start then d >= s else d <= s
+    val dg = i128(grp[t]) - i128(grp[k])
+
+    b.kind match
+        UnboundedPreceding | UnboundedFollowing -> return true
+        CurrentRow -> return within(if unit == Rows then i128(t) - i128(k) else dg, 0)
+        _ -> ()
+
+    val n = b.offset match
+        Some(Literal(_, Int(x))) -> x
+        _ -> panic("the reference's offsets are integer literals")
+
+    val s = if b.kind == Preceding then -n else n
+
+    unit match
+        Rows -> within(i128(t) - i128(k), s)
+        Groups -> within(dg, s)
+        Range ->
+            if keys[k].is_null() then return within(dg, 0)
+            if keys[t].is_null() then return if start then !nf else nf
+
+            val (vk, vt) = (xw_int(keys[k]), xw_int(keys[t]))
+            // `vt` against the bound's value, in the key's direction.
+            if desc then within(vk - s - vt, 0) else within(vt - (vk + s), 0)
+
+/** Every window value of every row, by the definitions (§6.8 rules 2–5), indexed by input row. */
+private xw_expected(rows: []const Value, frame: Option[Frame], desc: bool, nf: bool, wide: bool) -> Buf[Value]
+    val f = frame.unwrap_or(Frame(Range, xw_up(), xw_cur(), ExcludeNone))
+    val (sorted, pstart, grp) = xw_layout(rows, desc, nf)
+    val n = rows.len
+    val keys = buf[Value]()
+
+    for k in 0..<n
+        keys.push(xe_field(rows[sorted[k]], 1))
+
+    val out = buf[Value]()
+
+    for _ in 0..<n
+        out.push(Null)
+
+    for k in 0..<n
+        val lo = pstart[k]
+        var hi = k + 1
+
+        while hi < n && pstart[hi] == lo
+            hi += 1
+
+        val fr = buf[usize]()
+
+        for t in lo..<hi
+            val inside = xw_side(f.unit, f.start, true, k, t, keys, grp, desc, nf) && xw_side(f.unit, f.end, false, k, t, keys, grp, desc, nf)
+            val kept = f.exclude match
+                ExcludeNone -> true
+                ExcludeCurrent -> t != k
+                ExcludeGroup -> grp[t] != grp[k]
+                ExcludeTies -> t == k || grp[t] != grp[k]
+
+            if inside && kept then fr.push(sorted[t])
+
+        val v = (r: usize) -> xe_field(rows[r], 2)
+        var first_peer = lo
+
+        while grp[first_peer] != grp[k]
+            first_peer += 1
+
+        val vals = buf[Value]()
+        vals.push(Int(i128(k - lo + 1)))
+        vals.push(Int(i128(first_peer - lo + 1)))
+        vals.push(Int(i128(grp[k] - grp[lo] + 1)))
+        vals.push(if k > lo then v(sorted[k - 1]) else Null)
+        vals.push(if k + 2 < hi then v(sorted[k + 2]) else Int(-1))
+        vals.push(if fr.len() > 0 then v(fr[0]) else Null)
+        vals.push(if fr.len() > 0 then v(fr[fr.len() - 1]) else Null)
+
+        var c: i128 = 0
+        var sum: i128 = 0
+        var lo_v: i128 = 0
+        var hi_v: i128 = 0
+        var all = true
+        var any = false
+        var bools = 0
+        val vs = buf[Value]()
+        var gs = ""
+        var gn = 0
+
+        for r in fr
+            vs.push(v(r))
+
+            v(r) match
+                Int(x) ->
+                    if c == 0 || x < lo_v then lo_v = x
+                    if c == 0 || x > hi_v then hi_v = x
+                    c += 1
+                    sum += x
+                _ -> ()
+
+            xe_field(rows[r], 3) match
+                Bool(x) ->
+                    all = all && x
+                    any = any || x
+                    bools += 1
+                _ -> ()
+
+            xe_field(rows[r], 4) match
+                Text(s) ->
+                    gs = if gn == 0 then s else s"$gs,$s"
+                    gn += 1
+                _ -> ()
+
+        vals.push(Int(i128(fr.len())))
+        vals.push(Int(c))
+        vals.push(if c > 0 then Int(sum) else Null)
+        vals.push(if c > 0 then Int(lo_v) else Null)
+        vals.push(if c > 0 then Int(hi_v) else Null)
+        vals.push(if bools > 0 then Bool(all) else Null)
+        vals.push(if bools > 0 then Bool(any) else Null)
+        vals.push(if c > 0 then xw_avg(sum, c) else Null)
+
+        if wide
+            vals.push(Relation(vs))
+            vals.push(if gn > 0 then Text(gs) else Null)
+
+        out[sorted[k]] = Record(vals)
+
+    out
+end xw_expected
+
+/** The `avg` of integers summing to `s` over `c` values: `decimal(38, 6)`, rounded half away from zero
+ * (§6.7 rule 7).
+ */
+private xw_avg(s: i128, c: i128) -> Value
+    val num = s * 1000000
+    var q = num / c
+    val r = num % c
+
+    if 2 * (if r < 0 then -r else r) >= c then q += if num < 0 then -1 else 1
+
+    Int(q)
+
+/** The window over `rows`, against the reference, row by row. */
+private xw_check(rows: []const Value, sizes: []const usize, frame: Option[Frame], desc: bool, nf: bool, wide: bool, what: string)
+    val r = xw_window(xw_oitems(frame, desc, nf, wide).view())
+    val (elem, out) = xw_exec(xw_ocols(), rows, sizes, [], [], r).unwrap()
+    val wty = fields_of_type(elem)[1].ty
+    val got = xw_cols(xw_ocols(), rows, out)
+    val want = xw_expected(rows, frame, desc, nf, wide)
+
+    for i in 0..<rows.len
+        assert(same(wty, got[i], want[i]), s"$what desc=$desc nulls_first=$nf row $i: got ${got[i]}, want ${want[i]}")
+
+/** Every frame shape the reference runs: each unit with offsets, current and unbounded bounds,
+ * including one whose start passes its end.
+ */
+private xw_shapes() -> Buf[(FrameUnit, Bound, Bound)]
+    val out = buf[(FrameUnit, Bound, Bound)]()
+
+    for u in [Rows, Groups, Range]
+        out.push((u, xw_up(), xw_cur()))
+        out.push((u, xw_p(2), xw_fo(1)))
+        out.push((u, xw_p(3), xw_p(1)))
+        out.push((u, xw_fo(1), xw_fo(3)))
+        out.push((u, xw_cur(), xw_uf()))
+        out.push((u, xw_cur(), xw_cur()))
+        out.push((u, xw_up(), xw_uf()))
+        out.push((u, xw_p(1), xw_p(4)))
+        out.push((u, xw_p(0), xw_fo(0)))
+
+    out
+
+// -- the tests --------------------------------------------------------------------------------------
+
+@test
+every_function_over_every_frame_and_exclusion_matches_the_reference()
+    val rows = xw_orows(61, 3)
+    var i = 0
+
+    for sh in xw_shapes()
+        val (u, s, e) = sh
+
+        for ex in [ExcludeNone, ExcludeCurrent, ExcludeGroup, ExcludeTies]
+            for dir in [(false, false), (true, true), (false, true)]
+                val (desc, nf) = dir
+                xw_check(rows.view(), [7, 13], Some(Frame(u, s, e, ex)), desc, nf, true, s"shape $i")
+
+        i += 1
+
+@test
+the_default_frame_matches_the_reference()
+    val rows = xw_orows(61, 3)
+
+    for dir in [(false, false), (true, true), (true, false)]
+        val (desc, nf) = dir
+        xw_check(rows.view(), [1, 30], None, desc, nf, true, "default")
+
+@test
+partitions_spanning_batches_match_the_reference()
+    // One partition of about 1900 rows across batches of 1000, 3 and 1024, and a partition of null keys.
+    val rows = xw_orows(2100, 1)
+    xw_check(rows.view(), [1000, 3, 1024], None, false, false, false, "default, long")
+    xw_check(rows.view(), [1000, 3, 1024], Some(Frame(Rows, xw_p(3), xw_fo(2), ExcludeGroup)), true, true, false, "rows, long")
+    xw_check(rows.view(), [BatchSize], Some(Frame(Range, xw_p(1), xw_fo(1), ExcludeTies)), false, true, false, "range, long")
+
+@test
+single_row_partitions_match_the_reference()
+    val rows = buf[Value]()
+
+    for i in 0..<20
+        rows.push(rec([Int(i128(i)), xe_field(xw_orow(i, 1), 1), xe_field(xw_orow(i, 1), 2), Bool(true), Text("x")]))
+
+    xw_check(rows.view(), [], None, false, false, true, "single")
+    xw_check(rows.view(), [3], Some(Frame(Groups, xw_p(1), xw_fo(1), ExcludeCurrent)), false, false, true, "single, groups")

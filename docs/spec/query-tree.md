@@ -497,7 +497,56 @@ the kinds are listed; a start of `unbounded_following` or an end of `unbounded_p
 absent from a `preceding` or `following` bound or present on another; `range` with an offset and not
 exactly one order key) is `Q5008`. A `rows` or `groups` offset is `int64`; a `range` offset coerces
 to a numeric key's type, or is an `interval` for a `date`, `time`, `datetime` or `timestamp` key
-(`Q3001`).
+(`Q3001`). A frame's offsets see no binder (they MAY be parameters or literals).
+
+1. **Partitions, order and peers.** A call's `partition` and `order` expressions are evaluated on
+   every input row. The rows are partitioned under `same` (§3.1) on the partition values, so nulls
+   share a partition, as do every NaN and both zeros; with no `partition` every row is in one
+   partition. Within its partition a call reads the rows in its `order` (§6.9, each key's `desc` and
+   `nulls_first` honoured), **stably**: rows equal on every key keep their input order. Two rows of a
+   partition are **peers** when they are `same` on every order key, and a run of peers is a **peer
+   group**; with no `order` the whole partition is one peer group. Each call partitions and orders
+   on its own, and the output keeps the input's rows in the input's order.
+2. **Ranking.** `row_number` is the row's 1-based position in its partition's order; `rank` is 1 plus
+   the number of rows of the partition before its first peer; `dense_rank` is 1 plus the number of
+   peer groups before its own. The ranking functions and `lag` and `lead` ignore `frame`.
+3. **Offsets.** `lag(x, n, d)` is `x` on the row `n` rows before the current one in its partition's
+   order, `lead(x, n, d)` on the row `n` after; `n` defaults to 1, and 0 is the current row. Where
+   the partition has no such row the value is `d` on the current row, or null without `d`. `x`, `n`
+   and `d` are evaluated on every input row. `n` is never null (`int64?` does not coerce to `int64`);
+   a negative `n` is `R0006`.
+4. **Frames.** An absent `frame` is `range` from `unbounded_preceding` to `current`, excluding
+   `none`: with an `order`, the partition's rows up to the current row's last peer; without one, the
+   whole partition. In the partition's order:
+   - `rows`: an offset `k` counts rows. `k preceding` is the row `k` before the current row, `k
+     following` the row `k` after, and `current` the current row.
+   - `groups`: an offset counts peer groups. A start of `k preceding` or `k following` is the first row
+     of the peer group `k` groups before or after the current row's; an end, the last row of that
+     group. `current` is the current row's group: its first row as a start, its last as an end.
+   - `range`: `current` is as for `groups`. An offset `k` bounds the one order key's value. With `v`
+     the current row's key, let `p = v − k` and `f = v + k` for an ascending key, `p = v + k` and
+     `f = v − k` for a `desc` one; a start of `k preceding` admits the rows whose key is not before
+     `p` in the order, an end of `k preceding` those not after `p`, and `k following` likewise with
+     `f`. Integers and decimals compute `p` and `f` exactly (they never overflow). Floats compute them
+     in `float64`; an infinite `v` moved toward the opposite infinity by an infinite `k` is that
+     opposite infinity, so it admits every non-NaN key. A `date`, `time`, `datetime` or `timestamp`
+     computes them as the calendar `add` (§7.12 rule 4) of `v` and `k`, or of `v` and `k` with each
+     part negated, in microseconds (a `date` as its midnight, a `time` as that time of 1970-01-01, so
+     it does not wrap); a value past `int64` microseconds is `R0001`. A null key lies before or after
+     every value per its `nulls_first`, and a NaN after every number (before, for `desc`). Where the
+     current row's key is null or NaN, an offset bound is the edge of its peer group.
+   - A bound past the partition stops at its edge; `unbounded_preceding` is its first row and
+     `unbounded_following` its last. A start after the end leaves the frame empty.
+   - The offsets of a frame a call uses (not one rule 2 ignores) are each evaluated once, before any
+     row, also over an empty input. A null offset, a negative or NaN number, and an
+     interval with a negative part are `R0006`.
+   - `exclude current` removes the current row from the frame, `group` the current row and its peers,
+     `ties` its peers but not the current row; the rest stay in order.
+5. **Values over a frame.** `first_value(x)` and `last_value(x)` are `x` on the frame's first and last
+   row, null for an empty frame. An aggregate is §6.7's over the frame's rows, read in the partition's
+   order (which is the order a float `sum` adds in and `string_agg` joins in); over an empty frame it
+   is what it is over an empty group (§6.7 rule 4). `x` and an aggregate's arguments are evaluated on
+   every input row.
 
 ### 6.9 Sort
 
