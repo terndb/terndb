@@ -86,7 +86,54 @@ from its commit, and not at all once rolled back; at serializable a revoke commi
 not seen by it, at read committed it is seen by the next statement, and it never aborts a transaction by
 itself. Tests: `engine_privileges_tests.sysl`.
 
+## The server
+
+`sh/sysl/terndb/server.sysl` is the `Server`: one `Engine` shared by every connection and one `ServerSession`
+per connection, on **one thread** with non-blocking sockets and one `sysl.io.poll` poller, because the store is
+single-threaded. Each turn of the loop (`Server.turn`) waits for readiness, reads what arrived on each
+connection into its reassembler and hands the arrivals to its session, then **ticks every session** at the
+engine clock's reading, and writes what the sessions answered; output a socket will not take yet waits for
+writability. The tick is what resumes a parked statement once its holder, on another connection, has ended,
+and what ends one whose `lock_timeout_ms` is spent, so a parked statement is served no later than the next
+turn (`wire-protocol.md` §7.5 rules 2 and 5). `Server.run` turns every 10 ms while any request is in flight and
+every second otherwise. The engine's statement time (`Engine.now`) is set from the wall clock each turn. A
+connection whose transport ends has its session `lost`, which rolls back its open transactions (§5.1 rule 3)
+and releases their locks; a session that asks to close is closed once its output is written. On SIGINT or
+SIGTERM every session gets `Goodbye` with a five-second grace (§3.4 rule 5) and the socket file is removed.
+
+**Transports.** The Unix-domain socket serves the protocol in full (§1.1 rule 4). TCP must be direct TLS 1.3
+(§1.1 rule 2), which the server does not have yet, so a TCP listener only obeys §1.1 rule 3: a first octet of
+`T` is answered with `W3003` on stream 0, and any other first octet, a TLS record included, is closed without
+a response. The listener is opened only when asked for, on 127.0.0.1.
+
+**Credentials.** The server's `Authority` (`ServerCredentials`, narrowed by `CatalogAuthority`) holds one SCRAM
+verifier, the bootstrap role's (`terndb`), made at start from the configured password with a salt from the
+operating system's generator and 4,096 iterations; every other role fails as an unknown user does, since no
+verifier is stored in the catalog. Each connection's SCRAM server nonce is 18 random octets in hex. No token
+is accepted, since nothing issues one. A `peer` login needs the peer's operating-system user from the socket,
+which `sysl.net` does not report yet, so `peer` fails (`W3001`).
+
+**Configuration** is the command line, since the specs name no configuration file:
+
+```
+TERNDB_PASSWORD=… server/terndb [--socket <path>] [--port <n>] [--database <name>] [--password-file <path>]
+```
+
+`--socket` defaults to `terndb.sock` in the working directory (a file left there by an earlier run is
+replaced); `--database` is the one database's name, default `terndb`; the password comes from
+`--password-file` (its trailing whitespace dropped) or else `TERNDB_PASSWORD`, and there is no default; `--port`
+opens the TCP listener described above. The connection limits it announces are `max_frame_size` 1 MiB,
+`max_in_flight` 64, `max_open_txns` 16 and `max_message_size` 16 MiB; wire 1.0 and the tree version of
+`qtree.sysl`; no compression; a 10-second handshake deadline and no idle limit.
+
+The program is `server/` (its own `sysl.hocon`, depending on the package by path), built with
+`sysl build server`. Tests: `server_tests.sysl`, which run wire clients over a real Unix socket and a real TCP
+connection against a server in the same process, turning its loop by hand on a `ManualClock`.
+
 ## What it does not do yet
+
+- **TLS and `peer`** (§ The server): TCP refuses every connection, and a `peer` login fails, until TLS 1.3 with
+  `tls-exporter` and a socket's peer credentials are reachable from sysl.
 
 - **Reconciliation** (`ddl.md` §6.4) covers added unique keys only. A writer that commits after a DDL it did not
   see which added a check, not-null or referencing foreign-key constraint, a column whose default is not its fill

@@ -7,7 +7,16 @@ GraphQL-shaped answer of users, their posts and each post's comments comes back 
 batched join per level. The native input is a typed query tree, and SQL and GraphQL are front ends that produce it.
 One storage engine runs in memory for development and tests, and on disk for production.
 
-TernDB is in design. Nothing here runs yet.
+TernDB is in design. What runs so far is an in-memory server over a Unix-domain socket:
+
+```
+sysl build server
+TERNDB_PASSWORD=secret server/terndb --socket /tmp/terndb.sock
+```
+
+A client logs in as the role `terndb` with that password (SCRAM-SHA-256) and speaks the
+[native protocol](docs/spec/wire-protocol.md). TCP needs TLS, which is not served yet. Flags and design:
+[the server](docs/design/engine.md#the-server).
 
 ## What it does differently
 

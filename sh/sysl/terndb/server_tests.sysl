@@ -1,0 +1,273 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all}
+import sysl.net.{Socket, ipv4, peer_closed, socket, unix, unix_connect, would_block}
+import sysl.path.join
+import sysl.process.pid
+import sysl.time.millis
+
+// The server over real sockets (`server.sysl`): a wire client connects to its Unix socket, logs in,
+// and runs statements against the engine behind it, in one process — the test turns the server's
+// loop by hand between what the clients send. The engine's clock is a `ManualClock`, which is also
+// the clock the server ticks its sessions by, so a lock timeout is reached by setting it.
+
+/** One end of a real connection: a client session, its reassembler, and the socket. */
+struct NetClient
+    sock: Socket
+    c: ClientSession
+    cr: Reassembler
+    minor: u64
+    frame: u64
+    events: Buf[Event]
+    /** The server ended the stream. */
+    eof: bool
+
+impl NetClient
+    take(*self, st: ClientStep)
+        st.negotiated match
+            Some(n) ->
+                self.minor = n.minor
+                self.cr.minor = n.minor
+                self.cr.limits = n.receive
+                self.frame = n.send_frame_size
+            None -> ()
+
+        for o in st.out
+            self.sock.send_all(encode_frames(o.m, o.stream, self.minor, usize(self.frame)).unwrap().view()).unwrap()
+            if o.stream != 0 && is_request(o.m) then self.cr.sent(o.stream)
+
+        for e in st.events
+            self.events.push(e)
+
+    /** What has arrived from the server, through the client session; whether anything did. */
+    drain(*self) -> bool
+        var into = [0u8; 65536]
+        var moved = false
+        loop
+            if self.eof then return moved
+            self.sock.recv(into[..]) match
+                Ok(0) ->
+                    self.eof = true
+                    self.take(self.c.lost())
+                Ok(n) ->
+                    moved = true
+                    self.cr.push(into[0..<n]) match
+                        Ok(arrivals) ->
+                            for a in arrivals
+                                self.take(self.c.receive(a, 0))
+                        Err(e) -> self.take(self.c.refuse(e))
+                Err(e) ->
+                    assert(would_block(e), "a read either has bytes or would block")
+                    return moved
+
+    send(*self, m: Message) -> u64
+        val st = self.c.request(m, 0).unwrap()
+        val stream = st.stream
+        self.take(st)
+        stream
+
+    seen(self, stream: u64) -> Buf[Message]
+        val out = buf[Message]()
+        for e in self.events
+            e match
+                Response(s, m) -> if s == stream then out.push(m)
+                _ -> ()
+        out
+
+/** Turns the server and drains every client until a round moves nothing. */
+sv_pump(srv: *Server, clients: []const &NetClient)
+    var quiet = 0
+    for _ in 0..<500
+        srv.turn(Some(millis(0))).unwrap()
+        var moved = false
+        for c in clients
+            if c.drain() then moved = true
+        quiet = if moved then 0 else quiet + 1
+        if quiet >= 3 then return
+
+/** A server on a socket in a directory of the test's own, over the doctors' engine on `clock`. */
+sv_server(name: string, clock: &ManualClock) -> (Server, string)
+    val dir = make_temp_dir(f"terndb-sv-${pid()}-${name}-").unwrap()
+    var settings = server_settings("pencil")
+    settings.database = "app"
+    settings.unix_path = Some(join(dir, "s.sock"))
+    (serve(ew_doctors(clock), settings).unwrap(), dir)
+
+sv_client_config(password: string, defaults: SessionDefaults) -> ClientConfig =
+    ClientConfig(sx_versions([Version(1, 0)]), sx_versions([Version(1, 0)]), BootstrapRole, "app", "tests", sx_strings([ScramPlain]),
+        password, buf(), "CLIENTNONCE", buf(), OverUnix, false, 1048576, defaults, buf(), 60000, 10000)
+
+/** A client that has sent its `ClientHello` to `srv`'s socket; the handshake runs as the server turns. */
+sv_dial(srv: *Server, password: string = "pencil", defaults: SessionDefaults = no_session_defaults()) -> &NetClient
+    var sock = unix_connect(unix(srv.settings.unix_path.unwrap()).unwrap()).unwrap()
+    sock.non_blocking().unwrap()
+    val pre = buf[u8]()
+    push_preface(pre)
+    sock.send_all(pre.view()).unwrap()
+
+    val n: &NetClient = NetClient(sock, client_session(sv_client_config(password, defaults), 0), reassembler(Client), 0,
+        DefaultFrameSize, buf(), false)
+    n.take(n.c.hello(0))
+    n
+
+/** A logged-in client of `srv`. */
+sv_login(srv: *Server) -> &NetClient
+    val n = sv_dial(srv)
+    sv_pump(srv, [n])
+    assert(n.c.phase == Open, "the client is connected")
+    n
+
+@test
+a_client_logs_in_over_the_unix_socket_and_runs_a_query()
+    val clock: &ManualClock = ManualClock(0)
+    var (srv, dir) = sv_server("query", clock)
+    val a = sv_login(&srv)
+    assert_eq(srv.connections(), 1)
+
+    val q = query([], project(filter(scan("app", "doc", "d"), eq(col("d", "id"), ew_lit(2))), "r", [item("on", col("d", "on"))]))
+    val s = a.send(ew_exec(0, q))
+    sv_pump(&srv, [a])
+    assert_eq(ew_kinds(a.seen(s)), "header batch complete")
+    ew_rows(a.seen(s))[0] match
+        Record(fs) -> assert_eq(st_int(fs[0]), 1)
+        _ -> assert(false, "a record")
+
+    srv.shutdown(0)
+    sv_pump(&srv, [a])
+    assert(a.eof, "the server closed the connection at shutdown")
+    val _ = remove_dir_all(dir)
+
+@test
+a_wrong_password_fails_the_login_and_closes_the_connection()
+    val clock: &ManualClock = ManualClock(0)
+    var (srv, dir) = sv_server("password", clock)
+    val a = sv_dial(&srv, "pen")
+    sv_pump(&srv, [a])
+    assert(a.c.phase != Open, "not connected")
+    assert(a.eof, "the server closed the connection")
+    assert_eq(srv.connections(), 0)
+    val _ = remove_dir_all(dir)
+
+@test
+a_statement_waiting_on_another_connections_row_lock_runs_once_it_commits()
+    val clock: &ManualClock = ManualClock(0)
+    var (srv, dir) = sv_server("wait", clock)
+    val e = srv.engine
+    val a = sv_login(&srv)
+    val b = sv_login(&srv)
+
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+    sv_pump(&srv, [a, b])
+
+    // At read committed the rerun takes a new snapshot, so it reads a's commit rather than failing.
+    val s = b.send(ew_exec(0, ew_add_on(1, 100), [], no_exec_options(), Some(ew_level(ReadCommitted))))
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    // The commit arrives on a's connection; b's parked statement is resumed in the same turn.
+    val c = a.send(Commit(1))
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_kinds(a.seen(c)), "committed")
+    assert_eq(ew_kinds(b.seen(s)), "header complete")
+    assert_eq(ew_on_of(e, 1), 111)
+    val _ = remove_dir_all(dir)
+
+@test
+a_wait_as_long_as_the_lock_timeout_fails_when_the_server_ticks()
+    val clock: &ManualClock = ManualClock(0)
+    var (srv, dir) = sv_server("timeout", clock)
+    val e = srv.engine
+    val a = sv_login(&srv)
+    val b = sv_login(&srv)
+
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+    sv_pump(&srv, [a, b])
+
+    val s = b.send(lt_bump(1, Some(50)))
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    clock.ms = 49
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    // Nothing arrives: the server's own tick ends the wait.
+    clock.ms = 50
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_error(b.seen(s)).entries[0].code, "T1003")
+
+    val c = a.send(Commit(1))
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_kinds(a.seen(c)), "committed")
+    assert_eq(ew_on_of(e, 1), 11)
+    val _ = remove_dir_all(dir)
+
+@test
+a_dropped_connection_rolls_its_transaction_back_and_releases_its_locks()
+    val clock: &ManualClock = ManualClock(0)
+    var (srv, dir) = sv_server("drop", clock)
+    val e = srv.engine
+    val a = sv_login(&srv)
+    val b = sv_login(&srv)
+
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+    sv_pump(&srv, [a, b])
+
+    val s = b.send(ew_exec(0, ew_add_on(1, 100)))
+    sv_pump(&srv, [a, b])
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    a.sock.close().unwrap()
+    sv_pump(&srv, [b])
+    assert_eq(srv.connections(), 1)
+    assert_eq(ew_kinds(b.seen(s)), "header complete")
+    assert_eq(ew_on_of(e, 1), 101)
+    val _ = remove_dir_all(dir)
+
+/** A TCP connection to `srv` that has sent `first`, and what came back before the server closed it. */
+sv_tcp_answer(srv: *Server, first: []const u8) -> Buf[u8]
+    val at = srv.tcp_address().unwrap()
+    var sock = socket(at).unwrap()
+    sock.connect(at).unwrap()
+    sock.non_blocking().unwrap()
+    sock.send_all(first).unwrap()
+
+    val got = buf[u8]()
+    var into = [0u8; 4096]
+    for _ in 0..<500
+        srv.turn(Some(millis(1))).unwrap()
+        sock.recv(into[..]) match
+            Ok(0) -> return got
+            Ok(n) -> got.extend(into[0..<n])
+            Err(e) ->
+                if peer_closed(e) then return got
+                assert(would_block(e), "a read either has bytes or would block")
+    assert(false, "the server closed the connection")
+    got
+
+@test
+a_plaintext_tcp_client_is_answered_with_tls_required_and_anything_else_is_closed()
+    var settings = server_settings("pencil")
+    settings.tcp = Some(ipv4(127, 0, 0, 1, 0))
+    var srv = serve(ew_doctors(), settings).unwrap()
+
+    val pre = buf[u8]()
+    push_preface(pre)
+    val answer = sv_tcp_answer(&srv, pre.view())
+    var r = reassembler(Client)
+    val arrivals = r.push(answer.view()).unwrap()
+    assert_eq(arrivals.len(), 1)
+    arrivals[0] match
+        Whole(raw) ->
+            assert_eq(raw.stream, 0)
+            assert_eq(sx_code(raw.decode(0).unwrap()), "W3003")
+        _ -> assert(false, "a whole message")
+
+    // A TLS ClientHello's first octet, and a stray one, are closed without a response.
+    assert_eq(sv_tcp_answer(&srv, [0x16, 0x03, 0x01]).len(), 0)
+    assert_eq(sv_tcp_answer(&srv, [0x47, 0x45, 0x54]).len(), 0)

@@ -1,0 +1,450 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+import sysl.fs.IoError
+import sysl.io.poll.{Event as PollEvent, Poller}
+import sysl.io.wait.{Readable, Writable}
+import sysl.net.{Address, Socket, UnixListener, socket, unix, unix_listen, would_block}
+import sysl.posix.rand.entropy_from_os
+import sysl.time.{Duration, millis}
+
+// The `terndb` server: one in-memory `Engine` shared by every connection, and one `ServerSession` per
+// connection, driven by one thread over non-blocking sockets and one poller (`docs/design/engine.md`
+// § The server). The store is single-threaded, so the loop is too.
+//
+// Each turn of the loop waits for readiness, reads what has arrived into each connection's
+// reassembler and hands the arrivals to its session, then ticks every session at the clock's reading
+// — which is what resumes a statement parked on a row lock once its holder has ended, and what ends
+// one whose `lock_timeout_ms` is spent (`wire-protocol.md` §7.5 rules 2 and 5) — and writes what the
+// sessions answered. A connection that ends while a transaction is open has it rolled back (§5.1
+// rule 3).
+//
+// A Unix-domain socket serves the protocol in full (§1.1 rule 4). TCP must be direct TLS 1.3 (§1.1
+// rule 2), which the server does not have yet: a TCP listener answers a plaintext client with
+// `W3003` and closes every other connection without a response (§1.1 rule 3).
+
+/** The protocol versions this server speaks: wire 1.0, and the tree schema of `qtree.sysl`. */
+server_wire_versions() -> Buf[Version]
+    val b = buf[Version]()
+    b.push(Version(1, 0))
+    b
+
+server_tree_versions() -> Buf[Version]
+    val b = buf[Version]()
+    b.push(Version(TreeMajor, TreeMinor))
+    b
+
+/** What a server is started with. */
+struct ServerSettings
+    /** Where the Unix-domain socket is made; `None` makes none. */
+    unix_path: Option[string]
+    /** Where TCP is listened on; `None` listens on none. */
+    tcp: Option[Address]
+    /** The one database the server serves (`ClientHello.database`). */
+    database: string
+    /** The password of the bootstrap role, the one role with a SCRAM verifier. */
+    password: string
+    /** How long a connection may take to reach `Ready` (§2.1 rule 4). */
+    handshake_timeout_ms: u64
+    /** How long a connection may carry no traffic before `Goodbye` (§7.4); `None` is for ever. */
+    idle_timeout_ms: Option[u64]
+
+/** The settings a server takes unless told otherwise: no listener, the database `terndb`, a
+ * ten-second handshake and no idle limit.
+ */
+server_settings(password: string) -> ServerSettings = ServerSettings(None, None, "terndb", password, 10000, None)
+
+/** The server's own credentials, which `CatalogAuthority` narrows to the catalog's login roles: the
+ * bootstrap role's SCRAM verifier, made from the configured password with a salt drawn at start; no
+ * tokens, since nothing issues one; and a peer login as the operating-system user of the same name.
+ */
+struct ServerCredentials
+    bootstrap: ScramVerifier
+    database: string
+
+impl Authority for ServerCredentials
+    permits(self, user: string, database: string, method: string) -> bool = true
+
+    verifier(self, user: string) -> Option[ScramVerifier] = if user == BootstrapRole then Some(self.bootstrap) else None
+
+    token_user(self, hash: [32]u8) -> Option[string] = None
+
+    peer_permits(self, os_user: string, user: string) -> bool = os_user == user
+
+    has_database(self, database: string) -> bool = database == self.database
+
+/** `n` octets from the operating system's cryptographic generator. */
+random_octets(n: usize) -> Result[Buf[u8], IoError]
+    var b = buf[u8]()
+    for _ in 0..<n
+        b.push(0)
+    // `EIO`: the generator gave nothing, and key material has no fallback.
+    if !entropy_from_os(b.view_mut()) then return Err(Other(5))
+    Ok(b)
+
+/** Which listener or connection a poller event is for. */
+const UnixToken: u64 = 0
+const TcpToken: u64 = 1
+
+/** One connection speaking the protocol, over the Unix socket. */
+struct Conn
+    token: u64
+    sock: Socket
+    session: ServerSession
+    reasm: Reassembler
+    minor: u64
+    frame: u64
+    out: Buf[u8]
+    /** How much of `out` has been written. */
+    sent: usize
+    /** Whether the poller is told about writability, which it is while `out` has unwritten octets. */
+    armed: bool
+    /** The session asked to close once `out` is written. */
+    closing: bool
+    gone: bool
+
+/** A TCP connection, which is answered by its first octet and closed (§1.1 rule 3). */
+struct Probe
+    token: u64
+    sock: Socket
+    out: Buf[u8]
+    sent: usize
+    answered: bool
+    gone: bool
+
+/** A running server: its listeners, its connections and the engine behind them. */
+struct Server
+    engine: &Engine
+    settings: ServerSettings
+    private authority: &Authority
+    private poller: Poller
+    private unix_listener: Option[UnixListener]
+    private tcp_listener: Option[Socket]
+    private conns: Buf[&Conn]
+    private probes: Buf[&Probe]
+    private next_token: u64
+    private next_connection: u64
+    private stopping: bool
+
+    /** Where TCP is listened on, with the port the system chose for port 0. */
+    tcp_address(self) -> Option[Address] = self.tcp_listener match
+        Some(l) -> l.local().ok()
+        None -> None
+
+    /** How many protocol connections are open. */
+    connections(self) -> usize = self.conns.len()
+
+    /** Whether any connection has a request in flight, for which the loop must turn often. */
+    busy(self) -> bool
+        for c in self.conns
+            if c.session.in_flight() > 0 then return true
+        false
+
+    /** Serves until `stop` is asked: each turn waits at most 10 ms while a request is in flight and a
+     * second otherwise, since a parked statement must be resumed or timed out promptly and nothing
+     * else needs the loop sooner than the handshake deadline.
+     */
+    run(*self, stop: () -> bool) -> Result[unit, IoError]
+        loop
+            if stop() then
+                self.shutdown(5000)
+                while self.conns.len() > 0 || self.probes.len() > 0
+                    self.turn(Some(millis(10)))?
+                return Ok(())
+            self.turn(Some(if self.busy() then millis(10) else millis(1000)))?
+
+    /** One turn of the loop: wait at most `wait` for readiness, serve what is ready, tick every
+     * session, and write what they answered.
+     */
+    turn(*self, wait: Option[Duration]) -> Result[unit, IoError]
+        var events = [PollEvent.none; 64]
+        val n = self.poller.wait(events[..], wait)?
+        self.engine.now = sysl.time.now().us
+
+        for e in events[0..<n]
+            if e.token == UnixToken then self.accept_unix()
+            elif e.token == TcpToken then self.accept_tcp()
+            else self.ready(e)
+
+        val now = self.engine.clock.now_ms()
+        for c in self.conns
+            if !c.gone then self.take(c, c.session.tick(now))
+
+        for c in self.conns
+            if !c.gone then self.write(c)
+        for p in self.probes
+            if !p.gone then self.write_probe(p)
+
+        self.reap()
+        Ok(())
+
+    /** `Goodbye` to every connection, whose requests then have `grace_ms` to finish (§3.4 rule 5); the
+     * listeners are closed so no connection is accepted after it.
+     */
+    shutdown(*self, grace_ms: u64)
+        if self.stopping then return
+        self.stopping = true
+        self.unix_listener match
+            Some(l) ->
+                var listener = l
+                val _ = listener.close()
+                self.settings.unix_path match
+                    Some(p) ->
+                        val _ = sysl.fs.remove_file(p)
+                    None -> ()
+            None -> ()
+        self.tcp_listener match
+            Some(l) ->
+                var listener = l
+                val _ = listener.close()
+            None -> ()
+        self.unix_listener = None
+        self.tcp_listener = None
+
+        val now = self.engine.clock.now_ms()
+        for c in self.conns
+            if !c.gone then self.take(c, c.session.shutdown(now, grace_ms))
+
+    // -- accepting -------------------------------------------------------------------------------
+
+    private accept_unix(*self)
+        self.unix_listener match
+            Some(l) ->
+                var listener = l
+                loop
+                    listener.accept() match
+                        Ok(s) -> self.open(s)
+                        Err(_) -> return
+            None -> ()
+
+    private accept_tcp(*self)
+        self.tcp_listener match
+            Some(l) ->
+                var listener = l
+                loop
+                    listener.accept() match
+                        Ok((s, _)) ->
+                            var sock = s
+                            if sock.non_blocking().is_err() then continue
+                            val token = self.token()
+                            sock.fd() match
+                                Ok(fd) ->
+                                    if self.poller.register(fd, [Readable], token).is_ok() then
+                                        self.probes.push(Probe(token, sock, buf(), 0, false, false))
+                                Err(_) -> ()
+                        Err(_) -> return
+            None -> ()
+
+    private open(*self, s: Socket)
+        var sock = s
+        if sock.non_blocking().is_err() then return
+        val nonce = random_octets(18) match
+            Ok(b) -> hex_string(b.view())
+            Err(_) -> return
+        val token = self.token()
+        self.next_connection += 1
+        val config = ServerConfig(server_wire_versions(), server_tree_versions(), "terndb 0.0.1", 1048576, 64, 16,
+            MinMessageSize, self.next_connection, Primary, OverUnix, nonce, buf(), None, buf(),
+            self.settings.handshake_timeout_ms, self.settings.idle_timeout_ms)
+        val session = server_session(config, self.engine.connect(""), self.authority, self.engine.clock.now_ms())
+
+        sock.fd() match
+            Ok(fd) ->
+                if self.poller.register(fd, [Readable], token).is_ok() then
+                    self.conns.push(Conn(token, sock, session, reassembler(Server), 0, DefaultFrameSize, buf(), 0, false,
+                        false, false))
+            Err(_) -> ()
+
+    private token(*self) -> u64
+        self.next_token += 1
+        self.next_token
+
+    // -- reading ---------------------------------------------------------------------------------
+
+    private ready(*self, e: PollEvent)
+        for c in self.conns
+            if c.token == e.token && !c.gone
+                if e.readable || e.hangup || e.error then self.read(c)
+                if e.writable && !c.gone then self.write(c)
+                return
+        for p in self.probes
+            if p.token == e.token && !p.gone
+                if e.readable || e.hangup || e.error then self.read_probe(p)
+                if e.writable && !p.gone then self.write_probe(p)
+                return
+
+    /** Everything that has arrived on `c`, through its reassembler and into its session. */
+    private read(*self, c: &Conn)
+        var into = [0u8; 65536]
+        loop
+            c.sock.recv(into[..]) match
+                Ok(0) ->
+                    self.lost(c)
+                    return
+                Ok(n) ->
+                    val now = self.engine.clock.now_ms()
+                    c.reasm.push(into[0..<n]) match
+                        Ok(arrivals) ->
+                            for a in arrivals
+                                if !c.closing then self.take(c, c.session.receive(a, now))
+                        Err(e) -> self.take(c, c.session.refuse(e))
+                    if c.closing then return
+                Err(e) ->
+                    if !would_block(e) then self.lost(c)
+                    return
+
+    /** The transport of `c` has ended: its session rolls back every open transaction, and nothing more
+     * is sent.
+     */
+    private lost(*self, c: &Conn)
+        val _ = c.session.lost()
+        self.drop_conn(c)
+
+    private take(*self, c: &Conn, st: Step)
+        st.negotiated match
+            Some(n) ->
+                c.minor = n.minor
+                c.reasm.minor = n.minor
+                c.reasm.limits = n.receive
+                c.frame = n.send_frame_size
+            None -> ()
+
+        for o in st.out
+            encode_frames(o.m, o.stream, c.minor, usize(c.frame)) match
+                Ok(b) -> c.out.extend(b.view())
+                Err(_) -> c.closing = true
+            if o.stream != 0 && is_terminal(o.m) then c.reasm.answered(o.stream)
+
+        if st.close then c.closing = true
+
+    // -- writing ---------------------------------------------------------------------------------
+
+    /** As much of `c`'s output as the socket takes; the rest waits for writability. A session that
+     * asked to close is closed once all of it is written.
+     */
+    private write(*self, c: &Conn)
+        while c.sent < c.out.len()
+            c.sock.send(c.out.view()[c.sent..<c.out.len()]) match
+                Ok(n) -> c.sent += n
+                Err(e) ->
+                    if would_block(e) then break
+                    self.lost(c)
+                    return
+
+        if c.sent == c.out.len()
+            c.out.clear()
+            c.sent = 0
+            if c.closing
+                self.drop_conn(c)
+                return
+            if c.armed then c.armed = !self.interest(c.sock, c.token, false)
+        elif !c.armed
+            c.armed = self.interest(c.sock, c.token, true)
+
+    private interest(*self, sock: Socket, token: u64, writable: bool) -> bool
+        sock.fd() match
+            Ok(fd) ->
+                if writable then self.poller.modify(fd, [Readable, Writable], token).is_ok()
+                else self.poller.modify(fd, [Readable], token).is_ok()
+            Err(_) -> false
+
+    private drop_conn(*self, c: &Conn)
+        if c.gone then return
+        c.gone = true
+        c.sock.fd() match
+            Ok(fd) ->
+                val _ = self.poller.deregister(fd)
+            Err(_) -> ()
+        val _ = c.sock.close()
+
+    // -- TCP -------------------------------------------------------------------------------------
+
+    /** The first octet of a TCP connection decides it (§1.1 rule 3): `T`, the preface's first octet,
+     * is a plaintext client, answered with `W3003` on stream 0; anything else, a TLS record included,
+     * is closed without a response.
+     */
+    private read_probe(*self, p: &Probe)
+        if p.answered
+            self.drop_probe(p)
+            return
+        // Everything that has arrived is read, not only the first octet: a socket closed with input
+        // unread is reset rather than ended, and a reset can discard the answer before it is read.
+        var into = [0u8; 4096]
+        p.sock.recv(into[..]) match
+            Ok(0) -> self.drop_probe(p)
+            Ok(_) ->
+                p.answered = true
+                if into[0] == Preface[0] then
+                    val m = error_message("W3003", "TCP connections must use TLS; plaintext is refused", Unaffected, None)
+                    encode_frames(m, 0, 0, usize(DefaultFrameSize)) match
+                        Ok(b) -> p.out.extend(b.view())
+                        Err(_) -> ()
+                loop
+                    p.sock.recv(into[..]) match
+                        Ok(n) -> if n == 0 then break
+                        Err(_) -> break
+                if p.out.len() == 0 then self.drop_probe(p)
+            Err(e) -> if !would_block(e) then self.drop_probe(p)
+
+    private write_probe(*self, p: &Probe)
+        while p.sent < p.out.len()
+            p.sock.send(p.out.view()[p.sent..<p.out.len()]) match
+                Ok(n) -> p.sent += n
+                Err(e) ->
+                    if !would_block(e) then self.drop_probe(p)
+                    return
+        if p.answered && p.out.len() > 0 then self.drop_probe(p)
+
+    private drop_probe(*self, p: &Probe)
+        if p.gone then return
+        p.gone = true
+        p.sock.fd() match
+            Ok(fd) ->
+                val _ = self.poller.deregister(fd)
+            Err(_) -> ()
+        val _ = p.sock.close()
+
+    private reap(*self)
+        var i: usize = 0
+        while i < self.conns.len()
+            if self.conns[i].gone then val _ = self.conns.remove(i) else i += 1
+        i = 0
+        while i < self.probes.len()
+            if self.probes[i].gone then val _ = self.probes.remove(i) else i += 1
+
+/** A server over `engine` with `settings`, its listeners open and nothing yet accepted. A Unix
+ * socket file left at the path by an earlier run is replaced.
+ */
+serve(engine: &Engine, settings: ServerSettings) -> Result[Server, IoError]
+    val salt = random_octets(16)?
+    val bootstrap = scram_verifier(settings.password, salt.view(), 4096) match
+        Ok(v) -> v
+        Err(_) -> return Err(Other(22))
+    val credentials: &ServerCredentials = ServerCredentials(bootstrap, settings.database)
+    val poller = Poller.open()?
+
+    var unix_listener: Option[UnixListener] = None
+    settings.unix_path match
+        Some(p) ->
+            if sysl.fs.exists(p) then sysl.fs.remove_file(p)?
+            var l = unix_listen(unix(p)?)?
+            l.non_blocking()?
+            poller.register(l.fd()?, [Readable], UnixToken)?
+            unix_listener = Some(l)
+        None -> ()
+
+    var tcp_listener: Option[Socket] = None
+    settings.tcp match
+        Some(at) ->
+            var l = socket(at)?
+            l.reuse_address()?
+            l.bind(at)?
+            l.listen()?
+            l.non_blocking()?
+            poller.register(l.fd()?, [Readable], TcpToken)?
+            tcp_listener = Some(l)
+        None -> ()
+
+    Ok(Server(engine, settings, catalog_authority(engine, credentials), poller, unix_listener, tcp_listener, buf(), buf(),
+        TcpToken, 0, false))
