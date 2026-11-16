@@ -10,8 +10,8 @@ import sysl.buf.{Buf, buf}
 /** An engine holding `doc (id, on)` with doctors 1 and 2 both on call, and `acct (id, bal)` with the
  * check `bal > -1`.
  */
-ew_doctors() -> &Engine
-    val e = ew_engine()
+ew_doctors(clock: &Clock = ManualClock(0)) -> &Engine
+    val e = ew_engine(clock)
     val bal_ok = cat_check("bal_ok", call("gt", [cat_row("bal"), Literal(Int64, Int(-1))]))
     ew_setup(e, [ew_app(), ew_table("doc", [Field("id", Int64), Field("on", Int64)], "id"),
         envelope([], CreateTable(cat_q("acct"), ew_cols([Field("id", Int64), Field("bal", Int64)]), items_of(["id"]), items_of([bal_ok]), false)),

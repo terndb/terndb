@@ -199,7 +199,7 @@ per-row latches and a real wait) is the next slice of this work.
 ## Deferred
 
 - Disk, WAL, the buffer manager and recovery (waiting on sysl's CRC32C and io_uring gaps); `transaction_status`.
-- `lock_timeout` (no clock seam yet), `max_predicate_log` coarsening, `max_snapshot_age` and undo purge.
+- `max_predicate_log` coarsening, `max_snapshot_age` and undo purge.
 - Translation of a value whose representation a lossless retype changes other than integer to float (to
   `decimal`, `json` to `text`); the commit latch of `ddl.md` §6.1 rule 3, which a single-threaded store does not
   need.

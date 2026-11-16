@@ -40,6 +40,16 @@ a savepoint lets the locks of the span go while it stays live (`wire-protocol.md
 statement also runs again whenever the store's count of such rollbacks (`Store.released`) has moved since it
 parked.
 
+The engine is made with a `Clock` (`clock.sysl`: `now_ms`, milliseconds from an origin of its own), which a
+server gives as `MonotonicClock`, over `sysl.posix.time.monotonic`; the tests give a `ManualClock` they set by
+hand. A statement notes the reading when it first parks, and every `next` that finds it still parked
+compares the time since with its transaction's `lock_timeout_ms` — `Begin`'s for an explicit transaction,
+the statement's implicit options otherwise, both already filled from the connection's defaults. A wait that
+long fails with `lock_timeout` and aborts the transaction through `Store.abort_with`, which a retryable code
+rolls back whole (`wire-protocol.md` §7.5 rule 5). The wait goes on across runs again until a run gets past
+the lock, and a cycle is still refused before anything parks, so deadlock detection comes first. Tests:
+`engine_lock_timeout_tests.sysl`.
+
 ## Savepoints
 
 `savepoint`, `rollback_to` and `release` are the store's (`store.md` § Savepoints); the session keeps the names
@@ -70,8 +80,6 @@ changed, so a statement cached under one transaction's uncommitted table is `W20
 - **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
   column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
   expression applied on read. Translation (`store.md`) applies the lossless conversions only.
-- **`lock_timeout_ms`** is not applied: the `Executor` has no clock. A parked statement is bounded by
-  `statement_timeout_ms` and by `Cancel`.
 - **The role** is fixed when the connection is made (`Engine.connect`); the `Executor` trait carries no
   authenticated user. DDL is applied, and the plan cache keyed, as that role.
 - **`Authority`** is not backed by the catalog's roles; a server supplies its own.
