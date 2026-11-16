@@ -286,7 +286,6 @@ private struct Planner
                 self.ctes = saved
                 out
             CteRef(name, binder) -> Lowered(CteScanOp(cte_store(self.ctes, name), elem, 0), binder, elem, none)
-            _ -> panic("the executor does not run this relational node")
     end rel
 
     /** The recursive CTE `c`, framed at `slot` (§6.13 rules 3 and 4): its seed planned here, and each

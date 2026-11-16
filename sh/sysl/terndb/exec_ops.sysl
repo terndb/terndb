@@ -9,6 +9,8 @@ import sysl.slices.sort_stable_by
 
 trait Operator
     /** The next batch of at least one row, or `None` once every row has been handed up. */
+    // An operator keeps the children and stores it reads through self, so they outlive the call.
+    @keeps(self)
     next_batch(*self) -> Result[Option[ColumnVector], CodecError]
 
 /** A sort key with its expression typed (§6.9). */

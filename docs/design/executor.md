@@ -9,9 +9,9 @@ written into `query-tree.md` itself, and this note points at it.
 The code is `sh/sysl/terndb/exec_*.sysl`. This first slice covers what does not depend on storage:
 column vectors, expression evaluation, and the operators `Values`, `ParamScan`, `Filter`,
 `Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Tag`, `Join` (§4.1), and `Nest`, `Unnest`,
-`Apply` with the subquery expressions (§4.2), `Window` (§4.3), a source over in-memory batches
-standing in for `Scan`, and the conversion of an operator's output into result batches. Set
-operations, DML, storage, MVCC and the unnesting planner come later.
+`Apply` with the subquery expressions (§4.2), `Window` (§4.3), `SetOp`, `With` and `CteRef` with
+recursive CTEs (§4.4), a source over in-memory batches standing in for `Scan`, and the conversion of
+an operator's output into result batches. DML, storage, MVCC and the unnesting planner come later.
 
 ## 1. Column vectors
 
@@ -319,10 +319,34 @@ binders and the window's record, one member per call.
 Hash partitioning, which would need no sort of the partition values, waits on a fast seeded hash
 (the survey's gap, as for `Distinct` and `Aggregate`).
 
+### 4.4 Set operations and CTEs
+
+The code is `exec_setop.sysl`, with the shape check for recursion in `qtree_recursion.sysl`.
+
+- **SetOp** (§6.12) coerces every input's batches positionally to the output element type
+  (`drain_coerced`). `union all` streams its inputs in order, one batch at a time. Every other
+  combination is sort-based and blocking: the inputs are drained and laid end to end, the rows are
+  ordered by `Sort`'s stable comparator over every column (`row_orders`, shared with `Distinct`), and
+  each run of `same` rows keeps a count of its first rows computed from how many each input holds
+  (`copies_of`). Because the sort is stable and the inputs are laid in order, the rows kept by
+  `intersect` and `except` are the first input's. Hashing waits on the survey's fast seeded hash.
+- **With** frames each CTE as a `CteStore` in scope while its later CTEs (or, for a recursive `With`,
+  all of them) and its body are planned. A store holds the CTE's planned operator and drains it on the
+  first read only, so every `CteRef` sees one value (§6.13 rule 2) and an unread CTE is never run.
+  **CteRef** is a `CteScanOp` over its store's batches, coerced to the reference's element type.
+- **Recursive CTEs** are a `RecursiveOp`: the seed is planned once; each recursive input is kept as a
+  `SubPlan` and planned again at every step, with the CTE's frame bound to a store holding only the
+  previous step's new rows. Without `all`, a step's rows are cut by a set `except` against every row
+  found so far. The loop ends on a step with no new rows, and the 10001st step that yields new rows is
+  `R0005` (`RecursionSteps`).
+- **Operators keep what they read.** A store is an `&Operator` reachable from a `SubPlan`, so the
+  `Operator` trait's `next_batch` carries `@keeps(self)`: an operator keeps the children and stores it
+  reads through `self` beyond the call.
+
 ## 5. What this note relies on in `query-tree.md`
 
 §3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
-the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.11, §6.14 and §6.15 for
+the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.15 for
 the operators; §7.1–§7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
 its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
 `and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the calendar `add`
@@ -332,7 +356,9 @@ group's key, `filter`, `distinct`, and the values of `sum`, `min`, `max` and `st
 rows, and an `Unnest` without `outer` of an empty or null relation (§6.14 rules 1 and 2); and a
 window's partitions, peers, ranking, `lag`/`lead` offsets, default frame, the meaning of each frame
 unit and exclusion, `range` offsets over every key type, and when offsets are evaluated and refused
-(§6.8 rules 1–5).
+(§6.8 rules 1–5); a set operation's left fold and its nulls as duplicates (§6.12); and that an unread
+CTE is never evaluated, the places a recursive reference may not stand, and the 10000-step bound
+(§6.13 rules 2–4).
 
 ## 6. Where the survey's sysl gaps cost speed
 
