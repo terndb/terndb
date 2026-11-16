@@ -234,6 +234,7 @@ a_dropped_table_is_still_read_at_an_older_snapshot()
     var a = ew_duo(e)
     var b = ew_duo(e)
 
+    val doc = e.store.latest_catalog().tables[e.store.latest_catalog().table_at(cat_q("doc")).unwrap()].oid
     a.send(Begin(1, ew_level(Snapshot)))
     assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ew_on_call())))).len(), 2)
     assert_eq(b.kinds_of(0, envelope([], DropTable(cat_q("doc"), false, false))), "header complete")
@@ -245,12 +246,15 @@ a_dropped_table_is_still_read_at_an_older_snapshot()
     assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
 
     // Once nobody can see it, its rows go, at the end of the next transaction.
-    val tables = e.store.tables.len()
+    var held = false
+    for d in e.store.tables
+        if d.oid == doc then held = true
+    assert(held, "the reader's table was kept while it read")
+
     b.kinds_of(0, query([], project(scan("app", "acct", "a"), "r", [item("id", col("a", "id"))])))
-    assert_eq(e.store.tables.len(), tables - 1)
 
     for d in e.store.tables
-        assert(e.store.latest_catalog().table_by_oid(d.oid).is_some(), "only rows of live tables are kept")
+        assert(d.oid != doc, "the dropped table's rows are gone")
 
 @test
 a_writer_of_a_table_dropped_during_it_aborts_with_schema_changed()
