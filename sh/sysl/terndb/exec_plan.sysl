@@ -31,6 +31,10 @@ private struct Planner
     tables: Buf[MemTable]
     /** The outer rows a correlated subtree is planned for, one per binder (`exec_nest.sysl`). */
     outer: Buf[Binder]
+    /** The CTEs in scope, innermost last (`exec_setop.sysl`). A buffer here is never changed once
+     * made, since a `SubPlan` keeps it.
+     */
+    ctes: Buf[CteFrame]
 
     take_type(*self) -> Type
         val t = self.types[self.at]
@@ -49,7 +53,7 @@ private struct Planner
      * its types.
      */
     sub(*self, r: Rel) -> (SubPlan, Lowered)
-        val s = SubPlan(r, self.types, self.at, self.tables, self.outer)
+        val s = SubPlan(r, self.types, self.at, self.tables, self.outer, self.ctes)
         (s, self.rel(r))
 
     expr(*self, e: Expr) -> TExpr
@@ -220,8 +224,62 @@ private struct Planner
                 val l = self.rel(*left)
                 val (s, shape) = self.sub(*right)
                 plan_apply(kind, l, s, shape, self.opt_expr(on), mark, binder, self.ctx)
+            SetOp(op, all, binder, inputs) ->
+                val parts = buf[&Operator]()
+
+                for i in inputs
+                    parts.push(flat_input(self.rel(i)))
+
+                Lowered(SetOperator(op, all, elem, parts, 0, None), binder, elem, none)
+            With(recursive, ctes, body) ->
+                val saved = self.ctes
+
+                if recursive
+                    // Every CTE is in scope in every query (§6.13 rule 1), so all are framed first.
+                    val stores = buf[&CteStore]()
+                    var fs = saved
+
+                    for c in ctes
+                        val s: &CteStore = CteStore(c.name, None, None, false)
+                        stores.push(s)
+                        fs = with_frame(fs, c.name, s)
+
+                    self.ctes = fs
+
+                    for i in 0..<ctes.len()
+                        stores[i].source = Some(self.recursive_cte(ctes[i], saved.len() + i))
+                else
+                    for c in ctes
+                        val s: &CteStore = CteStore(c.name, Some(flat_input(self.rel(c.rel))), None, false)
+                        self.ctes = with_frame(self.ctes, c.name, s)
+
+                val out = self.rel(*body)
+                self.ctes = saved
+                out
+            CteRef(name, binder) -> Lowered(CteScanOp(cte_store(self.ctes, name), elem, 0), binder, elem, none)
             _ -> panic("the executor does not run this relational node")
     end rel
+
+    /** The recursive CTE `c`, framed at `slot` (§6.13 rules 3 and 4): its seed planned here, and each
+     * recursive input kept to be planned per step.
+     */
+    recursive_cte(*self, c: CteDef, slot: usize) -> &Operator
+        val (all, inputs) = c.rel match
+            SetOp(_, all, _, inputs) -> (all, inputs)
+            _ -> panic("a recursive CTE is a union (§6.13 rule 3)")
+
+        val elem = self.take_type() match
+            Bag(e) | List(e) -> *e
+            _ -> panic("a relation's type is a bag or a list")
+
+        val seed = flat_input(self.rel(inputs[0]))
+        val steps = buf[SubPlan]()
+
+        for k in 1..<inputs.len()
+            val (s, _) = self.sub(inputs[k])
+            steps.push(s)
+
+        RecursiveOp(c.name, seed, steps, slot, elem, all, self.ctx, None)
 end Planner
 
 /** The operator tree of `env`, a `Query` that `typing` is the type checker's answer for, run with
@@ -232,12 +290,12 @@ plan_query(env: Envelope, typing: Typing, ctx: Ctx, tables: Buf[MemTable]) -> Lo
         Query(r) -> r
         _ -> panic("plan_query: the statement is not a query")
 
-    var p = Planner(typing.nodes, 0, ctx, tables, buf[Binder]())
+    var p = Planner(typing.nodes, 0, ctx, tables, buf[Binder](), buf[CteFrame]())
     p.rel(rel)
 
 /** The correlated subtree `s` planned with `ctx` for the outer rows `outer` (`exec_nest.sysl`). */
 private[terndb] plan_sub(s: SubPlan, ctx: Ctx, outer: Buf[Binder]) -> Lowered
-    var p = Planner(s.types, s.at, ctx, s.tables, outer)
+    var p = Planner(s.types, s.at, ctx, s.tables, outer, s.ctes)
     p.rel(s.rel)
 
 /** `env` type-checked against `catalog`, run with `ctx` over `tables`, and its output as the result

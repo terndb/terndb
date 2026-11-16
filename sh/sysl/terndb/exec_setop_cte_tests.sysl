@@ -1,0 +1,222 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `With` and `CteRef` (`query-tree.md` §6.13) through the type checker and the planner: a CTE read
+// twice, nested and shadowed CTEs, declared columns, a CTE read from a correlated subquery, a CTE
+// never read; recursion with and without `all`, with two recursive inputs, its step bound, and the
+// shapes rule 3 refuses.
+
+private xc_kv() -> [2]Field = [Field("k", nullable(Int64)), Field("v", nullable(Text))]
+
+private xc_r(k: i128, v: string) -> Value = rec([Int(k), Text(v)])
+
+private xc_i(n: i128) -> Expr = Literal(Int64, Int(n))
+
+/** a: 1a, 2b, 3c, the null row; b: 1a, 1a, 4d; edges: 1→2, 2→3, 3→1, 3→4. */
+private xc_tables() -> [3]XnTable = [
+    xn_table("a", xc_kv(), rows_of([xc_r(1, "a"), xc_r(2, "b"), xc_r(3, "c"), rec([Null, Null])]), 2),
+    xn_table("b", xc_kv(), rows_of([xc_r(1, "a"), xc_r(1, "a"), xc_r(4, "d")]), 2),
+    xn_table("edges", [Field("src", Int64), Field("dst", Int64)],
+        rows_of([rec([Int(1), Int(2)]), rec([Int(2), Int(3)]), rec([Int(3), Int(1)]), rec([Int(3), Int(4)])]), 3)]
+
+private xc_run(r: Rel) -> Result[(Type, Buf[Value]), CodecError] = xn_run(xc_tables(), [], [], r)
+
+private xc_ints(ns: []const i128) -> Buf[Value]
+    val out = buf[Value]()
+
+    for n in ns
+        out.push(rec([Int(n)]))
+
+    out
+
+private cte(name: string, r: Rel) -> CteDef = CteDef(name, None, r)
+
+private with(ctes: []const CteDef, body: Rel) -> Rel = With(false, items_of(ctes), body)
+
+/** a's rows with k above `n`, read through binder `b`. */
+private xc_above(r: Rel, b: string, n: i128) -> Rel = filter(r, call("lt", [xc_i(n), col(b, "k")]))
+
+// -- non-recursive ------------------------------------------------------------------------------
+
+@test
+a_cte_read_twice_gives_both_references_its_rows()
+    val pairs = Join(Inner, CteRef("c", "r1"), CteRef("c", "r2"), None, None, None)
+    val body = project(pairs, "o", [item("x", col("r1", "k")), item("y", col("r2", "k"))])
+    val q = with([cte("c", xc_above(scan("app", "a", "t"), "t", 1))], body)
+    val want = rows_of([rec([Int(2), Int(2)]), rec([Int(2), Int(3)]), rec([Int(3), Int(2)]), rec([Int(3), Int(3)])])
+    xn_check(xc_run(q), want, "the cross product of c with itself")
+
+@test
+a_cte_reads_an_earlier_one_and_withs_nest()
+    // b1 reads a1; an inner With reads b1 through c1.
+    val inner = with([cte("c1", CteRef("b1", "r2"))], CteRef("c1", "r3"))
+    val q = with([cte("a1", scan("app", "a", "t")), cte("b1", xc_above(CteRef("a1", "r1"), "r1", 1))], inner)
+    xn_check(xc_run(q), rows_of([xc_r(2, "b"), xc_r(3, "c")]), "nested")
+
+@test
+the_nearest_with_defining_a_name_is_the_one_read()
+    val shadowed = with([cte("c", scan("app", "a", "t"))], with([cte("c", scan("app", "b", "u"))], CteRef("c", "r")))
+    xn_check(xc_run(shadowed), rows_of([xc_r(1, "a"), xc_r(1, "a"), xc_r(4, "d")]), "the inner c")
+
+    // A non-recursive CTE's own query reads the outer CTE of its name (§6.13 rule 1).
+    val outer = with([cte("c", scan("app", "a", "t"))], with([cte("c", xc_above(CteRef("c", "r1"), "r1", 2))], CteRef("c", "r2")))
+    xn_check(xc_run(outer), rows_of([xc_r(3, "c")]), "the inner c over the outer one")
+
+@test
+declared_columns_rename_a_cte_s_output()
+    val cols = Some(items_of([Field("n", nullable(Int64))]))
+    val q = with([CteDef("c", cols, project(scan("app", "b", "t"), "p", [item("k", col("t", "k"))]))], project(CteRef("c", "r"), "o", [item("m", col("r", "n"))]))
+    val (t, rows) = xc_run(q).unwrap()
+    assert(t == bag(record([Field("m", nullable(Int64))])))
+    assert(xn_same(t, rows, xc_ints([1, 1, 4])))
+
+@test
+a_correlated_subquery_reads_a_cte()
+    val count = Aggregate(filter(CteRef("c", "r"), eq(col("r", "k"), col("t", "k"))), "g", no_items(),
+        items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
+    val body = project(scan("app", "a", "t"), "o", [item("k", col("t", "k")), item("n", Scalar(count))])
+    val q = with([cte("c", scan("app", "b", "u"))], body)
+    xn_check(xc_run(q), rows_of([rec([Int(1), Int(2)]), rec([Int(2), Int(0)]), rec([Int(3), Int(0)]), rec([Null, Int(0)])]), "per row of a")
+
+@test
+a_cte_is_evaluated_only_when_it_is_read()
+    val bad = project(scan("app", "a", "t"), "p", [item("q", call("div", [col("t", "k"), xc_i(0)]))])
+    xn_check(xc_run(with([cte("bad", bad)], scan("app", "b", "u"))), rows_of([xc_r(1, "a"), xc_r(1, "a"), xc_r(4, "d")]), "unread")
+    assert_eq(xn_code(xc_run(with([cte("bad", bad)], CteRef("bad", "r")))), "R0002")
+
+// -- recursive ----------------------------------------------------------------------------------
+
+private xc_n() -> Option[Buf[Field]] = Some(items_of([Field("n", Int64)]))
+
+/** `{n}` rows of the one-column values `ns`, as an int8 literal each (coerced to the CTE's int64). */
+private xc_seed(ns: []const i128) -> Rel = xc_seed_as("s", ns)
+
+/** The same under binder `b`, for a second `Values` in one statement (binders are unique, §8.2). */
+private xc_seed_as(b: string, ns: []const i128) -> Rel
+    val rows = buf[Buf[Expr]]()
+
+    for n in ns
+        rows.push(items_of([Literal(Int8, Int(n))]))
+
+    Values(b, items_of([Field("n", Int8)]), rows)
+
+/** `n + by` for each row of CTE `c` (binder `b`) with `n < below`. */
+private xc_step(c: string, b: string, below: i128, by: i128) -> Rel =
+    project(filter(CteRef(c, b), call("lt", [col(b, "n"), xc_i(below)])), s"p$b", [item("n", call("add", [col(b, "n"), xc_i(by)]))])
+
+private xc_rec(all: bool, seed: Rel, steps: []const Rel, body: Rel) -> Rel
+    val inputs = buf[Rel]()
+    inputs.push(seed)
+    inputs.extend(steps)
+    With(true, items_of([CteDef("c", xc_n(), SetOp(Union, all, "u", inputs))]), body)
+
+/** 1 up to `to`, one row per step. */
+private xc_count(to: i128) -> Rel = xc_rec(true, xc_seed([1]), [xc_step("c", "c1", to, 1)], CteRef("c", "r"))
+
+private xc_upto(n: i128) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 1..<n + 1
+        out.push(rec([Int(i)]))
+
+    out
+
+@test
+a_recursive_cte_counts()
+    xn_check(xc_run(xc_count(5)), xc_upto(5), "1 to 5")
+    xn_check(xc_run(xc_count(1)), xc_upto(1), "the seed alone: the first step yields nothing")
+
+    val (t, _) = xc_run(xc_count(3)).unwrap()
+    assert(t == bag(record([Field("n", Int64)])), "the declared columns")
+
+@test
+duplicates_are_discarded_without_all_and_kept_with_it()
+    // Seed 1, 1, 2; each step adds one to every row below 3.
+    xn_check(xc_run(xc_rec(false, xc_seed([1, 1, 2]), [xc_step("c", "c1", 3, 1)], CteRef("c", "r"))), xc_ints([1, 2, 3]), "set")
+    xn_check(xc_run(xc_rec(true, xc_seed([1, 1, 2]), [xc_step("c", "c1", 3, 1)], CteRef("c", "r"))), xc_ints([1, 1, 2, 2, 2, 3, 3, 3]), "multiset")
+
+@test
+every_recursive_input_reads_the_previous_step_s_rows()
+    val two = xc_rec(true, xc_seed([1]), [xc_step("c", "c1", 3, 1), xc_step("c", "c2", 3, 10)], CteRef("c", "r"))
+    xn_check(xc_run(two), xc_ints([1, 2, 11, 3, 12]), "two recursive inputs")
+
+/** The nodes reachable from 1 over the edges, which hold a cycle. */
+private xc_reach(all: bool) -> Rel
+    val step = project(Join(Inner, CteRef("c", "c1"), scan("app", "edges", "e"), Some(eq(col("c1", "n"), col("e", "src"))), None, None), "st", [item("n", col("e", "dst"))])
+    xc_rec(all, xc_seed([1]), [step], CteRef("c", "r"))
+
+@test
+a_cycle_ends_without_all_and_is_r0005_with_it()
+    xn_check(xc_run(xc_reach(false)), xc_ints([1, 2, 3, 4]), "reachable from 1")
+    // With all the cycle yields new rows for ever, until the step bound.
+    assert_eq(xn_code(xc_run(xc_reach(true))), "R0005")
+
+@test
+the_step_bound_admits_exactly_recursion_steps_steps()
+    val steps = i128(RecursionSteps)
+    // Counting to steps + 1 takes `steps` steps that yield a row, and one more that yields none.
+    val (_, rows) = xc_run(xc_count(steps + 1)).unwrap()
+    assert_eq(rows.len(), RecursionSteps + 1)
+    assert_eq(xn_code(xc_run(xc_count(steps + 2))), "R0005")
+
+@test
+a_recursive_cte_read_twice_and_read_by_another()
+    val pairs = project(Join(Inner, CteRef("c", "r1"), CteRef("c", "r2"), Some(eq(col("r1", "n"), col("r2", "n"))), None, None), "o", [item("x", col("r1", "n"))])
+    xn_check(xc_run(xc_rec(true, xc_seed([1]), [xc_step("c", "c1", 3, 1)], pairs)), xc_ints([1, 2, 3]), "a self-join of c")
+
+    // In a recursive With, d's seed reads c, which is complete before d starts.
+    val c = CteDef("c", xc_n(), SetOp(Union, true, "u", items_of([xc_seed([1]), xc_step("c", "c1", 3, 1)])))
+    val d = CteDef("d", xc_n(), SetOp(Union, false, "w", items_of([project(CteRef("c", "rc"), "pc", [item("n", call("add", [col("rc", "n"), xc_i(10)]))]), xc_step("d", "d1", 12, 1)])))
+    xn_check(xc_run(With(true, items_of([c, d]), CteRef("d", "r"))), xc_ints([11, 12, 13]), "d over c")
+    // And the same with d defined first: every CTE of a recursive With is in scope in every query.
+    xn_check(xc_run(With(true, items_of([d, c]), CteRef("d", "r"))), xc_ints([11, 12, 13]), "d before c")
+
+// -- rule 3's shapes ----------------------------------------------------------------------------
+
+private xc_refusal(ctes: []const CteDef) -> string = check_refusal(query([], With(true, items_of(ctes), CteRef(ctes[0].name, "r"))))
+
+private xc_union(inputs: []const Rel) -> Rel = SetOp(Union, true, "u", items_of(inputs))
+
+@test
+rule_three_s_shapes_are_q5001()
+    val ok = CteDef("c", xc_n(), xc_union([xc_seed([1]), xc_step("c", "c1", 3, 1)]))
+    assert_eq(xc_refusal([ok]), "ok")
+
+    // Not a union, an intersect, a seed that reads the CTE.
+    assert_eq(xc_refusal([CteDef("c", xc_n(), xc_seed([1]))]), "Q5001")
+    assert_eq(xc_refusal([CteDef("c", xc_n(), SetOp(Intersect, true, "u", items_of([xc_seed([1]), xc_step("c", "c1", 3, 1)])))]), "Q5001")
+    assert_eq(xc_refusal([CteDef("c", xc_n(), xc_union([xc_step("c", "c0", 3, 1), xc_step("c", "c1", 3, 1)]))]), "Q5001")
+
+    // A recursive input reading the CTE twice, or not at all.
+    val twice = project(Join(Inner, CteRef("c", "c1"), CteRef("c", "c2"), None, None, None), "p", [item("n", col("c1", "n"))])
+    assert_eq(xc_refusal([CteDef("c", xc_n(), xc_union([xc_seed([1]), twice]))]), "Q5001")
+    assert_eq(xc_refusal([CteDef("c", xc_n(), xc_union([xc_seed([1]), xc_seed_as("t", [2])]))]), "Q5001")
+
+@test
+a_recursive_reference_where_a_step_cannot_see_it_is_q5001()
+    val c1 = CteRef("c", "c1")
+    val n = [item("n", col("c1", "n"))]
+    val total = Aggregate(c1, "g", no_items(), items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
+    val outer = project(Join(Left, xc_seed_as("t", [1]), c1, None, None, None), "p", n)
+    val anti = Join(Anti, xc_seed_as("t", [1]), c1, None, None, None)
+    val sub = project(xc_seed_as("t", [1]), "p", [item("n", Scalar(project(c1, "q", n)))])
+
+    for bad in [total, Distinct(project(c1, "p", n)), outer, anti, sub]
+        assert_eq(xc_refusal([CteDef("c", xc_n(), xc_union([xc_seed([1]), bad]))]), "Q5001")
+
+    // The preserved side of an outer join is fine.
+    val kept = project(Join(Left, c1, xc_seed_as("t", [1]), None, None, None), "p", n)
+    assert_eq(xc_refusal([CteDef("c", xc_n(), xc_union([xc_seed([1]), kept]))]), "ok")
+
+@test
+mutual_recursion_is_q5001()
+    val c = CteDef("c", xc_n(), xc_union([project(CteRef("d", "rd"), "pd", [item("n", col("rd", "n"))]), xc_step("c", "c1", 3, 1)]))
+    val d = CteDef("d", xc_n(), xc_union([project(CteRef("c", "rc"), "pc", [item("n", col("rc", "n"))]), xc_step("d", "d1", 3, 1)]))
+    assert_eq(xc_refusal([c, d]), "Q5001")
+
+    // An inner With that redefines the name hides the outer CTE from the count.
+    val hidden = With(false, items_of([CteDef("c", None, xc_seed_as("t", [5]))]), xc_step("c", "c2", 3, 1))
+    val step = project(Join(Inner, CteRef("c", "c1"), hidden, None, None, None), "p", [item("n", col("c1", "n"))])
+    assert_eq(xc_refusal([CteDef("c", xc_n(), xc_union([xc_seed([1]), step]))]), "ok")
