@@ -100,6 +100,10 @@ struct Engine
                 Ok(t) -> t.result
                 Err(e) -> return Err(failure_of(e))
 
+            statement_privileges(self.store.catalog, env.statement, role) match
+                Ok(_) -> ()
+                Err(e) -> return Err(failure_of(e))
+
         shape_digest(env) match
             Ok(shape) -> Ok(Checked(env, shape, result))
             Err(e) -> Err(failure_of(e))
@@ -248,7 +252,11 @@ struct EngineConn
                 Ok(_) -> r.counts.push(0)
                 Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
         else
-            run_statement(r.env, store, r.txn, Ctx(r.params.tuples[i], self.engine.now)) match
+            val who = store.catalog.role_at(self.role) match
+                Some(k) -> Some(store.catalog.roles[k].oid)
+                None -> None
+
+            run_statement(r.env, store, r.txn, Ctx(r.params.tuples[i], self.engine.now, Some(Draws(store, who)))) match
                 Ok(Blocked(h)) -> return Ok(Some(h))
                 Ok(Ran(n, _, batches)) ->
                     r.counts.push(n)

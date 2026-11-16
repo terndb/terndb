@@ -533,11 +533,13 @@ impl MemCatalog
         s.cache = def.cache.unwrap_or(s.cache)
         if def.cycle then s.cycle = true
         s.next = restart.unwrap_or(s.next)
+        if restart.is_some() then s.exhausted = false
 
         if s.next < s.min || s.next > s.max
             // A sequence whose range moves past its next value starts again from its start.
             if restart.is_some() then return fail("Q6017", "restart lies outside min to max")
             s.next = s.start
+            s.exhausted = false
 
         check_sequence(s)?
         self.sequences[si] = s

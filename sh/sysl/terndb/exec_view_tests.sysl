@@ -1,0 +1,253 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Views read through the store (`ddl.md` §2.9, `query-tree.md` §6.1): a view over a join, a view of a
+// view, one view scanned twice in one statement, the snapshot a view reads at, the reads it logs,
+// DML on a view refused, the changes to a table a view refuses or follows, and the privileges a
+// read needs (`ddl.md` §2.10 rule 8): `select` on the view only, its scans checked for its owner.
+
+/** `emp(id, name, dept)` and `dept(id, title)`; the view `staff`, each employee's name and title
+ * through a join; and `sales`, a view of `staff`: the names whose title is `sales`.
+ */
+private xv_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("emp", [cat_col("id", Int64), cat_col("name", Text), cat_col("dept", Int64)], ["id"]))
+    c = cat_ok(c, cat_table("dept", [cat_col("id", Int64), cat_col("title", Text)], ["id"]))
+    c = cat_ok(c, cat_view("staff", xv_staff()))
+    cat_ok(c, cat_view("sales", xv_sales()))
+
+private xv_staff() -> Rel =
+    Project(Join(Inner, scan("app", "emp", "e"), scan("app", "dept", "d"), Some(call("eq", [col("e", "dept"), col("d", "id")])), None, None),
+        "s", items_of([item("name", col("e", "name")), item("title", col("d", "title"))]))
+
+private xv_sales() -> Rel =
+    Project(Filter(scan("app", "staff", "x"), call("eq", [col("x", "title"), cat_text("sales")])), "y", items_of([item("name", col("x", "name"))]))
+
+private xv_store() -> &Store
+    val s = mem_store(xv_catalog())
+    val t = s.begin(Snapshot)
+    xv_run(s, t, xv_depts([(1, "sales"), (2, "ops")]))
+    xv_run(s, t, xv_emps([xv_emp(1, "ann", 1), xv_emp(2, "bob", 2), xv_emp(3, "cy", 1)]))
+    assert(s.commit(t).is_ok())
+    s
+
+private struct XvEmp
+    id: i128
+    name: string
+    dept: i128
+
+private xv_emp(id: i128, name: string, dept: i128) -> XvEmp = XvEmp(id, name, dept)
+
+private xv_emps(rows: []const XvEmp) -> Envelope
+    val out = buf[Buf[Expr]]()
+
+    for r in rows
+        out.push(items_of([cat_int(r.id), cat_text(r.name), cat_int(r.dept)]))
+
+    val cols = items_of([Field("id", Int64), Field("name", Text), Field("dept", Int64)])
+    envelope([], Insert(cat_q("emp"), "i", None, items_of(["id", "name", "dept"]), Values("v", cols, out), None, buf[Item]()))
+
+private xv_depts(rows: []const (i128, string)) -> Envelope
+    val out = buf[Buf[Expr]]()
+
+    for r in rows
+        out.push(items_of([cat_int(r.0), cat_text(r.1)]))
+
+    val cols = items_of([Field("id", Int64), Field("title", Text)])
+    envelope([], Insert(cat_q("dept"), "i", None, items_of(["id", "title"]), Values("v", cols, out), None, buf[Item]()))
+
+private xv_run(s: &Store, t: &Txn, env: Envelope, file: string = __FILE__, line: long = __LINE__)
+    val _ = xd_ran(s, t, env, [], file, line)
+
+/** `select * from <view> order by name`. */
+private xv_read(view: string) -> Envelope = query([], Sort(scan("app", view, "v"), items_of([SortKey(col("v", "name"), false, false)])))
+
+/** The rows of `o` as text, each record's fields joined by `/`, the rows by `,`. */
+private xv_text(o: Executed) -> string
+    var out = ""
+
+    for r in xd_rows(o)
+        if out.len > 0 then out = out + ","
+
+        r match
+            Record(fs) ->
+                var first = true
+
+                for f in fs
+                    if !first then out = out + "/"
+                    first = false
+
+                    f match
+                        Text(x) -> out = out + x
+                        Int(n) -> out = out + s"$n"
+                        _ -> out = out + "?"
+            _ -> out = out + "?"
+
+    out
+
+// -- reading --------------------------------------------------------------------------------------
+
+@test
+a_view_over_a_join_reads_its_stored_query_through_the_store()
+    val s = xv_store()
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), xv_read("staff"))), "ann/sales,bob/ops,cy/sales")
+
+@test
+a_view_of_a_view_expands_both()
+    val s = xv_store()
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), xv_read("sales"))), "ann,cy")
+
+    // A filter and a projection over the outer view, as a query writes them.
+    val q = query([], project(filter(scan("app", "sales", "z"), call("ne", [col("z", "name"), cat_text("ann")])), "o", [item("who", col("z", "name"))]))
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), q)), "cy")
+
+@test
+one_view_scanned_twice_keeps_its_binders_to_itself()
+    // The two scans expand to the same stored tree, binders `e`, `d` and `s` in each, which the
+    // statement's binders never meet.
+    val s = xv_store()
+    val pairs = Join(Inner, scan("app", "staff", "p"), scan("app", "staff", "q"), Some(call("eq", [col("p", "title"), col("q", "title")])), None, None)
+    val q = query([], Sort(project(pairs, "o", [item("a", col("p", "name")), item("b", col("q", "name"))]),
+        items_of([SortKey(col("o", "a"), false, false), SortKey(col("o", "b"), false, false)])))
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), q)), "ann/ann,ann/cy,bob/bob,cy/ann,cy/cy")
+
+@test
+a_view_reads_at_its_transaction_s_snapshot()
+    val s = xv_store()
+    val reader = s.begin(Snapshot)
+    val writer = s.begin(Snapshot)
+    xv_run(s, writer, xv_emps([xv_emp(4, "dee", 1)]))
+
+    // The writer sees its own row through the view; the reader neither it nor, once it commits, later.
+    assert_eq(xv_text(xd_ran(s, writer, xv_read("sales"))), "ann,cy,dee")
+    assert_eq(xv_text(xd_ran(s, reader, xv_read("sales"))), "ann,cy")
+    assert(s.commit(writer).is_ok())
+    assert_eq(xv_text(xd_ran(s, reader, xv_read("sales"))), "ann,cy")
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), xv_read("sales"))), "ann,cy,dee")
+
+@test
+a_serializable_read_of_a_view_logs_the_tables_under_it()
+    val s = xv_store()
+    val t = s.begin(Serializable)
+    assert_eq(xv_text(xd_ran(s, t, xv_read("sales"))), "ann,cy")
+    xv_run(s, t, xv_depts([(9, "lab")]))
+
+    // A concurrent insert into a table the view joins conflicts with the read.
+    val other = s.begin(Snapshot)
+    xv_run(s, other, xv_emps([xv_emp(5, "eve", 1)]))
+    assert(s.commit(other).is_ok())
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+a_view_s_query_takes_no_parameters()
+    // A view is a query with no parameters (§2.9 rule 1): one that reads a parameter is refused.
+    val c = xv_catalog()
+    val r = project(ParamScan("p", 0), "o", [item("n", col("p", "n"))])
+    assert_eq(cat_code(c, cat_view("bad", r)), "Q4001")
+    assert_eq(cat_code(c, cat_view("bad", project(scan("app", "emp", "e"), "o", [item("n", Param(0))]))), "Q4001")
+
+// -- DML on a view, §2.9 rule 2 --------------------------------------------------------------------
+
+@test
+dml_on_a_view_is_refused_with_q5003()
+    val s = xv_store()
+    val cols = items_of([Field("name", Text), Field("title", Text)])
+    val ins = envelope([], Insert(cat_q("staff"), "i", None, items_of(["name", "title"]),
+        Values("v", cols, items_of([items_of([cat_text("x"), cat_text("y")])])), None, buf[Item]()))
+    assert_eq(xd_code(s, s.begin(Snapshot), ins), "Q5003")
+
+    val upd = envelope([], Update(cat_q("staff"), "u", None, None, None, items_of([item("name", cat_text("z"))]), buf[Item]()))
+    assert_eq(xd_code(s, s.begin(Snapshot), upd), "Q5003")
+    assert_eq(xd_code(s, s.begin(Snapshot), envelope([], Delete(cat_q("sales"), "u", None, None, None, buf[Item]()))), "Q5003")
+
+    // Nothing was written underneath.
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), xv_read("staff"))), "ann/sales,bob/ops,cy/sales")
+
+// -- a table changing under a view, §2.9 rule 2, §3.5 rule 6 -----------------------------------------
+
+@test
+a_change_to_a_table_that_would_change_a_view_s_shape_is_refused()
+    val c = xv_catalog()
+    // Dropping or retyping a column a view reads.
+    assert_eq(cat_code(c, cat_alter("emp", [DropColumn("name", false)])), "Q6007")
+    assert_eq(cat_code(c, cat_alter("dept", [RetypeColumn("title", nullable(Text), None)])), "Q6007")
+
+    // A column added to a table a view reads whole changes the view's columns.
+    val whole = cat_ok(c, cat_view("everyone", scan("app", "emp", "w")))
+    assert_eq(cat_code(whole, cat_alter("emp", [AddColumn(cat_col("age", nullable(Int64)))])), "Q6007")
+
+    // A table the view reads only some columns of may grow.
+    assert_eq(cat_code(c, cat_alter("emp", [AddColumn(cat_col("age", nullable(Int64)))])), "ok")
+
+@test
+a_renamed_column_is_followed_by_the_view_that_reads_it()
+    val s = xv_store()
+    s.catalog = cat_ok(s.catalog, cat_alter("dept", [RenameColumn("title", "label")]))
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), xv_read("staff"))), "ann/sales,bob/ops,cy/sales")
+    assert_eq(xv_text(xd_ran(s, s.begin(Snapshot), xv_read("sales"))), "ann,cy")
+
+// -- privileges, §2.9 rule 3 -------------------------------------------------------------------------
+
+/** `xv_catalog` with roles: `alice`, who may create in `app` and read `emp` and `dept` and owns the
+ * view `team` over them, and `bob`, who may name objects of `app` and read `team` only.
+ */
+private xv_roles() -> MemCatalog
+    var c = cat_ok(xv_catalog(), cat_role("alice"))
+    c = cat_ok(c, cat_role("bob"))
+    c = cat_ok(c, Grant(items_of([PrivUsage, PrivCreate]), OnNamespace("app"), "alice", false))
+    c = cat_ok(c, Grant(items_of([PrivUsage]), OnNamespace("app"), "bob", false))
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("emp")), "alice", false))
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("dept")), "alice", false))
+    c = cat_ok(c, cat_view("team", xv_staff()), "alice")
+    cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("team")), "bob", false), "alice")
+
+private xv_may(c: MemCatalog, env: Envelope, role: string) -> string = statement_privileges(c, env.statement, role) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+@test
+reading_a_view_needs_select_on_the_view_only()
+    val c = xv_roles()
+    assert_eq(xv_may(c, xv_read("team"), "bob"), "ok")
+    // Not the tables under it, which bob cannot read himself.
+    assert_eq(xv_may(c, query([], scan("app", "emp", "e")), "bob"), "Q6015")
+    // Nor another view.
+    assert_eq(xv_may(c, xv_read("staff"), "bob"), "Q6015")
+    // A role with no grant at all, and one with select but no usage on the namespace.
+    val d = cat_ok(cat_ok(c, cat_role("cat")), Grant(items_of([PrivSelect]), OnTable(cat_q("team")), "cat", false))
+    assert_eq(xv_may(d, xv_read("team"), "cat"), "Q6015")
+    assert_eq(xv_may(d, xv_read("team"), "nobody"), "Q6015")
+
+@test
+a_view_is_checked_with_its_owner_s_privileges()
+    // Revoking a privilege from the owner takes the view away from every reader.
+    val c = cat_ok(xv_roles(), Revoke(items_of([PrivSelect]), OnTable(cat_q("dept")), "alice"))
+    assert_eq(xv_may(c, xv_read("team"), "bob"), "Q6015")
+    assert_eq(xv_may(c, xv_read("team"), "alice"), "Q6015")
+
+    // A view of a view: the outer view's owner needs select on the inner one only.
+    var d = cat_ok(xv_roles(), Grant(items_of([PrivCreate]), OnNamespace("app"), "bob", false))
+    d = cat_ok(d, cat_view("mine", project(scan("app", "team", "m"), "o", [item("name", col("m", "name"))])), "bob")
+    assert_eq(xv_may(d, xv_read("mine"), "bob"), "ok")
+    d = cat_ok(d, Revoke(items_of([PrivSelect]), OnTable(cat_q("emp")), "alice"))
+    assert_eq(xv_may(d, xv_read("mine"), "bob"), "Q6015")
+
+@test
+dml_needs_its_privilege_on_its_target_and_select_on_what_it_reads()
+    var c = xv_roles()
+    val ins = xv_emps([xv_emp(7, "gus", 1)])
+    assert_eq(xv_may(c, ins, "bob"), "Q6015")
+    c = cat_ok(c, Grant(items_of([PrivInsert]), OnTable(cat_q("emp")), "bob", false))
+    assert_eq(xv_may(c, ins, "bob"), "ok")
+
+    // An insert from a view reads the view, which bob may.
+    val from_view = envelope([], Insert(cat_q("emp"), "i", None, items_of(["id", "name", "dept"]),
+        project(scan("app", "team", "t"), "o", [item("id", cat_int(8)), item("name", col("t", "name")), item("dept", cat_int(1))]), None, buf[Item]()))
+    assert_eq(xv_may(c, from_view, "bob"), "ok")
+
+    val upd = envelope([], Update(cat_q("emp"), "u", None, None, None, items_of([item("name", cat_text("z"))]), buf[Item]()))
+    assert_eq(xv_may(c, upd, "bob"), "Q6015")
+    assert_eq(xv_may(c, envelope([], Delete(cat_q("emp"), "u", None, None, None, buf[Item]())), "bob"), "Q6015")
+    assert_eq(xv_may(c, upd, BootstrapRole), "ok")

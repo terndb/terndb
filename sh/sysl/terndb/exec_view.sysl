@@ -1,0 +1,145 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Views at run time (`ddl.md` §2.9, `query-tree.md` §6.1): a `Scan` of a view reads the view's
+// stored query in its place, planned on its own — its binders and CTEs are its own, it sees no outer
+// row and no parameter — and its rows reach the scan's binder as the view's row type. A view inside a
+// view expands the same way, as deep as views nest. Its scans log their own reads (`isolation.md`
+// §4.4), every column of them, since what the statement uses of the view is not traced through it.
+//
+// And the privileges a query or DML statement needs (`ddl.md` §2.10 rule 8), checked at validation:
+// `select` on each table or view it scans, its DML privilege on its target, `usage` on each sequence
+// it names; a view's own scans with the privileges of the view's owner.
+
+/** A view's rows: its stored query, planned at the first pull against the catalog as it is then. */
+struct ViewOp
+    db: Db
+    query: Rel
+    elem: Type
+    ctx: Ctx
+    inner: Option[&Operator]
+
+    private plan(self) -> Result[&Operator, CodecError]
+        val typing = type_envelope(envelope([], Query(self.query)), self.db.store.catalog)?
+        var u = no_uses()
+        u.add_rel(self.query, true)
+        var p = Planner(typing.nodes, 0, self.ctx, buf[MemTable](), buf[Binder](), buf[CteFrame](), Some(u.db(self.db.store, self.db.txn)), None)
+        Ok(flat_input(p.rel(self.query)))
+
+impl Operator for ViewOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        val op = self.inner match
+            Some(op) -> op
+            None ->
+                val op = self.plan()?
+                self.inner = Some(op)
+                op
+
+        op.next_batch()? match
+            Some(b) -> Ok(Some(b.as_type(self.elem)))
+            None -> Ok(None)
+
+/** The operator reading view `name` of `d`'s store as rows of `elem`. A `next_value` in the view
+ * draws as the view's owner (§2.9 rule 3).
+ */
+private[terndb] view_op(d: Db, name: QualName, elem: Type, ctx: Ctx) -> &Operator
+    val v = d.store.catalog.views[d.store.catalog.view_at(name).unwrap()]
+
+    val draws = ctx.draws match
+        Some(x) -> Some(Draws(x.store, if x.role.is_some() then Some(v.owner) else None))
+        None -> None
+
+    ViewOp(d, v.query, elem, Ctx(buf[Value](), ctx.now, draws), None)
+
+// -- privileges, `ddl.md` §2.10 rule 8 -----------------------------------------------------------
+
+/** That role `role` may run query or DML statement `s` against `c` (`Q6015`). */
+statement_privileges(c: MemCatalog, s: Statement, role: string) -> Result[(), CodecError]
+    val who = c.role_at(role) match
+        Some(i) -> c.roles[i].oid
+        None -> return fail("Q6015", s"no role '$role'")
+
+    var u = no_uses()
+    val rels = buf[Rel]()
+    val exprs = buf[Expr]()
+
+    s match
+        Query(r) -> rels.push(r)
+        Insert(table, _, _, _, source, on_conflict, returning) ->
+            dml_target(c, table, PrivInsert, who)?
+            rels.push(source)
+            u.add_items(returning)
+
+            on_conflict match
+                Some(oc) -> oc.action match
+                    DoUpdate(set, filter) ->
+                        dml_target(c, table, PrivUpdate, who)?
+                        u.add_items(set)
+                        push_some(exprs, filter)
+                    Nothing -> ()
+                None -> ()
+        Update(table, _, _, from, filter, set, returning) ->
+            dml_target(c, table, PrivUpdate, who)?
+            push_some(rels, from)
+            push_some(exprs, filter)
+            u.add_items(set)
+            u.add_items(returning)
+        Delete(table, _, _, using, filter, returning) ->
+            dml_target(c, table, PrivDelete, who)?
+            push_some(rels, using)
+            push_some(exprs, filter)
+            u.add_items(returning)
+        _ -> ()
+
+    for r in rels
+        u.add_rel(r, true)
+
+    for e in exprs
+        u.add_expr(e)
+
+    reads(c, u.refs, who)
+end statement_privileges
+
+private push_some[T](xs: Buf[T], x: Option[T]) = x match
+    Some(v) -> xs.push(v)
+    None -> ()
+
+/** That `who` may name DML target `q` and holds `p` on it: a table, since the type checker refuses
+ * a view (`Q5003`).
+ */
+private dml_target(c: MemCatalog, q: QualName, p: Privilege, who: u64) -> Result[(), CodecError]
+    c.need_usage(who, q.schema)?
+
+    c.table_at(q) match
+        Some(i) -> c.need(who, c.table_target(i), p)
+        None -> Ok(())
+
+/** That `who` may read what `refs` scans and draw from the sequences it names by literal; a view's
+ * scans are checked for its owner instead (§2.9 rule 3). The objects of `sys` and `catalog` need
+ * nothing (§2.10 rule 5).
+ */
+private reads(c: MemCatalog, refs: TreeRefs, who: u64) -> Result[(), CodecError]
+    for sc in refs.scans
+        val q = sc.table
+
+        if q.schema != "sys" && q.schema != "catalog"
+            c.need_usage(who, q.schema)?
+
+            c.table_at(q) match
+                Some(i) -> c.need(who, c.table_target(i), PrivSelect)?
+                None -> c.view_at(q) match
+                    Some(i) ->
+                        c.need(who, c.view_target(i), PrivSelect)?
+                        reads(c, rel_refs(c.views[i].query), c.views[i].owner)?
+                    None -> ()
+
+    for q in refs.sequences
+        c.need_usage(who, q.schema)?
+
+        c.sequence_at(q) match
+            Some(i) -> c.need(who, c.sequence_target(i), PrivUsage)?
+            None -> return fail("Q6003", s"no sequence '${q.schema}.${q.name}'")
+
+    Ok(())
+end reads

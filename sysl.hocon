@@ -22,8 +22,11 @@ package {
 // the package.
 exclude = ["docs"]
 
-// A result's size is not known until it is built or read, so buffers grow on the heap. Nothing here
-// opens a file or a socket: bytes come from the caller and go back to it.
+// A result's size is not known until it is built or read, so buffers grow on the heap. The one file
+// read is the host's time zone database, which `at_zone` and `from_zone` look a zone up in
+// (`exec_zone.sysl`); no socket is opened: bytes come from the caller and go back to it.
 requires {
-  heap = true
+  heap  = true
+  posix = true
+  libc  = true
 }

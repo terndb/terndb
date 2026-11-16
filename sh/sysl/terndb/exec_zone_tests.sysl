@@ -1,0 +1,75 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `at_zone` and `from_zone` (`query-tree.md` §7.6): an instant on a zone's wall clocks and back,
+// across both changes of the clocks in a northern and a southern zone — the hour skipped, read
+// forward by the gap, and the hour repeated, read as its earlier instant — and fixed offsets, UTC,
+// null and an unknown zone.
+
+private xz_store() -> &Store = mem_store(mem_catalog())
+
+/** `f(<micros> as <ty>, <zone>)` run as a one-row query: its value in microseconds, -1 for null. */
+private xz_call(f: string, ty: Type, us: i128, zone: string) -> i128
+    val s = xz_store()
+    val env = query([], project(Values("v", items_of([Field("k", Int64)]), items_of([items_of([cat_int(0)])])), "o",
+        [item("t", call(f, [Literal(ty, Int(us)), cat_text(zone)]))]))
+    val rows = xd_rows(xd_ran(s, s.begin(Snapshot), env))
+
+    rows[0] match
+        Record(fs) -> if fs[0].is_null() then -1 else st_int(fs[0])
+        _ -> -2
+
+private xz_code(f: string, ty: Type, us: i128, zone: string) -> string
+    val s = xz_store()
+    val env = query([], project(Values("v", items_of([Field("k", Int64)]), items_of([items_of([cat_int(0)])])), "o",
+        [item("t", call(f, [Literal(ty, Int(us)), cat_text(zone)]))]))
+    xd_code(s, s.begin(Snapshot), env)
+
+private xz_at(us: i128, zone: string) -> i128 = xz_call("at_zone", Timestamp, us, zone)
+
+private xz_from(us: i128, zone: string) -> i128 = xz_call("from_zone", DateTime, us, zone)
+
+@test
+at_zone_reads_an_instant_on_the_wall_clocks_across_both_changes()
+    // New York, 2024-03-10: 06:59:59Z is 01:59:59 EST, the next second 03:00:00 EDT.
+    assert_eq(xz_at(1710053999000000, "America/New_York"), 1710035999000000)
+    assert_eq(xz_at(1710054000000000, "America/New_York"), 1710039600000000)
+    // 2024-11-03: 05:30Z and 06:30Z are both 01:30 on the wall.
+    assert_eq(xz_at(1730611800000000, "America/New_York"), 1730597400000000)
+    assert_eq(xz_at(1730615400000000, "America/New_York"), 1730597400000000)
+
+@test
+from_zone_reads_a_skipped_reading_forward_and_a_repeated_one_as_its_earlier_instant()
+    // 02:30 never happened in New York on 2024-03-10: read at the offset before the gap, 07:30Z,
+    // which is 03:30 EDT.
+    assert_eq(xz_from(1710037800000000, "America/New_York"), 1710055800000000)
+    // 01:30 happened twice on 2024-11-03: the earlier is 01:30 EDT, 05:30Z.
+    assert_eq(xz_from(1730597400000000, "America/New_York"), 1730611800000000)
+    // Sydney repeats 02:00–03:00 on 2024-04-07: the earlier is 02:30 AEDT, 15:30Z the day before.
+    assert_eq(xz_from(1712457000000000, "Australia/Sydney"), 1712417400000000)
+    // Away from a change, the conversions are each other's inverse.
+    assert_eq(xz_from(xz_at(1719835200000000, "Europe/Paris"), "Europe/Paris"), 1719835200000000)
+
+@test
+a_zone_may_be_utc_or_a_fixed_offset()
+    assert_eq(xz_at(1719835200000000, "Asia/Kolkata"), 1719855000000000)
+    assert_eq(xz_at(1719835200000000, "+05:30"), 1719855000000000)
+    assert_eq(xz_from(1719855000000000, "+05:30"), 1719835200000000)
+    assert_eq(xz_at(1719835200000000, "UTC"), 1719835200000000)
+
+@test
+an_unknown_zone_is_r0006_and_null_is_null()
+    assert_eq(xz_code("at_zone", Timestamp, 0, "Mars/Olympus_Mons"), "R0006")
+    assert_eq(xz_code("from_zone", DateTime, 0, "+99:99"), "R0006")
+
+    val s = xz_store()
+    val env = query([], project(Values("v", items_of([Field("k", Int64)]), items_of([items_of([cat_int(0)])])), "o",
+        [item("t", call("at_zone", [Null(nullable(Timestamp)), cat_text("UTC")]))]))
+    assert(xd_rows(xd_ran(s, s.begin(Snapshot), env))[0] == rec([Null]))
+
+@test
+an_instant_at_the_edge_of_the_range_is_r0001()
+    assert_eq(xz_code("at_zone", Timestamp, 9223372036854775807, "UTC"), "R0001")
+    assert_eq(xz_code("from_zone", DateTime, -9223372036854775807 - 1, "UTC"), "R0001")

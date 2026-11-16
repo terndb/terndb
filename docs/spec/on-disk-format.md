@@ -305,7 +305,7 @@ The catalog is a set of ordinary B+trees whose roots have fixed PIDs in data seg
 | 4 | `sys.depends` | (`oid` u64, `ref_oid` u64): `oid`'s definition refers to `ref_oid` (`ddl.md` §2.11) |
 | 5 | `sys.grants` | (`object_oid` u64, `grantee_oid` u64, `privilege` u8) (`ddl.md` §2.10) |
 | 6 | `sys.jobs` | `job_id` u64 (`ddl.md` §7) |
-| 7 | `sys.sequence_state` | `oid` u64 → `next` i64, `cached_to` i64 (`ddl.md` §2.7; not versioned, see there) |
+| 7 | `sys.sequence_state` | `oid` u64 → `next` i64, `cached_to` i64, `exhausted` u8 (`ddl.md` §2.7 rules 5–6; not versioned, see there) |
 | 8–15 | reserved for later system trees |
 
 Catalog rows use the row format of §4 and are versioned by the undo log like any table, so DDL is transactional.

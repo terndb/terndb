@@ -1,0 +1,71 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{Instant, Zone, wall_of, wall_us, at_offset}
+import sysl.posix.time.zone
+
+// The zone conversions of `query-tree.md` §7.6: `at_zone(timestamp, text) → datetime` reads an
+// instant on the wall clocks of a zone, and `from_zone(datetime, text) → timestamp` finds the
+// instant a wall clock reading names there. Both are strict. A zone is an IANA name (`Europe/Paris`),
+// `UTC`, or a fixed offset written `+05:30`; it is read from the host's zone database. A reading the
+// zone shows twice is its earlier instant, and one the zone skips is pushed forward by the size of
+// the gap, so `02:30` in a skipped hour is `03:30` in the hour after (§7.6).
+
+/** The microseconds a conversion may start from: far enough inside `int64` that a zone's offset of
+ * at most a day cannot carry it out.
+ */
+private val ZoneLimit: i64 = 9223372036854775807 - 2 * DayMicros
+
+/** The zones one call has looked up, by name, so that a column of one zone reads its file once. */
+private struct Zones
+    names: Buf[string]
+    zones: Buf[Zone]
+
+    /** Zone `name`, `R0006` where there is none by that name. */
+    get(*self, name: string) -> Result[Zone, CodecError]
+        for i in 0..<self.names.len()
+            if self.names[i] == name then return Ok(self.zones[i])
+
+        val z = zone(name) match
+            Ok(z) -> z
+            Err(e) -> return fail("R0006", s"$e")
+
+        self.names.push(name)
+        self.zones.push(z)
+        Ok(z)
+
+/** `at_zone` or `from_zone` of a `timestamp` or `datetime` vector `t` and a text vector `zones`. */
+private[terndb] zone_function(f: string, t: ColumnVector, names: ColumnVector, result: Type) -> Result[ColumnVector, CodecError]
+    val micros = t.lanes match
+        I64s(x) -> x
+        _ -> panic("zone_function: a timestamp or datetime lane was expected")
+
+    var zs = Zones(buf[string](), buf[Zone]())
+    val validity = and_validity(t, names)
+    val out = buf[i64]()
+
+    for i in 0..<t.len
+        if !bit(validity, i)
+            out.push(0)
+        else
+            val us = micros[i]
+            if us > ZoneLimit || us < -ZoneLimit then return fail("R0001", "the instant is out of range")
+
+            val name = value_at(names, i) match
+                Text(s) -> s
+                _ -> panic("zone_function: a text lane was expected")
+
+            val z = zs.get(name)?
+            out.push(if f == "at_zone" then at_zone(us, z) else from_zone(us, z))
+
+    Ok(ColumnVector(result, t.len, validity, I64s(out)))
+
+/** Instant `us` on the wall clocks of `z`. */
+private at_zone(us: i64, z: Zone) -> i64
+    val t = Instant(us)
+    wall_us(at_offset(t, z.offset_at(t)))
+
+/** The instant wall reading `us` names in `z`: the earlier where the zone shows it twice, pushed
+ * forward by the gap where the zone skips it.
+ */
+private from_zone(us: i64, z: Zone) -> i64 = wall_of(us).at_earlier(z).instant().us

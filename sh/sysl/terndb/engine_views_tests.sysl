@@ -1,0 +1,93 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Views, sequences and the zone conversions driven through the wire, as `engine_tests.sysl` drives
+// the engine: a view read by a role that may read it and nothing under it, identity values and
+// `next_value` drawn for an insert and a query, the `usage` a draw needs, and `at_zone`.
+
+/** A connected client whose server session runs on `e` as role `role`. */
+private ev_duo(e: &Engine, role: string) -> Duo
+    val authority = sx_authority()
+    val pre = buf[u8]()
+    push_preface(pre)
+
+    var d = Duo(client_session(sx_client_config("alice", [ScramPlus]), 0), server_session(sx_server_config(), e.connect(role), authority, 0),
+        sx_engine(), authority, reassembler(Client), reassembler(Server), pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(),
+        false, false, None, None)
+    d.connect()
+    assert(d.connected(), "connected")
+    d
+
+/** `users`, the view `names` of their names, the sequence `counter`, the table `ticket(id int64
+ * identity always, note)`, and the role `bob`, who may read `names` and nothing else.
+ */
+private ev_engine() -> &Engine
+    val e = ew_engine()
+    val names = project(scan("app", "users", "u"), "n", [item("name", col("u", "name"))])
+    val ticket = envelope([], CreateTable(cat_q("ticket"), items_of([ColumnDef("id", Int64, None, None, Always, None), cat_col("note", Text)]),
+        items_of(["id"]), buf(), false))
+    ew_setup(e, [ew_app(), ew_table("users", ew_users(), "id"),
+        ew_insert("users", ew_users(), [rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")])]),
+        envelope([], cat_view("names", names)), ticket,
+        envelope([], CreateSequence(cat_q("counter"), SequenceDef(Int64, Some(7), None, None, None, false, None), false)),
+        envelope([], cat_role("bob")),
+        envelope([], Grant(items_of([PrivUsage]), OnNamespace("app"), "bob", false)),
+        envelope([], Grant(items_of([PrivSelect]), OnTable(cat_q("names")), "bob", false))])
+    e
+
+private ev_one_row(items: []const Item) -> Envelope =
+    query([], project(Values("v", items_of([Field("k", Int64)]), items_of([items_of([cat_int(0)])])), "o", items))
+
+@test
+a_view_is_read_over_the_wire_by_a_role_that_may_read_only_it()
+    val e = ev_engine()
+    var d = ev_duo(e, "bob")
+    val q = query([], Sort(scan("app", "names", "x"), items_of([SortKey(col("x", "name"), false, false)])))
+    val got = d.seen(d.send(ew_exec(0, q)))
+    assert_eq(ew_kinds(got), "header batch complete")
+    assert(Relation(ew_rows(got)) == rel([rec([Text("ann")]), rec([Text("bo")])]), "the view's rows")
+
+    // The table under it is bob's to read only through the view, and DML on the view is refused.
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, query([], scan("app", "users", "u")))))), "Q6015")
+    val ins = envelope([], Insert(cat_q("names"), "i", None, items_of(["name"]),
+        Values("v", items_of([Field("name", Text)]), items_of([items_of([cat_text("x")])])), None, buf[Item]()))
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, ins)))), "Q5003")
+
+@test
+identity_values_and_next_value_are_drawn_over_the_wire()
+    val e = ev_engine()
+    var d = ev_duo(e, BootstrapRole)
+    val ins = envelope([], Insert(cat_q("ticket"), "i", None, items_of(["note"]),
+        Values("v", items_of([Field("note", Text)]), items_of([items_of([cat_text("a")]), items_of([cat_text("b")])])), None,
+        items_of([item("id", col("i", "id"))])))
+    val got = d.seen(d.send(ew_exec(0, ins)))
+    assert_eq(ew_kinds(got), "header batch complete")
+    assert(Relation(ew_rows(got)) == rel([rec([Int(1)]), rec([Int(2)])]), "identity values")
+
+    val draw = ev_one_row([item("n", call("next_value", [cat_text("app"), cat_text("counter")]))])
+    assert(Relation(ew_rows(d.seen(d.send(ew_exec(0, draw))))) == rel([rec([Int(7)])]), "the first draw")
+    assert(Relation(ew_rows(d.seen(d.send(ew_exec(0, draw))))) == rel([rec([Int(8)])]), "the second draw")
+
+    // bob has no `usage` on the sequence: refused at validation when it is named by literals, and at
+    // the draw when its name is a parameter.
+    var b = ev_duo(e, "bob")
+    assert_eq(ew_kinds(b.seen(b.send(ew_exec(0, draw)))), "Q6015")
+    val by_name = query([param("name", Text)], project(Values("v", items_of([Field("k", Int64)]), items_of([items_of([cat_int(0)])])), "o",
+        [item("n", call("next_value", [cat_text("app"), Param(0)]))]))
+    // A refusal at the draw follows the result header.
+    assert_eq(ew_kinds(b.seen(b.send(ew_exec(0, by_name, [Text("counter")])))), "header Q6015")
+
+    // Granted it, bob draws; nothing drawn by the refusals was lost or given out.
+    ew_setup(e, [envelope([], Grant(items_of([PrivUsage]), OnSequence(cat_q("counter")), "bob", false))])
+    var c = ev_duo(e, "bob")
+    assert(Relation(ew_rows(c.seen(c.send(ew_exec(0, by_name, [Text("counter")]))))) == rel([rec([Int(9)])]), "bob's draw")
+
+@test
+at_zone_runs_over_the_wire()
+    var d = ev_duo(ev_engine(), BootstrapRole)
+    val q = ev_one_row([item("t", call("at_zone", [Literal(Timestamp, Int(1710054000000000)), cat_text("America/New_York")]))])
+    val got = d.seen(d.send(ew_exec(0, q)))
+    assert_eq(ew_kinds(got), "header batch complete")
+    assert(Relation(ew_rows(got)) == rel([rec([Int(1710039600000000)])]), "03:00 EDT")
