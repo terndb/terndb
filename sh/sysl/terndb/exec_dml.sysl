@@ -1,0 +1,665 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.contains
+
+// Statements run in a transaction of the in-memory store (`query-tree.md` §5, §9,
+// `docs/design/executor.md` §4.4): a query reads the store at the transaction's snapshot, and a DML
+// statement reads every row it needs first — its source, its targets, its conflicts and its
+// `returning` values — and then hands the store all of its writes at once, so that a statement that
+// must wait for a row lock writes nothing (`isolation.md` §4.2 rule 1). Any error aborts the
+// transaction with its code (§5.1).
+
+/** What a statement did: `Ran`, with its row count (§5 rule 2) and, for a query or a DML statement
+ * with `returning`, its result type and the result format's batches; or `Blocked`, having written
+ * nothing because a row it must write is locked by transaction `holder`. A blocked statement is run
+ * again once `holder` has committed or aborted.
+ */
+enum Executed
+    Ran(count: u64, result: Option[Type], batches: Buf[Buf[u8]])
+    Blocked(holder: u64)
+
+/** `env` validated against the store's catalog and run in `t` with `ctx`. At read committed the
+ * statement takes a new snapshot first (`isolation.md` §3.3).
+ */
+run_statement(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
+    s.statement(t)
+
+    run_in(env, s, t, ctx) match
+        Ok(o) -> Ok(o)
+        Err(e) -> Err(s.abort_with(t, e))
+
+private run_in(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
+    s.usable(t)?
+    val typing = type_envelope(env, s.catalog)?
+
+    env.statement match
+        Query(r) ->
+            var u = no_uses()
+            u.add_rel(r, true)
+            var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), Some(u.db(s, t)), None)
+            ran(typing.result, drain(flat_input(p.rel(r)))?)
+        Insert(table, binder, old, columns, source, on_conflict, returning) ->
+            run_insert(s, t, ctx, typing, table, binder, old, columns, source, on_conflict, returning)
+        Update(table, binder, old, from, filter, set, returning) ->
+            run_update(s, t, ctx, typing, table, binder, old, from, filter, set, returning)
+        Delete(table, binder, old, using, filter, returning) ->
+            run_update(s, t, ctx, typing, table, binder, old, using, filter, buf[Item](), returning, true)
+        _ -> panic("the executor runs no DDL statement")
+end run_in
+
+/** A statement that ran and returned `rows` as its result of type `result`, or nothing. */
+private ran(result: Option[Type], rows: Buf[ColumnVector]) -> Result[Executed, CodecError]
+    var n: u64 = 0
+
+    for b in rows
+        n += u64(b.len)
+
+    result match
+        Some(ty) -> Ok(Ran(n, Some(ty), result_batches(ty, mem_source(rows), 0)?))
+        None -> Ok(Ran(n, None, buf[Buf[u8]]()))
+
+// -- the target table ---------------------------------------------------------------------------
+
+/** The table a DML statement writes: its catalog entry, its row type, the positions of its primary
+ * key's columns and the schema version its rows are written in (`ddl.md` §5.4 rule 1).
+ */
+private struct Target
+    oid: u64
+    table: CatTable
+    row: Type
+    key: Buf[usize]
+    version: u64
+
+    /** The key of row `i` of `rows`: its primary-key columns, as the store keys it. */
+    key_at(self, rows: ColumnVector, i: usize) -> Value
+        val parts = buf[Value]()
+
+        for j in self.key
+            parts.push(value_at(rows.member(j), i))
+
+        rec(parts.view())
+
+    key_type(self) -> Type
+        val fs = fields_of_type(self.row)
+        val out = buf[Field]()
+
+        for j in self.key
+            out.push(fs[j])
+
+        record(out.view())
+
+    stored(self, rows: ColumnVector, i: usize) -> StoredRow = StoredRow(self.version, value_at(rows, i))
+
+    column(self, name: string) -> usize
+        for j in 0..<self.table.columns.len()
+            if self.table.columns[j].name == name then return j
+
+        panic(s"the table has no column '$name'")
+end Target
+
+private target_of(s: &Store, q: QualName) -> Result[Target, CodecError]
+    val ct = s.catalog.tables[s.catalog.table_at(q).unwrap()]
+    val fs = buf[Field]()
+
+    for c in ct.columns
+        fs.push(Field(c.name, resolve_type(s.catalog, c.ty)?))
+
+    val key = buf[usize]()
+
+    for id in ct.primary_key
+        for j in 0..<ct.columns.len()
+            if ct.columns[j].id == id then key.push(j)
+
+    Ok(Target(ct.oid, ct, record(fs.view()), key, ct.schema_version()))
+
+/** Row vector `rows` with member `j` replaced by `v`. */
+private with_column(rows: ColumnVector, j: usize, v: ColumnVector) -> ColumnVector
+    val cs = buf[ColumnVector]()
+
+    for k in 0..<fields_of_type(rows.ty).len()
+        cs.push(if k == j then v else rows.member(k))
+
+    ColumnVector(rows.ty, rows.len, rows.validity, Members(cs))
+
+// -- definition expressions: defaults, generated columns, checks (`ddl.md` §2.6, §2.7) -----------
+
+/** Each of `exprs`, a definition expression over the row binder `row` (`ddl.md` §2.12), evaluated
+ * over every row of `rows`: a `Project` over the rows as a relation-valued parameter, type-checked
+ * against the catalog.
+ */
+private eval_defs(s: &Store, ctx: Ctx, rows: ColumnVector, exprs: Buf[Expr]) -> Result[Buf[ColumnVector], CodecError]
+    val out = buf[ColumnVector]()
+    if exprs.len() == 0 || rows.len == 0 then return Ok(out)
+
+    val items = buf[Item]()
+
+    for i in 0..<exprs.len()
+        items.push(Item(s"d$i", exprs[i]))
+
+    val env = envelope([ParamDecl(None, bag(rows.ty))], Query(Project(ParamScan("row", 0), "d", items)))
+    val typing = type_envelope(env, s.catalog)?
+    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now), buf[MemTable]())
+    val r = drain_rows(plan.op, plan.elem)?
+
+    for j in 0..<exprs.len()
+        out.push(r.member(j))
+
+    Ok(out)
+
+private reads_any(e: Expr, names: Buf[string]) -> bool
+    val refs = expr_refs(e)
+    val row = items_of(["row"])
+
+    for n in names
+        if refs.reads_column(row, n) then return true
+
+    false
+
+/** `rows` with their generated columns computed (`ddl.md` §2.7 rule 2): every one for inserted rows
+ * (`changed` absent), else those reading a column of `changed`; and the names of those computed.
+ */
+private with_generated(s: &Store, ctx: Ctx, tg: Target, rows: ColumnVector, changed: Option[Buf[string]]) -> Result[(ColumnVector, Buf[string]), CodecError]
+    val fs = fields_of_type(tg.row)
+    val gens = buf[Expr]()
+    val at = buf[usize]()
+    val names = buf[string]()
+
+    for j in 0..<tg.table.columns.len()
+        tg.table.columns[j].generated match
+            Some(g) ->
+                val due = changed match
+                    Some(cs) -> reads_any(g, cs)
+                    None -> true
+
+                if due
+                    gens.push(g)
+                    at.push(j)
+                    names.push(fs[j].name)
+            None -> ()
+
+    val vs = eval_defs(s, ctx, rows, gens)?
+    var out = rows
+
+    for k in 0..<vs.len()
+        out = with_column(out, at[k], coerce_vector(vs[k], fs[at[k]].ty)?)
+
+    Ok((out, names))
+end with_generated
+
+/** The constraints `rows`, about to be written, must meet (`ddl.md` §2.6): every check constraint of
+ * the table for inserted rows (`changed` absent), else those reading a column of `changed`, and NOT
+ * NULL for every top-level column. The primary key's uniqueness is the store's (`T3001`).
+ */
+private check_rows(s: &Store, ctx: Ctx, tg: Target, rows: ColumnVector, changed: Option[Buf[string]]) -> Result[unit, CodecError]
+    val checks = buf[Expr]()
+    val names = buf[string]()
+
+    for c in s.catalog.constraints
+        if c.table == tg.oid
+            c.kind match
+                ConCheck(e) ->
+                    val due = changed match
+                        Some(cs) -> reads_any(e, cs)
+                        None -> true
+
+                    if due
+                        checks.push(e)
+                        names.push(c.name)
+                _ -> ()
+
+    val vs = eval_defs(s, ctx, rows, checks)?
+
+    for k in 0..<vs.len()
+        val v = vs[k]
+
+        v.lanes match
+            Bools(x) ->
+                for i in 0..<v.len
+                    if v.is_valid(i) && !x[i] then return fail("T3002", s"a row fails check constraint '${names[k]}'")
+            _ -> ()
+
+    val fs = fields_of_type(tg.row)
+
+    for j in 0..<fs.len()
+        if !fs[j].ty.is_nullable() && rows.member(j).has_nulls()
+            return fail("T3004", s"a null is written to the NOT NULL column '${fs[j].name}'")
+
+    Ok(())
+end check_rows
+
+// -- evaluation helpers -------------------------------------------------------------------------
+
+/** Whether `cond` is true over the one row of `env`; an absent condition is. */
+private passes(cond: Option[TExpr], env: Env) -> Result[bool, CodecError]
+    val x = cond match
+        Some(c) -> c
+        None -> return Ok(true)
+
+    val v = eval(x, env)?
+
+    v.lanes match
+        Bools(b) -> Ok(b[0] && v.is_valid(0))
+        _ -> panic("a condition is not bool")
+
+/** `rows` with each `set` item's value, evaluated over `env`, coerced into its column. */
+private apply_set(tg: Target, rows: ColumnVector, set: Buf[Item], values: Buf[TExpr], env: Env) -> Result[ColumnVector, CodecError]
+    val fs = fields_of_type(tg.row)
+    var out = rows
+
+    for i in 0..<set.len()
+        val j = tg.column(set[i].name)
+        out = with_column(out, j, coerce_vector(eval(values[i], env)?, fs[j].ty)?)
+
+    Ok(out)
+
+/** The `returning` records of the rows of `env`, row `i`'s `Action()` (§9.5) being variant `acts[i]`:
+ * 0 inserted, 1 updated, 2 deleted. The rows of each action are evaluated together, with the
+ * action's value in the parameter `action` the planner gave it, and put back in statement order.
+ */
+private returning_rows(result: Option[Type], items: Buf[TExpr], env: Env, action: Option[u64], acts: Buf[u16]) -> Result[Option[ColumnVector], CodecError]
+    val elem = result match
+        Some(Bag(e)) -> *e
+        _ -> return Ok(None)
+
+    val parts = buf[ColumnVector]()
+    val order = buf[usize]()
+
+    for tag in 0..<3
+        val idx = buf[usize]()
+
+        for i in 0..<acts.len()
+            if usize(acts[i]) == tag then idx.push(i)
+
+        if idx.len() > 0
+            val ps = buf[Value]()
+            ps.extend(env.ctx.params.view())
+
+            action match
+                Some(a) -> ps[usize(a)] = variant(tag, rec([]))
+                None -> ()
+
+            val group = env.take(idx.view())
+            val genv = Env(group.n, group.binders, Ctx(ps, env.ctx.now))
+            val cs = buf[ColumnVector]()
+
+            for x in items
+                cs.push(eval(x, genv)?)
+
+            parts.push(ColumnVector(elem, idx.len(), buf[u8](), Members(cs)))
+            order.extend(idx.view())
+
+    val back = buf[usize]()
+
+    for _ in 0..<order.len()
+        back.push(0)
+
+    for k in 0..<order.len()
+        back[order[k]] = k
+
+    Ok(Some(take(concat(elem, parts.view()), back.view())))
+end returning_rows
+
+/** The store's answer to a statement's writes, and its outcome: `rows` rows written, and its
+ * `returning` rows `ret` as its result.
+ */
+private written(s: &Store, t: &Txn, tg: Target, changes: Buf[RowChange], rows: usize, result: Option[Type], ret: Option[ColumnVector]) -> Result[Executed, CodecError]
+    s.write_rows(t, tg.oid, changes)? match
+        Wait(h) -> Ok(Blocked(h))
+        Done(_) -> ret match
+            Some(r) -> ran(result, batches_of(r))
+            None -> Ok(Ran(u64(rows), None, buf[Buf[u8]]()))
+
+/** The binders `returning` sees (§9.5): the written row as `binder`, the row before the statement as
+ * `old`, and any `from`/`using` binders in the composite `joined`.
+ */
+private returning_env(ctx: Ctx, binder: string, rows: ColumnVector, old: Option[string], olds: ColumnVector, joined: Option[ColumnVector]) -> Env
+    val bs = buf[Binder]()
+    bs.push(Binder(binder, rows))
+
+    old match
+        Some(o) -> bs.push(Binder(o, olds))
+        None -> ()
+
+    joined match
+        Some(m) -> bs.push(Binder(Composite, m))
+        None -> ()
+
+    Env(rows.len, bs, ctx)
+
+/** Keys kept sorted by `cmp` (§3.3), each with a position: the rows a statement has written. */
+private struct KeySet
+    ty: Type
+    keys: Buf[Value]
+    at: Buf[usize]
+
+    find(self, k: Value) -> (bool, usize)
+        var lo: usize = 0
+        var hi = self.keys.len()
+
+        while lo < hi
+            val mid = lo + (hi - lo) / 2
+            val c = cmp(self.ty, self.keys[mid], k)
+            if c == 0 then return (true, mid)
+            if c < 0 then lo = mid + 1 else hi = mid
+
+        (false, lo)
+
+    get(self, k: Value) -> Option[usize]
+        val (found, i) = self.find(k)
+        if found then Some(self.at[i]) else None
+
+    put(*self, k: Value, v: usize)
+        val (_, i) = self.find(k)
+        self.keys.insert(i, k)
+        self.at.insert(i, v)
+end KeySet
+
+private key_set(ty: Type) -> KeySet = KeySet(ty, buf[Value](), buf[usize]())
+
+// -- Insert and upsert, §9.2–§9.3 ---------------------------------------------------------------
+
+/** The rows `src` inserts: each source column in the target column it names, coerced to its type
+ * (§9.2 rule 1), every other column its default or null (`ddl.md` §2.7 rule 1), and the generated
+ * columns computed.
+ */
+private insert_rows(s: &Store, ctx: Ctx, tg: Target, columns: Buf[string], src: ColumnVector) -> Result[ColumnVector, CodecError]
+    val fs = fields_of_type(tg.row)
+    val defaults = buf[Expr]()
+    val at = buf[usize]()
+
+    for j in 0..<tg.table.columns.len()
+        val c = tg.table.columns[j]
+
+        if !contains(columns.view(), c.name) && c.generated.is_none()
+            c.default match
+                Some(e) ->
+                    defaults.push(e)
+                    at.push(j)
+                None ->
+                    if c.identity != NoIdentity then panic("the executor draws no identity value yet")
+                    if !fs[j].ty.is_nullable() then return fail("Q3005", s"column '${c.name}' is NOT NULL and has no default")
+
+    val dv = eval_defs(s, ctx, src, defaults)?
+    val cs = buf[ColumnVector]()
+
+    for j in 0..<fs.len()
+        var v = repeated(fs[j].ty, placeholder(fs[j].ty), src.len)
+
+        for i in 0..<columns.len()
+            if columns[i] == fs[j].name then v = coerce_vector(src.member(i), fs[j].ty)?
+
+        for k in 0..<at.len()
+            if at[k] == j then v = coerce_vector(dv[k], fs[j].ty)?
+
+        cs.push(v)
+
+    Ok(with_generated(s, ctx, tg, ColumnVector(tg.row, src.len, buf[u8](), Members(cs)), None)?.0)
+end insert_rows
+
+/** Whether an upsert's `target` is the table's primary key: the one unique key the store enforces. */
+private is_primary_key(s: &Store, tg: Target, target: ConflictTarget) -> bool
+    target match
+        Columns(names) ->
+            if names.len() != tg.key.len() then return false
+
+            for j in tg.key
+                if !contains(names.view(), tg.table.columns[j].name) then return false
+
+            true
+        Constraint(name) ->
+            for c in s.catalog.constraints
+                if c.table == tg.oid && c.name == name
+                    c.kind match
+                        ConPrimaryKey(_) -> return true
+                        _ -> ()
+
+            false
+
+private run_insert(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName, binder: string, old: Option[string], columns: Buf[string], source: Rel, on_conflict: Option[OnConflict], returning: Buf[Item]) -> Result[Executed, CodecError]
+    val tg = target_of(s, table)?
+    var u = no_uses()
+    u.add_rel(source, true)
+    var set = buf[Item]()
+    var where: Option[Expr] = None
+
+    on_conflict match
+        Some(oc) -> oc.action match
+            DoUpdate(items, w) ->
+                set = items
+                where = w
+            Nothing -> ()
+        None -> ()
+
+    u.add_items(set)
+
+    where match
+        Some(w) -> u.add_expr(w)
+        None -> ()
+
+    u.add_items(returning)
+
+    // The planner takes the types in the checker's order: the source, the conflict action's `set`
+    // and `where`, then `returning`.
+    var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), Some(u.db(s, t)), None)
+    val src = p.rel(source)
+    val values = buf[TExpr]()
+
+    for it in set
+        values.push(p.expr(it.expr))
+
+    val cond = p.opt_expr(where)
+    val rets = buf[TExpr]()
+
+    for it in returning
+        rets.push(p.expr(it.expr))
+
+    val c = p.ctx
+    val batches = drain(flat_input(src))?
+    val proposed = if batches.len() == 0 then empty_vector(tg.row) else insert_rows(s, c, tg, columns, concat(batches[0].ty, batches.view()))?
+    val olds_ty = nullable(tg.row)
+
+    val oc = on_conflict match
+        Some(x) -> x
+        None ->
+            check_rows(s, c, tg, proposed, None)?
+            val acts = buf[u16]()
+            val changes = buf[RowChange]()
+
+            for i in 0..<proposed.len
+                acts.push(0)
+                changes.push(Put(tg.stored(proposed, i)))
+
+            val env = returning_env(c, binder, proposed, old, repeated(olds_ty, Null, proposed.len), None)
+            return written(s, t, tg, changes, proposed.len, typing.result, returning_rows(typing.result, rets, env, p.action, acts)?)
+
+    if !is_primary_key(s, tg, oc.target) then panic("the executor upserts only on the primary key")
+
+    // §9.3 rule 2, row by row in source order. A row whose key this statement has already written
+    // conflicts with that write: skipped by `nothing`, `R0007` for an update (rule 3).
+    var seen = key_set(tg.key_type())
+    val rows = buf[Value]()
+    val olds = buf[Value]()
+    val keys = buf[Option[Value]]()
+    val acts = buf[u16]()
+
+    for i in 0..<proposed.len
+        val k = tg.key_at(proposed, i)
+        val mine = seen.get(k)
+
+        val existing = mine match
+            Some(at) -> Some(rows[at])
+            None -> s.get(t, tg.oid, k)?.map(r -> r.value)
+
+        existing match
+            None ->
+                seen.put(k, rows.len())
+                rows.push(value_at(proposed, i))
+                olds.push(Null)
+                keys.push(None)
+                acts.push(0)
+            Some(e) -> oc.action match
+                Nothing -> ()
+                DoUpdate(_, _) ->
+                    val before = vector_of(tg.row, [e])
+                    val bs = buf[Binder]()
+                    bs.push(Binder(binder, before))
+                    bs.push(Binder(oc.excluded, take(proposed, [i])))
+                    val one = Env(1, bs, c)
+
+                    if passes(cond, one)?
+                        if mine.is_some() then return fail("R0007", "the statement would write one row twice")
+                        seen.put(k, rows.len())
+                        rows.push(value_at(apply_set(tg, before, set, values, one)?, 0))
+                        olds.push(e)
+                        keys.push(Some(k))
+                        acts.push(1)
+
+    val names = buf[string]()
+
+    for it in set
+        names.push(it.name)
+
+    // Generated columns reading a set column are computed again, and each row meets the constraints
+    // its own kind of write must (`ddl.md` §2.6).
+    val (all, regenerated) = with_generated(s, c, tg, vector_of(tg.row, rows.view()), Some(names))?
+    names.extend(regenerated.view())
+    val inserted = buf[usize]()
+    val updated = buf[usize]()
+
+    for i in 0..<acts.len()
+        if acts[i] == 0 then inserted.push(i) else updated.push(i)
+
+    check_rows(s, c, tg, take(all, inserted.view()), None)?
+    check_rows(s, c, tg, take(all, updated.view()), Some(names))?
+
+    val env = returning_env(c, binder, all, old, vector_of(olds_ty, olds.view()), None)
+    val ret = returning_rows(typing.result, rets, env, p.action, acts)?
+    written(s, t, tg, ordered_changes(tg, all, keys), all.len, typing.result, ret)
+end run_insert
+
+/** The store's changes for `rows`, each a new row (`keys[i]` absent) or one replacing the row keyed
+ * `keys[i]`: removals of rows whose key changes first, then replacements, then new rows, so that a
+ * key a row leaves is free for the row taking it.
+ */
+private ordered_changes(tg: Target, rows: ColumnVector, keys: Buf[Option[Value]]) -> Buf[RowChange]
+    val removes = buf[RowChange]()
+    val replaces = buf[RowChange]()
+    val puts = buf[RowChange]()
+
+    for i in 0..<rows.len
+        val row = tg.stored(rows, i)
+
+        keys[i] match
+            Some(k) ->
+                if tg.key_at(rows, i) == k
+                    replaces.push(Replace(k, row))
+                else
+                    removes.push(Remove(k))
+                    puts.push(Put(row))
+            None -> puts.push(Put(row))
+
+    removes.extend(replaces.view())
+    removes.extend(puts.view())
+    removes
+
+// -- Update and Delete, §9.4 ---------------------------------------------------------------------
+
+/** An `Update`, or with `deleting` a `Delete` (whose `set` is empty and `from` is its `using`). */
+private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName, binder: string, old: Option[string], from: Option[Rel], filter: Option[Expr], set: Buf[Item], returning: Buf[Item], deleting: bool = false) -> Result[Executed, CodecError]
+    val tg = target_of(s, table)?
+    var u = no_uses()
+
+    from match
+        Some(f) -> u.add_rel(f, false)
+        None -> ()
+
+    filter match
+        Some(f) -> u.add_expr(f)
+        None -> ()
+
+    u.add_items(set)
+    u.add_items(returning)
+    val db = u.db(s, t)
+
+    // The checker's order: `from`, `filter`, `set`, `returning`.
+    var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), Some(db), None)
+
+    val joined = from match
+        Some(f) -> Some(p.rel(f))
+        None -> None
+
+    val f = p.opt_expr(filter)
+    val values = buf[TExpr]()
+
+    for it in set
+        values.push(p.expr(it.expr))
+
+    val rets = buf[TExpr]()
+
+    for it in returning
+        rets.push(p.expr(it.expr))
+
+    val c = p.ctx
+
+    // The targets are a scan of the table, logging `filter` when nothing but the target is in it.
+    val logged = if joined.is_none() && f.is_some() && !has_subquery(f.unwrap()) then f else None
+    val binders = items_of([binder])
+
+    old match
+        Some(o) -> binders.push(o)
+        None -> ()
+
+    val none = buf[TKey]()
+    val scan: &Operator = ScanOp(s, t, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), buf[ColumnVector](), false, 0)
+    val target = Lowered(scan, binder, tg.row, none)
+
+    val input = joined match
+        Some(r) -> plan_join(Inner, target, r, f, None, None, c, true)
+        None -> f match
+            Some(x) -> Lowered(FilterOp(target.op, binder, x, c), binder, tg.row, none)
+            None -> target
+
+    val matched = concat(input.elem, drain(input.op)?.view())
+    val env = env_of(c, input.binder, matched)
+    val rows = env.binder(binder)
+    val keys = buf[Option[Value]]()
+
+    // §9.4 rule 2: a target row matched by two `from` rows is refused.
+    var seen = key_set(tg.key_type())
+
+    for i in 0..<rows.len
+        val k = tg.key_at(rows, i)
+        if joined.is_some() && seen.get(k).is_some() then return fail("R0007", "a target row is matched by more than one row of 'from'")
+        if joined.is_some() then seen.put(k, i)
+        keys.push(Some(k))
+
+    val acts = buf[u16]()
+
+    for _ in 0..<rows.len
+        acts.push(if deleting then 2 else 1)
+
+    val composite = if joined.is_some() then Some(matched) else None
+    val olds = rows.as_type(nullable(tg.row))
+
+    if deleting
+        val changes = buf[RowChange]()
+
+        for k in keys
+            changes.push(Remove(k.unwrap()))
+
+        val ret = returning_rows(typing.result, rets, returning_env(c, binder, rows, old, olds, composite), p.action, acts)?
+        return written(s, t, tg, changes, rows.len, typing.result, ret)
+
+    val names = buf[string]()
+
+    for it in set
+        names.push(it.name)
+
+    val (after, regenerated) = with_generated(s, c, tg, apply_set(tg, rows, set, values, env)?, Some(names))?
+    names.extend(regenerated.view())
+    check_rows(s, c, tg, after, Some(names))?
+
+    val ret = returning_rows(typing.result, rets, returning_env(c, binder, after, old, olds, composite), p.action, acts)?
+    written(s, t, tg, ordered_changes(tg, after, keys), after.len, typing.result, ret)
+end run_update

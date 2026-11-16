@@ -8,7 +8,9 @@ import sysl.slices.sort_stable_by
 // node here exposes one binder, so a batch is that binder's rows.
 
 trait Operator
+    // Operators keep what they read through self: their inputs, and a scan's store and predicate.
     /** The next batch of at least one row, or `None` once every row has been handed up. */
+    @keeps(self)
     next_batch(*self) -> Result[Option[ColumnVector], CodecError]
 
 /** A sort key with its expression typed (§6.9). */

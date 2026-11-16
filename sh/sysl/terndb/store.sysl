@@ -119,6 +119,14 @@ enum WriteOutcome derives Eq
     Done(rows: usize)
     Wait(holder: u64)
 
+/** One row a write statement writes (`Store.write_rows`): a new row, the row keyed `key` replaced by
+ * `row`, or the row keyed `key` removed.
+ */
+enum RowChange
+    Put(row: StoredRow)
+    Replace(key: Value, row: StoredRow)
+    Remove(key: Value)
+
 /** The writes of a committed transaction, kept for validating the serializable transactions that
  * were running when it committed (§4.3 retention).
  */
@@ -187,6 +195,33 @@ struct Store
     delete_where(*self, t: &Txn, table: u64, p: Pred) -> Result[WriteOutcome, CodecError]
         val r = self.modify_in(t, table, p, None, 0)
         self.guard(t, r)
+
+    /** Every row of `table` visible to `t`, the read logged as `logged` under serializable (§4.4): what
+     * the executor's `Scan` reads, its filter then applied to the rows by the executor. `logged` must
+     * hold for every row the statement's result depends on.
+     */
+    scan_rows(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError]
+        val r = self.scan_rows_in(t, table, logged)
+        self.guard(t, r)
+
+    /** One write statement's changes to `table`, which the executor computed from rows it read at
+     * `t`'s snapshot: each a new row, a row replaced or a row removed, by key, applied in order under
+     * §4.2. A statement answers `Wait` before writing any of them if one of their keys is locked by
+     * another transaction. A `Put` of a key visible to `t` is `unique_violation`.
+     */
+    write_rows(*self, t: &Txn, table: u64, changes: Buf[RowChange]) -> Result[WriteOutcome, CodecError]
+        val r = self.write_rows_in(t, table, changes)
+        self.guard(t, r)
+
+    /** Whether `t` may run a statement: `W2001` once it has committed, `W2003` once it is aborted. */
+    usable(self, t: &Txn) -> Result[unit, CodecError] = live(t)
+
+    /** `e`, raised inside `t` outside the store: it aborts `t` with its code (§5.1), unless `t` has
+     * already ended.
+     */
+    abort_with(*self, t: &Txn, e: CodecError) -> CodecError
+        if t.state == Live then self.rollback(t, e.code)
+        e
 
     /** Commits `t` and answers its commit sequence number, or, for a transaction with an empty write
      * set, its snapshot, at which it is serialized (§5.5). A serializable writer is validated first
@@ -264,6 +299,19 @@ struct Store
         val (found, at) = locate(d, key)
         if !found then return Ok(None)
         Ok(visible_row(d.slots[at], t.snapshot, t.id))
+
+    private scan_rows_in(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+        val out = buf[Hit]()
+
+        for s in d.slots
+            visible_row(s, t.snapshot, t.id) match
+                Some(r) -> out.push(Hit(s.key, r))
+                None -> ()
+
+        self.log_read(t, table, logged, None)
+        Ok(out)
 
     // A read is logged only by a serializable transaction not declared read-only (§4.3, §5.5).
     private log_read(*self, t: &Txn, table: u64, p: Pred, key: Option[Value])
@@ -348,6 +396,42 @@ struct Store
         t.waits_for = 0
         Ok(Done(n))
     end modify_in
+
+    private write_rows_in(*self, t: &Txn, table: u64, changes: Buf[RowChange]) -> Result[WriteOutcome, CodecError]
+        live(t)?
+        if t.read_only then return fail("T4001", "a write in a read-only transaction")
+        val d = self.table_data(table)?
+
+        // As `modify_in`: nothing is written until no row the statement writes is locked.
+        for c in changes
+            val key = c match
+                Put(row) -> self.key_of(d, row)?
+                Replace(k, _) | Remove(k) -> k
+
+            val (found, at) = locate(d, key)
+            if found && d.slots[at].lock != 0 && d.slots[at].lock != t.id then return self.wait_on(t, d.slots[at].lock)
+
+        var n: usize = 0
+
+        for c in changes
+            c match
+                Put(row) ->
+                    val _ = self.insert_in(t, table, row)?
+                Replace(k, row) -> self.replace_in(t, d, k, Some(row))?
+                Remove(k) -> self.replace_in(t, d, k, None)?
+
+            n += 1
+
+        t.waits_for = 0
+        Ok(Done(n))
+    end write_rows_in
+
+    // `t`'s version of the row keyed `key`, which `t` sees, becomes `after`.
+    private replace_in(*self, t: &Txn, d: &TableData, key: Value, after: Option[StoredRow]) -> Result[unit, CodecError]
+        val (found, at) = locate(d, key)
+        if !found || visible_row(d.slots[at], t.snapshot, t.id).is_none() then return fail("D1001", "a written row is not visible to its writer")
+        val _ = self.install(t, d, d.slots[at], after)?
+        Ok(())
 
     // Installs `after` as `t`'s version of `s` (§4.2 rule 2), or replaces `t`'s own version.
     private install(*self, t: &Txn, d: &TableData, s: &Slot, after: Option[StoredRow]) -> Result[WriteOutcome, CodecError]

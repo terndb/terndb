@@ -829,6 +829,18 @@ and the conflict action, `as` denotes the existing row. In `returning`, `as` den
 written (or, for `Delete`, as it was removed), and `old` denotes the row as it was before the
 statement, with every column nullable (null for a newly inserted row).
 
+**Visibility of a statement's own writes.** Every read a DML statement makes — its `source`,
+`from`/`using`, its target rows and `filter`, an upsert's conflict check, and every subquery of a
+`set`, conflict action or `returning` item — sees the transaction's state as of the statement's start
+(its snapshot, `isolation.md` §4.1, with the transaction's earlier statements' writes), and none sees
+the statement's own writes. A statement's writes are applied together after those reads; a
+statement that must wait for a row lock (`isolation.md` §4.2 rule 1) has written nothing, and is run
+again whole once the holder has ended. Constraints (`ddl.md` §2.6) are judged on what the statement
+writes: two rows of one statement with one key are a `unique_violation` (`T3001`), as two
+statements' would be.
+*Rationale: statement-level visibility is what SQL gives, and it makes a statement's meaning
+independent of the order it visits rows in.*
+
 ### 9.2 Insert
 
 `Insert { table, as, old: binder?, columns: [name], source: Rel, on_conflict: OnConflict?, returning:
@@ -853,7 +865,10 @@ set: [(name, Expr)], where: Expr? } }`
    else it is skipped. Skipped rows produce no `returning` row and are not counted. Both `as` and
    `excluded` have the table's row type; `target`'s columns match a unique key's in any order, and a
    constraint name matches a unique constraint's or a unique index's name.
-3. A statement that would insert or update the same target row twice is `R0007`.
+3. A statement that would insert or update the same target row twice is `R0007`. Source rows are
+   taken in source order, and a row whose key an earlier row of the same statement inserted or
+   updated conflicts with that row: with `nothing`, or with a `where` that is not `true`, it is
+   skipped; otherwise it is `R0007`.
 
 ### 9.4 Update and Delete
 
@@ -866,12 +881,16 @@ set: [(name, Expr)], where: Expr? } }`
    `returning`. A target row matched by more than one `from` row MUST raise `R0007` (Postgres picks one
    arbitrarily; TernDB refuses).
 3. Absent `filter` means every row.
+4. An `Update` that sets a primary-key column moves the row to its new key. Every moved row leaves
+   its old key before any takes its new one, so keys may be exchanged or shifted within one
+   statement; a new key that another row still holds is `T3001`.
 
 ### 9.5 Returning and Action
 
 `returning` items see `as`, `old`, and the `from`/`using` binders. `Action()` is valid only in
 `returning` (`Q5002`), outside any subquery of a returning item, and has type `union<inserted: {}, updated: {}, deleted: {}>`. The result is a bag
-of the returning records.
+of the returning records, one per row the statement wrote. `returning` is evaluated before the
+statement's writes are applied (§9.1), so a subquery in it does not see them.
 
 ## 10. Parameters, shape and batches
 
