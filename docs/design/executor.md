@@ -9,9 +9,9 @@ written into `query-tree.md` itself, and this note points at it.
 The code is `sh/sysl/terndb/exec_*.sysl`. This first slice covers what does not depend on storage:
 column vectors, expression evaluation, and the operators `Values`, `ParamScan`, `Filter`,
 `Project`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Tag`, `Join` (§4.1), and `Nest`, `Unnest`,
-`Apply` with the subquery expressions (§4.2), a source over in-memory batches standing in for `Scan`,
-and the conversion of an operator's output into result batches. Windows, set operations, DML,
-storage, MVCC and the unnesting planner come later.
+`Apply` with the subquery expressions (§4.2), `Window` (§4.3), a source over in-memory batches
+standing in for `Scan`, and the conversion of an operator's output into result batches. Set
+operations, DML, storage, MVCC and the unnesting planner come later.
 
 ## 1. Column vectors
 
@@ -287,17 +287,52 @@ will be checked against; until that planner exists the executor does not meet ru
   or with an ordinality a record of the element's columns and the 1-based position), cut into
   `BatchSize` batches.
 
+### 4.3 Windows
+
+The code is `exec_window.sysl`. **Window** (§6.8) is sort-based and blocking: it drains its input and
+computes each call over every row on its own. A call evaluates its partition values and `order` keys
+on every row and orders the rows with `Sort`'s stable comparator (`KeyOrder`, `sorted_rows`), the
+partition values first (ascending, nulls first) and its own keys after, so a partition is a run of
+positions and a peer group (§6.8 rule 1) a run within it; a `Layout` records each position's
+partition bounds and peer group. A call's value is computed position by position and gathered back
+into input order with `take`, which the output keeps. The output is a composite (§4.1): the input's
+binders and the window's record, one member per call.
+
+- **Ranking** is arithmetic on the layout: the position, the first peer's position and the peer group
+  number, each less the partition's first.
+- **lag/lead** evaluate `x`, `n` and `d` on every row; each row takes one slot of `x`, of `d`, or a
+  null by one `take` over their concatenation.
+- **Frames** become a pair of positions per row. `rows` and `groups` bounds are arithmetic on the
+  position and the peer group, clamped to the partition. A `range` offset bound is a binary search of
+  the partition for the first row not before (a start) or after (an end) the bound's value, the
+  comparison placing nulls per `nulls_first`; the value is computed exactly in `i256` for integers and
+  decimals, in `float64` for floats, and by the calendar `add_interval` for date and time keys.
+  `exclude` cuts a frame into at most three runs of positions.
+- **Aggregates over a frame** reuse `Aggregate`'s kernels unchanged: each row's frame, as input row
+  numbers in the partition's order, is one group of a `Seen`, and `aggregate_column` computes every
+  group at once. The frames are handed over in runs of about 65 536 positions, so memory stays
+  bounded, but the work is the sum of the frames' sizes, quadratic in a partition for an unbounded or
+  running frame. Removable accumulators for `count`, `sum`, `avg`, `bool_and`/`bool_or` and a
+  segment tree for `min`/`max` are what would make that linear; they are not written yet.
+- **first_value/last_value** take the first or last position of the frame's runs, or a null.
+
+Hash partitioning, which would need no sort of the partition values, waits on a fast seeded hash
+(the survey's gap, as for `Distinct` and `Aggregate`).
+
 ## 5. What this note relies on in `query-tree.md`
 
 §3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
-the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.7, §6.9–§6.11, §6.14 and §6.15 for
+the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.11, §6.14 and §6.15 for
 the operators; §7.1–§7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
 its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
 `and`/`or` and of `coalesce`, the text functions' units and `like`'s escape, and the calendar `add`
 (all in §7.12); when a join's `on` is evaluated and `single`'s `R0003` (§6.5 rules 8 and 9); a
 group's key, `filter`, `distinct`, and the values of `sum`, `min`, `max` and `string_agg` (§6.7 rules
 5–7); when an `Apply`'s right input and a subquery are evaluated (§6.6 rule 4); a keyless `Nest` of no
-rows, and an `Unnest` without `outer` of an empty or null relation (§6.14 rules 1 and 2).
+rows, and an `Unnest` without `outer` of an empty or null relation (§6.14 rules 1 and 2); and a
+window's partitions, peers, ranking, `lag`/`lead` offsets, default frame, the meaning of each frame
+unit and exclusion, `range` offsets over every key type, and when offsets are evaluated and refused
+(§6.8 rules 1–5).
 
 ## 6. Where the survey's sysl gaps cost speed
 

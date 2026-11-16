@@ -196,6 +196,35 @@ private struct Planner
                     cs.push(TAgg(c.function, args, c.distinct, filter, order))
 
                 Lowered(AggregateOp(inner.op, inner.binder, inner.elem, elem, ks, cs, self.ctx, None), binder, elem, none)
+            Window(input, binder, items) ->
+                val inner = self.rel(*input)
+                val ws = buf[TWin]()
+
+                for it in items
+                    val c = it.call
+                    val args = buf[TExpr]()
+                    val part = buf[TExpr]()
+                    val order = buf[TKey]()
+
+                    for x in c.args
+                        args.push(self.expr(x))
+
+                    for x in c.partition
+                        part.push(self.expr(x))
+
+                    for k in c.order
+                        order.push(TKey(self.expr(k.expr), k.desc, k.nulls_first))
+
+                    val frame = c.frame match
+                        Some(f) ->
+                            val s = self.opt_expr(f.start.offset)
+                            val e = self.opt_expr(f.end.offset)
+                            Some(TFrame(f.unit, TBound(f.start.kind, s), TBound(f.end.kind, e), f.exclude))
+                        None -> None
+
+                    ws.push(TWin(c.function, args, part, order, frame))
+
+                plan_window(inner, binder, elem, ws, self.ctx)
             Nest(input, binder, keys, _, items, order) ->
                 val inner = self.rel(*input)
                 val ks = buf[TExpr]()

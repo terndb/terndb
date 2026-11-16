@@ -29,7 +29,7 @@ private struct Groups
 /** What one call reads of each group: positions in the call's own vectors, group `g`'s being
  * `at[bounds[g]..<bounds[g + 1]]`, in the order the call reads them.
  */
-private struct Seen
+private[terndb] struct Seen
     at: Buf[usize]
     bounds: Buf[usize]
 
@@ -216,8 +216,10 @@ private distinct_of(seen: Seen, args: Buf[ColumnVector], n: usize) -> Seen
 
     Seen(at, bounds)
 
-/** The aggregate `f` of `args` over each group of `seen`, as a column of `ty` (§6.7 rule 4). */
-private aggregate_column(f: string, ty: Type, args: Buf[ColumnVector], seen: Seen) -> Result[ColumnVector, CodecError] = f match
+/** The aggregate `f` of `args` over each group of `seen`, as a column of `ty` (§6.7 rule 4). A window
+ * (`exec_window.sysl`) calls it with each row's frame as a group.
+ */
+private[terndb] aggregate_column(f: string, ty: Type, args: Buf[ColumnVector], seen: Seen) -> Result[ColumnVector, CodecError] = f match
     "count" -> Ok(count_column(if args.len() == 0 then None else Some(args[0]), seen))
     "sum" -> sum_column(args[0], ty, seen)
     "avg" -> avg_column(args[0], ty, seen)
