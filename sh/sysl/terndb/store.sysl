@@ -1,0 +1,607 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The in-memory table store and its multi-version concurrency control (`isolation.md` §4.1–§4.5,
+// §5): transactions begun at one of the three levels, reads at a snapshot through each row's chain of
+// versions, writes under first-updater-wins, and commit-time validation of a serializable
+// transaction's predicate log. StoredRows are `Value` records, each carrying the schema version it was
+// encoded in (`ddl.md` §5.2). The store is single-threaded: transactions interleave by the order
+// their operations are called in, and a write that would wait for another transaction's row lock
+// answers `Wait` instead of blocking (`docs/design/store.md`).
+
+/** Where a transaction is: live, committed at `c`, or aborted with the §5.2 code that ended it
+ * (empty when the client rolled it back).
+ */
+enum TxnPhase derives Eq
+    Live
+    CommittedAt(c: u64)
+    AbortedWith(code: string)
+
+/** A stored row: the schema version it was encoded in and its value, a record of that version's
+ * columns in ordinal order.
+ */
+struct StoredRow derives Eq
+    schema: u64
+    value: Value
+
+    /** The value of the column at ordinal `i` of the row's own version. */
+    at(self, i: usize) -> Value = self.value match
+        Record(fields) -> fields[i]
+        _ -> Null
+
+/** A read's membership predicate over a table's rows (§4.4), and the columns, by column id, that the
+ * read used: those its predicate and its result read. `every` widens them to every column.
+ */
+struct Pred
+    matches: &Fn(StoredRow) -> bool
+    columns: Buf[u32]
+    every: bool
+
+/** A predicate that read `columns`. */
+pred(columns: []const u32, matches: &Fn(StoredRow) -> bool) -> Pred
+    val b = buf[u32]()
+    b.extend(columns)
+    Pred(matches, b, false)
+
+/** A predicate that read every column. */
+pred_all(matches: &Fn(StoredRow) -> bool) -> Pred = Pred(matches, buf[u32](), true)
+
+/** Every row, every column: a full scan with no filter. */
+all_rows() -> Pred = pred_all(r -> true)
+
+/** One version of a row: the transaction that wrote it, its commit sequence number (0 while
+ * uncommitted), and its image, `None` for a delete.
+ */
+struct RowVersion
+    writer: u64
+    commit: u64
+    row: Option[StoredRow]
+
+/** A row's place in its table: its key, the row lock (§4.2: the id of the live transaction that owns
+ * the newest version, 0 for none), and its versions, oldest first. The newest is the in-place
+ * version; the ones under it are the undo chain.
+ */
+struct Slot
+    key: Value
+    lock: u64
+    versions: Buf[RowVersion]
+
+/** A table's rows, kept sorted by key: the primary key's columns (every table has one, `Q6009`), as
+ * a record of `key_type`.
+ */
+struct TableData
+    oid: u64
+    key_columns: Buf[u32]
+    key_type: Type
+    slots: Buf[&Slot]
+
+/** One row a transaction wrote: the newest committed image it replaced and the image it installed
+ * (§4.3 `before(w)` and `after(w)`); `None` is absent or deleted.
+ */
+struct Write
+    table: u64
+    slot: &Slot
+    before: Option[StoredRow]
+    after: Option[StoredRow]
+
+/** One entry of the predicate log: a table, the predicate of a read of it, and, for a point lookup,
+ * the key it looked up, which then decides membership by itself.
+ */
+struct LogEntry
+    table: u64
+    pred: Pred
+    key: Option[Value]
+
+/** A transaction: its id, level, whether it was declared read-only, its snapshot (at read committed,
+ * the current statement's), its state, its predicate log (serializable only), its writes, one per
+ * row, and the transaction whose row lock it is waiting for (0 for none).
+ */
+struct Txn
+    id: u64
+    level: Isolation
+    read_only: bool
+    snapshot: u64
+    state: TxnPhase
+    log: Buf[LogEntry]
+    writes: Buf[Write]
+    waits_for: u64
+
+/** A row a read returned: its key and its version visible to the reader. */
+struct Hit
+    key: Value
+    row: StoredRow
+
+/** What a write statement did: changed `rows` rows, or nothing at all because a row it must write is
+ * locked by `holder`. A `Wait` is retried once `holder` has committed or aborted (§4.2 rule 1).
+ */
+enum WriteOutcome derives Eq
+    Done(rows: usize)
+    Wait(holder: u64)
+
+/** The writes of a committed transaction, kept for validating the serializable transactions that
+ * were running when it committed (§4.3 retention).
+ */
+struct CommittedWrites
+    c: u64
+    writes: Buf[Write]
+
+/** The fault-injected builds of §7.1 "prove the checker can fail". Both off in a real store. */
+struct Faults
+    skip_validation: bool
+    skip_first_updater_wins: bool
+
+/** The store: the catalog its tables are defined in, the id and commit counters, the visible horizon
+ * `h` (§4.1), each table's rows, the live transactions and the retained committed write sets.
+ */
+struct Store
+    catalog: MemCatalog
+    faults: Faults
+    next_txid: u64
+    horizon: u64
+    tables: Buf[&TableData]
+    active: Buf[&Txn]
+    history: Buf[CommittedWrites]
+
+    /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
+    begin(*self, level: Isolation, read_only: bool = false) -> &Txn
+        val t: &Txn = Txn(self.next_txid, level, read_only, self.horizon, Live, buf(), buf(), 0)
+        self.next_txid += 1
+        self.active.push(t)
+        t
+
+    /** The start of a statement: read committed takes a new snapshot (§3.3); the other levels keep
+     * the one taken at begin.
+     */
+    statement(*self, t: &Txn)
+        if t.state == Live && t.level == ReadCommitted then t.snapshot = self.horizon
+
+    /** The rows of `table` visible to `t` that satisfy `p`, logged under serializable (§4.4). */
+    scan(*self, t: &Txn, table: u64, p: Pred) -> Result[Buf[Hit], CodecError]
+        val r = self.scan_in(t, table, p)
+        self.guard(t, r)
+
+    /** The row of `table` with key `key` visible to `t`, if any; logged as the point read `key = k`
+     * of every column, found or not.
+     */
+    get(*self, t: &Txn, table: u64, key: Value) -> Result[Option[StoredRow], CodecError]
+        val r = self.get_in(t, table, key)
+        self.guard(t, r)
+
+    /** Inserts `row`. A key visible to `t` is `unique_violation`; one committed after `t`'s snapshot
+     * is `serialization_failure` at snapshot and serializable (§4.2 rule 4).
+     */
+    insert(*self, t: &Txn, table: u64, row: StoredRow) -> Result[WriteOutcome, CodecError]
+        val r = self.insert_in(t, table, row)
+        self.guard(t, r)
+
+    /** `UPDATE table SET … WHERE p`: every row visible to `t` that satisfies `p` is replaced by
+     * `change` of it, encoded in schema version `version` (0: the table's current one). `p` must
+     * name the columns `change` reads.
+     */
+    update_where(*self, t: &Txn, table: u64, p: Pred, change: &Fn(StoredRow) -> Value, version: u64 = 0) -> Result[WriteOutcome, CodecError]
+        val r = self.modify_in(t, table, p, Some(change), version)
+        self.guard(t, r)
+
+    /** `DELETE FROM table WHERE p`. */
+    delete_where(*self, t: &Txn, table: u64, p: Pred) -> Result[WriteOutcome, CodecError]
+        val r = self.modify_in(t, table, p, None, 0)
+        self.guard(t, r)
+
+    /** Commits `t` and answers its commit sequence number, or, for a transaction with an empty write
+     * set, its snapshot, at which it is serialized (§5.5). A serializable writer is validated first
+     * (§4.3) and aborted with `serialization_failure` if a write committed during its lifetime
+     * matches a read it logged. A transaction already aborted answers the code that aborted it.
+     */
+    commit(*self, t: &Txn) -> Result[u64, CodecError]
+        t.state match
+            Live -> ()
+            CommittedAt(_) -> return fail("W2001", "the transaction has already committed")
+            AbortedWith(code) ->
+                if code.len == 0 then return fail("W2003", "the transaction was rolled back")
+                return fail(code, "the transaction was aborted")
+
+        if t.writes.len() == 0
+            t.state = CommittedAt(t.snapshot)
+            self.retire(t)
+            return Ok(t.snapshot)
+
+        val c = self.horizon + 1
+
+        if t.level == Serializable && !self.faults.skip_validation && !self.valid(t)
+            self.rollback(t, "T1001")
+            return fail("T1001", "a write committed during the transaction matches a read it made")
+
+        for w in t.writes
+            val s = w.slot
+            val top = s.versions.len() - 1
+            val v = s.versions[top]
+            s.versions[top] = RowVersion(v.writer, c, v.row)
+            s.lock = 0
+
+        self.horizon = c
+        t.state = CommittedAt(c)
+        self.history.push(CommittedWrites(c, t.writes))
+        self.retire(t)
+        Ok(c)
+    end commit
+
+    /** Rolls `t` back at the client's request. Its writes are undone; none was ever visible. */
+    abort(*self, t: &Txn) -> Result[unit, CodecError]
+        t.state match
+            Live -> self.rollback(t, "")
+            CommittedAt(_) -> return fail("W2001", "the transaction has already committed")
+            AbortedWith(_) -> ()
+
+        Ok(())
+
+    /** The predicate-log entries `t` holds. */
+    logged(self, t: &Txn) -> usize = t.log.len()
+
+    /** The number of committed write sets retained for validation. */
+    retained(self) -> usize = self.history.len()
+
+    // -- reading ------------------------------------------------------------------------------------
+
+    private scan_in(*self, t: &Txn, table: u64, p: Pred) -> Result[Buf[Hit], CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+        val f = p.matches
+        val out = buf[Hit]()
+
+        for s in d.slots
+            visible_row(s, t.snapshot, t.id) match
+                Some(r) -> if f(r) then out.push(Hit(s.key, r))
+                None -> ()
+
+        self.log_read(t, table, p, None)
+        Ok(out)
+
+    private get_in(*self, t: &Txn, table: u64, key: Value) -> Result[Option[StoredRow], CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+        self.log_read(t, table, all_rows(), Some(key))
+        val (found, at) = locate(d, key)
+        if !found then return Ok(None)
+        Ok(visible_row(d.slots[at], t.snapshot, t.id))
+
+    // A read is logged only by a serializable transaction not declared read-only (§4.3, §5.5).
+    private log_read(*self, t: &Txn, table: u64, p: Pred, key: Option[Value])
+        if t.level == Serializable && !t.read_only then t.log.push(LogEntry(table, p, key))
+
+    // -- writing ------------------------------------------------------------------------------------
+
+    private insert_in(*self, t: &Txn, table: u64, row: StoredRow) -> Result[WriteOutcome, CodecError]
+        live(t)?
+        if t.read_only then return fail("T4001", "a write in a read-only transaction")
+        val d = self.table_data(table)?
+        val key = self.key_of(d, row)?
+        val (found, at) = locate(d, key)
+
+        if !found
+            val fresh: &Slot = Slot(key, 0, buf())
+            d.slots.insert(at, fresh)
+            return self.install(t, d, fresh, Some(row))
+
+        val s = d.slots[at]
+        if s.lock != 0 && s.lock != t.id then return self.wait_on(t, s.lock)
+        if visible_row(s, t.snapshot, t.id).is_some() then return duplicate()
+
+        // A key this transaction deleted is free for it again.
+        if s.lock == t.id then return self.install(t, d, s, Some(row))
+
+        // A live key committed after the snapshot is a race at snapshot and serializable (rule 4); at
+        // read committed the check reads the newest committed version, as rule 3 does.
+        newest_committed(s) match
+            Some(v) -> if v.row.is_some()
+                if t.level == ReadCommitted then return duplicate()
+                return fail("T1001", "the key was inserted by a transaction that committed after the snapshot")
+            None -> ()
+
+        self.install(t, d, s, Some(row))
+    end insert_in
+
+    private modify_in(*self, t: &Txn, table: u64, p: Pred, change: Option[&Fn(StoredRow) -> Value], version: u64) -> Result[WriteOutcome, CodecError]
+        live(t)?
+        if t.read_only then return fail("T4001", "a write in a read-only transaction")
+        val d = self.table_data(table)?
+        val f = p.matches
+        val targets = buf[&Slot]()
+
+        for s in d.slots
+            visible_row(s, t.snapshot, t.id) match
+                Some(r) -> if f(r) then targets.push(s)
+                None -> ()
+
+        // The statement writes nothing until no row it must write is locked, so a `Wait` leaves no
+        // trace and the statement is simply called again.
+        for s in targets
+            if s.lock != 0 && s.lock != t.id then return self.wait_on(t, s.lock)
+
+        self.log_read(t, table, p, None)
+        val schema = if version == 0 then self.current_version(table) else version
+        var n: usize = 0
+
+        for s in targets
+            val base = if s.lock == t.id
+                s.versions[s.versions.len() - 1].row
+            elif t.level == ReadCommitted
+                // Rule 3: re-read the newest committed version and re-evaluate the predicate on it.
+                newest_committed(s) match
+                    Some(v) -> v.row match
+                        Some(r) -> if f(r) then Some(r) else None
+                        None -> None
+                    None -> None
+            else
+                visible_row(s, t.snapshot, t.id)
+
+            base match
+                Some(r) ->
+                    val after = change match
+                        Some(g) -> Some(StoredRow(schema, g(r)))
+                        None -> None
+
+                    self.install(t, d, s, after)?
+                    n += 1
+                None -> ()
+
+        t.waits_for = 0
+        Ok(Done(n))
+    end modify_in
+
+    // Installs `after` as `t`'s version of `s` (§4.2 rule 2), or replaces `t`'s own version.
+    private install(*self, t: &Txn, d: &TableData, s: &Slot, after: Option[StoredRow]) -> Result[WriteOutcome, CodecError]
+        t.waits_for = 0
+
+        if s.lock == t.id
+            val top = s.versions.len() - 1
+            s.versions[top] = RowVersion(t.id, 0, after)
+
+            for i in 0..<t.writes.len()
+                val w = t.writes[i]
+                if w.table == d.oid && w.slot.key == s.key then t.writes[i] = Write(w.table, w.slot, w.before, after)
+
+            return Ok(Done(1))
+
+        var c: u64 = 0
+        var before: Option[StoredRow] = None
+
+        newest_committed(s) match
+            Some(v) ->
+                c = v.commit
+                before = v.row
+            None -> ()
+
+        if t.level != ReadCommitted && !self.faults.skip_first_updater_wins && c > t.snapshot
+            return fail("T1001", "the row was changed by a transaction that committed after the snapshot")
+
+        // `ddl.md` §5.4 rule 3: no writer replaces a newer encoding.
+        (before, after) match
+            (Some(b), Some(a)) -> if b.schema > a.schema
+                return fail("T1004", "the row is encoded in a schema version newer than the statement's")
+            _ -> ()
+
+        s.versions.push(RowVersion(t.id, 0, after))
+        s.lock = t.id
+        t.writes.push(Write(d.oid, s, before, after))
+        Ok(Done(1))
+    end install
+
+    // `t` waits for `holder`. A wait that would close a cycle in the wait-for graph aborts `t`, the
+    // transaction that closed it (§4.2 rule 1).
+    private wait_on(*self, t: &Txn, holder: u64) -> Result[WriteOutcome, CodecError]
+        var h = holder
+
+        while h != 0
+            if h == t.id then return fail("T1002", "waiting for the row lock would close a cycle")
+            h = self.waiting_of(h)
+
+        t.waits_for = holder
+        Ok(Wait(holder))
+
+    private waiting_of(self, id: u64) -> u64
+        for a in self.active
+            if a.id == id then return a.waits_for
+
+        0
+
+    // -- validation (§4.3) ------------------------------------------------------------------------
+
+    // Whether no write committed during `t`'s lifetime matches an entry of its predicate log.
+    private valid(self, t: &Txn) -> bool
+        for h in self.history
+            if h.c > t.snapshot
+                for w in h.writes
+                    for e in t.log
+                        if e.table == w.table && self.changes(e, w) && (matches(e, w, w.before) || matches(e, w, w.after))
+                            return false
+
+        true
+
+    // Whether `w` changes visibility or a column `e` read.
+    private changes(self, e: LogEntry, w: Write) -> bool
+        val (b, a) = (w.before, w.after) match
+            (Some(b), Some(a)) -> (b, a)
+            _ -> return true
+
+        if e.pred.every then return b != a
+
+        for id in e.pred.columns
+            val x = self.column_value(w.table, b, id)
+            val y = self.column_value(w.table, a, id)
+
+            (x, y) match
+                (Some((ty, u)), Some((_, v))) -> if !same(ty, u, v) then return true
+                (None, None) -> ()
+                _ -> return true
+
+        false
+
+    // -- the catalog ------------------------------------------------------------------------------
+
+    private table_data(*self, oid: u64) -> Result[&TableData, CodecError]
+        for d in self.tables
+            if d.oid == oid then return Ok(d)
+
+        val i = self.catalog.table_by_oid(oid) match
+            Some(i) -> i
+            None -> return fail("Q2001", "no table has this oid")
+
+        val ct = self.catalog.tables[i]
+        val fields = buf[Field]()
+
+        for id in ct.primary_key
+            ct.column_by_id(id) match
+                Some(c) -> fields.push(Field(c.name, c.ty))
+                None -> ()
+
+        val d: &TableData = TableData(oid, ct.primary_key.copy(), record(fields.view()), buf())
+        self.tables.push(d)
+        Ok(d)
+
+    private current_version(self, oid: u64) -> u64 = self.catalog.table_by_oid(oid) match
+        Some(i) -> self.catalog.tables[i].schema_version()
+        None -> 0
+
+    private columns_at(self, oid: u64, schema: u64) -> Option[Buf[CatColumn]]
+        val i = self.catalog.table_by_oid(oid)?
+
+        for v in self.catalog.tables[i].versions
+            if v.number == schema then return Some(v.columns)
+
+        None
+
+    // The type and value of column `id` in `r`, read through `r`'s own schema version.
+    private column_value(self, oid: u64, r: StoredRow, id: u32) -> Option[(Type, Value)]
+        val columns = self.columns_at(oid, r.schema)?
+
+        val fields = r.value match
+            Record(fs) -> fs
+            _ -> return None
+
+        for j in 0..<columns.len()
+            if columns[j].id == id && j < fields.len() then return Some((columns[j].ty, fields[j]))
+
+        None
+
+    // The key of `r`: its primary-key columns as a record.
+    private key_of(self, d: &TableData, r: StoredRow) -> Result[Value, CodecError]
+        val parts = buf[Value]()
+
+        for id in d.key_columns
+            self.column_value(d.oid, r, id) match
+                Some((_, v)) -> parts.push(v)
+                None -> return fail("D1001", "the row is not encoded in a schema version of its table")
+
+        Ok(Record(parts))
+
+    // -- ending -----------------------------------------------------------------------------------
+
+    // Wraps an operation: any error inside a transaction aborts it with that error's code (§5.1).
+    private guard[T](*self, t: &Txn, r: Result[T, CodecError]) -> Result[T, CodecError] = r match
+        Ok(v) -> Ok(v)
+        Err(e) ->
+            if t.state == Live then self.rollback(t, e.code)
+            Err(e)
+
+    // Undoes `t`'s writes, newest version of each of its rows first; none was ever visible.
+    private rollback(*self, t: &Txn, code: string)
+        for w in t.writes
+            val s = w.slot
+            if s.lock == t.id
+                val _ = s.versions.pop()
+                s.lock = 0
+
+        t.state = AbortedWith(code)
+        self.retire(t)
+
+    private retire(*self, t: &Txn)
+        t.waits_for = 0
+
+        for i in 0..<self.active.len()
+            if self.active[i].id == t.id
+                val _ = self.active.remove(i)
+                break
+
+        self.prune()
+
+    // Drops the committed write sets no live serializable transaction can be validated against: those
+    // committed at or before every such transaction's snapshot.
+    private prune(*self)
+        var low = self.horizon
+
+        for a in self.active
+            if a.level == Serializable && !a.read_only && a.snapshot < low then low = a.snapshot
+
+        val kept = buf[CommittedWrites]()
+
+        for h in self.history
+            if h.c > low then kept.push(h)
+
+        self.history = kept
+end Store
+
+/** A store over `catalog`'s tables, empty. */
+mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf())
+
+/** `value` as a row of `table` in its current schema version. */
+store_row(s: &Store, table: u64, value: Value) -> StoredRow
+    val v = s.catalog.table_by_oid(table) match
+        Some(i) -> s.catalog.tables[i].schema_version()
+        None -> 0
+
+    StoredRow(v, value)
+
+private live(t: &Txn) -> Result[unit, CodecError] = t.state match
+    Live -> Ok(())
+    CommittedAt(_) -> fail("W2001", "the transaction has already committed")
+    AbortedWith(_) -> fail("W2003", "the transaction is aborted")
+
+private duplicate[T]() -> Result[T, CodecError] = fail("T3001", "a row with this key is visible to the transaction")
+
+// The image of `s` that a reader with snapshot `snap` and id `me` sees: its own uncommitted version,
+// else the newest version committed at or before `snap` (§4.1). A deleted image is none.
+private visible_row(s: &Slot, snap: u64, me: u64) -> Option[StoredRow]
+    var i = s.versions.len()
+
+    while i > 0
+        i -= 1
+        val v = s.versions[i]
+
+        if v.commit == 0
+            if v.writer == me then return v.row
+        elif v.commit <= snap
+            return v.row
+
+    None
+
+private newest_committed(s: &Slot) -> Option[RowVersion]
+    var i = s.versions.len()
+
+    while i > 0
+        i -= 1
+        if s.versions[i].commit != 0 then return Some(s.versions[i])
+
+    None
+
+// Where `key` is among `d`'s slots, or where it would go.
+private locate(d: &TableData, key: Value) -> (bool, usize)
+    var lo: usize = 0
+    var hi = d.slots.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        val c = cmp(d.key_type, d.slots[mid].key, key)
+        if c == 0 then return (true, mid)
+        if c < 0 then lo = mid + 1 else hi = mid
+
+    (false, lo)
+
+// Whether the image `img` of write `w` satisfies the log entry `e`; an absent image matches nothing.
+private matches(e: LogEntry, w: Write, img: Option[StoredRow]) -> bool = img match
+    Some(r) -> e.key match
+        Some(k) -> w.slot.key == k
+        None ->
+            val f = e.pred.matches
+            f(r)
+    None -> false

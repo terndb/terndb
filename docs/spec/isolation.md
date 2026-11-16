@@ -258,7 +258,9 @@ any. When `Ti` writes object `x`:
 
 1. If `x` is locked by another live transaction `Tj`, `Ti` MUST wait until `Tj` commits or aborts. This is the
    only policy, at every level: the wait is bounded by `lock_timeout` (`lock_timeout`, §5.2) and by deadlock
-   detection over the wait-for graph (`deadlock_detected`). Waiting saves the abort when `Tj` rolls back.
+   detection over the wait-for graph (`deadlock_detected`). Waiting saves the abort when `Tj` rolls back. The
+   victim of a deadlock is the transaction whose wait would close the cycle: it aborts instead of waiting, and
+   every transaction already waiting keeps waiting.
 2. Let `x_k` be the newest committed version. At snapshot and serializable, if `c_k > s_i` (it is not in `Ti`'s
    snapshot), `Ti` MUST abort with `serialization_failure`. Otherwise `Ti` locks `x`, pushes `x_k` onto the undo
    chain and installs its version in place.
@@ -267,7 +269,9 @@ any. When `Ti` writes object `x`:
    matches the row is skipped.
 4. An insert of key `k` that finds a visible committed version of `k` in `Ti`'s snapshot fails with
    `unique_violation`; one that finds `k` only through rule 2 (committed after `s_i`) fails with
-   `serialization_failure`, because the conflict is a race, not a duplicate.
+   `serialization_failure`, because the conflict is a race, not a duplicate. At read committed the check reads
+   the newest committed version of `k`, as rule 3 does, so a live one fails with `unique_violation` whenever it
+   committed (`serialization_failure` is never raised there, §5.2).
 
 **Why first-updater-wins rather than first-committer-wins.** Undo-based MVCC keeps exactly one in-place newest
 version per row, so two uncommitted writers of one row cannot both have installed their version; first-committer-
@@ -299,8 +303,11 @@ validate(Ti):
 ```
 
 `before(w)` is the version `w` replaced (none for an insert), `after(w)` the version it installed (none for a
-delete); a dead or absent image matches nothing. An insert or a delete always changes visibility. Validation is
-**column-precise**: a write that changed only columns `Ti` never read does not abort it. Coarsening (§4.4) MAY
+delete); a dead or absent image matches nothing. A transaction that writes one row more than once contributes one
+write of it: `before` is the newest committed version its first write replaced, `after` the version its last
+write left, since no other transaction can observe the ones between (G1b). An insert or a delete always changes
+visibility. A point lookup's entry (`key = k`) matches an image exactly when the image is of the row keyed `k`.
+Validation is **column-precise**: a write that changed only columns `Ti` never read does not abort it. Coarsening (§4.4) MAY
 widen `C`, up to every column of the table. Validation and publication of `Ti` MUST be equivalent to running
 atomically with respect to other committing transactions; an implementation MAY validate in parallel and MAY
 validate early against commits already published, provided the outcome equals the procedure above.
