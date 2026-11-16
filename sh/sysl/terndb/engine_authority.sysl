@@ -1,0 +1,41 @@
+module sh.sysl.terndb
+
+// The user directory of a server, backed by its catalog (`ddl.md` §2.10 rule 1): a connection may
+// authenticate as a role only if the newest committed catalog holds that role with `login`. The
+// credentials themselves are not part of the catalog, so a server supplies them as an `Authority` of
+// its own, and the catalog narrows what it answers. A role without `login`, or one no committed
+// catalog holds yet, has no verifier, no token and no peer login, so its handshake fails as an
+// unknown user's does (`W3001`, `wire-protocol.md` §2.4), and which methods are permitted still says
+// nothing about whether the role exists.
+
+/** The user directory of `engine`: `credentials`, for the roles that may log in. */
+struct CatalogAuthority
+    engine: &Engine
+    credentials: &Authority
+
+    /** Whether the newest committed catalog holds role `user` with `login`; a login happens outside
+     * any transaction, so a role created by one still open is not seen.
+     */
+    may_log_in(self, user: string) -> bool
+        val c = self.engine.store.latest_catalog()
+
+        c.role_at(user) match
+            Some(i) -> c.roles[i].login
+            None -> false
+
+impl Authority for CatalogAuthority
+    permits(self, user: string, database: string, method: string) -> bool = self.credentials.permits(user, database, method)
+
+    verifier(self, user: string) -> Option[ScramVerifier] =
+        if self.may_log_in(user) then self.credentials.verifier(user) else None
+
+    token_user(self, hash: [32]u8) -> Option[string] = self.credentials.token_user(hash) match
+        Some(u) -> if self.may_log_in(u) then Some(u) else None
+        None -> None
+
+    peer_permits(self, os_user: string, user: string) -> bool = self.may_log_in(user) && self.credentials.peer_permits(os_user, user)
+
+    has_database(self, database: string) -> bool = self.credentials.has_database(database)
+
+/** The user directory of `engine`, whose credentials are `credentials`. */
+catalog_authority(engine: &Engine, credentials: &Authority) -> &CatalogAuthority = CatalogAuthority(engine, credentials)

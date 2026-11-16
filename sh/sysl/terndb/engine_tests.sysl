@@ -20,20 +20,50 @@ impl Clock for ManualClock
  */
 ew_engine(clock: &Clock = ManualClock(0)) -> &Engine = engine(mem_catalog(), 1700000000000000, clock)
 
-/** A connected client whose server session runs on `e`, as the bootstrap role, its connection
- * defaults `defaults`. The `Duo`'s own fake engine is left unused.
+/** The credentials of the engine tests' server: every user's SCRAM password is `pencil`, the fake
+ * directory's token is issued to `svc`, and each operating-system user may log in as itself, to the
+ * database `app`. Which users may log in at all is the catalog's to say (`CatalogAuthority`).
  */
-ew_duo(e: &Engine, defaults: SessionDefaults = no_session_defaults()) -> Duo
-    val authority = sx_authority()
+struct EwCredentials
+    pencil: ScramVerifier
+    token: Buf[u8]
+
+impl Authority for EwCredentials
+    permits(self, user: string, database: string, method: string) -> bool = true
+
+    verifier(self, user: string) -> Option[ScramVerifier] = Some(self.pencil)
+
+    token_user(self, hash: [32]u8) -> Option[string] = if hash == token_hash(self.token.view()) then Some("svc") else None
+
+    peer_permits(self, os_user: string, user: string) -> bool = os_user == user
+
+    has_database(self, database: string) -> bool = database == "app"
+
+/** `e`'s user directory over `EwCredentials`. */
+ew_authority(e: &Engine) -> &CatalogAuthority =
+    catalog_authority(e, EwCredentials(scram_verifier("pencil", sx_salt().view(), 4096).unwrap(), sx_token()))
+
+/** A client logging in to `e` as `user` by `methods`, its connection defaults `defaults`, after the
+ * handshake, connected or not. The server's connection names no role until the handshake gives it the
+ * user's. The `Duo`'s own fake engine is left unused.
+ */
+ew_login(e: &Engine, user: string, methods: []const string = [ScramPlus], defaults: SessionDefaults = no_session_defaults()) -> Duo
     val pre = buf[u8]()
     push_preface(pre)
 
-    var cc = sx_client_config("alice", [ScramPlus])
+    var cc = sx_client_config(user, methods)
     cc.defaults = defaults
-    var d = Duo(client_session(cc, 0), server_session(sx_server_config(), e.connect(BootstrapRole), authority, 0),
-        sx_engine(), authority, reassembler(Client), reassembler(Server), pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(),
+    var d = Duo(client_session(cc, 0), server_session(sx_server_config(), e.connect(""), ew_authority(e), 0),
+        sx_engine(), sx_authority(), reassembler(Client), reassembler(Server), pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(),
         false, false, None, None)
     d.connect()
+    d
+
+/** A connected client whose server session runs on `e`, as role `user` (the bootstrap role unless
+ * named), its connection defaults `defaults`.
+ */
+ew_duo(e: &Engine, defaults: SessionDefaults = no_session_defaults(), user: string = BootstrapRole) -> Duo
+    var d = ew_login(e, user, [ScramPlus], defaults)
     assert(d.connected(), "connected")
     d
 

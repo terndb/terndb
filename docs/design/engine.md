@@ -71,6 +71,21 @@ version, a transaction's own view included. A lookup by digest (`cached(shape, t
 `txid` sees and validates an entry of another version again, dropping it if it fails or its result type
 changed, so a statement cached under one transaction's uncommitted table is `W2004` to everyone else.
 
+## Roles and privileges
+
+A connection runs as the role it authenticated as: the server session calls `Executor.authenticated(user)` once
+the handshake succeeds, before `Ready`, and `EngineConn` takes that user as its role, for DDL, for the privilege
+checks and for its plan-cache key. The user directory is `CatalogAuthority` (`engine_authority.sysl`): it wraps
+the server's own credentials and answers a verifier, a token's user or a peer login only for a role the newest
+committed catalog holds with `login`, so any other user fails as an unknown one does (`W3001`); which methods are
+permitted is left to the credentials, so it says nothing about which roles exist (`ddl.md` §2.10 rule 1).
+
+Privileges are checked at validation (`statement_privileges`, `ddl.md` §2.10 rules 4 and 8) against the catalog
+the statement's transaction sees, so a `Grant` or `Revoke` is seen by its own transaction at once, by others
+from its commit, and not at all once rolled back; at serializable a revoke committed during a transaction is
+not seen by it, at read committed it is seen by the next statement, and it never aborts a transaction by
+itself. Tests: `engine_privileges_tests.sysl`.
+
 ## What it does not do yet
 
 - **Reconciliation** (`ddl.md` §6.4) covers added unique keys only. A writer that commits after a DDL it did not
@@ -80,9 +95,9 @@ changed, so a statement cached under one transaction's uncommitted table is `W20
 - **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
   column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
   expression applied on read. Translation (`store.md`) applies the lossless conversions only.
-- **The role** is fixed when the connection is made (`Engine.connect`); the `Executor` trait carries no
-  authenticated user. DDL is applied, and the plan cache keyed, as that role.
-- **`Authority`** is not backed by the catalog's roles; a server supplies its own.
+- **Credentials** are the server's own `Authority`: `CatalogAuthority` narrows it to the roles the newest committed
+  catalog holds with `login`, but no SCRAM verifier or token hash is stored in the database, and nothing issues a
+  token yet.
 - **Runtime errors name no node**: an `R…` error has an empty path (`wire-protocol.md` §8.1 rule 2's SHOULD), so
   it carries no `span` either. Validation errors carry both: the engine maps each entry's path to its node's
   pre-order index (`node_paths`) and copies that node's span from the envelope (§8.1 rule 4).
