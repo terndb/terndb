@@ -100,13 +100,19 @@ struct Engine
         Ok(())
 
     /** `bytes` validated against the catalog as `role` (§4.4 rule 1). A validation error carries every
-     * error of the first phase that has one ([QT] §11.2).
+     * error of the first phase that has one ([QT] §11.2), each with its node's span when the envelope
+     * gave one (`wire-protocol.md` §8.1 rule 4). An envelope that does not decode has no spans to give.
      */
     private validate(self, bytes: []const u8, role: string) -> Result[Checked, Failure]
         val env = read_envelope(bytes) match
             Ok(e) -> e
             Err(e) -> return Err(failure_of(e))
 
+        self.validate_envelope(env, role) match
+            Ok(c) -> Ok(c)
+            Err(f) -> Err(spanned(env, f))
+
+    private validate_envelope(self, env: Envelope, role: string) -> Result[Checked, Failure]
         val structural = check_errors(env)
         if structural.len() > 0 then return Err(failure_all(structural))
 
@@ -410,7 +416,7 @@ impl Executor for EngineConn
                 Ok(None) -> r.since = None
                 Err(f) ->
                     self.drop(cursor)
-                    return Err(f)
+                    return Err(spanned(r.env, f))
 
     finish(*self, cursor: u64) -> Result[Finished, Failure]
         val r = self.find(cursor) match
@@ -464,6 +470,35 @@ impl Executor for EngineConn
 private saved(s: &Store, t: &Txn, r: Result[unit, CodecError]) -> Result[unit, Failure] = r match
     Ok(_) -> Ok(())
     Err(e) -> Err(failure_in(s.abort_with(t, e), t, None))
+
+/** `f` with each entry that names a node of `env` given that node's span, when `env` has spans and one
+ * of them is the node's own (`wire-protocol.md` §8.1 rule 4). An entry with no path, or the path of
+ * something that is no node (`/params/<i>`, `/spans/<i>`), has no span.
+ */
+private spanned(env: Envelope, f: Failure) -> Failure
+    val spans = env.spans match
+        Some(s) -> s
+        None -> return f
+
+    val paths = node_paths(env)
+    val entries = buf[ErrorEntry]()
+    for e in f.entries
+        val span = if e.span.is_some() then e.span else span_at(paths, spans, e.path)
+        entries.push(ErrorEntry(e.code, e.message, e.path, e.details, span))
+    Failure(entries, f.txid, f.tuple)
+
+/** The range of the span `spans` gives the node whose path is `at` among `paths` (by span index). */
+private span_at(paths: Buf[string], spans: Buf[Span], at: string) -> Option[SourceRange]
+    if at.len == 0 then return None
+
+    for i in 0..<paths.len()
+        if paths[i] != at then continue
+
+        for s in spans
+            if s.node == u64(i) then return Some(SourceRange(s.start, s.end))
+        return None
+
+    None
 
 /** The failure of every error in `es`, in their order. */
 private failure_all(es: Buf[CodecError]) -> Failure

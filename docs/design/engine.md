@@ -83,4 +83,6 @@ changed, so a statement cached under one transaction's uncommitted table is `W20
 - **The role** is fixed when the connection is made (`Engine.connect`); the `Executor` trait carries no
   authenticated user. DDL is applied, and the plan cache keyed, as that role.
 - **`Authority`** is not backed by the catalog's roles; a server supplies its own.
-- Error spans: the engine reports paths, not `span`s, since nothing maps a path to a node's pre-order index yet.
+- **Runtime errors name no node**: an `R…` error has an empty path (`wire-protocol.md` §8.1 rule 2's SHOULD), so
+  it carries no `span` either. Validation errors carry both: the engine maps each entry's path to its node's
+  pre-order index (`node_paths`) and copies that node's span from the envelope (§8.1 rule 4).

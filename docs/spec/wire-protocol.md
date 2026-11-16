@@ -1071,7 +1071,17 @@ ErrorEntry := str code
    a runtime error the server SHOULD give the path of the node whose evaluation failed.
 3. A validation error MUST carry, as `entries`, every error [QT] §11.2 requires: the first phase's errors sorted by
    path, the pre-order-first one first.
-4. `span` is present when the envelope carried `spans` and one covers the node at `path` ([QT] §5.4).
+4. `span` is present when the envelope carried `spans` and one covers the node at `path` ([QT] §5.4): the
+   span whose index is the pre-order index ([QT] §12.2) of the `Statement`, `Rel` or `Expr` node that `path`
+   names, its `start` and `end` copied unchanged. Every entry of an `Error` gets its own node's span, the
+   validation errors of rule 3 and a runtime error that names a node alike. It is absent otherwise: when the
+   envelope carried no `spans`; when the node has no span of its own, an ancestor's span not standing in for
+   it; when `path` is empty or names no node (`/params/<i>`, `/spans/<i>`, a §4.2.4 parameter path); and for
+   every error the tree decoder raises before it has read the `spans`, which follow the statement in the
+   encoding ([QT] §12.2), so a statement that does not decode carries no span.
+   *Rationale: a span is the front end's claim about one node, and only the node's own range points at the
+   text the error is about; an ancestor's range would point at more source than the error names, so a
+   front end that wants coarser spans gives them to the nodes it means.*
 5. `retryable` is true iff `entries[0].code` is marked retryable in `errors.md` (the `T1…` codes, `W2004`, `W2008`,
    `W4001`, `S1001` and `S1007`). A retryable error MUST guarantee that the request had no effect,
    and for a transaction-aborting code that the transaction had no effect ([ISO] §5.2).

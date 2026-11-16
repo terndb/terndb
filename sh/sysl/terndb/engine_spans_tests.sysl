@@ -1,0 +1,155 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Source spans on errors, through the wire (`wire-protocol.md` §8.1 rule 4): an error about a node
+// carries the range the envelope's `spans` gave that node, and an error about no node, or about a
+// node with no span of its own, carries none. An envelope that does not decode has no spans to give.
+
+/** `env` with a span for every one of its nodes: node `i` covers `[100 + 10i, 103 + 10i)`. */
+sp_spanned(env: Envelope) -> Envelope
+    val spans = buf[Span]()
+    for i in 0..<node_paths(env).len()
+        spans.push(Span(u64(i), sp_start(i), sp_start(i) + 3))
+
+    var out = env
+    out.spans = Some(spans)
+    out
+
+sp_start(i: usize) -> u64 = u64(100 + 10 * i)
+
+/** The span `sp_spanned` gives the node of `env` at `path`, which must be one of its nodes. */
+sp_span_of(env: Envelope, path: string) -> Option[SourceRange]
+    val paths = node_paths(env)
+    for i in 0..<paths.len()
+        if paths[i] == path then return Some(SourceRange(sp_start(i), sp_start(i) + 3))
+
+    assert(false, s"a node at $path")
+    None
+
+/** The primary entry of the `Error` that executing `env` (spanned) in an implicit transaction gives. */
+sp_error(env: Envelope) -> ErrorEntry
+    var d = ew_duo(ew_blog())
+    ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env))))).entries[0]
+
+@test
+a_name_resolution_error_carries_the_span_of_its_node()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", col("u", "nope"))]))
+    val e = sp_error(env)
+    assert_eq(e.code, "Q2003")
+    assert_eq(e.path, "/statement/rel/items/0/1")
+    assert(e.span == sp_span_of(env, e.path), "the column's span")
+
+@test
+an_unknown_table_carries_the_span_of_its_scan()
+    val env = query([], project(scan("app", "nope", "u"), "r", [item("x", col("u", "id"))]))
+    val e = sp_error(env)
+    assert_eq(e.code, "Q2001")
+    assert_eq(e.path, "/statement/rel/input")
+    assert(e.span == sp_span_of(env, e.path), "the scan's span")
+
+@test
+a_type_error_deep_in_an_expression_carries_the_span_of_the_inner_call()
+    val inner = call("add", [col("u", "id"), Literal(Text, Text("x"))])
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", call("add", [ew_lit(1), call("mul", [ew_lit(2), inner])]))]))
+    val e = sp_error(env)
+    assert_eq(e.code, "Q3002")
+    assert_eq(e.path, "/statement/rel/items/0/1/args/1/args/1")
+    assert(e.span == sp_span_of(env, e.path), "the inner call's span, not an ancestor's")
+
+@test
+an_error_in_a_subquery_carries_the_span_of_its_node_inside_the_subquery()
+    val sub = filter(scan("app", "posts", "p"), eq(col("p", "author_id"), col("u", "nope")))
+    val env = query([], Filter(scan("app", "users", "u"), Exists(sub)))
+    val e = sp_error(env)
+    assert_eq(e.code, "Q2003")
+    assert_eq(e.path, "/statement/rel/predicate/rel/predicate/args/1")
+    assert(e.span == sp_span_of(env, e.path), "the subquery column's span")
+
+@test
+every_entry_of_a_phase_carries_its_own_span()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", col("u", "nope")), item("y", col("u", "gone"))]))
+    var d = ew_duo(ew_blog())
+    val err = ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env)))))
+    assert_eq(err.entries.len(), 2)
+    assert_eq(err.entries[1].path, "/statement/rel/items/1/1")
+    assert(err.entries[0].span == sp_span_of(env, "/statement/rel/items/0/1"), "the first column's span")
+    assert(err.entries[1].span == sp_span_of(env, "/statement/rel/items/1/1"), "the second column's span")
+
+@test
+an_error_inside_an_explicit_transaction_carries_its_span_and_aborts_it()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", col("u", "nope"))]))
+    var d = ew_duo(ew_blog())
+    assert_eq(ew_kinds(d.seen(d.send(Begin(1, no_txn_options())))), "begun")
+    val err = ew_error(d.seen(d.send(ew_exec(1, sp_spanned(env)))))
+    assert_eq(err.entries[0].code, "Q2003")
+    assert(err.entries[0].span == sp_span_of(env, "/statement/rel/items/0/1"), "the column's span")
+    assert(err.txn_state == Aborted, "aborted")
+
+@test
+an_error_about_no_node_carries_no_span()
+    // A declared parameter never referenced is about `/params/0`, which is no node.
+    val env = query([ParamDecl(Some("n"), Int64)], project(scan("app", "users", "u"), "r", [item("x", col("u", "id"))]))
+    var d = ew_duo(ew_blog())
+    val err = ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env), [Int(1)]))))
+    assert_eq(err.entries[0].code, "Q4002")
+    assert_eq(err.entries[0].path, "/params/0")
+    assert(err.entries[0].span.is_none(), "no span")
+
+@test
+a_node_without_a_span_of_its_own_gets_none_from_its_ancestors()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", col("u", "nope"))]))
+    var only_root = env
+    only_root.spans = Some(items_of([Span(0, 0, 40), Span(1, 0, 40)]))
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, only_root)))).entries[0]
+    assert_eq(e.code, "Q2003")
+    assert(e.span.is_none(), "no span of its own")
+
+@test
+an_envelope_without_spans_gives_errors_without_spans()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", col("u", "nope"))]))
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, env)))).entries[0]
+    assert_eq(e.code, "Q2003")
+    assert(e.span.is_none(), "no spans, no span")
+
+@test
+a_decode_error_carries_no_span_since_the_spans_were_never_read()
+    // The binder `zz` made invalid UTF-8: the statement does not decode, so the spans after it
+    // are never reached.
+    val bytes = encode_envelope(sp_spanned(query([], scan("app", "users", "zz")))).unwrap()
+    var hit = false
+    for i in 0..<bytes.len() - 2
+        if bytes[i] == 2 && bytes[i + 1] == u8('z') && bytes[i + 2] == u8('z')
+            bytes[i + 1] = 0xff
+            bytes[i + 2] = 0xff
+            hit = true
+            break
+    assert(hit, "the binder's octets")
+
+    var d = ew_duo(ew_blog())
+    val m = ExecuteMsg(Execute(0, None, no_exec_options(), bytes, ew_params(query([], scan("app", "users", "zz")), [buf[Value]()]), None))
+    val e = ew_error(d.seen(d.send(m))).entries[0]
+    assert_eq(e.code, "Q1004")
+    assert_eq(e.path, "/statement/rel")
+    assert(e.span.is_none(), "no span")
+
+@test
+a_malformed_span_is_refused_at_its_own_path_with_no_span()
+    var env = query([], project(scan("app", "users", "u"), "r", [item("x", col("u", "id"))]))
+    env.spans = Some(items_of([Span(0, 0, 4), Span(1, 9, 3)]))
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, env)))).entries[0]
+    assert_eq(e.code, "Q1001")
+    assert_eq(e.path, "/spans/1")
+    assert(e.span.is_none(), "no span")
+
+@test
+a_runtime_error_of_a_spanned_statement_names_no_node_and_carries_no_span()
+    val env = query([], project(scan("app", "users", "u"), "r", [item("x", call("div", [col("u", "id"), ew_lit(0)]))]))
+    var d = ew_duo(ew_blog())
+    val e = ew_error(d.seen(d.send(ew_exec(0, sp_spanned(env))))).entries[0]
+    assert(e.code.starts_with("R"), s"a runtime code: ${e.code}")
+    assert(e.span == (if e.path.len == 0 then None else sp_span_of(env, e.path)), "a span only with a node's path")
