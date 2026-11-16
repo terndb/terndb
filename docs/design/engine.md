@@ -35,7 +35,16 @@ The store is single-threaded and answers `Wait(holder)` rather than blocking, ha
 statement is then **parked**: `next` answers `NotYet` while `holder` is live, and runs the statement again
 from its start once it is not. The session asks again at every arrival and every tick, which is
 `wire-protocol.md` §7.5. A cycle is refused by the store with `deadlock_detected` before anything parks. A DDL
-statement parks the same way on another transaction's catalog lock (`ddl.md` §6.1).
+statement parks the same way on another transaction's catalog lock (`ddl.md` §6.1). A holder that rolls back to
+a savepoint lets the locks of the span go while it stays live (`wire-protocol.md` §5.5 rule 5), so a parked
+statement also runs again whenever the store's count of such rollbacks (`Store.released`) has moved since it
+parked.
+
+## Savepoints
+
+`savepoint`, `rollback_to` and `release` are the store's (`store.md` § Savepoints); the session keeps the names
+and refuses an unknown one with `W2012` before the engine sees it, and a failure the store answers aborts the
+transaction like any error. Tests: `engine_savepoint_tests.sysl`.
 
 ## Transactional DDL
 
@@ -58,7 +67,6 @@ changed, so a statement cached under one transaction's uncommitted table is `W20
   see which added a check, not-null or referencing foreign-key constraint, a column whose default is not its fill
   (or a generated or filling column), or a foreign key referencing a table it removed or changed rows of, aborts
   with `schema_changed` instead of being reconciled, since the store cannot evaluate expressions.
-- **Savepoints** are refused with `unsupported_request` (`W2018`), since the store keeps none.
 - **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
   column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
   expression applied on read. Translation (`store.md`) applies the lossless conversions only.

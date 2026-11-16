@@ -1,0 +1,406 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Savepoints through the wire against the engine (`wire-protocol.md` §5.3 and §5.5, `isolation.md`
+// §4.3 and §5.1, `ddl.md` §9 rule 1): nested savepoints rolled back to the middle one; a rollback to
+// a savepoint undoing inserts, updates, deletes, a unique-key value, a cascade, a deferred check and
+// DDL; release; an error inside a span, which a rollback to the savepoint clears unless its code is
+// retryable; a serializable transaction's reads after a savepoint staying logged; the locks taken
+// after a savepoint let go, and those taken before kept; a shadowed name; and sequence draws kept.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+private sp_fk(name: string, target: string, action: FkAction, deferred: bool) -> ConstraintDef =
+    ConstraintDef(name, ForeignKey(items_of(["pid"]), cat_q(target), items_of(["id"]), action, action, deferred))
+
+private sp_pid() -> [2]Field = [Field("id", Int64), Field("pid", Int64)]
+
+private sp_email() -> [2]Field = [Field("id", Int64), Field("email", Text)]
+
+/** An engine holding `parent(id)` with rows 1 and 2; `child(id, pid?)` referencing it in cascade,
+ * with rows (10, 1) and (20, 2); `later(id, pid?)` referencing it by a deferred `no_action` key;
+ * `u(id, email?)` unique on `email`, holding (1, 'x'); and the sequence `seq`.
+ */
+private sp_engine() -> &Engine
+    val e = ew_engine()
+    val pid = [cat_col("id", Int64), cat_col("pid", nullable(Int64))]
+    ew_setup(e, [ew_app(),
+        envelope([], cat_table("parent", [cat_col("id", Int64)], ["id"])),
+        envelope([], cat_table("child", pid, ["id"], [sp_fk("child_fk", "parent", FkCascade, false)])),
+        envelope([], cat_table("later", pid, ["id"], [sp_fk("later_fk", "parent", FkNoAction, true)])),
+        envelope([], cat_table("u", [cat_col("id", Int64), cat_col("email", nullable(Text))], ["id"], [cat_unique("u_email", ["email"])])),
+        envelope([], CreateSequence(cat_q("seq"), SequenceDef(Int64, None, None, None, None, false, None), false)),
+        ew_insert("parent", [Field("id", Int64)], [rec([Int(1)]), rec([Int(2)])]),
+        ew_insert("child", sp_pid(), [rec([Int(10), Int(1)]), rec([Int(20), Int(2)])]),
+        ew_insert("u", sp_email(), [rec([Int(1), Text("x")])])])
+    e
+
+/** `select id from app.<table>`. */
+private sp_all(table: string) -> Envelope = query([], project(scan("app", table, "t"), "r", [item("id", col("t", "id"))]))
+
+/** `insert into app.u values (<id>, <email>)`. */
+private sp_user(id: i128, email: string) -> Envelope = ew_insert("u", sp_email(), [rec([Int(id), Text(email)])])
+
+/** `insert into app.parent values (<id>)`. */
+private sp_parent(id: i128) -> Envelope = ew_insert("parent", [Field("id", Int64)], [rec([Int(id)])])
+
+private sp_where(id: i128) -> Option[Expr] = Some(eq(col("t", "id"), ew_lit(id)))
+
+/** `delete from app.<table> where id = <id>`. */
+private sp_delete(table: string, id: i128) -> Envelope = envelope([], Delete(cat_q(table), "t", None, None, sp_where(id), buf[Item]()))
+
+/** `update app.u set email = <email> where id = <id>`. */
+private sp_set_email(id: i128, email: string) -> Envelope =
+    envelope([], Update(cat_q("u"), "t", None, None, sp_where(id), items_of([item("email", cat_text(email))]), buf[Item]()))
+
+/** `select next_value('app', 'seq') from app.parent where id = 2`. */
+private sp_draw() -> Envelope =
+    query([], project(filter(scan("app", "parent", "t"), eq(col("t", "id"), ew_lit(2))), "r", [item("n", call("next_value", [cat_text("app"), cat_text("seq")]))]))
+
+/** The first column of each row, space-separated. */
+private sp_str(rows: Buf[Value]) -> string
+    var out = ""
+
+    for r in rows
+        val n = r match
+            Record(fs) -> st_int(fs[0])
+            _ -> -1
+        out = if out.len == 0 then s"$n" else s"$out $n"
+
+    out
+
+/** The ids of `table` as transaction `txn` of `d` sees them. */
+private sp_ids_in(d: *Duo, txn: u64, table: string) -> string = sp_str(ew_rows(d.seen(d.send(ew_exec(txn, sp_all(table))))))
+
+/** The ids of `table`, committed. */
+private sp_ids(e: &Engine, table: string) -> string
+    var d = ew_duo(e)
+    sp_ids_in(&d, 0, table)
+
+private sp_ok(d: *Duo, m: Message, file: string = __FILE__, line: long = __LINE__) = assert_eq(ew_kinds(d.seen(d.send(m))), "ok", "", file, line)
+
+// -- nesting, release and names (§5.5) -------------------------------------------------------------
+
+@test
+nested_savepoints_roll_back_to_the_middle_one()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    d.kinds_of(1, sp_parent(3))
+    sp_ok(&d, Savepoint(1, "a"))
+    d.kinds_of(1, sp_parent(4))
+    sp_ok(&d, Savepoint(1, "b"))
+    d.kinds_of(1, sp_parent(5))
+    sp_ok(&d, Savepoint(1, "c"))
+    d.kinds_of(1, sp_parent(6))
+
+    sp_ok(&d, RollbackToSavepoint(1, "b"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2 3 4")
+    // `b` is kept and `c`, set after it, is gone.
+    d.kinds_of(1, sp_parent(7))
+    sp_ok(&d, RollbackToSavepoint(1, "b"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2 3 4")
+    val gone = ew_error(d.seen(d.send(RollbackToSavepoint(1, "c"))))
+    assert(gone.entries[0].code == "W2012" && gone.txn_state == Aborted, "an unknown savepoint aborts")
+
+    // Every savepoint predates that error, so rolling back to `a` clears it.
+    sp_ok(&d, RollbackToSavepoint(1, "a"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2 3")
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "committed")
+    assert_eq(sp_ids(e, "parent"), "1 2 3")
+
+@test
+release_keeps_the_effects_and_a_rollback_to_an_outer_savepoint_undoes_them()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    sp_ok(&d, Savepoint(1, "a"))
+    d.kinds_of(1, sp_parent(3))
+    sp_ok(&d, Savepoint(1, "b"))
+    d.kinds_of(1, sp_parent(4))
+    sp_ok(&d, ReleaseSavepoint(1, "b"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2 3 4")
+    assert_eq(ew_kinds(d.seen(d.send(ReleaseSavepoint(1, "b")))), "W2012")
+    sp_ok(&d, RollbackToSavepoint(1, "a"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2")
+
+    // Releasing the outer savepoint forgets the inner one too, keeping both spans' work.
+    sp_ok(&d, Savepoint(1, "x"))
+    d.kinds_of(1, sp_parent(5))
+    sp_ok(&d, Savepoint(1, "y"))
+    d.kinds_of(1, sp_parent(6))
+    sp_ok(&d, ReleaseSavepoint(1, "x"))
+    assert_eq(ew_kinds(d.seen(d.send(RollbackToSavepoint(1, "y")))), "W2012")
+    assert_eq(ew_kinds(d.seen(d.send(Rollback(1)))), "ok")
+    assert_eq(sp_ids(e, "parent"), "1 2")
+
+    d.send(Begin(2, no_txn_options()))
+    sp_ok(&d, Savepoint(2, "x"))
+    d.kinds_of(2, sp_parent(5))
+    sp_ok(&d, ReleaseSavepoint(2, "x"))
+    assert_eq(ew_kinds(d.seen(d.send(Commit(2)))), "committed")
+    assert_eq(sp_ids(e, "parent"), "1 2 5")
+
+@test
+a_reused_name_shadows_the_older_savepoint_until_it_is_released()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    sp_ok(&d, Savepoint(1, "s"))
+    d.kinds_of(1, sp_parent(3))
+    sp_ok(&d, Savepoint(1, "s"))
+    d.kinds_of(1, sp_parent(4))
+
+    // The newer `s` answers to the name.
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2 3")
+
+    // Released, it uncovers the older one.
+    sp_ok(&d, ReleaseSavepoint(1, "s"))
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2")
+    sp_ok(&d, ReleaseSavepoint(1, "s"))
+    assert_eq(ew_kinds(d.seen(d.send(ReleaseSavepoint(1, "s")))), "W2012")
+
+// -- what a rollback to a savepoint undoes ---------------------------------------------------------
+
+@test
+a_rollback_to_a_savepoint_undoes_inserts_updates_deletes_a_unique_value_and_a_cascade()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    // Written before the savepoint, and kept.
+    assert_eq(d.kinds_of(1, sp_user(2, "w")), "header complete")
+    sp_ok(&d, Savepoint(1, "s"))
+
+    assert_eq(d.kinds_of(1, sp_user(3, "y")), "header complete")
+    assert_eq(d.kinds_of(1, sp_set_email(1, "z")), "header complete")
+    assert_eq(d.kinds_of(1, sp_set_email(2, "v")), "header complete")
+    assert_eq(d.kinds_of(1, sp_delete("parent", 1)), "header complete")
+    assert_eq(sp_ids_in(&d, 1, "child"), "20")
+    assert_eq(sp_ids_in(&d, 1, "u"), "1 2 3")
+
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    assert_eq(sp_ids_in(&d, 1, "u"), "1 2")
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2")
+    // The cascade's delete went with the delete that caused it.
+    assert_eq(sp_ids_in(&d, 1, "child"), "10 20")
+
+    // 'y' and 'v' are free again; 'x' and 'w', which the rollback restored and kept, are not.
+    assert_eq(d.kinds_of(1, sp_user(4, "y")), "header complete")
+    assert_eq(d.kinds_of(1, sp_user(5, "v")), "header complete")
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "committed")
+    assert_eq(sp_ids(e, "u"), "1 2 4 5")
+    assert_eq(d.kinds_of(0, sp_user(6, "x")), "header T3001")
+    assert_eq(d.kinds_of(0, sp_user(6, "w")), "header T3001")
+    assert_eq(d.kinds_of(0, sp_user(6, "z")), "header complete")
+
+@test
+a_rollback_to_a_savepoint_undoes_a_deferred_check_taken_after_it()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    sp_ok(&d, Savepoint(1, "s"))
+    // A reference to no parent, checked only at commit.
+    assert_eq(d.kinds_of(1, ew_insert("later", sp_pid(), [rec([Int(1), Int(99)])])), "header complete")
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    assert_eq(d.kinds_of(1, ew_insert("later", sp_pid(), [rec([Int(2), Int(1)])])), "header complete")
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "committed")
+    assert_eq(sp_ids(e, "later"), "2")
+
+    // Without the rollback the same check fails the commit.
+    d.send(Begin(2, no_txn_options()))
+    sp_ok(&d, Savepoint(2, "s"))
+    d.kinds_of(2, ew_insert("later", sp_pid(), [rec([Int(3), Int(99)])]))
+    assert_eq(ew_kinds(d.seen(d.send(Commit(2)))), "T3003")
+
+@test
+ddl_inside_a_span_is_rolled_back_and_ddl_before_it_is_kept()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    var other = ew_duo(e)
+    val x = ew_table("x", [Field("id", Int64), Field("v", Int64)], "id")
+    val y = ew_table("y", [Field("id", Int64)], "id")
+
+    d.send(Begin(1, no_txn_options()))
+    assert_eq(d.kinds_of(1, y), "header complete")
+    sp_ok(&d, Savepoint(1, "s"))
+    assert_eq(d.kinds_of(1, x), "header complete")
+    assert_eq(d.kinds_of(1, ew_insert("x", [Field("id", Int64), Field("v", Int64)], [rec([Int(1), Int(10)])])), "header complete")
+    assert_eq(d.kinds_of(1, sp_delete("parent", 2)), "header complete")
+    assert_eq(d.kinds_of(1, envelope([], DropTable(cat_q("later"), false, false))), "header complete")
+
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    // `later` is back with its rows untouched, `x` is gone, and its name is free again.
+    assert_eq(sp_ids_in(&d, 1, "later"), "")
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2")
+    assert_eq(d.kinds_of(1, x), "header complete")
+    assert_eq(sp_ids_in(&d, 1, "x"), "")
+    assert_eq(other.kinds_of(0, sp_all("y")), "Q2001")
+
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "committed")
+    assert_eq(sp_ids(e, "x"), "")
+    assert_eq(sp_ids(e, "y"), "")
+    assert_eq(other.kinds_of(0, ew_insert("later", sp_pid(), [rec([Int(1), Int(1)])])), "header complete")
+    assert_eq(sp_ids(e, "later"), "1")
+
+@test
+sequence_draws_are_not_undone_by_a_rollback_to_a_savepoint()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    sp_ok(&d, Savepoint(1, "s"))
+    assert_eq(sp_str(ew_rows(d.seen(d.send(ew_exec(1, sp_draw()))))), "1")
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    assert_eq(sp_str(ew_rows(d.seen(d.send(ew_exec(1, sp_draw()))))), "2")
+
+// -- errors inside a span (§5.3) ---------------------------------------------------------------------
+
+@test
+an_error_inside_a_span_is_cleared_by_rolling_back_to_its_savepoint()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    var b = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    d.kinds_of(1, sp_parent(3))
+    sp_ok(&d, Savepoint(1, "s"))
+    d.kinds_of(1, sp_parent(4))
+
+    val dup = ew_error(d.seen(d.send(ew_exec(1, sp_user(9, "x")))))
+    assert(dup.entries[0].code == "T3001" && dup.txn_state == Aborted, "the span's error aborts the transaction")
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(1, sp_all("parent"))))), "W2003")
+    assert_eq(ew_kinds(d.seen(d.send(Savepoint(1, "t")))), "W2003")
+
+    // Aborted, it still holds what it wrote: another writer of row 3 waits.
+    val s = b.send(ew_exec(0, ew_insert("parent", [Field("id", Int64)], [rec([Int(3)])])))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    sp_ok(&d, RollbackToSavepoint(1, "s"))
+    assert_eq(sp_ids_in(&d, 1, "parent"), "1 2 3")
+    d.kinds_of(1, sp_parent(5))
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "committed")
+    assert_eq(sp_ids(e, "parent"), "1 2 3 5")
+    // Row 3 committed after the waiter's snapshot (isolation.md §4.2 rule 4).
+    b.tick(5)
+    assert_eq(ew_kinds(b.seen(s)), "header T1001")
+
+@test
+an_aborted_transaction_with_a_savepoint_lets_its_locks_go_when_rolled_back()
+    val e = sp_engine()
+    var d = ew_duo(e)
+    var b = ew_duo(e)
+    d.send(Begin(1, no_txn_options()))
+    d.kinds_of(1, sp_parent(3))
+    sp_ok(&d, Savepoint(1, "s"))
+    d.kinds_of(1, sp_user(9, "x"))
+    val s = b.send(ew_exec(0, sp_parent(3)))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    // The commit of the aborted transaction names its error and rolls it back.
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "T3001")
+    b.tick(5)
+    assert_eq(ew_kinds(b.seen(s)), "header complete")
+    assert_eq(sp_ids(e, "parent"), "1 2 3")
+
+@test
+a_retryable_error_inside_a_span_aborts_the_whole_transaction()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, ew_level(Snapshot)))
+    a.kinds_of(1, ew_set_on(2, ew_lit(5)))
+    sp_ok(&a, Savepoint(1, "s"))
+    assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(7))), "header complete")
+
+    // First-updater-wins: the transaction is aborted and had no effect (isolation.md §5.2).
+    val lost = ew_error(a.seen(a.send(ew_exec(1, ew_set_on(1, ew_lit(9))))))
+    assert(lost.entries[0].code == "T1001" && lost.retryable && lost.txn_state == Aborted, "retryable, aborted")
+    assert_eq(ew_on_of(e, 2), 1)
+    // Its write before the savepoint is gone already: another writer of the row does not wait.
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(3))), "header complete")
+
+    val back = ew_error(a.seen(a.send(RollbackToSavepoint(1, "s"))))
+    assert(back.entries[0].code == "W2003" && back.txn_state == Aborted, "no savepoint survives")
+    val commit = ew_error(a.seen(a.send(Commit(1))))
+    assert(commit.entries[0].code == "T1001" && commit.txn_state == Closed, "the commit names it")
+    assert_eq(ew_on_of(e, 1), 7)
+
+// -- serializable reads and locks --------------------------------------------------------------------
+
+@test
+reads_after_a_savepoint_stay_logged_through_a_rollback_to_it()
+    for read in [true, false]
+        val e = ew_doctors()
+        var a = ew_duo(e)
+        var b = ew_duo(e)
+        a.send(Begin(1, ew_level(Serializable)))
+        // A write before the savepoint, so that the commit is validated.
+        a.kinds_of(1, ew_set_on(2, ew_lit(5)))
+        sp_ok(&a, Savepoint(1, "s"))
+        if read then assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ew_on_call())))).len(), 1)
+        sp_ok(&a, RollbackToSavepoint(1, "s"))
+
+        // b takes doctor 1 off call; a's read of who is on call saw doctor 1.
+        assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(0))), "header complete")
+        val last = a.seen(a.send(Commit(1)))
+
+        if read
+            assert_eq(ew_error(last).entries[0].code, "T1001")
+            assert_eq(ew_on_of(e, 2), 1)
+        else
+            assert_eq(ew_kinds(last), "committed")
+            assert_eq(ew_on_of(e, 2), 5)
+
+@test
+locks_taken_after_a_savepoint_are_let_go_by_a_rollback_to_it_and_earlier_ones_are_kept()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    var c = ew_duo(e)
+    val rc = Some(ew_level(ReadCommitted))
+    // At snapshot: at serializable the span's update of doctor 1 stays logged, and b's write of it
+    // would fail a's commit.
+    a.send(Begin(1, ew_level(Snapshot)))
+    a.kinds_of(1, ew_add_on(2, 10))
+    sp_ok(&a, Savepoint(1, "s"))
+    a.kinds_of(1, ew_add_on(1, 10))
+
+    val one = b.send(ew_exec(0, ew_add_on(1, 100), [], no_exec_options(), rc))
+    val two = c.send(ew_exec(0, ew_add_on(2, 100), [], no_exec_options(), rc))
+    assert_eq(ew_kinds(b.seen(one)), "header")
+    assert_eq(ew_kinds(c.seen(two)), "header")
+
+    // Doctor 1's lock was taken after the savepoint: b runs while a is still live.
+    sp_ok(&a, RollbackToSavepoint(1, "s"))
+    b.tick(5)
+    c.tick(5)
+    assert_eq(ew_kinds(b.seen(one)), "header complete")
+    assert_eq(ew_on_of(e, 1), 101)
+    // Doctor 2's was taken before it, and is held to a's end.
+    assert_eq(ew_kinds(c.seen(two)), "header")
+
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    c.tick(10)
+    assert_eq(ew_kinds(c.seen(two)), "header complete")
+    assert_eq(ew_on_of(e, 2), 111)
+
+@test
+a_catalog_lock_taken_after_a_savepoint_is_let_go_by_a_rollback_to_it()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    val add = envelope([], AlterTable(cat_q("doc"), items_of([AddColumn(cat_col("z", nullable(Int64)))])))
+    a.send(Begin(1, no_txn_options()))
+    sp_ok(&a, Savepoint(1, "s"))
+    assert_eq(a.kinds_of(1, add), "header complete")
+
+    b.send(Begin(1, ew_level(ReadCommitted)))
+    val s = b.send(ew_exec(1, add))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+    sp_ok(&a, RollbackToSavepoint(1, "s"))
+    b.tick(5)
+    assert_eq(ew_kinds(b.seen(s)), "header complete")
+    assert_eq(ew_kinds(b.seen(b.send(Commit(1)))), "committed")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")

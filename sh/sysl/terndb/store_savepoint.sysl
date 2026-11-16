@@ -1,0 +1,156 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Savepoints in the store (`wire-protocol.md` §5.5, `isolation.md` §4.3 and §5.1). A savepoint is a
+// mark in its transaction's undo log, write set, lock-only locks and deferred checks, with how many
+// DDL statements and catalog locks the transaction had then. Rolling back to it undoes what came
+// after: the row versions (whose unique-index entries are judged by the versions, so they lapse
+// with them), the DDL, the foreign-key checks deferred and the locks taken. The predicate log and
+// the catalog read are kept, since the reads happened; sequence draws are kept, since a sequence is
+// not transactional (`ddl.md` §2.7 rule 5).
+
+/** One savepoint of a transaction: its name, the mark of the transaction's undo log, writes, locks
+ * and deferred checks when it was set, and how many DDL statements and catalog locks it had then.
+ */
+struct Save
+    name: string
+    mark: Mark
+    steps: usize
+    cat_locks: usize
+
+impl Store
+    /** Sets savepoint `name` in `t`; one set before with the same name is shadowed by it until it is
+     * released or rolled back past (§5.5 rule 1).
+     */
+    savepoint(*self, t: &Txn, name: string) -> Result[unit, CodecError]
+        live(t)?
+        t.saves.push(Save(name, mark_of(t), self.ddl_steps(t), self.cat_locks_of(t)))
+        Ok(())
+
+    /** Undoes everything `t` did after savepoint `name` and keeps the savepoint (§5.5 rule 2): its
+     * row writes, DDL, deferred checks, and the row, lock-only and catalog locks taken since, which
+     * are let go. An aborted transaction becomes live again, since every savepoint predates its
+     * error. One a retryable error aborted was rolled back whole (`fail_txn`) and stays aborted:
+     * `W2003`. An unknown name is `W2012`.
+     */
+    rollback_to(*self, t: &Txn, name: string) -> Result[unit, CodecError]
+        t.state match
+            CommittedAt(_) -> return fail("W2001", "the transaction has already committed")
+            AbortedWith(_) -> if !self.holds(t) then return fail("W2003", "the transaction was aborted whole, past every savepoint")
+            Live -> ()
+
+        val i = save_index(t, name) match
+            Some(i) -> i
+            None -> return fail("W2012", s"no savepoint $name is set")
+
+        val sp = t.saves[i]
+        undo_to(t, sp.mark)
+        t.saves.truncate(i + 1)
+        t.state = Live
+        t.waits_for = 0
+        t.mark = mark_of(t)
+
+        self.rollback_catalog(t, sp.steps, sp.cat_locks) match
+            Ok(_) -> ()
+            Err(e) ->
+                self.rollback(t, e.code)
+                return Err(e)
+
+        // A statement parked on a lock let go runs again; its wait-for edge is dropped until it
+        // waits again.
+        for a in self.active
+            if a.waits_for == t.id then a.waits_for = 0
+
+        self.released += 1
+        Ok(())
+    end rollback_to
+
+    /** Forgets savepoint `name` and every one set after it, keeping their effects (§5.5 rule 3). An
+     * unknown name is `W2012`.
+     */
+    release(*self, t: &Txn, name: string) -> Result[unit, CodecError]
+        live(t)?
+
+        save_index(t, name) match
+            Some(i) ->
+                t.saves.truncate(i)
+                Ok(())
+            None -> fail("W2012", s"no savepoint $name is set")
+
+    /** How many savepoints `t` has set and not released. */
+    savepoints(self, t: &Txn) -> usize = t.saves.len()
+
+    /** An error of `code` inside `t`, which aborts it (`isolation.md` §5.1). With a savepoint set and
+     * a code that is not retryable, `t` keeps its writes, locks and DDL, so that rolling back to the
+     * savepoint can take back only what came after it; until then it is aborted, and its locks are
+     * held. Otherwise, and for a retryable code, which guarantees the transaction had no effect
+     * (§5.2), it is rolled back whole at once.
+     */
+    private[terndb] fail_txn(*self, t: &Txn, code: string)
+        if t.saves.len() > 0 && !is_retryable_code(code)
+            t.state = AbortedWith(code)
+            t.waits_for = 0
+        else
+            self.rollback(t, code)
+
+    /** Whether `t` is still among the live transactions: live, or aborted and holding its writes. */
+    private[terndb] holds(self, t: &Txn) -> bool
+        for a in self.active
+            if a.id == t.id then return true
+
+        false
+
+    private ddl_steps(self, t: &Txn) -> usize = self.txn_catalog(t.id) match
+        Some(c) -> c.steps.len()
+        None -> 0
+
+    private cat_locks_of(self, t: &Txn) -> usize
+        var n: usize = 0
+
+        for l in self.cat.locks
+            if l.txid == t.id then n += 1
+
+        n
+
+    // `t`'s catalog side as it was when it had run `steps` DDL statements and held `locks` catalog
+    // locks: the later statements dropped, its view made again from the earlier ones (with the oids
+    // they handed out), and the later locks let go. The catalog read stays.
+    private rollback_catalog(*self, t: &Txn, steps: usize, locks: usize) -> Result[unit, CodecError]
+        val c = self.txn_catalog(t.id) match
+            Some(c) -> c
+            None -> return Ok(())
+
+        if c.steps.len() > steps
+            c.steps.truncate(steps)
+
+            if steps == 0
+                c.own = None
+            else
+                val b = self.base_at(c.base)
+                c.own = Some(self.replay(c.steps, b.catalog)?)
+
+        val kept = buf[CatLock]()
+        var mine: usize = 0
+
+        for l in self.cat.locks
+            if l.txid != t.id
+                kept.push(l)
+            elif mine < locks
+                kept.push(l)
+                mine += 1
+
+        self.cat.locks = kept
+        self.enter(t)
+    end rollback_catalog
+end Store
+
+// The newest savepoint of `t` named `name`, which shadows any older one of that name.
+private save_index(t: &Txn, name: string) -> Option[usize]
+    var i = t.saves.len()
+
+    while i > 0
+        i -= 1
+        if t.saves[i].name == name then return Some(i)
+
+    None

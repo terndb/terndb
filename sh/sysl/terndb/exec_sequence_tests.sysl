@@ -270,6 +270,16 @@ an_alter_without_a_restart_commits_onto_the_position_draws_have_reached()
     xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 3))), [25, 26, 27])
 
 @test
+an_alter_rolled_back_to_a_savepoint_never_takes_effect()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    s.savepoint(t, "a").unwrap()
+    xq_ddl(s, t, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, false, None), Some(20)))
+    s.rollback_to(t, "a").unwrap()
+    assert(s.commit(t).is_ok())
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 2))), [10, 15])
+
+@test
 draws_around_a_rolled_back_alter_never_repeat_a_value()
     val s = xq_store()
     xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 1))), [10])

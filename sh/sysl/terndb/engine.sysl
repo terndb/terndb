@@ -40,8 +40,8 @@ private struct Checked
 
 /** A started statement: its transaction (its own when `implicit`), the statement and its bound
  * parameter tuples, the next tuple to run, the row count of each tuple run so far, the batches of
- * the last tuple run and how many of them are handed out, and the transaction whose row lock it is
- * parked on (0 for none).
+ * the last tuple run and how many of them are handed out, the transaction whose row lock it is
+ * parked on (0 for none), and the store's count of savepoint rollbacks when it parked.
  */
 private struct Running
     cursor: u64
@@ -56,6 +56,7 @@ private struct Running
     ready: Buf[Buf[u8]]
     at: usize
     holder: u64
+    released: u64
 
 /** The database a server serves: its store (which holds the catalog), the statement time `now()`
  * answers, in microseconds since the epoch, which the server sets, the explicit transactions open on
@@ -342,7 +343,7 @@ impl Executor for EngineConn
 
         val cursor = self.engine.next_cursor
         self.engine.next_cursor += 1
-        self.running.push(Running(cursor, t, s.txid == 0, c.env, params, s.options, c.result, 0, buf(), buf(), 0, 0))
+        self.running.push(Running(cursor, t, s.txid == 0, c.env, params, s.options, c.result, 0, buf(), buf(), 0, 0, 0))
         Ok(Started(cursor, ResultHeader(t.id, t.snapshot, c.shape, c.result)))
 
     next(*self, cursor: u64) -> Result[Produced, Failure]
@@ -357,13 +358,15 @@ impl Executor for EngineConn
 
             if r.tuple == r.params.tuples.len() then return Ok(NoMore)
 
-            // A parked statement stays parked while the holder of its row lock is live (§7.5).
-            if r.holder != 0 && self.engine.is_live(r.holder) then return Ok(NotYet)
+            // A parked statement stays parked while the holder of its row lock is live (§7.5) and
+            // has let no lock go by rolling back to a savepoint.
+            if r.holder != 0 && self.engine.is_live(r.holder) && r.released == self.engine.store.released then return Ok(NotYet)
             r.holder = 0
 
             self.run_tuple(r) match
                 Ok(Some(h)) ->
                     r.holder = h
+                    r.released = self.engine.store.released
                     return Ok(NotYet)
                 Ok(None) -> ()
                 Err(f) ->
@@ -402,17 +405,26 @@ impl Executor for EngineConn
                 val _ = self.engine.store.abort(t)
             Err(_) -> ()
 
-    // The in-memory store keeps no savepoints (`docs/design/store.md`), so a savepoint request is
-    // refused with `unsupported_request`, which aborts the transaction like any error (§5.3 rule 1).
-    savepoint(*self, txid: u64, name: string) -> Result[unit, Failure] = Err(no_savepoints())
+    // The savepoint requests are the store's (`store_savepoint.sysl`); a failure of one aborts the
+    // transaction like any error (§5.3 rule 1).
+    savepoint(*self, txid: u64, name: string) -> Result[unit, Failure]
+        val t = self.engine.explicit(txid)?
+        saved(self.engine.store, t, self.engine.store.savepoint(t, name))
 
-    rollback_to(*self, txid: u64, name: string) -> Result[unit, Failure] = Err(no_savepoints())
+    rollback_to(*self, txid: u64, name: string) -> Result[unit, Failure]
+        val t = self.engine.explicit(txid)?
+        saved(self.engine.store, t, self.engine.store.rollback_to(t, name))
 
-    release(*self, txid: u64, name: string) -> Result[unit, Failure] = Err(no_savepoints())
+    release(*self, txid: u64, name: string) -> Result[unit, Failure]
+        val t = self.engine.explicit(txid)?
+        saved(self.engine.store, t, self.engine.store.release(t, name))
 
     status(*self, txid: u64) -> Result[Outcome, Failure] = Ok(self.engine.status(txid))
 
-private no_savepoints() -> Failure = failure("W2018", "this server keeps no savepoints")
+/** The answer to a savepoint request on `t`: a failure aborts `t` like any error (§5.3 rule 1). */
+private saved(s: &Store, t: &Txn, r: Result[unit, CodecError]) -> Result[unit, Failure] = r match
+    Ok(_) -> Ok(())
+    Err(e) -> Err(failure_in(s.abort_with(t, e), t, None))
 
 /** The failure of every error in `es`, in their order. */
 private failure_all(es: Buf[CodecError]) -> Failure

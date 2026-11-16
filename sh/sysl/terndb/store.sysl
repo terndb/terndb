@@ -118,7 +118,9 @@ struct Mark
  * the current statement's), its state, its predicate log (serializable only), its writes, one per
  * row, and the transaction whose row lock it is waiting for (0 for none); the rows it holds a
  * lock on without having written them (`LOCK_ONLY`, `ddl.md` §2.6 rule 3), the foreign-key checks
- * deferred to its commit, and the undo log and mark of its current statement.
+ * deferred to its commit, the undo log and mark of its current statement, and its savepoints, oldest
+ * first (`store_savepoint.sysl`). While a savepoint is set the undo log runs from the oldest one,
+ * not from the current statement.
  */
 struct Txn
     id: u64
@@ -133,6 +135,7 @@ struct Txn
     deferred: Buf[Deferred]
     undo: Buf[Undo]
     mark: Mark
+    saves: Buf[Save]
 
 /** A row a read returned: its key and its version visible to the reader. */
 struct Hit
@@ -179,10 +182,14 @@ struct Store
     active: Buf[&Txn]
     history: Buf[CommittedWrites]
     cat: CatalogVersions
+    /** How many times a live transaction has let locks go by rolling back to a savepoint, so that a
+     * statement waiting for one of them runs again although its holder is still live.
+     */
+    released: u64
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
-        val t: &Txn = Txn(self.next_txid, level, read_only, self.horizon, Live, buf(), buf(), 0, buf(), buf(), buf(), Mark(0, 0, 0, 0))
+        val t: &Txn = Txn(self.next_txid, level, read_only, self.horizon, Live, buf(), buf(), 0, buf(), buf(), buf(), Mark(0, 0, 0, 0), buf())
         self.next_txid += 1
         self.active.push(t)
         t
@@ -192,7 +199,7 @@ struct Store
      */
     statement(*self, t: &Txn)
         if t.state == Live && t.level == ReadCommitted then t.snapshot = self.horizon
-        t.undo.clear()
+        if t.saves.len() == 0 then t.undo.clear()
         t.mark = mark_of(t)
 
     /** Undoes everything the current statement (begun by `statement`) wrote, locked and deferred, so
@@ -262,11 +269,11 @@ struct Store
     /** Whether `t` may run a statement: `W2001` once it has committed, `W2003` once it is aborted. */
     usable(self, t: &Txn) -> Result[unit, CodecError] = live(t)
 
-    /** `e`, raised inside `t` outside the store: it aborts `t` with its code (§5.1), unless `t` has
-     * already ended.
+    /** `e`, raised inside `t` outside the store: it aborts `t` with its code (§5.1, `fail_txn`),
+     * unless `t` has already ended.
      */
     abort_with(*self, t: &Txn, e: CodecError) -> CodecError
-        if t.state == Live then self.rollback(t, e.code)
+        if t.state == Live then self.fail_txn(t, e.code)
         e
 
     /** Commits `t` and answers its commit sequence number, or, for a transaction with an empty write
@@ -279,6 +286,7 @@ struct Store
             Live -> ()
             CommittedAt(_) -> return fail("W2001", "the transaction has already committed")
             AbortedWith(code) ->
+                if self.holds(t) then self.rollback(t, code)
                 if code.len == 0 then return fail("W2003", "the transaction was rolled back")
                 return fail(code, "the transaction was aborted")
 
@@ -326,12 +334,14 @@ struct Store
         Ok(c)
     end commit
 
-    /** Rolls `t` back at the client's request. Its writes are undone; none was ever visible. */
+    /** Rolls `t` back at the client's request. Its writes are undone; none was ever visible. An
+     * aborted transaction still holding its writes for a savepoint (`fail_txn`) lets them go now.
+     */
     abort(*self, t: &Txn) -> Result[unit, CodecError]
         t.state match
             Live -> self.rollback(t, "")
             CommittedAt(_) -> return fail("W2001", "the transaction has already committed")
-            AbortedWith(_) -> ()
+            AbortedWith(code) -> if self.holds(t) then self.rollback(t, code)
 
         Ok(())
 
@@ -698,7 +708,7 @@ struct Store
     private[terndb] guard[T](*self, t: &Txn, r: Result[T, CodecError]) -> Result[T, CodecError] = r match
         Ok(v) -> Ok(v)
         Err(e) ->
-            if t.state == Live then self.rollback(t, e.code)
+            if t.state == Live then self.fail_txn(t, e.code)
             Err(e)
 
     // Undoes `t`'s writes, newest version of each of its rows first; none was ever visible.
@@ -710,6 +720,7 @@ struct Store
                 s.lock = 0
 
         release_locks(t)
+        t.saves.clear()
         t.state = AbortedWith(code)
         self.retire(t)
 
@@ -746,7 +757,7 @@ private fill_of(fill: Option[Expr]) -> Value = fill match
     _ -> Null
 
 /** A store over `catalog`'s tables, empty. */
-mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf(), catalog_versions(catalog))
+mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf(), catalog_versions(catalog), 0)
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow

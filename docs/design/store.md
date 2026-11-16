@@ -119,6 +119,28 @@ Any error inside a transaction aborts it with that error's code (§5.1); later o
 `transaction_aborted` (`W2003`), and its `commit` answers the code that aborted it. Operations on a committed
 transaction answer `unknown_transaction` (`W2001`), the handle being closed.
 
+## Savepoints
+
+`store_savepoint.sysl` (`wire-protocol.md` §5.5); tests `store_savepoint_tests.sysl`, and through the wire
+`engine_savepoint_tests.sysl`.
+
+- **A savepoint** is a `Save` in `Txn.saves`: its name, the `Mark` of the undo log, writes, `LOCK_ONLY` locks and
+  deferred checks when it was set, and how many DDL statements and catalog locks the transaction had. While one
+  is set, `statement` keeps the undo log instead of clearing it, so the log reaches back to the oldest savepoint.
+  The newest savepoint of a name answers to it.
+- **`rollback_to(t, name)`** runs `undo_to` from the savepoint's mark — the versions installed after it are popped
+  or restored (their row locks going with them), the writes, lock-only locks and deferred checks taken after it
+  dropped — so a unique-key entry the span installed matches no version any more and lapses. Its catalog side
+  drops the later DDL steps, makes its view again from the earlier ones with their oids (`replay`), and lets go
+  of the catalog locks taken since. The predicate log and the catalog read are kept, and so are sequence draws.
+  It drops the wait-for edges of the transactions waiting for `t` and bumps `Store.released`, so that a statement
+  parked on a released lock runs again.
+- **An error inside a span** (`fail_txn`, which `guard` and `abort_with` call) aborts `t` but, while a savepoint is
+  set and the code is not retryable, keeps its versions, locks and DDL in place: `t` stays among the live
+  transactions, holding its locks, until `rollback_to` makes it live again or `abort`/`commit` rolls it back
+  whole. A retryable code rolls it back whole at once, past every savepoint (`isolation.md` §5.2), and a later
+  `rollback_to` answers `W2003`.
+
 `Faults` switches validation or first-updater-wins off, the fault-injected builds §7.1 requires so that each
 anomaly check is shown able to fail; a real store has both on.
 
@@ -177,8 +199,7 @@ per-row latches and a real wait) is the next slice of this work.
 ## Deferred
 
 - Disk, WAL, the buffer manager and recovery (waiting on sysl's CRC32C and io_uring gaps); `transaction_status`.
-- `lock_timeout` (no clock seam yet), savepoints, `max_predicate_log` coarsening, `max_snapshot_age` and undo
-  purge.
+- `lock_timeout` (no clock seam yet), `max_predicate_log` coarsening, `max_snapshot_age` and undo purge.
 - Translation of a value whose representation a lossless retype changes other than integer to float (to
   `decimal`, `json` to `text`); the commit latch of `ddl.md` §6.1 rule 3, which a single-threaded store does not
   need.
