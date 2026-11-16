@@ -88,7 +88,7 @@ three_inputs_fold_from_the_left()
     xn_check(xs_of(Except, false, ["a", "c", "b"]), rows_of([xs_r(3, "c")]), "except twice")
 
 @test
-an_empty_input_on_either_side()
+a_set_operation_with_an_empty_input_on_either_side()
     for all in [true, false]
         val a = if all then xs_a() else rows_of([xs_r(1, "a"), xs_r(2, "b"), xs_r(3, "c"), xs_null()])
         xn_check(xs_of(Union, all, ["a", "e"]), a, "a union e")
