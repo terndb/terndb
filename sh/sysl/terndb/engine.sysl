@@ -10,7 +10,8 @@ import sysl.buf.{Buf, buf}
 // types — and run when its first batch is asked for: a query or DML statement through `run_statement`,
 // a DDL statement through `Store.ddl`, within its transaction. A statement that must wait for another
 // transaction's row lock or catalog lock is parked, answering `NotYet`, and run again once the holder
-// has ended (`wire-protocol.md` §7.5).
+// has ended, or failed with `lock_timeout` once it has waited its transaction's `lock_timeout_ms` on
+// the engine's `Clock` (`wire-protocol.md` §7.5).
 
 /** A transaction that committed through the engine, and its commit number, absent when its write
  * set was empty (`wire-protocol.md` §5.4 rule 1).
@@ -41,7 +42,8 @@ private struct Checked
 /** A started statement: its transaction (its own when `implicit`), the statement and its bound
  * parameter tuples, the next tuple to run, the row count of each tuple run so far, the batches of
  * the last tuple run and how many of them are handed out, the transaction whose row lock it is
- * parked on (0 for none), and the store's count of savepoint rollbacks when it parked.
+ * parked on (0 for none), the store's count of savepoint rollbacks when it parked, its transaction's
+ * `lock_timeout_ms`, and the clock reading when its current wait began.
  */
 private struct Running
     cursor: u64
@@ -57,16 +59,25 @@ private struct Running
     at: usize
     holder: u64
     released: u64
+    lock_timeout_ms: Option[u64]
+    since: Option[u64]
+
+/** An explicit transaction open on some connection, and the `lock_timeout_ms` it began with. */
+private struct Opened
+    txn: &Txn
+    lock_timeout_ms: Option[u64]
 
 /** The database a server serves: its store (which holds the catalog), the statement time `now()`
- * answers, in microseconds since the epoch, which the server sets, the explicit transactions open on
- * any connection, the commits made through it, and the plan cache.
+ * answers, in microseconds since the epoch, which the server sets, the clock a row-lock wait is
+ * measured on, the explicit transactions open on any connection, the commits made through it, and
+ * the plan cache.
  */
 struct Engine
     store: &Store
     now: i64
+    clock: &Clock
     private next_cursor: u64
-    private open: Buf[&Txn]
+    private open: Buf[Opened]
     private ended: Buf[Ended]
     private cache: Buf[Cached]
 
@@ -180,15 +191,22 @@ struct Engine
 
     /** The open explicit transaction `txid`. */
     private explicit(self, txid: u64) -> Result[&Txn, Failure]
-        for t in self.open
-            if t.id == txid then return Ok(t)
+        for o in self.open
+            if o.txn.id == txid then return Ok(o.txn)
 
         Err(failure("W2001", s"no transaction $txid is open"))
 
+    /** The `lock_timeout_ms` explicit transaction `txid` began with; absent bounds no wait. */
+    private lock_timeout(self, txid: u64) -> Option[u64]
+        for o in self.open
+            if o.txn.id == txid then return o.lock_timeout_ms
+
+        None
+
     private close(*self, txid: u64)
-        val left = buf[&Txn]()
-        for t in self.open
-            if t.id != txid then left.push(t)
+        val left = buf[Opened]()
+        for o in self.open
+            if o.txn.id != txid then left.push(o)
         self.open = left
 
     /** Whether transaction `txid` is live: a parked statement waits while its holder is. */
@@ -225,8 +243,10 @@ struct Engine
         if self.is_live(txid) then Outcome(InProgress, None) else Outcome(Aborted, None)
 end Engine
 
-/** An engine over a database whose catalog is `catalog` and which holds no rows yet. */
-engine(catalog: MemCatalog, now: i64) -> &Engine = Engine(mem_store(catalog), now, 1, buf(), buf(), buf())
+/** An engine over a database whose catalog is `catalog` and which holds no rows yet, measuring
+ * row-lock waits on `clock`.
+ */
+engine(catalog: MemCatalog, now: i64, clock: &Clock) -> &Engine = Engine(mem_store(catalog), now, clock, 1, buf(), buf(), buf())
 
 /** One connection to an engine, of role `role`: the `Executor` its server session drives. */
 struct EngineConn
@@ -245,6 +265,23 @@ struct EngineConn
         for r in self.running
             if r.cursor != cursor then left.push(r)
         self.running = left
+
+    /** `NotYet` for parked statement `r` while its wait is shorter than its `lock_timeout_ms`; once it
+     * has waited that long it fails with `lock_timeout` and aborts its transaction, which a retryable
+     * code rolls back whole (`wire-protocol.md` §7.5 rule 5).
+     */
+    private waiting(*self, r: &Running) -> Result[Produced, Failure]
+        val limit = r.lock_timeout_ms match
+            Some(ms) -> ms
+            None -> return Ok(NotYet)
+
+        val waited = self.engine.clock.now_ms() - r.since.unwrap_or(0)
+        if waited < limit then return Ok(NotYet)
+
+        self.drop(r.cursor)
+        val tuple = if r.params.tuples.len() > 1 then Some(u64(r.tuple)) else None
+        val e = CodecError("T1003", "", s"waited $waited ms for a lock transaction ${r.holder} holds", buf())
+        Err(failure_in(self.engine.store.abort_with(r.txn, e), r.txn, tuple))
 
     /** Runs `r`'s next tuple, answering the holder of the row lock it is parked on, if it must wait.
      * A failure aborts its transaction (§5.3 rule 1; an implicit one is rolled back).
@@ -297,7 +334,7 @@ impl Executor for EngineConn
 
     begin(*self, options: TxnOptions) -> Result[Begun, Failure]
         val t = self.engine.begin(options)?
-        self.engine.open.push(t)
+        self.engine.open.push(Opened(t, options.lock_timeout_ms))
         Ok(Begun(t.id, t.snapshot, t.level))
 
     start(*self, s: Invocation) -> Result[Started, Failure]
@@ -343,7 +380,8 @@ impl Executor for EngineConn
 
         val cursor = self.engine.next_cursor
         self.engine.next_cursor += 1
-        self.running.push(Running(cursor, t, s.txid == 0, c.env, params, s.options, c.result, 0, buf(), buf(), 0, 0, 0))
+        val lock_timeout = if s.txid == 0 then s.implicit.lock_timeout_ms else self.engine.lock_timeout(s.txid)
+        self.running.push(Running(cursor, t, s.txid == 0, c.env, params, s.options, c.result, 0, buf(), buf(), 0, 0, 0, lock_timeout, None))
         Ok(Started(cursor, ResultHeader(t.id, t.snapshot, c.shape, c.result)))
 
     next(*self, cursor: u64) -> Result[Produced, Failure]
@@ -360,15 +398,16 @@ impl Executor for EngineConn
 
             // A parked statement stays parked while the holder of its row lock is live (§7.5) and
             // has let no lock go by rolling back to a savepoint.
-            if r.holder != 0 && self.engine.is_live(r.holder) && r.released == self.engine.store.released then return Ok(NotYet)
+            if r.holder != 0 && self.engine.is_live(r.holder) && r.released == self.engine.store.released then return self.waiting(r)
             r.holder = 0
 
             self.run_tuple(r) match
                 Ok(Some(h)) ->
                     r.holder = h
                     r.released = self.engine.store.released
-                    return Ok(NotYet)
-                Ok(None) -> ()
+                    if r.since.is_none() then r.since = Some(self.engine.clock.now_ms())
+                    return self.waiting(r)
+                Ok(None) -> r.since = None
                 Err(f) ->
                     self.drop(cursor)
                     return Err(f)

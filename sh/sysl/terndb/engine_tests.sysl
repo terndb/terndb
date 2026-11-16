@@ -8,18 +8,29 @@ import sysl.buf.{Buf, buf}
 // as an encoded tree envelope with an encoded parameter block, and every result is read back from
 // the `Batch` payloads the client accepted.
 
-/** An engine with an empty catalog: every table a test uses is made by DDL over the wire. */
-ew_engine() -> &Engine = engine(mem_catalog(), 1700000000000000)
+/** A clock a test sets by hand: it reads `ms` until the test moves it. */
+struct ManualClock
+    ms: u64
 
-/** A connected client whose server session runs on `e`, as the bootstrap role. The `Duo`'s own fake
- * engine is left unused.
+impl Clock for ManualClock
+    now_ms(self) -> u64 = self.ms
+
+/** An engine with an empty catalog, measuring waits on `clock`: every table a test uses is made by
+ * DDL over the wire.
  */
-ew_duo(e: &Engine) -> Duo
+ew_engine(clock: &Clock = ManualClock(0)) -> &Engine = engine(mem_catalog(), 1700000000000000, clock)
+
+/** A connected client whose server session runs on `e`, as the bootstrap role, its connection
+ * defaults `defaults`. The `Duo`'s own fake engine is left unused.
+ */
+ew_duo(e: &Engine, defaults: SessionDefaults = no_session_defaults()) -> Duo
     val authority = sx_authority()
     val pre = buf[u8]()
     push_preface(pre)
 
-    var d = Duo(client_session(sx_client_config("alice", [ScramPlus]), 0), server_session(sx_server_config(), e.connect(BootstrapRole), authority, 0),
+    var cc = sx_client_config("alice", [ScramPlus])
+    cc.defaults = defaults
+    var d = Duo(client_session(cc, 0), server_session(sx_server_config(), e.connect(BootstrapRole), authority, 0),
         sx_engine(), authority, reassembler(Client), reassembler(Server), pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(),
         false, false, None, None)
     d.connect()

@@ -1,0 +1,19 @@
+module sh.sysl.terndb
+
+import sysl.posix.time.monotonic
+import sysl.time.whole_millis
+
+// The engine's clock: what a row-lock wait is measured on (`wire-protocol.md` §7.5 rule 3). Only the
+// difference of two readings means anything, so a clock counts milliseconds from an origin it need
+// not name, and never goes backwards.
+
+/** A clock a wait is measured on, in milliseconds from an origin of its own. */
+trait Clock
+    now_ms(self) -> u64
+
+/** The host's monotonic clock, which nothing can set. */
+struct MonotonicClock
+end MonotonicClock
+
+impl Clock for MonotonicClock
+    now_ms(self) -> u64 = u64(whole_millis(monotonic()))

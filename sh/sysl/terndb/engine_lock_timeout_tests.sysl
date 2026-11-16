@@ -1,0 +1,195 @@
+module sh.sysl.terndb
+@tests
+
+// `lock_timeout_ms` through the wire against the engine (`wire-protocol.md` §7.5 rule 5): a statement
+// parked on a row lock fails with `lock_timeout` once it has waited that long on the engine's clock,
+// set from `Begin`, from an implicit transaction's options or from the connection's defaults; a
+// shorter wait runs once the holder ends; no setting waits for ever, and 0 does not wait at all.
+
+/** Transaction options at `level` whose `lock_timeout_ms` is `ms`. */
+lt_options(ms: Option[u64], level: Isolation = ReadCommitted) -> TxnOptions = TxnOptions(Some(level), None, None, None, ms, None, None)
+
+/** An implicit `update doc set on = on + 100 where id = <id>` with `lock_timeout_ms` `ms`. */
+lt_bump(id: i128, ms: Option[u64]) -> Message = ew_exec(0, ew_add_on(id, 100), [], no_exec_options(), Some(lt_options(ms)))
+
+@test
+a_wait_as_long_as_the_lock_timeout_fails_and_aborts_the_explicit_transaction()
+    val clock: &ManualClock = ManualClock(0)
+    val e = ew_doctors(clock)
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    assert_eq(ew_kinds(b.seen(b.send(Begin(1, lt_options(Some(50)))))), "begun")
+    assert_eq(ew_kinds(b.seen(b.send(ew_exec(1, ew_add_on(2, 100))))), "header complete")
+    val s = b.send(ew_exec(1, ew_add_on(1, 100)))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    clock.ms = 49
+    b.tick(49)
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    clock.ms = 50
+    b.tick(50)
+    val err = ew_error(b.seen(s))
+    assert_eq(err.entries[0].code, "T1003")
+    assert(err.retryable && err.txn_state == Aborted, "retryable, the transaction aborted")
+    assert_eq(ew_kinds(b.seen(b.send(Commit(1)))), "T1003")
+
+    // The transaction had no effect: its earlier update is undone, and the holder is untouched.
+    assert_eq(ew_on_of(e, 2), 1)
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    assert_eq(ew_on_of(e, 1), 11)
+
+@test
+an_implicit_statement_that_times_out_rolls_its_transaction_back()
+    val clock: &ManualClock = ManualClock(0)
+    val e = ew_doctors(clock)
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val s = b.send(lt_bump(1, Some(30)))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+    clock.ms = 30
+    b.tick(30)
+    val err = ew_error(b.seen(s))
+    assert_eq(err.entries[0].code, "T1003")
+    assert(err.retryable && err.txn_state == Unaffected && err.txid.is_some(), "the implicit transaction rolled back")
+
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    assert_eq(ew_on_of(e, 1), 11)
+
+@test
+the_connection_default_bounds_a_wait_and_begin_overrides_it()
+    val clock: &ManualClock = ManualClock(0)
+    val e = ew_doctors(clock)
+    var a = ew_duo(e)
+    var b = ew_duo(e, SessionDefaults(None, None, Some(20), None, None))
+    var c = ew_duo(e, SessionDefaults(None, None, Some(20), None, None))
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val sb = b.send(ew_exec(0, ew_add_on(1, 100), [], no_exec_options(), Some(ew_level(ReadCommitted))))
+    c.send(Begin(1, lt_options(Some(100))))
+    val sc = c.send(ew_exec(1, ew_add_on(1, 1000)))
+
+    clock.ms = 20
+    b.tick(20)
+    c.tick(20)
+    assert_eq(ew_error(b.seen(sb)).entries[0].code, "T1003")
+    assert_eq(ew_kinds(c.seen(sc)), "header")
+
+    // c's own 100 ms is not spent, so it runs once the holder commits.
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    c.tick(25)
+    assert_eq(ew_kinds(c.seen(sc)), "header complete")
+    assert_eq(ew_kinds(c.seen(c.send(Commit(1)))), "committed")
+    assert_eq(ew_on_of(e, 1), 1011)
+
+@test
+a_wait_shorter_than_the_lock_timeout_runs_when_the_holder_commits()
+    val clock: &ManualClock = ManualClock(0)
+    val e = ew_doctors(clock)
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val s = b.send(lt_bump(1, Some(100)))
+    clock.ms = 99
+    b.tick(99)
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    b.tick(99)
+    val got = b.seen(s)
+    assert_eq(ew_kinds(got), "header complete")
+    assert(ew_complete(got).1.is_some(), "committed")
+    assert_eq(ew_on_of(e, 1), 111)
+
+@test
+no_lock_timeout_waits_for_ever()
+    val clock: &ManualClock = ManualClock(0)
+    val e = ew_doctors(clock)
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val s = b.send(lt_bump(1, None))
+    // The engine's clock moves a long way; the session's stays inside its idle time.
+    clock.ms = 1000000000
+    b.tick(10)
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    b.tick(20)
+    assert_eq(ew_kinds(b.seen(s)), "header complete")
+    assert_eq(ew_on_of(e, 1), 111)
+
+@test
+a_lock_timeout_of_zero_fails_without_waiting()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val err = ew_error(b.seen(b.send(lt_bump(1, Some(0)))))
+    assert_eq(err.entries[0].code, "T1003")
+    assert(err.retryable && err.txn_state == Unaffected, "rolled back")
+
+    // A row nobody holds is written at once, the bound being only on a wait.
+    assert_eq(ew_kinds(b.seen(b.send(lt_bump(2, Some(0))))), "header complete")
+    assert_eq(ew_on_of(e, 2), 101)
+
+@test
+deadlock_detection_wins_over_a_lock_timeout_that_is_already_spent()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    b.send(Begin(1, lt_options(Some(0), Serializable)))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+    b.send(ew_exec(1, ew_add_on(2, 10)))
+
+    val sa = a.send(ew_exec(1, ew_add_on(2, 100)))
+    assert_eq(ew_kinds(a.seen(sa)), "header")
+
+    // b's wait would close the cycle: that is refused before it parks, so its timeout never applies.
+    val err = ew_error(b.seen(b.send(ew_exec(1, ew_add_on(1, 100)))))
+    assert_eq(err.entries[0].code, "T1002")
+    assert(err.retryable && err.txn_state == Aborted, "the waiter is the victim")
+
+    a.tick(5)
+    assert_eq(ew_kinds(a.seen(sa)), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+
+@test
+a_statement_that_parks_again_on_a_new_holder_goes_on_with_the_same_wait()
+    val clock: &ManualClock = ManualClock(0)
+    val e = ew_doctors(clock)
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    var c = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val s = b.send(lt_bump(1, Some(50)))
+    clock.ms = 40
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+
+    // c takes the lock before b runs again, so b's run parks on c, 40 ms into its wait.
+    c.send(Begin(1, no_txn_options()))
+    assert_eq(ew_kinds(c.seen(c.send(ew_exec(1, ew_add_on(1, 1000))))), "header complete")
+    b.tick(40)
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    clock.ms = 50
+    b.tick(50)
+    assert_eq(ew_error(b.seen(s)).entries[0].code, "T1003")
+    assert_eq(ew_kinds(c.seen(c.send(Commit(1)))), "committed")
+    assert_eq(ew_on_of(e, 1), 1011)

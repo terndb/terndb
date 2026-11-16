@@ -1036,6 +1036,16 @@ server MAY close a connection with no traffic for a configured idle time after s
    transaction is then rolled back if implicit, and aborted if explicit (§7.3 rule 1).
 4. A wait that would close a cycle of waiting transactions is not parked: the statement fails with
    `deadlock_detected` and its transaction aborts ([ISO] §4.2 rule 1), which ends the holder's wait on it.
+   Deadlock detection therefore comes before rule 5, whatever the `lock_timeout_ms`.
+5. `lock_timeout_ms` (from the transaction's `TxnOptions`, else the connection default, §5.2 rule 2) bounds
+   the wait: once a statement has waited that long it fails with `lock_timeout` and its transaction aborts,
+   the code being retryable, so the whole transaction is rolled back — an implicit one is unaffected, an
+   explicit one aborted ([ISO] §5.2). The wait begins when the statement first parks and lasts until a run
+   of it gets past the lock; a run again (rule 2) that parks once more, on the same holder or another,
+   goes on with the same wait. `0` means the statement does not wait at all, failing at once where it
+   would park; an absent value, the server's default, bounds no wait. The server MUST end a statement
+   whose wait is spent no later than its next processing of the connection after that (rule 2), and the
+   wait is measured on a clock that never goes backwards.
 
 ## 8. Errors
 
