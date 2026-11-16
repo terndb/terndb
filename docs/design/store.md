@@ -2,7 +2,7 @@
 
 `sh/sysl/terndb/store.sysl` is the table store of the in-memory mode and its multi-version concurrency control:
 `isolation.md` §4.1–§4.5 and the abort rules and codes of §5. The executor runs statements against it
-(`executor.md` §4.4) through `scan_rows`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
+(`executor.md` §4.5) through `scan_rows`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
 workloads at each level, and each forbidden anomaly again on a fault-injected store).
 
 ## Structure
@@ -89,5 +89,5 @@ per-row latches and a real wait) is the next slice of this work.
   in its own version, and the executor reads it as the current one until it translates it. Catalog versioning under MVCC and `schema_changed` from
   catalog validation (§5.6).
 - Secondary indexes, unique constraints other than the primary key (so an upsert's target must be the primary
-  key) and foreign keys. Check and NOT NULL constraints are checked by the executor (`executor.md` §4.4).
+  key) and foreign keys. Check and NOT NULL constraints are checked by the executor (`executor.md` §4.5).
 - Term bits in transaction ids and commit numbers (`replication.md` §1.4).

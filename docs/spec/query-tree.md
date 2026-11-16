@@ -577,7 +577,10 @@ Removes duplicates under `same`. The output is a bag with the input's binders.
 `op` is `union`, `intersect` or `except`; `all` selects multiset (`true`) or set (`false`) semantics.
 `inputs` holds at least two relations (`Q5009`), each with the same number of columns (`Q3010`);
 columns unify positionally to their common type (§4.2, `Q3010`); output names are the first input's.
-Duplicates are judged by `same`. The output is a bag; `union all` of lists is a bag.
+Duplicates are judged by `same`, so two nulls in one column are duplicates. The output is a bag;
+`union all` of lists is a bag. More than two inputs fold from the left: `op(a, b, c)` is
+`op(op(a, b), c)`, so `except` keeps the rows of the first input that no later input has, and an
+`intersect`/`except` with `all = true` counts a row's copies the same way, one fold at a time.
 
 ### 6.13 With and CteRef
 
@@ -587,16 +590,25 @@ Duplicates are judged by `same`. The output is a bag; `union all` of lists is a 
    own `rel`; in a recursive one, every CTE of the `With` is in scope in every `rel` and the body. The
    nearest enclosing `With` that defines a name is the one a reference names.
 2. Every `CteRef` of a non-recursive CTE observes one and the same value within a statement. The
-   planner MAY inline a CTE whose body is free of volatile functions.
+   planner MAY inline a CTE whose body is free of volatile functions. A CTE is evaluated at most once,
+   on its first read; a CTE no reference reads is never evaluated, so an error its `rel` would raise
+   (a division by zero, `R0005`) is never raised.
 3. With `recursive = true`, each CTE MUST declare `columns` (`Q5001`) and its `rel` MUST be a `SetOp`
    with `op = union` whose first input does not reference the CTE (the seed) and whose remaining inputs
-   each reference it exactly once (linear recursion), never inside an `Aggregate`, `Distinct`, the
-   null-supplying side of an outer join, an `anti` join's right input, or a `Relation` subquery
-   (`Q5001`). Mutual recursion is refused (`Q5001`).
+   each reference it exactly once (linear recursion) (`Q5001`). The reference MUST NOT stand where a
+   step's rows could not be computed from the previous step's new rows alone (`Q5001`): under an
+   `Aggregate`, a `Distinct` or a `Nest`; on the null-supplying side of an outer join (the right of
+   `left`, the left of `right`, either side of `full`); the right input of an `anti` or `single` join;
+   the right input of an `outer`, `anti` or `single` `Apply`; or anywhere inside an expression's
+   subquery (`Relation`, `Scalar`, `Exists`, `In`). The preserved side of an outer join, `Window`,
+   `Sort`, `Limit`, `Unnest` and `Tag` are allowed. A nested `With` that defines the same name hides
+   the outer CTE from the count. A CTE that reaches itself through another is mutual recursion and is
+   refused (`Q5001`).
 4. Evaluation iterates: the working set is the seed; each step evaluates the recursive inputs against
    the previous step's new rows; with `all = false`, rows `same` as any earlier row are discarded. It
    ends when a step yields no new rows. A server MAY bound the number of steps; exceeding the bound is
-   `R0005`.
+   `R0005`. TernDB's bound is 10000 steps that yield new rows: the step after the 10000th that still
+   yields new rows is `R0005`.
 
 ### 6.14 Nest and Unnest
 

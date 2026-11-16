@@ -21,6 +21,8 @@ struct SubPlan
     at: usize
     tables: Buf[MemTable]
     outer: Buf[Binder]
+    /** The CTEs in scope where the subtree stands (`exec_setop.sysl`). */
+    ctes: Buf[CteFrame]
     db: Option[Db]
 
 // -- correlated references ----------------------------------------------------------------------

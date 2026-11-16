@@ -4,7 +4,7 @@ import sysl.buf.{Buf, buf}
 import sysl.slices.contains
 
 // Statements run in a transaction of the in-memory store (`query-tree.md` §5, §9,
-// `docs/design/executor.md` §4.4): a query reads the store at the transaction's snapshot, and a DML
+// `docs/design/executor.md` §4.5): a query reads the store at the transaction's snapshot, and a DML
 // statement reads every row it needs first — its source, its targets, its conflicts and its
 // `returning` values — and then hands the store all of its writes at once, so that a statement that
 // must wait for a row lock writes nothing (`isolation.md` §4.2 rule 1). Any error aborts the
@@ -37,7 +37,7 @@ private run_in(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, 
         Query(r) ->
             var u = no_uses()
             u.add_rel(r, true)
-            var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), Some(u.db(s, t)), None)
+            var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), buf[CteFrame](), Some(u.db(s, t)), None)
             ran(typing.result, drain(flat_input(p.rel(r)))?)
         Insert(table, binder, old, columns, source, on_conflict, returning) ->
             run_insert(s, t, ctx, typing, table, binder, old, columns, source, on_conflict, returning)
@@ -441,7 +441,7 @@ private run_insert(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
 
     // The planner takes the types in the checker's order: the source, the conflict action's `set`
     // and `where`, then `returning`.
-    var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), Some(u.db(s, t)), None)
+    var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), buf[CteFrame](), Some(u.db(s, t)), None)
     val src = p.rel(source)
     val values = buf[TExpr]()
 
@@ -583,7 +583,7 @@ private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
     val db = u.db(s, t)
 
     // The checker's order: `from`, `filter`, `set`, `returning`.
-    var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), Some(db), None)
+    var p = Planner(typing.nodes, 0, ctx, buf[MemTable](), buf[Binder](), buf[CteFrame](), Some(db), None)
 
     val joined = from match
         Some(f) -> Some(p.rel(f))

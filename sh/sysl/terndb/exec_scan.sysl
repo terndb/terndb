@@ -3,7 +3,7 @@ module sh.sysl.terndb
 import sysl.buf.{Buf, buf}
 import sysl.slices.contains
 
-// `Scan` over the in-memory store (`query-tree.md` §6.1, `docs/design/executor.md` §4.4): a table's
+// `Scan` over the in-memory store (`query-tree.md` §6.1, `docs/design/executor.md` §4.5): a table's
 // rows visible at the transaction's snapshot, and the read recorded in a serializable transaction's
 // predicate log (`isolation.md` §4.3, §4.4) with the columns the statement uses of it.
 
