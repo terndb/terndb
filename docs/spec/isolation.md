@@ -491,7 +491,10 @@ a non-idempotent transaction. The harness uses the same query to resolve `info` 
   changed by a DDL committed during its lifetime MUST abort with `schema_changed` at commit (at read committed:
   at its next statement on `t` if that statement would plan against the dropped or changed definition, else at
   commit). This is validation of the catalog read, applied at every level. A DDL that changes nothing the
-  transaction read (an added column it never named, a new index) does not abort it.
+  transaction read (an added column it never named, a new index) does not abort it. A transaction whose write set
+  is empty — it wrote no row and no catalog entry — is serialized at its snapshot, before every DDL that committed
+  during it (§5.5), so its catalog read is not validated at commit; at read committed the statement rule above
+  still applies to it.
 - A transaction that wrote `t` and commits after a DDL on `t` that it did not see **reconciles** its writes with
   that DDL before its commit record (`ddl.md` §6.4): it maintains the new indexes, checks the new constraints and
   fills the new columns for the rows it wrote, and aborts if that fails.

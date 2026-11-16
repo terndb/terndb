@@ -1,0 +1,322 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Transactional DDL through the wire (`ddl.md` §9, `isolation.md` §5.6): a transaction's catalog
+// changes are its own until it commits and are undone when it rolls back or fails; two changes of one
+// object are ordered by its catalog lock; a writer whose catalog read a committed DDL changed aborts
+// with `schema_changed`, and one whose read it did not change commits; and a cached statement is not
+// run against a catalog version it was not validated for.
+
+/** `create table app.x (id int64, v int64) primary key (id)`. */
+private ed_create_x() -> Envelope = ew_table("x", [Field("id", Int64), Field("v", Int64)], "id")
+
+/** `insert into app.x values (<id>, <v>)`. */
+private ed_insert_x(id: i128, v: i128) -> Envelope = ew_insert("x", [Field("id", Int64), Field("v", Int64)], [rec([Int(id), Int(v)])])
+
+/** `select id from app.x`. */
+private ed_ids_x() -> Envelope = query([], project(scan("app", "x", "x"), "r", [item("id", col("x", "id"))]))
+
+/** `select <name> from app.doc`. */
+private ed_doc_col(name: string) -> Envelope = query([], project(scan("app", "doc", "d"), "r", [item(name, col("d", name))]))
+
+/** `alter table app.doc <actions>`. */
+private ed_alter(actions: []const AlterAction) -> Envelope = envelope([], AlterTable(cat_q("doc"), items_of(actions)))
+
+private ed_add(name: string) -> Envelope = ed_alter([AddColumn(cat_col(name, nullable(Int64)))])
+
+/** `ExecutePrepared` by digest of `ed_ids_x`, in `txn`. */
+private ed_digest(txn: u64) -> Message =
+    ExecutePreparedMsg(ExecutePrepared(txn, None, no_exec_options(), ByDigest(shape_digest(ed_ids_x()).unwrap()), ew_params(ed_ids_x(), [buf[Value]()])))
+
+@test
+a_table_created_in_a_rolled_back_transaction_is_gone_with_its_rows()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    val tables = e.store.tables.len()
+    val version = e.catalog_version()
+
+    a.send(Begin(1, no_txn_options()))
+    assert_eq(a.kinds_of(1, ed_create_x()), "header complete")
+    assert_eq(a.kinds_of(1, ed_insert_x(1, 10)), "header complete")
+    // The transaction sees its own table and row at once; nobody else does.
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ed_ids_x())))).len(), 1)
+    assert_eq(b.kinds_of(0, ed_ids_x()), "Q2001")
+    assert_eq(e.catalog_version(), version)
+
+    assert_eq(ew_kinds(a.seen(a.send(Rollback(1)))), "ok")
+    assert_eq(b.kinds_of(0, ed_ids_x()), "Q2001")
+    assert_eq(e.store.tables.len(), tables)
+    assert_eq(e.catalog_version(), version)
+
+    // The name is free again, and the new table holds nothing of the old one.
+    assert_eq(b.kinds_of(0, ed_create_x()), "header complete")
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, ed_ids_x())))).len(), 0)
+
+@test
+a_created_table_and_its_rows_are_seen_by_others_only_after_commit()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    a.kinds_of(1, ed_create_x())
+    a.kinds_of(1, ed_insert_x(1, 10))
+    a.kinds_of(1, ed_insert_x(2, 20))
+    assert_eq(b.kinds_of(0, ed_ids_x()), "Q2001")
+
+    // A DDL-only or DDL-and-data transaction wrote, so its commit has a number.
+    val committed = a.seen(a.send(Commit(1)))
+    assert_eq(ew_kinds(committed), "committed")
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, ed_ids_x())))).len(), 2)
+
+@test
+a_ddl_only_implicit_transaction_answers_its_commit_number()
+    var d = ew_duo(ew_doctors())
+    val (_, commit) = ew_complete(d.seen(d.send(ew_exec(0, ed_create_x()))))
+    assert(commit.is_some(), "a DDL statement writes the catalog")
+
+@test
+another_sessions_column_is_invisible_until_it_commits()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    assert_eq(a.kinds_of(1, ed_add("note")), "header complete")
+    assert_eq(a.kinds_of(1, ed_doc_col("note")), "header batch complete")
+    assert_eq(b.kinds_of(0, ed_doc_col("note")), "Q2003")
+
+    // A snapshot that predates the commit keeps the old definition after it too.
+    b.send(Begin(1, ew_level(Snapshot)))
+    assert_eq(b.kinds_of(1, ed_doc_col("on")), "header batch complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    assert_eq(b.kinds_of(1, ed_doc_col("note")), "Q2003")
+
+    var c = ew_duo(e)
+    assert_eq(c.kinds_of(0, ed_doc_col("note")), "header batch complete")
+
+@test
+a_writer_whose_column_a_committed_ddl_renamed_aborts_with_schema_changed()
+    for level in [Serializable, Snapshot, ReadCommitted]
+        val e = ew_doctors()
+        var a = ew_duo(e)
+        var b = ew_duo(e)
+
+        a.send(Begin(1, ew_level(level)))
+        assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(5))), "header complete")
+
+        // DDL waits for no writer of the table (`ddl.md` §6.1 rule 2).
+        assert_eq(b.kinds_of(0, ed_alter([RenameColumn("on", "duty")])), "header complete")
+
+        val err = ew_error(a.seen(a.send(Commit(1))))
+        assert_eq(err.entries[0].code, "T1004")
+        assert(err.retryable, "schema_changed is retryable")
+        assert_eq(b.kinds_of(0, ed_doc_col("duty")), "header batch complete")
+
+@test
+a_writer_whose_read_a_committed_ddl_did_not_change_commits()
+    for level in [Serializable, Snapshot, ReadCommitted]
+        val e = ew_doctors()
+        var a = ew_duo(e)
+        var b = ew_duo(e)
+
+        a.send(Begin(1, ew_level(level)))
+        assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(5))), "header complete")
+
+        // An added column, and an added unique key the row reconciles with (§6.3, §6.4).
+        assert_eq(b.kinds_of(0, ed_add("note")), "header complete")
+        assert_eq(b.kinds_of(0, ed_alter([AddConstraint(cat_unique("doc_on", ["on"]), false)])), "header complete")
+
+        assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+        assert_eq(ew_on_of(e, 1), 5)
+
+@test
+a_writer_that_breaks_a_unique_key_added_during_it_fails_reconciliation()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    // Doctor 1's `on` becomes 7 in a; b sets doctor 2's to 7 too and commits, then adds
+    // `unique (on)`, which a never saw.
+    a.send(Begin(1, ew_level(ReadCommitted)))
+    a.kinds_of(1, ew_set_on(1, ew_lit(7)))
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(7))), "header complete")
+    assert_eq(b.kinds_of(0, ed_alter([AddConstraint(cat_unique("doc_on", ["on"]), false)])), "header complete")
+
+    // a's row is checked against the new key at its commit (§6.4 rule 1).
+    assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T3001")
+    assert_eq(ew_on_of(e, 1), 1)
+
+@test
+a_reader_at_read_committed_meets_schema_changed_at_its_next_statement_on_the_table()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, ew_level(ReadCommitted)))
+    assert_eq(a.kinds_of(1, ed_doc_col("on")), "header batch complete")
+    b.kinds_of(0, ed_alter([RenameColumn("on", "duty")]))
+
+    // A statement on another table plans against nothing that changed.
+    val other = a.kinds_of(1, query([], project(scan("app", "acct", "a"), "r", [item("id", col("a", "id"))])))
+    assert(other.starts_with("header") && other.ends_with("complete"), s"the statement runs: $other")
+    assert_eq(a.kinds_of(1, ed_doc_col("duty")), "T1004")
+
+@test
+two_concurrent_alters_of_one_table_are_ordered_by_its_catalog_lock()
+    for level in [Serializable, Snapshot, ReadCommitted]
+        val e = ew_doctors()
+        var a = ew_duo(e)
+        var b = ew_duo(e)
+
+        a.send(Begin(1, ew_level(level)))
+        b.send(Begin(1, ew_level(level)))
+        assert_eq(a.kinds_of(1, ed_add("x")), "header complete")
+
+        // b's alter of the same table waits for a's catalog lock.
+        val s = b.send(ew_exec(1, ed_add("y")))
+        assert_eq(ew_kinds(b.seen(s)), "header")
+        assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+        b.tick(10)
+
+        if level == ReadCommitted
+            // Validated again against the newest catalog, it applies over a's change.
+            assert_eq(ew_kinds(b.seen(s)), "header complete")
+            assert_eq(ew_kinds(b.seen(b.send(Commit(1)))), "committed")
+            var c = ew_duo(e)
+            assert_eq(c.kinds_of(0, ed_doc_col("x")), "header batch complete")
+            assert_eq(c.kinds_of(0, ed_doc_col("y")), "header batch complete")
+        else
+            assert_eq(ew_kinds(b.seen(s)), "header T1001")
+
+@test
+alters_of_two_different_tables_both_commit()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    b.send(Begin(1, no_txn_options()))
+    assert_eq(a.kinds_of(1, ed_add("x")), "header complete")
+    assert_eq(b.kinds_of(1, envelope([], AlterTable(cat_q("acct"), items_of([AddColumn(cat_col("y", nullable(Int64)))])))), "header complete")
+    assert_eq(b.kinds_of(1, ed_create_x()), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    // b's DDL is applied again over a's commit, its new table keeping its oid and its rows.
+    assert_eq(b.kinds_of(1, ed_insert_x(1, 1)), "header complete")
+    assert_eq(ew_kinds(b.seen(b.send(Commit(1)))), "committed")
+
+    var c = ew_duo(e)
+    assert_eq(c.kinds_of(0, ed_doc_col("x")), "header batch complete")
+    assert_eq(ew_rows(c.seen(c.send(ew_exec(0, ed_ids_x())))).len(), 1)
+
+@test
+two_transactions_creating_one_name_are_ordered_by_its_lock()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    b.send(Begin(1, ew_level(ReadCommitted)))
+    a.kinds_of(1, ed_create_x())
+    val s = b.send(ew_exec(1, ed_create_x()))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    b.tick(10)
+    // At read committed the create is validated again and meets the committed table.
+    assert_eq(ew_kinds(b.seen(s)), "header Q6002")
+
+@test
+a_dropped_table_is_still_read_at_an_older_snapshot()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, ew_level(Snapshot)))
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ew_on_call())))).len(), 2)
+    assert_eq(b.kinds_of(0, envelope([], DropTable(cat_q("doc"), false, false))), "header complete")
+    assert_eq(b.kinds_of(0, ew_on_call()), "Q2001")
+
+    // The reader keeps reading at its snapshot, and, having written nothing, is serialized before
+    // the drop and commits (§5.5).
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ew_on_call())))).len(), 2)
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+
+    // Once nobody can see it, its rows go, at the end of the next transaction.
+    val tables = e.store.tables.len()
+    b.kinds_of(0, query([], project(scan("app", "acct", "a"), "r", [item("id", col("a", "id"))])))
+    assert_eq(e.store.tables.len(), tables - 1)
+
+    for d in e.store.tables
+        assert(e.store.latest_catalog().table_by_oid(d.oid).is_some(), "only rows of live tables are kept")
+
+@test
+a_writer_of_a_table_dropped_during_it_aborts_with_schema_changed()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, ew_level(Snapshot)))
+    a.kinds_of(1, ew_set_on(1, ew_lit(0)))
+    b.kinds_of(0, envelope([], DropTable(cat_q("doc"), false, false)))
+    assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T1004")
+
+@test
+an_error_later_in_the_transaction_rolls_back_its_earlier_ddl()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    a.kinds_of(1, ed_create_x())
+    a.kinds_of(1, ed_add("note"))
+    a.kinds_of(1, ed_insert_x(1, 1))
+    // A duplicate key aborts the transaction, and its DDL with it.
+    assert_eq(a.kinds_of(1, ed_insert_x(1, 2)), "header T3001")
+    assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T3001")
+
+    assert_eq(b.kinds_of(0, ed_ids_x()), "Q2001")
+    assert_eq(b.kinds_of(0, ed_doc_col("note")), "Q2003")
+    assert_eq(b.kinds_of(0, ed_create_x()), "header complete")
+
+@test
+a_failed_ddl_statement_aborts_the_transaction_and_its_earlier_ddl()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    a.kinds_of(1, ed_create_x())
+    assert_eq(a.kinds_of(1, ed_create_x()), "Q6002")
+    assert_eq(b.kinds_of(0, ed_ids_x()), "Q2001")
+
+@test
+a_ddl_statement_in_a_read_only_transaction_is_refused()
+    var a = ew_duo(ew_doctors())
+    a.send(Begin(1, TxnOptions(None, None, Some(true), None, None, None, None)))
+    assert_eq(a.kinds_of(1, ed_create_x()), "header T4001")
+
+@test
+a_cached_statement_is_not_run_against_a_catalog_version_it_was_not_validated_for()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    // a's statement over its own new table is cached under a's view.
+    a.send(Begin(1, no_txn_options()))
+    a.kinds_of(1, ed_create_x())
+    a.kinds_of(1, ed_insert_x(1, 1))
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ed_ids_x())))).len(), 1)
+
+    // a may run it by digest; b, whose catalog has no `x`, may not.
+    assert_eq(ew_kinds(a.seen(a.send(ed_digest(1)))), "header batch complete")
+    assert_eq(ew_kinds(b.seen(b.send(ed_digest(0)))), "W2004")
+
+    // Once a's table is committed and dropped again, a digest of it runs nowhere.
+    a.send(Commit(1))
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, ed_ids_x())))).len(), 1)
+    assert_eq(ew_rows(b.seen(b.send(ed_digest(0)))).len(), 1)
+    b.kinds_of(0, envelope([], DropTable(cat_q("x"), false, false)))
+    assert_eq(ew_kinds(b.seen(b.send(ed_digest(0)))), "W2004")

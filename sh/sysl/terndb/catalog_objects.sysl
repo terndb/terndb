@@ -60,7 +60,7 @@ struct SchemaVersion derives Eq
 /** A table (§2.2): its columns in ordinal order, its primary key by column id, the next column id
  * to hand out, and every schema version it has had, the current one last.
  */
-struct CatTable
+struct CatTable derives Eq
     oid: u64
     ns: u64
     name: string
@@ -102,7 +102,7 @@ enum ConKind derives Eq
 /** A constraint of a table: whether it is validated (§2.6 rule 1), whether a validation job is due at
  * commit (§8.7), and the unique index backing a `unique` constraint (0 for none).
  */
-struct CatConstraint
+struct CatConstraint derives Eq
     oid: u64
     table: u64
     name: string
@@ -127,7 +127,7 @@ enum IndexState
     IndexFailed
 
 /** A secondary index (§2.5), and the `unique` constraint it backs (0 for none). */
-struct CatIndex
+struct CatIndex derives Eq
     oid: u64
     table: u64
     name: string
@@ -140,7 +140,7 @@ struct CatIndex
 /** A sequence (§2.7 rule 4) with every option filled in, the next value it hands out, and the
  * identity column that owns it (`owner_table` 0 for a sequence of its own).
  */
-struct CatSequence
+struct CatSequence derives Eq
     oid: u64
     ns: u64
     name: string
@@ -157,7 +157,7 @@ struct CatSequence
     owner_column: u32
 
 /** A named type (§2.8): its definition as declared, named references inside it kept. */
-struct CatType
+struct CatType derives Eq
     oid: u64
     ns: u64
     name: string
@@ -165,7 +165,7 @@ struct CatType
     ty: Type
 
 /** A view (§2.9): its stored query and the columns of its result. */
-struct CatView
+struct CatView derives Eq
     oid: u64
     ns: u64
     name: string
@@ -174,7 +174,7 @@ struct CatView
     columns: Buf[Field]
 
 /** A role (§2.10 rule 1); `member_of` holds role oids. */
-struct CatRole
+struct CatRole derives Eq
     oid: u64
     name: string
     login: bool
@@ -182,14 +182,14 @@ struct CatRole
     member_of: Buf[u64]
 
 /** One privilege on one object held by one role (§2.10 rule 3). */
-struct CatGrant
+struct CatGrant derives Eq
     object: Obj
     grantee: u64
     privilege: Privilege
     grantable: bool
     grantor: u64
 
-struct CatNamespace
+struct CatNamespace derives Eq
     oid: u64
     name: string
     owner: u64

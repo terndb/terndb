@@ -131,8 +131,8 @@ Raised under the rules of `isolation.md` §5. Levels: SER serializable, SI snaps
 |---|---|---|---|---|
 | `T1001` | `serialization_failure` | first-updater-wins conflict (`isolation.md` §4.2 rule 2 or 4, including a unique or referenced value found only through a commit after the snapshot, `ddl.md` §2.6 rules 3 and 5); validation failure (§4.3) | SI, SER | yes |
 | `T1002` | `deadlock_detected` | the wait-for graph of row locks has a cycle; the victim aborts | all | yes |
-| `T1003` | `lock_timeout` | a row-lock wait exceeded `lock_timeout`; a deferred foreign-key check found its referenced row locked by another live transaction at commit, which does not wait (`ddl.md` §2.6 rule 3) | all | yes |
-| `T1004` | `schema_changed` | a DDL committed during its lifetime changed a part of a definition this transaction read (§5.6, `ddl.md` §6.3), or a write would re-encode a row in an older schema version (`ddl.md` §5.4) | all | yes |
+| `T1003` | `lock_timeout` | a row-lock wait exceeded `lock_timeout`; a deferred foreign-key check found its referenced row locked by another live transaction at commit, which does not wait (`ddl.md` §2.6 rule 3), as did reconciliation with a unique key added during the transaction (`ddl.md` §6.4 rule 1) | all | yes |
+| `T1004` | `schema_changed` | a DDL committed during its lifetime changed a part of a definition this transaction read (§5.6, `ddl.md` §6.3), a DDL statement of the transaction no longer applies to the newest committed catalog at its commit (`ddl.md` §9 rule 8), or a write would re-encode a row in an older schema version (`ddl.md` §5.4) | all | yes |
 | `T1005` | `replica_lag_timeout` | `after` or `max_lag` not satisfied within `replica_wait_timeout` (§3.6) | replica | yes |
 | `T1006` | `replica_conflict` | WAL replay needed to remove a structure or undo this replica transaction uses (§5.6) | replica | yes |
 | `T1007` | `cancelled` | the client, an administrator or a shutdown cancelled it before commit | all | yes |

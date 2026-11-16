@@ -676,7 +676,7 @@ struct ServerSession
         val envelope = tree match
             Some(e) -> e
             None ->
-                self.resolve_plan(r, t, plan.unwrap()) match
+                self.resolve_plan(r, t, txid, plan.unwrap()) match
                     Some(e) -> e
                     None -> return
 
@@ -702,12 +702,13 @@ struct ServerSession
 
     /** The tree a `PlanRef` runs, or `None` once the reply refusing it is sent: `W2005` for an
      * unknown handle, `W2007` for a result type a catalog change altered (and the handle is
-     * released), `W2004` for a digest not in the plan cache (§4.4 rules 4–6).
+     * released), `W2004` for a digest not in the plan cache, or not valid for the catalog version
+     * the executor's transaction `txid` sees (§4.4 rules 4–6).
      */
-    private resolve_plan(*self, r: &Req, t: u64, plan: PlanRef) -> Option[Buf[u8]]
+    private resolve_plan(*self, r: &Req, t: u64, txid: u64, plan: PlanRef) -> Option[Buf[u8]]
         plan match
             ByDigest(shape) ->
-                val e = self.exec.cached(shape)
+                val e = self.exec.cached(shape, txid)
                 if e.is_none() then self.fail_in(r, t, failure("W2004", "the shape is not in the plan cache"))
                 e
             ByHandle(h) ->

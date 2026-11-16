@@ -5,11 +5,12 @@ import sysl.buf.{Buf, buf}
 // The engine behind the server sessions (`docs/design/engine.md`): one in-memory database, a
 // `MemCatalog` and the MVCC `Store` that holds it, shared by every connection of a server, and an
 // `EngineConn` per connection that a `ServerSession` drives as its `Executor`. A statement is
-// validated when it starts — decoded, structurally checked and type-checked against the catalog, its
-// parameters decoded by their declared types — and run when its first batch is asked for: a query or
-// DML statement through `run_statement`, a DDL statement through `MemCatalog.apply`. A statement that
-// must wait for another transaction's row lock is parked, answering `NotYet`, and run again once the
-// holder has ended (`wire-protocol.md` §7.5).
+// validated when it starts — decoded, structurally checked and type-checked against the catalog its
+// transaction sees, which the store versions under MVCC, its parameters decoded by their declared
+// types — and run when its first batch is asked for: a query or DML statement through `run_statement`,
+// a DDL statement through `Store.ddl`, within its transaction. A statement that must wait for another
+// transaction's row lock or catalog lock is parked, answering `NotYet`, and run again once the holder
+// has ended (`wire-protocol.md` §7.5).
 
 /** A transaction that committed through the engine, and its commit number, absent when its write
  * set was empty (`wire-protocol.md` §5.4 rule 1).
@@ -71,8 +72,20 @@ struct Engine
     /** A connection of role `role`, as a server session drives it. */
     connect(&self, role: string) -> &EngineConn = EngineConn(self, role, buf())
 
-    /** The catalog version now. */
-    catalog_version(self) -> u64 = self.store.catalog.version
+    /** The catalog version now: the newest committed one's. */
+    catalog_version(self) -> u64 = self.store.latest_catalog().version
+
+    /** Installs the catalog transaction `txid` sees (the newest committed one for 0, or for a
+     * transaction not open here); a view that no longer applies is the error.
+     */
+    private see(*self, txid: u64) -> Result[unit, CodecError]
+        if txid != 0
+            self.explicit(txid) match
+                Ok(t) -> return self.store.enter(t)
+                Err(_) -> ()
+
+        self.store.enter_latest()
+        Ok(())
 
     /** `bytes` validated against the catalog as `role` (§4.4 rule 1). A validation error carries every
      * error of the first phase that has one ([QT] §11.2).
@@ -104,33 +117,42 @@ struct Engine
             Ok(shape) -> Ok(Checked(env, shape, result))
             Err(e) -> Err(failure_of(e))
 
-    /** Keeps a validated statement in `role`'s plan cache; a DDL statement is not kept (`ddl.md` §3.1
-     * rule 6).
+    /** Keeps a validated statement in `role`'s plan cache, keyed by the catalog version it was
+     * validated against, which no two catalogs share (a transaction's own view has its own); a DDL
+     * statement is not kept (`ddl.md` §3.1 rule 6).
      */
     private remember(*self, role: string, c: Checked, envelope: Buf[u8])
         if is_ddl(c.env.statement) then return
+        val version = self.store.catalog.version
 
         for i in 0..<self.cache.len()
             if self.cache[i].role == role && self.cache[i].shape == c.shape
-                self.cache[i] = Cached(role, c.shape, envelope.copy(), self.catalog_version(), c.result)
+                self.cache[i] = Cached(role, c.shape, envelope.copy(), version, c.result)
                 return
 
         if self.cache.len() == PlanCacheSize then self.cache.remove(0)
-        self.cache.push(Cached(role, c.shape, envelope.copy(), self.catalog_version(), c.result))
+        self.cache.push(Cached(role, c.shape, envelope.copy(), version, c.result))
 
-    /** The tree of shape `shape` in `role`'s plan cache. One validated against an older catalog is
+    /** The tree of shape `shape` in `role`'s plan cache, for a statement in transaction `txid` (0:
+     * an implicit one). One validated against another catalog version than the one `txid` sees is
      * validated again, and dropped if it now fails or its result type changed (§4.4 rule 6).
      */
-    private cached(*self, role: string, shape: [32]u8) -> Option[Buf[u8]]
+    private cached(*self, role: string, shape: [32]u8, txid: u64) -> Option[Buf[u8]]
+        self.see(txid) match
+            Ok(_) -> ()
+            Err(_) -> return None
+
+        val version = self.store.catalog.version
+
         for i in 0..<self.cache.len()
             val k = self.cache[i]
             if k.role == role && k.shape == shape
-                if k.catalog_version == self.catalog_version() then return Some(k.envelope.copy())
+                if k.catalog_version == version then return Some(k.envelope.copy())
 
                 self.validate(k.envelope.view(), role) match
                     Ok(c) ->
                         if c.result == k.result
-                            self.cache[i] = Cached(role, shape, k.envelope, self.catalog_version(), k.result)
+                            self.cache[i] = Cached(role, shape, k.envelope, version, k.result)
                             return Some(k.envelope.copy())
                     Err(_) -> ()
 
@@ -173,7 +195,7 @@ struct Engine
 
     /** Commits `t`, answering its commit number, absent for an empty write set. */
     private commit(*self, t: &Txn) -> Result[Option[u64], Failure]
-        val wrote = t.writes.len() > 0
+        val wrote = t.writes.len() > 0 || self.store.has_ddl(t)
 
         self.store.commit(t) match
             Ok(c) ->
@@ -189,22 +211,6 @@ struct Engine
                 val _ = self.store.abort_with(x, CodecError(f.entries[0].code, "", f.entries[0].message, buf()))
                 Failure(f.entries, Some(x.id), f.tuple)
             None -> f
-
-    /** DDL statement `env` applied as `role` in `t`. It changes the catalog at once and the store's
-     * tables with it: the catalog is not yet versioned under MVCC (`docs/design/engine.md`).
-     */
-    private apply(*self, t: &Txn, env: Envelope, role: string) -> Result[unit, CodecError]
-        self.store.usable(t)?
-        if t.read_only then return fail("T4001", "a DDL statement in a read-only transaction")
-        self.store.catalog.apply(env, role)?
-
-        // The rows of a dropped table go with it.
-        val kept = buf[&TableData]()
-        for d in self.store.tables
-            if self.store.catalog.table_by_oid(d.oid).is_some() then kept.push(d)
-        self.store.tables = kept
-
-        Ok(())
 
     private status(self, txid: u64) -> Outcome
         for e in self.ended
@@ -243,9 +249,15 @@ struct EngineConn
         val store = self.engine.store
         val tuple = if r.params.tuples.len() > 1 then Some(u64(i)) else None
 
+        // Other transactions ran since the statement started: its own view goes back in.
+        store.enter(r.txn) match
+            Ok(_) -> ()
+            Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
+
         if is_ddl(r.env.statement)
-            self.engine.apply(r.txn, r.env, self.role) match
-                Ok(_) -> r.counts.push(0)
+            store.ddl(r.txn, r.env, self.role) match
+                Ok(Wait(h)) -> return Ok(Some(h))
+                Ok(Done(_)) -> r.counts.push(0)
                 Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
         else
             run_statement(r.env, store, r.txn, Ctx(r.params.tuples[i], self.engine.now)) match
@@ -268,10 +280,11 @@ impl Executor for EngineConn
     catalog_version(self) -> u64 = self.engine.catalog_version()
 
     describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
+        self.engine.store.enter_latest()
         val c = self.engine.validate(envelope.view(), self.role)?
         Ok(Described(c.shape, self.engine.catalog_version(), c.result))
 
-    cached(*self, shape: [32]u8) -> Option[Buf[u8]] = self.engine.cached(self.role, shape)
+    cached(*self, shape: [32]u8, txid: u64) -> Option[Buf[u8]] = self.engine.cached(self.role, shape, txid)
 
     begin(*self, options: TxnOptions) -> Result[Begun, Failure]
         val t = self.engine.begin(options)?
@@ -279,14 +292,34 @@ impl Executor for EngineConn
         Ok(Begun(t.id, t.snapshot, t.level))
 
     start(*self, s: Invocation) -> Result[Started, Failure]
+        val store = self.engine.store
         var explicit: Option[&Txn] = None
         if s.txid != 0 then explicit = Some(self.engine.explicit(s.txid)?)
+
+        // The statement is validated against the catalog its transaction sees: an explicit one's
+        // view, at read committed at the statement's own snapshot, taken now (§4.3 rule 2); for an
+        // implicit one, the newest committed catalog, which its snapshot will see.
+        explicit match
+            Some(x) ->
+                store.statement(x)
+                val seen = read_envelope(s.envelope.view()) match
+                    Ok(env) -> store.check_reads(x, env)
+                    Err(_) -> Ok(())
+
+                seen match
+                    Ok(_) -> ()
+                    Err(e) -> return Err(self.engine.aborting(explicit, failure_of(e)))
+
+                store.enter(x) match
+                    Ok(_) -> ()
+                    Err(e) -> return Err(self.engine.aborting(explicit, failure_of(e)))
+            None -> store.enter_latest()
 
         val c = self.engine.validate(s.envelope.view(), self.role) match
             Ok(c) -> c
             Err(f) -> return Err(self.engine.aborting(explicit, f))
 
-        val params = bind(c.env, self.engine.store.catalog, s.params.view()) match
+        val params = bind(c.env, store.catalog, s.params.view()) match
             Ok(p) -> p
             Err(e) -> return Err(self.engine.aborting(explicit, failure_of(e)))
 
@@ -295,7 +328,8 @@ impl Executor for EngineConn
             None -> self.engine.begin(s.implicit)?
 
         // At read committed the statement's snapshot is taken now (§4.3 rule 2).
-        self.engine.store.statement(t)
+        store.statement(t)
+        store.note_read(t, c.env)
         self.engine.remember(self.role, c, s.envelope)
 
         val cursor = self.engine.next_cursor

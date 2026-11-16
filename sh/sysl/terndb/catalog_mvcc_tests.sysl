@@ -1,0 +1,192 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.contains
+
+// The versioned catalog of `catalog_mvcc.sysl` on a store driven directly: views and their
+// visibility, the keys a DDL statement locks, the parts of a catalog read and what conflicts with
+// them, a replay keeping its oids, the sequences' next values outside the versions, and the pruning
+// of versions and of the rows of tables nobody can see.
+
+private cm_ddl(s: &Store, t: &Txn, st: Statement, file: string = __FILE__, line: long = __LINE__)
+    s.ddl(t, envelope([], st), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+private cm_sees(s: &Store, t: &Txn, name: string) -> bool
+    s.enter(t).unwrap()
+    s.catalog.table_at(cat_q(name)).is_some()
+
+private cm_x() -> Statement = cat_table("x", [cat_col("id", Int64)], ["id"])
+
+@test
+a_transactions_ddl_is_its_own_until_it_commits()
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    val before = s.begin(Snapshot)
+    cm_ddl(s, t, cm_x())
+
+    assert(cm_sees(s, t, "x"), "its own table")
+    assert(!cm_sees(s, before, "x"), "not another's")
+    assert(s.latest_catalog().table_at(cat_q("x")).is_none(), "not committed")
+
+    st_commit(s, t)
+    val after = s.begin(Snapshot)
+    assert(cm_sees(s, after, "x"), "a later snapshot sees it")
+    assert(!cm_sees(s, before, "x"), "an earlier one still does not")
+
+    st_commit(s, before)
+    st_commit(s, after)
+    assert_eq(s.catalogs_retained(), 1)
+
+@test
+a_rolled_back_create_leaves_no_rows_and_the_newest_catalog_installed()
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    cm_ddl(s, t, cm_x())
+    s.enter(t).unwrap()
+    val x = st_oid(s, "x")
+    st_insert(s, t, x, [Int(1)])
+    assert(s.tables.len() > 0, "the row is stored")
+
+    s.abort(t).unwrap()
+    for d in s.tables
+        assert(d.oid != x, "the table's rows are gone")
+    assert(s.catalog.table_at(cat_q("x")).is_none(), "the newest committed catalog is installed")
+
+@test
+the_keys_a_statement_changes_name_its_objects_and_their_names()
+    val a = cat_ok(cat_base(), cat_table("p", [cat_col("id", Int64)], ["id"]))
+    val t = cat_table_of(a, "t").oid
+    val p = cat_table_of(a, "p").oid
+
+    // Adding a column changes the table's entry only.
+    val added = changed_keys(a, cat_ok(a, cat_alter("t", [AddColumn(cat_col("n", nullable(Int64)))])))
+    assert(contains(added.view(), oid_key(t)), "the table")
+    assert(!contains(added.view(), oid_key(p)), "not another table")
+
+    // A foreign key changes both tables' entries.
+    val fk = changed_keys(a, cat_ok(a, cat_alter("t", [AddConstraint(cat_fk("t_p", ["id"], "p", ["id"]), false)])))
+    assert(contains(fk.view(), oid_key(t)) && contains(fk.view(), oid_key(p)), "both tables")
+
+    // A create takes its name; a rename gives one name up and takes another.
+    val created = cat_ok(a, cm_x())
+    val ns = cat_table_of(a, "t").ns
+    assert(contains(changed_keys(a, created).view(), name_key(ns, "x")), "the new name")
+    val renamed = changed_keys(a, cat_ok(a, cat_alter("t", [RenameTable("u")])))
+    assert(contains(renamed.view(), name_key(ns, "t")) && contains(renamed.view(), name_key(ns, "u")), "both names")
+
+    assert_eq(changed_keys(a, a).len(), 0)
+
+@test
+a_catalog_read_conflicts_only_with_a_change_to_what_it_read()
+    val base = cat_base()
+    val oid = cat_table_of(base, "t").oid
+    val q = query([], project(scan("app", "t", "r"), "o", [item("a", col("r", "a"))]))
+    val parts = statement_read(base, base, q)
+
+    var hit = false
+    for p in parts
+        if conflicts(p, cat_ok(base, cat_alter("t", [AddColumn(cat_col("n", nullable(Int64)))]))) then hit = true
+    assert(!hit, "an added column it never named")
+
+    hit = false
+    for p in parts
+        if conflicts(p, cat_ok(base, cat_alter("t", [RenameColumn("b", "bb")]))) then hit = true
+    assert(!hit, "a renamed column it never named")
+
+    hit = false
+    for p in parts
+        if conflicts(p, cat_ok(base, cat_alter("t", [RenameColumn("a", "aa")]))) then hit = true
+    assert(hit, "a renamed column it resolved")
+
+    // A scan whose rows reach the result reads the whole column list.
+    val whole = statement_read(base, base, query([], scan("app", "t", "r")))
+    assert(contains(whole.view(), ReadColumns(oid, shapes_of(base, "t"))), "the whole list")
+    hit = false
+    for p in whole
+        if conflicts(p, cat_ok(base, cat_alter("t", [AddColumn(cat_col("n", nullable(Int64)))]))) then hit = true
+    assert(hit, "an added column changes the whole list")
+
+    // An insert reads the defaults of the columns it leaves out.
+    val ins = statement_read(base, base, envelope([], Insert(cat_q("t"), "t", None, items_of(["id", "b"]), Values("v", items_of([Field("id", Int64), Field("b", Text)]), buf()), None, buf[Item]())))
+    hit = false
+    for p in ins
+        if conflicts(p, cat_ok(base, cat_alter("t", [SetColumnDefault("a", Some(Literal(Int32, Int(3))))]))) then hit = true
+    assert(hit, "a default it used")
+
+private shapes_of(c: MemCatalog, name: string) -> Buf[ColumnShape]
+    val out = buf[ColumnShape]()
+    for col in cat_table_of(c, name).columns
+        out.push(ColumnShape(col.id, col.name, col.ty))
+    out
+
+@test
+a_ddl_applied_again_over_a_newer_commit_keeps_its_oids()
+    val s = mem_store(cat_base())
+    val a = s.begin(Serializable)
+    val b = s.begin(Serializable)
+    cm_ddl(s, a, cm_x())
+    s.enter(a).unwrap()
+    val x = st_oid(s, "x")
+    cm_ddl(s, b, cat_table("y", [cat_col("id", Int64)], ["id"]))
+
+    // b commits first; a's create is applied again over it, under the oid a's rows are stored by.
+    st_commit(s, b)
+    s.enter(a).unwrap()
+    st_insert(s, a, x, [Int(1)])
+    st_commit(s, a)
+    assert_eq(cat_table_of(s.latest_catalog(), "x").oid, x)
+    assert(s.latest_catalog().table_at(cat_q("y")).is_some(), "both tables")
+
+@test
+a_drop_of_a_table_another_transaction_altered_waits_for_its_lock()
+    val s = mem_store(cat_base())
+    val a = s.begin(Serializable)
+    cm_ddl(s, a, cat_alter("t", [AddConstraint(cat_check("ck", call("gt", [cat_row("id"), cat_int(0)])), false)]))
+    val b = s.begin(Serializable)
+    assert_eq(st_waits(s.ddl(b, envelope([], DropTable(cat_q("t"), false, false)), BootstrapRole)), a.id)
+    st_commit(s, a)
+
+    // The holder committed after b's snapshot: first-updater-wins.
+    assert_eq(st_code(s.ddl(b, envelope([], DropTable(cat_q("t"), false, false)), BootstrapRole)), "T1001")
+    assert(s.latest_catalog().table_at(cat_q("t")).is_some(), "the table is kept")
+
+@test
+a_ddl_whose_dependency_a_commit_dropped_is_schema_changed_at_commit()
+    val s = mem_store(cat_base())
+    val a = s.begin(Serializable)
+    cm_ddl(s, a, CreateView(cat_q("v"), project(scan("app", "t", "r"), "o", [item("id", col("r", "id"))]), false))
+    s.statement(a)
+    s.note_read(a, envelope([], CreateView(cat_q("v"), project(scan("app", "t", "r"), "o", [item("id", col("r", "id"))]), false)))
+
+    // The view's table is not locked by the view, so its drop commits.
+    val b = s.begin(Serializable)
+    cm_ddl(s, b, DropTable(cat_q("t"), false, false))
+    st_commit(s, b)
+
+    assert_eq(st_code_of(s.commit(a)), "T1004")
+    assert(s.latest_catalog().view_at(cat_q("v")).is_none(), "no view")
+
+private st_code_of(r: Result[u64, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+@test
+a_sequences_next_value_is_not_versioned()
+    val base = cat_ok(cat_base(), CreateSequence(cat_q("seq"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    val s = mem_store(base)
+    val old = s.begin(Snapshot)
+    val t = s.begin(Serializable)
+    cm_ddl(s, t, cm_x())
+    st_commit(s, t)
+
+    // A draw under the newest catalog is seen under the older one the snapshot sees.
+    s.enter_latest()
+    var q = s.catalog.sequences[0]
+    q.next = 42
+    s.catalog.sequences[0] = q
+    s.enter(old).unwrap()
+    assert_eq(s.catalog.sequences[0].next, 42)

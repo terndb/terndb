@@ -1,0 +1,1070 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.contains
+
+// The catalog versioned under MVCC (`isolation.md` §5.6, `ddl.md` §6 and §9). The store keeps every
+// committed catalog a live transaction can still see, each stamped with the commit that made it; a
+// transaction sees the one committed at or before its snapshot, with its own DDL applied on top. A
+// DDL statement runs against that view: the keys it changes (an object by oid, a name in a
+// namespace) take the catalog's row write locks and obey first-updater-wins, and the statement is
+// kept so that it can be applied again, with the same oids, to a newer committed catalog. Every
+// statement records the parts of the definitions it read, as its committed catalog held them, and a
+// writer whose read a DDL committed during its lifetime changed aborts with `schema_changed`.
+//
+// The store is single-threaded, so `Store.catalog` is the catalog of the operation in progress: the
+// engine installs a transaction's view before each of its statements, and a commit installs the
+// newest committed catalog. A sequence's next value is not versioned (`ddl.md` §2.7 rule 5): it is
+// kept beside the versions and carried into each catalog as it is installed.
+
+/** A committed catalog and the commit that made it (0 for the catalog the store began with). */
+struct CatalogAt
+    commit: u64
+    catalog: MemCatalog
+
+/** One DDL statement of a transaction as it ran: the statement, its role, and the oids it handed out,
+ * `first_oid` up to `end_oid`, which a replay hands out again.
+ */
+struct DdlStep
+    env: Envelope
+    role: string
+    first_oid: u64
+    end_oid: u64
+
+/** A column as a catalog read records it (`ddl.md` §6.2 rule 2). */
+struct ColumnShape derives Eq
+    id: u32
+    name: string
+    ty: Type
+
+/** One part of a statement's catalog read (`ddl.md` §6.2), as the committed catalog it planned
+ * against held it.
+ */
+enum ReadPart derives Eq
+    /** A table's identity, name and primary key (rule 1). */
+    ReadTable(oid: u64, name: QualName, key: Buf[u32])
+    /** A column it resolved (rule 2). */
+    ReadColumn(table: u64, column: ColumnShape)
+    /** A table's whole column list (rule 3). */
+    ReadColumns(table: u64, columns: Buf[ColumnShape])
+    /** The default, generation expression and identity of a column (rule 4). */
+    ReadDefault(table: u64, id: u32, default: Option[Expr], generated: Option[Expr], identity: Identity)
+    /** A constraint named as a conflict target (rule 1). */
+    ReadConstraint(oid: u64, table: u64, name: string)
+    ReadView(oid: u64, name: QualName, query: Rel)
+    ReadType(oid: u64, name: QualName, ty: Type)
+    ReadSequence(oid: u64, name: QualName)
+
+/** The table a part of a read belongs to (0 for none). */
+private part_table(p: ReadPart) -> u64 = p match
+    ReadTable(oid, _, _) -> oid
+    ReadColumn(t, _) -> t
+    ReadColumns(t, _) -> t
+    ReadDefault(t, _, _, _, _) -> t
+    ReadConstraint(_, t, _) -> t
+    _ -> 0
+
+/** A catalog row write lock (`ddl.md` §6.1 rule 1) on `key`, held by transaction `txid`. */
+struct CatLock
+    key: string
+    txid: u64
+
+/** The last commit that changed `key`, for first-updater-wins ([ISO] §4.2 rule 2). */
+struct CatChange
+    key: string
+    commit: u64
+
+/** A sequence's next value, kept outside the versions (`ddl.md` §2.7 rule 5). */
+struct SeqNext
+    oid: u64
+    next: i64
+
+/** A transaction's side of the catalog: its DDL statements, the view they made and the committed
+ * catalog it was made on, the oldest committed catalog any of its statements planned against, its
+ * catalog read, and, during its commit, its DDL applied to the newest committed catalog.
+ */
+struct TxnCatalog
+    txid: u64
+    steps: Buf[DdlStep]
+    own: Option[MemCatalog]
+    base: u64
+    low: u64
+    reads: Buf[ReadPart]
+    merged: Option[MemCatalog]
+
+/** The store's catalog versions: the committed catalogs, oldest first; each transaction's side; the
+ * held locks and the last change of each key; the next oid and catalog version to hand out, which no
+ * two catalogs share; and the sequences' next values.
+ */
+struct CatalogVersions
+    versions: Buf[CatalogAt]
+    txns: Buf[&TxnCatalog]
+    locks: Buf[CatLock]
+    changes: Buf[CatChange]
+    next_oid: u64
+    version: u64
+    draws: Buf[SeqNext]
+
+/** The versions of a store that begins with `c`. */
+catalog_versions(c: MemCatalog) -> CatalogVersions
+    val vs = buf[CatalogAt]()
+    vs.push(CatalogAt(0, c))
+    CatalogVersions(vs, buf(), buf(), buf(), c.next_oid, c.version, buf())
+
+impl Store
+    // -- the committed catalogs ---------------------------------------------------------------------
+
+    /** The newest committed catalog. */
+    latest_catalog(self) -> MemCatalog = self.cat.versions[self.cat.versions.len() - 1].catalog
+
+    /** The committed catalog a snapshot `s` sees: the newest committed at or before `s`. */
+    private[terndb] base_at(self, s: u64) -> CatalogAt
+        var at = self.cat.versions[0]
+
+        for v in self.cat.versions
+            if v.commit <= s then at = v
+
+        at
+
+    /** The number of committed catalogs retained. */
+    catalogs_retained(self) -> usize = self.cat.versions.len()
+
+    private[terndb] txn_catalog(self, id: u64) -> Option[&TxnCatalog]
+        for c in self.cat.txns
+            if c.txid == id then return Some(c)
+
+        None
+
+    private[terndb] txn_catalog_of(*self, t: &Txn) -> &TxnCatalog
+        self.txn_catalog(t.id) match
+            Some(c) -> c
+            None ->
+                val c: &TxnCatalog = TxnCatalog(t.id, buf(), None, 0, t.snapshot, buf(), None)
+                self.cat.txns.push(c)
+                c
+
+    /** Whether `t` ran a DDL statement, which makes its write set non-empty (§5.5). */
+    has_ddl(self, t: &Txn) -> bool = self.txn_catalog(t.id) match
+        Some(c) -> c.steps.len() > 0
+        None -> false
+
+    // -- views --------------------------------------------------------------------------------------
+
+    /** The catalog `t` sees: the committed catalog of its snapshot, with its own DDL applied. At read
+     * committed the snapshot moves, and its DDL is applied again to the newer catalog, with the same
+     * oids; a statement that no longer applies is `schema_changed`.
+     */
+    private[terndb] view_of(*self, t: &Txn) -> Result[MemCatalog, CodecError]
+        val b = self.base_at(t.snapshot)
+
+        val c = self.txn_catalog(t.id) match
+            Some(c) -> c
+            None -> return Ok(b.catalog)
+
+        if c.steps.len() == 0 then return Ok(b.catalog)
+
+        if c.base != b.commit
+            c.own = Some(self.replay(c.steps, b.catalog)?)
+            c.base = b.commit
+
+        Ok(c.own.unwrap())
+
+    /** Installs `t`'s view as the catalog of the operations that follow. */
+    enter(*self, t: &Txn) -> Result[unit, CodecError]
+        val v = self.view_of(t)?
+        self.install(v, false)
+        Ok(())
+
+    /** Installs the newest committed catalog, for work done outside any transaction. */
+    enter_latest(*self) = self.install(self.latest_catalog(), false)
+
+    /** `c` installed as `self.catalog`. The sequences' next values drawn under the catalog it replaces
+     * are kept first; then `c` takes them, or, when `c` is the result of a DDL statement (`fresh`),
+     * gives its own (a sequence it created or restarted).
+     */
+    private[terndb] install(*self, c: MemCatalog, fresh: bool)
+        for q in self.catalog.sequences
+            self.set_draw(q.oid, q.next)
+
+        if fresh
+            for q in c.sequences
+                self.set_draw(q.oid, q.next)
+        else
+            for i in 0..<c.sequences.len()
+                self.draw_of(c.sequences[i].oid) match
+                    Some(n) ->
+                        var q = c.sequences[i]
+                        q.next = n
+                        c.sequences[i] = q
+                    None -> ()
+
+        self.catalog = c
+
+    private set_draw(*self, oid: u64, next: i64)
+        for i in 0..<self.cat.draws.len()
+            if self.cat.draws[i].oid == oid
+                self.cat.draws[i] = SeqNext(oid, next)
+                return
+
+        self.cat.draws.push(SeqNext(oid, next))
+
+    private draw_of(self, oid: u64) -> Option[i64]
+        for d in self.cat.draws
+            if d.oid == oid then return Some(d.next)
+
+        None
+
+    /** `steps` applied again, in order, to `over`, each handing out the oids it handed out first. A
+     * step that is refused, or hands out a different number of oids, is `schema_changed`: a commit
+     * the transaction did not see changed what it depended on.
+     */
+    private[terndb] replay(*self, steps: Buf[DdlStep], over: MemCatalog) -> Result[MemCatalog, CodecError]
+        var c = over
+
+        for s in steps
+            c.next_oid = s.first_oid
+
+            c.apply(s.env, s.role) match
+                Ok(_) -> ()
+                Err(e) -> return fail("T1004", s"a catalog change committed since no longer admits a DDL statement of the transaction: ${e.message}")
+
+            if c.next_oid != s.end_oid then return fail("T1004", "a catalog change committed since changes what a DDL statement of the transaction creates")
+
+        c.next_oid = self.cat.next_oid
+        self.cat.version += 1
+        c.version = self.cat.version
+        Ok(c)
+    end replay
+
+    // -- DDL ----------------------------------------------------------------------------------------
+
+    /** DDL statement `env` run as `role` in `t` (`ddl.md` §9): applied to `t`'s view, under the row
+     * write lock of every catalog key it changes (§6.1 rule 1). A key another live transaction holds
+     * answers `Wait`, having changed nothing; at snapshot and serializable a key a commit after `t`'s
+     * snapshot changed is `serialization_failure` (§6.1 rule 4); at read committed the statement runs
+     * against the newest committed catalog.
+     */
+    ddl(*self, t: &Txn, env: Envelope, role: string) -> Result[WriteOutcome, CodecError]
+        live(t)?
+        if t.read_only then return fail("T4001", "a DDL statement in a read-only transaction")
+        if t.level == ReadCommitted then t.snapshot = self.horizon
+
+        val before = self.view_of(t)?
+        var trial = before
+        trial.next_oid = if self.cat.next_oid > before.next_oid then self.cat.next_oid else before.next_oid
+        val first = trial.next_oid
+        trial.apply(env, role)?
+
+        val keys = changed_keys(before, trial)
+
+        for k in keys
+            val h = self.lock_holder(k)
+            if h != 0 && h != t.id then return self.wait_on(t, h)
+
+        if t.level != ReadCommitted
+            for k in keys
+                if self.last_change(k) > t.snapshot then
+                    return fail("T1001", "a catalog entry the statement changes was changed by a commit after the snapshot")
+
+        for k in keys
+            if self.lock_holder(k) == 0 then self.cat.locks.push(CatLock(k, t.id))
+
+        if trial.next_oid > self.cat.next_oid then self.cat.next_oid = trial.next_oid
+        self.cat.version += 1
+        trial.version = self.cat.version
+
+        val b = self.base_at(t.snapshot)
+        val c = self.txn_catalog_of(t)
+        c.steps.push(DdlStep(env, role, first, trial.next_oid))
+        c.own = Some(trial)
+        c.base = b.commit
+        if b.commit < c.low then c.low = b.commit
+
+        self.install(trial, true)
+        t.waits_for = 0
+        Ok(Done(0))
+    end ddl
+
+    private lock_holder(self, key: string) -> u64
+        for l in self.cat.locks
+            if l.key == key then return l.txid
+
+        0
+
+    private last_change(self, key: string) -> u64
+        for c in self.cat.changes
+            if c.key == key then return c.commit
+
+        0
+
+    // -- catalog reads ------------------------------------------------------------------------------
+
+    /** Records the catalog read of statement `env` in `t` (`ddl.md` §6.2), from the committed catalog
+     * of `t`'s snapshot; what `t` itself created is not part of it. Call it with `t`'s view installed.
+     */
+    note_read(*self, t: &Txn, env: Envelope)
+        val b = self.base_at(t.snapshot)
+        val parts = statement_read(self.catalog, b.catalog, env)
+        val c = self.txn_catalog_of(t)
+        if b.commit < c.low then c.low = b.commit
+
+        for p in parts
+            if !contains(c.reads.view(), p) then c.reads.push(p)
+
+    /** At read committed, a statement on a table whose definition an earlier statement of `t` read and
+     * a commit since has changed is `schema_changed` ([ISO] §5.6), before it plans against the change.
+     */
+    check_reads(self, t: &Txn, env: Envelope) -> Result[unit, CodecError]
+        if t.level != ReadCommitted then return Ok(())
+
+        val c = self.txn_catalog(t.id) match
+            Some(c) -> c
+            None -> return Ok(())
+
+        val names = statement_names(env)
+        val latest = self.latest_catalog()
+
+        for p in c.reads
+            if conflicts(p, latest)
+                val table = part_table(p)
+
+                for q in c.reads
+                    q match
+                        ReadTable(oid, name, _) -> if oid == table && contains(names.view(), name) then
+                            return fail("T1004", s"'${name.schema}.${name.name}' was changed by a DDL statement committed during the transaction")
+                        ReadView(_, name, _) -> if p == q && contains(names.view(), name) then
+                            return fail("T1004", s"'${name.schema}.${name.name}' was changed by a DDL statement committed during the transaction")
+                        _ -> ()
+
+        Ok(())
+    end check_reads
+
+    // -- commit and rollback ------------------------------------------------------------------------
+
+    /** The catalog side of `t`'s commit, before its commit record: a writer's catalog read is
+     * validated against the newest committed catalog (`ddl.md` §6.3); its DDL is applied to that
+     * catalog; and its writes are reconciled with the DDL committed since it planned them (§6.4). A
+     * transaction with an empty write set is serialized at its snapshot and needs none of it (§5.5).
+     * The newest definition is installed for the rest of the commit.
+     */
+    private[terndb] commit_catalog(*self, t: &Txn) -> Result[unit, CodecError]
+        val c = self.txn_catalog(t.id) match
+            Some(c) -> c
+            None -> return Ok(())
+
+        if t.writes.len() == 0 && c.steps.len() == 0 then return Ok(())
+
+        val newest = self.cat.versions[self.cat.versions.len() - 1]
+
+        for p in c.reads
+            if conflicts(p, newest.catalog) then
+                return fail("T1004", "a DDL statement committed during the transaction changed a definition it read")
+
+        var merged = newest.catalog
+
+        if c.steps.len() > 0
+            merged = if c.base == newest.commit then c.own.unwrap() else self.replay(c.steps, newest.catalog)?
+            c.merged = Some(merged)
+
+        self.install(merged, false)
+        self.reconcile(t, c, merged)
+    end commit_catalog
+
+    /** Reconciliation (`ddl.md` §6.4): for each table `t` wrote whose definition a commit changed after
+     * `t`'s oldest statement planned, the unique keys added since are checked for `t`'s rows. The
+     * other work of §6.4 — checking a check, not-null or referencing foreign-key constraint added
+     * since, or computing a column added since whose default is not its fill — is not done by this
+     * store, which aborts such a transaction with `schema_changed` instead (`docs/design/engine.md`).
+     */
+    private reconcile(*self, t: &Txn, c: &TxnCatalog, newest: MemCatalog) -> Result[unit, CodecError]
+        val old = self.base_at(c.low).catalog
+        val tables = buf[u64]()
+
+        for w in t.writes
+            if !contains(tables.view(), w.table) then tables.push(w.table)
+
+        for oid in tables
+            if self.last_change(oid_key(oid)) > c.low
+                val i = newest.table_by_oid(oid) match
+                    Some(i) -> i
+                    None -> return fail("T1004", "a table the transaction wrote was dropped by a DDL statement committed during it")
+
+                var changed = false
+
+                for w in t.writes
+                    if w.table == oid && w.before.is_some() then changed = true
+
+                if !reconcilable(old, newest, newest.tables[i], changed) then
+                    return fail("T1004", "a DDL statement committed during the transaction changed a table it wrote in a way this store does not reconcile")
+
+                self.reconcile_uniques(t, oid)?
+
+        Ok(())
+    end reconcile
+
+    /** The catalog side of `t`'s commit at `c`: its merged catalog is published at `c`, and every key
+     * it locked is recorded as changed at `c`.
+     */
+    private[terndb] publish_catalog(*self, t: &Txn, c: u64)
+        val tc = self.txn_catalog(t.id) match
+            Some(x) -> x
+            None -> return
+
+        tc.merged match
+            Some(m) ->
+                self.cat.versions.push(CatalogAt(c, m))
+
+                for l in self.cat.locks
+                    if l.txid == t.id then self.set_change(l.key, c)
+
+                self.install(m, false)
+            None -> ()
+
+    private set_change(*self, key: string, c: u64)
+        for i in 0..<self.cat.changes.len()
+            if self.cat.changes[i].key == key
+                self.cat.changes[i] = CatChange(key, c)
+                return
+
+        self.cat.changes.push(CatChange(key, c))
+
+    /** The catalog side of `t`'s end, committed or not: its locks are released and its side dropped;
+     * a rolled-back DDL leaves the newest committed catalog installed. The committed catalogs no live
+     * transaction can see any more are dropped, and with them the rows of tables no retained catalog
+     * holds (a dropped table, or one whose creation rolled back).
+     */
+    private[terndb] retire_catalog(*self, t: &Txn)
+        val locks = buf[CatLock]()
+
+        for l in self.cat.locks
+            if l.txid != t.id then locks.push(l)
+
+        self.cat.locks = locks
+
+        self.txn_catalog(t.id) match
+            Some(c) ->
+                val txns = buf[&TxnCatalog]()
+
+                for x in self.cat.txns
+                    if x.txid != t.id then txns.push(x)
+
+                self.cat.txns = txns
+                if c.steps.len() > 0 && !is_committed(t) then self.install(self.latest_catalog(), false)
+            None -> ()
+
+        self.prune_catalogs()
+    end retire_catalog
+
+    /** Drops the committed catalogs older than the one the oldest live transaction sees, and the rows
+     * of every table that no retained catalog, no live transaction's view and the installed catalog
+     * holds.
+     */
+    private prune_catalogs(*self)
+        var low = self.horizon
+
+        for a in self.active
+            if a.snapshot < low then low = a.snapshot
+
+            self.txn_catalog(a.id) match
+                Some(c) -> if c.low < low then low = c.low
+                None -> ()
+
+        val from = self.base_at(low).commit
+        val kept = buf[CatalogAt]()
+
+        for v in self.cat.versions
+            if v.commit >= from then kept.push(v)
+
+        self.cat.versions = kept
+
+        val tables = buf[&TableData]()
+
+        for d in self.tables
+            if self.holds_table(d.oid) then tables.push(d)
+
+        self.tables = tables
+    end prune_catalogs
+
+    private holds_table(self, oid: u64) -> bool
+        if self.catalog.table_by_oid(oid).is_some() then return true
+
+        for v in self.cat.versions
+            if v.catalog.table_by_oid(oid).is_some() then return true
+
+        for c in self.cat.txns
+            c.own match
+                Some(o) -> if o.table_by_oid(oid).is_some() then return true
+                None -> ()
+
+        false
+end Store
+
+private is_committed(t: &Txn) -> bool = t.state match
+    CommittedAt(_) -> true
+    _ -> false
+
+// -- the keys a DDL statement changes ---------------------------------------------------------------
+
+/** The lock key of the catalog entry of the object `oid` (oids are unique across kinds). */
+oid_key(oid: u64) -> string = s"o$oid"
+
+/** The lock key of name `name` in namespace `ns`, which one object at most holds (§2.1). */
+name_key(ns: u64, name: string) -> string = s"n$ns.$name"
+
+private add_key(out: Buf[string], k: string)
+    if !contains(out.view(), k) then out.push(k)
+
+/** The catalog keys `b` changed from `a` (`ddl.md` §6.1 rule 1): every object created, changed or
+ * dropped, and every name taken or given up. A change to a table's indexes or constraints changes
+ * the table's entry, and a foreign key changes both tables'. A sequence's next value is not part of
+ * its entry.
+ */
+changed_keys(a: MemCatalog, b: MemCatalog) -> Buf[string]
+    val out = buf[string]()
+
+    for x in a.tables
+        b.table_by_oid(x.oid) match
+            Some(i) -> if !(b.tables[i] == x) then named_change(out, x.oid, x.ns, x.name, b.tables[i].ns, b.tables[i].name)
+            None -> named_change(out, x.oid, x.ns, x.name, x.ns, x.name)
+
+    for y in b.tables
+        if a.table_by_oid(y.oid).is_none() then named_change(out, y.oid, y.ns, y.name, y.ns, y.name)
+
+    for x in a.views
+        match_view(b, x.oid) match
+            Some(y) -> if !(y == x) then named_change(out, x.oid, x.ns, x.name, y.ns, y.name)
+            None -> named_change(out, x.oid, x.ns, x.name, x.ns, x.name)
+
+    for y in b.views
+        if match_view(a, y.oid).is_none() then named_change(out, y.oid, y.ns, y.name, y.ns, y.name)
+
+    for x in a.types
+        match_type(b, x.oid) match
+            Some(y) -> if !(y == x) then named_change(out, x.oid, x.ns, x.name, y.ns, y.name)
+            None -> named_change(out, x.oid, x.ns, x.name, x.ns, x.name)
+
+    for y in b.types
+        if match_type(a, y.oid).is_none() then named_change(out, y.oid, y.ns, y.name, y.ns, y.name)
+
+    for x in a.sequences
+        match_sequence(b, x.oid) match
+            Some(y) -> if !same_sequence(x, y) then named_change(out, x.oid, x.ns, x.name, y.ns, y.name)
+            None -> named_change(out, x.oid, x.ns, x.name, x.ns, x.name)
+
+    for y in b.sequences
+        if match_sequence(a, y.oid).is_none() then named_change(out, y.oid, y.ns, y.name, y.ns, y.name)
+
+    for x in a.indexes
+        b.index_by_oid(x.oid) match
+            Some(i) ->
+                if !(b.indexes[i] == x)
+                    add_key(out, oid_key(x.oid))
+                    add_key(out, oid_key(x.table))
+                    add_key(out, name_key(a.table_ns(x.table), x.name))
+                    add_key(out, name_key(b.table_ns(x.table), b.indexes[i].name))
+            None ->
+                add_key(out, oid_key(x.oid))
+                add_key(out, oid_key(x.table))
+                add_key(out, name_key(a.table_ns(x.table), x.name))
+
+    for y in b.indexes
+        if a.index_by_oid(y.oid).is_none()
+            add_key(out, oid_key(y.oid))
+            add_key(out, oid_key(y.table))
+            add_key(out, name_key(b.table_ns(y.table), y.name))
+
+    for x in a.constraints
+        b.constraint_by_oid(x.oid) match
+            Some(i) -> if !(b.constraints[i] == x) then constraint_change(out, x)
+            None -> constraint_change(out, x)
+
+    for y in b.constraints
+        if a.constraint_by_oid(y.oid).is_none() then constraint_change(out, y)
+
+    for x in a.namespaces
+        match_namespace(b, x.oid) match
+            Some(y) -> if !(y == x) then add_key(out, oid_key(x.oid))
+            None ->
+                add_key(out, oid_key(x.oid))
+                add_key(out, s"N${x.name}")
+
+    for y in b.namespaces
+        if match_namespace(a, y.oid).is_none()
+            add_key(out, oid_key(y.oid))
+            add_key(out, s"N${y.name}")
+
+    for x in a.roles
+        b.role_by_oid(x.oid) match
+            Some(i) ->
+                if !(b.roles[i] == x)
+                    add_key(out, oid_key(x.oid))
+                    add_key(out, s"R${x.name}")
+                    add_key(out, s"R${b.roles[i].name}")
+            None ->
+                add_key(out, oid_key(x.oid))
+                add_key(out, s"R${x.name}")
+
+    for y in b.roles
+        if a.role_by_oid(y.oid).is_none()
+            add_key(out, oid_key(y.oid))
+            add_key(out, s"R${y.name}")
+
+    for g in a.grants
+        if !contains(b.grants.view(), g) then add_key(out, oid_key(g.object.oid))
+
+    for g in b.grants
+        if !contains(a.grants.view(), g) then add_key(out, oid_key(g.object.oid))
+
+    out
+end changed_keys
+
+private named_change(out: Buf[string], oid: u64, ns: u64, name: string, new_ns: u64, new_name: string)
+    add_key(out, oid_key(oid))
+    add_key(out, name_key(ns, name))
+    add_key(out, name_key(new_ns, new_name))
+
+private constraint_change(out: Buf[string], c: CatConstraint)
+    add_key(out, oid_key(c.oid))
+    add_key(out, oid_key(c.table))
+
+    c.kind match
+        ConForeignKey(_, ref_table, _, _, _, _) -> add_key(out, oid_key(ref_table))
+        _ -> ()
+
+private match_view(c: MemCatalog, oid: u64) -> Option[CatView]
+    for v in c.views
+        if v.oid == oid then return Some(v)
+
+    None
+
+private match_type(c: MemCatalog, oid: u64) -> Option[CatType]
+    for v in c.types
+        if v.oid == oid then return Some(v)
+
+    None
+
+private match_sequence(c: MemCatalog, oid: u64) -> Option[CatSequence]
+    for v in c.sequences
+        if v.oid == oid then return Some(v)
+
+    None
+
+private match_namespace(c: MemCatalog, oid: u64) -> Option[CatNamespace]
+    for v in c.namespaces
+        if v.oid == oid then return Some(v)
+
+    None
+
+/** Whether two sequences have one definition; the next value is not part of it. */
+private same_sequence(a: CatSequence, b: CatSequence) -> bool
+    var x = a
+    var y = b
+    x.next = 0
+    y.next = 0
+    x == y
+
+// -- what a committed DDL changed, for reconciliation -----------------------------------------------
+
+/** Whether this store can reconcile a writer of table `now` (as `newest` holds it) with what changed
+ * since `old` (§6.4): it can for added unique keys, indexes and columns whose default is their fill;
+ * it cannot for an added check, not-null or referencing foreign-key constraint, an added column
+ * whose default is not its fill or that is generated or filling, or, for a writer that removed or
+ * changed a row (`changed`), a foreign key now referencing the table (§6.4 rule 3).
+ */
+private reconcilable(old: MemCatalog, newest: MemCatalog, now: CatTable, changed: bool) -> bool
+    val was = old.table_by_oid(now.oid) match
+        Some(i) -> old.tables[i]
+        None -> return true
+
+    for c in now.columns
+        was.column_by_id(c.id) match
+            Some(p) -> if is_nullable(p.ty) && !is_nullable(c.ty) then return false
+            None -> if c.default != c.fill || c.generated.is_some() || c.state != ColumnReady then return false
+
+    for k in newest.constraints
+        if old.constraint_by_oid(k.oid).is_none()
+            k.kind match
+                ConCheck(_) -> if k.table == now.oid then return false
+                ConForeignKey(_, ref_table, _, _, _, _) ->
+                    if k.table == now.oid then return false
+                    if ref_table == now.oid && changed then return false
+                _ -> ()
+
+    true
+
+private is_nullable(t: Type) -> bool = t match
+    Nullable(_) -> true
+    _ -> false
+
+// -- the catalog read of a statement ----------------------------------------------------------------
+
+/** What a statement's tree names, gathered in one walk: its scans, the columns it reads by binder,
+ * the binders it reads whole, the relations whose rows reach its result (§6.2 rule 3), and the named
+ * types and sequences it names.
+ */
+private struct Reading
+    scans: Buf[ScanRef]
+    cols: Buf[ColRef]
+    rows: Buf[string]
+    wholes: Buf[QualName]
+    types: Buf[QualName]
+    sequences: Buf[QualName]
+
+private reading() -> Reading = Reading(buf(), buf(), buf(), buf(), buf(), buf())
+
+impl Reading
+    /** `r`, whose rows reach the statement's result when `top`. */
+    rel(*self, r: Rel, top: bool) -> unit = r match
+        Scan(table, binder) ->
+            self.scans.push(ScanRef(table, binder))
+            if top then self.wholes.push(table)
+        Values(_, columns, rows) ->
+            for f in columns
+                self.ty(f.ty)
+
+            for row in rows
+                self.exprs(row)
+        ParamScan(_, _) | CteRef(_, _) -> ()
+        Filter(input, p) ->
+            self.rel(*input, top)
+            self.expr(p)
+        Project(input, _, items) ->
+            self.rel(*input, false)
+            self.items(items)
+        Join(_, left, right, on, _, _) ->
+            self.rel(*left, top)
+            self.rel(*right, top)
+            self.opt(on)
+        Apply(_, left, right, on, _, _) ->
+            self.rel(*left, top)
+            self.rel(*right, top)
+            self.opt(on)
+        Aggregate(input, _, keys, aggs) ->
+            self.rel(*input, false)
+            self.items(keys)
+
+            for a in aggs
+                self.exprs(a.call.args)
+                self.opt(a.call.filter)
+                self.sort_keys(a.call.order)
+        Window(input, _, items) ->
+            self.rel(*input, top)
+
+            for w in items
+                self.exprs(w.call.args)
+                self.exprs(w.call.partition)
+                self.sort_keys(w.call.order)
+        Sort(input, keys) ->
+            self.rel(*input, top)
+            self.sort_keys(keys)
+        Limit(input, count, offset, _, _) ->
+            self.rel(*input, top)
+            self.opt(count)
+            self.opt(offset)
+        Distinct(input) -> self.rel(*input, top)
+        SetOp(_, _, _, inputs) ->
+            for x in inputs
+                self.rel(x, top)
+        With(_, ctes, body) ->
+            for c in ctes
+                self.rel(c.rel, top)
+
+            self.rel(*body, top)
+        Nest(input, _, keys, _, items, order) ->
+            self.rel(*input, false)
+            self.items(keys)
+            self.items(items)
+            self.sort_keys(order)
+        Unnest(input, _, value, _, _) ->
+            self.rel(*input, top)
+            self.expr(value)
+        Tag(input, _, ty, _) ->
+            self.rel(*input, top)
+            self.ty(ty)
+    end rel
+
+    expr(*self, e: Expr) -> unit = e match
+        Col(binder, name) -> self.cols.push(ColRef(binder, name))
+        Row(binder) -> self.rows.push(binder)
+        Param(_) | Action -> ()
+        Null(t) -> self.ty(t)
+        Literal(t, _) -> self.ty(t)
+        Call(f, args) ->
+            self.exprs(args)
+            if f == "next_value" then self.sequences.extend(expr_refs(e).sequences.view())
+        Cast(x, t, _) ->
+            self.expr(*x)
+            self.ty(t)
+        If(arms, otherwise) ->
+            for a in arms
+                self.expr(a.cond)
+                self.expr(a.value)
+
+            otherwise match
+                Some(x) -> self.expr(*x)
+                None -> ()
+        Match(x, arms, otherwise) ->
+            self.expr(*x)
+
+            for a in arms
+                self.expr(a.expr)
+
+            otherwise match
+                Some(o) -> self.expr(*o)
+                None -> ()
+        Record(fs) -> self.items(fs)
+        Field(x, _) -> self.expr(*x)
+        Variant(t, _, x) ->
+            self.ty(t)
+            self.expr(*x)
+        Relation(r) -> self.rel(*r, true)
+        Scalar(r) -> self.rel(*r, false)
+        Exists(r) -> self.rel(*r, false)
+        In(es, r) ->
+            self.exprs(es)
+            self.rel(*r, false)
+    end expr
+
+    exprs(*self, es: Buf[Expr])
+        for e in es
+            self.expr(e)
+
+    items(*self, is: Buf[Item])
+        for i in is
+            self.expr(i.expr)
+
+    sort_keys(*self, ks: Buf[SortKey])
+        for k in ks
+            self.expr(k.expr)
+
+    opt(*self, e: Option[Expr]) = e match
+        Some(x) -> self.expr(x)
+        None -> ()
+
+    ty(*self, t: Type) = self.types.extend(type_refs(t).types.view())
+
+    /** A DML target `table` read under `binder`, and under `old` when the statement names it. */
+    target(*self, table: QualName, binder: string, old: Option[string])
+        self.scans.push(ScanRef(table, binder))
+
+        old match
+            Some(o) -> self.scans.push(ScanRef(table, o))
+            None -> ()
+
+    rel_opt(*self, r: Option[Rel]) = r match
+        Some(x) -> self.rel(x, false)
+        None -> ()
+
+    /** Walks statement `s`, answering a DML statement's target. */
+    statement(*self, s: Statement) -> Option[QualName] = s match
+        Query(rel) ->
+            self.rel(rel, true)
+            None
+        Insert(table, binder, old, columns, source, on_conflict, returning) ->
+            self.rel(source, true)
+            self.target(table, binder, old)
+
+            for c in columns
+                self.cols.push(ColRef(binder, c))
+
+            if columns.len() == 0 then self.wholes.push(table)
+
+            on_conflict match
+                Some(oc) ->
+                    self.scans.push(ScanRef(table, oc.excluded))
+
+                    oc.target match
+                        Columns(names) ->
+                            for n in names
+                                self.cols.push(ColRef(binder, n))
+                        Constraint(_) -> ()
+
+                    oc.action match
+                        DoUpdate(set, where) ->
+                            for i in set
+                                self.cols.push(ColRef(binder, i.name))
+
+                            self.items(set)
+                            self.opt(where)
+                        Nothing -> ()
+                None -> ()
+
+            self.items(returning)
+            Some(table)
+        Update(table, binder, old, from, filter, set, returning) ->
+            self.target(table, binder, old)
+            self.rel_opt(from)
+            self.opt(filter)
+
+            for i in set
+                self.cols.push(ColRef(binder, i.name))
+
+            self.items(set)
+            self.items(returning)
+            Some(table)
+        Delete(table, binder, old, using, filter, returning) ->
+            self.target(table, binder, old)
+            self.rel_opt(using)
+            self.opt(filter)
+            self.items(returning)
+            Some(table)
+        CreateView(_, query, _) ->
+            self.rel(query, true)
+            None
+        CreateTable(_, columns, _, _, _) ->
+            for c in columns
+                self.ty(c.ty)
+
+            None
+        _ -> None
+    end statement
+end Reading
+
+/** The tables, views and DML target a statement names, without the catalog. */
+statement_names(env: Envelope) -> Buf[QualName]
+    var r = reading()
+    val out = buf[QualName]()
+
+    r.statement(env.statement) match
+        Some(q) -> out.push(q)
+        None -> ()
+
+    for s in r.scans
+        if !contains(out.view(), s.table) then out.push(s.table)
+
+    out
+
+/** The catalog read of statement `env` (`ddl.md` §6.2), planned against `view`: each object it names
+ * that `base`, the committed catalog under the view, holds, with the parts of its definition the
+ * statement depends on, as `base` holds them.
+ */
+statement_read(view: MemCatalog, base: MemCatalog, env: Envelope) -> Buf[ReadPart]
+    var r = reading()
+    val target = r.statement(env.statement)
+    val out = buf[ReadPart]()
+    resolve(view, base, r, out, 0)
+
+    // An insert reads the defaults of the columns it does not name, an update the generation
+    // expressions of every generated column (rule 4).
+    target match
+        Some(q) -> view.table_at(q).map(i -> view.tables[i].oid) match
+            Some(oid) -> base.table_by_oid(oid) match
+                Some(j) ->
+                    val t = base.tables[j]
+
+                    env.statement match
+                        Insert(_, _, _, columns, _, on_conflict, _) ->
+                            for c in t.columns
+                                if !contains(columns.view(), c.name) then push_part(out, ReadDefault(oid, c.id, c.default, c.generated, c.identity))
+
+                            on_conflict match
+                                Some(oc) -> oc.target match
+                                    Constraint(name) ->
+                                        for k in base.constraints
+                                            if k.table == oid && k.name == name then push_part(out, ReadConstraint(k.oid, oid, name))
+                                    _ -> ()
+                                None -> ()
+                        Update(_, _, _, _, _, _, _) ->
+                            for c in t.columns
+                                if c.generated.is_some() then push_part(out, ReadDefault(oid, c.id, c.default, c.generated, c.identity))
+                        _ -> ()
+                None -> ()
+            None -> ()
+        None -> ()
+
+    out
+end statement_read
+
+private push_part(out: Buf[ReadPart], p: ReadPart)
+    if !contains(out.view(), p) then out.push(p)
+
+/** The parts `r` reads, resolved in `view` and recorded from `base`; a view's query is read too, its
+ * scans whole.
+ */
+private resolve(view: MemCatalog, base: MemCatalog, r: Reading, out: Buf[ReadPart], depth: usize)
+    for s in r.scans
+        view.table_at(s.table) match
+            Some(i) ->
+                val oid = view.tables[i].oid
+
+                base.table_by_oid(oid) match
+                    Some(j) ->
+                        val t = base.tables[j]
+                        push_part(out, ReadTable(oid, s.table, t.primary_key.copy()))
+
+                        for c in r.cols
+                            if c.binder == s.binder
+                                t.column_named(c.name) match
+                                    Some(col) ->
+                                        push_part(out, ReadColumn(oid, ColumnShape(col.id, col.name, col.ty)))
+                                        types_read(base, type_refs(col.ty).types, out)
+                                    None -> ()
+
+                        if contains(r.rows.view(), s.binder) || contains(r.wholes.view(), s.table) then push_part(out, ReadColumns(oid, shapes(t)))
+                    None -> ()
+            None ->
+                view.view_at(s.table) match
+                    Some(i) ->
+                        val v = view.views[i]
+                        match_view(base, v.oid) match
+                            Some(b) -> push_part(out, ReadView(b.oid, s.table, b.query))
+                            None -> ()
+
+                        if depth < 16
+                            var inner = reading()
+                            inner.rel(v.query, true)
+                            resolve(view, base, inner, out, depth + 1)
+                    None -> ()
+
+    types_read(base, r.types, out)
+
+    for q in r.sequences
+        base.sequence_at(q) match
+            Some(i) -> push_part(out, ReadSequence(base.sequences[i].oid, q))
+            None -> ()
+end resolve
+
+private types_read(base: MemCatalog, names: Buf[QualName], out: Buf[ReadPart])
+    for q in names
+        base.type_at(q) match
+            Some(i) -> push_part(out, ReadType(base.types[i].oid, q, base.types[i].ty))
+            None -> ()
+
+/** A table's visible columns, as a whole-list read records them. */
+private shapes(t: CatTable) -> Buf[ColumnShape]
+    val out = buf[ColumnShape]()
+
+    for c in t.columns
+        if c.state == ColumnReady then out.push(ColumnShape(c.id, c.name, c.ty))
+
+    out
+
+/** Whether catalog `n` differs from what part `p` recorded (`ddl.md` §6.3). */
+conflicts(p: ReadPart, n: MemCatalog) -> bool = p match
+    ReadTable(oid, name, key) -> n.table_by_oid(oid) match
+        Some(i) -> !(n.qual_name(i) == name) || !(n.tables[i].primary_key == key)
+        None -> true
+    ReadColumn(table, c) -> n.table_by_oid(table) match
+        Some(i) -> n.tables[i].column_by_id(c.id) match
+            Some(x) -> x.name != c.name || !(x.ty == c.ty) || x.state != ColumnReady
+            None -> true
+        None -> true
+    ReadColumns(table, cs) -> n.table_by_oid(table) match
+        Some(i) -> !(shapes(n.tables[i]) == cs)
+        None -> true
+    ReadDefault(table, id, d, g, identity) -> n.table_by_oid(table) match
+        Some(i) -> n.tables[i].column_by_id(id) match
+            Some(x) -> !(x.default == d) || !(x.generated == g) || x.identity != identity
+            None -> true
+        None -> true
+    ReadConstraint(oid, _, name) -> n.constraint_by_oid(oid) match
+        Some(i) -> n.constraints[i].name != name
+        None -> true
+    ReadView(oid, _, query) -> match_view(n, oid) match
+        Some(v) -> !(v.query == query)
+        None -> true
+    ReadType(oid, _, ty) -> match_type(n, oid) match
+        Some(t) -> !(t.ty == ty)
+        None -> true
+    ReadSequence(oid, _) -> match_sequence(n, oid).is_none()
+end conflicts

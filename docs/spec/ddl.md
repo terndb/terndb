@@ -751,7 +751,9 @@ per-version column map computed once per (table, `r`, `v`) and cached, not a per
 1. A DDL statement takes the row write lock ([DISK] §4.1, [ISO] §4.2) of every `sys.objects` row it changes. Every
    DDL that changes a table's definition — its columns, indexes, constraints, name or owner — changes the table's
    `sys.objects` row, so DDL statements on one table are ordered by that lock, with the waiting, timeout and
-   deadlock rules of [ISO] §4.2. A foreign key locks both tables' rows.
+   deadlock rules of [ISO] §4.2. A foreign key locks both tables' rows. A statement that creates or renames an
+   object also locks the name it takes (and a rename the name it gives up) in its namespace — the unique key of
+   `sys.objects` on (namespace, name) — so two transactions creating one name are ordered the same way.
 2. DML takes **no** catalog lock, and DDL waits for no reader and no writer of the table. Readers of an object that
    is dropped keep reading it at their snapshot: its storage is freed only by purge, after the horizon passes the
    drop ([DISK] §5.6).
@@ -787,7 +789,9 @@ with those added later by reconciliation (§6.4).
 1. A transaction **conflicts** with a committed DDL `D` that it did not see if `D` changed any element of the
    catalog read of any of its statements. Then it MUST abort with `schema_changed` (`T1004`), at commit or, at read
    committed, at its next statement on the table if that statement would plan against the changed definition
-   ([ISO] §5.6). A transaction that does not conflict commits.
+   ([ISO] §5.6). A transaction that does not conflict commits. A transaction with an empty write set (no row and
+   no catalog entry written) is serialized at its snapshot, before `D` ([ISO] §5.5), and is not aborted at commit:
+   a reader of a dropped table finishes and commits.
 2. Hence, for a transaction `T` that used table `t` under the definition before `D`:
 
 | `D` | conflicts with `T` when |
@@ -813,7 +817,9 @@ wrote in `t` up to the newest committed definition of `t`:
 1. **Indexes.** For each index added or rebuilt by `D` (in state `building` or `ready`), insert the entries of each
    row `T` wrote and delete-mark those of each row it removed or changed ([DISK] §4.9 rule 2). A unique index is
    checked as an insert by an aware writer would be, and fails with `unique_violation` or, for a conflict with a
-   version committed after `T`'s snapshot, `serialization_failure`.
+   version committed after `T`'s snapshot, `serialization_failure` (`unique_violation` at read committed, which
+   never raises `serialization_failure`). A conflict with a row another live transaction is writing is
+   `lock_timeout`, since a commit does not wait (as for a deferred foreign-key check, §2.6 rule 3).
 2. **Constraints.** For each check constraint and each not-null change added by `D` (including the guard of a
    retype, §8.5), check every row `T` inserted or updated; for each foreign key in which `t` is the referencing
    table, check and lock the referenced rows as §2.6 rule 3 requires. A failure aborts `T` with the constraint's
@@ -1071,6 +1077,15 @@ All three **rebuild** the table into a new clustered tree under a new oid.
 6. A DDL statement that fails rolls back to the start of the statement, and aborts the transaction under [ISO] §5.1.
 7. After a DDL commits, a prepared statement whose result type it changed is released on its next execution
    (`W2007`, [WIRE] §4.4); one whose shape is still valid is re-validated against the new catalog and keeps running.
+   The catalog version a statement is validated and cached against is the one its transaction sees: a
+   transaction's own uncommitted DDL gives it a version no other transaction sees ([WIRE] §4.4 rule 6).
+8. **The catalog a transaction commits.** Its DDL statements changed only rows it holds locked (§6.1), but other
+   DDL may have committed on other objects since. At commit, its DDL is the newest committed catalog with its own
+   statements applied, in order, each creating its objects under the oids it created them under when it ran (so
+   rows written under those oids stay theirs). A statement that no longer applies to that catalog — an object it
+   depended on and did not lock was dropped or changed by a commit it did not see — aborts the transaction with
+   `schema_changed` (`T1004`). At read committed, the view each later statement plans against is built the same
+   way over the statement's snapshot.
 
 ## 10. Checkable properties
 

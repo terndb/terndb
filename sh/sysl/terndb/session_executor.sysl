@@ -91,8 +91,10 @@ trait Executor
     /** Validates a tree envelope without running it (`Prepare`, §4.4 rule 1). */
     describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
 
-    /** The tree whose shape digest is `shape` in this role's plan cache, if it is there (§4.4 rule 5). */
-    cached(*self, shape: [32]u8) -> Option[Buf[u8]]
+    /** The tree whose shape digest is `shape` in this role's plan cache, if it is there and valid for
+     * the catalog version transaction `txid` sees (0: an implicit one) (§4.4 rules 5–6).
+     */
+    cached(*self, shape: [32]u8, txid: u64) -> Option[Buf[u8]]
 
     /** Opens a transaction with options already filled from the connection's defaults. */
     begin(*self, options: TxnOptions) -> Result[Begun, Failure]

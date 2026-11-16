@@ -124,7 +124,7 @@ impl Executor for FakeEngine
             Some(f) -> Err(f)
             None -> Ok(Described(sx_shape(canned.id), self.catalog, canned.result))
 
-    cached(*self, shape: [32]u8) -> Option[Buf[u8]]
+    cached(*self, shape: [32]u8, txid: u64) -> Option[Buf[u8]]
         for id in self.cache
             if sx_shape(id) == shape then return Some(sx_envelope(id))
         None
@@ -448,6 +448,9 @@ impl Duo
         false
 
     connected(self) -> bool = self.c.phase == Open && self.s.phase == Serving
+
+    /** The kinds of the replies to `env` executed in transaction `txn` (`ew_kinds`). */
+    kinds_of(*self, txn: u64, env: Envelope) -> string = ew_kinds(self.seen(self.send(ew_exec(txn, env))))
 
 /** The code of an `Error`, or the type of any other message as a code-like word. */
 sx_code(m: Message) -> string = m match

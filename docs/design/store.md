@@ -9,7 +9,7 @@ foreign keys of `store_index.sysl` are tested in `store_constraint_tests.sysl` a
 
 ## Structure
 
-- **`Store`** holds the `MemCatalog` its tables come from, the transaction-id counter, the visible horizon `h`
+- **`Store`** holds the `MemCatalog` of the operation in progress and the catalog's committed versions (below), the transaction-id counter, the visible horizon `h`
   (the last commit sequence number), one `TableData` per table that has been touched, the live transactions and
   the retained committed write sets.
 - **`TableData`** keeps the table's rows as a `Buf[&Slot]` sorted by primary key (a record of the key columns,
@@ -122,6 +122,45 @@ transaction answer `unknown_transaction` (`W2001`), the handle being closed.
 `Faults` switches validation or first-updater-wins off, the fault-injected builds §7.1 requires so that each
 anomaly check is shown able to fail; a real store has both on.
 
+## The versioned catalog
+
+`catalog_mvcc.sysl` versions the catalog under MVCC (`isolation.md` §5.6, `ddl.md` §6 and §9); its tests are
+`catalog_mvcc_tests.sysl`.
+
+- **Versions.** `CatalogVersions` keeps every committed catalog a live transaction can still see, each stamped
+  with the commit that made it, oldest first. A transaction's view is the newest committed at or before its
+  snapshot with its own DDL applied; `enter(t)` installs it as `Store.catalog`, the catalog every operation
+  reads, and a commit installs the newest committed one. A catalog's `version` and every oid come from counters
+  kept beside the versions, so no two catalogs share a version and no two transactions hand out one oid.
+- **DDL** (`ddl(t, env, role)`) applies the statement to a copy of `t`'s view and diffs the two
+  (`changed_keys`): every object created, changed or dropped (by oid; an index or constraint change is its
+  table's, a foreign key both tables'), and every name taken or given up. Each key is a catalog row lock: one
+  another live transaction holds answers `Wait` (deadlocks found through the same wait-for graph as row locks);
+  at snapshot and serializable a key changed by a commit after the snapshot is `serialization_failure`; at read
+  committed the statement runs against the newest committed catalog. The statement is kept with the oids it
+  handed out, so that it can be applied again to a newer committed catalog — at read committed for each later
+  statement's view, and at commit when other DDL committed meanwhile (`ddl.md` §9 rule 8).
+- **Catalog reads.** Every statement records, in its transaction, the parts of the definitions it read
+  (`ReadPart`, `ddl.md` §6.2) as the committed catalog under its view held them: each table's identity, name and
+  key, each column it resolved, a whole column list where a scan's rows reach the result or a binder is read by
+  `Row`, the defaults an insert relies on, views (whose queries are read too), named types and sequences. At
+  commit, a writer whose read the newest committed catalog contradicts (`conflicts`) aborts with
+  `schema_changed`; a transaction with an empty write set does not. At read committed, a statement naming a
+  table an earlier statement's read of which has changed is `schema_changed` before it plans.
+- **Reconciliation** (`ddl.md` §6.4) re-checks the rows a writer wrote against unique keys added since; what it
+  cannot do it refuses with `schema_changed` (`engine.md`).
+- **Translation** (`ddl.md` §5.3). `scan_rows`, `get` and `lookup_unique` answer each row in the current schema
+  version of the installed catalog: columns matched by id, one added since reading its fill (a literal, else
+  null), one dropped since skipped, an integer becoming a float converted; every other lossless conversion keeps
+  the `Value`.
+- **Ending.** Commit publishes the transaction's merged catalog at its commit number and records each key it
+  locked as changed there; any end releases its keys. A version older than the one the oldest live transaction
+  sees is dropped, and with it the rows of every table no retained catalog, no live view and the installed
+  catalog holds — a dropped table once nobody can read it, or a table whose creation rolled back.
+- **Sequences** are not transactional (`ddl.md` §2.7 rule 5): a sequence's next value is kept beside the
+  versions and carried into each catalog as it is installed, so a draw under one version is seen under every
+  other.
+
 ## Concurrency
 
 The store is **single-threaded**: transactions interleave in the order their operations are called, which is
@@ -134,9 +173,9 @@ per-row latches and a real wait) is the next slice of this work.
 - Disk, WAL, the buffer manager and recovery (waiting on sysl's CRC32C and io_uring gaps); `transaction_status`.
 - `lock_timeout` (no clock seam yet), savepoints, `max_predicate_log` coarsening, `max_snapshot_age` and undo
   purge.
-- Translation of a row of an older schema version into the reader's (`ddl.md` §5.3): the store returns each image
-  in its own version, and the executor reads it as the current one until it translates it. Catalog versioning under MVCC and `schema_changed` from
-  catalog validation (§5.6).
+- Translation of a value whose representation a lossless retype changes other than integer to float (to
+  `decimal`, `json` to `text`); the commit latch of `ddl.md` §6.1 rule 3, which a single-threaded store does not
+  need.
 - Non-unique secondary indexes, and unique indexes with a predicate or an expression component: those need the
   executor's evaluator inside the store, so such an index enforces nothing in the in-memory store yet. A
   referencing scan is therefore a full scan of the referencing table. Check and NOT NULL constraints are checked

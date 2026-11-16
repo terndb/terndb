@@ -166,8 +166,9 @@ struct Faults
     skip_validation: bool
     skip_first_updater_wins: bool
 
-/** The store: the catalog its tables are defined in, the id and commit counters, the visible horizon
- * `h` (§4.1), each table's rows, the live transactions and the retained committed write sets.
+/** The store: the catalog of the operation in progress (`catalog_mvcc.sysl`), the id and commit
+ * counters, the visible horizon `h` (§4.1), each table's rows, the live transactions, the retained
+ * committed write sets, and the catalog's committed versions.
  */
 struct Store
     catalog: MemCatalog
@@ -177,6 +178,7 @@ struct Store
     tables: Buf[&TableData]
     active: Buf[&Txn]
     history: Buf[CommittedWrites]
+    cat: CatalogVersions
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
@@ -280,15 +282,23 @@ struct Store
                 if code.len == 0 then return fail("W2003", "the transaction was rolled back")
                 return fail(code, "the transaction was aborted")
 
-        // The deferred foreign-key checks run first, so that a serializable transaction's reads
-        // among them are validated with the rest (`ddl.md` §2.6 rule 2).
+        // The catalog read is validated and the transaction's DDL merged first, so that what follows
+        // runs against the newest definitions (`ddl.md` §6.3, §6.4). The deferred foreign-key checks
+        // run next, so that a serializable transaction's reads among them are validated with the
+        // rest (`ddl.md` §2.6 rule 2).
+        self.commit_catalog(t) match
+            Ok(_) -> ()
+            Err(e) ->
+                self.rollback(t, e.code)
+                return Err(e)
+
         self.check_deferred(t) match
             Ok(_) -> ()
             Err(e) ->
                 self.rollback(t, e.code)
                 return Err(e)
 
-        if t.writes.len() == 0
+        if t.writes.len() == 0 && !self.has_ddl(t)
             release_locks(t)
             t.state = CommittedAt(t.snapshot)
             self.retire(t)
@@ -308,6 +318,7 @@ struct Store
             s.lock = 0
 
         release_locks(t)
+        self.publish_catalog(t, c)
         self.horizon = c
         t.state = CommittedAt(c)
         self.history.push(CommittedWrites(c, t.writes))
@@ -352,7 +363,7 @@ struct Store
         self.log_read(t, table, all_rows(), Some(key))
         val (found, at) = locate(d, key)
         if !found then return Ok(None)
-        Ok(visible_row(d.slots[at], t.snapshot, t.id))
+        Ok(visible_row(d.slots[at], t.snapshot, t.id).map(r -> self.translated(table, r)))
 
     private scan_rows_in(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError]
         live(t)?
@@ -361,7 +372,7 @@ struct Store
 
         for s in d.slots
             visible_row(s, t.snapshot, t.id) match
-                Some(r) -> out.push(Hit(s.key, r))
+                Some(r) -> out.push(Hit(s.key, self.translated(table, r)))
                 None -> ()
 
         self.log_read(t, table, logged, None)
@@ -609,6 +620,40 @@ struct Store
         Some(i) -> self.catalog.tables[i].schema_version()
         None -> 0
 
+    /** `r` as a row of the current schema version of table `oid` in the installed catalog (`ddl.md`
+     * §5.3), each column matched by id: one present in `r`'s version keeps its value, an integer
+     * becoming a float being converted; one added since reads its fill (a literal, else null); one
+     * dropped since is skipped. Every other lossless conversion of §5.3 rule 3 keeps the `Value`.
+     */
+    private[terndb] translated(self, oid: u64, r: StoredRow) -> StoredRow
+        val now = self.current_version(oid)
+        if r.schema == now || now == 0 then return r
+
+        val from = self.columns_at(oid, r.schema) match
+            Some(c) -> c
+            None -> return r
+
+        val to = self.columns_at(oid, now) match
+            Some(c) -> c
+            None -> return r
+
+        val fields = r.value match
+            Record(fs) -> fs
+            _ -> return r
+
+        val out = buf[Value]()
+
+        for c in to
+            var v = fill_of(c.fill)
+
+            for j in 0..<from.len()
+                if from[j].id == c.id && j < fields.len() then v = widened(fields[j], c.ty)
+
+            out.push(v)
+
+        StoredRow(now, Record(out))
+    end translated
+
     private columns_at(self, oid: u64, schema: u64) -> Option[Buf[CatColumn]]
         val i = self.catalog.table_by_oid(oid)?
 
@@ -670,6 +715,7 @@ struct Store
                 val _ = self.active.remove(i)
                 break
 
+        self.retire_catalog(t)
         self.prune()
 
     // Drops the committed write sets no live serializable transaction can be validated against: those
@@ -688,8 +734,22 @@ struct Store
         self.history = kept
 end Store
 
+/** The value a row of an older version reads for a column added since: its fill. */
+private fill_of(fill: Option[Expr]) -> Value = fill match
+    Some(Literal(_, v)) -> v
+    _ -> Null
+
+/** `v` converted to `ty` where the conversion changes the `Value`: an integer to a float. */
+private widened(v: Value, ty: Type) -> Value = (v, ty) match
+    (Int(n), Float32) -> Float(real(n))
+    (Int(n), Float64) -> Float(real(n))
+    (UInt(n), Float32) -> Float(real(n))
+    (UInt(n), Float64) -> Float(real(n))
+    (_, Nullable(inner)) -> widened(v, *inner)
+    _ -> v
+
 /** A store over `catalog`'s tables, empty. */
-mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf())
+mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf(), catalog_versions(catalog))
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow

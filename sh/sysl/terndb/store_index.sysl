@@ -387,6 +387,23 @@ impl Store
         d.uniques = kept
     end sync_uniques
 
+    /** Reconciliation of `t`'s rows of `table` with the unique keys a DDL committed since added
+     * (`ddl.md` §6.4 rule 1): each row `t` wrote is checked as an aware writer's would be. A row
+     * another live transaction is writing that holds the value is `lock_timeout`, since a commit
+     * does not wait.
+     */
+    private[terndb] reconcile_uniques(*self, t: &Txn, table: u64) -> Result[unit, CodecError]
+        val d = self.table_data(table)?
+        self.sync_uniques(d)
+
+        for w in t.writes
+            if w.table == table
+                self.unique_check(t, d, w.slot)? match
+                    Some(_) -> return fail("T1003", "a row holding a value of a unique key added during the transaction is locked by a live transaction at its commit")
+                    None -> ()
+
+        Ok(())
+
     // Whether `t`'s version of `s` conflicts on a secondary unique key of `d` with another row
     // (`isolation.md` §4.2 rules 1 and 4, applied to the key's value): an error, the id of a live
     // transaction writing a row that holds the value (`Some`, to wait for), or none.
@@ -431,7 +448,7 @@ impl Store
 
         for o in slots_holding(d, ids, value)?
             visible_row(o, t.snapshot, t.id) match
-                Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, r)))
+                Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, self.translated(table, r))))
                 None -> ()
 
         Ok(None)
