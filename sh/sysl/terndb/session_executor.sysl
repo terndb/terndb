@@ -88,6 +88,11 @@ trait Executor
     /** The catalog version now (§4.4 rule 4). */
     catalog_version(self) -> u64
 
+    /** The handshake has authenticated the connection as `user`: what it runs from now on is run as
+     * that role (`ddl.md` §2.10 rule 1). Called once, before `Ready`.
+     */
+    authenticated(*self, user: string)
+
     /** Validates a tree envelope without running it (`Prepare`, §4.4 rule 1). */
     describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
 

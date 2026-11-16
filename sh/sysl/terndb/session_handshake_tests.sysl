@@ -40,6 +40,7 @@ ssh_scram_plus_over_tls_reaches_ready()
     assert_eq(sx_handshake(d), "type 129 type 131")
     assert(d.saw(Connected(d.c.ready.unwrap())), "the client reports Ready")
     assert_eq(d.c.causal_token(), 50)
+    assert(d.engine.logged("user alice"), "the executor runs as the authenticated user")
 
 @test
 ssh_scram_without_binding_over_unix_reaches_ready()
@@ -54,6 +55,7 @@ ssh_a_token_reaches_ready()
     var d = sx_duo("svc", [TokenMethod])
     d.connect()
     assert(d.connected(), "a token in ClientHello.initial")
+    assert(d.engine.logged("user svc"), "the token's user")
 
     // Token second: the server ignores `initial` and the token comes in an AuthResponse.
     var e = sx_duo("svc", [PeerMethod, TokenMethod])
@@ -123,6 +125,7 @@ ssh_every_failed_credential_is_w3001()
     var wrong = sx_duo_with(cc, sx_server_config())
     wrong.connect()
     assert_eq(sx_fatal(wrong), "W3001 W3001")
+    assert(!wrong.engine.logged("user alice"), "a failed login names no user to the executor")
 
     // An unknown user runs the whole exchange against a decoy and fails the same way.
     var unknown = sx_duo("mallory", [ScramPlus])

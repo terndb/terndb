@@ -413,11 +413,12 @@ struct ServerSession
             Err(_) -> self.die_with("W3001", "authentication failed")
 
     /** Authentication has succeeded: an unknown database is reported now (§3.4 rule 2), and
-     * otherwise `Ready`.
+     * otherwise the executor is told the user, whose role the connection runs as, and `Ready` goes out.
      */
     private authenticated(*self, final: Buf[u8])
         if !self.authority.has_database(self.database) then return self.die_with("W3004", s"unknown database ${self.database}")
 
+        self.exec.authenticated(self.user)
         self.send(0, ReadyMsg(Ready(self.config.connection_id, self.config.role, self.config.max_in_flight,
             self.config.max_open_txns, self.config.max_message_size, self.exec.horizon(), self.exec.catalog_version(), final)))
         self.phase = Serving

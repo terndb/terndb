@@ -115,6 +115,8 @@ impl Executor for FakeEngine
 
     catalog_version(self) -> u64 = self.catalog
 
+    authenticated(*self, user: string) = self.log.push(s"user $user")
+
     describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
         val c = self.find(envelope[0])
         if c.is_none() then return Err(sx_failure("Q1001"))

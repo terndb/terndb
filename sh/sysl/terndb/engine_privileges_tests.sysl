@@ -1,0 +1,204 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Roles and privileges through the wire (`ddl.md` §2.10): a connection runs as the role it logged in
+// as, which must be a committed role with `login`; a statement's privileges are those of the catalog
+// its transaction sees, so a grant or revoke is seen by its own transaction at once and by others only
+// once it commits, and a rolled-back one changes nothing; membership carries privileges transitively;
+// an owner needs no grant; and a revoke committed during a transaction does not abort it.
+
+/** The table `app.t(id, name)` holding rows 1 and 2, and the role `bob`, who may name objects of
+ * `app` and holds nothing on `t`.
+ */
+private ep_engine() -> &Engine
+    val e = ew_engine()
+    ew_setup(e, [ew_app(), ew_table("t", ew_users(), "id"),
+        ew_insert("t", ew_users(), [rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")])]),
+        envelope([], cat_role("bob")), ep_grant([PrivUsage], OnNamespace("app"), "bob")])
+    e
+
+private ep_grant(ps: []const Privilege, on: ObjectRef, to: string, grantable: bool = false) -> Envelope =
+    envelope([], Grant(items_of(ps), on, to, grantable))
+
+private ep_revoke(ps: []const Privilege, on: ObjectRef, from: string) -> Envelope = envelope([], Revoke(items_of(ps), on, from))
+
+private ep_t() -> ObjectRef = OnTable(cat_q("t"))
+
+/** `select id from app.t`. */
+private ep_ids() -> Envelope = query([], project(scan("app", "t", "t"), "r", [item("id", col("t", "id"))]))
+
+/** `insert into app.t values (<id>, 'x')`. */
+private ep_add(id: i128) -> Envelope = ew_insert("t", ew_users(), [rec([Int(id), Text("x")])])
+
+private ep_role(name: string, login: bool, member_of: []const string) -> Envelope =
+    envelope([], CreateRole(name, RoleDef(login, false, sx_strings(member_of))))
+
+@test
+a_connection_runs_as_the_role_it_logged_in_as()
+    val e = ep_engine()
+    var b = ew_duo(e, no_session_defaults(), "bob")
+    var root = ew_duo(e)
+
+    assert_eq(b.kinds_of(0, ep_ids()), "Q6015")
+    assert_eq(root.kinds_of(0, ep_ids()), "header batch complete")
+
+    // A grant committed by another connection is seen by bob's next statement, and so is a revoke.
+    ew_setup(e, [ep_grant([PrivSelect], ep_t(), "bob")])
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, ep_ids())))).len(), 2)
+    assert_eq(b.kinds_of(0, ep_add(3)), "Q6015")
+
+    ew_setup(e, [ep_revoke([PrivSelect], ep_t(), "bob")])
+    assert_eq(b.kinds_of(0, ep_ids()), "Q6015")
+
+    // Revoking a privilege bob does not hold changes nothing.
+    ew_setup(e, [ep_revoke([PrivDelete], ep_t(), "bob")])
+    assert_eq(b.kinds_of(0, ep_ids()), "Q6015")
+
+@test
+a_login_needs_a_committed_role_with_login()
+    val e = ep_engine()
+
+    // An unknown role fails as a wrong password does, by every credential.
+    val unknown = ew_login(e, "mallory")
+    assert_eq(sx_fatal(unknown), "W3001 W3001")
+    val no_svc = ew_login(e, "svc", [TokenMethod])
+    assert_eq(sx_fatal(no_svc), "W3001 W3001")
+
+    // A role without `login` may not log in, whatever its credentials.
+    ew_setup(e, [ep_role("readers", false, [])])
+    assert_eq(sx_fatal(ew_login(e, "readers")), "W3001 W3001")
+
+    // A role an open transaction created is not there to log in as until it commits.
+    var root = ew_duo(e)
+    root.send(Begin(1, no_txn_options()))
+    assert_eq(root.kinds_of(1, ep_role("svc", true, [])), "header complete")
+    assert_eq(sx_fatal(ew_login(e, "svc", [TokenMethod])), "W3001 W3001")
+    assert_eq(ew_kinds(root.seen(root.send(Commit(1)))), "committed")
+    assert(ew_login(e, "svc", [TokenMethod]).connected(), "svc logs in by token")
+    assert(ew_login(e, "svc").connected(), "and by SCRAM")
+
+    // Losing `login` stops the next login, not a connection already made.
+    ew_setup(e, [ep_grant([PrivUsage], OnNamespace("app"), "svc"), ep_grant([PrivSelect], ep_t(), "svc")])
+    var svc = ew_duo(e, no_session_defaults(), "svc")
+    ew_setup(e, [envelope([], AlterRole("svc", RoleDef(false, false, buf[string]()), None))])
+    assert_eq(sx_fatal(ew_login(e, "svc")), "W3001 W3001")
+    assert_eq(svc.kinds_of(0, ep_ids()), "header batch complete")
+
+@test
+membership_carries_a_roles_privileges_transitively()
+    val e = ep_engine()
+    ew_setup(e, [ep_role("readers", false, []), ep_role("staff", false, ["readers"]), ep_role("carol", true, ["staff"]),
+        ep_role("dave", true, []), ep_grant([PrivUsage], OnNamespace("app"), "readers"), ep_grant([PrivSelect], ep_t(), "readers")])
+
+    var c = ew_duo(e, no_session_defaults(), "carol")
+    assert_eq(ew_rows(c.seen(c.send(ew_exec(0, ep_ids())))).len(), 2)
+    // Only what the roles hold: no `insert`.
+    assert_eq(c.kinds_of(0, ep_add(3)), "Q6015")
+
+    // dave belongs to nothing, and is given the privileges by joining.
+    var d = ew_duo(e, no_session_defaults(), "dave")
+    assert_eq(d.kinds_of(0, ep_ids()), "Q6015")
+    ew_setup(e, [envelope([], AlterRole("dave", RoleDef(true, false, sx_strings(["staff"])), None))])
+    assert_eq(ew_rows(d.seen(d.send(ew_exec(0, ep_ids())))).len(), 2)
+
+    // A privilege revoked from the role it came through is gone for every member.
+    ew_setup(e, [ep_revoke([PrivSelect], ep_t(), "readers")])
+    assert_eq(c.kinds_of(0, ep_ids()), "Q6015")
+    assert_eq(d.kinds_of(0, ep_ids()), "Q6015")
+
+@test
+a_grant_in_a_transaction_is_seen_by_others_only_after_it_commits()
+    val e = ep_engine()
+    var root = ew_duo(e)
+    var b = ew_duo(e, no_session_defaults(), "bob")
+
+    root.send(Begin(1, no_txn_options()))
+    assert_eq(root.kinds_of(1, ep_grant([PrivSelect], ep_t(), "bob")), "header complete")
+    assert_eq(b.kinds_of(0, ep_ids()), "Q6015")
+
+    assert_eq(ew_kinds(root.seen(root.send(Commit(1)))), "committed")
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, ep_ids())))).len(), 2)
+
+@test
+a_rolled_back_grant_gives_nothing()
+    val e = ep_engine()
+    var root = ew_duo(e)
+    var b = ew_duo(e, no_session_defaults(), "bob")
+
+    root.send(Begin(1, no_txn_options()))
+    assert_eq(root.kinds_of(1, ep_grant([PrivSelect], ep_t(), "bob")), "header complete")
+    assert_eq(ew_kinds(root.seen(root.send(Rollback(1)))), "ok")
+    assert_eq(b.kinds_of(0, ep_ids()), "Q6015")
+
+@test
+a_revoke_in_a_transaction_is_seen_by_it_at_once()
+    val e = ep_engine()
+    ew_setup(e, [envelope([], cat_role("alice")), ep_grant([PrivUsage], OnNamespace("app"), "alice"),
+        ep_grant([PrivSelect], ep_t(), "alice", true)])
+    var a = ew_duo(e, no_session_defaults(), "alice")
+    var other = ew_duo(e, no_session_defaults(), "alice")
+
+    // alice holds `select` grantable, so she may revoke it from herself; her own next statement in
+    // that transaction no longer holds it, and the refusal aborts the transaction.
+    a.send(Begin(1, no_txn_options()))
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ep_ids())))).len(), 2)
+    assert_eq(a.kinds_of(1, ep_revoke([PrivSelect], ep_t(), "alice")), "header complete")
+    assert_eq(other.kinds_of(0, ep_ids()), "header batch complete")
+    assert_eq(a.kinds_of(1, ep_ids()), "Q6015")
+    a.send(Rollback(1))
+
+    // The revoke was never committed.
+    assert_eq(a.kinds_of(0, ep_ids()), "header batch complete")
+    assert_eq(other.kinds_of(0, ep_ids()), "header batch complete")
+
+@test
+a_revoke_committed_during_a_transaction_does_not_abort_it()
+    val e = ep_engine()
+    ew_setup(e, [ep_grant([PrivSelect, PrivInsert], ep_t(), "bob")])
+    var b = ew_duo(e, no_session_defaults(), "bob")
+
+    // At serializable every statement is checked against the catalog of the transaction's snapshot,
+    // which still grants bob `insert`; the transaction commits.
+    b.send(Begin(1, ew_level(Serializable)))
+    assert_eq(b.kinds_of(1, ep_add(3)), "header complete")
+    ew_setup(e, [ep_revoke([PrivInsert], ep_t(), "bob")])
+    assert_eq(b.kinds_of(1, ep_add(4)), "header complete")
+    assert_eq(ew_kinds(b.seen(b.send(Commit(1)))), "committed")
+    assert_eq(b.kinds_of(0, ep_add(5)), "Q6015")
+
+    // At read committed each statement's snapshot is its own, so the next statement after the
+    // revoke commits is refused; a transaction that makes no statement after it commits.
+    b.send(Begin(2, ew_level(ReadCommitted)))
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(2, ep_ids())))).len(), 4)
+    ew_setup(e, [ep_revoke([PrivSelect], ep_t(), "bob")])
+    assert_eq(b.kinds_of(2, ep_ids()), "Q6015")
+
+    ew_setup(e, [ep_grant([PrivSelect], ep_t(), "bob")])
+    b.send(Begin(3, ew_level(ReadCommitted)))
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(3, ep_ids())))).len(), 4)
+    ew_setup(e, [ep_revoke([PrivSelect], ep_t(), "bob")])
+    assert_eq(ew_kinds(b.seen(b.send(Commit(3)))), "committed")
+
+@test
+an_owner_needs_no_grant()
+    val e = ep_engine()
+    ew_setup(e, [envelope([], cat_role("alice")), ep_grant([PrivUsage, PrivCreate], OnNamespace("app"), "alice")])
+    var a = ew_duo(e, no_session_defaults(), "alice")
+    var b = ew_duo(e, no_session_defaults(), "bob")
+
+    // alice owns what she creates, and reads and writes it with no grant.
+    assert_eq(a.kinds_of(0, ew_table("mine", ew_users(), "id")), "header complete")
+    assert_eq(a.kinds_of(0, ew_insert("mine", ew_users(), [rec([Int(1), Text("a")])])), "header complete")
+    val mine = query([], project(scan("app", "mine", "m"), "r", [item("id", col("m", "id"))]))
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(0, mine)))).len(), 1)
+    // She owns nothing else.
+    assert_eq(a.kinds_of(0, ep_ids()), "Q6015")
+
+    // bob holds nothing on her table until she, its owner, grants it.
+    assert_eq(b.kinds_of(0, mine), "Q6015")
+    assert_eq(a.kinds_of(0, ep_grant([PrivSelect], OnTable(cat_q("mine")), "bob")), "header complete")
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, mine)))).len(), 1)
+    // A grantee without `grantable` may not grant on.
+    assert_eq(b.kinds_of(0, ep_grant([PrivSelect], OnTable(cat_q("mine")), "alice")), "Q6015")

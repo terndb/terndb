@@ -268,7 +268,11 @@ Every constraint has a name unique in the table's namespace, and is one of:
 1. A **role** has a name, `login` (whether a connection may authenticate as it, [WIRE] §2.4), `superuser`, and a
    list of roles it is a member of; a member has every privilege of the roles it belongs to, transitively.
    Credentials are not part of the catalog defined here; the wire's authentication methods map a credential to a
-   role.
+   role. A login reads the newest committed catalog: a role it does not hold, or holds without `login`, fails
+   authentication as an unknown user does (`W3001`), whatever its credentials. A connection runs every statement as
+   the role it authenticated as; a later change to that role (losing `login`, being dropped) stops the next login,
+   not the connection, whose statements are checked against their own catalog snapshot (rule 4). There is no
+   statement that changes a connection's role.
 2. Every object has an **owner** role, initially the role that created it. The owner, a member of the owner, and a
    superuser may alter or drop the object and grant privileges on it.
 3. The privileges are: on a table or view, `select`, `insert`, `update`, `delete`, `references` (needed to create a

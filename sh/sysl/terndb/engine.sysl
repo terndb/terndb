@@ -81,7 +81,9 @@ struct Engine
     private ended: Buf[Ended]
     private cache: Buf[Cached]
 
-    /** A connection of role `role`, as a server session drives it. */
+    /** A connection of role `role`, as a server session drives it; its handshake makes the role the
+     * user it authenticated.
+     */
     connect(&self, role: string) -> &EngineConn = EngineConn(self, role, buf())
 
     /** The catalog version now: the newest committed one's. */
@@ -248,7 +250,9 @@ end Engine
  */
 engine(catalog: MemCatalog, now: i64, clock: &Clock) -> &Engine = Engine(mem_store(catalog), now, clock, 1, buf(), buf(), buf())
 
-/** One connection to an engine, of role `role`: the `Executor` its server session drives. */
+/** One connection to an engine, of role `role`: the `Executor` its server session drives. A server
+ * session's handshake makes the role the user it authenticated.
+ */
 struct EngineConn
     engine: &Engine
     role: string
@@ -324,6 +328,8 @@ impl Executor for EngineConn
     horizon(self) -> u64 = self.engine.store.horizon
 
     catalog_version(self) -> u64 = self.engine.catalog_version()
+
+    authenticated(*self, user: string) = self.role = user
 
     describe(*self, envelope: Buf[u8]) -> Result[Described, Failure]
         self.engine.store.enter_latest()

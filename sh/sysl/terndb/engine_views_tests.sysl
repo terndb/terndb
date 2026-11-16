@@ -8,17 +8,7 @@ import sysl.buf.{Buf, buf}
 // `next_value` drawn for an insert and a query, the `usage` a draw needs, and `at_zone`.
 
 /** A connected client whose server session runs on `e` as role `role`. */
-private ev_duo(e: &Engine, role: string) -> Duo
-    val authority = sx_authority()
-    val pre = buf[u8]()
-    push_preface(pre)
-
-    var d = Duo(client_session(sx_client_config("alice", [ScramPlus]), 0), server_session(sx_server_config(), e.connect(role), authority, 0),
-        sx_engine(), authority, reassembler(Client), reassembler(Server), pre, buf(), 0, 0, DefaultFrameSize, DefaultFrameSize, 0, buf(), buf(),
-        false, false, None, None)
-    d.connect()
-    assert(d.connected(), "connected")
-    d
+private ev_duo(e: &Engine, role: string) -> Duo = ew_duo(e, no_session_defaults(), role)
 
 /** `users`, the view `names` of their names, the sequence `counter`, the table `ticket(id int64
  * identity always, note)`, and the role `bob`, who may read `names` and nothing else.
