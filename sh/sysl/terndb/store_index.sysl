@@ -448,7 +448,7 @@ impl Store
 
         for o in slots_holding(d, ids, value)?
             visible_row(o, t.snapshot, t.id) match
-                Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, self.translated(table, r))))
+                Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, self.translated(table, r)?)))
                 None -> ()
 
         Ok(None)

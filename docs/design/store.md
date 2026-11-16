@@ -149,17 +149,23 @@ anomaly check is shown able to fail; a real store has both on.
   table an earlier statement's read of which has changed is `schema_changed` before it plans.
 - **Reconciliation** (`ddl.md` §6.4) re-checks the rows a writer wrote against unique keys added since; what it
   cannot do it refuses with `schema_changed` (`engine.md`).
-- **Translation** (`ddl.md` §5.3). `scan_rows`, `get` and `lookup_unique` answer each row in the current schema
+- **Translation** (`ddl.md` §5.3). `scan` (whose predicate reads the stored image), `scan_rows`, `get` and `lookup_unique` answer each row in the current schema
   version of the installed catalog: columns matched by id, one added since reading its fill (a literal, else
-  null), one dropped since skipped, an integer becoming a float converted; every other lossless conversion keeps
-  the `Value`.
+  null), one dropped since skipped, and one present converted through each retype between, in order
+  (`translate.sysl`; tests `translate_tests.sysl`). A scalar step is the strict cast of `exec_functions.sysl`; a
+  record, union or relation converts by position, a record value short of its named type's fields reading the
+  fills the type keeps (`CatType.fills`). A value that does not convert is `D1001`.
 - **Ending.** Commit publishes the transaction's merged catalog at its commit number and records each key it
   locked as changed there; any end releases its keys. A version older than the one the oldest live transaction
   sees is dropped, and with it the rows of every table no retained catalog, no live view and the installed
   catalog holds — a dropped table once nobody can read it, or a table whose creation rolled back.
-- **Sequences** are not transactional (`ddl.md` §2.7 rule 5): a sequence's next value is kept beside the
-  versions and carried into each catalog as it is installed, so a draw under one version is seen under every
-  other.
+- **Sequences** are not transactional (`ddl.md` §2.7 rule 5): where a sequence draws from (its next value and
+  whether it is exhausted) is kept beside the versions (`CatalogVersions.draws`) and carried into each catalog as
+  it is installed, so a draw under one version is seen under every other. A draw (`Store.drawing`) takes the
+  newest committed definition at that shared position, so an uncommitted `AlterSequence` moves no draw, its own
+  transaction's included (rule 8); at commit the transaction's DDL is applied again over the shared position and
+  each committed sequence it altered takes the result. A sequence a transaction created is its own until commit,
+  and its draws and alters act at once.
 
 ## Concurrency
 

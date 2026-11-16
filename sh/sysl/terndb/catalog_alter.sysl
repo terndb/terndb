@@ -418,6 +418,7 @@ impl MemCatalog
 
         self.need_owner(who, self.type_target(ti))?
         val old = self.types[ti].ty
+        val fills = self.types[ti].fills.copy()
 
         val changed = change match
             AppendVariants(variants) ->
@@ -445,13 +446,20 @@ impl MemCatalog
 
                 val out = fs.copy()
 
+                // Older values lack the appended fields and read each one's fill (§5.3 rule 3).
+                while fills.len() < fs.len()
+                    fills.push(Null)
+
                 for f in fields
                     if has_member(out, f.name) then return fail("Q6002", s"type '${name.name}' already has a field '${f.name}'")
                     val to = self.usable_type(f.ty, who)?
 
                     f.fill match
-                        Some(Literal(lt, _)) -> if !coerces(resolve_type(*self, lt)?, to) then return fail("Q3001", s"the fill of '${f.name}' does not coerce to its type")
-                        _ -> ()
+                        Some(Literal(lt, v)) ->
+                            val from = resolve_type(*self, lt)?
+                            if !coerces(from, to) then return fail("Q3001", s"the fill of '${f.name}' does not coerce to its type")
+                            fills.push(cast_value(v, from, resolve_type(*self, to)?)?)
+                        _ -> fills.push(Null)
 
                     out.push(Field(f.name, f.ty))
 
@@ -479,6 +487,7 @@ impl MemCatalog
 
         if self.type_reaches(changed, name, 0) then return fail("Q6005", s"type '${name.name}' would refer to itself")
         self.types[ti].ty = changed
+        self.types[ti].fills = fills
 
         for i in 0..<self.tables.len()
             var uses = false

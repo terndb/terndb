@@ -1,0 +1,189 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Reading a row of an older schema version (`ddl.md` §5.3): every lossless conversion of rule 3
+// applied to a stored value, a null and a nested value among them; the decimal and integer edges,
+// where nothing rounds or overflows, and a stored value that cannot convert, which is `D1001`; `json`
+// becoming its canonical text; retypes composed across versions; and the fills of fields appended to a
+// named record type, at the top of a column and inside a relation.
+
+/** `v` of `from` converted to `to` with no catalog; "D1001" style codes come back as `Err`. */
+private tr(v: Value, from: Type, to: Type) -> Result[Value, CodecError] = converted_value(mem_catalog(), v, from, to)
+
+private tr_is(v: Value, from: Type, to: Type, want: Value, file: string = __FILE__, line: long = __LINE__)
+    tr(v, from, to) match
+        Ok(got) -> assert(got == want, "the converted value", file, line)
+        Err(e) -> assert(false, s"the conversion fails with ${e.code}: ${e.message}", file, line)
+
+private tr_code(v: Value, from: Type, to: Type) -> string = st_code(tr(v, from, to))
+
+@test
+integers_widen_and_become_signed_decimals_and_floats()
+    tr_is(Int(-128), Int8, Int16, Int(-128))
+    tr_is(Int(9223372036854775807), Int64, Int128, Int(9223372036854775807))
+    tr_is(UInt(4294967295), UInt32, UInt64, UInt(4294967295))
+    tr_is(UInt(255), UInt8, Int16, Int(255))
+    tr_is(UInt(18446744073709551615), UInt64, Int128, Int(18446744073709551615))
+
+    // Into a decimal of scale 0 wide enough for every value: the edges of the range are exact.
+    tr_is(Int(-9223372036854775808), Int64, Decimal(19, 0), Int(-9223372036854775808))
+    tr_is(Int(9223372036854775807), Int64, Decimal(19, 0), Int(9223372036854775807))
+    tr_is(UInt(18446744073709551615), UInt64, Decimal(20, 0), Int(18446744073709551615))
+    tr_is(Int(-128), Int8, Decimal(3, 0), Int(-128))
+
+    // Into a float wide enough for every value.
+    tr_is(Int(-32768), Int16, Float32, Float(-32768.0))
+    tr_is(Int(2147483647), Int32, Float64, Float(2147483647.0))
+    tr_is(UInt(4294967295), UInt32, Float64, Float(4294967295.0))
+    tr_is(Float(1.5), Float32, Float64, Float(1.5))
+
+@test
+a_decimal_gains_scale_and_digits_without_rounding()
+    tr_is(Int(12345), Decimal(5, 2), Decimal(7, 4), Int(1234500))
+    tr_is(Int(-99999), Decimal(5, 2), Decimal(7, 4), Int(-9999900))
+    tr_is(Int(99999), Decimal(5, 2), Decimal(6, 2), Int(99999))
+    tr_is(Int(1), Decimal(38, 0), Decimal(38, 0), Int(1))
+    tr_is(Int(-5), Decimal(2, 1), Decimal(20, 19), Int(-5000000000000000000))
+
+@test
+a_stored_value_that_cannot_convert_is_data_corrupted()
+    // A decimal holding more digits than its type allows overflows the wider type too.
+    assert_eq(tr_code(Int(100000), Decimal(5, 2), Decimal(7, 4)), "D1001")
+    assert_eq(tr_code(Int(10000000000), Int32, Decimal(10, 0)), "D1001")
+    // A value not held the way its version's type is.
+    assert_eq(tr_code(Text("7"), Int32, Int64), "D1001")
+    assert_eq(tr_code(Int(7), Json, Text), "D1001")
+    assert_eq(tr_code(rec([Int(1), Int(2)]), record([Field("a", Int32)]), record([Field("a", Int64)])), "D1001")
+    assert_eq(tr_code(variant(3, rec([])), union_of([Field("a", record([]))]), union_of([Field("a", record([])), Field("b", record([]))])), "D1001")
+    // A json text that is not in canonical form was never stored by a writer.
+    assert_eq(tr_code(Text("{\"b\":1, \"a\":2}"), Json, Text), "D1001")
+
+@test
+json_becomes_its_canonical_text()
+    val stored = "{\"a\":1,\"b\":[true,null,\"\\n\"],\"c\":1.5e+300}"
+    val canonical = canonical_json(stored).unwrap()
+    assert_eq(canonical, stored)
+    tr_is(Text(stored), Json, Text, Text(to_text(Json, Text(stored)).unwrap()))
+    tr_is(Text(stored), Json, nullable(Text), Text(canonical))
+    tr_is(Text("[]"), Json, Text, Text("[]"))
+
+@test
+a_null_stays_null_and_a_type_becomes_nullable()
+    tr_is(Int(5), Int32, nullable(Int64), Int(5))
+    tr_is(Null, nullable(Int32), nullable(Int64), Null)
+    tr_is(Null, nullable(Json), nullable(Text), Null)
+    tr_is(Null, nullable(Decimal(5, 2)), nullable(Decimal(7, 4)), Null)
+    tr_is(Null, nullable(record([Field("a", Int8)])), nullable(record([Field("a", Int16)])), Null)
+    tr_is(Text("x"), Text, nullable(Text), Text("x"))
+
+@test
+nested_values_convert_member_by_member()
+    // A list becoming a bag, with its elements widened and a null element kept.
+    tr_is(rel([Int(1), Null, Int(-3)]), list(nullable(Int8)), bag(nullable(Int16)), rel([Int(1), Null, Int(-3)]))
+
+    // A record whose fields convert, with a nullable field appended, which reads null.
+    val from = record([Field("a", Int32), Field("b", Json)])
+    val to = record([Field("a", Int64), Field("b", Text), Field("c", nullable(Int32))])
+    tr_is(rec([Int(1), Text("[1]")]), from, to, rec([Int(1), Text("[1]"), Null]))
+
+    // A union whose payloads convert, with a variant appended; renamed members match by position.
+    val u0 = union_of([Field("x", record([Field("n", Int16)])), Field("y", record([]))])
+    val u1 = union_of([Field("big", record([Field("count", Float32)])), Field("y", record([])), Field("z", record([]))])
+    tr_is(variant(0, rec([Int(7)])), u0, u1, variant(0, rec([Float(7.0)])))
+    tr_is(variant(1, rec([])), u0, u1, variant(1, rec([])))
+
+    // A relation of records, with a decimal inside gaining scale.
+    tr_is(rel([rec([Int(125)]), rec([Null])]), list(record([Field("d", nullable(Decimal(3, 1)))])), bag(record([Field("d", nullable(Decimal(5, 2)))])),
+        rel([rec([Int(1250)]), rec([Null])]))
+
+// -- through the store: retypes composed across versions, and named types' fills -------------------
+
+/** DDL statement `st` committed in a transaction of its own. */
+private tr_ddl(s: &Store, st: Statement, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+
+    s.ddl(t, envelope([], st), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+    st_commit(s, t, file, line)
+
+/** The row of `table` keyed `k` as a fresh transaction sees it. */
+private tr_row(s: &Store, table: u64, k: i128, file: string = __FILE__, line: long = __LINE__) -> Value = s.get(s.begin(Snapshot), table, st_key(k)) match
+    Ok(Some(r)) ->
+        assert(r.schema == s.catalog.tables[s.catalog.table_by_oid(table).unwrap()].schema_version(), "the row is read in the current version", file, line)
+        r.value
+    Ok(None) ->
+        assert(false, s"no row $k", file, line)
+        Null
+    Err(e) ->
+        assert(false, s"the read fails with ${e.code}: ${e.message}", file, line)
+        Null
+
+@test
+retypes_compose_across_versions_and_each_row_reads_in_the_current_one()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("a", Int8), cat_col("d", Decimal(5, 2)), cat_col("j", nullable(Json)), cat_col("gone", Int64)], ["id"]))
+    val s = mem_store(c)
+    val oid = st_oid(s, "t")
+
+    val w1 = s.begin(Snapshot)
+    st_insert(s, w1, oid, [Int(1), Int(-100), Int(12345), Text("{\"k\":[1,2]}"), Int(9)])
+    st_insert(s, w1, oid, [Int(2), Int(127), Int(-1), Null, Int(9)])
+    st_commit(s, w1)
+
+    // Version 2: a widened, the json column now text, a column dropped and one added with a fill.
+    tr_ddl(s, cat_alter("t", [RetypeColumn("a", Int16, None), RetypeColumn("j", nullable(Text), None), DropColumn("gone", false),
+        AddColumn(ColumnDef("f", Int32, Some(Literal(Int32, Int(4))), None, NoIdentity, None))]))
+    val w2 = s.begin(Snapshot)
+    st_insert(s, w2, oid, [Int(3), Int(30000), Int(500), Text("plain"), Int(5)])
+    st_commit(s, w2)
+
+    // Version 3: a widened again, into a decimal; the decimal gaining scale.
+    tr_ddl(s, cat_alter("t", [RetypeColumn("a", Decimal(5, 0), None), RetypeColumn("d", Decimal(8, 3), None)]))
+
+    assert(tr_row(s, oid, 1) == rec([Int(1), Int(-100), Int(123450), Text("{\"k\":[1,2]}"), Int(4)]), "a row of version 1")
+    assert(tr_row(s, oid, 2) == rec([Int(2), Int(127), Int(-10), Null, Int(4)]), "a row of version 1 holding a null")
+    assert(tr_row(s, oid, 3) == rec([Int(3), Int(30000), Int(5000), Text("plain"), Int(5)]), "a row of version 2")
+
+    // A scan reads them the same way.
+    val hits = s.scan(s.begin(Snapshot), oid, all_rows()).unwrap()
+    assert_eq(hits.len(), 3)
+    assert(hits[0].row.value == tr_row(s, oid, 1), "the scan's row")
+
+@test
+a_named_records_appended_fields_read_their_fills_in_older_values()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, CreateType(cat_q("point"), record([Field("x", Int32), Field("y", Int32)]), false))
+    val point = Named("app", "point")
+    c = cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("p", nullable(point)), cat_col("ps", bag(point))], ["id"]))
+    val s = mem_store(c)
+    val oid = st_oid(s, "u")
+
+    val w = s.begin(Snapshot)
+    st_insert(s, w, oid, [Int(1), rec([Int(1), Int(2)]), rel([rec([Int(3), Int(4)]), rec([Int(5), Int(6)])])])
+    st_insert(s, w, oid, [Int(2), Null, rel([])])
+    st_commit(s, w)
+
+    val z = FieldFill("z", Int64, Some(Literal(Int32, Int(7))))
+    tr_ddl(s, AlterType(cat_q("point"), AppendFields(items_of([z, FieldFill("w", nullable(Text), None)]))))
+    assert(s.catalog.types[s.catalog.type_at(cat_q("point")).unwrap()].fills == items_of([Null, Null, Int(7), Null]), "the fills by position")
+
+    val p = rec([Int(1), Int(2), Int(7), Null])
+    assert(tr_row(s, oid, 1) == rec([Int(1), p, rel([rec([Int(3), Int(4), Int(7), Null]), rec([Int(5), Int(6), Int(7), Null])])]), "the fills")
+    assert(tr_row(s, oid, 2) == rec([Int(2), Null, rel([])]), "a null and an empty relation")
+
+    // A value written since has every field, and reads as written.
+    val w2 = s.begin(Snapshot)
+    st_insert(s, w2, oid, [Int(3), rec([Int(1), Int(1), Int(0), Text("a")]), rel([])])
+    st_commit(s, w2)
+    assert(tr_row(s, oid, 3) == rec([Int(3), rec([Int(1), Int(1), Int(0), Text("a")]), rel([])]), "a new value")
+
+    // A second append keeps the first one's fills.
+    tr_ddl(s, AlterType(cat_q("point"), AppendFields(items_of([FieldFill("v", Bool, Some(Literal(Bool, Bool(true))))]))))
+    assert(tr_row(s, oid, 1) == rec([Int(1), rec([Int(1), Int(2), Int(7), Null, Bool(true)]),
+        rel([rec([Int(3), Int(4), Int(7), Null, Bool(true)]), rec([Int(5), Int(6), Int(7), Null, Bool(true)])])]), "both fills")
+    assert(tr_row(s, oid, 3) == rec([Int(3), rec([Int(1), Int(1), Int(0), Text("a"), Bool(true)]), rel([])]), "the newer value's one fill")

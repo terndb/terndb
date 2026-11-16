@@ -185,8 +185,8 @@ a_sequences_next_value_is_not_versioned()
 
     // A draw under the newest catalog is seen under the older one the snapshot sees.
     s.enter_latest()
-    var q = s.catalog.sequences[0]
-    q.next = 42
-    s.catalog.sequences[0] = q
+    assert_eq(draw(s, 0).unwrap(), 1)
+    assert_eq(draw(s, 0).unwrap(), 2)
     s.enter(old).unwrap()
-    assert_eq(s.catalog.sequences[0].next, 42)
+    assert_eq(s.catalog.sequences[0].next, 3)
+    assert_eq(draw(s, 0).unwrap(), 3)

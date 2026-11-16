@@ -189,15 +189,112 @@ an_exhausted_sequence_draws_again_once_altered()
     assert_eq(xd_code(s, t, xq_draws("counter", 1)), "R0008")
 
     // A wider range continues after the last value drawn.
-    s.catalog = cat_ok(s.catalog, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, Some(40), false, None), None))
+    xq_alter(s, SequenceDef(Int64, None, None, None, Some(40), false, None), None)
     xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 3))), [30, 35, 40])
     assert_eq(xd_code(s, s.begin(Snapshot), xq_draws("counter", 1)), "R0008")
 
     // Cycling wraps to the start of the range; a restart starts where it says.
-    s.catalog = cat_ok(s.catalog, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, true, None), None))
+    xq_alter(s, SequenceDef(Int64, None, None, None, None, true, None), None)
     xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 1))), [1])
-    s.catalog = cat_ok(s.catalog, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, false, None), Some(12)))
+    xq_alter(s, SequenceDef(Int64, None, None, None, None, false, None), Some(12))
     xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 2))), [12, 17])
+
+/** `AlterSequence counter` committed in a transaction of its own. */
+private xq_alter(s: &Store, def: SequenceDef, restart: Option[i64], file: string = __FILE__, line: long = __LINE__) -> &Txn
+    val t = s.begin(Snapshot)
+    xq_ddl(s, t, AlterSequence(cat_q("counter"), def, restart), file, line)
+    assert(s.commit(t).is_ok(), "the alter commits", file, line)
+    t
+
+/** DDL statement `st` run in `t`, which must apply. */
+private xq_ddl(s: &Store, t: &Txn, st: Statement, file: string = __FILE__, line: long = __LINE__)
+    s.ddl(t, envelope([], st), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+// -- AlterSequence is transactional, the draws are not: §2.7 rule 8 ----------------------------------
+
+@test
+an_alter_rolled_back_leaves_the_sequence_as_it_was()
+    val s = xq_store()
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 1))), [10])
+
+    // The altering transaction sees its own options, but its restart moves no draw before it commits.
+    val t = s.begin(Snapshot)
+    xq_ddl(s, t, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, Some(1), None, Some(100), false, None), Some(50)))
+    s.enter(t).unwrap()
+    val mine = s.catalog.sequences[s.catalog.sequence_at(cat_q("counter")).unwrap()]
+    assert(mine.increment == 1 && mine.max == 100, "its own transaction sees its options")
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("counter", 1))), [15])
+    s.abort(t).unwrap()
+
+    // The rollback leaves the old options, and draws continue where they were.
+    val after = s.latest_catalog().sequences[s.latest_catalog().sequence_at(cat_q("counter")).unwrap()]
+    assert(after.increment == 5 && after.max == 25, "the old options")
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 2))), [20, 25])
+    assert_eq(xd_code(s, s.begin(Snapshot), xq_draws("counter", 1)), "R0008")
+
+@test
+an_alter_is_invisible_to_another_transaction_until_it_commits()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_ddl(s, t, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, Some(1), None, Some(100), false, None), Some(50)))
+
+    val other = s.begin(Snapshot)
+    s.enter(other).unwrap()
+    val seen = s.catalog.sequences[s.catalog.sequence_at(cat_q("counter")).unwrap()]
+    assert(seen.increment == 5 && seen.max == 25, "another transaction sees the committed options")
+    xq_are(xq_ints(xd_ran(s, other, xq_draws("counter", 2))), [10, 15])
+
+    // A second alter of the sequence waits for the first one's lock.
+    val second = s.ddl(other, envelope([], AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, false, None), Some(3))), BootstrapRole)
+    assert(second match
+        Ok(Wait(h)) -> h == t.id
+        _ -> false, "it waits")
+    s.abort(other).unwrap()
+
+    // At commit the restart takes effect, for every transaction.
+    assert(s.commit(t).is_ok())
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 3))), [50, 51, 52])
+
+@test
+an_alter_without_a_restart_commits_onto_the_position_draws_have_reached()
+    val s = xq_store()
+    val t = s.begin(Snapshot)
+    xq_ddl(s, t, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, Some(1), None, Some(100), false, None), None))
+
+    // Others draw while the alter is uncommitted; its commit continues after them, by its new step.
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 3))), [10, 15, 20])
+    assert(s.commit(t).is_ok())
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 3))), [25, 26, 27])
+
+@test
+draws_around_a_rolled_back_alter_never_repeat_a_value()
+    val s = xq_store()
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 1))), [10])
+
+    // A restart back to the start of the range, which would hand 10 out again, drawn from by its own
+    // transaction and by another while it is uncommitted, then rolled back.
+    val t = s.begin(Snapshot)
+    xq_ddl(s, t, AlterSequence(cat_q("counter"), SequenceDef(Int64, None, None, None, None, false, None), Some(10)))
+    s.enter(t).unwrap()
+    xq_are(xq_ints(xd_ran(s, t, xq_draws("counter", 1))), [15])
+    val other = s.begin(Snapshot)
+    s.enter(other).unwrap()
+    xq_are(xq_ints(xd_ran(s, other, xq_draws("counter", 1))), [20])
+    s.abort(t).unwrap()
+    xq_are(xq_ints(xd_ran(s, s.begin(Snapshot), xq_draws("counter", 1))), [25])
+    assert_eq(xd_code(s, s.begin(Snapshot), xq_draws("counter", 1)), "R0008")
+
+    // An exhausted sequence stays exhausted under every catalog, an older snapshot's included.
+    val old = s.begin(Snapshot)
+    xq_alter(s, SequenceDef(Int64, None, None, None, Some(30), false, None), None)
+    xq_are(xq_ints(xd_ran(s, old, xq_draws("counter", 1))), [30])
+    s.enter(old).unwrap()
+    assert_eq(xd_code(s, old, xq_draws("counter", 1)), "R0008")
+    s.enter_latest()
+    assert_eq(xd_code(s, s.begin(Snapshot), xq_draws("counter", 1)), "R0008")
 
 @test
 next_value_by_a_name_computed_at_run_time()

@@ -206,6 +206,21 @@ Every constraint has a name unique in the table's namespace, and is one of:
    stored default's draws none beyond those its owner was checked for when it was stored (§2.10 rule 8); a
    `next_value` the statement itself writes needs `usage` on the sequence, checked at validation when it names the
    sequence by two text literals and at the draw otherwise, where a sequence that does not exist is `Q6003`.
+8. **`AlterSequence` is transactional; the draws are not.** Where a sequence draws from — its next value and
+   whether it is exhausted — is one state that every transaction shares (rule 5). An `AlterSequence` is DDL (§9):
+   its options are seen by its own transaction's catalog reads at once and by others from its commit, it takes the
+   sequence's catalog lock (§6.1) even when it only restarts it, and a rollback takes it back. **It moves no draw
+   before it commits**: until then every draw from the sequence, its own transaction's included, takes the next
+   value under the sequence's committed options from the shared state. At its commit the alter is applied to the
+   shared state as draws have left it — a `restart` sets the next value, and otherwise a range that no longer holds
+   it starts again at `start` (§2.13 rule 8) — and the following draws, by every transaction, use its options. A
+   rolled-back alter leaves the shared state exactly as the draws left it. A sequence the transaction itself
+   created has no committed state, so the transaction's alters of it and draws from it act at once, and a rollback
+   drops it with them.
+   *Rationale: a draw is seen by every transaction the moment it is made. A draw under an uncommitted alter would
+   either make the alter visible to others or come from a private position whose values a rollback would leave
+   for the shared state to hand out again; holding the alter's effect on draws until its commit keeps rule 5's
+   guarantee and §9's isolation, the way a job a transaction starts waits for its commit (§9 rule 2).*
 
 ### 2.8 Named types
 
@@ -352,7 +367,9 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
    field `Q3001`, and a `rename_member` of a member the type lacks `Q6003`. A change that would make the type
    refer to itself, directly or through others, is `Q6005`. The structural changes give every table with a column
    whose type reaches the type a new schema version; `rename` changes only names, which no row encoding holds,
-   and adds none.
+   and adds none. The catalog keeps the fill of each appended field with the type, converted to the field's type
+   ([QT] §7.6), and a value of the type stored before the append reads that fill for the field, or null where it
+   has none (§5.3 rule 3), wherever in a column the value lies.
 8. **`AlterSequence`** may change a sequence's `type` unless an identity owns it (`Q6017`). A `restart` outside the
    resulting range is `Q6017`; a next value the new range excludes restarts from `start`.
 9. **`retype_column`** of a column a view reads through a scan of its table is `Q6007`, whether or not the view
@@ -746,6 +763,14 @@ each column of `v` that the statement reads, matched by **column id**:
    the end; a relation whose element converts losslessly; renames of fields and tags (by position, which the
    encoding keys on). Nothing else is lossless.
 4. Columns dropped between `r` and `v` are skipped; their bytes are never decoded.
+5. **What each conversion does to a value.** A null converts to null. A non-null scalar converts as the strict
+   `Cast` of [QT] §7.6 does, which no lossless conversion makes round or fail: an integer keeps its value as a
+   wider integer, a `decimal(p, 0)` or a float; a `decimal` keeps its value at the larger scale (its unscaled
+   integer multiplied by 10^(s' − s)); `float32 → float64` keeps the number; `json → text` is the value's canonical
+   text ([QT] §3.5), which is how a `json` value is held. A record converts field by field, a union its variant's
+   payload and a relation each element, members matched by position; a record value lacking fields its type has
+   since gained reads each one's fill (§2.13 rule 7), or null. A stored value that is not of its version's type, or
+   that does not convert (a `decimal` holding more digits than its precision allows), is `D1001`.
 
 *Rationale: a row stores positions and the catalog keeps every version's column list, so translation is a
 per-version column map computed once per (table, `r`, `v`) and cached, not a per-row search.*
@@ -1095,6 +1120,7 @@ All three **rebuild** the table into a new clustered tree under a new oid.
 2. A transaction sees its own catalog changes in its later statements, at every level: a table it created can be
    written, a column it added can be named. A job it started does not run until it commits (§7 rule 1), so an index
    it created stays `building`, and a column it added as `filling` stays invisible, for the rest of the transaction.
+   Likewise an `AlterSequence` of a committed sequence moves no draw until it commits (§2.7 rule 8).
 3. Catalog reads follow [ISO] §5.6: at snapshot and serializable, at the transaction's snapshot; at read
    committed, at each statement's snapshot. A transaction's DDL is itself a write of catalog rows and obeys
    first-updater-wins ([ISO] §4.2), so two transactions that change one object cannot both commit at snapshot or

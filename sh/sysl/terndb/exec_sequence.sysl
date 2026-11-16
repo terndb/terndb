@@ -3,8 +3,8 @@ module sh.sysl.terndb
 import sysl.buf.{Buf, buf}
 
 // Sequences at run time (`ddl.md` §2.7): `next_value` (`query-tree.md` §7.12) and the values an
-// insert draws for an identity column. A draw changes the sequence in place, outside the store's
-// transactions, so nothing undoes it: a value drawn by a statement that rolls back is never handed
+// insert draws for an identity column. A draw moves the sequence's shared position, outside the
+// store's transactions, so nothing undoes it: a value drawn by a statement that rolls back is never handed
 // out again, and identity values have gaps (§2.7 rule 5).
 
 /** Where `next_value` draws from: the store's sequences, and the role whose `usage` a draw by name
@@ -34,10 +34,12 @@ private step(q: CatSequence, v: i64) -> Option[i64]
 
 /** The next value of sequence `i` of `s`'s catalog, which is never handed out again. A sequence that
  * has handed out the last value of its range is exhausted, and each draw from it is `R0008` until a
- * change of its options gives it a next value (§2.7 rule 6).
+ * change of its options gives it a next value (§2.7 rule 6). The value comes from the sequence's
+ * committed definition and shared position, so an `AlterSequence` that has not committed moves no
+ * draw, its own transaction's included (§2.7 rule 8).
  */
 draw(s: &Store, i: usize) -> Result[i64, CodecError]
-    var q = s.catalog.sequences[i]
+    var q = s.drawing(s.catalog.sequences[i])
     var v = q.next
 
     if q.exhausted
@@ -53,7 +55,7 @@ draw(s: &Store, i: usize) -> Result[i64, CodecError]
             q.next = v
             q.exhausted = true
 
-    s.catalog.sequences[i] = q
+    s.drawn(q)
     Ok(v)
 
 /** The next value of sequence `q`, drawn for `d`'s role: one that exists (`Q6003`) and that the role

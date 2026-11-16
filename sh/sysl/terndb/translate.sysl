@@ -1,0 +1,143 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Reading a row of an older schema version (`ddl.md` §5.3): a column's stored value converted
+// through every retype between the row's version and the reader's, in order. Each step is one of
+// the lossless conversions of §5.3 rule 3, and a scalar step is the `Cast` of `query-tree.md` §7.6,
+// which a lossless conversion never makes round or fail: an integer widening or becoming a float or a
+// `decimal(p, 0)`, a `decimal` gaining scale or integer digits, `float32` becoming `float64`, `json`
+// becoming its canonical text, and `T` becoming `T?`. A record, union or relation converts member by
+// member, matched by position: a record value older than its type lacks the fields appended since,
+// and reads each one's fill (§2.8 rule 5), or null. Translation cannot fail on a value of its
+// version's type, so a value that does not convert is `data_corrupted` (`D1001`, §5.3 rule 1).
+//
+// A named type is a reference resolved in the reader's catalog, so a column declared with one has its
+// current structure in every version; what changed is the value's shape, which is what the record
+// rule reads.
+
+private corrupt[T]() -> Result[T, CodecError] = fail("D1001", "a stored value does not convert to its column's type")
+
+/** The value `v` that column `id` of table `t` holds in a row encoded in schema version `schema`, as
+ * a value of the column's type in `t`'s current version, `c` resolving named types.
+ */
+private[terndb] translated_column(c: MemCatalog, t: CatTable, id: u32, schema: u64, v: Value) -> Result[Value, CodecError]
+    var ty: Option[Type] = None
+    var out = v
+
+    for version in t.versions
+        if version.number >= schema
+            for col in version.columns
+                if col.id == id
+                    ty match
+                        Some(prev) -> if prev != col.ty then out = converted_value(c, out, prev, col.ty)?
+                        None -> ()
+
+                    ty = Some(col.ty)
+
+    ty match
+        Some(last) -> if reaches_named(last) then converted_value(c, out, last, last) else Ok(out)
+        None -> Ok(out)
+end translated_column
+
+/** `v`, a value of `from`, as a value of `to`, where `from` converts to `to` losslessly (`ddl.md` §5.3
+ * rule 3). A null stays null; `D1001` where `v` does not convert.
+ */
+private[terndb] converted_value(c: MemCatalog, v: Value, from: Type, to: Type) -> Result[Value, CodecError]
+    if v.is_null() then return Ok(v)
+
+    val (f, _) = structure(c, from)?
+    val (u, fills) = structure(c, to)?
+
+    (f, u) match
+        (Record(ff), Record(tf)) ->
+            val xs = v match
+                Record(x) -> x
+                _ -> return corrupt()
+
+            if xs.len() > tf.len() then return corrupt()
+            val out = buf[Value]()
+
+            for j in 0..<tf.len()
+                if j < xs.len()
+                    out.push(converted_value(c, xs[j], if j < ff.len() then ff[j].ty else tf[j].ty, tf[j].ty)?)
+                else
+                    out.push(if j < fills.len() then fills[j] else Null)
+
+            return Ok(Record(out))
+        (Union(fv), Union(tv)) ->
+            return v match
+                Variant(tag, p) ->
+                    if tag >= tv.len() then return corrupt()
+                    Ok(variant(tag, converted_value(c, *p, if tag < fv.len() then fv[tag].ty else tv[tag].ty, tv[tag].ty)?))
+                _ -> corrupt()
+        (Bag(fe), Bag(te)) | (List(fe), List(te)) | (List(fe), Bag(te)) ->
+            val xs = v match
+                Relation(x) -> x
+                _ -> return corrupt()
+            val out = buf[Value]()
+
+            for x in xs
+                out.push(converted_value(c, x, *fe, *te)?)
+
+            return Ok(Relation(out))
+        _ -> ()
+
+    if !holds(f, v) then return corrupt()
+    if f == u then return Ok(v)
+
+    // A `json` value is held in its canonical form, which is its text (`query-tree.md` §3.5).
+    if f == Json
+        val s = v match
+            Text(x) -> x
+            _ -> return corrupt()
+
+        if canonical_json(s) != Some(s) then return corrupt()
+
+    cast_value(v, f, u) match
+        Ok(x) -> Ok(x)
+        Err(_) -> corrupt()
+end converted_value
+
+/** `t` with its nullability and named references stripped, down to its structure, and the fills of
+ * the named record it names, if it names one.
+ */
+private structure(c: MemCatalog, t: Type) -> Result[(Type, Buf[Value]), CodecError]
+    var u = t
+    var fills = buf[Value]()
+
+    loop
+        u match
+            Nullable(inner) -> u = *inner
+            Named(schema, name) ->
+                val i = c.type_at(QualName(schema, name)) match
+                    Some(i) -> i
+                    None -> return corrupt()
+
+                fills = c.types[i].fills
+                u = c.types[i].ty
+            _ -> return Ok((u, fills))
+
+/** Whether `t` refers to a named type anywhere in it. */
+private reaches_named(t: Type) -> bool
+    t match
+        Named(_, _) -> return true
+        Nullable(e) | Bag(e) | List(e) -> return reaches_named(*e)
+        Record(ms) | Union(ms) ->
+            for m in ms
+                if reaches_named(m.ty) then return true
+        _ -> ()
+
+    false
+
+/** Whether `v` is held the way a non-null scalar of `t` is (`value.sysl`). */
+private holds(t: Type, v: Value) -> bool = (t, v) match
+    (Bool, Bool(_)) -> true
+    (Int8 | Int16 | Int32 | Int64 | Int128 | Decimal(_, _) | Date | Time | DateTime | Timestamp, Int(_)) -> true
+    (UInt8 | UInt16 | UInt32 | UInt64, UInt(_)) -> true
+    (Float32 | Float64, Float(_)) -> true
+    (Text | Json, Text(_)) -> true
+    (Bytes, Bytes(_)) -> true
+    (Interval, Interval(_, _, _)) -> true
+    (Uuid, Uuid(_)) -> true
+    _ -> false

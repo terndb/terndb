@@ -351,7 +351,7 @@ struct Store
 
         for s in d.slots
             visible_row(s, t.snapshot, t.id) match
-                Some(r) -> if f(r) then out.push(Hit(s.key, r))
+                Some(r) -> if f(r) then out.push(Hit(s.key, self.translated(table, r)?))
                 None -> ()
 
         self.log_read(t, table, p, None)
@@ -363,7 +363,9 @@ struct Store
         self.log_read(t, table, all_rows(), Some(key))
         val (found, at) = locate(d, key)
         if !found then return Ok(None)
-        Ok(visible_row(d.slots[at], t.snapshot, t.id).map(r -> self.translated(table, r)))
+        visible_row(d.slots[at], t.snapshot, t.id) match
+            Some(r) -> Ok(Some(self.translated(table, r)?))
+            None -> Ok(None)
 
     private scan_rows_in(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError]
         live(t)?
@@ -372,7 +374,7 @@ struct Store
 
         for s in d.slots
             visible_row(s, t.snapshot, t.id) match
-                Some(r) -> out.push(Hit(s.key, self.translated(table, r)))
+                Some(r) -> out.push(Hit(s.key, self.translated(table, r)?))
                 None -> ()
 
         self.log_read(t, table, logged, None)
@@ -621,25 +623,29 @@ struct Store
         None -> 0
 
     /** `r` as a row of the current schema version of table `oid` in the installed catalog (`ddl.md`
-     * §5.3), each column matched by id: one present in `r`'s version keeps its value, an integer
-     * becoming a float being converted; one added since reads its fill (a literal, else null); one
-     * dropped since is skipped. Every other lossless conversion of §5.3 rule 3 keeps the `Value`.
+     * §5.3), each column matched by id: one present in `r`'s version converted through every retype
+     * since (`translate.sysl`); one added since reads its fill (a literal, else null); one dropped
+     * since is skipped. A value that does not convert is `data_corrupted` (`D1001`).
      */
-    private[terndb] translated(self, oid: u64, r: StoredRow) -> StoredRow
+    private[terndb] translated(self, oid: u64, r: StoredRow) -> Result[StoredRow, CodecError]
         val now = self.current_version(oid)
-        if r.schema == now || now == 0 then return r
+        if r.schema == now || now == 0 then return Ok(r)
+
+        val i = self.catalog.table_by_oid(oid) match
+            Some(i) -> i
+            None -> return Ok(r)
 
         val from = self.columns_at(oid, r.schema) match
             Some(c) -> c
-            None -> return r
-
-        val to = self.columns_at(oid, now) match
-            Some(c) -> c
-            None -> return r
+            None -> return fail("D1001", "the row is not encoded in a schema version of its table")
 
         val fields = r.value match
             Record(fs) -> fs
-            _ -> return r
+            _ -> return fail("D1001", "a stored row is not a record")
+
+        val to = self.columns_at(oid, now) match
+            Some(c) -> c
+            None -> return Ok(r)
 
         val out = buf[Value]()
 
@@ -647,11 +653,11 @@ struct Store
             var v = fill_of(c.fill)
 
             for j in 0..<from.len()
-                if from[j].id == c.id && j < fields.len() then v = widened(fields[j], c.ty)
+                if from[j].id == c.id && j < fields.len() then v = translated_column(self.catalog, self.catalog.tables[i], c.id, r.schema, fields[j])?
 
             out.push(v)
 
-        StoredRow(now, Record(out))
+        Ok(StoredRow(now, Record(out)))
     end translated
 
     private columns_at(self, oid: u64, schema: u64) -> Option[Buf[CatColumn]]
@@ -738,15 +744,6 @@ end Store
 private fill_of(fill: Option[Expr]) -> Value = fill match
     Some(Literal(_, v)) -> v
     _ -> Null
-
-/** `v` converted to `ty` where the conversion changes the `Value`: an integer to a float. */
-private widened(v: Value, ty: Type) -> Value = (v, ty) match
-    (Int(n), Float32) -> Float(real(n))
-    (Int(n), Float64) -> Float(real(n))
-    (UInt(n), Float32) -> Float(real(n))
-    (UInt(n), Float64) -> Float(real(n))
-    (_, Nullable(inner)) -> widened(v, *inner)
-    _ -> v
 
 /** A store over `catalog`'s tables, empty. */
 mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf(), catalog_versions(catalog))

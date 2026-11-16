@@ -344,7 +344,7 @@ impl MemCatalog
             _ -> return fail("Q6005", "only a record or a union may be named")
 
         val oid = self.oid()
-        self.types.push(CatType(oid, ns, name.name, who, ty))
+        self.types.push(CatType(oid, ns, name.name, who, ty, buf()))
         Ok(())
 
     // -- sequences, §2.7 --------------------------------------------------------------------------

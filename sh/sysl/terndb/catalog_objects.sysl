@@ -158,13 +158,18 @@ struct CatSequence derives Eq
     owner_column: u32
     exhausted: bool
 
-/** A named type (§2.8): its definition as declared, named references inside it kept. */
+/** A named type (§2.8): its definition as declared, named references inside it kept, and for a
+ * record, the fill of each field by position: the value an older value, which lacks the field, reads
+ * for it (§2.8 rule 5, §5.3 rule 3). A field the type was created with, or appended with no fill, has
+ * none, and reads null.
+ */
 struct CatType derives Eq
     oid: u64
     ns: u64
     name: string
     owner: u64
     ty: Type
+    fills: Buf[Value]
 
 /** A view (§2.9): its stored query and the columns of its result. */
 struct CatView derives Eq

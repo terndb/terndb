@@ -59,6 +59,9 @@ changed, so a statement cached under one transaction's uncommitted table is `W20
   (or a generated or filling column), or a foreign key referencing a table it removed or changed rows of, aborts
   with `schema_changed` instead of being reconciled, since the store cannot evaluate expressions.
 - **Savepoints** are refused with `unsupported_request` (`W2018`), since the store keeps none.
+- **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
+  column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
+  expression applied on read. Translation (`store.md`) applies the lossless conversions only.
 - **`lock_timeout_ms`** is not applied: the `Executor` has no clock. A parked statement is bounded by
   `statement_timeout_ms` and by `Cancel`.
 - **The role** is fixed when the connection is made (`Engine.connect`); the `Executor` trait carries no

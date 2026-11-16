@@ -324,3 +324,21 @@ a_cached_statement_is_not_run_against_a_catalog_version_it_was_not_validated_for
     assert_eq(ew_rows(b.seen(b.send(ed_digest(0)))).len(), 1)
     b.kinds_of(0, envelope([], DropTable(cat_q("x"), false, false)))
     assert_eq(ew_kinds(b.seen(b.send(ed_digest(0)))), "W2004")
+
+@test
+a_row_stored_before_a_lossless_retype_reads_in_the_new_type()
+    var a = ew_duo(ew_doctors())
+    val fields = [Field("id", Int64), Field("j", Json), Field("d", Decimal(5, 2))]
+    assert_eq(a.kinds_of(0, ew_table("conv", fields, "id")), "header complete")
+    assert_eq(a.kinds_of(0, ew_insert("conv", fields, [rec([Int(1), Text("{\"a\":[1,2],\"b\":null}"), Int(12345)])])), "header complete")
+
+    // `json` becomes `text` and the decimal gains scale, both metadata only (`ddl.md` §8.5 rule 1).
+    val retype = envelope([], AlterTable(cat_q("conv"), items_of([RetypeColumn("j", Text, None), RetypeColumn("d", Decimal(7, 4), None)])))
+    assert_eq(a.kinds_of(0, retype), "header complete")
+
+    val read = query([], project(scan("app", "conv", "c"), "r", [item("j", col("c", "j")), item("d", col("c", "d"))]))
+    val ms = a.seen(a.send(ew_exec(0, read)))
+    assert(ew_type(ms) == Some(bag(record([Field("j", Text), Field("d", Decimal(7, 4))]))), "the result has the new types")
+    val rows = ew_rows(ms)
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([Text(to_text(Json, Text("{\"a\":[1,2],\"b\":null}")).unwrap()), Int(1234500)]), "the old row in the new types")

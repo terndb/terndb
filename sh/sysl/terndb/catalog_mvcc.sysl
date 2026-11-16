@@ -14,8 +14,9 @@ import sysl.slices.contains
 //
 // The store is single-threaded, so `Store.catalog` is the catalog of the operation in progress: the
 // engine installs a transaction's view before each of its statements, and a commit installs the
-// newest committed catalog. A sequence's next value is not versioned (`ddl.md` §2.7 rule 5): it is
-// kept beside the versions and carried into each catalog as it is installed.
+// newest committed catalog. Where a sequence draws from is not versioned (`ddl.md` §2.7 rule 5): it is
+// kept beside the versions and carried into each catalog as it is installed, and an `AlterSequence`
+// moves it only when it commits (rule 8).
 
 /** A committed catalog and the commit that made it (0 for the catalog the store began with). */
 struct CatalogAt
@@ -74,10 +75,13 @@ struct CatChange
     key: string
     commit: u64
 
-/** A sequence's next value, kept outside the versions (`ddl.md` §2.7 rule 5). */
+/** Where a sequence draws from, kept outside the versions (`ddl.md` §2.7 rules 5–6): its next value
+ * and whether it is exhausted.
+ */
 struct SeqNext
     oid: u64
     next: i64
+    exhausted: bool
 
 /** A transaction's side of the catalog: its DDL statements, the view they made and the committed
  * catalog it was made on, the oldest committed catalog any of its statements planned against, its
@@ -178,41 +182,75 @@ impl Store
     /** Installs the newest committed catalog, for work done outside any transaction. */
     enter_latest(*self) = self.install(self.latest_catalog(), false)
 
-    /** `c` installed as `self.catalog`. The sequences' next values drawn under the catalog it replaces
-     * are kept first; then `c` takes them, or, when `c` is the result of a DDL statement (`fresh`),
-     * gives its own (a sequence it created or restarted).
+    /** `c` installed as `self.catalog`, each sequence at the position draws have left it. When `c` is
+     * the result of a DDL statement (`fresh`), a sequence no committed catalog holds — one its own
+     * transaction created — draws from where the statement left it; a committed sequence's position
+     * moves only when the change commits (`ddl.md` §2.7 rule 8).
      */
     private[terndb] install(*self, c: MemCatalog, fresh: bool)
-        for q in self.catalog.sequences
-            self.set_draw(q.oid, q.next)
-
         if fresh
+            val committed = self.latest_catalog()
+
             for q in c.sequences
-                self.set_draw(q.oid, q.next)
-        else
-            for i in 0..<c.sequences.len()
-                self.draw_of(c.sequences[i].oid) match
-                    Some(n) ->
-                        var q = c.sequences[i]
-                        q.next = n
-                        c.sequences[i] = q
-                    None -> ()
+                if match_sequence(committed, q.oid).is_none() then self.set_draw(q.oid, q.next, q.exhausted)
 
-        self.catalog = c
+        self.catalog = self.with_positions(c)
 
-    private set_draw(*self, oid: u64, next: i64)
+    /** `c` with each sequence at the position draws have left it. */
+    private with_positions(self, c: MemCatalog) -> MemCatalog
+        var out = c
+        out.sequences = c.sequences.copy()
+
+        for i in 0..<out.sequences.len()
+            self.draw_of(out.sequences[i].oid) match
+                Some(d) ->
+                    var q = out.sequences[i]
+                    q.next = d.next
+                    q.exhausted = d.exhausted
+                    out.sequences[i] = q
+                None -> ()
+
+        out
+
+    private set_draw(*self, oid: u64, next: i64, exhausted: bool)
         for i in 0..<self.cat.draws.len()
             if self.cat.draws[i].oid == oid
-                self.cat.draws[i] = SeqNext(oid, next)
+                self.cat.draws[i] = SeqNext(oid, next, exhausted)
                 return
 
-        self.cat.draws.push(SeqNext(oid, next))
+        self.cat.draws.push(SeqNext(oid, next, exhausted))
 
-    private draw_of(self, oid: u64) -> Option[i64]
+    private draw_of(self, oid: u64) -> Option[SeqNext]
         for d in self.cat.draws
-            if d.oid == oid then return Some(d.next)
+            if d.oid == oid then return Some(d)
 
         None
+
+    /** The sequence a draw from `view` (as the drawer's catalog holds it) takes its value from
+     * (`ddl.md` §2.7 rule 8): the newest committed definition at the shared position, whatever the
+     * drawer's own uncommitted DDL says; a sequence no committed catalog holds is the drawer's own.
+     */
+    private[terndb] drawing(self, view: CatSequence) -> CatSequence
+        var q = match_sequence(self.latest_catalog(), view.oid).unwrap_or(view)
+
+        self.draw_of(q.oid) match
+            Some(d) ->
+                q.next = d.next
+                q.exhausted = d.exhausted
+            None -> ()
+
+        q
+
+    /** Records that a draw left sequence `q` at its `next` and `exhausted`, seen by every catalog. */
+    private[terndb] drawn(*self, q: CatSequence)
+        self.set_draw(q.oid, q.next, q.exhausted)
+
+        for i in 0..<self.catalog.sequences.len()
+            if self.catalog.sequences[i].oid == q.oid
+                var x = self.catalog.sequences[i]
+                x.next = q.next
+                x.exhausted = q.exhausted
+                self.catalog.sequences[i] = x
 
     /** `steps` applied again, in order, to `over`, each handing out the oids it handed out first. A
      * step that is refused, or hands out a different number of oids, is `schema_changed`: a commit
@@ -249,13 +287,18 @@ impl Store
         if t.read_only then return fail("T4001", "a DDL statement in a read-only transaction")
         if t.level == ReadCommitted then t.snapshot = self.horizon
 
-        val before = self.view_of(t)?
+        val before = self.with_positions(self.view_of(t)?)
         var trial = before
         trial.next_oid = if self.cat.next_oid > before.next_oid then self.cat.next_oid else before.next_oid
         val first = trial.next_oid
         trial.apply(env, role)?
 
         val keys = changed_keys(before, trial)
+
+        // An `AlterSequence` changes its sequence's entry even where it only restarts it (§2.7 rule 8).
+        altered_sequence(before, env.statement) match
+            Some(oid) -> add_key(keys, oid_key(oid))
+            None -> ()
 
         for k in keys
             val h = self.lock_holder(k)
@@ -363,7 +406,9 @@ impl Store
         var merged = newest.catalog
 
         if c.steps.len() > 0
-            merged = if c.base == newest.commit then c.own.unwrap() else self.replay(c.steps, newest.catalog)?
+            // An `AlterSequence` applies to its sequence's position as draws have left it (§2.7 rule 8).
+            val again = c.base != newest.commit || alters_sequence(c.steps)
+            merged = if again then self.replay(c.steps, self.with_positions(newest.catalog))? else c.own.unwrap()
             c.merged = Some(merged)
 
         self.install(merged, false)
@@ -412,6 +457,13 @@ impl Store
 
         tc.merged match
             Some(m) ->
+                // Each committed sequence it altered now draws from where the alter put it (§2.7 rule 8).
+                if alters_sequence(tc.steps)
+                    val prev = self.latest_catalog()
+
+                    for q in m.sequences
+                        if match_sequence(prev, q.oid).is_some() && self.lock_holder(oid_key(q.oid)) == t.id then self.set_draw(q.oid, q.next, q.exhausted)
+
                 self.cat.versions.push(CatalogAt(c, m))
 
                 for l in self.cat.locks
@@ -513,6 +565,20 @@ name_key(ns: u64, name: string) -> string = s"n$ns.$name"
 
 private add_key(out: Buf[string], k: string)
     if !contains(out.view(), k) then out.push(k)
+
+/** The oid of the sequence `st` alters in `c`, when `st` is an `AlterSequence`. */
+private altered_sequence(c: MemCatalog, st: Statement) -> Option[u64] = st match
+    AlterSequence(name, _, _) -> c.sequence_at(name).map(i -> c.sequences[i].oid)
+    _ -> None
+
+/** Whether any of `steps` is an `AlterSequence`. */
+private alters_sequence(steps: Buf[DdlStep]) -> bool
+    for s in steps
+        s.env.statement match
+            AlterSequence(_, _, _) -> return true
+            _ -> ()
+
+    false
 
 /** The catalog keys `b` changed from `a` (`ddl.md` §6.1 rule 1): every object created, changed or
  * dropped, and every name taken or given up. A change to a table's indexes or constraints changes
@@ -655,12 +721,16 @@ private match_namespace(c: MemCatalog, oid: u64) -> Option[CatNamespace]
 
     None
 
-/** Whether two sequences have one definition; the next value is not part of it. */
+/** Whether two sequences have one definition; where draws have left it (its next value and whether
+ * it is exhausted) is not part of it.
+ */
 private same_sequence(a: CatSequence, b: CatSequence) -> bool
     var x = a
     var y = b
     x.next = 0
     y.next = 0
+    x.exhausted = false
+    y.exhausted = false
     x == y
 
 // -- what a committed DDL changed, for reconciliation -----------------------------------------------
