@@ -1,0 +1,346 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Transactions, row-lock waits, errors and large results, through the wire against the engine: two
+// sessions on one engine, write skew at serializable, a statement parked on a row lock and resumed
+// when its holder ends (`wire-protocol.md` §7.5), and how each kind of failure reaches the client.
+
+/** An engine holding `doc (id, on)` with doctors 1 and 2 both on call, and `acct (id, bal)` with the
+ * check `bal > -1`.
+ */
+ew_doctors() -> &Engine
+    val e = ew_engine()
+    val bal_ok = cat_check("bal_ok", call("gt", [cat_row("bal"), Literal(Int64, Int(-1))]))
+    ew_setup(e, [ew_app(), ew_table("doc", [Field("id", Int64), Field("on", Int64)], "id"),
+        envelope([], CreateTable(cat_q("acct"), ew_cols([Field("id", Int64), Field("bal", Int64)]), items_of(["id"]), items_of([bal_ok]), false)),
+        ew_insert("doc", [Field("id", Int64), Field("on", Int64)], [rec([Int(1), Int(1)]), rec([Int(2), Int(1)])])])
+    e
+
+ew_lit(n: i128) -> Expr = Literal(Int64, Int(n))
+
+/** The ids of the doctors on call. */
+ew_on_call() -> Envelope = query([], project(filter(scan("app", "doc", "d"), eq(col("d", "on"), ew_lit(1))), "r", [item("id", col("d", "id"))]))
+
+/** `update doc set on = <to> where id = <id>`. */
+ew_set_on(id: i128, to: Expr) -> Envelope =
+    envelope([], Update(cat_q("doc"), "d", None, None, Some(eq(col("d", "id"), ew_lit(id))), items_of([item("on", to)]), buf[Item]()))
+
+/** `update doc set on = on + <n> where id = <id>`. */
+ew_add_on(id: i128, n: i128) -> Envelope = ew_set_on(id, call("add", [col("d", "on"), ew_lit(n)]))
+
+/** Doctor `id`'s `on`, read in a transaction of its own. */
+ew_on_of(e: &Engine, id: i128) -> i128
+    var d = ew_duo(e)
+    val q = query([], project(filter(scan("app", "doc", "d"), eq(col("d", "id"), ew_lit(id))), "r", [item("on", col("d", "on"))]))
+    ew_rows(d.seen(d.send(ew_exec(0, q))))[0] match
+        Record(fs) -> st_int(fs[0])
+        _ -> -1
+
+ew_level(level: Isolation) -> TxnOptions = TxnOptions(Some(level), None, None, None, None, None, None)
+
+@test
+write_skew_between_two_sessions_fails_at_serializable_and_not_at_snapshot()
+    for level in [Serializable, Snapshot]
+        val e = ew_doctors()
+        var a = ew_duo(e)
+        var b = ew_duo(e)
+        assert_eq(ew_kinds(a.seen(a.send(Begin(1, ew_level(level))))), "begun")
+        assert_eq(ew_kinds(b.seen(b.send(Begin(1, ew_level(level))))), "begun")
+
+        // Each sees both doctors on call, and takes the other one's doctor... its own off.
+        assert_eq(ew_rows(a.seen(a.send(ew_exec(1, ew_on_call())))).len(), 2)
+        assert_eq(ew_rows(b.seen(b.send(ew_exec(1, ew_on_call())))).len(), 2)
+        assert_eq(ew_kinds(a.seen(a.send(ew_exec(1, ew_set_on(1, ew_lit(0)))))), "header complete")
+        assert_eq(ew_kinds(b.seen(b.send(ew_exec(1, ew_set_on(2, ew_lit(0)))))), "header complete")
+
+        assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+        val last = b.seen(b.send(Commit(1)))
+
+        if level == Serializable
+            val err = ew_error(last)
+            assert_eq(err.entries[0].code, "T1001")
+            assert(err.retryable && err.txn_state == Closed, "retryable, the handle closed")
+            assert_eq(ew_on_of(e, 2), 1)
+        else
+            // Snapshot isolation allows the skew: both commit and nobody is on call.
+            assert_eq(ew_kinds(last), "committed")
+            assert_eq(ew_on_of(e, 2), 0)
+
+@test
+a_statement_parked_on_a_row_lock_resumes_when_the_holder_commits()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    assert_eq(ew_kinds(a.seen(a.send(ew_exec(1, ew_add_on(1, 10))))), "header complete")
+
+    // At read committed b's update waits for a's row lock: its header is sent and nothing more.
+    val s = b.send(ew_exec(0, ew_add_on(1, 100), [], no_exec_options(), Some(ew_level(ReadCommitted))))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+    b.tick(10)
+    assert_eq(ew_kinds(b.seen(s)), "header")
+
+    // Other streams of the parked connection go on meanwhile.
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, ew_on_call())))).len(), 2)
+
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    b.tick(20)
+    val got = b.seen(s)
+    assert_eq(ew_kinds(got), "header complete")
+    assert(ew_complete(got).0[0] == 1 && ew_complete(got).1.is_some(), "one row, committed")
+    // It ran again at a new statement snapshot, over a's commit: no update is lost.
+    assert_eq(ew_on_of(e, 1), 111)
+
+@test
+a_parked_statement_whose_holder_rolls_back_runs_at_serializable()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val s = b.send(ew_exec(0, ew_add_on(1, 100)))
+    assert_eq(ew_kinds(b.seen(s)), "header")
+    assert_eq(ew_kinds(a.seen(a.send(Rollback(1)))), "ok")
+
+    // Waiting saved the abort: nothing committed over b's snapshot.
+    b.tick(5)
+    assert_eq(ew_kinds(b.seen(s)), "header complete")
+    assert_eq(ew_on_of(e, 1), 101)
+
+@test
+a_parked_statement_whose_holder_commits_fails_at_serializable()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    val s = b.send(ew_exec(0, ew_add_on(1, 100)))
+    a.send(Commit(1))
+    b.tick(5)
+    val err = ew_error(b.seen(s))
+    assert_eq(err.entries[0].code, "T1001")
+    assert(err.retryable && err.txn_state == Unaffected && err.txid.is_some(), "the implicit transaction rolled back")
+    assert_eq(ew_on_of(e, 1), 11)
+
+@test
+a_parked_statement_times_out_and_its_implicit_transaction_rolls_back()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+
+    // The wait counts toward the statement timeout (§7.5 rule 3).
+    val s = b.send(ew_exec(0, ew_add_on(1, 100), [], ExecOptions(None, None, None, Some(50)), Some(ew_level(ReadCommitted))))
+    b.tick(60)
+    val err = ew_error(b.seen(s))
+    assert_eq(err.entries[0].code, "T1007")
+    assert(err.entries[0].details.len() == 1 && err.entries[0].details[0].value == "statement_timeout", "timed out")
+
+    a.send(Commit(1))
+    b.tick(70)
+    assert_eq(ew_on_of(e, 1), 11)
+
+@test
+a_wait_that_would_close_a_cycle_aborts_the_waiter_and_frees_the_other()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, no_txn_options()))
+    b.send(Begin(1, no_txn_options()))
+    a.send(ew_exec(1, ew_add_on(1, 10)))
+    b.send(ew_exec(1, ew_add_on(2, 10)))
+
+    val sa = a.send(ew_exec(1, ew_add_on(2, 100)))
+    assert_eq(ew_kinds(a.seen(sa)), "header")
+
+    val err = ew_error(b.seen(b.send(ew_exec(1, ew_add_on(1, 100)))))
+    assert_eq(err.entries[0].code, "T1002")
+    assert(err.retryable && err.txn_state == Aborted, "the waiter is the victim")
+    assert_eq(ew_kinds(b.seen(b.send(Commit(1)))), "T1002")
+
+    a.tick(5)
+    assert_eq(ew_kinds(a.seen(sa)), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    assert_eq(ew_on_of(e, 2), 101)
+
+// -- errors -----------------------------------------------------------------------------------
+
+@test
+a_type_error_is_refused_before_the_header_with_its_validation_code()
+    var d = ew_duo(ew_doctors())
+    val bad = query([], project(scan("app", "doc", "d"), "r", [item("x", col("d", "nope"))]))
+    val got = d.seen(d.send(ew_exec(0, bad)))
+    assert_eq(ew_kinds(got), "Q2003")
+    val err = ew_error(got)
+    assert(!err.retryable && err.txn_state == Unaffected, "nothing ran")
+    assert(err.entries[0].path.len > 0, "it names the node")
+
+    // In an explicit transaction it aborts the transaction, whose commit names it.
+    d.send(Begin(1, no_txn_options()))
+    assert(ew_error(d.seen(d.send(ew_exec(1, bad)))).txn_state == Aborted, "aborted")
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(1, ew_on_call())))), "W2003")
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "Q2003")
+
+@test
+every_error_of_the_first_failing_phase_is_reported()
+    var d = ew_duo(ew_doctors())
+    val bad = query([], project(scan("app", "doc", "d"), "r", [item("x", col("d", "nope")), item("y", col("d", "nor"))]))
+    val err = ew_error(d.seen(d.send(ew_exec(0, bad))))
+    assert_eq(err.entries.len(), 2)
+    assert(err.entries[0].code == "Q2003" && err.entries[1].code == "Q2003", "both")
+
+@test
+a_runtime_error_follows_the_header_and_aborts_an_explicit_transaction()
+    val e = ew_doctors()
+    var d = ew_duo(e)
+    val div = query([], project(scan("app", "doc", "d"), "r", [item("x", call("div", [col("d", "on"), ew_lit(0)]))]))
+    val got = d.seen(d.send(ew_exec(0, div)))
+    assert_eq(ew_kinds(got), "header R0002")
+    assert(ew_error(got).txn_state == Unaffected && ew_error(got).txid.is_some(), "the implicit transaction rolled back")
+
+    d.send(Begin(1, no_txn_options()))
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(1, ew_set_on(1, ew_lit(5)))))), "header complete")
+    assert(ew_error(d.seen(d.send(ew_exec(1, div)))).txn_state == Aborted, "aborted")
+    val commit = ew_error(d.seen(d.send(Commit(1))))
+    assert(commit.entries[0].code == "R0002" && commit.txn_state == Closed, "the commit names it")
+    // The aborted transaction's write was never visible.
+    assert_eq(ew_on_of(e, 1), 1)
+
+ew_acct(id: i128, bal: i128) -> Envelope = ew_insert("acct", [Field("id", Int64), Field("bal", Int64)], [rec([Int(id), Int(bal)])])
+
+@test
+constraint_errors_follow_the_header_with_their_codes()
+    val e = ew_doctors()
+    var d = ew_duo(e)
+    val check = d.seen(d.send(ew_exec(0, ew_acct(1, -5))))
+    assert_eq(ew_kinds(check), "header T3002")
+    assert(!ew_error(check).retryable, "not retryable")
+
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, ew_acct(1, 5))))), "header complete")
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, ew_acct(1, 6))))), "header T3001")
+
+    d.send(Begin(1, no_txn_options()))
+    assert(ew_error(d.seen(d.send(ew_exec(1, ew_acct(2, -1))))).txn_state == Aborted, "aborted")
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "T3002")
+
+@test
+a_write_in_a_read_only_transaction_is_refused()
+    var d = ew_duo(ew_doctors())
+    val ro = TxnOptions(None, None, Some(true), None, None, None, None)
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(0, ew_add_on(1, 1), [], no_exec_options(), Some(ro))))), "header T4001")
+    d.send(Begin(1, ro))
+    assert_eq(ew_kinds(d.seen(d.send(ew_exec(1, envelope([], CreateNamespace("other", false)))))), "header T4001")
+
+@test
+a_savepoint_is_refused_and_aborts_its_transaction()
+    var d = ew_duo(ew_doctors())
+    d.send(Begin(1, no_txn_options()))
+    assert_eq(ew_kinds(d.seen(d.send(Savepoint(1, "s")))), "W2018")
+    assert_eq(ew_kinds(d.seen(d.send(Commit(1)))), "W2018")
+
+@test
+transaction_status_answers_what_became_of_a_transaction()
+    val e = ew_doctors()
+    var d = ew_duo(e)
+    val begun = d.seen(d.send(Begin(1, no_txn_options())))
+    val txid = begun[0] match
+        TxnBegun(t, _, _) -> t
+        _ -> 0
+    assert(d.seen(d.send(TransactionStatus(txid)))[0] == TxnStatus(InProgress, None), "in progress")
+    d.send(ew_exec(1, ew_add_on(1, 1)))
+    val c = d.seen(d.send(Commit(1)))[0] match
+        TxnCommitted(_, c) -> c
+        _ -> None
+    assert(c.is_some(), "it wrote")
+    assert(d.seen(d.send(TransactionStatus(txid)))[0] == TxnStatus(Committed, c), "committed")
+
+    d.send(Begin(2, no_txn_options()))
+    val other = txid + 1
+    d.send(Rollback(2))
+    assert(d.seen(d.send(TransactionStatus(other)))[0] == TxnStatus(Aborted, None), "rolled back")
+
+// -- a large result ---------------------------------------------------------------------------
+
+/** An engine holding `big (id, pad)` of `n` rows, each `pad` 100 octets. */
+ew_big(n: i128) -> &Engine
+    val e = ew_engine()
+    var pad = ""
+    for _ in 0..<100
+        pad = s"${pad}x"
+
+    val rows = buf[Value]()
+    for i in 0..<n
+        rows.push(rec([Int(i), Text(pad)]))
+
+    val fields = [Field("id", Int64), Field("pad", Text)]
+    ew_setup(e, [ew_app(), ew_table("big", fields, "id"), ew_insert("big", fields, rows.view())])
+    e
+
+ew_all_big() -> Envelope = query([], project(scan("app", "big", "b"), "r", [item("id", col("b", "id")), item("pad", col("b", "pad"))]))
+
+/** Whether `rows` holds ids 0 to `n` − 1, each once. */
+ew_every_id(rows: Buf[Value], n: usize) -> bool
+    if rows.len() != n then return false
+    val seen = buf[bool]()
+    for _ in 0..<n
+        seen.push(false)
+
+    for r in rows
+        r match
+            Record(fs) ->
+                val id = usize(st_int(fs[0]))
+                if id >= n || seen[id] then return false
+                seen[id] = true
+            _ -> return false
+
+    true
+
+@test
+a_large_result_spans_several_batches_and_frames()
+    var d = ew_duo(ew_big(3000))
+    val got = d.seen(d.send(ew_exec(0, ew_all_big())))
+    assert_eq(ew_kinds(got), "header batch complete")
+
+    val batches = ew_batches(got)
+    assert(batches.len() >= 3, s"several batches: ${batches.len()}")
+    var multi_frame = false
+    for b in batches
+        if u64(b.len()) > DefaultFrameSize then multi_frame = true
+    assert(multi_frame, "a batch larger than a frame crossed in several")
+
+    assert(ew_every_id(ew_rows(got), 3000), "every row, once")
+    assert(ew_complete(got).0[0] == 3000, "the count")
+
+@test
+batch_rows_and_batch_bytes_bound_each_batch()
+    var d = ew_duo(ew_big(1200))
+    val tree = column_tree(ew_type(d.seen(d.send(ew_exec(0, ew_all_big())))).unwrap()).unwrap()
+
+    val by_rows = d.seen(d.send(ew_exec(0, ew_all_big(), [], ExecOptions(None, Some(500), None, None))))
+    val bs = ew_batches(by_rows)
+    assert_eq(bs.len(), 3)
+    for b in bs
+        assert(decode_batch(tree, b.view()).unwrap().rows().len() <= 500, "at most 500 rows")
+    assert(ew_every_id(ew_rows(by_rows), 1200), "every row, once")
+
+    val by_bytes = d.seen(d.send(ew_exec(0, ew_all_big(), [], ExecOptions(None, None, Some(20000), None))))
+    for b in ew_batches(by_bytes)
+        assert(b.len() <= 20000, "at most 20000 octets")
+    assert(ew_batches(by_bytes).len() > 6, "so several batches")
+    assert(ew_every_id(ew_rows(by_bytes), 1200), "every row, once")
+
+@test
+credit_paces_a_large_result()
+    var d = ew_duo(ew_big(3000))
+    val s = d.send(ew_exec(0, ew_all_big(), [], ExecOptions(Some(1), None, None, None)))
+    // One batch may start on the credit and take it negative; then the server waits.
+    assert_eq(ew_batches(d.seen(s)).len(), 1)
+    d.grant(s, 100000000)
+    val got = d.seen(s)
+    assert_eq(ew_kinds(got), "header batch complete")
+    assert(ew_every_id(ew_rows(got), 3000), "every row, once")
