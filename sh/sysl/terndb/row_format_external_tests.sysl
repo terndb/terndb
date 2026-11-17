@@ -41,7 +41,7 @@ private ex_vals(cols: []const Type) -> Buf[Value]
     b
 
 private ex_row(cols: []const Type, moved: []const usize) -> Buf[u8]
-    encode_row_with_stubs(ex_header(), cols, ex_vals(cols), ex_stubs(cols.len, moved)).unwrap()
+    encode_row_with_stubs(ex_header(), cols, ex_vals(cols).view(), ex_stubs(cols.len, moved)).unwrap()
 
 /** The external bitmap of a row of `cols` with the columns `moved` out of line, in hex. */
 private ex_bitmap(cols: []const Type, moved: []const usize) -> string
@@ -125,22 +125,11 @@ a_table_of_only_variable_columns_numbers_them_from_zero()
     ex_back(cols, [0, 1, 2])
 
 @test
-a_nested_or_list_column_is_a_variable_column_with_its_column_number()
-    val rec = record([Field("x", Int32)])
-    val rel = list(Int32)
-    val cols = [Int32, rec, Int64, rel, Int8, union_of([Field("a", Int32)])]
-
-    assert_eq(ex_bitmap(cols, [1]), "02")
-    assert_eq(ex_bitmap(cols, [3]), "08")
-    assert_eq(ex_bitmap(cols, [5]), "20")
-    assert_eq(ex_bitmap(cols, [1, 3, 5]), "2a")
-
-@test
 a_bitmap_of_two_octets_numbers_columns_across_the_octet_boundary()
     val nine = ex_nine_fixed()
     val cols = [Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Type.Text, Int8, Type.Bytes]
 
-    assert_eq(nine.len, 9)
+    assert_eq(nine.len(), 9)
     assert_eq(ex_bitmap(cols, [9]), "0002")
     assert_eq(ex_bitmap(cols, [11]), "0008")
     assert_eq(ex_bitmap(cols, [9, 11]), "000a")

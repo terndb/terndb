@@ -29,11 +29,11 @@ private fit_adds(n: usize) -> Buf[AlterAction]
     val b = buf[AlterAction]()
 
     for i in 0..<n
-        b.push(AddColumn(cat_col(s"w$i", Type.Text)))
+        b.push(AddColumn(cat_col(s"w$i", nullable(Type.Text))))
 
     b
 
-private fit_alter(name: string, actions: Buf[AlterAction]) -> Statement = AlterTable(cat_q(name), actions)
+private fit_alter(name: string, actions: []const AlterAction) -> Statement = AlterTable(cat_q(name), items_of(actions))
 
 private fit_empty() -> MemCatalog = cat_ok(mem_catalog(), CreateNamespace("app", false))
 
@@ -65,8 +65,11 @@ the_limit_is_derived_from_the_row_format_constants()
 
 @test
 the_largest_variable_count_agrees_with_the_hand_arithmetic_for_every_shape()
-    for key in [0, 8, 16, 100, 1000]
-        for fixed in [0, 1, 7, 8, 9, 64, 100]
+    val keys: []const usize = [0, 8, 16, 100, 1000]
+    val counts: []const usize = [0, 1, 7, 8, 9, 64, 100]
+
+    for key in keys
+        for fixed in counts
             val over = fit_first_over(key, fixed, 8)
 
             if 20 + key + (fixed + 7) / 8 + fixed * 8 > InlineEntryLimit
@@ -175,21 +178,21 @@ if_not_exists_on_an_existing_table_does_not_recount_it()
 adding_columns_up_to_exactly_the_limit_is_accepted()
     val c = cat_ok(fit_empty(), fit_table("t", 10))
 
-    assert_eq(cat_code(c, fit_alter("t", fit_adds(1859))), "ok")
-    assert_eq(cat_code(c, fit_alter("t", fit_adds(1860))), "Q6022")
+    assert_eq(cat_code(c, fit_alter("t", fit_adds(1859).view())), "ok")
+    assert_eq(cat_code(c, fit_alter("t", fit_adds(1860).view())), "Q6022")
 
 @test
 adding_one_column_to_a_table_at_the_limit_is_refused()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
 
-    assert_eq(cat_code(c, fit_alter("t", fit_adds(1))), "Q6022")
+    assert_eq(cat_code(c, fit_alter("t", fit_adds(1).view())), "Q6022")
     assert_eq(cat_code(c, fit_alter("t", [AddColumn(cat_col("n", nullable(Type.Text)))])), "Q6022")
 
     // The step before the limit takes one and no more.
     val b = cat_ok(fit_empty(), fit_table("t", 1868))
 
-    assert_eq(cat_code(b, fit_alter("t", fit_adds(1))), "ok")
-    assert_eq(cat_code(b, fit_alter("t", fit_adds(2))), "Q6022")
+    assert_eq(cat_code(b, fit_alter("t", fit_adds(1).view())), "ok")
+    assert_eq(cat_code(b, fit_alter("t", fit_adds(2).view())), "Q6022")
 
 @test
 adding_a_fixed_column_counts_its_width_and_its_bit()
@@ -217,28 +220,28 @@ adding_columns_to_an_existing_table_with_fixed_columns_crosses_the_line()
     val over = fit_first_over(8, 100, 8)
     val c = cat_ok(fit_empty(), fit_table("t", over - 10, 100))
 
-    assert_eq(cat_code(c, fit_alter("t", fit_adds(9))), "ok")
-    assert_eq(cat_code(c, fit_alter("t", fit_adds(10))), "Q6022")
+    assert_eq(cat_code(c, fit_alter("t", fit_adds(9).view())), "ok")
+    assert_eq(cat_code(c, fit_alter("t", fit_adds(10).view())), "Q6022")
 
 @test
 a_drop_in_the_same_statement_makes_room_for_an_add()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
 
-    assert_eq(cat_code(c, fit_alter("t", [DropColumn("v0", false), AddColumn(cat_col("n", Type.Text))])), "ok")
-    assert_eq(cat_code(c, fit_alter("t", [DropColumn("v0", false), AddColumn(cat_col("n", Type.Text)), AddColumn(cat_col("m", Type.Text))])), "Q6022")
+    assert_eq(cat_code(c, fit_alter("t", [DropColumn("v0", false), AddColumn(cat_col("n", nullable(Type.Text)))])), "ok")
+    assert_eq(cat_code(c, fit_alter("t", [DropColumn("v0", false), AddColumn(cat_col("n", nullable(Type.Text))), AddColumn(cat_col("m", nullable(Type.Text)))])), "Q6022")
 
     // A drop alone is never refused, and frees room for a later add.
     val d = cat_ok(c, fit_alter("t", [DropColumn("v0", false)]))
 
-    assert_eq(cat_code(d, fit_alter("t", fit_adds(1))), "ok")
-    assert_eq(cat_code(d, fit_alter("t", fit_adds(2))), "Q6022")
+    assert_eq(cat_code(d, fit_alter("t", fit_adds(1).view())), "ok")
+    assert_eq(cat_code(d, fit_alter("t", fit_adds(2).view())), "Q6022")
 
 @test
 a_refused_add_column_leaves_the_catalog_unchanged()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
     var d = c
 
-    assert_eq(d.apply(envelope([], fit_alter("t", fit_adds(1))), BootstrapRole).unwrap_err().code, "Q6022")
+    assert_eq(d.apply(envelope([], fit_alter("t", fit_adds(1).view())), BootstrapRole).unwrap_err().code, "Q6022")
     assert_eq(d.version, c.version)
     assert_eq(cat_table_of(d, "t").schema_version(), 1)
     assert_eq(cat_table_of(d, "t").columns.len(), 1870)
@@ -253,14 +256,14 @@ a_refused_add_column_applies_none_of_its_other_actions()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
     var d = c
 
-    assert_eq(d.apply(envelope([], fit_alter("t", [RenameColumn("v0", "renamed"), AddColumn(cat_col("n", Type.Text))])), BootstrapRole).unwrap_err().code, "Q6022")
+    assert_eq(d.apply(envelope([], fit_alter("t", [RenameColumn("v0", "renamed"), AddColumn(cat_col("n", nullable(Type.Text)))])), BootstrapRole).unwrap_err().code, "Q6022")
     assert(cat_table_of(d, "t").column_named("renamed").is_none())
     assert(cat_table_of(d, "t").column_named("v0").is_some())
 
 @test
 a_fixed_column_with_a_default_is_counted_like_one_without()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
-    val d = ColumnDef("n", Int8, Some(cat_int(1)), None, NoIdentity, None)
+    val d = ColumnDef("n", Int8, Some(Literal(Int8, Int(1))), None, NoIdentity, None)
 
     assert_eq(cat_code(c, fit_alter("t", [AddColumn(d)])), "Q6022")
 
