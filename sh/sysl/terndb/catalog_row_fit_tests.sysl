@@ -393,7 +393,7 @@ a_retype_with_a_pending_retype_on_the_table_counts_the_pending_one_at_its_target
     assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), RetypeColumn("f1", Type.Text, None)])), "Q6022")
 
     // The pending column may be retyped again: it still counts once, at its newest target.
-    assert_eq(cat_code(d, fit_retype("t", "f0", nullable(Type.Text))), "ok")
+    assert_eq(cat_code(d, fit_retype("t", "f0")), "ok")
 
 @test
 a_pending_retype_counts_against_a_later_add_column()
