@@ -12,13 +12,15 @@ import sysl.slices.sort_by
 
 // -- unique indexes ---------------------------------------------------------------------------------
 
-/** One entry of a unique index: a non-null key value some version of `slot` holds. Entries are
- * sorted by value, then by the slot's primary key, and never removed: a lookup reads the slot's
- * versions to decide whether the value is still there, as a purge would otherwise.
+/** One entry of a unique index: a key value with no null component that some version of the row
+ * keyed `key` holds (a value with a null component has no entry here: it never conflicts, Q48).
+ * Entries are sorted by value, then by primary key, and never removed: a lookup reads the row's
+ * versions to decide whether the value is still there, as `on-disk-format.md` §4.9 rule 2 has a
+ * reader do.
  */
 struct IxEntry
     value: Value
-    slot: &Slot
+    key: Value
 
 /** A secondary unique key of a table (a `unique` constraint, or a ready unique index over columns
  * with no predicate): its name, its columns by id, their record type, and its entries.
@@ -131,8 +133,8 @@ private ix_first(ix: &UniqueIx, u: Value) -> usize
 
     lo
 
-// Adds the entry `(u, s)` to `ix` unless it is there already.
-private ix_add(ix: &UniqueIx, key_type: Type, u: Value, s: &Slot)
+// Adds the entry `(u, key)` to `ix` unless it is there already.
+private ix_add(ix: &UniqueIx, key_type: Type, u: Value, key: Value)
     var lo: usize = 0
     var hi = ix.entries.len()
 
@@ -140,14 +142,14 @@ private ix_add(ix: &UniqueIx, key_type: Type, u: Value, s: &Slot)
         val mid = lo + (hi - lo) / 2
         val e = ix.entries[mid]
         var c = cmp(ix.ty, e.value, u)
-        if c == 0 then c = cmp(key_type, e.slot.key, s.key)
+        if c == 0 then c = cmp(key_type, e.key, key)
         if c == 0 then return
         if c < 0 then lo = mid + 1 else hi = mid
 
-    ix.entries.insert(lo, IxEntry(u, s))
+    ix.entries.insert(lo, IxEntry(u, key))
 
-/** Enters the image `img` of `s` in every unique index of `d`. */
-private[terndb] index_image(c: MemCatalog, d: &TableData, s: &Slot, img: Option[StoredRow])
+/** Enters the image `img` of the row keyed `key` in every unique index of `d`. */
+private[terndb] index_image(c: MemCatalog, d: &TableData, key: Value, img: Option[StoredRow])
     if d.uniques.len() == 0 then return
 
     val r = img match
@@ -158,18 +160,17 @@ private[terndb] index_image(c: MemCatalog, d: &TableData, s: &Slot, img: Option[
 
     for ix in d.uniques
         image_values(versions, r, ix.columns) match
-            Some(u) -> ix_add(ix, d.key_type, u, s)
+            Some(u) -> ix_add(ix, d.key_type, u, key)
             None -> ()
 
-/** The slots whose versions may hold `value` in columns `ids` of `d`: the slot of that key when
- * `ids` is the primary key, else the entries of the unique index over `ids`.
+/** The keys of the rows whose versions may hold `value` in columns `ids` of `d`: that key itself
+ * when `ids` is the primary key, else those of the entries of the unique index over `ids`.
  */
-private slots_holding(d: &TableData, ids: Buf[u32], value: Value) -> Result[Buf[&Slot], CodecError]
-    val out = buf[&Slot]()
+private keys_holding(d: &TableData, ids: Buf[u32], value: Value) -> Result[Buf[Value], CodecError]
+    val out = buf[Value]()
 
     if same_ids(ids, d.key_columns)
-        val (found, at) = locate(d, value)
-        if found then out.push(d.slots[at])
+        out.push(value)
         return Ok(out)
 
     for ix in d.uniques
@@ -177,7 +178,7 @@ private slots_holding(d: &TableData, ids: Buf[u32], value: Value) -> Result[Buf[
             var i = ix_first(ix, value)
 
             while i < ix.entries.len() && cmp(ix.ty, ix.entries[i].value, value) == 0
-                out.push(ix.entries[i].slot)
+                out.push(ix.entries[i].key)
                 i += 1
 
             return Ok(out)
@@ -247,54 +248,32 @@ private within(versions: Buf[SchemaVersion], ids: Buf[u32], ty: Type, values: Bu
 
 // -- the statement undo log ---------------------------------------------------------------------------
 
-private[terndb] mark_of(t: &Txn) -> Mark = Mark(t.undo.len(), t.writes.len(), t.locks.len(), t.deferred.len())
-
-/** Whether the newest version of `s` is the uncommitted one of transaction `id`. */
-private[terndb] owns(s: &Slot, id: u64) -> bool
-    val n = s.versions.len()
-    s.lock == id && n > 0 && s.versions[n - 1].writer == id && s.versions[n - 1].commit == 0
-
-/** Releases the `LOCK_ONLY` locks `t` holds. */
-private[terndb] release_locks(t: &Txn)
-    for s in t.locks
-        if s.lock == t.id then s.lock = 0
-
-    t.locks.clear()
-
-/** Undoes what `t` installed, locked and deferred since `m`, newest first. */
-private[terndb] undo_to(t: &Txn, m: Mark)
-    var i = t.undo.len()
-
-    while i > m.undo
-        i -= 1
-        val u = t.undo[i]
-        val s = u.slot
-
-        if u.pushed
-            val _ = s.versions.pop()
-            s.lock = 0
-        else
-            s.versions[s.versions.len() - 1] = u.prev
-            val w = t.writes[u.write_at]
-            t.writes[u.write_at] = Write(w.table, w.slot, w.before, u.prev_after)
-
-    t.undo.truncate(m.undo)
-    t.writes.truncate(m.writes)
-
-    for j in m.locks..<t.locks.len()
-        val s = t.locks[j]
-        if s.lock == t.id then s.lock = 0
-
-    t.locks.truncate(m.locks)
-
-    // A lock-only row the statement then wrote lost its lock with the version undone.
-    for s in t.locks
-        s.lock = t.id
-
-    t.deferred.truncate(m.deferred)
-end undo_to
-
 impl Store
+    /** Where `t`'s statement log, writes, locks, deferred checks and rollback chain stand now. */
+    private[terndb] mark_of(self, t: &Txn) -> Mark =
+        Mark(t.undo.len(), t.writes.len(), t.locks.len(), t.deferred.len(), self.rows.last_record(t.id))
+
+    /** Undoes what `t` installed, locked and deferred since `m`, newest first: its undo records
+     * after the mark's are rolled back (`UndoRows.rollback_to`), which restores every row and lets
+     * go of every row and `LOCK_ONLY` lock taken since, and its write list is restored.
+     */
+    private[terndb] undo_to(*self, t: &Txn, m: Mark)
+        val _ = self.rows.rollback_to(t.id, m.addr)
+        var i = t.undo.len()
+
+        while i > m.undo
+            i -= 1
+            val u = t.undo[i]
+
+            if !u.pushed
+                val w = t.writes[u.write_at]
+                t.writes[u.write_at] = Write(w.table, w.key, w.before, u.prev_after)
+
+        t.undo.truncate(m.undo)
+        t.writes.truncate(m.writes)
+        t.locks.truncate(m.locks)
+        t.deferred.truncate(m.deferred)
+
     /** The visible row of `table` whose columns `ids` (a unique or primary key, in its own order)
      * hold `value`, if any; logged as a read of that value, found or not, reading every column
      * (`isolation.md` §4.4, an upsert's conflict check).
@@ -341,24 +320,25 @@ impl Store
             Done(n) -> n
 
         val d = self.table_data(table)?
-        self.sync_uniques(d)
+        self.sync_uniques(d)?
         if d.uniques.len() == 0 then return Ok(Done(n))
 
         for i in m.undo..<t.undo.len()
-            self.unique_check(t, d, t.undo[i].slot)? match
-                Some(h) ->
-                    undo_to(t, m)
-                    return self.wait_on(t, h)
-                None -> ()
+            if t.undo[i].table == d.oid
+                self.unique_check(t, d, t.undo[i].key)? match
+                    Some(h) ->
+                        self.undo_to(t, m)
+                        return self.wait_on(t, h)
+                    None -> ()
 
         t.waits_for = 0
         Ok(Done(n))
 
     // Brings `d`'s unique indexes in line with the catalog: a key added since is built from every
-    // version of every row, and a key dropped is forgotten.
-    private sync_uniques(*self, d: &TableData)
+    // version of every row still reachable, and a key dropped is forgotten.
+    private sync_uniques(*self, d: &TableData) -> Result[unit, CodecError]
         val keys = unique_keys(self.catalog, d.oid)
-        if keys.len() == 0 && d.uniques.len() == 0 then return
+        if keys.len() == 0 && d.uniques.len() == 0 then return Ok(())
 
         val kept = buf[&UniqueIx]()
 
@@ -374,17 +354,16 @@ impl Store
                 val ix: &UniqueIx = UniqueIx(k.name, k.columns, columns_type(self.catalog, d.oid, k.columns), buf())
                 val versions = table_versions(self.catalog, d.oid)
 
-                for s in d.slots
-                    for v in s.versions
-                        v.row match
-                            Some(r) -> image_values(versions, r, ix.columns) match
-                                Some(u) -> ix_add(ix, d.key_type, u, s)
-                                None -> ()
+                for s in self.slots_of(d)?
+                    for r in self.all_versions(d, s)?
+                        image_values(versions, r, ix.columns) match
+                            Some(u) -> ix_add(ix, d.key_type, u, s.key)
                             None -> ()
 
                 kept.push(ix)
 
         d.uniques = kept
+        Ok(())
     end sync_uniques
 
     /** Reconciliation of `t`'s rows of `table` with the unique keys a DDL committed since added
@@ -394,23 +373,28 @@ impl Store
      */
     private[terndb] reconcile_uniques(*self, t: &Txn, table: u64) -> Result[unit, CodecError]
         val d = self.table_data(table)?
-        self.sync_uniques(d)
+        self.sync_uniques(d)?
 
         for w in t.writes
             if w.table == table
-                self.unique_check(t, d, w.slot)? match
+                self.unique_check(t, d, w.key)? match
                     Some(_) -> return fail("T1003", "a row holding a value of a unique key added during the transaction is locked by a live transaction at its commit")
                     None -> ()
 
         Ok(())
 
-    // Whether `t`'s version of `s` conflicts on a secondary unique key of `d` with another row
-    // (`isolation.md` §4.2 rules 1 and 4, applied to the key's value): an error, the id of a live
-    // transaction writing a row that holds the value (`Some`, to wait for), or none.
-    private unique_check(*self, t: &Txn, d: &TableData, s: &Slot) -> Result[Option[u64], CodecError]
+    // Whether `t`'s version of the row keyed `key` conflicts on a secondary unique key of `d` with
+    // another row (`isolation.md` §4.2 rules 1 and 4, applied to the key's value): an error, the id
+    // of a live transaction writing a row that holds the value (`Some`, to wait for), or none. A
+    // value with a null component is never checked (Q48).
+    private unique_check(*self, t: &Txn, d: &TableData, key: Value) -> Result[Option[u64], CodecError]
+        val s = self.slot_at(d, key)? match
+            Some(s) -> s
+            None -> return Ok(None)
+
         if !owns(s, t.id) then return Ok(None)
 
-        val r = s.versions[s.versions.len() - 1].row match
+        val r = self.image_row(d, s.key, s.img)? match
             Some(r) -> r
             None -> return Ok(None)
 
@@ -422,12 +406,14 @@ impl Store
                     var i = ix_first(ix, u)
 
                     while i < ix.entries.len() && cmp(ix.ty, ix.entries[i].value, u) == 0
-                        val o = ix.entries[i].slot
+                        val ok = ix.entries[i].key
                         i += 1
 
-                        if o.key != s.key
-                            unique_conflict(t, versions, ix, o, u)? match
-                                Some(h) -> return Ok(Some(h))
+                        if ok != s.key
+                            self.slot_at(d, ok)? match
+                                Some(o) -> self.unique_conflict(t, d, versions, ix, o, u)? match
+                                    Some(h) -> return Ok(Some(h))
+                                    None -> ()
                                 None -> ()
                 None -> ()
 
@@ -441,14 +427,16 @@ impl Store
         if same_ids(ids, d.key_columns)
             return Ok(self.get_in(t, table, value)?.map(r -> Hit(value, r)))
 
-        self.sync_uniques(d)
+        self.sync_uniques(d)?
         val versions = table_versions(self.catalog, table)
         val ty = columns_type(self.catalog, table, ids)
         self.log_read(t, table, pred_all(r -> row_holds(versions, ids, ty, value, r)), None)
 
-        for o in slots_holding(d, ids, value)?
-            visible_row(o, t.snapshot, t.id) match
-                Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, self.translated(table, r)?)))
+        for k in keys_holding(d, ids, value)?
+            self.slot_at(d, k)? match
+                Some(o) -> self.visible(d, o, t.snapshot, t.id)? match
+                    Some(r) -> if row_holds(versions, ids, ty, value, r) then return Ok(Some(Hit(o.key, self.translated(table, r)?)))
+                    None -> ()
                 None -> ()
 
         Ok(None)
@@ -458,42 +446,61 @@ impl Store
     private reference_in(*self, t: &Txn, fk: ForeignKey, value: Value, at_commit: bool) -> Result[Option[u64], CodecError]
         live(t)?
         val d = self.table_data(fk.ref_table)?
-        self.sync_uniques(d)
+        self.sync_uniques(d)?
         val ids = fk.ref_columns
         val versions = table_versions(self.catalog, fk.ref_table)
         val ty = columns_type(self.catalog, fk.ref_table, ids)
         val key = if same_ids(ids, d.key_columns) then Some(value) else None
         self.log_read(t, fk.ref_table, pred(ids.view(), r -> row_holds(versions, ids, ty, value, r)), key)
 
-        for o in slots_holding(d, ids, value)?
-            val n = o.versions.len()
-
-            if n > 0
-                val top = o.versions[n - 1]
-                val committed = newest_committed(o)
-                val held = committed.is_some() && image_holds(versions, ids, ty, value, committed.unwrap().row)
-
-                if owns(o, t.id)
-                    if image_holds(versions, ids, ty, value, top.row) then return Ok(None)
-                elif o.lock != 0 && o.lock != t.id && (held || image_holds(versions, ids, ty, value, top.row))
-                    if at_commit then return fail("T1003", s"the row foreign key '${fk.name}' references is locked by a live transaction, and a commit does not wait")
-
-                    val _ = self.wait_on(t, o.lock)?
-                    return Ok(Some(o.lock))
-                elif held
-                    if t.level != ReadCommitted && committed.unwrap().commit > t.snapshot
-                        return fail("T1001", s"the row foreign key '${fk.name}' references was committed after the snapshot")
-
-                    if o.lock == 0
-                        o.lock = t.id
-                        t.locks.push(o)
-
-                    return Ok(None)
-                elif t.level != ReadCommitted && image_holds(versions, ids, ty, value, visible_row(o, t.snapshot, t.id))
-                    return fail("T1001", s"the row foreign key '${fk.name}' references was changed after the snapshot")
+        for k in keys_holding(d, ids, value)?
+            self.slot_at(d, k)? match
+                Some(o) -> self.reference_row(t, fk, d, o, versions, ty, value, at_commit)? match
+                    Some(answer) -> return Ok(answer)
+                    None -> ()
+                None -> ()
 
         fk_fail(fk.name, "no row of the referenced table holds the value of")
     end reference_in
+
+    // `reference_in` for one row `o` of the referenced table `d` that may hold `value`: the answer
+    // (`Some`), or none to go on to the next row.
+    private reference_row(*self, t: &Txn, fk: ForeignKey, d: &TableData, o: Slot, versions: Buf[SchemaVersion], ty: Type, value: Value,
+            at_commit: bool) -> Result[Option[Option[u64]], CodecError]
+        val ids = fk.ref_columns
+
+        val top = self.top_version(d, o)? match
+            Some(v) -> v.row
+            None -> None
+
+        val committed = self.newest_committed(d, o)?
+        val held = committed.is_some() && image_holds(versions, ids, ty, value, committed.unwrap().row)
+        val lock = self.lock_of(o)
+
+        if owns(o, t.id)
+            if image_holds(versions, ids, ty, value, top) then return Ok(Some(None))
+        elif lock != 0 && lock != t.id && (held || image_holds(versions, ids, ty, value, top))
+            if at_commit then return fail("T1003", s"the row foreign key '${fk.name}' references is locked by a live transaction, and a commit does not wait")
+
+            val _ = self.wait_on(t, lock)?
+            return Ok(Some(Some(lock)))
+        elif held
+            if t.level != ReadCommitted && committed.unwrap().commit > t.snapshot
+                return fail("T1001", s"the row foreign key '${fk.name}' references was committed after the snapshot")
+
+            // The referenced row is locked `LOCK_ONLY` (a LOCK undo record, Q49) unless `t` holds
+            // it already.
+            if lock == 0
+                self.rows.lock(t.id, d.oid, o.kb.view())? match
+                    UndoDone(_) -> t.locks.push(o.key)
+                    _ -> return fail("D1001", "a referenced row the store found unlocked could not be locked")
+
+            return Ok(Some(None))
+        elif t.level != ReadCommitted && image_holds(versions, ids, ty, value, self.visible(d, o, t.snapshot, t.id)?)
+            return fail("T1001", s"the row foreign key '${fk.name}' references was changed after the snapshot")
+
+        Ok(None)
+    end reference_row
 
     private referencing_in(*self, t: &Txn, fk: ForeignKey, values: Buf[Value]) -> Result[Buf[Hit], CodecError]
         live(t)?
@@ -508,16 +515,14 @@ impl Store
         self.log_read(t, fk.table, pred(ids.view(), r -> within(versions, ids, ty, sorted, Some(r))), None)
         val out = buf[Hit]()
 
-        for s in d.slots
-            val n = s.versions.len()
-
+        for s in self.slots_of(d)?
             if owns(s, t.id)
-                val top = s.versions[n - 1]
-                if within(versions, ids, ty, sorted, top.row) then out.push(Hit(s.key, top.row.unwrap()))
+                val top = self.image_row(d, s.key, s.img)?
+                if within(versions, ids, ty, sorted, top) then out.push(Hit(s.key, top.unwrap()))
             else
-                newest_committed(s) match
+                self.newest_committed(d, s)? match
                     Some(v) -> if within(versions, ids, ty, sorted, v.row)
-                        if t.level != ReadCommitted && v.commit > t.snapshot && !within(versions, ids, ty, sorted, visible_row(s, t.snapshot, t.id))
+                        if t.level != ReadCommitted && v.commit > t.snapshot && !within(versions, ids, ty, sorted, self.visible(d, s, t.snapshot, t.id)?)
                             return fail("T1001", s"a row referencing through foreign key '${fk.name}' was committed after the snapshot")
 
                         out.push(Hit(s.key, v.row.unwrap()))
@@ -529,12 +534,14 @@ impl Store
     private holds_in(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
         live(t)?
         val d = self.table_data(table)?
-        self.sync_uniques(d)
+        self.sync_uniques(d)?
         val versions = table_versions(self.catalog, table)
         val ty = columns_type(self.catalog, table, ids)
 
-        for o in slots_holding(d, ids, value)?
-            if image_holds(versions, ids, ty, value, visible_row(o, t.snapshot, t.id)) then return Ok(true)
+        for k in keys_holding(d, ids, value)?
+            self.slot_at(d, k)? match
+                Some(o) -> if image_holds(versions, ids, ty, value, self.visible(d, o, t.snapshot, t.id)?) then return Ok(true)
+                None -> ()
 
         Ok(false)
 
@@ -544,15 +551,15 @@ impl Store
             x match
                 ChildCheck(fk, key) ->
                     val d = self.table_data(fk.table)?
-                    val (found, at) = locate(d, key)
 
-                    if found
-                        visible_row(d.slots[at], t.snapshot, t.id) match
+                    self.slot_at(d, key)? match
+                        Some(s) -> self.visible(d, s, t.snapshot, t.id)? match
                             Some(r) -> image_values(table_versions(self.catalog, fk.table), r, fk.columns) match
                                 Some(v) ->
                                     val _ = self.reference_in(t, fk, v, true)?
                                 None -> ()
                             None -> ()
+                        None -> ()
                 ParentCheck(fk, value) ->
                     if !self.holds_in(t, fk.ref_table, fk.ref_columns, value)?
                         val one = buf[Value]()
@@ -561,35 +568,36 @@ impl Store
 
         Ok(())
     end check_deferred
-end Store
 
-// Whether row `o`, another than the one `t` wrote, conflicts with `u` on `ix`: `t`'s own version of
-// it holding `u` is `unique_violation`; a version another live transaction is writing, or the
-// committed one under it, holding `u` answers that transaction to wait for, its outcome deciding
-// (§4.2 rule 1); else the version in `t`'s snapshot holding `u` is `unique_violation`, and the newest
-// committed one holding it is a race (`serialization_failure`) at snapshot and serializable and
-// `unique_violation` at read committed (rule 4). A row another transaction only holds `LOCK_ONLY`
-// is judged by its committed version, which that lock does not change.
-private unique_conflict(t: &Txn, versions: Buf[SchemaVersion], ix: &UniqueIx, o: &Slot, u: Value) -> Result[Option[u64], CodecError]
-    val n = o.versions.len()
-    if n == 0 then return Ok(None)
-    val top = o.versions[n - 1]
-    val committed = newest_committed(o)
-    val held = committed.is_some() && image_holds(versions, ix.columns, ix.ty, u, committed.unwrap().row)
+    // Whether row `o`, another than the one `t` wrote, conflicts with `u` on `ix`: `t`'s own version
+    // of it holding `u` is `unique_violation`; a version another live transaction is writing, or the
+    // committed one under it, holding `u` answers that transaction to wait for, its outcome deciding
+    // (§4.2 rule 1); else the version in `t`'s snapshot holding `u` is `unique_violation`, and the
+    // newest committed one holding it is a race (`serialization_failure`) at snapshot and
+    // serializable and `unique_violation` at read committed (rule 4). A row another transaction only
+    // holds `LOCK_ONLY` is judged by its committed version, which that lock does not change.
+    private unique_conflict(*self, t: &Txn, d: &TableData, versions: Buf[SchemaVersion], ix: &UniqueIx, o: Slot, u: Value) -> Result[Option[u64], CodecError]
+        val top = self.top_version(d, o)? match
+            Some(v) -> v
+            None -> return Ok(None)
 
-    if top.commit == 0
-        if top.writer == t.id
-            if image_holds(versions, ix.columns, ix.ty, u, top.row) then return unique_fail(ix.name)
+        val committed = self.newest_committed(d, o)?
+        val held = committed.is_some() && image_holds(versions, ix.columns, ix.ty, u, committed.unwrap().row)
+
+        if top.commit == 0
+            if top.writer == t.id
+                if image_holds(versions, ix.columns, ix.ty, u, top.row) then return unique_fail(ix.name)
+                return Ok(None)
+
+            if held || image_holds(versions, ix.columns, ix.ty, u, top.row) then return Ok(Some(top.writer))
             return Ok(None)
 
-        if held || image_holds(versions, ix.columns, ix.ty, u, top.row) then return Ok(Some(top.writer))
-        return Ok(None)
+        if image_holds(versions, ix.columns, ix.ty, u, self.visible(d, o, t.snapshot, t.id)?) then return unique_fail(ix.name)
 
-    if image_holds(versions, ix.columns, ix.ty, u, visible_row(o, t.snapshot, t.id)) then return unique_fail(ix.name)
+        if held
+            if t.level == ReadCommitted then return unique_fail(ix.name)
+            return fail("T1001", s"a row with this value of unique key '${ix.name}' was committed after the snapshot")
 
-    if held
-        if t.level == ReadCommitted then return unique_fail(ix.name)
-        return fail("T1001", s"a row with this value of unique key '${ix.name}' was committed after the snapshot")
-
-    Ok(None)
-end unique_conflict
+        Ok(None)
+    end unique_conflict
+end Store

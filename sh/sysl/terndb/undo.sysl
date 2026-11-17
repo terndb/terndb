@@ -798,6 +798,16 @@ struct UndoRows
      */
     last_record(self, txn: u64) -> u64 = self.last_of(txn)
 
+    /** Ends `txn`, which wrote no version, as committed at `c`, an existing commit point (its
+     * snapshot), without publishing a new one: `isolation.md` §5.5's transaction with an empty write
+     * set. Its LOCK records, which no reader needs, are then finished for purge once `c` is below the
+     * horizon. False when `txn` is not active.
+     */
+    commit_at(*self, txn: u64, c: u64) -> bool
+        if !self.is_active(txn) then return false
+        self.txns[usize(txn - 1)] = UndoTxn(UndoTxnCommitted, c, self.last_of(txn))
+        true
+
     /** Rolls back the records `txn` wrote after `stop`, an address its rollback chain held as its
      * head earlier (`last_record`), newest first, as `abort` would; `txn` stays active, with `stop`
      * the head of its chain again. The records rolled back stay in the log, named by no row, until
