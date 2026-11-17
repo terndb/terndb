@@ -1,0 +1,518 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The executable model of `isolation.md` §7.4: §4's mechanism written as plainly as it is stated,
+// over rows that are keys and integer (or integer-list) columns, with no catalog, no index and no
+// executor, so that it can be checked by reading it beside §4. Snapshots and the visible horizon
+// (§4.1), first-updater-wins with waits and deadlock detection (§4.2), the predicate log and
+// `validate` (§4.3), the predicates of §4.4 as data, a list column as one value of its row (§4.5),
+// and the abort rules and codes of §5. It is single-threaded, as the store is: a write that must
+// wait answers `MoWait` and is called again once the holder has ended. `iso_lockstep.sysl` runs it
+// beside the store (`docs/design/iso-model.md`).
+
+/** One column of a model row: an integer, or a list of integers, a nested relation that is one
+ * value of its row (§4.5 N1, N2).
+ */
+enum MoVal derives Eq
+    MoInt(n: i64)
+    MoList(items: Buf[i64])
+
+/** The integer in column `i` of `img`; 0 for a list or a missing column. */
+mo_int(img: Buf[MoVal], i: usize) -> i64 = if i >= img.len() then 0 else img[i] match
+    MoInt(n) -> n
+    MoList(_) -> 0
+
+/** The list in column `i` of `img`; empty for an integer or a missing column. */
+mo_list(img: Buf[MoVal], i: usize) -> Buf[i64] = if i >= img.len() then buf[i64]() else img[i] match
+    MoInt(_) -> buf[i64]()
+    MoList(items) -> items
+
+/** A row's key: its column 0. */
+mo_key(img: Buf[MoVal]) -> i64 = mo_int(img, 0)
+
+/** A membership predicate over one table's rows (§4.4): the row keyed `k` (a point lookup, found or
+ * not), the rows keyed by any of `keys`, the keys in `[lo, hi)`, the rows whose column `col` is `v`,
+ * the rows whose list column `col` holds `e` (a predicate over a nested level, §4.5 N3), or every
+ * row.
+ */
+enum MoFilter derives Eq
+    MoKey(k: i64)
+    MoKeys(keys: Buf[i64])
+    MoRange(lo: i64, hi: i64)
+    MoEq(col: usize, v: i64)
+    MoHas(col: usize, e: i64)
+    MoAll
+
+/** Whether the image `img` satisfies `f`. */
+mo_holds(f: MoFilter, img: Buf[MoVal]) -> bool = f match
+    MoKey(k) -> mo_key(img) == k
+    MoKeys(keys) ->
+        var hit = false
+        for k in keys
+            if k == mo_key(img) then hit = true
+        hit
+    MoRange(lo, hi) -> mo_key(img) >= lo && mo_key(img) < hi
+    MoEq(col, v) -> mo_int(img, col) == v
+    MoHas(col, e) ->
+        var hit = false
+        for x in mo_list(img, col)
+            if x == e then hit = true
+        hit
+    MoAll -> true
+
+/** The columns `f` reads. */
+mo_filter_columns(f: MoFilter) -> Buf[usize] = f match
+    MoKey(_) | MoKeys(_) | MoRange(_, _) -> mo_cols([0])
+    MoEq(col, _) | MoHas(col, _) -> mo_cols([col])
+    MoAll -> buf[usize]()
+
+/** `cols` as a buffer. */
+mo_cols(cols: []const usize) -> Buf[usize]
+    val out = buf[usize]()
+    out.extend(cols)
+    out
+
+/** What a write statement does to each row it selects: sets column `col` to `v`, adds `d` to it,
+ * appends `e` to the list in it, or removes the row.
+ */
+enum MoChange derives Eq
+    MoSet(col: usize, v: i64)
+    MoAdd(col: usize, d: i64)
+    MoAppend(col: usize, e: i64)
+    MoRemove
+
+/** The image `c` leaves of `img`; `None` for a removal. */
+mo_apply(c: MoChange, img: Buf[MoVal]) -> Option[Buf[MoVal]]
+    val out = img.copy()
+    c match
+        MoSet(col, v) -> out[col] = MoInt(v)
+        MoAdd(col, d) -> out[col] = MoInt(mo_int(img, col) + d)
+        MoAppend(col, e) ->
+            val items = mo_list(img, col).copy()
+            items.push(e)
+            out[col] = MoList(items)
+        MoRemove -> return None
+    Some(out)
+
+/** The columns `c` reads of the row it changes. */
+mo_change_reads(c: MoChange) -> Buf[usize] = c match
+    MoAdd(col, _) | MoAppend(col, _) -> mo_cols([col])
+    MoSet(_, _) | MoRemove -> buf[usize]()
+
+/** One version of a row: its writer, its commit sequence number (0 while uncommitted) and its
+ * image, `None` for a deleted row.
+ */
+struct MoVersion
+    writer: u64
+    c: u64
+    image: Option[Buf[MoVal]]
+
+/** One row: its table and key, its write lock (§4.2: the live transaction owning the in-place
+ * version, 0 for none) and its versions, oldest first; the newest is the in-place version, the rest
+ * its undo chain (§4.1).
+ */
+struct MoObject
+    table: u64
+    key: i64
+    lock: u64
+    versions: Buf[MoVersion]
+
+/** One row a transaction wrote (§4.3): `before` the newest committed image its first write
+ * replaced, `after` the image its last write left; `None` is absent or deleted.
+ */
+struct MoWrite
+    table: u64
+    key: i64
+    before: Option[Buf[MoVal]]
+    after: Option[Buf[MoVal]]
+
+/** One predicate-log entry (§4.3): a table, a membership predicate `L` and the columns `C` the
+ * access used, or `every` column.
+ */
+struct MoEntry
+    table: u64
+    filter: MoFilter
+    cols: Buf[usize]
+    every: bool
+
+/** Where a transaction is: live, committed at `c`, or aborted with the §5.2 code that ended it
+ * (empty when the client rolled it back).
+ */
+enum MoState derives Eq
+    MoLive
+    MoCommitted(c: u64)
+    MoAborted(code: string)
+
+/** A transaction: its id, level, whether it was declared read-only, its snapshot (at read
+ * committed, its current statement's), its state, its predicate log, its writes (one per row) and
+ * the transaction it waits for (0 for none).
+ */
+struct MoTxn
+    id: u64
+    level: Isolation
+    read_only: bool
+    snapshot: u64
+    state: MoState
+    log: Buf[MoEntry]
+    writes: Buf[MoWrite]
+    waits_for: u64
+
+/** A committed transaction's writes, kept for validation (§4.3). The model keeps them all. */
+struct MoCommit
+    c: u64
+    writes: Buf[MoWrite]
+
+/** What a write statement did: changed `n` rows, or nothing because a row it must write is locked
+ * by the live transaction `holder` (§4.2 rule 1).
+ */
+enum MoDone derives Eq
+    MoRows(n: usize)
+    MoWait(holder: u64)
+
+/** A row a scan returned: its key and the image visible to the reader. */
+struct MoHit derives Eq
+    key: i64
+    image: Buf[MoVal]
+
+/** The model: the visible horizon `h`, every transaction (id `i` at index `i - 1`), every row
+ * (sorted by table, then key) and every committed write set.
+ */
+struct IsoModel
+    horizon: u64
+    txns: Buf[&MoTxn]
+    objects: Buf[&MoObject]
+    committed: Buf[MoCommit]
+
+    /** Begins a transaction at `level` with the snapshot `s = h` (§4.1); answers its id. */
+    begin(*self, level: Isolation, read_only: bool = false) -> u64
+        val id = u64(self.txns.len() + 1)
+        self.txns.push(MoTxn(id, level, read_only, self.horizon, MoLive, buf(), buf(), 0))
+        id
+
+    /** The transaction `id`, if there is one. */
+    txn(self, id: u64) -> Option[&MoTxn] = if id >= 1 && id <= u64(self.txns.len()) then Some(self.txns[usize(id - 1)]) else None
+
+    /** The snapshot of `id` (at read committed, its latest statement's); 0 for no such transaction. */
+    snapshot_of(self, id: u64) -> u64 = self.txn(id) match
+        Some(t) -> t.snapshot
+        None -> 0
+
+    /** The state of `id`; aborted with `W2001` for no such transaction. */
+    state_of(self, id: u64) -> MoState = self.txn(id) match
+        Some(t) -> t.state
+        None -> MoAborted("W2001")
+
+    /** Whether `id` is live. */
+    live(self, id: u64) -> bool = self.state_of(id) == MoLive
+
+    /** The transaction `id` waits for; 0 for none. */
+    waiting(self, id: u64) -> u64 = self.txn(id) match
+        Some(t) -> if t.state == MoLive then t.waits_for else 0
+        None -> 0
+
+    /** How many predicate-log entries `id` holds. */
+    logged(self, id: u64) -> usize = self.txn(id) match
+        Some(t) -> t.log.len()
+        None -> 0
+
+    // -- reading (§4.1) -----------------------------------------------------------------------------
+
+    /** The row of `table` keyed `key` as `id` sees it: logged as the point read `key = k` of every
+     * column, found or not (§4.4).
+     */
+    get(*self, id: u64, table: u64, key: i64) -> Result[Option[Buf[MoVal]], string]
+        val t = self.usable(id)?
+        self.statement(t)
+        self.log(t, table, MoKey(key), buf(), true)
+        self.find(table, key) match
+            Some(o) -> Ok(visible(o, t))
+            None -> Ok(None)
+
+    /** The rows of `table` that `id` sees and that satisfy `f`, in key order: logged as `f` with the
+     * columns `cols` (§4.4).
+     */
+    scan(*self, id: u64, table: u64, f: MoFilter, cols: Buf[usize]) -> Result[Buf[MoHit], string]
+        val t = self.usable(id)?
+        self.statement(t)
+        val out = buf[MoHit]()
+
+        for o in self.objects
+            if o.table == table
+                visible(o, t) match
+                    Some(img) -> if mo_holds(f, img) then out.push(MoHit(o.key, img))
+                    None -> ()
+
+        self.log(t, table, f, cols, false)
+        Ok(out)
+
+    // -- writing (§4.2) -----------------------------------------------------------------------------
+
+    /** `UPDATE` (or, with `MoRemove`, `DELETE`) of the rows of `table` that `id` sees satisfying `f`.
+     * The statement waits before writing anything if a row it selects is locked by another live
+     * transaction (rule 1); it is logged as `f` with the columns `f` and `c` read.
+     */
+    update(*self, id: u64, table: u64, f: MoFilter, c: MoChange) -> Result[MoDone, string]
+        val t = self.usable(id)?
+        self.statement(t)
+        if t.read_only then return self.fail(t, "T4001")
+        t.waits_for = 0
+
+        val targets = buf[&MoObject]()
+        for o in self.objects
+            if o.table == table
+                visible(o, t) match
+                    Some(img) -> if mo_holds(f, img) then targets.push(o)
+                    None -> ()
+
+        for o in targets
+            if o.lock != 0 && o.lock != t.id then return self.wait(t, o.lock)
+
+        val cols = mo_filter_columns(f)
+        cols.extend(mo_change_reads(c).view())
+        self.log(t, table, f, cols, false)
+
+        var n: usize = 0
+        for o in targets
+            val base = if o.lock == t.id
+                newest(o).image
+            elif t.level == ReadCommitted
+                // Rule 3: the newest committed version, if the statement's predicate still holds of it.
+                newest_committed_version(o).image match
+                    Some(img) -> if mo_holds(f, img) then Some(img) else None
+                    None -> None
+            else
+                visible(o, t)
+
+            base match
+                Some(img) ->
+                    self.write(t, o, mo_apply(c, img))?
+                    n += 1
+                None -> ()
+
+        Ok(MoRows(n))
+
+    /** `INSERT` of `img` into `table`, keyed by its column 0 (§4.2 rule 4): a key `id` sees is
+     * `unique_violation`; one committed after the snapshot is `serialization_failure` at snapshot
+     * and serializable and `unique_violation` at read committed.
+     */
+    insert(*self, id: u64, table: u64, img: Buf[MoVal]) -> Result[MoDone, string]
+        val t = self.usable(id)?
+        self.statement(t)
+        if t.read_only then return self.fail(t, "T4001")
+        t.waits_for = 0
+
+        val o = self.find_or_add(table, mo_key(img))
+        if o.lock != 0 && o.lock != t.id then return self.wait(t, o.lock)
+        if visible(o, t).is_some() then return self.fail(t, "T3001")
+
+        if o.lock != t.id && newest_committed_version(o).image.is_some()
+            // Not visible, yet live in the newest committed version: committed after the snapshot.
+            return self.fail(t, if t.level == ReadCommitted then "T3001" else "T1001")
+
+        self.write(t, o, Some(img))?
+        Ok(MoRows(1))
+
+    // -- ending (§4.3, §5) --------------------------------------------------------------------------
+
+    /** Commits `id`: its commit sequence number, or its snapshot for an empty write set (§5.5). A
+     * serializable writer is validated first. An ended transaction answers `W2001` once committed,
+     * and once aborted the code that aborted it (`W2003` when the client rolled it back).
+     */
+    commit(*self, id: u64) -> Result[u64, string]
+        val t = self.txn(id) match
+            Some(t) -> t
+            None -> return Err("W2001")
+
+        t.state match
+            MoLive -> ()
+            MoCommitted(_) -> return Err("W2001")
+            MoAborted(code) -> return Err(if code.len == 0 then "W2003" else code)
+
+        if t.writes.len() == 0
+            t.state = MoCommitted(t.snapshot)
+            t.waits_for = 0
+            return Ok(t.snapshot)
+
+        val c = self.horizon + 1
+        if t.level == Serializable && !self.validate(t, c) then return Err(self.fail_code(t, "T1001"))
+
+        for w in t.writes
+            val o = self.find(w.table, w.key).unwrap()
+            val top = o.versions.len() - 1
+            o.versions[top] = MoVersion(t.id, c, o.versions[top].image)
+            o.lock = 0
+
+        // Publication in `c` order, before the acknowledgement this answer is (§4.1).
+        self.horizon = c
+        self.committed.push(MoCommit(c, t.writes))
+        t.state = MoCommitted(c)
+        t.waits_for = 0
+        Ok(c)
+
+    /** Rolls `id` back at the client's request; `W2001` once it has committed. */
+    abort(*self, id: u64) -> Result[unit, string]
+        val t = self.txn(id) match
+            Some(t) -> t
+            None -> return Err("W2001")
+
+        t.state match
+            MoLive -> self.rollback(t, "")
+            MoCommitted(_) -> return Err("W2001")
+            MoAborted(_) -> ()
+
+        Ok(())
+
+    // §4.3 `validate`: no write of a transaction committed during `t`'s lifetime (`s_i < c_j < c_i`)
+    // changes visibility or a column of `C` of an entry of `t`'s log whose `L` holds of its before- or
+    // after-image.
+    private validate(self, t: &MoTxn, c: u64) -> bool
+        for j in self.committed
+            if t.snapshot < j.c && j.c < c
+                for w in j.writes
+                    for e in t.log
+                        if e.table == w.table && mo_changes(e, w) && (mo_matches(e, w.key, w.before) || mo_matches(e, w.key, w.after))
+                            return false
+        true
+
+    // -- the mechanism's parts ----------------------------------------------------------------------
+
+    // The transaction `id` if it may run a statement: `W2001` once committed (or unknown), the code
+    // `W2003` once aborted.
+    private usable(self, id: u64) -> Result[&MoTxn, string]
+        val t = self.txn(id) match
+            Some(t) -> t
+            None -> return Err("W2001")
+
+        t.state match
+            MoLive -> Ok(t)
+            MoCommitted(_) -> Err("W2001")
+            MoAborted(_) -> Err("W2003")
+
+    // A statement begins: read committed takes a new snapshot (§3.3, §4.1).
+    private statement(*self, t: &MoTxn)
+        if t.level == ReadCommitted then t.snapshot = self.horizon
+
+    // A read is logged by a serializable transaction not declared read-only (§4.3, §5.5).
+    private log(*self, t: &MoTxn, table: u64, f: MoFilter, cols: Buf[usize], every: bool)
+        if t.level == Serializable && !t.read_only then t.log.push(MoEntry(table, f, cols, every))
+
+    // Rule 1: `t` waits for `holder`, unless the wait would close a cycle of the wait-for graph, when
+    // `t` is the victim and aborts with `deadlock_detected`.
+    private wait(*self, t: &MoTxn, holder: u64) -> Result[MoDone, string]
+        var h = holder
+        var hops: usize = 0
+
+        while h != 0 && hops <= self.txns.len()
+            if h == t.id then return self.fail(t, "T1002")
+            h = self.waiting(h)
+            hops += 1
+
+        t.waits_for = holder
+        Ok(MoWait(holder))
+
+    // Installs `after` as `t`'s version of `o`. `t`'s own version is replaced in place; otherwise
+    // rule 2: at snapshot and serializable the newest committed version must be in the snapshot, and
+    // `t` locks the row and pushes its version over it.
+    private write(*self, t: &MoTxn, o: &MoObject, after: Option[Buf[MoVal]]) -> Result[unit, string]
+        if o.lock == t.id
+            o.versions[o.versions.len() - 1] = MoVersion(t.id, 0, after)
+            for i in 0..<t.writes.len()
+                val w = t.writes[i]
+                if w.table == o.table && w.key == o.key then t.writes[i] = MoWrite(w.table, w.key, w.before, after)
+            return Ok(())
+
+        val k = newest_committed_version(o)
+        if t.level != ReadCommitted && k.c > t.snapshot
+            return Err(self.fail_code(t, "T1001"))
+
+        o.versions.push(MoVersion(t.id, 0, after))
+        o.lock = t.id
+        t.writes.push(MoWrite(o.table, o.key, k.image, after))
+        Ok(())
+
+    // `t` aborts with `code` (§5.1): its writes are undone, none ever visible.
+    private fail[T](*self, t: &MoTxn, code: string) -> Result[T, string] = Err(self.fail_code(t, code))
+
+    private fail_code(*self, t: &MoTxn, code: string) -> string
+        self.rollback(t, code)
+        code
+
+    private rollback(*self, t: &MoTxn, code: string)
+        for w in t.writes
+            self.find(w.table, w.key) match
+                Some(o) -> if o.lock == t.id
+                    val _ = o.versions.pop()
+                    o.lock = 0
+                None -> ()
+        t.state = MoAborted(code)
+        t.waits_for = 0
+
+    private find(self, table: u64, key: i64) -> Option[&MoObject]
+        for o in self.objects
+            if o.table == table && o.key == key then return Some(o)
+        None
+
+    private find_or_add(*self, table: u64, key: i64) -> &MoObject
+        self.find(table, key) match
+            Some(o) -> return o
+            None -> ()
+
+        var at: usize = 0
+        while at < self.objects.len() && (self.objects[at].table < table || self.objects[at].table == table && self.objects[at].key < key)
+            at += 1
+
+        val o: &MoObject = MoObject(table, key, 0, buf())
+        self.objects.insert(at, o)
+        o
+end IsoModel
+
+/** A model with no rows and no transactions. */
+iso_model() -> &IsoModel = IsoModel(0, buf(), buf(), buf())
+
+// The image of `o` that `t` sees (§4.1): its own uncommitted version, else the newest version
+// committed at or before its snapshot. A deleted image is none.
+private visible(o: &MoObject, t: &MoTxn) -> Option[Buf[MoVal]]
+    var i = o.versions.len()
+    while i > 0
+        i -= 1
+        val v = o.versions[i]
+        if v.c == 0
+            if v.writer == t.id then return v.image
+        elif v.c <= t.snapshot
+            return v.image
+    None
+
+// The in-place version of `o`.
+private newest(o: &MoObject) -> MoVersion = o.versions[o.versions.len() - 1]
+
+// The newest committed version of `o`: `c = 0` and no image when there is none.
+private newest_committed_version(o: &MoObject) -> MoVersion
+    var i = o.versions.len()
+    while i > 0
+        i -= 1
+        if o.versions[i].c != 0 then return o.versions[i]
+    MoVersion(0, 0, None)
+
+// Whether `w` changes visibility (an insert or a delete) or a column of `e`'s `C`.
+private mo_changes(e: MoEntry, w: MoWrite) -> bool
+    val (b, a) = (w.before, w.after) match
+        (Some(b), Some(a)) -> (b, a)
+        _ -> return true
+
+    if e.every then return b != a
+
+    for col in e.cols
+        val x = if col < b.len() then Some(b[col]) else None
+        val y = if col < a.len() then Some(a[col]) else None
+        if x != y then return true
+
+    false
+
+// Whether the image `img` of the row keyed `key` satisfies `e`'s `L`: a point entry by the key
+// alone; an absent or deleted image never.
+private mo_matches(e: MoEntry, key: i64, img: Option[Buf[MoVal]]) -> bool = img match
+    Some(r) -> e.filter match
+        MoKey(k) -> key == k
+        _ -> mo_holds(e.filter, r)
+    None -> false
