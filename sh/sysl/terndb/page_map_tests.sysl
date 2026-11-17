@@ -1,0 +1,678 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+import sysl.slices.sort_by
+
+// The page map (`page_map.sysl`): its edge cases one by one, the sharing a path copy promises, and a
+// seeded model test that drives thousands of sets, removes and lookups into the map and a sorted
+// buffer side by side while older maps are kept alive, every one of which must go on answering as the
+// model did when it was taken.
+
+/** A frame for page `pid`. */
+private pmf(pid: u64) -> &PageFrame = PageFrame(pid, 0, [0; 16384])
+
+/** A map holding a fresh frame for each of `pids`. */
+private pm_of(pids: []const u64) -> PageMap
+    var m = page_map()
+
+    for p in pids
+        m = m.set(p, pmf(p))
+
+    m
+
+/** The PIDs `m` walks, in walk order. */
+private pm_pids(m: PageMap) -> Buf[u64]
+    val out = buf[u64]()
+
+    for (p, _) in m.iter()
+        out.push(p)
+
+    out
+
+private pm_ok(m: PageMap)
+    check_page_map(m) match
+        Some(e) -> panic(s"page map broken: $e")
+        None -> ()
+
+/** The address of every node of `m`, sorted. */
+private pm_nodes(m: PageMap) -> Buf[u64]
+    var out = buf[u64]()
+
+    for s in 0..<8
+        m.roots[s] match
+            Some(r) -> pm_collect(r, out)
+            None -> ()
+
+    sort_by(out.view_mut(), (a, b) -> a < b)
+    out
+
+private pm_collect(n: &PmNode, out: Buf[u64])
+    out.push(u64(usize(&*n)))
+
+    for i in 0..<64
+        pm_kid(n, i) match
+            Some(c) -> pm_collect(c, out)
+            None -> ()
+
+/** The address of each node on the path from the root to `pid`'s slot, root first. */
+private pm_path(m: PageMap, pid: u64) -> Buf[u64]
+    val out = buf[u64]()
+    val s = pid_space(pid)
+    val n = pid & PidNumberMask
+    var at = m.roots[s]
+    var level = m.heights[s]
+
+    while level > 0
+        val node = at match
+            Some(x) -> x
+            None -> break
+        out.push(u64(usize(&*node)))
+        level -= 1
+        at = pm_kid(node, pm_slot(n, level))
+
+    out
+
+private pm_has(xs: Buf[u64], x: u64) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+/** The nodes of `b` that are not nodes of `a`. */
+private pm_fresh(a: PageMap, b: PageMap) -> Buf[u64]
+    val old = pm_nodes(a)
+    val out = buf[u64]()
+
+    for x in pm_nodes(b)
+        if !pm_has(old, x) then out.push(x)
+
+    out
+
+/** Checks that `b` was made from `a` by one path copy to `pid`: the nodes new in `b` are exactly the
+ * nodes of `b`'s path to `pid`, one per level, and every other node of `b` is a node of `a`.
+ */
+private pm_one_path(a: PageMap, b: PageMap, pid: u64)
+    val fresh = pm_fresh(a, b)
+    val p = pm_path(b, pid)
+    assert_eq(fresh.len(), b.heights[pid_space(pid)])
+    assert_eq(p.len(), fresh.len())
+
+    for x in p
+        assert(pm_has(fresh, x))
+
+/** Page number 64^k, the first that needs k + 1 levels. */
+private pm_pow(k: usize) -> u64 = u64(1) << (6 * u64(k))
+
+// -- the empty map, one entry, absent PIDs ------------------------------------------------------------
+
+@test
+an_empty_map_has_nothing_and_walks_nothing()
+    val m = page_map()
+    pm_ok(m)
+    assert_eq(m.len(), 0)
+    assert(m.is_empty())
+    assert(m.get(0).is_none())
+    assert(m.get(MaxPid).is_none())
+    assert(m.get(u64(1) << 60).is_none())
+    assert(m.seek(0).is_none())
+    assert(m.last().is_none())
+    assert_eq(pm_pids(m).len(), 0)
+    assert_eq(pm_nodes(m).len(), 0)
+
+    for (_, _) in m.iter_from(12345)
+        panic("an empty map walked a page")
+
+@test
+one_entry_is_found_walked_and_removed()
+    val f = pmf(7)
+    val m = page_map().set(7, f)
+    pm_ok(m)
+    assert_eq(m.len(), 1)
+    assert(!m.is_empty())
+    assert(m.get(7).unwrap() === f)
+    assert(m.get(6).is_none())
+    assert(m.get(8).is_none())
+    assert(m.get(7 + 64).is_none())
+    assert(m.get((u64(1) << 60) | 7).is_none())
+    assert_eq(m.heights[0], 1)
+    assert_eq(pm_nodes(m).len(), 1)
+    assert_eq(pm_pids(m).view(), [u64(7)])
+    assert_eq(m.seek(0).unwrap().0, 7)
+    assert_eq(m.seek(7).unwrap().0, 7)
+    assert(m.seek(8).is_none())
+    assert_eq(m.last().unwrap().0, 7)
+    val e = m.remove(7)
+    pm_ok(e)
+    assert(e.is_empty())
+    assert(e.get(7).is_none())
+    assert(e.roots[0].is_none())
+    assert_eq(e.heights[0], 0)
+    assert(m.get(7).unwrap() === f)
+
+@test
+removing_an_absent_pid_answers_the_same_map()
+    val m = pm_of([0, 5, 64, 4096])
+    val before = pm_nodes(m)
+
+    for p in [u64(1), 63, 65, 128, 4095, 4097, pm_pow(3), pm_pow(9), MaxPid, u64(1) << 60, u64(1) << 63, 0xFFFFFFFFFFFFFFFF]
+        val r = m.remove(p)
+        pm_ok(r)
+        assert_eq(r.len(), 4)
+        assert_eq(pm_nodes(r).view(), before.view())
+
+        for s in 0..<8
+            assert_eq(r.heights[s], m.heights[s])
+            assert(r.roots[s].is_none() == m.roots[s].is_none())
+
+    assert(page_map().remove(0).is_empty())
+    assert(page_map().remove(MaxPid).is_empty())
+
+@test
+a_pid_with_bit_63_set_is_never_found()
+    val m = pm_of([0, MaxPid])
+    assert(m.get(u64(1) << 63).is_none())
+    assert(m.get(0xFFFFFFFFFFFFFFFF).is_none())
+    assert(m.seek(u64(1) << 63).is_none())
+    var c = m.iter_from(u64(1) << 63)
+    assert(c.next().is_none())
+
+@test(should_trap)
+setting_a_pid_with_bit_63_set_traps()
+    val m = page_map().set(u64(1) << 63, pmf(0))
+    assert_eq(m.len(), 1)
+
+@test(should_trap)
+setting_the_all_ones_pid_traps()
+    val m = page_map().set(0xFFFFFFFFFFFFFFFF, pmf(0))
+    assert_eq(m.len(), 1)
+
+// sysl 0.11.8 traps on a failed `require` without printing its message or its place.
+@test(should_trap: "a PID never has bit 63 set", ignore: "a failed require prints neither its message nor its place")
+setting_a_pid_with_bit_63_set_traps_with_its_message()
+    val m = page_map().set(u64(1) << 63, pmf(0))
+    assert_eq(m.len(), 1)
+
+// -- set ----------------------------------------------------------------------------------------------
+
+@test
+setting_an_existing_pid_replaces_its_frame_and_keeps_the_count()
+    val a = pmf(300)
+    val b = pmf(300)
+    val m1 = pm_of([1, 2, 299, 301]).set(300, a)
+    val m2 = m1.set(300, b)
+    pm_ok(m2)
+    assert_eq(m1.len(), 5)
+    assert_eq(m2.len(), 5)
+    assert(m1.get(300).unwrap() === a)
+    assert(m2.get(300).unwrap() === b)
+    assert_eq(pm_pids(m2).view(), [u64(1), 2, 299, 300, 301])
+    pm_one_path(m1, m2, 300)
+    val m3 = m2.set(300, b)
+    assert_eq(m3.len(), 5)
+    assert(m3.get(300).unwrap() === b)
+
+@test
+a_set_copies_exactly_one_node_per_level_and_shares_the_rest()
+    var m = page_map()
+    var g = rng(11, 0)
+
+    for _ in 0..<2000
+        val p = g.below(pm_pow(4))
+        m = m.set(p, pmf(p))
+
+    assert_eq(m.heights[0], 4)
+    pm_ok(m)
+
+    // A new PID on a path that exists, a new PID whose path is partly new, a replacement, and a PID
+    // whose whole path below the root is new.
+    for p in [m.seek(pm_pow(3) * 9).unwrap().0, pm_pow(3) * 9 + 1, m.seek(77).unwrap().0, pm_pow(4) - 1]
+        val n = m.set(p, pmf(p))
+        pm_ok(n)
+        pm_one_path(m, n, p)
+        assert_eq(n.heights[0], 4)
+
+@test
+a_set_in_one_space_leaves_every_other_space_shared()
+    val m = pm_of([3, 4096, (u64(1) << 60) | 9, (u64(7) << 60) | 1])
+    val n = m.set((u64(1) << 60) | 10, pmf((u64(1) << 60) | 10))
+    pm_ok(n)
+
+    for s in [0, 7]
+        assert(n.roots[s].unwrap() === m.roots[s].unwrap())
+
+    assert(n.roots[1].unwrap() !== m.roots[1].unwrap())
+    assert(n.roots[2].is_none())
+    pm_one_path(m, n, (u64(1) << 60) | 10)
+
+@test
+a_set_beyond_the_height_grows_the_tree_under_the_old_root()
+    val m = pm_of([0, 1, 63])
+    assert_eq(m.heights[0], 1)
+    val p = pm_pow(3) * 5
+    val n = m.set(p, pmf(p))
+    pm_ok(n)
+    assert_eq(n.heights[0], 4)
+    assert_eq(n.len(), 4)
+    assert_eq(pm_pids(n).view(), [u64(0), 1, 63, p])
+
+    // The old root is now the leaf of slot 0 of slot 0 of slot 0, the same object; the new nodes are
+    // the new root, two nodes above the old root on slot 0's path, and three on `p`'s path.
+    val old = m.roots[0].unwrap()
+    val l2 = pm_kid(n.roots[0].unwrap(), 0).unwrap()
+    val l1 = pm_kid(l2, 0).unwrap()
+    assert(pm_kid(l1, 0).unwrap() === old)
+    assert_eq(pm_fresh(m, n).len(), 4 + (4 - 1 - 1))
+    assert_eq(m.heights[0], 1)
+    assert_eq(pm_pids(m).view(), [u64(0), 1, 63])
+
+@test
+growing_a_space_with_no_root_builds_only_the_path()
+    val p = pm_pow(9) * 63 + 5
+    val m = page_map().set(p, pmf(p))
+    pm_ok(m)
+    assert_eq(m.heights[0], 10)
+    assert_eq(pm_nodes(m).len(), 10)
+    assert_eq(pm_path(m, p).len(), 10)
+
+// -- the boundaries of every level --------------------------------------------------------------------
+
+@test
+pids_at_every_level_boundary_need_exactly_their_height()
+    for k in 1..<10
+        val lo = pm_pow(k)
+        val m1 = page_map().set(lo - 1, pmf(lo - 1))
+        val m2 = page_map().set(lo, pmf(lo))
+        pm_ok(m1)
+        pm_ok(m2)
+        assert_eq(m1.heights[0], k)
+        assert_eq(m2.heights[0], k + 1)
+        val both = m1.set(lo, pmf(lo))
+        pm_ok(both)
+        assert_eq(both.heights[0], k + 1)
+        assert_eq(pm_pids(both).view(), [lo - 1, lo])
+        assert(both.get(lo - 1).unwrap() === m1.get(lo - 1).unwrap())
+        val back = both.remove(lo)
+        pm_ok(back)
+        assert_eq(back.heights[0], k)
+        assert(back.roots[0].unwrap() === m1.roots[0].unwrap())
+
+@test
+the_deepest_pid_and_the_edges_of_every_space()
+    val ps = buf[u64]()
+
+    for s in 0..<8
+        ps.push(u64(s) << 60)
+        ps.push((u64(s) << 60) | PidNumberMask)
+
+    val m = pm_of(ps.view())
+    pm_ok(m)
+    assert_eq(m.len(), 16)
+    assert_eq(pm_pids(m).view(), ps.view())
+    assert_eq(m.last().unwrap().0, MaxPid)
+
+    for s in 0..<8
+        assert_eq(m.heights[s], 10)
+        assert_eq(m.seek((u64(s) << 60) + 1).unwrap().0, (u64(s) << 60) | PidNumberMask)
+
+    for p in ps
+        assert_eq(m.get(p).unwrap().pid, p)
+        assert(m.get(p ^ 1).is_none())
+
+    val d = page_map().set(MaxPid, pmf(MaxPid))
+    pm_ok(d)
+    assert_eq(d.heights[7], 10)
+    assert_eq(pm_path(d, MaxPid).len(), 10)
+    assert_eq(pm_pids(d).view(), [MaxPid])
+    assert(d.get(MaxPid - 1).is_none())
+    assert(d.remove(MaxPid).is_empty())
+
+// -- remove and pruning -------------------------------------------------------------------------------
+
+@test
+a_remove_prunes_every_node_it_empties_and_lowers_the_root()
+    // Page 0 and a page whose path shares only the root: removing the far page leaves the root with
+    // one child in slot 0, so the root gives way to it, level by level, down to the leaf of page 0.
+    val far = pm_pow(5) * 3 + pm_pow(2) * 7 + 11
+    val m = pm_of([0, far])
+    assert_eq(m.heights[0], 6)
+    assert_eq(pm_nodes(m).len(), 11)
+    val r = m.remove(far)
+    pm_ok(r)
+    assert_eq(r.heights[0], 1)
+    assert_eq(pm_nodes(r).len(), 1)
+    assert_eq(pm_pids(r).view(), [u64(0)])
+    assert_eq(pm_nodes(m).len(), 11)
+    assert(m.get(far).is_some())
+
+@test
+a_remove_keeps_the_height_while_a_page_needs_it()
+    val m = pm_of([0, 64, 4096 * 2])
+    assert_eq(m.heights[0], 3)
+    val r = m.remove(0)
+    pm_ok(r)
+    assert_eq(r.heights[0], 3)
+    assert_eq(pm_nodes(r).len(), 5)
+    val r2 = r.remove(4096 * 2)
+    pm_ok(r2)
+    assert_eq(r2.heights[0], 2)
+    assert_eq(pm_nodes(r2).len(), 2)
+    assert_eq(pm_pids(r2).view(), [u64(64)])
+
+@test
+a_remove_that_leaves_a_sibling_prunes_only_the_emptied_branch()
+    val m = pm_of([5, 6, 4096 + 5])
+    val r = m.remove(4096 + 5)
+    pm_ok(r)
+    assert_eq(r.heights[0], 1)
+    assert(r.roots[0].unwrap() === pm_kid(pm_kid(m.roots[0].unwrap(), 0).unwrap(), 0).unwrap())
+    val r2 = m.remove(5)
+    pm_ok(r2)
+    assert_eq(r2.heights[0], 3)
+    assert_eq(pm_fresh(m, r2).len(), 3)
+
+@test
+removing_every_page_in_any_order_ends_empty_and_shapes_match_a_fresh_build()
+    var g = rng(5, 1)
+    var ps = buf[u64]()
+
+    for _ in 0..<300
+        ps.push(g.below(pm_pow(3) * 2))
+
+    var m = pm_of(ps.view())
+    g.shuffle(ps.view_mut())
+
+    for i in 0..<ps.len()
+        m = m.remove(ps[i])
+        if i % 37 == 0
+            pm_ok(m)
+            // The shape depends on the pages alone: rebuilding them gives the same node count and
+            // heights.
+            val fresh = pm_of(pm_pids(m).view())
+            assert_eq(pm_nodes(fresh).len(), pm_nodes(m).len())
+            assert_eq(fresh.heights[0], m.heights[0])
+
+    pm_ok(m)
+    assert(m.is_empty())
+    assert(m.roots[0].is_none())
+
+// -- iteration -----------------------------------------------------------------------------------------
+
+@test
+iteration_over_a_full_leaf_walks_all_64_in_order()
+    val ps = buf[u64]()
+
+    for i in 0..<64
+        ps.push(u64(63 - i))
+
+    val m = pm_of(ps.view())
+    pm_ok(m)
+    assert_eq(pm_nodes(m).len(), 1)
+    val got = pm_pids(m)
+    assert_eq(got.len(), 64)
+
+    for i in 0..<64
+        assert_eq(got[i], u64(i))
+
+    var c63 = m.iter_from(63)
+    assert_eq(c63.next().unwrap().0, 63)
+    assert(c63.next().is_none())
+    var c64 = m.iter_from(64)
+    assert(c64.next().is_none())
+
+@test
+iteration_crosses_gaps_leaves_levels_and_spaces()
+    val ps = [u64(1), 63, 64, 4095, 4096 * 5, pm_pow(4) * 2, (u64(1) << 60), (u64(1) << 60) | 70, (u64(6) << 60) | pm_pow(7), MaxPid]
+    val m = pm_of(ps)
+    pm_ok(m)
+    assert_eq(pm_pids(m).view(), ps)
+
+    for i in 0..<ps.len
+        assert_eq(m.seek(ps[i]).unwrap().0, ps[i])
+        if i + 1 < ps.len then assert_eq(m.seek(ps[i] + 1).unwrap().0, ps[i + 1])
+        val rest = buf[u64]()
+        for (p, _) in m.iter_from(ps[i])
+            rest.push(p)
+        assert_eq(rest.view(), ps[i..])
+
+    assert_eq(m.seek(0).unwrap().0, 1)
+    assert_eq(m.seek(4096 * 5 + 1).unwrap().0, pm_pow(4) * 2)
+    assert_eq(m.seek((u64(2) << 60)).unwrap().0, (u64(6) << 60) | pm_pow(7))
+
+@test
+a_cursor_walks_the_map_it_was_made_from()
+    val m = pm_of([1, 2, 3])
+    var c = m.iter()
+    assert_eq(c.next().unwrap().0, 1)
+    val m2 = m.remove(2).set(9, pmf(9))
+    assert_eq(c.next().unwrap().0, 2)
+    assert_eq(c.next().unwrap().0, 3)
+    assert(c.next().is_none())
+    assert(c.next().is_none())
+    assert_eq(pm_pids(m2).view(), [u64(1), 3, 9])
+
+// -- clones --------------------------------------------------------------------------------------------
+
+@test
+a_clone_shares_every_root_and_both_sides_diverge_alone()
+    val base = pm_of([0, 10, 4096, 4100, (u64(1) << 60) | 3])
+    var a = base.clone()
+
+    for s in 0..<8
+        assert(a.roots[s].is_none() == base.roots[s].is_none())
+        a.roots[s] match
+            Some(r) -> assert(r === base.roots[s].unwrap())
+            None -> ()
+
+    var b = base.clone()
+    a = a.set(10, pmf(10)).remove(4096).set(77, pmf(77))
+    b = b.remove(10).set(4096, pmf(4096)).set((u64(1) << 60) | 4, pmf((u64(1) << 60) | 4))
+    pm_ok(a)
+    pm_ok(b)
+    assert_eq(pm_pids(base).view(), [u64(0), 10, 4096, 4100, (u64(1) << 60) | 3])
+    assert_eq(pm_pids(a).view(), [u64(0), 10, 77, 4100, (u64(1) << 60) | 3])
+    assert_eq(pm_pids(b).view(), [u64(0), 4096, 4100, (u64(1) << 60) | 3, (u64(1) << 60) | 4])
+    assert(a.get(10).unwrap() !== base.get(10).unwrap())
+    assert(b.get(4096).unwrap() !== base.get(4096).unwrap())
+    assert(a.get(0).unwrap() === base.get(0).unwrap())
+    assert(b.get(0).unwrap() === base.get(0).unwrap())
+    assert(a.roots[1].unwrap() === base.roots[1].unwrap())
+    assert(b.roots[1].unwrap() !== base.roots[1].unwrap())
+
+// -- the page space through the map -------------------------------------------------------------------
+
+@test
+the_page_space_finds_and_drops_frames_through_the_map()
+    val s = page_space()
+    assert_eq(s.map.len(), 1)
+    assert(s.frame(0).is_some())
+    val p = s.allocate()
+    val f = s.new_frame(p)
+    assert(s.frame(p).unwrap() === f)
+    val before = s.map.clone()
+    s.release(p)
+    assert(s.frame(p).is_none())
+    assert(before.get(p).unwrap() === f)
+    s.add_segment()
+    assert(s.frame(SegmentPages).is_some())
+    assert_eq(s.map.heights[0], 3)
+    pm_ok(s.map)
+
+// -- the model ----------------------------------------------------------------------------------------
+
+private struct PmEntry
+    pid: u64
+    f: &PageFrame
+
+/** Where `pid` is in the model, or where it would go. */
+private pm_find(m: Buf[PmEntry], pid: u64) -> (usize, bool)
+    var lo: usize = 0
+    var hi = m.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if m[mid].pid < pid then lo = mid + 1 else hi = mid
+
+    (lo, lo < m.len() && m[lo].pid == pid)
+
+/** The boundaries the PID patterns cluster on: 0, the maximum, every level's first page and the
+ * page before it, and the edges of every space.
+ */
+private pm_edges() -> Buf[u64]
+    val out = buf[u64]()
+
+    for s in 0..<8
+        val base = u64(s) << 60
+        out.push(base)
+        out.push(base | PidNumberMask)
+        for k in 1..<10
+            out.push(base | (pm_pow(k) - 1))
+            out.push(base | pm_pow(k))
+
+    out
+
+/** A PID of pattern `mode`: dense low pages, sparse PIDs over the whole range, PIDs at and beside a
+ * level boundary, or a mix of the data and undo spaces.
+ */
+private pm_pick(g: *Rng, mode: usize, edges: Buf[u64]) -> u64
+    if mode == 0 then return g.below(400)
+    if mode == 1
+        val s = g.below(8)
+        val n = (g.next_u64() & PidNumberMask) >> g.below(60)
+        return (s << 60) | n
+    if mode == 2
+        val e = edges[usize(g.below(u64(edges.len())))]
+        val d = g.below(5)
+        val p = if d < 2 && e >= d + 1 then e - (d + 1) elif d > 2 then e + (d - 2) else e
+        return if p > MaxPid then MaxPid else p
+    if g.below(2) == 0 then g.below(3000) else (u64(1) << 60) | g.below(3000)
+
+/** The map agrees with `model` entirely: every PID's frame, the walk, `len`, `last` and the check. */
+private pm_agree(m: PageMap, model: Buf[PmEntry], g: *Rng, mode: usize, edges: Buf[u64])
+    pm_ok(m)
+    assert_eq(m.len(), u64(model.len()))
+    var i: usize = 0
+
+    for (p, f) in m.iter()
+        assert(i < model.len())
+        assert_eq(p, model[i].pid)
+        assert(f === model[i].f)
+        i += 1
+
+    assert_eq(i, model.len())
+
+    if model.len() == 0
+        assert(m.last().is_none())
+    else
+        assert_eq(m.last().unwrap().0, model[model.len() - 1].pid)
+
+    for _ in 0..<20
+        val p = pm_pick(g, mode, edges)
+        val (at, found) = pm_find(model, p)
+        m.get(p) match
+            Some(f) -> assert(found && f === model[at].f)
+            None -> assert(!found)
+        m.seek(p) match
+            Some((q, f)) ->
+                assert(at < model.len())
+                assert_eq(q, model[at].pid)
+                assert(f === model[at].f)
+            None -> assert_eq(at, model.len())
+
+/** One seeded run of pattern `mode`: `ops` operations, with up to eight older maps kept alive
+ * alongside the models they were taken with, every one checked again now and then and at the end.
+ */
+private pm_run(seed: u64, mode: usize, ops: usize)
+    var g = rng(seed, u64(mode))
+    val edges = pm_edges()
+    var m = page_map()
+    var model = buf[PmEntry]()
+    val olds = buf[PageMap]()
+    val old_models = buf[Buf[PmEntry]]()
+
+    for step in 0..<ops
+        val p = pm_pick(&g, mode, edges)
+        val (at, found) = pm_find(model, p)
+        val op = g.below(10)
+
+        if op < 5
+            val f = pmf(p)
+            val before = m
+            m = m.set(p, f)
+            if found then model[at] = PmEntry(p, f) else model.insert(at, PmEntry(p, f))
+            if before.heights[pid_space(p)] == m.heights[pid_space(p)] && before.roots[pid_space(p)].is_some() && step % 16 == 0
+                pm_one_path(before, m, p)
+        elif op < 8
+            val before = m
+            m = m.remove(p)
+            if found
+                model.remove(at)
+            else
+                assert(m.roots[pid_space(p)].is_none() == before.roots[pid_space(p)].is_none())
+                before.roots[pid_space(p)] match
+                    Some(r) -> assert(m.roots[pid_space(p)].unwrap() === r)
+                    None -> ()
+        else
+            m.get(p) match
+                Some(f) -> assert(found && f === model[at].f)
+                None -> assert(!found)
+
+        assert_eq(m.len(), u64(model.len()))
+
+        if step % 50 == 0
+            if olds.len() < 8
+                olds.push(m.clone())
+                old_models.push(model.copy())
+            else
+                val k = usize(g.below(8))
+                olds[k] = m.clone()
+                old_models[k] = model.copy()
+
+        if step % 250 == 0
+            pm_agree(m, model, &g, mode, edges)
+            for k in 0..<olds.len()
+                pm_agree(olds[k], old_models[k], &g, mode, edges)
+
+    pm_agree(m, model, &g, mode, edges)
+
+    // Down to empty in random order, the older maps untouched by it.
+    var left = buf[u64]()
+
+    for e in model
+        left.push(e.pid)
+
+    g.shuffle(left.view_mut())
+
+    for i in 0..<left.len()
+        m = m.remove(left[i])
+        val (at, found) = pm_find(model, left[i])
+        assert(found)
+        model.remove(at)
+        if i % 100 == 0 then pm_agree(m, model, &g, mode, edges)
+
+    pm_agree(m, model, &g, mode, edges)
+    assert(m.is_empty())
+
+    for k in 0..<olds.len()
+        pm_agree(olds[k], old_models[k], &g, mode, edges)
+
+@test
+the_model_agrees_on_dense_low_pages()
+    pm_run(1, 0, 6000)
+    pm_run(2, 0, 3000)
+
+@test
+the_model_agrees_on_sparse_pids_over_the_whole_range()
+    pm_run(3, 1, 4000)
+    pm_run(4, 1, 2000)
+
+@test
+the_model_agrees_on_pids_at_every_level_boundary()
+    pm_run(5, 2, 5000)
+    pm_run(6, 2, 2000)
+
+@test
+the_model_agrees_on_data_and_undo_pages_together()
+    pm_run(7, 3, 5000)
+    pm_run(8, 3, 2000)

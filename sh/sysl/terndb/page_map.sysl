@@ -1,0 +1,429 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The page map of the in-memory mode (`on-disk-format.md` §8.1 rule 4): a persistent radix tree from
+// page id to frame, path-copied on write, so that a clone can share it (§8.4). A `PageMap` is a small
+// value; `set` and `remove` answer a new one and leave the old one answering exactly as it did, the
+// two sharing every node off the changed path (`docs/design/page-map.md`).
+
+// -- the shape ----------------------------------------------------------------------------------------
+
+/** Bits of a page number each level of the tree consumes: a node has 64 slots. */
+const PmBits: u64 = 6
+
+/** Slots per node. */
+const PmFanout: usize = 64
+
+/** The levels that cover a whole 60-bit page number (§2.1): 10 levels of 6 bits. */
+const PmMaxHeight: usize = 10
+
+/** The page spaces bits 62–60 of a PID can name (§2.1): data, undo, and six reserved. */
+const PmSpaces: usize = 8
+
+/** The bits of a PID that number a page within its space (§2.1). */
+const PidNumberMask: u64 = 0x0FFFFFFFFFFFFFFF
+
+/** The largest PID: bit 63, the swizzle tag, is never part of one (§2.1, §3.8). */
+const MaxPid: u64 = 0x7FFFFFFFFFFFFFFF
+
+/** A node of the tree. An inner node at level `l` holds the subtrees for one value of bits
+ * `6l .. 6l + 5` of the page number; a leaf, at level 0, holds the frames themselves. `used` counts
+ * the occupied slots, and is never 0: a node left empty by a remove is pruned from its parent.
+ * Nodes are never written once built, which is what lets two maps share them.
+ */
+enum PmNode
+    PmInner(used: usize, kids: [64]Option[&PmNode])
+    PmLeaf(used: usize, frames: [64]Option[&PageFrame])
+
+/** A page map: the root of each page space's tree, and its height in levels (0 while the space is
+ * empty). Each space has a tree of its own so that the data space, numbered from 0, is not made ten
+ * levels deep by the undo space's PIDs, which all have bit 60 set.
+ *
+ * The shape is a function of the set of PIDs alone: no node is empty, and a space's height is the
+ * least that covers its largest page number, so a root is a leaf or has a child other than slot 0.
+ */
+struct PageMap
+    roots: [8]Option[&PmNode]
+    heights: [8]usize
+    count: u64
+
+    /** How many PIDs have a frame. */
+    len(self) -> u64 = self.count
+
+    /** Whether no PID has a frame. */
+    is_empty(self) -> bool = self.count == 0
+
+    /** The frame of page `pid`, if it has one. */
+    get(self, pid: u64) -> Option[&PageFrame]
+        if pid > MaxPid then return None
+        val s = pid_space(pid)
+        val n = pid & PidNumberMask
+        if pm_height_for(n) > self.heights[s] then return None
+        var at = self.roots[s]
+        var level = self.heights[s]
+
+        loop
+            val node = at match
+                Some(x) -> x
+                None -> return None
+            level -= 1
+            val i = pm_slot(n, level)
+
+            *node match
+                PmInner(_, kids) -> at = kids[i]
+                PmLeaf(_, frames) -> return frames[i]
+
+    /** This map with page `pid` mapped to `f`, replacing any frame it had. Every node off the path to
+     * `pid` is shared with this map, which is left unchanged.
+     */
+    set(self, pid: u64, f: &PageFrame) -> PageMap
+        require pid <= MaxPid, "a PID never has bit 63 set"
+
+        val s = pid_space(pid)
+        val n = pid & PidNumberMask
+        val h = self.heights[s]
+        val need = pm_height_for(n)
+        var out = self
+
+        self.roots[s] match
+            None ->
+                out.roots[s] = Some(pm_set(None, need - 1, n, f).0)
+                out.heights[s] = need
+                out.count += 1
+            Some(root) ->
+                if need <= h
+                    val (node, added) = pm_set(Some(root), h - 1, n, f)
+                    out.roots[s] = Some(node)
+                    if added then out.count += 1
+                else
+                    // `n` lies beyond what the tree covers, so its top digit is not 0 and its path
+                    // shares no node with the old tree: the old root goes under slot 0 of new nodes
+                    // up to the level below the new root, and the new root takes both.
+                    var low = root
+                    var level = h
+
+                    while level < need - 1
+                        var kids: [64]Option[&PmNode] = [None; 64]
+                        kids[0] = Some(low)
+                        low = PmInner(1, kids)
+                        level += 1
+
+                    var top: [64]Option[&PmNode] = [None; 64]
+                    top[0] = Some(low)
+                    top[pm_slot(n, need - 1)] = Some(pm_set(None, need - 2, n, f).0)
+                    out.roots[s] = Some(PmInner(2, top))
+                    out.heights[s] = need
+                    out.count += 1
+
+        out
+
+    /** This map without page `pid`. Nodes the remove leaves empty are pruned, and a root left with
+     * only slot 0 gives way to that child, so the shape is the one the remaining PIDs alone would
+     * build. A PID with no frame answers this map itself.
+     */
+    remove(self, pid: u64) -> PageMap
+        if pid > MaxPid then return self
+        val s = pid_space(pid)
+        val n = pid & PidNumberMask
+        if pm_height_for(n) > self.heights[s] then return self
+        val root = self.roots[s] match
+            Some(x) -> x
+            None -> return self
+        var out = self
+
+        pm_remove(root, self.heights[s] - 1, n) match
+            PmAbsent -> return self
+            PmEmptied ->
+                out.roots[s] = None
+                out.heights[s] = 0
+            PmKept(node) ->
+                var top = node
+                var h = self.heights[s]
+
+                while h > 1 && pm_only_first(top)
+                    top = pm_kid(top, 0).unwrap()
+                    h -= 1
+
+                out.roots[s] = Some(top)
+                out.heights[s] = h
+
+        out.count -= 1
+        out
+
+    /** A map sharing this one's roots: O(1), since nothing is ever written in place (§8.4). */
+    clone(self) -> PageMap = self
+
+    /** The mapped page with the least PID at or after `pid`, and its frame. */
+    seek(self, pid: u64) -> Option[(u64, &PageFrame)]
+        if pid > MaxPid then return None
+        var s = pid_space(pid)
+        var lo = pid & PidNumberMask
+        var exact = true
+
+        while s < PmSpaces
+            self.roots[s] match
+                Some(root) ->
+                    val h = self.heights[s]
+
+                    if !exact || pm_height_for(lo) <= h
+                        pm_seek(root, h - 1, lo, exact, 0) match
+                            Some((n, f)) -> return Some(((u64(s) << 60) | n, f))
+                            None -> ()
+                None -> ()
+            s += 1
+            lo = 0
+            exact = false
+
+        None
+
+    /** The mapped page with the greatest PID, and its frame. */
+    last(self) -> Option[(u64, &PageFrame)]
+        var s = PmSpaces
+
+        while s > 0
+            s -= 1
+            self.roots[s] match
+                Some(root) ->
+                    val (n, f) = pm_last(root, self.heights[s] - 1, 0)
+                    return Some(((u64(s) << 60) | n, f))
+                None -> ()
+
+        None
+
+    /** Every mapped page and its frame, in PID order. */
+    iter(self) -> PageMapCursor = PageMapCursor(self, 0, false)
+
+    /** Every mapped page from `pid` on, in PID order. */
+    iter_from(self, pid: u64) -> PageMapCursor = PageMapCursor(self, pid, pid > MaxPid)
+
+/** An empty page map. */
+page_map() -> PageMap = PageMap([None; 8], [0; 8], 0)
+
+/** A walk of a page map in PID order, from `at`. The cursor holds the map it walks, so the walk sees
+ * the map as it was when the cursor was made, whatever later maps are derived from it.
+ */
+struct PageMapCursor
+    map: PageMap
+    at: u64
+    done: bool
+
+impl Iterate for PageMapCursor
+    type Item = (u64, &PageFrame)
+
+    next(*self) -> Option[(u64, &PageFrame)]
+        if self.done then return None
+
+        self.map.seek(self.at) match
+            Some((pid, f)) ->
+                if pid == MaxPid then self.done = true else self.at = pid + 1
+                Some((pid, f))
+            None ->
+                self.done = true
+                None
+
+// -- the walks ----------------------------------------------------------------------------------------
+
+/** The space bits 62–60 of `pid` name. */
+private[terndb] pid_space(pid: u64) -> usize = usize((pid >> 60) & 7)
+
+/** Slot of page number `n` in a node at `level`. */
+private[terndb] pm_slot(n: u64, level: usize) -> usize = usize((n >> (PmBits * u64(level))) & 63)
+
+/** The least height whose tree covers page number `n`: 1 for 0–63, 2 for 64–4095, and so on to 10. */
+private[terndb] pm_height_for(n: u64) -> usize
+    var h: usize = 1
+
+    while h < PmMaxHeight && (n >> (PmBits * u64(h))) != 0
+        h += 1
+
+    h
+
+/** The child in slot `i` of inner node `node`; a leaf has none. */
+private[terndb] pm_kid(node: &PmNode, i: usize) -> Option[&PmNode] = *node match
+    PmInner(_, kids) -> kids[i]
+    PmLeaf(_, _) -> None
+
+/** A node's occupied slots. */
+private[terndb] pm_used(node: &PmNode) -> usize = *node match
+    PmInner(used, _) -> used
+    PmLeaf(used, _) -> used
+
+/** Whether `node` is an inner node whose one child is in slot 0. */
+private pm_only_first(node: &PmNode) -> bool = *node match
+    PmInner(used, kids) -> used == 1 && kids[0].is_some()
+    PmLeaf(_, _) -> false
+
+/** A copy of `node`, or of an empty node at `level` where there is none, with page number `n` mapped
+ * to `f`; and whether `n` was not mapped before. Exactly one new node per level.
+ */
+private pm_set(node: Option[&PmNode], level: usize, n: u64, f: &PageFrame) -> (&PmNode, bool)
+    val i = pm_slot(n, level)
+
+    if level == 0
+        var frames: [64]Option[&PageFrame] = [None; 64]
+        var used: usize = 0
+
+        node match
+            Some(x) -> *x match
+                PmLeaf(u, fs) ->
+                    frames = fs
+                    used = u
+                PmInner(_, _) -> panic("pm_set: an inner node at level 0")
+            None -> ()
+
+        val added = frames[i].is_none()
+        frames[i] = Some(f)
+        return (PmLeaf(if added then used + 1 else used, frames), added)
+
+    var kids: [64]Option[&PmNode] = [None; 64]
+    var used: usize = 0
+
+    node match
+        Some(x) -> *x match
+            PmInner(u, ks) ->
+                kids = ks
+                used = u
+            PmLeaf(_, _) -> panic("pm_set: a leaf above level 0")
+        None -> ()
+
+    val was = kids[i]
+    val (child, added) = pm_set(was, level - 1, n, f)
+    kids[i] = Some(child)
+    (PmInner(if was.is_none() then used + 1 else used, kids), added)
+
+/** What a remove did to a subtree. */
+private enum PmRemoved
+    /** The page was not there; the subtree is unchanged. */
+    PmAbsent
+    /** The page was the subtree's last, so the subtree is gone. */
+    PmEmptied
+    /** The subtree without the page. */
+    PmKept(node: &PmNode)
+
+private pm_remove(node: &PmNode, level: usize, n: u64) -> PmRemoved
+    val i = pm_slot(n, level)
+
+    *node match
+        PmLeaf(used, fs) ->
+            if fs[i].is_none() then return PmAbsent
+            if used == 1 then return PmEmptied
+            var frames = fs
+            frames[i] = None
+            PmKept(PmLeaf(used - 1, frames))
+        PmInner(used, ks) ->
+            val child = ks[i] match
+                Some(c) -> c
+                None -> return PmAbsent
+
+            pm_remove(child, level - 1, n) match
+                PmAbsent -> PmAbsent
+                PmEmptied ->
+                    if used == 1 then return PmEmptied
+                    var kids = ks
+                    kids[i] = None
+                    PmKept(PmInner(used - 1, kids))
+                PmKept(c) ->
+                    var kids = ks
+                    kids[i] = Some(c)
+                    PmKept(PmInner(used, kids))
+
+/** The least page number at or after `lo` under `node`, `base` holding the bits above `level`. While
+ * `exact`, the walk is still on `lo`'s own path; once it steps right of it, any entry is later.
+ */
+private pm_seek(node: &PmNode, level: usize, lo: u64, exact: bool, base: u64) -> Option[(u64, &PageFrame)]
+    val start = if exact then pm_slot(lo, level) else 0
+    val shift = PmBits * u64(level)
+
+    *node match
+        PmLeaf(_, frames) ->
+            for i in start..<PmFanout
+                frames[i] match
+                    Some(f) -> return Some((base | u64(i), f))
+                    None -> ()
+            None
+        PmInner(_, kids) ->
+            for i in start..<PmFanout
+                kids[i] match
+                    Some(c) ->
+                        pm_seek(c, level - 1, lo, exact && i == start, base | (u64(i) << shift)) match
+                            Some(hit) -> return Some(hit)
+                            None -> ()
+                    None -> ()
+            None
+
+/** The greatest page number under `node`, which is never empty. */
+private pm_last(node: &PmNode, level: usize, base: u64) -> (u64, &PageFrame)
+    var i = PmFanout
+
+    *node match
+        PmLeaf(_, frames) ->
+            while i > 0
+                i -= 1
+                frames[i] match
+                    Some(f) -> return (base | u64(i), f)
+                    None -> ()
+            panic("pm_last: an empty leaf")
+        PmInner(_, kids) ->
+            while i > 0
+                i -= 1
+                kids[i] match
+                    Some(c) -> return pm_last(c, level - 1, base | (u64(i) << (PmBits * u64(level))))
+                    None -> ()
+            panic("pm_last: an empty inner node")
+
+// -- the structural check -----------------------------------------------------------------------------
+
+/** Checks the shape every page map keeps, answering the first rule broken: each node's kind agrees
+ * with its level, its `used` with its occupied slots, and none is empty; each space's height is
+ * between 1 and 10 exactly when it has a root, and is the least that covers its largest page number;
+ * each leaf's frames carry the PID they are mapped at (§3.8 rule 3); and `len` is the number of
+ * mapped pages.
+ */
+check_page_map(m: PageMap) -> Option[string]
+    var total: u64 = 0
+
+    for s in 0..<PmSpaces
+        m.roots[s] match
+            None -> if m.heights[s] != 0 then return Some(s"space $s: no root, height ${m.heights[s]}")
+            Some(root) ->
+                val h = m.heights[s]
+                if h < 1 || h > PmMaxHeight then return Some(s"space $s: height $h")
+                if h > 1 && pm_only_first(root) then return Some(s"space $s: the root's one child is in slot 0")
+                val (n, _) = pm_last(root, h - 1, 0)
+                if pm_height_for(n) != h then return Some(s"space $s: height $h for page number $n")
+                pm_check(root, h - 1, u64(s) << 60) match
+                    Ok(pages) -> total += pages
+                    Err(e) -> return Some(s"space $s: $e")
+
+    if total != m.count then return Some(s"len ${m.count}, but $total pages are mapped")
+    None
+
+/** The pages mapped under `node`, or the first rule it breaks. */
+private pm_check(node: &PmNode, level: usize, base: u64) -> Result[u64, string]
+    var seen: usize = 0
+    var pages: u64 = 0
+
+    *node match
+        PmLeaf(used, frames) ->
+            if level != 0 then return Err(s"a leaf at level $level")
+            for i in 0..<PmFanout
+                frames[i] match
+                    Some(f) ->
+                        seen += 1
+                        if f.pid != base | u64(i) then return Err(s"page ${base | u64(i)} maps a frame of page ${f.pid}")
+                    None -> ()
+            if seen != used then return Err(s"a leaf says $used slots and holds $seen")
+            pages = u64(seen)
+        PmInner(used, kids) ->
+            if level == 0 then return Err("an inner node at level 0")
+            for i in 0..<PmFanout
+                kids[i] match
+                    Some(c) ->
+                        seen += 1
+                        pages += pm_check(c, level - 1, base | (u64(i) << (PmBits * u64(level))))?
+                    None -> ()
+            if seen != used then return Err(s"an inner node says $used slots and holds $seen")
+
+    if seen == 0 then return Err(s"an empty node at level $level")
+    Ok(pages)
