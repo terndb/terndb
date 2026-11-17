@@ -199,13 +199,18 @@ private struct ReadRef
     txn: usize
     op: usize
 
-/** Everything known about one key. */
+/** Everything known about one key. A list key's `filtered` reads are shaping reads `R.c|price > p`,
+ * which return only the elements the filter keeps; `order` is its inferred order of appends, the
+ * longest read.
+ */
 private struct KeyInfo
     key: string
     list: bool
     counter: bool
     writes: Buf[usize]
     reads: Buf[ReadRef]
+    filtered: Buf[ReadRef]
+    order: Buf[i64]
 
 private struct HChecker
     opts: CheckOptions
@@ -247,7 +252,10 @@ private struct HChecker
                 open_proc.remove(slot)
                 open_txn.remove(slot)
                 val t = self.txns[id]
-                val ops = if e.value.len() > 0 then e.value else t.ops
+                // A completion's value is what the transaction ran: an `ok` or `fail` with none ran
+                // nothing (each write it planned found no row). Only an `info`, whose answer may be
+                // lost, stands on the operations its invoke planned.
+                val ops = if e.kind == HInfo && e.value.len() == 0 then t.ops else e.value
                 val outcome = e.kind match
                     HOk -> TCommitted
                     HFail -> TAborted
@@ -266,7 +274,7 @@ private struct HChecker
         Some(i) -> i
         None ->
             val i = self.keys.len()
-            self.keys.push(KeyInfo(key, false, false, buf(), buf()))
+            self.keys.push(KeyInfo(key, false, false, buf(), buf(), buf(), buf()))
             self.by_key.put(key, i)
             i
 
@@ -277,9 +285,10 @@ private struct HChecker
             for i in 0..<t.ops.len()
                 val m = t.ops[i]
                 if m.kind == MPred then continue
-                val k = self.key_info(m.key)
+                val k = self.key_info(base_key(m.key))
 
-                if m.kind == MAppend || (m.kind == MRead && is_list(m.seen)) then self.keys[k].list = true
+                // A nested `R.c` is always a list (§7.2 W5), even where every read found no row.
+                if m.kind == MAppend || (m.kind == MRead && is_list(m.seen)) || is_nested_key(m.key) then self.keys[k].list = true
                 if m.kind == MAdd then self.keys[k].counter = true
 
                 if m.kind == MAppend || m.kind == MWrite || m.kind == MDelete
@@ -349,7 +358,11 @@ private struct HChecker
             for i in 0..<t.ops.len()
                 val m = t.ops[i]
                 if m.kind == MRead && m.seen != ObsNone
-                    self.keys[self.key_info(m.key)].reads.push(ReadRef(t.id, i))
+                    val k = self.key_info(base_key(m.key))
+                    if base_key(m.key) == m.key
+                        self.keys[k].reads.push(ReadRef(t.id, i))
+                    else
+                        self.keys[k].filtered.push(ReadRef(t.id, i))
 
     set_outcome(*self, id: usize, o: TxnOutcome)
         val t = self.txns[id]
@@ -360,14 +373,20 @@ private struct HChecker
         val out = buf[usize]()
 
         if m.kind == MRead
+            val key = base_key(m.key)
             m.seen match
                 ObsList(list) ->
                     for e in list
-                        val r = self.writer(m.key, e, false)
+                        val r = self.writer(key, e, false)
                         if r != NoTxn then out.push(r)
                 ObsNum(n) ->
-                    val r = self.writer(m.key, n, false)
+                    val r = self.writer(key, n, false)
                     if r != NoTxn then out.push(r)
+                ObsUnborn ->
+                    // No row in a nested list's place: the row's delete.
+                    if is_nested_key(key)
+                        val r = self.writer(row_of(key), 0, true)
+                        if r != NoTxn then out.push(r)
                 _ -> ()
         elif m.kind == MPred && m.seen == ObsRows
             pred_group(m.key) match
@@ -375,7 +394,14 @@ private struct HChecker
                     for k in m.rows
                         val r = self.writer(k, g, false)
                         if r != NoTxn then out.push(r)
-                None -> ()
+                None -> nested_pred(m.key) match
+                    Some(np) ->
+                        // A returned row matched through some append; where no committed one can
+                        // explain it, a single unknown one does.
+                        for row in m.rows
+                            val r = self.only_unknown_match(s"$row.${np.col}", np.bound)
+                            if r != NoTxn then out.push(r)
+                    None -> ()
 
         out
 
@@ -398,14 +424,28 @@ private struct HChecker
     // -- objects --------------------------------------------------------------------------------
 
     objects(*self)
+        // The rows that hold a nested list: their key names the row itself, written only by its
+        // delete, which `row_delete` places in each of its lists' orders.
+        val nested_rows = buf[string]()
+        for k in self.keys
+            if is_nested_key(k.key) && !contains_str(nested_rows, row_of(k.key)) then nested_rows.push(row_of(k.key))
+
         for ki in 0..<self.keys.len()
             val k = self.keys[ki]
             if k.list
-                self.list_key(k)
+                val order = self.list_key(k)
+                self.keys[ki].order = order
+                self.filtered_reads(self.keys[ki])
+                self.row_delete(self.keys[ki])
+            elif contains_str(nested_rows, k.key)
+                continue
             elif k.counter
                 if self.opts.counters then self.counter_key(k)
             elif self.opts.registers
                 self.register_key(k)
+
+        for row in nested_rows
+            self.row_lost_updates(row)
 
         if self.opts.registers then self.predicates()
         self.read_only_aborts()
@@ -437,9 +477,9 @@ private struct HChecker
         out.extend(list.view()[0..<cut])
         (out, true)
 
-    list_key(*self, k: KeyInfo)
+    list_key(*self, k: KeyInfo) -> Buf[i64]
         // The checks on each read: its own appends, duplicates, garbage, aborted and intermediate
-        // reads. The longest read gives the version order.
+        // reads. The longest read gives the version order, which is the answer.
         var longest = buf[i64]()
         var longest_txn = NoTxn
 
@@ -511,6 +551,8 @@ private struct HChecker
 
         for rr in k.reads
             val t = self.txns[rr.txn]
+            // A read that found no row saw the row's delete (`row_delete`).
+            if !is_list(t.ops[rr.op].seen) then continue
             val (ext, _) = self.external_list(t, rr.op)
             if !is_prefix(ext, longest) then continue
             val n = ext.len()
@@ -568,6 +610,7 @@ private struct HChecker
                 lost_txn.push(t.id)
 
         self.lost_updates(k.key, lost_base, lost_txn)
+        longest
 
     later_of_same(self, list: Buf[i64], i: usize, w: WriteRec) -> bool
         for j in (i + 1)..<list.len()
@@ -779,7 +822,9 @@ private struct HChecker
                 if m.kind != MPred || m.seen != ObsRows then continue
                 pred_group(m.key) match
                     Some(g) -> self.predicate_read(t, op, m, g)
-                    None -> self.anomaly("malformed", true, [t.id], buf(), s"T${t.id}'s predicate '${m.key}' is not of the form g = n")
+                    None -> nested_pred(m.key) match
+                        Some(np) -> self.nested_predicate_read(t, op, m, np)
+                        None -> self.anomaly("malformed", true, [t.id], buf(), s"T${t.id}'s predicate '${m.key}' is not of the form g = n or c.price > p")
 
     predicate_read(*self, t: HTxn, op: usize, m: Mop, g: i64)
         // The rows the read returned.
@@ -871,6 +916,373 @@ private struct HChecker
             val m = t.ops[j]
             if m.key == key && (if del then m.kind == MDelete else m.kind == MWrite) then return true
         false
+
+    // -- nested relations (§4.5, §7.2 W5) --------------------------------------------------------
+
+    // N1: a list inside a row is part of the row, so the row's delete is a write of the list too,
+    // after every append to it (a row is never inserted again). A read that found no row saw the
+    // delete; a read that found a list saw a version before it.
+    row_delete(*self, k: KeyInfo)
+        val row = row_of(k.key)
+        val d = self.writer(row, 0, true)
+        val dt = if d == NoTxn || self.recs[d].ambiguous then NoTxn else self.recs[d].txn
+
+        if dt != NoTxn && self.committed(dt)
+            for r in k.writes
+                val w = self.recs[r]
+                if w.ambiguous || !self.committed(w.txn) || w.txn == dt then continue
+                self.edge(w.txn, dt, EWw, false, k.key)
+                val a = self.txns[w.txn]
+                val b = self.txns[dt]
+                if self.opts.white_box && a.commit != 0 && b.commit != 0 && a.commit >= b.commit
+                    self.anomaly("I5", true, [w.txn, dt], buf(), s"T${w.txn} appended to ${k.key} before T${dt} deleted ${row}, but their commits are ${a.commit} and ${b.commit}")
+
+        val all = buf[ReadRef]()
+        all.extend(k.reads.view())
+        all.extend(k.filtered.view())
+
+        for rr in all
+            val t = self.txns[rr.txn]
+            val m = t.ops[rr.op]
+            val own = self.own_write_before(t, row, rr.op, true)
+
+            if m.seen == ObsUnborn
+                if own then continue
+                if dt == NoTxn
+                    self.anomaly("garbage", true, [t.id], buf(), s"T${t.id} found no row ${row} reading ${k.key}, and no transaction deleted it")
+                elif self.txns[dt].outcome == TAborted
+                    self.anomaly("G1a", true, [dt, t.id], buf(), s"T${t.id} found no row ${row} reading ${k.key}, deleted by T${dt}, which aborted")
+                elif dt != t.id
+                    self.edge(dt, t.id, EWr, false, k.key)
+                    val c = self.txns[dt].commit
+                    if self.opts.white_box && t.txid != 0 && t.rank() >= 1 && c != 0 && c > t.snapshot
+                        self.anomaly("wb-read", true, [t.id], buf(), s"T${t.id} found no row ${row} at snapshot ${t.snapshot}, but its delete committed at ${c}")
+            elif is_list(m.seen)
+                if own
+                    self.anomaly("internal", true, [t.id], buf(), s"T${t.id} read ${m.key} after it had deleted ${row}")
+                    continue
+                if dt == NoTxn || dt == t.id || !self.committed(dt) then continue
+                self.edge(t.id, dt, ERw, false, k.key)
+                val dx = self.txns[dt]
+
+                if dx.end != 0 && dx.end < t.invoked
+                    val es = buf[HEdge]()
+                    es.push(HEdge(dt, t.id, ERt, false, k.key))
+                    es.push(HEdge(t.id, dt, ERw, false, k.key))
+                    self.anomaly("G-stale", true, [dt, t.id], es, s"T${t.id} began after T${dt}'s delete of ${row} was acknowledged, but read ${m.key} as a list")
+
+                if self.opts.white_box && t.txid != 0 && t.rank() >= 1 && dx.commit != 0 && dx.commit <= t.snapshot
+                    self.anomaly("wb-read", true, [t.id], buf(), s"T${t.id} read ${m.key} at snapshot ${t.snapshot}, but ${row} was deleted at ${dx.commit}")
+
+    // N4: a shaping read `R.c|price > p` returns the elements of one version of `R.c` that its filter
+    // keeps, so it is a prefix of the kept elements of the order. It names the writer of its last
+    // element, and anti-depends on the writer of the next kept element and of every kept append no
+    // read holds; an element the filter drops places the version nowhere, and gives no edge.
+    filtered_reads(*self, k: KeyInfo)
+        val order = k.order
+
+        for rr in k.filtered
+            val t = self.txns[rr.txn]
+            val m = t.ops[rr.op]
+            val full = m.seen match
+                ObsList(l) -> l
+                _ -> continue
+            val bound = price_bound(key_filter(m.key)) match
+                Some(b) -> b
+                None ->
+                    self.anomaly("malformed", true, [t.id], buf(), s"T${t.id}'s read of ${m.key} has a filter not of the form price > p")
+                    continue
+
+            // Its own earlier appends that the filter keeps come off its end.
+            val own = buf[i64]()
+            for e in self.own_appends(t, k.key, rr.op)
+                if nest_price(e) > bound then own.push(e)
+            var own_ok = own.len() <= full.len()
+            val ext = buf[i64]()
+            if own_ok
+                val cut = full.len() - own.len()
+                for j in 0..<own.len()
+                    if full[cut + j] != own[j] then own_ok = false
+                ext.extend(full.view()[0..<cut])
+            if !own_ok
+                self.anomaly("internal", true, [t.id], buf(), s"T${t.id} read ${m.key} as ${list_text(full)}, which does not end with its own earlier appends")
+                continue
+
+            var bad = false
+            for e in ext
+                val r = self.writer(k.key, e, false)
+                if r == NoTxn
+                    self.anomaly("garbage", true, [t.id], buf(), s"T${t.id} read ${e} in ${m.key}, which no transaction appended")
+                    bad = true
+                elif !self.recs[r].ambiguous && self.txns[self.recs[r].txn].outcome == TAborted
+                    self.anomaly("G1a", true, [self.recs[r].txn, t.id], buf(), s"T${t.id} read ${e} in ${m.key}, appended by T${self.recs[r].txn}, which aborted")
+                    bad = true
+            if bad then continue
+
+            val kept = buf[i64]()
+            for e in order
+                if nest_price(e) > bound then kept.push(e)
+
+            if !is_prefix(ext, kept)
+                self.anomaly("incompatible-order", true, [t.id], buf(),
+                    s"T${t.id} read ${m.key} as ${list_text(ext)}, which is not a prefix of ${list_text(kept)}, the elements of ${k.key}'s order its filter keeps")
+                continue
+
+            val n = ext.len()
+            if n > 0
+                val r = self.writer(k.key, ext[n - 1], false)
+                if r != NoTxn && !self.recs[r].ambiguous then self.edge(self.recs[r].txn, t.id, EWr, false, k.key)
+
+            var j = n
+            while j < kept.len()
+                val r = self.writer(k.key, kept[j], false)
+                if r != NoTxn && !self.recs[r].ambiguous && self.committed(self.recs[r].txn)
+                    if self.recs[r].txn != t.id then self.edge(t.id, self.recs[r].txn, ERw, false, k.key)
+                    break
+                j += 1
+
+            for wr in k.writes
+                val w = self.recs[wr]
+                if w.ambiguous || w.txn == t.id || !self.committed(w.txn) || nest_price(w.value) <= bound then continue
+                if index_in(order, w.value) == NoTxn then self.edge(t.id, w.txn, ERw, false, k.key)
+
+            // G-stale: a kept append acknowledged before the reader began, which it missed.
+            for wr in k.writes
+                val w = self.recs[wr]
+                if w.ambiguous || w.txn == t.id || !self.committed(w.txn) || nest_price(w.value) <= bound then continue
+                val wt = self.txns[w.txn]
+                if wt.end == 0 || wt.end >= t.invoked then continue
+                val p = index_in(kept, w.value)
+                if p == NoTxn || p >= n
+                    val es = buf[HEdge]()
+                    es.push(HEdge(w.txn, t.id, ERt, false, k.key))
+                    es.push(HEdge(t.id, w.txn, ERw, false, k.key))
+                    self.anomaly("G-stale", true, [w.txn, t.id], es, s"T${t.id} began after T${w.txn} was acknowledged, but read ${m.key} without its append ${w.value}")
+                    break
+
+            // White box: exactly the kept elements committed at or before the snapshot.
+            if self.opts.white_box && t.txid != 0 && t.rank() >= 1
+                var expect: usize = 0
+                var known = true
+                for wr in k.writes
+                    val w = self.recs[wr]
+                    if w.ambiguous || w.txn == t.id || nest_price(w.value) <= bound || self.txns[w.txn].outcome == TAborted then continue
+                    val c = self.txns[w.txn].commit
+                    if !self.committed(w.txn) || c == 0
+                        known = false
+                    elif c <= t.snapshot
+                        expect += 1
+                if known && expect != n
+                    self.anomaly("wb-read", true, [t.id], buf(),
+                        s"T${t.id} read ${n} kept elements of ${m.key} at snapshot ${t.snapshot}, where ${expect} were committed")
+
+    // N3 and §7.2 W5: a predicate `c.price > p` selects the rows with some element of their nested
+    // `c` priced above `p`. Elements are only appended, so a row starts to match with the first kept
+    // element of its order and stops with its delete: the edges are W4's, that append in the place
+    // of the insert. A returned row read it (wr) and anti-depends on the delete (rw); a lacking row
+    // that was never deleted anti-depends on it, and on every kept append no read holds.
+    nested_predicate_read(*self, t: HTxn, op: usize, m: Mop, np: NestedPred)
+        for k in self.keys
+            if !k.list || !is_nested_key(k.key) then continue
+            val row = row_of(k.key)
+            if k.key != s"$row.${np.col}" then continue
+            val returned = contains_str(m.rows, row)
+
+            var first = NoTxn
+            for e in k.order
+                if nest_price(e) <= np.bound then continue
+                val r = self.writer(k.key, e, false)
+                if r != NoTxn && !self.recs[r].ambiguous && self.committed(self.recs[r].txn)
+                    first = self.recs[r].txn
+                    break
+
+            var own_match = false
+            for e in self.own_appends(t, k.key, op)
+                if nest_price(e) > np.bound then own_match = true
+
+            val late = buf[usize]()
+            for wr in k.writes
+                val w = self.recs[wr]
+                if !w.ambiguous && w.txn != t.id && self.committed(w.txn) && nest_price(w.value) > np.bound && index_in(k.order, w.value) == NoTxn
+                    late.push(w.txn)
+
+            val d = self.writer(row, 0, true)
+            val dt = if d == NoTxn || self.recs[d].ambiguous then NoTxn else self.recs[d].txn
+            val deleted = dt != NoTxn && self.txns[dt].outcome != TAborted
+            val own_delete = self.own_write_before(t, row, op, true)
+
+            if returned
+                if own_delete
+                    self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${row}, which it had deleted")
+                    continue
+
+                if first != NoTxn && !own_match
+                    self.edge(first, t.id, EWr, true, m.key)
+                elif first == NoTxn && late.len() == 0 && !own_match
+                    // Nothing committed made the row match: an aborted append did, or nothing did.
+                    var aborted = NoTxn
+                    var unknown = false
+                    for wr in k.writes
+                        val w = self.recs[wr]
+                        if w.ambiguous || nest_price(w.value) <= np.bound then continue
+                        val o = self.txns[w.txn].outcome
+                        if o == TAborted then aborted = w.txn
+                        if o == TUnknown then unknown = true
+                    if aborted != NoTxn && !unknown
+                        self.anomaly("G1a", true, [aborted, t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${row}, which only T${aborted}'s append made match, and T${aborted} aborted")
+                    elif !unknown
+                        self.anomaly("garbage", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${row}, which no append made match")
+
+                if deleted && dt != t.id && self.committed(dt)
+                    self.edge(t.id, dt, ERw, true, m.key)
+                    val dx = self.txns[dt]
+                    if dx.end != 0 && dx.end < t.invoked
+                        val es = buf[HEdge]()
+                        es.push(HEdge(dt, t.id, ERt, true, m.key))
+                        es.push(HEdge(t.id, dt, ERw, true, m.key))
+                        self.anomaly("G-stale", true, [dt, t.id], es, s"T${t.id} began after T${dt}'s delete of ${row} was acknowledged, but its read of '${m.key}' returned it")
+            else
+                if own_delete then continue
+                if own_match
+                    self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' lacks ${row}, which its own append made match")
+                    continue
+                // A delete that committed, or may have (§5.4), explains the absence.
+                if deleted then continue
+
+                val targets = buf[usize]()
+                if first != NoTxn then targets.push(first)
+                targets.extend(late.view())
+                var stale = false
+
+                for x in targets
+                    if x == t.id then continue
+                    self.edge(t.id, x, ERw, true, m.key)
+                    val xt = self.txns[x]
+                    if !stale && xt.end != 0 && xt.end < t.invoked
+                        stale = true
+                        val es = buf[HEdge]()
+                        es.push(HEdge(x, t.id, ERt, true, m.key))
+                        es.push(HEdge(t.id, x, ERw, true, m.key))
+                        self.anomaly("G-stale", true, [x, t.id], es, s"T${t.id} began after T${x}'s append to ${k.key} was acknowledged, but its read of '${m.key}' lacks ${row}")
+
+        if self.opts.white_box && t.txid != 0 && t.rank() >= 1 then self.nested_predicate_white_box(t, op, m, np)
+
+    // White box: the rows are exactly those with a kept element committed at or before the
+    // snapshot, and not deleted by then.
+    nested_predicate_white_box(*self, t: HTxn, op: usize, m: Mop, np: NestedPred)
+        val expect = buf[string]()
+
+        for k in self.keys
+            if !k.list || !is_nested_key(k.key) then continue
+            val row = row_of(k.key)
+            if k.key != s"$row.${np.col}" then continue
+
+            var member = false
+            for e in self.own_appends(t, k.key, op)
+                if nest_price(e) > np.bound then member = true
+
+            for wr in k.writes
+                val w = self.recs[wr]
+                if w.ambiguous || w.txn == t.id || nest_price(w.value) <= np.bound then continue
+                val o = self.txns[w.txn].outcome
+                if o == TAborted then continue
+                val c = self.txns[w.txn].commit
+                if o == TUnknown || c == 0 then return
+                if c <= t.snapshot then member = true
+
+            val d = self.writer(row, 0, true)
+            if d != NoTxn && !self.recs[d].ambiguous
+                val dx = self.txns[self.recs[d].txn]
+                if dx.id == t.id
+                    if self.own_write_before(t, row, op, true) then member = false
+                elif dx.outcome == TUnknown
+                    return
+                elif dx.outcome == TCommitted
+                    if dx.commit == 0 then return
+                    if dx.commit <= t.snapshot then member = false
+
+            if member then expect.push(row)
+
+        var same = expect.len() == m.rows.len()
+        for r in expect
+            if !contains_str(m.rows, r) then same = false
+
+        if !same
+            self.anomaly("wb-read", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' is not the rows matching at its snapshot ${t.snapshot}")
+
+    // P4 at the level of a row (N1): an append to any list of a row, and its delete, are writes of
+    // the row. Two committed transactions that both wrote it, each having read (before its first
+    // write of the row) a version of one of its lists that a write of the other's follows, lost an
+    // update whichever wrote first. `list_key` finds the case of one list read at one version; this
+    // finds the rest: reads of two lists, and a delete.
+    row_lost_updates(*self, row: string)
+        val ts = buf[usize]()
+        for t in self.txns
+            if t.outcome == TCommitted && self.first_row_write(t, row) != NoTxn then ts.push(t.id)
+
+        for i in 0..<ts.len()
+            for j in (i + 1)..<ts.len()
+                val a = ts[i]
+                val b = ts[j]
+                if !self.read_before(a, b, row) || !self.read_before(b, a, row) || self.p4_reported(a, b) then continue
+                val forbidden = self.txns[a].rank() >= 1 && self.txns[b].rank() >= 1
+                val es = buf[HEdge]()
+                es.push(HEdge(a, b, ERw, false, row))
+                es.push(HEdge(b, a, ERw, false, row))
+                self.anomaly("P4", forbidden, [a, b], es, s"T${a} and T${b} each read a version of row ${row} that the other's write follows, and both wrote it: one update is lost")
+
+    // The first operation of `t` that writes `row`, NoTxn where none does.
+    first_row_write(self, t: HTxn, row: string) -> usize
+        for j in 0..<t.ops.len()
+            val m = t.ops[j]
+            if m.kind == MAppend && row_of(m.key) == row || m.kind == MDelete && m.key == row then return j
+        NoTxn
+
+    // Whether `a` read, before its first write of `row`, a version of a list in it that a write of
+    // `b` follows: an append of `b`'s the read lacks, or `b`'s delete of the row.
+    read_before(self, a: usize, b: usize, row: string) -> bool
+        val ta = self.txns[a]
+        val tb = self.txns[b]
+        val fw = self.first_row_write(ta, row)
+
+        for op in 0..<fw
+            val m = ta.ops[op]
+            if m.kind != MRead || !is_list(m.seen) || row_of(m.key) != row || base_key(m.key) != m.key then continue
+            val ki = self.by_key.get(m.key) match
+                Some(i) -> i
+                None -> continue
+            val order = self.keys[ki].order
+            val (ext, _) = self.external_list(ta, op)
+            if !is_prefix(ext, order) then continue
+
+            for mb in tb.ops
+                if mb.kind == MDelete && mb.key == row then return true
+                if mb.kind == MAppend && mb.key == m.key
+                    val p = index_in(order, mb.arg)
+                    if p == NoTxn || p >= ext.len() then return true
+        false
+
+    p4_reported(self, a: usize, b: usize) -> bool
+        for x in self.anomalies
+            if x.name == "P4" && contains_usize(x.txns, a) && contains_usize(x.txns, b) then return true
+        false
+
+    // The append to `key` priced above `bound` that a returned row can only be explained by: the one
+    // unknown transaction's, where no committed transaction made such an append.
+    only_unknown_match(self, key: string, bound: i64) -> usize
+        val ki = self.by_key.get(key) match
+            Some(i) -> i
+            None -> return NoTxn
+        var found = NoTxn
+        for r in self.keys[ki].writes
+            val w = self.recs[r]
+            if w.del || w.ambiguous || nest_price(w.value) <= bound then continue
+            val o = self.txns[w.txn].outcome
+            if o == TCommitted then return NoTxn
+            if o == TUnknown
+                if found != NoTxn && self.recs[found].txn != w.txn then return NoTxn
+                found = r
+        found
 
     // -- counters (I14) -------------------------------------------------------------------------
 
@@ -1232,6 +1644,37 @@ private contains_str(xs: Buf[string], x: string) -> bool
     for y in xs
         if y == x then return true
     false
+
+/** A predicate over a nested level, `c.price > bound` (§7.2 W5): the rows some element of whose
+ * nested `c` is priced above `bound`.
+ */
+struct NestedPred derives Eq
+    col: string
+    bound: i64
+
+/** The nested column and bound of a predicate `c.price > p`. */
+nested_pred(p: string) -> Option[NestedPred] = p.index_of(".") match
+    Some(i) -> price_bound(p[i + 1..<p.len]) match
+        Some(b) -> Some(NestedPred(p[..<i], b))
+        None -> None
+    None -> None
+
+/** The bound `p` of a filter `price > p`. */
+price_bound(f: string) -> Option[i64]
+    if !f.starts_with("price > ") then return None
+    parse_long(f[8..<f.len]) match
+        Ok(n) -> Some(i64(n))
+        Err(_) -> None
+
+/** The list key a read names: a shaping read's `R.c|filter` reads the list `R.c`. */
+base_key(key: string) -> string = key.index_of("|") match
+    Some(i) -> key[..<i]
+    None -> key
+
+/** The filter of a shaping read's key `R.c|filter`; empty where there is none. */
+key_filter(key: string) -> string = key.index_of("|") match
+    Some(i) -> key[i + 1..<key.len]
+    None -> ""
 
 /** The group `n` of a predicate `g = n`, the one predicate shape W4 reads. */
 pred_group(p: string) -> Option[i64]

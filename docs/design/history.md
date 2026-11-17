@@ -93,7 +93,7 @@ its `snapshot` (`wb-read`), for lists, registers and predicate reads.
 
 W1 list-append, W2 rw-register with counters, W3 bank (single-statement total, I13; one statement per account,
 exact at snapshot and serializable; overdraft), W3b write skew (a negative pair), W4 phantom and its on-call
-shape (an empty group), and W6 the read-only anomaly [Fekete]. W3, W3b and on-call add invariants of their
+shape (an empty group), W5 nested (below), and W6 the read-only anomaly [Fekete]. W3, W3b and on-call add invariants of their
 own to the checker's report; W3 and W3b do not use register inference, since balances repeat.
 
 The fault runs use the store's `Faults`: `skip_validation` (W2, W3b, W4, on-call and W6 red at serializable),
@@ -101,16 +101,52 @@ The fault runs use the store's `Faults`: `skip_validation` (W2, W3b, W4, on-call
 while W3's one-statement total stays green), and `stale_snapshot`, a snapshot one commit behind the horizon,
 which is what publication out of order or acknowledgement before publication look like to a single-threaded
 store (G-stale at every level, G-rt at serializable). Each is caught on some seed, and the same seed on the
-real store is clean.
+real store is clean. The unrecorded setup ends with a commit of its own (a row no key names), so that a stale
+snapshot still sees the seeded rows and the fault shows as a reader missing a recorded commit.
+
+## W5 and the nested level
+
+W5 runs against the bench's `nest(k, tag, items list<(e, price)>)` table, driven through the store's closures
+(a `Pred` may read the nested level, §4.5 N3). Its rows `n<i>` start with `items` empty and `tag` the parity of
+the row key; `items` is a list, not a bag, so that its order of appends can be inferred. An element's price is
+its value mod 10 (`nest_price`), so a history carries prices without a field of its own. The operations: an
+append (`["append", "n1.items", e]`), a whole-row read (`["r", "n1.items", [..]]`, `null` where the row is
+gone), the predicate `["pr", "items.price > p", rows]` for `WHERE EXISTS (SELECT 1 FROM items WHERE price >
+p)`, a shaping read of one tag's rows recorded as one `["r", "n1.items|price > p", kept]` per row returned
+(N4: membership is `tag = t`, but `C` names `items` too, which the read returns), and a read-then-delete of a
+row (`["w", "n1", null]`). A write that finds no row records a read finding no row, since the row is gone; an
+`ok` or `fail` with no value ran nothing (only an `info` stands on its invoke's plan).
+
+What the checker adds, keyed by the row (the part of a key before its first `.`):
+
+- *Lists in a row* (I17). `R.c` is a list key as in W1, and so is `R` itself where a row has a list of its own.
+  N1 makes the row's delete a write of each of its lists, after every append; a read finding no row reads the
+  delete (wr; `garbage` where nobody deleted it, `G1a` where the delete aborted), and a read finding a list
+  anti-depends on it (rw, G-stale, the white-box read rule, I5 against the delete's commit).
+- *Row P4.* Two committed transactions that both wrote a row, each having read (before its first write of it)
+  a version of one of its lists that a write of the other's follows: an update is lost whichever wrote first.
+  This catches two different lists of one row, and a delete racing an append, which no one-list rule sees.
+- *Shaping reads.* The kept elements read must be a prefix of the order's kept elements; the read names the
+  writer of its last element and anti-depends on the next kept element's writer and on unread kept appends.
+- *Predicates over the nested level* (I18). Elements are only appended, so a row starts to match with the first
+  kept element of its order and stops with its delete: W4's edges with that append in the insert's place. A
+  returned row nothing committed made match is `G1a` or `garbage`; one lacking a deleted row gives no edge.
+
+Not inferred: the relative order of appends to two different lists of one row (no edge is drawn where the
+history does not say), and per-statement snapshots at read committed. The clean sweep runs 12 seeds at each
+level mix; the permitted runs find a phantom at depth (G2) and write skew at snapshot, and read skew or a lost
+update at read committed; the faults are caught as for W1 and W4 (G2 and G2-item without validation,
+P4/G-single without first-updater-wins or with a snapshot per statement, G-stale and G-rt with a stale
+snapshot).
 
 ## Not yet
 
-- W5 (nested lists and predicates over a nested level) needs list-append objects inside a row's relation and
-  predicate edges over the nested level; W7 (replicas), W8 (crash, I22–I25, I28) and W9 (DDL) need replicas,
-  the WAL and recovery, and concurrent DDL in the driver. None of those exists in the in-memory store yet.
+- W7 (replicas), W8 (crash, I22–I25, I28) and W9 (DDL) need replicas, the WAL and recovery, and concurrent DDL
+  in the driver. None of those exists in the in-memory store yet.
 - I5 has no fault that breaks it: in a single-threaded store commit stamps are taken in publication order.
   The check is proven on hand-built histories only. Likewise I27's error-code rules beyond I16.
 - G-stale and the white-box read rule at read committed are per transaction, not per statement: the
   history records one time and one snapshot per transaction.
-- Predicate reads are checked for the one shape W4 issues, `g = n` over rows whose `g` never changes.
+- Predicate reads are checked for the two shapes W4 and W5 issue: `g = n` over rows whose `g` never changes, and
+  `c.price > p` over a nested list that is only appended to.
 - The fsync fault (I23) belongs to the disk store.

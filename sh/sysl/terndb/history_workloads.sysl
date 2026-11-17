@@ -5,8 +5,8 @@ import sysl.rand.{Rng, rng}
 
 // The workloads of `isolation.md` §7.2 that the in-memory store can run, each as the plans its
 // clients follow, the rows it starts from, what the checker infers for it, and the invariants of its
-// own the DSG does not express (W3's totals, W3b's pairs, the on-call group). W5 (nested), W7
-// (replicas), W8 (crashes) and W9 (DDL) are not here: `docs/design/history.md` says why.
+// own the DSG does not express (W3's totals, W3b's pairs, the on-call group). W7 (replicas), W8
+// (crashes) and W9 (DDL) are not here: `docs/design/history.md` says why.
 
 /** Which levels a run's transactions take (§3.4): all one level, or each drawn from the three. */
 enum LevelMix
@@ -454,3 +454,56 @@ w6_read_only(seed: u64, instances: usize, mix: LevelMix) -> Workload
     cs.push(t2)
     cs.push(t3)
     Workload("W6", buf(), ks, 0, buf(), cs, read_all(buf(), ks, []), check_all(), none_extra())
+
+// -- W5 nested -----------------------------------------------------------------------------------
+
+/** W5 (§7.2): `rows` rows `n<i>(k, tag, items list<(e, price)>)`, each with `items` empty and `tag`
+ * the parity of its row key; `n<i>.items` is a list-append object inside the row (I17). Each client
+ * runs `txns` transactions. About one in sixteen reads a row and deletes it; the rest are 1–6 of: an
+ * append to a row's `items` (an element `e` priced `e mod 10`, sometimes twice, for G1b), a read of a
+ * row with its whole `items`, a read of the rows `WHERE EXISTS (SELECT 1 FROM items WHERE price > p)`
+ * (I18), and a read of one tag's rows with their `items` shaped by `price > p` (N4), `p` from 3 to 7.
+ */
+w5_nested(seed: u64, clients: usize, txns: usize, rows: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5735)
+    val ks = buf[string]()
+    for i in 0..<rows
+        ks.push(s"n$i.items")
+    val cs = buf[Buf[Plan]]()
+
+    for _ in 0..<clients
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val steps = buf[HStep]()
+            if g.below(16) == 0
+                val r = usize(skewed(&g, u64(rows)))
+                steps.push(SReadList(ks[r]))
+                steps.push(SNestDelete(s"n$r"))
+            else
+                val n = 1 + g.below(6)
+                for _ in 0..<n
+                    val k = ks[usize(skewed(&g, u64(rows)))]
+                    val x = g.below(20)
+                    if x < 8
+                        steps.push(SAppend(k))
+                        if x == 0 then steps.push(SAppend(k))
+                    elif x < 13
+                        steps.push(SReadList(k))
+                    elif x < 17
+                        steps.push(SNestExists(i64(3 + g.below(5))))
+                    else
+                        steps.push(SNestShape(i64(g.below(2)), i64(3 + g.below(5))))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    // The final reader reads every row, and the nested predicate and both tags once more.
+    val last = buf[HStep]()
+    for k in ks
+        last.push(SReadList(k))
+    last.push(SNestExists(4))
+    last.push(SNestShape(0, 4))
+    last.push(SNestShape(1, 4))
+    val post = buf[Plan]()
+    post.push(Plan(Serializable, true, true, last))
+
+    Workload("W5", ks, buf(), 0, buf(), cs, post, check_all(), none_extra())

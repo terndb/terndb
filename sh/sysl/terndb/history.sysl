@@ -571,6 +571,9 @@ enum HStep
     SInsert(prefix: string, group: i64)
     SInsertKey(key: string, group: i64)
     SDelete(key: string)
+    SNestExists(bound: i64)
+    SNestShape(tag: i64, bound: i64)
+    SNestDelete(row: string)
     SThen(f: &Fn(Buf[Mop]) -> Buf[HStep])
 
 /** One transaction a client runs: its level, whether it is declared read-only, whether a retryable
@@ -584,18 +587,21 @@ struct Plan
 
 hplan(level: Isolation, steps: Buf[HStep]) -> Plan = Plan(level, false, true, steps)
 
-/** The in-memory store a history is recorded against and its three tables: `lists(k, v list<int64>)`
- * for list-append keys, `regs(k, v int64)` for registers, counters and accounts, and `grp(k, g, v)`
- * for W4's rows. A history's keys are names; each is given an integer row key on first use.
+/** The in-memory store a history is recorded against and its four tables: `lists(k, v list<int64>)`
+ * for list-append keys, `regs(k, v int64)` for registers, counters and accounts, `grp(k, g, v)`
+ * for W4's rows, and `nest(k, tag, items list<(e, price)>)` for W5's rows, whose nested `items` is the
+ * list key `R.items`. A history's keys are names; each is given an integer row key on first use.
  */
 struct Bench
     store: &Store
     lists: u64
     regs: u64
     grp: u64
+    nest: u64
     list_cols: Buf[u32]
     reg_cols: Buf[u32]
     grp_cols: Buf[u32]
+    nest_cols: Buf[u32]
     names: Buf[string]
     ids: Map[string, i64]
     next_value: i64
@@ -616,17 +622,32 @@ struct Bench
         self.next_value += 1
         self.next_value
 
-    /** Creates, unrecorded, the rows the keys start in: each list empty, each register `init`. */
+    /** Creates, unrecorded, the rows the keys start in: each list empty, each register `init`. A
+     * nested list key `R.items` creates W5's row `R` with its `items` empty and its `tag` the parity
+     * of its row key.
+     */
     seed_rows(*self, lists: Buf[string], regs: Buf[string], init: i64)
         val t = self.store.begin(Serializable)
 
         for k in lists
-            val _ = self.store.insert(t, self.lists, store_row(self.store, self.lists, rec([Int(i128(self.id(k))), Relation(buf())])))
+            if is_nested_key(k)
+                val id = self.id(row_of(k))
+                val _ = self.store.insert(t, self.nest, store_row(self.store, self.nest, rec([Int(i128(id)), Int(i128(id % 2)), Relation(buf())])))
+            else
+                val _ = self.store.insert(t, self.lists, store_row(self.store, self.lists, rec([Int(i128(self.id(k))), Relation(buf())])))
 
         for k in regs
             val _ = self.store.insert(t, self.regs, store_row(self.store, self.regs, rec([Int(i128(self.id(k))), Int(i128(init))])))
 
         val _ = self.store.commit(t)
+
+        // The setup ends with a commit of its own, of a row no key names (row keys start at 1), so
+        // that a snapshot one commit behind the horizon (`stale_snapshot`) still sees the rows above.
+        // The setup is not recorded, so the checker could not judge a read that missed it; the fault
+        // must show in what the history records, as a reader missing a recorded commit.
+        val u = self.store.begin(Serializable)
+        val _ = self.store.insert(u, self.regs, store_row(self.store, self.regs, rec([Int(0), Int(0)])))
+        val _ = self.store.commit(u)
 
 /** A bench over a fresh store whose faults are `faults`. */
 bench(faults: Faults) -> &Bench
@@ -635,13 +656,16 @@ bench(faults: Faults) -> &Bench
     bench_ddl(&c, bench_table("lists", [bench_col("k", Int64), bench_col("v", List(Int64))]))
     bench_ddl(&c, bench_table("regs", [bench_col("k", Int64), bench_col("v", Int64)]))
     bench_ddl(&c, bench_table("grp", [bench_col("k", Int64), bench_col("g", Int64), bench_col("v", Int64)]))
+    val item = record([Field("e", Int64), Field("price", Int64)])
+    bench_ddl(&c, bench_table("nest", [bench_col("k", Int64), bench_col("tag", Int64), bench_col("items", List(item))]))
     val s = mem_store(c)
     s.faults = faults
     val lists = c.tables[c.table_at(QualName("app", "lists")).unwrap()]
     val grp = c.tables[c.table_at(QualName("app", "grp")).unwrap()]
     val regs = c.tables[c.table_at(QualName("app", "regs")).unwrap()]
-    Bench(s, lists.oid, regs.oid, grp.oid, column_ids(lists, ["k", "v"]), column_ids(regs, ["k", "v"]), column_ids(grp, ["k", "g"]),
-        buf(), map(), 0)
+    val nest = c.tables[c.table_at(QualName("app", "nest")).unwrap()]
+    Bench(s, lists.oid, regs.oid, grp.oid, nest.oid, column_ids(lists, ["k", "v"]), column_ids(regs, ["k", "v"]), column_ids(grp, ["k", "g"]),
+        column_ids(nest, ["k", "items", "tag"]), buf(), map(), 0)
 
 private column_ids(t: CatTable, names: []const string) -> Buf[u32]
     val out = buf[u32]()
@@ -675,6 +699,7 @@ const MaxAttempts: usize = 8
 /** What one statement came to. */
 private enum StepEnd
     StepRan(mop: Option[Mop])
+    StepRanAll(mops: Buf[Mop])
     StepBlocked(holder: u64)
     StepFailed(code: string, mop: Option[Mop])
 
@@ -793,6 +818,10 @@ private act(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: 
                     None -> ()
                 cs[i].at += 1
                 cs[i].waiting = 0
+            StepRanAll(ms) ->
+                cs[i].mops.extend(ms.view())
+                cs[i].at += 1
+                cs[i].waiting = 0
             StepBlocked(h) -> cs[i].waiting = h
             StepFailed(code, m) ->
                 m match
@@ -850,11 +879,50 @@ private step_mop(s: HStep) -> Option[Mop] = s match
     SPred(grp) -> Some(m_pred(s"g = $grp"))
     SInsertKey(k, grp) -> Some(m_write(k, grp))
     SDelete(k) -> Some(m_delete(k))
+    SNestExists(bound) -> Some(m_pred(nest_pred(bound)))
+    SNestDelete(r) -> Some(m_delete(r))
     _ -> None
 
 private int_value(v: Value) -> i64 = v match
     Int(n) -> i64(n)
     _ -> 0
+
+// -- W5's nested rows ----------------------------------------------------------------------------
+
+/** The price of element `e` of a W5 row's `items`: `e mod 10`. The history records the element
+ * alone, so the price is a function of it, and the checker evaluates `price > p` from the value.
+ */
+nest_price(e: i64) -> i64 = e % 10
+
+/** The predicate text of W5's read `WHERE EXISTS (SELECT 1 FROM items WHERE price > bound)`. */
+nest_pred(bound: i64) -> string = s"items.price > $bound"
+
+/** The key of a shaping read of row `row`: its `items` filtered by `price > bound`. */
+nest_filter_key(row: string, bound: i64) -> string = s"$row.items|price > $bound"
+
+/** Whether `key` names a nested list `R.c` inside row `R` (§2.5). */
+is_nested_key(key: string) -> bool = key.index_of(".").is_some()
+
+/** The row a key is part of (§4.5 N1): `R` for the key `R` and for each nested `R.c`, and for a
+ * shaping read's `R.c|filter`.
+ */
+row_of(key: string) -> string = key.index_of(".") match
+    Some(i) -> key[..<i]
+    None -> key
+
+private const NoBound: i64 = -9223372036854775807
+
+// The elements of a nested `items` value whose price exceeds `bound`.
+private elements(v: Value, bound: i64) -> Buf[i64]
+    val out = buf[i64]()
+    v match
+        Relation(es) ->
+            for e in es
+                e match
+                    Record(fs) -> if int_value(fs[1]) > bound then out.push(int_value(fs[0]))
+                    _ -> ()
+        _ -> ()
+    out
 
 // The rows keyed `id`, the read using the columns `cols` names: the key, and the value where the
 // statement's change reads it.
@@ -869,12 +937,58 @@ private write_end(r: Result[WriteOutcome, CodecError], m: Mop) -> StepEnd = r ma
     Ok(Wait(h)) -> StepBlocked(h)
     Err(e) -> StepFailed(e.code, Some(m))
 
+// A write of a W5 row that found no row observed that the row is gone, deleted (rows are never
+// re-inserted), and records that as a read of its list finding no row; it wrote nothing.
+private nest_write_end(r: Result[WriteOutcome, CodecError], m: Mop, list: string) -> StepEnd = r match
+    Ok(Done(n)) -> if n == 0 then StepRan(Some(m_read_unborn(list))) else StepRan(Some(m))
+    _ -> write_end(r, m)
+
 // Runs one statement of a transaction.
 private exec(b: &Bench, t: &Txn, step: HStep) -> StepEnd
     val s = b.store
     s.statement(t)
 
     step match
+        SReadList(k) if is_nested_key(k) -> s.get(t, b.nest, rec([Int(i128(b.id(row_of(k))))])) match
+            Ok(Some(row)) -> StepRan(Some(Mop(MRead, k, 0, ObsList(elements(row.at(2), NoBound)), buf())))
+            Ok(None) -> StepRan(Some(m_read_unborn(k)))
+            Err(e) -> StepFailed(e.code, None)
+        SAppendE(k, e) if is_nested_key(k) ->
+            val change: &Fn(StoredRow) -> Value = r ->
+                val list = r.at(2) match
+                    Relation(es) -> es.copy()
+                    _ -> buf[Value]()
+                list.push(rec([Int(i128(e)), Int(i128(nest_price(e)))]))
+                rec([r.at(0), r.at(1), Relation(list)])
+            nest_write_end(s.update_where(t, b.nest, key_pred(b.nest_cols, b.id(row_of(k)), true), change), m_append(k, e), k)
+        SNestExists(bound) ->
+            // §4.5 N3: the membership predicate reads the nested level, so its `C` is `items`.
+            val cols = buf[u32]()
+            cols.push(b.nest_cols[1])
+            val member: &Fn(StoredRow) -> bool = r -> elements(r.at(2), bound).len() > 0
+            s.scan(t, b.nest, Pred(member, cols, false)) match
+                Ok(hits) ->
+                    val rows = buf[string]()
+                    for h in hits
+                        rows.push(b.name_of(int_value(h.row.at(0))))
+                    StepRan(Some(Mop(MPred, nest_pred(bound), 0, ObsRows, rows)))
+                Err(e) -> StepFailed(e.code, None)
+        SNestShape(tag, bound) ->
+            // §4.5 N4: membership is `tag = t`; the inner filter only shapes each row's `items`, which
+            // the read returns and so reads.
+            val cols = buf[u32]()
+            cols.push(b.nest_cols[2])
+            cols.push(b.nest_cols[1])
+            s.scan(t, b.nest, Pred(r -> int_value(r.at(1)) == tag, cols, false)) match
+                Ok(hits) ->
+                    val ms = buf[Mop]()
+                    for h in hits
+                        val name = b.name_of(int_value(h.row.at(0)))
+                        ms.push(Mop(MRead, nest_filter_key(name, bound), 0, ObsList(elements(h.row.at(2), bound)), buf()))
+                    StepRanAll(ms)
+                Err(e) -> StepFailed(e.code, None)
+        SNestDelete(r) ->
+            nest_write_end(s.delete_where(t, b.nest, key_pred(b.nest_cols, b.id(r), false)), m_delete(r), s"$r.items")
         SReadList(k) -> s.get(t, b.lists, rec([Int(i128(b.id(k)))])) match
             Ok(Some(row)) ->
                 val list = buf[i64]()

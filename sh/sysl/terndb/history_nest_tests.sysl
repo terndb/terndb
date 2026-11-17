@@ -1,0 +1,713 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// W5 (`isolation.md` §7.2) and the checker's nested level (§4.5, I17, I18). First the checker on
+// hand-built nested histories: each phenomenon occurring inside a row's nested list, found with its
+// cycle, and a legal near miss of each, not flagged. Then W5 against the real store: clean at every
+// level mix, the anomalies a weaker level permits occurring at the nested level, and each fault of
+// the store caught by W5 on some seed that is clean on the real store.
+//
+// An element's price is its value mod 10: 7, 17 and 27 are priced 7, while 3 and 13 are priced 3.
+
+private const Exists4 = "items.price > 4"
+
+private rw_count(a: Anomaly) -> usize
+    var n: usize = 0
+    for e in a.edges
+        if e.kind == ERw then n += 1
+    n
+
+// -- one transaction appending at the parent level and the nested level --------------------------
+
+// Two transactions each append to row k1's own list and to its nested k1.items; the final read
+// orders them one way in k1 and the other way in k1.items.
+private two_levels(nested: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_append("k1", 1), m_append("k1.items", 2)])
+    h.ok(2, [m_append("k1", 3), m_append("k1.items", 4)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1", [1, 3]), m_read_list("k1.items", nested)])
+    h.check()
+
+@test
+nested_g0_appends_at_the_parent_and_nested_level_ordered_two_ways_is_forbidden_even_at_read_committed()
+    val r = two_levels([4, 2])
+    assert_forbidden(r, "G0")
+    val a = r.first("G0")
+    assert_set(a.txns, [0, 1])
+    var keys = buf[string]()
+    for e in a.edges
+        assert(e.kind == EWw)
+        keys.push(e.key)
+    assert(contains_text(keys, "k1") && contains_text(keys, "k1.items"), describe_cycle(a.edges))
+
+@test
+nested_g0_near_miss_both_levels_in_one_order_is_legal()
+    assert_clean(two_levels([2, 4]))
+
+@test
+nested_g1b_a_read_of_an_intermediate_version_inside_a_row_is_forbidden()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_append("k1.items", 1), m_append("k1", 9), m_append("k1.items", 2)])
+    h.ok(2, [m_read_list("k1.items", [1])])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [1, 2]), m_read_list("k1", [9])])
+    val r = h.check()
+    assert_forbidden(r, "G1b")
+    assert_set(r.first("G1b").txns, [0, 1])
+
+@test
+nested_g1b_near_miss_the_final_version_of_both_levels_is_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("k1.items", 1), m_append("k1", 9), m_append("k1.items", 2)])
+    val _ = h.tx(2, LevelRc, [m_read_list("k1.items", [1, 2]), m_read_list("k1", [9])])
+    assert_clean(h.check())
+
+// -- two nested lists of one row -----------------------------------------------------------------
+
+// Both read row k1 empty and each appends to a different nested list of it: under N1 both wrote
+// row k1 from a version the other's write follows.
+private two_lists(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("k1.a", []), m_read_list("k1.b", []), m_append("k1.a", 1)])
+    h.ok(2, [m_read_list("k1.a", []), m_read_list("k1.b", []), m_append("k1.b", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.a", [1]), m_read_list("k1.b", [2])])
+    h.check()
+
+@test
+nested_p4_appends_to_two_lists_of_one_row_lose_an_update_at_snapshot()
+    val r = two_lists(LevelSi)
+    assert_forbidden(r, "P4")
+    val a = r.first("P4")
+    assert_set(a.txns, [0, 1])
+    assert_eq(rw_count(a), 2)
+    assert(a.edges[0].key == "k1", describe_cycle(a.edges))
+
+@test
+nested_p4_appends_to_two_lists_of_one_row_lose_an_update_at_serializable()
+    assert_forbidden(two_lists(LevelSer), "P4")
+
+@test
+nested_p4_appends_to_two_lists_of_one_row_are_permitted_at_read_committed()
+    assert_permitted(two_lists(LevelRc), "P4")
+
+@test
+nested_p4_near_miss_the_second_sees_the_first_append_to_the_other_list()
+    var h = hb()
+    val _ = h.tx(1, LevelSi, [m_read_list("k1.a", []), m_read_list("k1.b", []), m_append("k1.a", 1)])
+    val _ = h.tx(2, LevelSi, [m_read_list("k1.a", [1]), m_read_list("k1.b", []), m_append("k1.b", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.a", [1]), m_read_list("k1.b", [2])])
+    assert_clean(h.check())
+
+@test
+nested_p4_near_miss_lists_of_two_different_rows_are_write_skew_not_a_lost_update()
+    // k1.a and k2.b are in two rows: two rw edges and no common write is write skew (A5B, the
+    // two-transaction G2-item), permitted at SI.
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    val _ = h.inv(2, LevelSi)
+    h.ok(1, [m_read_list("k1.a", []), m_read_list("k2.b", []), m_append("k1.a", 1)])
+    h.ok(2, [m_read_list("k1.a", []), m_read_list("k2.b", []), m_append("k2.b", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.a", [1]), m_read_list("k2.b", [2])])
+    val r = h.check()
+    assert(!r.found("P4"), r.summary())
+    assert_permitted(r, "A5B")
+
+// -- deleting the parent row ---------------------------------------------------------------------
+
+// t0 reads n1 empty and deletes it while t1 reads it empty and appends to its nested list.
+private delete_and_append(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("n1.items", []), m_delete("n1")])
+    h.ok(2, [m_read_list("n1.items", []), m_append("n1.items", 5)])
+    val _ = h.tx(3, LevelSer, [m_read_unborn("n1.items")])
+    h.check()
+
+@test
+nested_deleting_the_parent_while_another_appends_to_its_list_is_g_single_at_snapshot()
+    val r = delete_and_append(LevelSi)
+    assert_forbidden(r, "G-single")
+    val a = r.first("G-single")
+    assert_set(a.txns, [0, 1])
+    assert_eq(rw_count(a), 1)
+    var ww = false
+    for e in a.edges
+        if e.kind == EWw && e.from == 1 && e.to == 0 then ww = true
+    assert(ww, s"the append precedes the delete: ${describe_cycle(a.edges)}")
+    assert_forbidden(r, "P4")
+
+@test
+nested_deleting_the_parent_while_another_appends_is_permitted_at_read_committed()
+    assert_permitted(delete_and_append(LevelRc), "G-single")
+
+@test
+nested_delete_near_miss_the_delete_reads_the_append_first()
+    var h = hb()
+    val _ = h.tx(1, LevelSi, [m_read_list("n1.items", []), m_append("n1.items", 5)])
+    val _ = h.tx(2, LevelSi, [m_read_list("n1.items", [5]), m_delete("n1")])
+    val _ = h.tx(3, LevelSer, [m_read_unborn("n1.items")])
+    val r = h.check()
+    assert_clean(r)
+    // The final reader saw the delete.
+    var wr = false
+    for e in r.edges
+        if e.kind == EWr && e.from == 1 && e.to == 2 then wr = true
+    assert(wr)
+
+@test
+nested_a_row_found_missing_that_nobody_deleted_is_garbage()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_read_unborn("n1.items")])
+    assert_forbidden(h.check(), "garbage")
+
+@test
+nested_a_row_found_missing_whose_delete_aborted_is_g1a()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.fail(1, [m_delete("n1")])
+    val _ = h.tx(2, LevelSer, [m_read_unborn("n1.items")])
+    val r = h.check()
+    assert_forbidden(r, "G1a")
+    assert_set(r.first("G1a").txns, [0, 1])
+
+@test
+nested_a_list_read_after_its_rows_delete_was_acknowledged_is_g_stale()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_delete("n1")])
+    val _ = h.tx(2, LevelRc, [m_read_list("n1.items", [])])
+    assert_forbidden(h.check(), "G-stale")
+
+@test
+nested_an_unknown_delete_whose_missing_row_was_read_is_resolved_as_committed()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("n1.items", 3)])
+    val _ = h.inv(2, LevelSer)
+    h.info(2, [m_read_list("n1.items", [3]), m_delete("n1")])
+    val _ = h.tx(3, LevelSer, [m_read_unborn("n1.items")])
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[1].outcome == TCommitted && r.txns[1].info)
+
+@test
+nested_reading_a_list_after_deleting_its_own_row_is_internal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_delete("n1"), m_read_list("n1.items", [])])
+    assert_forbidden(h.check(), "internal")
+
+// -- an empty nested list ------------------------------------------------------------------------
+
+// Read skew through an empty list: t0 sees t1's append to k2.items but not to k1.items.
+private empty_skew(level: string, first: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("k1.items", first), m_read_list("k2.items", [2])])
+    h.ok(2, [m_append("k1.items", 1), m_append("k2.items", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [1]), m_read_list("k2.items", [2])])
+    h.check()
+
+@test
+nested_read_skew_through_an_empty_list_is_g_single_at_snapshot()
+    val r = empty_skew(LevelSi, [])
+    assert_forbidden(r, "G-single")
+    assert_set(r.first("G-single").txns, [0, 1])
+
+@test
+nested_read_skew_near_miss_the_list_is_not_empty()
+    assert_clean(empty_skew(LevelSi, [1]))
+
+@test
+nested_lists_that_stay_empty_are_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_read_list("k1.items", []), m_pred_rows(Exists4, [])])
+    val _ = h.tx(2, LevelSi, [m_read_list("k1.items", []), m_read_list("k1.items|price > 4", [])])
+    assert_clean(h.check())
+
+@test
+nested_a_predicate_returning_a_row_whose_list_is_empty_is_garbage()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_read_list("k1.items", [])])
+    val _ = h.tx(2, LevelSer, [m_pred_rows(Exists4, ["k1"])])
+    assert_forbidden(h.check(), "garbage")
+
+// -- a predicate over the nested level -----------------------------------------------------------
+
+// The phantom at depth: each reads the rows with an element priced above 4, finds none, and appends
+// such an element to a different row.
+private phantom_at_depth(level: string, second: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows(Exists4, []), m_append("k1.items", 7)])
+    h.ok(2, [m_pred_rows(Exists4, []), m_append("k2.items", second)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [7]), m_read_list("k2.items", [second])])
+    h.check()
+
+@test
+nested_g2_a_phantom_at_depth_is_forbidden_at_serializable_with_predicate_edges()
+    val r = phantom_at_depth(LevelSer, 17)
+    assert_forbidden(r, "G2")
+    val a = r.first("G2")
+    assert_set(a.txns, [0, 1])
+    for e in a.edges
+        assert(e.kind == ERw && e.pred && e.key == Exists4, describe_cycle(a.edges))
+
+@test
+nested_g2_a_phantom_at_depth_is_permitted_at_snapshot()
+    assert_permitted(phantom_at_depth(LevelSi, 17), "G2")
+
+@test
+nested_g2_near_miss_an_append_the_predicate_does_not_select_is_no_phantom()
+    // 13 is priced 3: k2 never matches, so t0's read lacks nothing.
+    assert_clean(phantom_at_depth(LevelSer, 13))
+
+@test
+nested_g2_near_miss_the_second_sees_the_first_rows_match()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_pred_rows(Exists4, []), m_append("k1.items", 7)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows(Exists4, ["k1"]), m_append("k2.items", 17)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [7]), m_read_list("k2.items", [17])])
+    assert_clean(h.check())
+
+// A predicate read that misses a concurrent append's match but sees the same transaction's other
+// append: one rw edge through the predicate.
+private predicate_skew(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows(Exists4, rows), m_read_list("k2.items", [3])])
+    h.ok(2, [m_append("k1.items", 3), m_append("k1.items", 7), m_append("k2.items", 3)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [3, 7]), m_read_list("k2.items", [3])])
+    h.check()
+
+@test
+nested_g_single_a_predicate_read_missing_a_concurrent_match_is_forbidden_at_snapshot()
+    val r = predicate_skew(LevelSi, [])
+    assert_forbidden(r, "G-single")
+    val a = r.first("G-single")
+    assert_set(a.txns, [0, 1])
+    var pred_rw = false
+    for e in a.edges
+        if e.kind == ERw && e.pred then pred_rw = true
+    assert(pred_rw, describe_cycle(a.edges))
+
+@test
+nested_g_single_through_a_predicate_is_permitted_at_read_committed()
+    assert_permitted(predicate_skew(LevelRc, []), "G-single")
+
+@test
+nested_g_single_near_miss_the_predicate_read_sees_the_match()
+    assert_clean(predicate_skew(LevelSi, ["k1"]))
+
+@test
+nested_a_predicate_returning_a_row_then_deleted_anti_depends_on_the_delete()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("k1.items", 7)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows(Exists4, ["k1"])])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [7]), m_delete("k1")])
+    val _ = h.tx(4, LevelSer, [m_pred_rows(Exists4, []), m_read_unborn("k1.items")])
+    val r = h.check()
+    assert_clean(r)
+    var rw = false
+    for e in r.edges
+        if e.kind == ERw && e.pred && e.from == 1 && e.to == 2 then rw = true
+    assert(rw)
+
+@test
+nested_a_predicate_lacking_a_deleted_row_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok(1, [m_pred_rows(Exists4, [])])
+    h.ok(2, [m_append("k1.items", 7)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [7]), m_delete("k1")])
+    assert_clean(h.check())
+
+@test
+nested_a_predicate_returning_a_row_only_an_aborted_append_made_match_is_g1a()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("k1.items", 3)])
+    val _ = h.inv(2, LevelSer)
+    h.fail(2, [m_append("k1.items", 7)])
+    val _ = h.tx(3, LevelSer, [m_pred_rows(Exists4, ["k1"])])
+    val _ = h.tx(4, LevelSer, [m_read_list("k1.items", [3])])
+    val r = h.check()
+    assert_forbidden(r, "G1a")
+    assert_set(r.first("G1a").txns, [1, 2])
+
+@test
+nested_a_predicate_lacking_a_row_its_own_append_made_match_is_internal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("k1.items", 7), m_pred_rows(Exists4, [])])
+    assert_forbidden(h.check(), "internal")
+
+@test
+nested_a_predicate_missing_a_match_acknowledged_before_it_began_is_g_stale()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_append("k1.items", 7)])
+    val _ = h.tx(2, LevelRc, [m_pred_rows(Exists4, [])])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [7])])
+    assert_forbidden(h.check(), "G-stale")
+
+@test
+nested_an_unknown_append_a_predicate_returned_is_resolved_as_committed()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.info(1, [m_append("k1.items", 7)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows(Exists4, ["k1"])])
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[0].outcome == TCommitted)
+
+@test
+nested_a_predicate_not_of_a_known_shape_is_malformed()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_pred_rows("items.weight > 4", [])])
+    assert_forbidden(h.check(), "malformed")
+
+// -- a shaping read (N4) -------------------------------------------------------------------------
+
+private shaped(read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("n1.items", 7), m_append("n1.items", 3), m_append("n1.items", 17)])
+    val _ = h.tx(2, LevelSer, [m_read_list("n1.items|price > 4", read)])
+    val _ = h.tx(3, LevelSer, [m_read_list("n1.items", [7, 3, 17])])
+    h.check()
+
+@test
+nested_a_shaping_read_of_the_kept_elements_is_legal()
+    assert_clean(shaped([7, 17]))
+
+@test
+nested_a_shaping_read_skipping_a_kept_element_is_an_incompatible_order()
+    assert_forbidden(shaped([17]), "incompatible-order")
+
+@test
+nested_a_shaping_read_holding_a_dropped_element_is_an_incompatible_order()
+    assert_forbidden(shaped([3]), "incompatible-order")
+
+@test
+nested_a_shaping_read_holding_an_element_nobody_appended_is_garbage()
+    assert_forbidden(shaped([7, 27]), "garbage")
+
+@test
+nested_a_shaping_read_ends_with_its_own_kept_appends()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("n1.items", 7)])
+    val _ = h.tx(2, LevelSer, [m_append("n1.items", 13), m_append("n1.items", 17), m_read_list("n1.items|price > 4", [7, 17])])
+    val _ = h.tx(3, LevelSer, [m_read_list("n1.items", [7, 13, 17])])
+    assert_clean(h.check())
+
+// Read skew through a shaping read: t0's filtered read of k1 misses t1's kept append.
+private shaped_skew(level: string, appended: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("k1.items|price > 4", []), m_read_list("k2.items", [2])])
+    h.ok(2, [m_append("k1.items", appended), m_append("k2.items", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("k1.items", [appended]), m_read_list("k2.items", [2])])
+    h.check()
+
+@test
+nested_g_single_through_a_shaping_read_is_forbidden_at_snapshot()
+    val r = shaped_skew(LevelSi, 7)
+    assert_forbidden(r, "G-single")
+    assert_set(r.first("G-single").txns, [0, 1])
+
+@test
+nested_g_single_near_miss_a_dropped_element_places_the_shaping_read_nowhere()
+    // 3 is dropped by the filter, so the empty result may be of either version.
+    assert_clean(shaped_skew(LevelSi, 3))
+
+// -- the white box at the nested level -----------------------------------------------------------
+
+@test
+nested_white_box_a_predicate_read_must_be_the_rows_matching_at_its_snapshot()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.ok_wb(1, [m_append("k1.items", 7)], 1, 0, 5)
+    val _ = h.inv(2, LevelSi)
+    h.ok_wb(2, [m_pred_rows(Exists4, [])], 2, 5, 0)
+    val _ = h.inv(3, LevelSi)
+    h.ok_wb(3, [m_pred_rows(Exists4, ["k1"])], 3, 5, 0)
+    val r = h.check()
+    assert_forbidden(r, "wb-read")
+    assert_set(r.first("wb-read").txns, [1])
+
+@test
+nested_white_box_a_shaping_read_must_be_the_kept_elements_at_its_snapshot()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.ok_wb(1, [m_append("k1.items", 7), m_append("k1.items", 3)], 1, 0, 5)
+    val _ = h.inv(2, LevelSi)
+    h.ok_wb(2, [m_read_list("k1.items|price > 4", [])], 2, 6, 0)
+    val _ = h.inv(3, LevelSi)
+    h.ok_wb(3, [m_read_list("k1.items|price > 4", [7]), m_read_list("k1.items", [7, 3])], 3, 6, 0)
+    val r = h.check()
+    assert_forbidden(r, "wb-read")
+    assert_set(r.first("wb-read").txns, [1])
+
+@test
+nested_white_box_a_missing_row_must_have_been_deleted_by_the_snapshot()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.ok_wb(1, [m_delete("n1")], 1, 0, 9)
+    val _ = h.inv(2, LevelSi)
+    h.ok_wb(2, [m_read_unborn("n1.items")], 2, 4, 0)
+    val _ = h.inv(3, LevelSi)
+    h.ok_wb(3, [m_read_unborn("n1.items")], 3, 9, 0)
+    val r = h.check()
+    assert_forbidden(r, "wb-read")
+    assert_set(r.first("wb-read").txns, [1])
+
+@test
+nested_white_box_an_append_after_the_delete_in_commit_order_breaks_i5()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    h.ok_wb(1, [m_append("n1.items", 1)], 1, 0, 9)
+    val _ = h.inv(2, LevelRc)
+    h.ok_wb(2, [m_delete("n1")], 2, 0, 8)
+    assert_forbidden(h.check(), "I5")
+
+// -- the recorded form ---------------------------------------------------------------------------
+
+@test
+a_nested_history_survives_its_json_lines()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("n1.items", 7), m_read_list("n1.items|price > 4", [7]), m_pred_rows(Exists4, ["n1"])])
+    val _ = h.tx(2, LevelSi, [m_read_list("n1.items", [7]), m_delete("n1"), m_read_unborn("n1.items")])
+    assert_eq(parse_history(history_jsonl(h.events)).unwrap(), h.events)
+
+@test
+the_nested_key_helpers_name_the_row_list_and_filter()
+    assert_eq(row_of("n3.items"), "n3")
+    assert_eq(row_of("n3.items|price > 4"), "n3")
+    assert_eq(row_of("n3"), "n3")
+    assert(is_nested_key("n3.items") && !is_nested_key("n3"))
+    assert_eq(base_key("n3.items|price > 4"), "n3.items")
+    assert_eq(key_filter("n3.items|price > 4"), "price > 4")
+    assert_eq(key_filter("n3.items"), "")
+    assert_eq(price_bound("price > 12").unwrap(), 12)
+    assert(price_bound("price < 12").is_none() && price_bound("price > x").is_none())
+    assert(nested_pred("items.price > 6").unwrap() == NestedPred("items", 6))
+    assert(nested_pred("g = 1").is_none() && nested_pred("items.weight > 6").is_none())
+    assert_eq(nest_price(17), 7)
+    assert_eq(nest_pred(5), "items.price > 5")
+    assert_eq(nest_filter_key("n2", 5), "n2.items|price > 5")
+
+// -- W5 against the real store -------------------------------------------------------------------
+
+/** How many seeds W5's clean sweep runs per level mix. Raise it for a longer soak. */
+const NestSeeds: u64 = 12
+
+/** How far a search for a seed showing an anomaly in W5 goes. */
+const NestSearch: u64 = 60
+
+private w5(seed: u64, mix: LevelMix) -> Workload = w5_nested(seed, 4, 6, 5, mix)
+
+private nest_mixes() -> Buf[LevelMix] = items_of([MixSer, MixSi, MixRc, MixAll])
+
+// The first seed whose W5 run on `f` at `mix` finds one of `wanted`, forbidden or not as asked,
+// with an edge at the nested level on its cycle where it has one; 0 if none does. The same seed on
+// the real store must be clean.
+private w5_seed_showing(mix: LevelMix, f: Faults, wanted: []const string, forbidden: bool, file: string = __FILE__, line: long = __LINE__) -> u64
+    for seed in 1..NestSearch
+        val run = run_workload(w5(seed, mix), f, DriveOptions(seed, 0))
+        var hit = false
+        for a in run.report.anomalies
+            if a.forbidden != forbidden then continue
+            for w in wanted
+                if a.name == w && (a.edges.len() == 0 || nested_cycle(a)) then hit = true
+        if hit
+            val clean = run_workload(w5(seed, mix), no_faults(), DriveOptions(seed, 0))
+            assert(clean.report.forbidden().len() == 0, s"seed $seed on the real store:\n${clean.report.summary()}", file, line)
+            return seed
+    0
+
+// Whether an anomaly's edges are about the nested level: a nested list, a row, or a nested predicate.
+private nested_cycle(a: Anomaly) -> bool
+    for e in a.edges
+        if is_nested_key(e.key) || e.key.starts_with("n") then return true
+    false
+
+@test
+w5_nested_runs_clean_at_every_level()
+    for mix in nest_mixes()
+        for seed in 1..NestSeeds
+            val run = run_workload(w5(seed, mix), no_faults(), DriveOptions(seed, 60))
+            assert(run.report.forbidden().len() == 0, s"seed $seed:\n${run.report.summary()}")
+
+@test
+w5_runs_clean_without_the_white_box_fields_too()
+    for mix in nest_mixes()
+        val w = w5(5, mix)
+        val run = run_workload(w, no_faults(), DriveOptions(5, 60))
+        val black = check_history(strip_white_box(run.history), w.opts)
+        assert(black.forbidden().len() == 0, black.summary())
+
+@test
+w5_exercises_every_operation_at_the_nested_level()
+    // The sweep is not vacuous: rows are appended to, read, deleted and found missing; the nested
+    // predicate returns rows and misses some; the shaping read returns kept elements; and some
+    // transactions abort.
+    var appends: usize = 0
+    var deletes: usize = 0
+    var missing: usize = 0
+    var pred_hits: usize = 0
+    var pred_misses: usize = 0
+    var shaped: usize = 0
+    var aborted: usize = 0
+    var pred_edges: usize = 0
+    for seed in 1..NestSeeds
+        val run = run_workload(w5(seed, MixAll), no_faults(), DriveOptions(seed, 0))
+        for t in run.report.txns
+            if t.outcome == TAborted then aborted += 1
+            if t.outcome != TCommitted then continue
+            for m in t.ops
+                if m.kind == MAppend && is_nested_key(m.key) then appends += 1
+                if m.kind == MDelete then deletes += 1
+                if m.kind == MRead && m.seen == ObsUnborn then missing += 1
+                if m.kind == MPred && m.rows.len() > 0 then pred_hits += 1
+                if m.kind == MPred && m.rows.len() < 5 then pred_misses += 1
+                if m.kind == MRead && key_filter(m.key).len > 0
+                    m.seen match
+                        ObsList(l) -> if l.len() > 0 then shaped += 1
+                        _ -> ()
+        for e in run.report.edges
+            if e.pred then pred_edges += 1
+    assert(appends > 0 && deletes > 0 && missing > 0 && pred_hits > 0 && pred_misses > 0 && shaped > 0 && aborted > 0 && pred_edges > 0,
+        s"$appends $deletes $missing $pred_hits $pred_misses $shaped $aborted $pred_edges")
+
+@test
+w5_histories_survive_their_json_lines()
+    val run = run_workload(w5(2, MixAll), no_faults(), DriveOptions(2, 60))
+    assert_eq(parse_history(history_jsonl(run.history)).unwrap(), run.history)
+
+// -- what a weaker level permits does occur at the nested level ------------------------------------
+
+@test
+w5_a_phantom_at_depth_occurs_at_snapshot()
+    assert(w5_seed_showing(MixSi, no_faults(), ["G2"], false) != 0)
+
+@test
+w5_write_skew_at_the_nested_level_occurs_at_snapshot()
+    assert(w5_seed_showing(MixSi, no_faults(), ["G2-item", "A5B"], false) != 0)
+
+@test
+w5_read_skew_or_a_lost_update_at_the_nested_level_occurs_at_read_committed()
+    assert(w5_seed_showing(MixRc, no_faults(), ["G-single", "P4", "G-nonadjacent"], false) != 0)
+
+// -- prove the checker can fail at the nested level (§7.1) ----------------------------------------
+
+private nest_faults(skip_validation: bool, skip_fuw: bool, statement_snapshot: bool, stale: bool) -> Faults =
+    Faults(skip_validation, skip_fuw, statement_snapshot, stale)
+
+@test
+w5_without_validation_a_phantom_at_depth_is_caught_at_serializable()
+    assert(w5_seed_showing(MixSer, nest_faults(true, false, false, false), ["G2"], true) != 0)
+
+@test
+w5_without_validation_nested_write_skew_is_caught_at_serializable()
+    assert(w5_seed_showing(MixSer, nest_faults(true, false, false, false), ["G2-item", "A5B"], true) != 0)
+
+@test
+w5_without_first_updater_wins_a_lost_nested_append_is_caught_at_snapshot()
+    assert(w5_seed_showing(MixSi, nest_faults(false, true, false, false), ["P4", "G-single", "incompatible-order"], true) != 0)
+
+@test
+w5_a_snapshot_taken_per_statement_loses_nested_updates_at_snapshot()
+    assert(w5_seed_showing(MixSi, nest_faults(false, false, true, false), ["P4", "G-single", "incompatible-order"], true) != 0)
+
+@test
+w5_a_stale_snapshot_is_caught_as_g_stale_at_every_level()
+    for mix in [MixSer, MixSi, MixRc]
+        assert(w5_seed_showing(mix, nest_faults(false, false, false, true), ["G-stale"], true) != 0)
+
+@test
+w5_a_stale_snapshot_is_caught_as_a_real_time_violation_at_serializable()
+    assert(w5_seed_showing(MixSer, nest_faults(false, false, false, true), ["G-rt"], true) != 0)
+
+private contains_text(xs: Buf[string], x: string) -> bool
+    for y in xs
+        if y == x then return true
+    false
+
+// -- a write that found no row -------------------------------------------------------------------
+
+// W5 seed 2 at snapshot: a transaction planned an append to n1 after n1's delete committed; its
+// statement found no row and wrote nothing. Its `ok` record must not be read as the planned append.
+@test
+an_ok_that_ran_nothing_does_not_stand_on_its_invoked_plan()
+    var h = hb()
+    h.push(1, HInvoke, LevelSi, items_of([m_append("n1.items", 51)]), "", 0, 0, 0)
+    h.ok(1, [])
+    val r = h.check()
+    assert_eq(r.txns[0].ops.len(), 0)
+    assert_clean(r)
+
+@test
+an_info_with_no_value_stands_on_its_invoked_plan()
+    var h = hb()
+    h.push(1, HInvoke, LevelSi, items_of([m_append("n1.items", 51)]), "", 0, 0, 0)
+    h.info(1, [])
+    assert_eq(h.check().txns[0].ops.len(), 1)
+
+@test
+nested_an_append_after_the_rows_delete_finds_no_row_and_is_clean()
+    // The reduction of that history as the driver records it: the append that found no row is a
+    // read of n1.items finding no row, after the delete in commit order.
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    h.ok_wb(1, [m_append("n1.items", 3), m_append("n1.items", 5)], 4, 1, 3)
+    val _ = h.inv(1, LevelSi)
+    h.ok_wb(1, [m_read_list("n1.items", [3, 5]), m_delete("n1")], 10, 3, 4)
+    val _ = h.inv(3, LevelSi)
+    h.ok_wb(3, [m_read_unborn("n1.items")], 29, 10, 10)
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[2].ops.len() == 1 && r.txns[2].ops[0].kind == MRead)
+
+@test
+w5_a_write_that_finds_no_row_records_the_row_as_gone()
+    // The driver half of the reduction: on the real store, seed 2 at snapshot plans an append to a
+    // deleted row, and it is recorded as a read finding no row, never as an append.
+    val run = run_workload(w5(2, MixSi), no_faults(), DriveOptions(2, 0))
+    assert(run.report.forbidden().len() == 0, run.report.summary())
+    var gone = false
+    for t in run.report.txns
+        if t.outcome != TCommitted then continue
+        var deleted = false
+        for m in t.ops
+            if m.kind == MDelete then deleted = true
+        for m in t.ops
+            if m.kind == MRead && m.seen == ObsUnborn && !deleted then gone = true
+    assert(gone)
+
+@test
+a_stale_snapshot_still_sees_the_unrecorded_setup()
+    // With the setup in one commit, a snapshot one behind the horizon missed it: every W1 row read
+    // as missing and every append found no row, so the fault showed nowhere a history records (the
+    // stale-snapshot tests passed only because an `ok` that ran nothing was read as its plan). The
+    // setup's own last commit keeps it visible, and the fault shows as a missed recorded commit.
+    val run = run_workload(w1_list_append(1, 4, 6, 4, MixSer), Faults(false, false, false, true), DriveOptions(1, 0))
+    var lists: usize = 0
+    var appends: usize = 0
+    for t in run.report.txns
+        if t.outcome != TCommitted then continue
+        for m in t.ops
+            if m.kind == MAppend then appends += 1
+            if m.kind == MRead && is_list_obs(m.seen) then lists += 1
+            assert(m.seen != ObsUnborn, "a seeded row read as missing")
+    assert(lists > 0 && appends > 0, s"$lists $appends")
+
+private is_list_obs(s: Obs) -> bool = s match
+    ObsList(_) -> true
+    _ -> false

@@ -602,8 +602,10 @@ passes is not evidence.
   an empty group is F at SER.
 - **W5 nested.** Rows `(k, tag, items RELATION(e, price))`. Ops: append an element to `k.items`; read `k` with
   its whole `items`; read rows `WHERE EXISTS (SELECT 1 FROM items WHERE price > $p)`; read with a shaping inner
-  filter. Each `k.items` is a list-append object (I17); the `EXISTS` reads are W4 predicates over the nested
-  level (I18).
+  filter; read a row and delete it. Each `k.items` is a list-append object (I17), so `items` keeps its order
+  of appends; the row's delete is a write of it under N1. The `EXISTS` reads are W4 predicates over the nested
+  level (I18). A shaping read records, per row returned, `["r", "k.items|price > p", kept]`: a prefix of the
+  elements of one version that the filter keeps.
 - **W6 read-only anomaly** [Fekete]: checking `x`, savings `y`; `T2` deposits into `y`; `T1` withdraws from `x`
   with an overdraft penalty judged on `x + y`; read-only `T3` reads both. Run concurrently at random
   interleavings; the [Fekete] cycle is F at SER, and `T3` never aborts.
