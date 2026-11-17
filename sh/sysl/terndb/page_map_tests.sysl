@@ -188,10 +188,14 @@ setting_the_all_ones_pid_traps()
     val m = page_map().set(0xFFFFFFFFFFFFFFFF, pmf(0))
     assert_eq(m.len(), 1)
 
-// sysl 0.11.8 traps on a failed `require` without printing its message or its place.
-@test(should_trap: "a PID never has bit 63 set", ignore: "a failed require prints neither its message nor its place")
+@test(should_trap: "a PID never has bit 63 set")
 setting_a_pid_with_bit_63_set_traps_with_its_message()
     val m = page_map().set(u64(1) << 63, pmf(0))
+    assert_eq(m.len(), 1)
+
+@test(should_trap: "a PID never has bit 63 set")
+setting_the_all_ones_pid_traps_with_its_message()
+    val m = page_map().set(0xFFFFFFFFFFFFFFFF, pmf(0))
     assert_eq(m.len(), 1)
 
 // -- set ----------------------------------------------------------------------------------------------
