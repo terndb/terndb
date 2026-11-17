@@ -1,0 +1,456 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// The workloads of `isolation.md` §7.2 that the in-memory store can run, each as the plans its
+// clients follow, the rows it starts from, what the checker infers for it, and the invariants of its
+// own the DSG does not express (W3's totals, W3b's pairs, the on-call group). W5 (nested), W7
+// (replicas), W8 (crashes) and W9 (DDL) are not here: `docs/design/history.md` says why.
+
+/** Which levels a run's transactions take (§3.4): all one level, or each drawn from the three. */
+enum LevelMix
+    MixSer
+    MixSi
+    MixRc
+    MixAll
+
+/** A workload: its name, the list and register keys it starts with (registers at `init`), the plans
+ * run before, by and after its clients, what the checker infers, and the anomalies of its own
+ * invariants that `extra` finds in a checked history.
+ */
+struct Workload
+    name: string
+    lists: Buf[string]
+    regs: Buf[string]
+    init: i64
+    pre: Buf[Plan]
+    clients: Buf[Buf[Plan]]
+    post: Buf[Plan]
+    opts: CheckOptions
+    extra: &Fn(HistoryReport) -> Buf[Anomaly]
+
+/** A run: the history recorded and the checker's report on it. */
+struct WorkloadRun
+    history: Buf[HEvent]
+    report: HistoryReport
+
+/** Runs `w` against a store with `faults`, driven by `opts`, and checks the history. */
+run_workload(w: Workload, faults: Faults, opts: DriveOptions) -> WorkloadRun
+    val b = bench(faults)
+    b.seed_rows(w.lists, w.regs, w.init)
+    val clock: &SimClock = SimClock(0)
+
+    drive(b, clock, w.pre, w.clients, w.post, opts) match
+        Ok(h) ->
+            val rep = check_history(h, w.opts)
+            val f = w.extra
+            for a in f(rep)
+                rep.anomalies.push(a)
+            WorkloadRun(h, rep)
+        Err(m) ->
+            val anomalies = buf[Anomaly]()
+            anomalies.push(Anomaly("stuck", true, buf(), buf(), m))
+            WorkloadRun(buf(), HistoryReport(buf(), buf(), anomalies))
+
+/** The level of a transaction in a run of `mix`. */
+pick_level(g: *Rng, mix: LevelMix) -> Isolation = mix match
+    MixSer -> Serializable
+    MixSi -> Snapshot
+    MixRc -> ReadCommitted
+    MixAll -> g.below(3) match
+        0 -> Serializable
+        1 -> Snapshot
+        _ -> ReadCommitted
+
+// A key among `n`, skewed towards the low ones as a Zipfian draw is: the minimum of two uniform
+// draws makes key 0 about `2n - 1` times as likely as key `n - 1`.
+private skewed(g: *Rng, n: u64) -> u64
+    val a = g.below(n)
+    val b = g.below(n)
+    if a < b then a else b
+
+private key_names(prefix: string, n: usize) -> Buf[string]
+    val out = buf[string]()
+    for i in 0..<n
+        out.push(s"$prefix$i")
+    out
+
+/** The value the last read of `key` among `ops` saw; 0 where there is none. */
+read_value(ops: Buf[Mop], key: string) -> i64
+    var v: i64 = 0
+    for m in ops
+        if m.kind == MRead && m.key == key
+            m.seen match
+                ObsNum(n) -> v = n
+                _ -> ()
+    v
+
+/** The rows the last predicate read among `ops` returned. */
+read_rows(ops: Buf[Mop]) -> Buf[string]
+    var rows = buf[string]()
+    for m in ops
+        if m.kind == MPred && m.seen == ObsRows then rows = m.rows
+    rows
+
+private none_extra() -> &Fn(HistoryReport) -> Buf[Anomaly] = r -> buf[Anomaly]()
+
+// A final serializable transaction reading every key, run once every client is done.
+private read_all(lists: Buf[string], regs: Buf[string], groups: []const i64) -> Buf[Plan]
+    val steps = buf[HStep]()
+    for k in lists
+        steps.push(SReadList(k))
+    for k in regs
+        steps.push(SReadReg(k))
+    for grp in groups
+        steps.push(SPred(grp))
+    val out = buf[Plan]()
+    out.push(Plan(Serializable, true, true, steps))
+    out
+
+// -- W1 list-append ------------------------------------------------------------------------------
+
+/** W1: `keys` list keys; each client runs `txns` transactions of 1–8 appends and reads over them,
+ * skewed towards the low keys, and about one in four appends twice to one key (G1b).
+ */
+w1_list_append(seed: u64, clients: usize, txns: usize, keys: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5731)
+    val ks = key_names("l", keys)
+    val cs = buf[Buf[Plan]]()
+
+    for _ in 0..<clients
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val steps = buf[HStep]()
+            val n = 1 + g.below(8)
+            for _ in 0..<n
+                val k = ks[usize(skewed(&g, u64(keys)))]
+                if g.boolean()
+                    steps.push(SAppend(k))
+                    if g.below(4) == 0 then steps.push(SAppend(k))
+                else
+                    steps.push(SReadList(k))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    Workload("W1", ks, buf(), 0, buf(), cs, read_all(ks, buf(), []), check_all(), none_extra())
+
+// -- W2 rw-register ------------------------------------------------------------------------------
+
+/** W2: `keys` registers written with unique values, and two counters. A transaction is a
+ * single-statement increment of a counter (I14) about one time in four, and otherwise 1–4 reads,
+ * writes and read-then-writes of registers.
+ */
+w2_register(seed: u64, clients: usize, txns: usize, keys: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5732)
+    val ks = key_names("r", keys)
+    val counters = key_names("c", 2)
+    val cs = buf[Buf[Plan]]()
+
+    for _ in 0..<clients
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val steps = buf[HStep]()
+            if g.below(4) == 0
+                steps.push(SAdd(counters[usize(g.below(2))], 1))
+            else
+                val n = 1 + g.below(4)
+                for _ in 0..<n
+                    val k = ks[usize(skewed(&g, u64(keys)))]
+                    g.below(10) match
+                        0 | 1 | 2 | 3 -> steps.push(SReadReg(k))
+                        4 | 5 | 6 -> steps.push(SWrite(k))
+                        _ ->
+                            steps.push(SReadReg(k))
+                            steps.push(SWrite(k))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    val all = ks.copy()
+    all.extend(counters.view())
+    Workload("W2", buf(), all, 0, buf(), cs, read_all(buf(), all, []), check_all(), none_extra())
+
+// -- W3 bank -------------------------------------------------------------------------------------
+
+/** W3: `accounts` accounts of 10 each. Transfers read two balances, refuse an overdraft, and move
+ * the amount by two relative updates; readers read every balance in one statement (the total must
+ * be exact at every level, I13) or one statement per account (exact at serializable and snapshot).
+ */
+w3_bank(seed: u64, clients: usize, txns: usize, accounts: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5733)
+    val ks = key_names("b", accounts)
+    val total = i64(accounts) * 10
+    val cs = buf[Buf[Plan]]()
+
+    for _ in 0..<clients
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val steps = buf[HStep]()
+            g.below(5) match
+                0 -> steps.push(SSum(ks, "total"))
+                1 ->
+                    for k in ks
+                        steps.push(SReadReg(k))
+                _ ->
+                    val from = ks[usize(g.below(u64(accounts)))]
+                    var to = ks[usize(g.below(u64(accounts)))]
+                    if to == from then to = ks[(usize(g.below(u64(accounts - 1))) + index_of_name(ks, from) + 1) % accounts]
+                    val amount = 1 + i64(g.below(5))
+                    steps.push(SReadReg(from))
+                    steps.push(SReadReg(to))
+                    steps.push(SThen(m ->
+                        val out = buf[HStep]()
+                        if read_value(m, from) >= amount
+                            out.push(SAdd(from, -amount))
+                            out.push(SAdd(to, amount))
+                        out))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    Workload("W3", buf(), ks, 10, buf(), cs, read_all(buf(), ks, []), CheckOptions(false, false, false), bank_extra(ks, total))
+
+private index_of_name(ks: Buf[string], k: string) -> usize
+    for i in 0..<ks.len()
+        if ks[i] == k then return i
+    0
+
+// W3's own invariants: every `total` read is exact (I13); a reader of every account, one statement
+// each, sums to the total at serializable and snapshot; no balance is read negative where every
+// transaction that debited it ran at snapshot or stronger.
+private bank_extra(ks: Buf[string], total: i64) -> &Fn(HistoryReport) -> Buf[Anomaly] = rep ->
+    val out = buf[Anomaly]()
+
+    for t in rep.txns
+        if t.outcome != TCommitted then continue
+        var sum: i64 = 0
+        var reads: usize = 0
+
+        for m in t.ops
+            if m.kind != MRead then continue
+            val v = m.seen match
+                ObsNum(n) -> n
+                _ -> continue
+            if m.key == "total"
+                if v != total
+                    out.push(Anomaly("bank-total", true, items_of([t.id]), buf(), s"T${t.id} read the total in one statement as ${v}, not ${total}"))
+            else
+                sum += v
+                reads += 1
+                if v < 0
+                    out.push(Anomaly("overdraft", debits_all_strong(rep, m.key), items_of([t.id]), buf(), s"T${t.id} read ${m.key} as ${v}"))
+
+        if reads == ks.len() && sum != total
+            out.push(Anomaly("bank-total-multi", t.rank() >= 1, items_of([t.id]), buf(), s"T${t.id} read every account, one statement each, summing to ${sum}, not ${total}"))
+
+    out
+
+// Whether every committed transaction that took from `key` ran at snapshot or serializable.
+private debits_all_strong(rep: HistoryReport, key: string) -> bool
+    for t in rep.txns
+        if t.outcome != TCommitted then continue
+        for m in t.ops
+            if m.kind == MAdd && m.key == key && m.arg < 0 && t.rank() < 1 then return false
+    true
+
+// -- W3b write skew ------------------------------------------------------------------------------
+
+/** W3b: `pairs` pairs of accounts of 10 each, with the constraint `a + b >= 0`. A withdrawal reads
+ * both and debits one if the pair's sum stays non-negative. A negative pair is forbidden where every
+ * withdrawal from it was serializable (I8).
+ */
+w3b_write_skew(seed: u64, clients: usize, txns: usize, pairs: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5734)
+    val ks = buf[string]()
+    for i in 0..<pairs
+        ks.push(s"p${i}a")
+        ks.push(s"p${i}b")
+    val cs = buf[Buf[Plan]]()
+
+    for _ in 0..<clients
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val p = usize(g.below(u64(pairs)))
+            val a = ks[2 * p]
+            val b = ks[2 * p + 1]
+            val from = if g.boolean() then a else b
+            val amount = 1 + i64(g.below(15))
+            val steps = buf[HStep]()
+            steps.push(SReadReg(a))
+            steps.push(SReadReg(b))
+            steps.push(SThen(m ->
+                val out = buf[HStep]()
+                if read_value(m, a) + read_value(m, b) - amount >= 0 then out.push(SAdd(from, -amount))
+                out))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    Workload("W3b", buf(), ks, 10, buf(), cs, read_all(buf(), ks, []), CheckOptions(false, false, false), pairs_extra(ks))
+
+private pairs_extra(ks: Buf[string]) -> &Fn(HistoryReport) -> Buf[Anomaly] = rep ->
+    val out = buf[Anomaly]()
+
+    for t in rep.txns
+        if t.outcome != TCommitted then continue
+        var i: usize = 0
+        while i + 1 < ks.len()
+            val a = ks[i]
+            val b = ks[i + 1]
+            if reads_key(t, a) && reads_key(t, b) && t.rank() >= 1
+                val sum = read_value(t.ops, a) + read_value(t.ops, b)
+                if sum < 0
+                    val strong = debits_all_ser(rep, a) && debits_all_ser(rep, b)
+                    out.push(Anomaly("negative-pair", strong, items_of([t.id]), buf(), s"T${t.id} read ${a} + ${b} as ${sum}"))
+            i += 2
+
+    out
+
+private reads_key(t: HTxn, key: string) -> bool
+    for m in t.ops
+        if m.kind == MRead && m.key == key && m.seen != ObsNone then return true
+    false
+
+private debits_all_ser(rep: HistoryReport, key: string) -> bool
+    for t in rep.txns
+        if t.outcome != TCommitted then continue
+        for m in t.ops
+            if m.kind == MAdd && m.key == key && t.rank() < 2 then return false
+    true
+
+// -- W4 predicate / phantom ----------------------------------------------------------------------
+
+/** W4: rows `(k, g, v)` in groups 1 and 2, two of each to start. A transaction reads
+ * `g = $g`, then inserts a fresh row into one of the groups, deletes a row it read, or does
+ * nothing.
+ */
+w4_phantom(seed: u64, clients: usize, txns: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5735)
+    val pre_steps = buf[HStep]()
+    for grp in [1, 1, 2, 2]
+        pre_steps.push(SInsert("k", grp))
+    val pre = buf[Plan]()
+    pre.push(hplan(Serializable, pre_steps))
+    val cs = buf[Buf[Plan]]()
+
+    for _ in 0..<clients
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val grp = 1 + i64(g.below(2))
+            val other = 1 + i64(g.below(2))
+            val choice = g.below(4)
+            val pick = g.below(64)
+            val steps = buf[HStep]()
+            steps.push(SPred(grp))
+            steps.push(SThen(m ->
+                val out = buf[HStep]()
+                val rows = read_rows(m)
+                if choice < 2
+                    out.push(SInsert("k", other))
+                elif choice == 2 && rows.len() > 0
+                    out.push(SDelete(rows[usize(pick) % rows.len()]))
+                out))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    Workload("W4", buf(), buf(), 0, pre, cs, read_all(buf(), buf(), [1, 2]), check_all(), none_extra())
+
+/** W4's on-call shape: each client is a doctor with a row in group 1. A doctor on call goes off
+ * (deletes its row) only if the group read holds at least two; one off call goes back on (inserts a
+ * fresh row). An empty group is forbidden where every doctor that went off call was serializable.
+ */
+w4_on_call(seed: u64, clients: usize, txns: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5736)
+    val pre_steps = buf[HStep]()
+    for p in 1..clients
+        pre_steps.push(SInsert(s"d${p}_", 1))
+    val pre = buf[Plan]()
+    pre.push(hplan(Serializable, pre_steps))
+    val cs = buf[Buf[Plan]]()
+
+    for c in 0..<clients
+        val mine = s"d${c + 1}_"
+        val ps = buf[Plan]()
+        for _ in 0..<txns
+            val steps = buf[HStep]()
+            steps.push(SPred(1))
+            steps.push(SThen(m ->
+                val out = buf[HStep]()
+                val rows = read_rows(m)
+                var own = ""
+                for r in rows
+                    if r.starts_with(mine) then own = r
+                if own.len == 0
+                    out.push(SInsert(mine, 1))
+                elif rows.len() >= 2
+                    out.push(SDelete(own))
+                out))
+            ps.push(hplan(pick_level(&g, mix), steps))
+        cs.push(ps)
+
+    Workload("on-call", buf(), buf(), 0, pre, cs, read_all(buf(), buf(), [1]), check_all(), on_call_extra())
+
+private on_call_extra() -> &Fn(HistoryReport) -> Buf[Anomaly] = rep ->
+    val out = buf[Anomaly]()
+    var strong = true
+
+    for t in rep.txns
+        if t.outcome != TCommitted then continue
+        for m in t.ops
+            if m.kind == MDelete && t.rank() < 2 then strong = false
+
+    for t in rep.txns
+        if t.outcome != TCommitted then continue
+        for m in t.ops
+            if m.kind == MPred && m.seen == ObsRows && m.rows.len() == 0
+                out.push(Anomaly("empty-group", strong, items_of([t.id]), buf(), s"T${t.id} found nobody on call"))
+
+    out
+
+// -- W6 the read-only anomaly --------------------------------------------------------------------
+
+/** W6 [Fekete]: `instances` pairs of checking `x<i>` and savings `y<i>`, both 0. Per instance, client
+ * 1 withdraws 10 from `x`, charging 1 more if `x + y - 10` is negative on what it read; client 2
+ * deposits 20 into `y`; client 3 reads both in a transaction declared read-only. The cycle is
+ * forbidden at serializable, and the reader never aborts (I15, I16).
+ */
+w6_read_only(seed: u64, instances: usize, mix: LevelMix) -> Workload
+    var g = rng(seed, 0x5737)
+    val ks = buf[string]()
+    val t1 = buf[Plan]()
+    val t2 = buf[Plan]()
+    val t3 = buf[Plan]()
+
+    for i in 0..<instances
+        val x = s"x$i"
+        val y = s"y$i"
+        ks.push(x)
+        ks.push(y)
+
+        val s2 = buf[HStep]()
+        s2.push(SReadReg(y))
+        s2.push(SThen(m ->
+            val out = buf[HStep]()
+            out.push(SPut(y, read_value(m, y) + 20))
+            out))
+        t2.push(hplan(pick_level(&g, mix), s2))
+
+        val s1 = buf[HStep]()
+        s1.push(SReadReg(x))
+        s1.push(SReadReg(y))
+        s1.push(SThen(m ->
+            val vx = read_value(m, x)
+            val penalty: i64 = if vx + read_value(m, y) - 10 < 0 then 1 else 0
+            val out = buf[HStep]()
+            out.push(SPut(x, vx - 10 - penalty))
+            out))
+        t1.push(hplan(pick_level(&g, mix), s1))
+
+        val s3 = buf[HStep]()
+        s3.push(SReadReg(x))
+        s3.push(SReadReg(y))
+        t3.push(Plan(pick_level(&g, mix), true, false, s3))
+
+    val cs = buf[Buf[Plan]]()
+    cs.push(t1)
+    cs.push(t2)
+    cs.push(t3)
+    Workload("W6", buf(), ks, 0, buf(), cs, read_all(buf(), ks, []), check_all(), none_extra())

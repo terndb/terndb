@@ -1,0 +1,207 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The §7.2 workloads against the real in-memory store: clean runs over many seeds at every level
+// and at mixed levels (§3.4), where the checker must find nothing forbidden; the anomalies a weaker
+// level permits, which must actually occur there, so the checks are not vacuous; and §7.1's "prove
+// the checker can fail": each fault-injected store must be caught, and the same seed on the real
+// store must not be.
+
+/** How many seeds each clean sweep runs per workload and level. Raise it for a longer soak. */
+const CleanSeeds: u64 = 12
+
+/** How far a search for a seed showing an anomaly goes. */
+const SearchSeeds: u64 = 40
+
+/** How many commits in a thousand lose their acknowledgement in a clean run (§5.4). */
+const LostAcks: u64 = 60
+
+private mixes() -> Buf[LevelMix] = items_of([MixSer, MixSi, MixRc, MixAll])
+
+private mix_name(m: LevelMix) -> string = m match
+    MixSer -> "serializable"
+    MixSi -> "snapshot"
+    MixRc -> "read committed"
+    MixAll -> "mixed"
+
+private w1(seed: u64, mix: LevelMix) -> Workload = w1_list_append(seed, 4, 6, 4, mix)
+private w2(seed: u64, mix: LevelMix) -> Workload = w2_register(seed, 4, 6, 4, mix)
+private w3(seed: u64, mix: LevelMix) -> Workload = w3_bank(seed, 4, 6, 4, mix)
+private w3b(seed: u64, mix: LevelMix) -> Workload = w3b_write_skew(seed, 4, 5, 2, mix)
+private w4(seed: u64, mix: LevelMix) -> Workload = w4_phantom(seed, 4, 6, mix)
+private w4c(seed: u64, mix: LevelMix) -> Workload = w4_on_call(seed, 2, 6, mix)
+private w6(seed: u64, mix: LevelMix) -> Workload = w6_read_only(seed, 5, mix)
+
+private faults(skip_validation: bool, skip_fuw: bool, statement_snapshot: bool, stale: bool) -> Faults =
+    Faults(skip_validation, skip_fuw, statement_snapshot, stale)
+
+// Every seed of the sweep at every level mix runs with nothing forbidden found.
+private sweep_clean(make: &Fn(u64, LevelMix) -> Workload, file: string = __FILE__, line: long = __LINE__)
+    for mix in mixes()
+        for seed in 1..CleanSeeds
+            val run = run_workload(make(seed, mix), no_faults(), DriveOptions(seed, LostAcks))
+            val bad = run.report.forbidden()
+            assert(bad.len() == 0, s"seed $seed at ${mix_name(mix)}:\n${run.report.summary()}", file, line)
+
+// The first seed whose run on `f` finds one of `wanted` with the given forbiddenness; 0 if none
+// does within the search. Every seed tried must be clean on the real store.
+private seed_showing(make: &Fn(u64, LevelMix) -> Workload, mix: LevelMix, f: Faults, wanted: []const string, forbidden: bool,
+        file: string = __FILE__, line: long = __LINE__) -> u64
+    for seed in 1..SearchSeeds
+        val run = run_workload(make(seed, mix), f, DriveOptions(seed, 0))
+        var hit = false
+        for a in run.report.anomalies
+            for w in wanted
+                if a.name == w && a.forbidden == forbidden then hit = true
+        if hit
+            val clean = run_workload(make(seed, mix), no_faults(), DriveOptions(seed, 0))
+            assert(clean.report.forbidden().len() == 0, s"seed $seed on the real store:\n${clean.report.summary()}", file, line)
+            return seed
+    0
+
+// -- clean runs ----------------------------------------------------------------------------------
+
+@test
+w1_list_append_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w1(s, m))
+
+@test
+w2_register_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w2(s, m))
+
+@test
+w3_bank_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w3(s, m))
+
+@test
+w3b_write_skew_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w3b(s, m))
+
+@test
+w4_phantom_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w4(s, m))
+
+@test
+w4_on_call_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w4c(s, m))
+
+@test
+w6_read_only_anomaly_runs_clean_at_every_level()
+    sweep_clean((s, m) -> w6(s, m))
+
+@test
+a_clean_run_is_clean_without_the_white_box_fields_too()
+    for mix in mixes()
+        val w = w1(3, mix)
+        val run = run_workload(w, no_faults(), DriveOptions(3, LostAcks))
+        val black = check_history(strip_white_box(run.history), w.opts)
+        assert(black.forbidden().len() == 0, black.summary())
+
+@test
+a_clean_run_has_committed_aborted_and_unknown_transactions()
+    // The sweeps are not vacuous: contention aborts some transactions and lost acknowledgements
+    // leave some unknown, and the checker resolves some of those as committed.
+    var aborted: usize = 0
+    var unknown: usize = 0
+    var resolved: usize = 0
+    var committed: usize = 0
+    for seed in 1..CleanSeeds
+        val run = run_workload(w1(seed, MixSi), no_faults(), DriveOptions(seed, 200))
+        for t in run.report.txns
+            if t.outcome == TAborted then aborted += 1
+            if t.outcome == TUnknown then unknown += 1
+            if t.outcome == TCommitted && t.info then resolved += 1
+            if t.outcome == TCommitted then committed += 1
+    assert(aborted > 0 && unknown + resolved > 0 && resolved > 0 && committed > 0, s"$committed $aborted $unknown $resolved")
+
+// -- what a weaker level permits does occur -------------------------------------------------------
+
+@test
+write_skew_occurs_at_snapshot_in_w2()
+    assert(seed_showing((s, m) -> w2(s, m), MixSi, no_faults(), ["A5B", "G2-item"], false) != 0)
+
+@test
+read_skew_or_a_lost_update_occurs_at_read_committed_in_w1()
+    assert(seed_showing((s, m) -> w1(s, m), MixRc, no_faults(), ["G-single", "P4", "G-nonadjacent"], false) != 0)
+
+@test
+a_phantom_occurs_at_snapshot_in_w4()
+    assert(seed_showing((s, m) -> w4(s, m), MixSi, no_faults(), ["G2"], false) != 0)
+
+@test
+the_on_call_group_can_empty_at_snapshot()
+    assert(seed_showing((s, m) -> w4c(s, m), MixSi, no_faults(), ["empty-group"], false) != 0)
+
+@test
+a_pair_can_go_negative_at_snapshot_in_w3b()
+    assert(seed_showing((s, m) -> w3b(s, m), MixSi, no_faults(), ["negative-pair"], false) != 0)
+
+@test
+the_read_only_anomaly_occurs_at_snapshot_in_w6()
+    assert(seed_showing((s, m) -> w6(s, m), MixSi, no_faults(), ["G2-item", "A5B"], false) != 0)
+
+@test
+an_overdraft_or_a_wrong_multi_statement_total_occurs_at_read_committed_in_w3()
+    assert(seed_showing((s, m) -> w3(s, m), MixRc, no_faults(), ["overdraft", "bank-total-multi"], false) != 0)
+
+// -- prove the checker can fail (§7.1) ------------------------------------------------------------
+
+@test
+without_validation_write_skew_is_caught_at_serializable()
+    assert(seed_showing((s, m) -> w2(s, m), MixSer, faults(true, false, false, false), ["A5B", "G2-item"], true) != 0)
+
+@test
+without_validation_a_phantom_is_caught_at_serializable()
+    assert(seed_showing((s, m) -> w4(s, m), MixSer, faults(true, false, false, false), ["G2"], true) != 0)
+
+@test
+without_validation_the_on_call_group_empties_at_serializable()
+    assert(seed_showing((s, m) -> w4c(s, m), MixSer, faults(true, false, false, false), ["empty-group"], true) != 0)
+
+@test
+without_validation_a_pair_goes_negative_at_serializable()
+    assert(seed_showing((s, m) -> w3b(s, m), MixSer, faults(true, false, false, false), ["negative-pair"], true) != 0)
+
+@test
+without_validation_the_read_only_anomaly_is_caught_at_serializable()
+    assert(seed_showing((s, m) -> w6(s, m), MixSer, faults(true, false, false, false), ["G2-item", "A5B"], true) != 0)
+
+@test
+without_first_updater_wins_a_lost_append_is_caught_at_snapshot()
+    assert(seed_showing((s, m) -> w1(s, m), MixSi, faults(false, true, false, false), ["P4", "G-single", "incompatible-order"], true) != 0)
+
+@test
+without_first_updater_wins_a_lost_register_update_is_caught_at_snapshot()
+    assert(seed_showing((s, m) -> w2(s, m), MixSi, faults(false, true, false, false), ["P4", "G-single"], true) != 0)
+
+@test
+without_first_updater_wins_the_bank_total_breaks_at_snapshot()
+    assert(seed_showing((s, m) -> w3(s, m), MixSi, faults(false, true, false, false), ["bank-total", "bank-total-multi"], true) != 0)
+
+@test
+a_snapshot_taken_per_statement_loses_updates_at_snapshot()
+    assert(seed_showing((s, m) -> w1(s, m), MixSi, faults(false, false, true, false), ["P4", "G-single", "incompatible-order"], true) != 0)
+    assert(seed_showing((s, m) -> w2(s, m), MixSi, faults(false, false, true, false), ["P4", "G-single"], true) != 0)
+
+@test
+a_snapshot_taken_per_statement_keeps_one_statement_totals_exact()
+    // I13 stays green: each statement still reads one snapshot.
+    for seed in 1..CleanSeeds
+        val run = run_workload(w3(seed, MixSi), faults(false, false, true, false), DriveOptions(seed, 0))
+        assert(!run.report.found("bank-total"), run.report.summary())
+
+@test
+a_stale_snapshot_is_caught_as_g_stale_at_every_level()
+    for mix in [MixSer, MixSi, MixRc]
+        assert(seed_showing((s, m) -> w1(s, m), mix, faults(false, false, false, true), ["G-stale"], true) != 0, mix_name(mix))
+        assert(seed_showing((s, m) -> w2(s, m), mix, faults(false, false, false, true), ["G-stale"], true) != 0, mix_name(mix))
+
+@test
+a_stale_snapshot_is_caught_as_a_real_time_violation_at_serializable()
+    assert(seed_showing((s, m) -> w1(s, m), MixSer, faults(false, false, false, true), ["G-rt"], true) != 0)
+
+@test
+a_stale_snapshot_is_caught_in_predicate_reads()
+    assert(seed_showing((s, m) -> w4(s, m), MixSi, faults(false, false, false, true), ["G-stale"], true) != 0)

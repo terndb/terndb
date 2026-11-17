@@ -164,10 +164,17 @@ struct CommittedWrites
     c: u64
     writes: Buf[Write]
 
-/** The fault-injected builds of §7.1 "prove the checker can fail". Both off in a real store. */
+/** The fault-injected builds of §7.1 "prove the checker can fail". All off in a real store.
+ * `si_statement_snapshot` takes a snapshot transaction's snapshot afresh at each statement, as read
+ * committed does. `stale_snapshot` takes every snapshot one commit behind the horizon, so that a
+ * transaction begun after a commit was acknowledged need not see it: what publication out of order,
+ * or acknowledgement before publication, look like to a single-threaded store.
+ */
 struct Faults
     skip_validation: bool
     skip_first_updater_wins: bool
+    si_statement_snapshot: bool
+    stale_snapshot: bool
 
 /** The store: the catalog of the operation in progress (`catalog_mvcc.sysl`), the id and commit
  * counters, the visible horizon `h` (§4.1), each table's rows, the live transactions, the retained
@@ -189,16 +196,20 @@ struct Store
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
-        val t: &Txn = Txn(self.next_txid, level, read_only, self.horizon, Live, buf(), buf(), 0, buf(), buf(), buf(), Mark(0, 0, 0, 0), buf())
+        val t: &Txn = Txn(self.next_txid, level, read_only, self.snapshot_now(), Live, buf(), buf(), 0, buf(), buf(), buf(), Mark(0, 0, 0, 0), buf())
         self.next_txid += 1
         self.active.push(t)
         t
+
+    /** The snapshot a transaction or statement beginning now takes: the horizon (§4.1). */
+    snapshot_now(self) -> u64 = if self.faults.stale_snapshot && self.horizon > 0 then self.horizon - 1 else self.horizon
 
     /** The start of a statement: read committed takes a new snapshot (§3.3); the other levels keep
      * the one taken at begin.
      */
     statement(*self, t: &Txn)
-        if t.state == Live && t.level == ReadCommitted then t.snapshot = self.horizon
+        val fresh = t.level == ReadCommitted || t.level == Snapshot && self.faults.si_statement_snapshot
+        if t.state == Live && fresh then t.snapshot = self.snapshot_now()
         if t.saves.len() == 0 then t.undo.clear()
         t.mark = mark_of(t)
 
@@ -757,7 +768,7 @@ private fill_of(fill: Option[Expr]) -> Value = fill match
     _ -> Null
 
 /** A store over `catalog`'s tables, empty. */
-mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false), 1, 0, buf(), buf(), buf(), catalog_versions(catalog), 0)
+mem_store(catalog: MemCatalog) -> &Store = Store(catalog, Faults(false, false, false, false), 1, 0, buf(), buf(), buf(), catalog_versions(catalog), 0)
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow

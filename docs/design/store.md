@@ -5,7 +5,9 @@
 (`executor.md` §4.5) through `scan_rows`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
 workloads at each level, and each forbidden anomaly again on a fault-injected store); the unique keys and
 foreign keys of `store_index.sysl` are tested in `store_constraint_tests.sysl` and, through DML, in
-`exec_dml_constraint_tests.sysl`.
+`exec_dml_constraint_tests.sysl`. `Faults` holds the fault-injected builds of §7.1 (validation or first-updater-wins
+skipped, a snapshot taken per statement at snapshot level, a snapshot one commit behind the horizon), all off
+in a real store; the history checker of `history.md` is proven against each.
 
 ## Structure
 
