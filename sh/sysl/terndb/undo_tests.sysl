@@ -72,6 +72,9 @@ private ux_del(u: &UndoRows, key: string) -> u64
     ux_done(u.delete(t, 1, key.bytes))
     u.commit(t).unwrap()
 
+/** Every row of the leaf, by table and key. */
+private ux_rows(u: &UndoRows) -> Buf[LeafRow] = u.leaf_rows().unwrap()
+
 private ux_check(u: &UndoRows) -> UndoStats = check_undo(u) match
     Ok(s) -> s
     Err(e) -> panic(s"the undo check failed: ${e.message}")
@@ -226,7 +229,7 @@ an_insert_then_a_delete_in_one_transaction_leaves_a_ghost_no_one_sees()
     assert_eq(ux_get(u, "k", s0, 0), None)
     u.release_snapshot(s0)
     assert_eq(u.purge(1000), Ok(PurgeStats(2, 1, 1)))
-    assert_eq(u.rows.len(), 0)
+    assert_eq(u.row_count(), 0)
     assert_eq(ux_check(u), UndoStats(0, 0, 0, 0))
 
 @test
@@ -236,7 +239,7 @@ an_insert_then_a_delete_in_one_transaction_rolls_back_to_no_row()
     ux_done(u.insert(t, 1, "k".bytes, 1, ux_cols(["a"]).view()))
     ux_done(u.delete(t, 1, "k".bytes))
     assert_eq(u.abort(t), Ok(true))
-    assert_eq(u.rows.len(), 0)
+    assert_eq(u.row_count(), 0)
     assert_eq(ux_get(u, "k", 1000, 0), None)
     ux_check(u)
 
@@ -268,7 +271,7 @@ an_update_of_a_row_the_same_transaction_inserted_rolls_back_to_no_row()
     ux_done(u.update(t, 1, "k".bytes, 1, ux_cols(["v2"]).view()))
     ux_done(u.update(t, 1, "k".bytes, 1, ux_cols(["v3"]).view()))
     assert_eq(u.abort(t), Ok(true))
-    assert_eq(u.rows.len(), 1)
+    assert_eq(u.row_count(), 1)
     assert_eq(ux_get(u, "k", 1000, 0), None)
     assert_eq(ux_get(u, "other", 1000, 0), Some(ux_cols(["x"])))
     ux_check(u)
@@ -299,11 +302,11 @@ an_insert_over_a_ghost_rolls_back_to_the_ghost()
     val u = undo_rows()
     ux_put(u, "k", ["v1"])
     val c2 = ux_del(u, "k")
-    val ghost = copy_row_image(u.rows[0].row)
+    val ghost = ux_rows(u)[0].row
     val t = u.begin()
     ux_done(u.insert(t, 1, "k".bytes, 1, ux_cols(["v3"]).view()))
     assert_eq(u.abort(t), Ok(true))
-    assert_eq(u.rows[0].row, ghost)
+    assert_eq(ux_rows(u)[0].row,ghost)
     assert_eq(ux_get(u, "k", c2, 0), None)
     assert_eq(ux_get(u, "k", 1, 0), Some(ux_cols(["v1"])))
     ux_check(u)
@@ -388,23 +391,30 @@ a_row_image_of_no_columns_has_versions_like_any_other()
     assert_eq(ux_get(u, "k", c1, 0), Some(buf[ColumnImage]()))
     assert_eq(ux_get(u, "k", c2, 0), Some(buf[ColumnImage]()))
     assert_eq(ux_get(u, "k", c3, 0), None)
-    // A column of no bytes is not a null one.
-    val c4 = ux_put(u, "e", [""])
-    val c5 = ux_set(u, "e", ["~"])
-    val c6 = ux_set(u, "e", [""])
-    assert_eq(ux_get(u, "e", c4, 0), Some(ux_cols([""])))
-    assert_eq(ux_get(u, "e", c5, 0), Some(ux_cols(["~"])))
-    assert_eq(ux_get(u, "e", c6, 0), Some(ux_cols([""])))
-    assert(ux_cols([""]) != ux_cols(["~"]), "empty and null differ")
     ux_check(u)
+    // A column of no bytes is not a null one. (A table's schema version has one column count, so
+    // the one-column rows go in a store of their own.)
+    val v = undo_rows()
+    val c4 = ux_put(v, "e", [""])
+    val c5 = ux_set(v, "e", ["~"])
+    val c6 = ux_set(v, "e", [""])
+    assert_eq(ux_get(v, "e", c4, 0), Some(ux_cols([""])))
+    assert_eq(ux_get(v, "e", c5, 0), Some(ux_cols(["~"])))
+    assert_eq(ux_get(v, "e", c6, 0), Some(ux_cols([""])))
+    assert(ux_cols([""]) != ux_cols(["~"]), "empty and null differ")
+    ux_check(v)
+    // A row of another column count in the same schema version is refused.
+    val t5 = u.begin()
+    assert_eq(u.insert(t5, 1, "x".bytes, 1, ux_cols(["a"]).view()).unwrap_err().code, "Q3001")
 
 @test
 row_images_at_the_in_place_limit_fit_their_records()
     // The largest entry stored in place is 4,000 bytes (§4.7), so no old value of an in-place row
-    // reaches the 16,352 bytes of an undo page.
+    // reaches the 16,352 bytes of an undo page. One variable column takes a bitmap byte and an
+    // offset beside its bytes.
     val u = undo_rows()
     val key = "k".bytes
-    val big = InlineEntryLimit - RowHeaderSize - key.len
+    val big = InlineEntryLimit - RowHeaderSize - 1 - 2 - key.len
     val t0 = u.begin()
     ux_done(u.insert(t0, 1, key, 1, [ux_fill(0x41, big)]))
     u.commit(t0)
@@ -454,11 +464,11 @@ aborting_a_transaction_with_no_writes_changes_nothing()
 aborting_a_transaction_with_one_write_restores_the_row_header()
     val u = undo_rows()
     ux_put(u, "k", ["a"])
-    val before = copy_row_image(u.rows[0].row)
+    val before = ux_rows(u)[0].row
     val t = u.begin()
     ux_done(u.update(t, 1, "k".bytes, 1, ux_cols(["b"]).view()))
     assert_eq(u.abort(t), Ok(true))
-    assert_eq(u.rows[0].row, before)
+    assert_eq(ux_rows(u)[0].row,before)
     assert_eq(ux_get(u, "k", 1000, 0), Some(ux_cols(["a"])))
     ux_check(u)
 
@@ -471,8 +481,8 @@ aborting_a_transaction_with_writes_across_many_pages_restores_every_row()
 
     val before = buf[RowImage]()
 
-    for r in u.rows
-        before.push(copy_row_image(r.row))
+    for r in ux_rows(u)
+        before.push(r.row)
 
     val first_page = u.space.next_page
     val t = u.begin()
@@ -498,10 +508,12 @@ aborting_a_transaction_with_writes_across_many_pages_restores_every_row()
     assert(u.space.next_page - first_page >= 4, "the transaction's writes span pages")
     ux_check(u)
     assert_eq(u.abort(t), Ok(true))
-    assert_eq(u.rows.len(), 40)
+    assert_eq(u.row_count(), 40)
+
+    val after = ux_rows(u)
 
     for i in 0..<40
-        assert_eq(u.rows[i].row, before[i], s"row $i")
+        assert_eq(after[i].row, before[i], s"row $i")
 
     ux_check(u)
     u.purge(1000).unwrap()
@@ -570,7 +582,7 @@ truncation_with_no_live_snapshot_purges_everything_committed()
     assert_eq(u.snapshots.len(), 0)
     assert_eq(u.horizon(), 4)
     assert_eq(u.purge(0xffffffffffffffff), Ok(PurgeStats(4, 1, 1)))
-    assert_eq(u.rows.len(), 1)
+    assert_eq(u.row_count(), 1)
     assert_eq(ux_get(u, "b", 4, 0), Some(ux_cols(["3"])))
     assert_eq(ux_check(u), UndoStats(0, 0, 1, 0))
 
@@ -584,12 +596,12 @@ purge_stops_at_the_first_record_of_a_live_transaction()
     val low = u.space.low
     assert_eq(u.purge(0xffffffffffffffff), Ok(PurgeStats(0, 0, 0)))
     assert_eq(u.space.low, low)
-    assert_eq(u.rows.len(), 2)
+    assert_eq(u.row_count(), 2)
     ux_check(u)
     // Once it is rolled back its records are finished too, and the ghost after them goes.
     assert_eq(u.abort(t1), Ok(true))
     assert_eq(u.purge(0xffffffffffffffff), Ok(PurgeStats(3, 1, 1)))
-    assert_eq(u.rows.len(), 0)
+    assert_eq(u.row_count(), 0)
     assert_eq(ux_check(u), UndoStats(0, 0, 0, 0))
 
 @test
@@ -612,10 +624,10 @@ rolling_back_an_insert_over_a_ghost_purge_passed_removes_the_ghost()
     ux_done(u.insert(t, 1, "k".bytes, 1, ux_cols(["v4"]).view()))
     // Purge passes the DELETE but leaves the row, which the live insert now owns.
     assert_eq(u.purge(0xffffffffffffffff), Ok(PurgeStats(3, 0, 0)))
-    assert_eq(u.rows.len(), 2)
+    assert_eq(u.row_count(), 2)
     ux_check(u)
     assert_eq(u.abort(t), Ok(true))
-    assert_eq(u.rows.len(), 1)
+    assert_eq(u.row_count(), 1)
     assert_eq(ux_get(u, "k", c3, 0), None)
     assert_eq(ux_check(u), UndoStats(1, 1, 1, 0))
     // The same rollback with the DELETE still above undo_low restores the ghost.
@@ -897,20 +909,20 @@ a_damaged_chain_is_refused_by_reads_and_rollback()
     val t = u.begin()
     ux_done(u.update(t, 1, "b".bytes, 1, ux_cols(["4"]).view()))
     // Row a's undo now names the record of another transaction.
-    val ra = u.rows[0]
-    u.rows[0] = LeafRow(ra.oid, ra.key, RowImage(RowHeader(ra.row.header.txn, u.rows[1].row.header.undo, 0, 1), ra.row.cols))
+    val ra = ux_rows(u)[0]
+    val rb = ux_rows(u)[1]
+    u.put_row(1, ra.key.view(), RowImage(RowHeader(ra.row.header.txn, rb.row.header.undo, 0, 1), ra.row.cols))
     ux_corrupt(u.read(1, "a".bytes, 1, 0), "a chain naming another transaction's record")
     ux_corrupt(check_undo(u), "the check of that chain")
     // A row naming a transaction that never began.
-    u.rows[0] = LeafRow(ra.oid, ra.key, RowImage(RowHeader(500, ra.row.header.undo, 0, 1), ra.row.cols))
+    u.put_row(1, ra.key.view(), RowImage(RowHeader(500, ra.row.header.undo, 0, 1), ra.row.cols))
     ux_corrupt(u.read(1, "a".bytes, 1, 0), "a transaction that never began")
-    u.rows[0] = ra
+    u.put_row(1, ra.key.view(), ra.row)
     assert_eq(ux_get(u, "a", 1, 0), Some(ux_cols(["1"])))
     // Rollback that finds the row rewritten under it.
-    val rb = u.rows[1]
-    u.rows[1] = LeafRow(rb.oid, rb.key, RowImage(RowHeader(t, rb.row.header.undo + 1, 0, 1), rb.row.cols))
+    u.put_row(1, rb.key.view(), RowImage(RowHeader(t, rb.row.header.undo + 1, 0, 1), rb.row.cols))
     ux_corrupt(u.abort(t), "a rollback whose row moved on")
-    u.rows[1] = rb
+    u.put_row(1, rb.key.view(), rb.row)
     assert_eq(u.abort(t), Ok(true))
     ux_check(u)
 
@@ -960,27 +972,29 @@ the_check_refuses_each_kind_of_damage()
     val u5 = undo_rows()
     ux_put(u5, "a", ["1"])
     ux_del(u5, "a")
-    val ghost = u5.rows[0]
+    val ghost = ux_rows(u5)[0]
     u5.purge(0xffffffffffffffff).unwrap()
-    u5.rows.push(ghost)
+    u5.put_row(1, ghost.key.view(), ghost.row)
     ux_corrupt(check_undo(u5), "a purged ghost left in the leaf")
-    // Rows out of key order, and a row carrying a rolled-back transaction.
+    // A row carrying a rolled-back transaction. Key order is the B+tree's, which its own check
+    // covers (`btree_tests.sysl`).
     val u6 = undo_rows()
     ux_put(u6, "a", ["1"])
     ux_put(u6, "b", ["2"])
-    val r0 = u6.rows[0]
-    u6.rows[0] = u6.rows[1]
-    u6.rows[1] = r0
-    ux_corrupt(check_undo(u6), "rows out of order")
-    u6.rows[1] = u6.rows[0]
-    u6.rows[0] = r0
+    val r0 = ux_rows(u6)[0]
     val t6 = u6.begin()
     assert_eq(u6.abort(t6), Ok(true))
-    u6.rows[0] = LeafRow(r0.oid, r0.key, RowImage(RowHeader(t6, r0.row.header.undo, 0, 1), r0.row.cols))
+    u6.put_row(1, r0.key.view(), RowImage(RowHeader(t6, r0.row.header.undo, 0, 1), r0.row.cols))
     ux_corrupt(check_undo(u6), "a row naming a rolled-back transaction")
     // A row flagged LOCK_ONLY whose undo names an INSERT, not a LOCK.
-    u6.rows[0] = LeafRow(r0.oid, r0.key, RowImage(RowHeader(r0.row.header.txn, r0.row.header.undo, RowLockOnly, 1), r0.row.cols))
+    u6.put_row(1, r0.key.view(), RowImage(RowHeader(r0.row.header.txn, r0.row.header.undo, RowLockOnly, 1), r0.row.cols))
     ux_corrupt(check_undo(u6), "a LOCK_ONLY row over an INSERT record")
     // A ghost that is LOCK_ONLY.
-    u6.rows[0] = LeafRow(r0.oid, r0.key, RowImage(RowHeader(r0.row.header.txn, r0.row.header.undo, RowLockOnly | RowDeleted, 1), r0.row.cols))
+    u6.put_row(1, r0.key.view(), RowImage(RowHeader(r0.row.header.txn, r0.row.header.undo, RowLockOnly | RowDeleted, 1), r0.row.cols))
     ux_corrupt(check_undo(u6), "a lock-only ghost")
+    u6.put_row(1, r0.key.view(), r0.row)
+    ux_check(u6)
+    // A leaf page damaged under the rows fails the B+tree check the undo check runs.
+    val root = u6.tree_of(1).unwrap().root_frame()
+    root.page[0] = 1
+    ux_corrupt(check_undo(u6), "a leaf page with a checksum")

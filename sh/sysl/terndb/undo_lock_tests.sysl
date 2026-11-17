@@ -44,7 +44,7 @@ private ul_get(u: &UndoRows, key: string, s: u64, own: u64) -> Option[Buf[Column
     Ok(None) -> None
     Err(e) -> panic(s"a read failed: ${e.message}")
 
-private ul_row(u: &UndoRows, key: string) -> RowImage = u.current(1, key.bytes).unwrap()
+private ul_row(u: &UndoRows, key: string) -> RowImage = u.current(1, key.bytes).unwrap().unwrap()
 
 private ul_check(u: &UndoRows) -> UndoStats = check_undo(u) match
     Ok(s) -> s
