@@ -36,8 +36,13 @@ struct WorkloadRun
     report: HistoryReport
 
 /** Runs `w` against a store with `faults`, driven by `opts`, and checks the history. */
-run_workload(w: Workload, faults: Faults, opts: DriveOptions) -> WorkloadRun
-    val b = bench(faults)
+run_workload(w: Workload, faults: Faults, opts: DriveOptions) -> WorkloadRun = run_workload_on(bench(faults), w, opts)
+
+/** Runs `w` against the target `b`, which has run nothing yet, driven by `opts`, and checks the
+ * history. A run that cannot finish, or that a lock-step target stops, reports one `stuck` anomaly
+ * saying why.
+ */
+run_workload_on(b: &HTarget, w: Workload, opts: DriveOptions) -> WorkloadRun
     b.seed_rows(w.lists, w.regs, w.init)
     val clock: &SimClock = SimClock(0)
 

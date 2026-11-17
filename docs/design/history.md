@@ -25,8 +25,9 @@ against each fault-injected store).
 
 ## The driver
 
-`drive` runs a list of `Plan`s per client against a `Bench`, a fresh store with three tables (`lists` for
-list keys, `regs` for registers, counters and accounts, `grp(k, g, v)` for W4's rows). A plan is a level, a
+`drive` runs a list of `Plan`s per client against any `HTarget` (`iso-model.md`): a `Bench`, a fresh store
+with four tables (`lists` for list keys, `regs` for registers, counters and accounts, `grp(k, g, v)` for W4's
+rows, `nest(k, tag, items)` for W5's), the isolation model, or the two in lock step. A plan is a level, a
 read-only flag, whether a retryable failure re-runs it (§5.3), and `HStep`s. `SAppend`, `SWrite` and
 `SInsert` take a fresh unique value when the transaction is invoked, so a retried attempt writes its own
 values; `SThen` is replaced, when its turn comes, by the steps its function makes of what was read so far
@@ -102,7 +103,8 @@ while W3's one-statement total stays green), and `stale_snapshot`, a snapshot on
 which is what publication out of order or acknowledgement before publication look like to a single-threaded
 store (G-stale at every level, G-rt at serializable). Each is caught on some seed, and the same seed on the
 real store is clean. The unrecorded setup ends with a commit of its own (a row no key names), so that a stale
-snapshot still sees the seeded rows and the fault shows as a reader missing a recorded commit.
+snapshot still sees the seeded rows and the fault shows as a reader missing a recorded commit. Every target
+makes the same `SetupCommits` setup commits, the model included, so lock step stays aligned (`iso-model.md`).
 
 ## W5 and the nested level
 

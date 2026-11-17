@@ -1,0 +1,474 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The isolation model against the store and against §3 (`isolation.md` §7.4): every §7.2 workload
+// the driver has, at every level mix, run on the store and the model in lock step with no
+// divergence; each fault-injected store diverging from the model on some seed, at a named step,
+// where the real store does not; and the model's own histories checked by the history checker with
+// the expectations a store's must meet, including the anomalies a weaker level permits actually
+// occurring.
+
+/** How many seeds each lock-step sweep runs per workload and level mix. Raise it for a longer soak. */
+const LockstepSeeds: u64 = 6
+
+/** How far a search for a seed on which a faulty store diverges goes. */
+const DivergeSeeds: u64 = 40
+
+/** How many commits in a thousand lose their acknowledgement in a lock-step run (§5.4). */
+const LockstepLostAcks: u64 = 60
+
+private ls_mixes() -> Buf[LevelMix] = items_of([MixSer, MixSi, MixRc, MixAll])
+
+private ls_mix_name(m: LevelMix) -> string = m match
+    MixSer -> "serializable"
+    MixSi -> "snapshot"
+    MixRc -> "read committed"
+    MixAll -> "mixed"
+
+private ls_w1(seed: u64, mix: LevelMix) -> Workload = w1_list_append(seed, 4, 6, 4, mix)
+private ls_w2(seed: u64, mix: LevelMix) -> Workload = w2_register(seed, 4, 6, 4, mix)
+private ls_w3(seed: u64, mix: LevelMix) -> Workload = w3_bank(seed, 4, 6, 4, mix)
+private ls_w3b(seed: u64, mix: LevelMix) -> Workload = w3b_write_skew(seed, 4, 5, 2, mix)
+private ls_w4(seed: u64, mix: LevelMix) -> Workload = w4_phantom(seed, 4, 6, mix)
+private ls_w4c(seed: u64, mix: LevelMix) -> Workload = w4_on_call(seed, 2, 6, mix)
+private ls_w6(seed: u64, mix: LevelMix) -> Workload = w6_read_only(seed, 5, mix)
+private ls_w5(seed: u64, mix: LevelMix) -> Workload = w5_nested(seed, 4, 6, 5, mix)
+
+private ls_faults(skip_validation: bool, skip_fuw: bool, statement_snapshot: bool, stale: bool) -> Faults =
+    Faults(skip_validation, skip_fuw, statement_snapshot, stale)
+
+/** Runs `seeds` seeds of `make` at every level mix on the real store and the model in lock step:
+ * none may diverge.
+ */
+lockstep_sweep(make: &Fn(u64, LevelMix) -> Workload, seeds: u64, file: string = __FILE__, line: long = __LINE__)
+    for mix in ls_mixes()
+        for seed in 1..seeds
+            lockstep_divergence(make(seed, mix), no_faults(), DriveOptions(seed, LockstepLostAcks)) match
+                Some(m) -> assert(false, s"${ls_mix_name(mix)}: $m", file, line)
+                None -> ()
+
+/** The first seed on which the store with `f` diverges from the model, at a named step; 0 if none
+ * does within the search. The real store must not diverge on that seed.
+ */
+private ls_diverging_seed(make: &Fn(u64, LevelMix) -> Workload, mix: LevelMix, f: Faults, file: string = __FILE__, line: long = __LINE__) -> u64
+    for seed in 1..DivergeSeeds
+        lockstep_divergence(make(seed, mix), f, DriveOptions(seed, 0)) match
+            Some(m) ->
+                assert(m.contains("lock-step divergence at step ") && m.contains(s"(seed $seed)"), m, file, line)
+                val clean = lockstep_divergence(make(seed, mix), no_faults(), DriveOptions(seed, 0))
+                assert(clean.is_none(), s"seed $seed on the real store: ${clean.unwrap_or("")}", file, line)
+                return seed
+            None -> ()
+    0
+
+/** Runs `seeds` seeds of `make` at every level mix on the model alone: the checker must find nothing
+ * forbidden in its histories.
+ */
+private ls_model_clean(make: &Fn(u64, LevelMix) -> Workload, seeds: u64, file: string = __FILE__, line: long = __LINE__)
+    for mix in ls_mixes()
+        for seed in 1..seeds
+            val run = run_workload_on(model_bench(), make(seed, mix), DriveOptions(seed, LockstepLostAcks))
+            val bad = run.report.forbidden()
+            assert(bad.len() == 0, s"seed $seed at ${ls_mix_name(mix)}:\n${run.report.summary()}", file, line)
+
+/** The first seed whose model history shows one of `wanted`, permitted; 0 if none does. */
+private ls_model_showing(make: &Fn(u64, LevelMix) -> Workload, mix: LevelMix, wanted: []const string) -> u64
+    for seed in 1..DivergeSeeds
+        val run = run_workload_on(model_bench(), make(seed, mix), DriveOptions(seed, 0))
+        for a in run.report.anomalies
+            for w in wanted
+                if a.name == w && !a.forbidden then return seed
+    0
+
+// -- lock step: the real store agrees with the model ------------------------------------------------
+
+@test
+w1_list_append_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w1(s, m), LockstepSeeds)
+
+@test
+w2_register_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w2(s, m), LockstepSeeds)
+
+@test
+w3_bank_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w3(s, m), LockstepSeeds)
+
+@test
+w3b_write_skew_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w3b(s, m), LockstepSeeds)
+
+@test
+w4_phantom_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w4(s, m), LockstepSeeds)
+
+@test
+w4_on_call_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w4c(s, m), LockstepSeeds)
+
+@test
+w6_read_only_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w6(s, m), LockstepSeeds)
+
+@test
+w5_nested_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w5(s, m), LockstepSeeds)
+
+@test
+a_w5_lock_step_run_exercises_every_nested_step()
+    // The W5 sweep is not vacuous: the store and the model agreed on appends inside a row, whole-row
+    // reads, the nested predicate returning rows and missing some, shaping reads keeping elements,
+    // row deletes, rows found missing, waits and aborts.
+    var appends: usize = 0
+    var deletes: usize = 0
+    var missing: usize = 0
+    var pred_hits: usize = 0
+    var pred_misses: usize = 0
+    var shaped: usize = 0
+    var failed: usize = 0
+    var waits: u64 = 0
+    for seed in 1..LockstepSeeds
+        val w = ls_w5(seed, MixAll)
+        val l = lockstep(no_faults(), seed)
+        l.seed_rows(w.lists, w.regs, w.init)
+        val clock: &SimClock = SimClock(0)
+        val h = drive(l, clock, w.pre, w.clients, w.post, DriveOptions(seed, 0))
+        assert(h.is_ok() && l.failure.is_none(), l.failure.unwrap_or(""))
+        for e in h.unwrap()
+            if e.kind == HFail then failed += 1
+            if e.kind != HOk then continue
+            for m in e.value
+                if m.kind == MAppend && is_nested_key(m.key) then appends += 1
+                if m.kind == MDelete then deletes += 1
+                if m.kind == MRead && m.seen == ObsUnborn then missing += 1
+                if m.kind == MPred && m.rows.len() > 0 then pred_hits += 1
+                if m.kind == MPred && m.rows.len() < 5 then pred_misses += 1
+                if m.kind == MRead && m.key.contains("|")
+                    m.seen match
+                        ObsList(xs) -> if xs.len() > 0 then shaped += 1
+                        _ -> ()
+        waits += l.waits
+    assert(appends > 0 && deletes > 0 && missing > 0 && pred_hits > 0 && pred_misses > 0 && shaped > 0 && failed > 0 && waits > 0,
+        s"appends $appends, deletes $deletes, missing $missing, predicate hits $pred_hits and misses $pred_misses, shaped $shaped, failed $failed, waits $waits")
+
+// -- the nested steps one at a time -----------------------------------------------------------------
+
+// A lock step over W5's rows `n0` (row key 1, tag 1), `n1` (row key 2, tag 0) and `n2` (row key 3,
+// tag 1), and the register `x`.
+private ls_nested() -> &LockStep
+    val l = lockstep(no_faults(), 1)
+    l.seed_rows(items_of(["n0.items", "n1.items", "n2.items"]), items_of(["x"]), 0)
+    l
+
+// Runs `step` of `txn` in lock step: the answer must be `want`, and the model must have agreed.
+private ls_expect(l: &LockStep, txn: u64, step: HStep, want: StepEnd, file: string = __FILE__, line: long = __LINE__)
+    val got = l.run(txn, step)
+    assert(l.failure.is_none(), l.failure.unwrap_or(""), file, line)
+    assert(got == want, s"${step_text(step)}: ${end_text(got)}, wanted ${end_text(want)}", file, line)
+
+private ls_rows(pred: string, rows: []const string) -> StepEnd = StepRan(Some(Mop(MPred, pred, 0, ObsRows, items_of(rows))))
+
+private ls_none(pred: string) -> StepEnd = StepRan(Some(Mop(MPred, pred, 0, ObsRows, buf[string]())))
+
+private ls_kept(row: string, bound: i64, kept: Buf[i64]) -> Mop = Mop(MRead, nest_filter_key(row, bound), 0, ObsList(kept), buf())
+
+private ls_ints(xs: []const i64) -> Buf[i64] = items_of(xs)
+
+private ls_all(ms: []const Mop) -> StepEnd = StepRanAll(items_of(ms))
+
+@test
+each_nested_step_answers_alike_on_the_store_and_the_model()
+    val l = ls_nested()
+    val (t, snap) = l.begin(Serializable, false)
+    assert_eq(snap, SetupCommits)
+    ls_expect(l, t, SAppendE("n0.items", 17), StepRan(Some(m_append("n0.items", 17))))
+    ls_expect(l, t, SAppendE("n0.items", 4), StepRan(Some(m_append("n0.items", 4))))
+    ls_expect(l, t, SReadList("n0.items"), StepRan(Some(m_read_list("n0.items", [17, 4]))))
+    // The price is `e mod 10` and the comparison strict: 17 is priced 7.
+    ls_expect(l, t, SNestExists(6), ls_rows(nest_pred(6), ["n0"]))
+    ls_expect(l, t, SNestExists(7), ls_none(nest_pred(7)))
+    // Tag 1 is `n0` and `n2`; the inner filter shapes each row's `items` and drops no row.
+    ls_expect(l, t, SNestShape(1, 4), ls_all([ls_kept("n0", 4, ls_ints([17])), ls_kept("n2", 4, buf[i64]())]))
+    ls_expect(l, t, SNestShape(1, 3), ls_all([ls_kept("n0", 3, ls_ints([17, 4])), ls_kept("n2", 3, buf[i64]())]))
+    ls_expect(l, t, SNestShape(0, 9), ls_all([ls_kept("n1", 9, buf[i64]())]))
+    ls_expect(l, t, SNestShape(2, 0), StepRanAll(buf[Mop]()))
+    ls_expect(l, t, SNestDelete("n1"), StepRan(Some(m_delete("n1"))))
+    ls_expect(l, t, SReadList("n1.items"), StepRan(Some(m_read_unborn("n1.items"))))
+    ls_expect(l, t, SNestShape(0, 0), StepRanAll(buf[Mop]()))
+    // A write of a row that is gone writes nothing and records a read finding no row.
+    ls_expect(l, t, SAppendE("n1.items", 5), StepRan(Some(m_read_unborn("n1.items"))))
+    ls_expect(l, t, SNestDelete("n1"), StepRan(Some(m_read_unborn("n1.items"))))
+    // So does a row never seeded.
+    ls_expect(l, t, SReadList("n9.items"), StepRan(Some(m_read_unborn("n9.items"))))
+    ls_expect(l, t, SAppendE("n9.items", 3), StepRan(Some(m_read_unborn("n9.items"))))
+    ls_expect(l, t, SNestDelete("n9"), StepRan(Some(m_read_unborn("n9.items"))))
+    assert(l.commit(t) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+    assert(l.failure.is_none(), l.failure.unwrap_or(""))
+
+@test
+a_committed_nested_append_and_delete_are_seen_alike_by_a_later_transaction()
+    val l = ls_nested()
+    val (w, _) = l.begin(Snapshot, false)
+    ls_expect(l, w, SAppendE("n2.items", 26), StepRan(Some(m_append("n2.items", 26))))
+    ls_expect(l, w, SNestDelete("n0"), StepRan(Some(m_delete("n0"))))
+    assert(l.commit(w) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+    val (r, snap) = l.begin(Snapshot, true)
+    assert_eq(snap, SetupCommits + 1)
+    ls_expect(l, r, SNestExists(5), ls_rows(nest_pred(5), ["n2"]))
+    ls_expect(l, r, SNestShape(1, 5), ls_all([ls_kept("n2", 5, ls_ints([26]))]))
+    ls_expect(l, r, SReadList("n0.items"), StepRan(Some(m_read_unborn("n0.items"))))
+    // A read-only transaction's empty write set commits at its snapshot (§5.5).
+    assert(l.commit(r) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+
+@test
+a_nested_append_waits_for_another_writer_of_its_row_and_then_follows_the_level()
+    // First-updater-wins over a row (§4.2): the second writer of `n0` waits; once the first commits,
+    // snapshot and serializable abort it and read committed appends over the newest version.
+    for level in items_of([Serializable, Snapshot, ReadCommitted])
+        val l = ls_nested()
+        val (a, _) = l.begin(level, false)
+        val (b, _) = l.begin(level, false)
+        ls_expect(l, a, SAppendE("n0.items", 11), StepRan(Some(m_append("n0.items", 11))))
+        ls_expect(l, b, SAppendE("n0.items", 12), StepBlocked(a))
+        assert(l.commit(a) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+        if level == ReadCommitted
+            ls_expect(l, b, SAppendE("n0.items", 12), StepRan(Some(m_append("n0.items", 12))))
+            ls_expect(l, b, SReadList("n0.items"), StepRan(Some(m_read_list("n0.items", [11, 12]))))
+            assert(l.commit(b) == Ok(SetupCommits + 2), l.failure.unwrap_or(""))
+        else
+            ls_expect(l, b, SAppendE("n0.items", 12), StepFailed("T1001", Some(m_append("n0.items", 12))))
+            assert(l.commit(b) == Err("T1001"), l.failure.unwrap_or(""))
+        assert(l.failure.is_none(), l.failure.unwrap_or(""))
+
+@test
+an_append_racing_a_row_delete_waits_and_then_finds_the_row_gone_at_read_committed()
+    for level in items_of([Serializable, Snapshot, ReadCommitted])
+        val l = ls_nested()
+        val (d, _) = l.begin(level, false)
+        val (a, _) = l.begin(level, false)
+        ls_expect(l, d, SNestDelete("n1"), StepRan(Some(m_delete("n1"))))
+        ls_expect(l, a, SAppendE("n1.items", 13), StepBlocked(d))
+        assert(l.commit(d) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+        if level == ReadCommitted
+            ls_expect(l, a, SAppendE("n1.items", 13), StepRan(Some(m_read_unborn("n1.items"))))
+            // It wrote nothing, so it commits at its snapshot.
+            assert(l.commit(a) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+        else
+            ls_expect(l, a, SAppendE("n1.items", 13), StepFailed("T1001", Some(m_append("n1.items", 13))))
+        assert(l.failure.is_none(), l.failure.unwrap_or(""))
+
+@test
+write_skew_through_the_nested_predicate_is_refused_only_at_serializable()
+    // Each reads `EXISTS (… price > 5)`, finds no row, and appends a matching element to a different
+    // row: serializable refuses the second commit (§4.3), snapshot and read committed take both.
+    for level in items_of([Serializable, Snapshot, ReadCommitted])
+        val l = ls_nested()
+        val (a, _) = l.begin(level, false)
+        val (b, _) = l.begin(level, false)
+        ls_expect(l, a, SNestExists(5), ls_none(nest_pred(5)))
+        ls_expect(l, b, SNestExists(5), ls_none(nest_pred(5)))
+        ls_expect(l, a, SAppendE("n0.items", 18), StepRan(Some(m_append("n0.items", 18))))
+        ls_expect(l, b, SAppendE("n1.items", 19), StepRan(Some(m_append("n1.items", 19))))
+        assert(l.commit(a) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+        val want: Result[u64, string] = if level == Serializable then Err("T1001") else Ok(SetupCommits + 2)
+        assert(l.commit(b) == want, l.failure.unwrap_or(""))
+        assert(l.failure.is_none(), l.failure.unwrap_or(""))
+
+@test
+a_shaping_read_conflicts_through_the_items_it_returns_at_serializable()
+    // N4: the shaping read's membership is `tag = 1`, but it returns `items`, so a concurrent append
+    // to a returned row's `items` is a read-write conflict, even one its filter drops.
+    for bound in ls_ints([0, 9])
+        val l = ls_nested()
+        val (a, _) = l.begin(Serializable, false)
+        val (b, _) = l.begin(Serializable, false)
+        ls_expect(l, a, SNestShape(1, bound), ls_all([ls_kept("n0", bound, buf[i64]()), ls_kept("n2", bound, buf[i64]())]))
+        ls_expect(l, b, SAppendE("n2.items", 21), StepRan(Some(m_append("n2.items", 21))))
+        ls_expect(l, b, SReadReg("x"), StepRan(Some(m_read_num("x", 0))))
+        ls_expect(l, a, SPut("x", 1), StepRan(Some(m_write("x", 1))))
+        assert(l.commit(b) == Ok(SetupCommits + 1), l.failure.unwrap_or(""))
+        assert(l.commit(a) == Err("T1001"), l.failure.unwrap_or(""))
+        assert(l.failure.is_none(), l.failure.unwrap_or(""))
+
+// -- the setup the targets share ----------------------------------------------------------------------
+
+@test
+every_target_ends_its_setup_at_the_same_commit()
+    // Each of the bench and the model makes `SetupCommits` setup commits, so the first transaction
+    // after it has the same snapshot in both. With no keys at all the first writes nothing and so
+    // commits at its snapshot (§5.5), in both alike.
+    val shapes = items_of([(buf[string](), buf[string]()), (items_of(["a"]), buf[string]()), (buf[string](), items_of(["x"])),
+        (items_of(["n0.items"]), buf[string]()), (items_of(["a", "n0.items", "n1.items"]), items_of(["x", "y"]))])
+    for shape in shapes
+        val (lists, regs) = shape
+        val want = if lists.len() + regs.len() == 0 then SetupCommits - 1 else SetupCommits
+        val b = bench(no_faults())
+        b.seed_rows(lists, regs, 3)
+        val (_, bs) = b.begin(Serializable, false)
+        assert_eq(bs, want)
+        val m = model_bench()
+        m.seed_rows(lists, regs, 3)
+        val (_, ms) = m.begin(Serializable, false)
+        assert_eq(ms, want)
+
+@test
+the_setup_seeds_the_same_rows_in_the_store_and_the_model()
+    // A nested row's tag is the parity of its row key in both, a list starts empty and a register at
+    // `init`, and the setup's own row 0 is no key's.
+    val l = lockstep(no_faults(), 1)
+    l.seed_rows(items_of(["a", "n0.items", "n1.items", "n2.items"]), items_of(["x"]), 7)
+    val (t, _) = l.begin(Serializable, true)
+    ls_expect(l, t, SReadList("a"), StepRan(Some(Mop(MRead, "a", 0, ObsList(buf[i64]()), buf()))))
+    ls_expect(l, t, SReadReg("x"), StepRan(Some(m_read_num("x", 7))))
+    ls_expect(l, t, SNestShape(0, -1), ls_all([ls_kept("n0", -1, buf[i64]()), ls_kept("n2", -1, buf[i64]())]))
+    ls_expect(l, t, SNestShape(1, -1), ls_all([ls_kept("n1", -1, buf[i64]())]))
+    ls_expect(l, t, SSum(items_of(["x"]), "total"), StepRan(Some(m_read_num("total", 7))))
+    val mt = l.model.model.begin(Serializable)
+    assert(l.model.model.get(mt, ModelRegs, 0) == Ok(Some(mo_row([MoInt(0), MoInt(0)]))), "the model's row 0")
+
+@test
+a_setup_commit_the_model_lacks_diverges_at_the_first_begin()
+    val l = lockstep(no_faults(), 1)
+    l.seed_rows(items_of(["a"]), items_of(["x"]), 0)
+    val (t, _) = l.store.begin(Serializable, false)
+    assert(l.store.run(t, SPut("x", 5)) == StepRan(Some(m_write("x", 5))))
+    assert(l.store.commit(t) == Ok(SetupCommits + 1))
+    val (_, s) = l.begin(Serializable, false)
+    assert_eq(s, SetupCommits + 1)
+    val m = l.failure.unwrap_or("")
+    assert(m.contains(s"at step 1 (seed 1)") && m.contains(s"the store answered snapshot ${SetupCommits + 1}, the model snapshot $SetupCommits"), m)
+
+@test
+a_setup_commit_the_store_lacks_diverges_at_the_first_begin()
+    val l = lockstep(no_faults(), 1)
+    l.seed_rows(items_of(["a"]), items_of(["x"]), 0)
+    val t = l.model.model.begin(Serializable)
+    val _ = l.model.model.update(t, ModelRegs, MoKey(l.store.keys.id("x")), MoSet(1, 5))
+    assert(l.model.model.commit(t) == Ok(SetupCommits + 1))
+    val (_, s) = l.begin(Serializable, false)
+    assert_eq(s, SetupCommits)
+    val m = l.failure.unwrap_or("")
+    assert(m.contains(s"the store answered snapshot $SetupCommits, the model snapshot ${SetupCommits + 1}"), m)
+
+@test
+a_setup_seeding_different_rows_diverges_at_the_first_read_of_them()
+    // The same number of setup commits but not the same rows: the begin agrees, the read does not.
+    val l = lockstep(no_faults(), 1)
+    l.store.seed_rows(items_of(["n0.items"]), items_of(["x"]), 0)
+    l.model.seed_rows(buf[string](), items_of(["x"]), 0)
+    val (t, _) = l.begin(Serializable, false)
+    assert(l.failure.is_none(), l.failure.unwrap_or(""))
+    val _ = l.run(t, SReadList("n0.items"))
+    val m = l.failure.unwrap_or("")
+    assert(m.contains("statement read list n0.items"), m)
+
+    val k = lockstep(no_faults(), 1)
+    k.store.seed_rows(buf[string](), items_of(["x"]), 0)
+    k.model.seed_rows(buf[string](), items_of(["x"]), 1)
+    val (u, _) = k.begin(Serializable, false)
+    val _ = k.run(u, SReadReg("x"))
+    val n = k.failure.unwrap_or("")
+    assert(n.contains("the store answered ran") && n.contains("statement read x"), n)
+
+@test
+a_lock_step_run_exercises_waits_aborts_and_every_answer()
+    // The sweeps are not vacuous: across them the store waits, aborts with each contention code and
+    // commits, and the model agreed with every one of those answers.
+    var waits: u64 = 0
+    var serialization: usize = 0
+    var commits: usize = 0
+    for seed in 1..LockstepSeeds
+        for w in items_of([ls_w1(seed, MixAll), ls_w3b(seed, MixAll)])
+            val l = lockstep(no_faults(), seed)
+            l.seed_rows(w.lists, w.regs, w.init)
+            val clock: &SimClock = SimClock(0)
+            val h = drive(l, clock, w.pre, w.clients, w.post, DriveOptions(seed, 0))
+            assert(h.is_ok() && l.failure.is_none(), l.failure.unwrap_or(""))
+            for e in h.unwrap()
+                if e.kind == HOk then commits += 1
+                if e.error == "serialization_failure" then serialization += 1
+            waits += l.waits
+    assert(waits > 0 && serialization > 0 && commits > 0, s"waits $waits, serialization failures $serialization, commits $commits")
+
+// -- prove the comparison can fail ------------------------------------------------------------------
+
+@test
+a_store_without_validation_diverges_from_the_model()
+    assert(ls_diverging_seed((s, m) -> ls_w3b(s, m), MixSer, ls_faults(true, false, false, false)) != 0)
+    assert(ls_diverging_seed((s, m) -> ls_w4(s, m), MixSer, ls_faults(true, false, false, false)) != 0)
+
+@test
+a_store_without_first_updater_wins_diverges_from_the_model()
+    assert(ls_diverging_seed((s, m) -> ls_w1(s, m), MixSi, ls_faults(false, true, false, false)) != 0)
+    assert(ls_diverging_seed((s, m) -> ls_w2(s, m), MixSer, ls_faults(false, true, false, false)) != 0)
+
+@test
+a_store_taking_a_snapshot_per_statement_at_snapshot_level_diverges_from_the_model()
+    assert(ls_diverging_seed((s, m) -> ls_w1(s, m), MixSi, ls_faults(false, false, true, false)) != 0)
+
+@test
+a_store_with_a_stale_snapshot_diverges_from_the_model_at_every_level()
+    for mix in ls_mixes()
+        assert(ls_diverging_seed((s, m) -> ls_w2(s, m), mix, ls_faults(false, false, false, true)) != 0, ls_mix_name(mix))
+
+@test
+a_faulty_store_diverges_from_the_model_on_w5()
+    assert(ls_diverging_seed((s, m) -> ls_w5(s, m), MixSer, ls_faults(true, false, false, false)) != 0, "without validation")
+    assert(ls_diverging_seed((s, m) -> ls_w5(s, m), MixSi, ls_faults(false, true, false, false)) != 0, "without first-updater-wins")
+    assert(ls_diverging_seed((s, m) -> ls_w5(s, m), MixSi, ls_faults(false, false, true, false)) != 0, "a snapshot per statement")
+    for mix in ls_mixes()
+        assert(ls_diverging_seed((s, m) -> ls_w5(s, m), mix, ls_faults(false, false, false, true)) != 0, s"a stale snapshot at ${ls_mix_name(mix)}")
+
+@test
+a_divergence_names_its_step_its_seed_and_both_answers()
+    val d = lockstep_divergence(ls_w2(1, MixSer), ls_faults(false, false, false, true), DriveOptions(1, 0))
+    assert(d.is_some(), "a stale snapshot diverges at the first begin")
+    val m = d.unwrap()
+    assert(m.contains("at step 1 (seed 1)"), m)
+    assert(m.contains(s"the store answered snapshot ${SetupCommits - 1}, the model snapshot $SetupCommits"), m)
+
+// -- the model's own histories (§3) -----------------------------------------------------------------
+
+@test
+the_models_w1_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w1(s, m), LockstepSeeds)
+
+@test
+the_models_w2_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w2(s, m), LockstepSeeds)
+
+@test
+the_models_w3_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w3(s, m), LockstepSeeds)
+
+@test
+the_models_w3b_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w3b(s, m), LockstepSeeds)
+
+@test
+the_models_w4_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w4(s, m), LockstepSeeds)
+
+@test
+the_models_w4_on_call_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w4c(s, m), LockstepSeeds)
+
+@test
+the_models_w6_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w6(s, m), LockstepSeeds)
+
+@test
+the_models_w5_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w5(s, m), LockstepSeeds)
+
+@test
+the_model_permits_what_snapshot_and_read_committed_permit()
+    // The model's checks are not vacuous: the anomalies a weaker level allows occur in its histories.
+    assert(ls_model_showing((s, m) -> ls_w2(s, m), MixSi, ["A5B", "G2-item"]) != 0, "write skew at snapshot")
+    assert(ls_model_showing((s, m) -> ls_w4(s, m), MixSi, ["G2"]) != 0, "a phantom at snapshot")
+    assert(ls_model_showing((s, m) -> ls_w6(s, m), MixSi, ["G2-item", "A5B"]) != 0, "the read-only anomaly at snapshot")
+    assert(ls_model_showing((s, m) -> ls_w1(s, m), MixRc, ["G-single", "P4", "G-nonadjacent"]) != 0, "read skew at read committed")
+    assert(ls_model_showing((s, m) -> ls_w5(s, m), MixSi, ["G2", "G2-item", "A5B", "G-single"]) != 0, "a phantom at depth or write skew at snapshot on W5")
+    assert(ls_model_showing((s, m) -> ls_w5(s, m), MixRc, ["G-single", "P4", "G-nonadjacent"]) != 0, "read skew or a lost update at read committed on W5")

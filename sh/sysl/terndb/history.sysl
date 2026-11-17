@@ -214,7 +214,7 @@ private json_event(e: HEvent, sb: *StrBuilder)
 
     sb.push("]}")
 
-private json_mop(m: Mop, sb: *StrBuilder)
+private[terndb] json_mop(m: Mop, sb: *StrBuilder)
     val name = m.kind match
         MAppend -> "append"
         MRead -> "r"
@@ -587,21 +587,57 @@ struct Plan
 
 hplan(level: Isolation, steps: Buf[HStep]) -> Plan = Plan(level, false, true, steps)
 
-/** The in-memory store a history is recorded against and its four tables: `lists(k, v list<int64>)`
- * for list-append keys, `regs(k, v int64)` for registers, counters and accounts, `grp(k, g, v)`
- * for W4's rows, and `nest(k, tag, items list<(e, price)>)` for W5's rows, whose nested `items` is the
- * list key `R.items`. A history's keys are names; each is given an integer row key on first use.
+/** What one statement came to: it ran (with what it records, `None` for a write that changed no
+ * row), it ran and records several operations (`SNestShape`: one shaping read per row it returns),
+ * it must wait for the transaction `holder`, or it failed with a §5.2 code, which
+ * aborted its transaction.
  */
-struct Bench
-    store: &Store
-    lists: u64
-    regs: u64
-    grp: u64
-    nest: u64
-    list_cols: Buf[u32]
-    reg_cols: Buf[u32]
-    grp_cols: Buf[u32]
-    nest_cols: Buf[u32]
+enum StepEnd derives Eq
+    StepRan(mop: Option[Mop])
+    StepRanAll(mops: Buf[Mop])
+    StepBlocked(holder: u64)
+    StepFailed(code: string, mop: Option[Mop])
+
+/** What the driver runs transactions against: the in-memory store (`Bench`), the isolation model
+ * (`iso_model.sysl`), or the two in lock step (`iso_lockstep.sysl`). A transaction is named by the
+ * id `begin` answers for it.
+ */
+trait HTarget
+    /** Creates, unrecorded, the rows the keys start in: each list empty, each register `init`. A
+     * nested list key `R.items` creates W5's row `R` with its `items` empty and its `tag` the parity
+     * of its row key. The setup ends with a second commit, of a row no key names (`regs` row 0), so
+     * every target's commit numbers and snapshots start from the same place (`SetupCommits`).
+     */
+    seed_rows(*self, lists: Buf[string], regs: Buf[string], init: i64)
+
+    /** A value no other step of the run writes. */
+    fresh(*self) -> i64
+
+    /** Begins a transaction at `level`: its id and its snapshot. */
+    begin(*self, level: Isolation, read_only: bool) -> (u64, u64)
+
+    /** Runs one statement of the transaction `txn`. */
+    run(*self, txn: u64, step: HStep) -> StepEnd
+
+    /** Commits `txn`: its commit sequence number (its snapshot for an empty write set, §5.5), or
+     * the §5.2 code it was aborted with.
+     */
+    commit(*self, txn: u64) -> Result[u64, string]
+
+    /** Rolls `txn` back, if it is still live. */
+    abort(*self, txn: u64)
+
+    /** Whether `txn` is live. */
+    live(*self, txn: u64) -> bool
+
+    /** Why the run must stop now, if it must: a divergence between targets run in lock step. */
+    trouble(self) -> Option[string]
+
+/** A run's names: a history's keys are names, each given an integer row key on first use, and the
+ * values its steps write are drawn from one counter. Targets run in lock step share one, so that a
+ * name is the same row key in each.
+ */
+struct Names
     names: Buf[string]
     ids: Map[string, i64]
     next_value: i64
@@ -622,10 +658,41 @@ struct Bench
         self.next_value += 1
         self.next_value
 
-    /** Creates, unrecorded, the rows the keys start in: each list empty, each register `init`. A
-     * nested list key `R.items` creates W5's row `R` with its `items` empty and its `tag` the parity
-     * of its row key.
-     */
+/** How many commits `seed_rows` makes: the rows the keys start in, then `regs` row 0. Every target
+ * makes the same two, so the first transaction after the setup has snapshot `SetupCommits` in each
+ * (one less with no keys at all, whose first commit writes nothing and so stays at its snapshot,
+ * §5.5).
+ */
+const SetupCommits: u64 = 2
+
+/** Names with nothing named yet. */
+names() -> &Names = Names(buf(), map(), 0)
+
+/** The in-memory store a history is recorded against and its four tables: `lists(k, v list<int64>)`
+ * for list-append keys, `regs(k, v int64)` for registers, counters and accounts, `grp(k, g, v)`
+ * for W4's rows, and `nest(k, tag, items list<(e, price)>)` for W5's rows, whose nested `items` is the
+ * list key `R.items`. `open` finds a transaction by its id.
+ */
+struct Bench
+    store: &Store
+    lists: u64
+    regs: u64
+    grp: u64
+    nest: u64
+    list_cols: Buf[u32]
+    reg_cols: Buf[u32]
+    grp_cols: Buf[u32]
+    nest_cols: Buf[u32]
+    keys: &Names
+    open: Map[u64, &Txn]
+
+    /** The row key of `name`. */
+    id(*self, name: string) -> i64 = self.keys.id(name)
+
+    /** The name of row key `i`. */
+    name_of(self, i: i64) -> string = self.keys.name_of(i)
+
+impl HTarget for Bench
     seed_rows(*self, lists: Buf[string], regs: Buf[string], init: i64)
         val t = self.store.begin(Serializable)
 
@@ -649,8 +716,34 @@ struct Bench
         val _ = self.store.insert(u, self.regs, store_row(self.store, self.regs, rec([Int(0), Int(0)])))
         val _ = self.store.commit(u)
 
+    fresh(*self) -> i64 = self.keys.fresh()
+
+    begin(*self, level: Isolation, read_only: bool) -> (u64, u64)
+        val t = self.store.begin(level, read_only)
+        self.open.put(t.id, t)
+        (t.id, t.snapshot)
+
+    run(*self, txn: u64, step: HStep) -> StepEnd = self.open.get(txn) match
+        Some(t) -> exec(self, t, step)
+        None -> StepFailed("W2001", None)
+
+    commit(*self, txn: u64) -> Result[u64, string] = self.open.get(txn) match
+        Some(t) -> self.store.commit(t) match
+            Ok(n) -> Ok(n)
+            Err(e) -> Err(e.code)
+        None -> Err("W2001")
+
+    abort(*self, txn: u64) = self.open.get(txn) match
+        Some(t) ->
+            val _ = self.store.abort(t)
+        None -> ()
+
+    live(*self, txn: u64) -> bool = txn_live(self.store, txn)
+
+    trouble(self) -> Option[string] = None
+
 /** A bench over a fresh store whose faults are `faults`. */
-bench(faults: Faults) -> &Bench
+bench(faults: Faults, keys: &Names = names()) -> &Bench
     var c = mem_catalog()
     bench_ddl(&c, CreateNamespace("app", false))
     bench_ddl(&c, bench_table("lists", [bench_col("k", Int64), bench_col("v", List(Int64))]))
@@ -665,7 +758,7 @@ bench(faults: Faults) -> &Bench
     val regs = c.tables[c.table_at(QualName("app", "regs")).unwrap()]
     val nest = c.tables[c.table_at(QualName("app", "nest")).unwrap()]
     Bench(s, lists.oid, regs.oid, grp.oid, nest.oid, column_ids(lists, ["k", "v"]), column_ids(regs, ["k", "v"]), column_ids(grp, ["k", "g"]),
-        column_ids(nest, ["k", "items", "tag"]), buf(), map(), 0)
+        column_ids(nest, ["k", "items", "tag"]), keys, map())
 
 private column_ids(t: CatTable, names: []const string) -> Buf[u32]
     val out = buf[u32]()
@@ -696,19 +789,12 @@ struct DriveOptions
 /** How many times a plan is attempted before its last failure stands. */
 const MaxAttempts: usize = 8
 
-/** What one statement came to. */
-private enum StepEnd
-    StepRan(mop: Option[Mop])
-    StepRanAll(mops: Buf[Mop])
-    StepBlocked(holder: u64)
-    StepFailed(code: string, mop: Option[Mop])
-
 private struct HClient
     process: u64
     plans: Buf[Plan]
     next: usize
     attempts: usize
-    txn: Option[&Txn]
+    txn: Option[u64]
     begun_at: u64
     steps: Buf[HStep]
     at: usize
@@ -721,7 +807,7 @@ private struct HClient
  * runs one after another on the process after the last client. Answers the recorded history, or why
  * the run could not finish.
  */
-drive(b: &Bench, clock: &SimClock, pre: Buf[Plan], clients: Buf[Buf[Plan]], post: Buf[Plan], opts: DriveOptions) -> Result[Buf[HEvent], string]
+drive(b: &HTarget, clock: &SimClock, pre: Buf[Plan], clients: Buf[Buf[Plan]], post: Buf[Plan], opts: DriveOptions) -> Result[Buf[HEvent], string]
     var r = recorder(clock)
     var g = rng(opts.seed, 0x4859)
     val cs = buf[HClient]()
@@ -742,13 +828,16 @@ drive(b: &Bench, clock: &SimClock, pre: Buf[Plan], clients: Buf[Buf[Plan]], post
         for i in first..<cs.len()
             if cs[i].next >= cs[i].plans.len() then continue
             unfinished += 1
-            if cs[i].waiting == 0 || !txn_live(b.store, cs[i].waiting) then runnable.push(i)
+            if cs[i].waiting == 0 || !b.live(cs[i].waiting) then runnable.push(i)
 
         if unfinished == 0 then break
         if runnable.len() == 0 then return Err("every unfinished client waits for a live transaction")
 
         clock.ns += 1000
         act(b, &r, &g, cs, runnable[usize(g.below(u64(runnable.len())))], opts)?
+        b.trouble() match
+            Some(m) -> return Err(m)
+            None -> ()
 
     cs.push(new_client(u64(clients.len() + 1), post))
     run_alone(b, &r, &g, cs, cs.len() - 1, opts)?
@@ -756,11 +845,14 @@ drive(b: &Bench, clock: &SimClock, pre: Buf[Plan], clients: Buf[Buf[Plan]], post
 
 private new_client(process: u64, plans: Buf[Plan]) -> HClient = HClient(process, plans, 0, 0, None, 0, buf(), 0, buf(), 0)
 
-private run_alone(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: DriveOptions) -> Result[unit, string]
+private run_alone(b: &HTarget, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: DriveOptions) -> Result[unit, string]
     // A plan run alone never waits for long: nothing else is live.
     var guard: usize = 0
     while cs[i].next < cs[i].plans.len()
         act(b, r, g, cs, i, DriveOptions(opts.seed, 0))?
+        b.trouble() match
+            Some(m) -> return Err(m)
+            None -> ()
         guard += 1
         if guard > 100000 then return Err("a plan run alone did not finish")
     Ok(())
@@ -771,7 +863,7 @@ private txn_live(s: &Store, id: u64) -> bool
     false
 
 // One action of client `i`: begin its next plan, run its next statement, or commit.
-private act(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: DriveOptions) -> Result[unit, string]
+private act(b: &HTarget, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: DriveOptions) -> Result[unit, string]
     val c = cs[i]
     val p = c.plans[c.next]
 
@@ -788,9 +880,9 @@ private act(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: 
                         Some(m) -> known.push(m)
                         None -> ()
             val _ = r.add(c.process, HInvoke, level_name(p.level), 0, 0, 0, "", known)
-            val t = b.store.begin(p.level, p.read_only)
+            val (t, snapshot) = b.begin(p.level, p.read_only)
             cs[i].txn = Some(t)
-            cs[i].begun_at = t.snapshot
+            cs[i].begun_at = snapshot
             cs[i].steps = steps
             cs[i].at = 0
             cs[i].mops = buf()
@@ -811,7 +903,7 @@ private act(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: 
         cs[i].steps = steps
 
     if cs[i].at < cs[i].steps.len()
-        exec(b, t, cs[i].steps[cs[i].at]) match
+        b.run(t, cs[i].steps[cs[i].at]) match
             StepRan(m) ->
                 m match
                     Some(x) -> cs[i].mops.push(x)
@@ -827,17 +919,17 @@ private act(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: 
                 m match
                     Some(x) -> cs[i].mops.push(x)
                     None -> ()
-                val _ = b.store.abort(t)
+                b.abort(t)
                 finish(r, cs, i, p, HFail, code, 0)
         return Ok(())
 
-    b.store.commit(t) match
+    b.commit(t) match
         Ok(n) ->
             val lost = opts.lost_acks > 0 && g.below(1000) < opts.lost_acks
             finish(r, cs, i, p, if lost then HInfo else HOk, "", n)
-        Err(e) ->
+        Err(code) ->
             val lost = opts.lost_acks > 0 && g.below(1000) < opts.lost_acks
-            finish(r, cs, i, p, if lost then HInfo else HFail, e.code, 0)
+            finish(r, cs, i, p, if lost then HInfo else HFail, code, 0)
 
     Ok(())
 
@@ -847,7 +939,7 @@ private finish(r: *Recorder, cs: Buf[HClient], i: usize, p: Plan, kind: HKind, c
     val c = cs[i]
     val t = c.txn.unwrap()
     val err = if kind == HFail then error_name(code) else ""
-    val _ = r.add(c.process, kind, level_name(p.level), t.id, c.begun_at, commit, err, c.mops)
+    val _ = r.add(c.process, kind, level_name(p.level), t, c.begun_at, commit, err, c.mops)
 
     cs[i].txn = None
     cs[i].waiting = 0
@@ -859,7 +951,7 @@ private finish(r: *Recorder, cs: Buf[HClient], i: usize, p: Plan, kind: HKind, c
         cs[i].next += 1
 
 // `steps` with fresh values in place of `SAppend`, `SWrite` and `SInsert`.
-private concrete(b: &Bench, steps: Buf[HStep]) -> Buf[HStep]
+private concrete(b: &HTarget, steps: Buf[HStep]) -> Buf[HStep]
     val out = buf[HStep]()
     for s in steps
         out.push(s match
@@ -944,7 +1036,7 @@ private nest_write_end(r: Result[WriteOutcome, CodecError], m: Mop, list: string
     _ -> write_end(r, m)
 
 // Runs one statement of a transaction.
-private exec(b: &Bench, t: &Txn, step: HStep) -> StepEnd
+private exec(b: *Bench, t: &Txn, step: HStep) -> StepEnd
     val s = b.store
     s.statement(t)
 
@@ -1053,4 +1145,6 @@ private exec(b: &Bench, t: &Txn, step: HStep) -> StepEnd
             write_end(s.insert(t, b.grp, row), m_write(k, grp))
         SDelete(k) ->
             write_end(s.delete_where(t, b.grp, key_pred(b.grp_cols, b.id(k), false)), m_delete(k))
-        _ -> StepRan(None)
+        // The driver makes these concrete (`SAppendE`, `SPut`, `SInsertKey`) or expands them before
+        // they reach a target.
+        SAppend(_) | SWrite(_) | SInsert(_, _) | SThen(_) -> StepRan(None)

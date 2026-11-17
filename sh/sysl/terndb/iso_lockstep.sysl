@@ -1,0 +1,285 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{StrBuilder, str_builder}
+
+// The isolation model (`iso_model.sysl`) as a target of the history driver, and the lock-step
+// comparison of `isolation.md` §7.4: the model and the in-memory store run the same seeded schedule,
+// and every answer of the store — a read's value, `Wait` or proceed, commit or which abort code, a
+// snapshot, a commit sequence number — must equal the model's. The first divergence stops the run
+// with the step, the seed and both answers (`docs/design/iso-model.md`).
+
+/** The model's tables, as the bench's: `lists(k, v list)`, `regs(k, v)`, `grp(k, g, v)` and
+ * `nest(k, tag, items list)`. A `nest` row's `items` holds each element `e` alone, its price being
+ * `nest_price(e)`, as the history records it.
+ */
+const ModelLists: u64 = 1
+const ModelRegs: u64 = 2
+const ModelGrp: u64 = 3
+const ModelNest: u64 = 4
+
+/** The model run by the history driver, its keys named by `keys`. */
+struct ModelBench
+    model: &IsoModel
+    keys: &Names
+
+/** A model bench over an empty model. */
+model_bench(keys: &Names = names()) -> &ModelBench = ModelBench(iso_model(), keys)
+
+impl HTarget for ModelBench
+    seed_rows(*self, lists: Buf[string], regs: Buf[string], init: i64)
+        val t = self.model.begin(Serializable)
+
+        for k in lists
+            if is_nested_key(k)
+                val id = self.keys.id(row_of(k))
+                val _ = self.model.insert(t, ModelNest, mo_row([MoInt(id), MoInt(id % 2), MoList(buf())]))
+            else
+                val _ = self.model.insert(t, ModelLists, mo_row([MoInt(self.keys.id(k)), MoList(buf())]))
+
+        for k in regs
+            val _ = self.model.insert(t, ModelRegs, mo_row([MoInt(self.keys.id(k)), MoInt(init)]))
+
+        val _ = self.model.commit(t)
+
+        // The bench's second setup commit, of `regs` row 0, so that snapshots and commit numbers
+        // start where the store's do.
+        val u = self.model.begin(Serializable)
+        val _ = self.model.insert(u, ModelRegs, mo_row([MoInt(0), MoInt(0)]))
+        val _ = self.model.commit(u)
+
+    fresh(*self) -> i64 = self.keys.fresh()
+
+    begin(*self, level: Isolation, read_only: bool) -> (u64, u64)
+        val t = self.model.begin(level, read_only)
+        (t, self.model.snapshot_of(t))
+
+    run(*self, txn: u64, step: HStep) -> StepEnd = model_exec(self, txn, step)
+
+    commit(*self, txn: u64) -> Result[u64, string] = self.model.commit(txn)
+
+    abort(*self, txn: u64)
+        val _ = self.model.abort(txn)
+
+    live(*self, txn: u64) -> bool = self.model.live(txn)
+
+    trouble(self) -> Option[string] = None
+
+/** `cols` as a model row image. */
+mo_row(cols: []const MoVal) -> Buf[MoVal]
+    val out = buf[MoVal]()
+    out.extend(cols)
+    out
+
+private mo_write_end(r: Result[MoDone, string], m: Mop) -> StepEnd = r match
+    Ok(MoRows(n)) -> if n == 0 then StepRan(None) else StepRan(Some(m))
+    Ok(MoWait(h)) -> StepBlocked(h)
+    Err(code) -> StepFailed(code, Some(m))
+
+// A write of a W5 row that found no row records a read of its list finding none, as the bench's
+// `nest_write_end` does.
+private mo_nest_write_end(r: Result[MoDone, string], m: Mop, list: string) -> StepEnd = r match
+    Ok(MoRows(0)) -> StepRan(Some(m_read_unborn(list)))
+    _ -> mo_write_end(r, m)
+
+// One statement of the driver's against the model, as `exec` runs it against the store: the same
+// predicates and the same columns read.
+private model_exec(b: *ModelBench, t: u64, step: HStep) -> StepEnd
+    val m = b.model
+
+    step match
+        SReadList(k) if is_nested_key(k) -> m.get(t, ModelNest, b.keys.id(row_of(k))) match
+            Ok(Some(img)) -> StepRan(Some(Mop(MRead, k, 0, ObsList(mo_list(img, 2).copy()), buf())))
+            Ok(None) -> StepRan(Some(m_read_unborn(k)))
+            Err(code) -> StepFailed(code, None)
+        SAppendE(k, e) if is_nested_key(k) ->
+            mo_nest_write_end(m.update(t, ModelNest, MoKey(b.keys.id(row_of(k))), MoAppend(2, e)), m_append(k, e), k)
+        SNestExists(bound) -> m.scan(t, ModelNest, MoPriceAbove(2, bound), mo_cols([2])) match
+            Ok(hits) ->
+                val rows = buf[string]()
+                for h in hits
+                    rows.push(b.keys.name_of(h.key))
+                StepRan(Some(Mop(MPred, nest_pred(bound), 0, ObsRows, rows)))
+            Err(code) -> StepFailed(code, None)
+        SNestShape(tag, bound) -> m.scan(t, ModelNest, MoEq(1, tag), mo_cols([1, 2])) match
+            Ok(hits) ->
+                val ms = buf[Mop]()
+                for h in hits
+                    ms.push(Mop(MRead, nest_filter_key(b.keys.name_of(h.key), bound), 0, ObsList(mo_priced_above(mo_list(h.image, 2), bound)), buf()))
+                StepRanAll(ms)
+            Err(code) -> StepFailed(code, None)
+        SNestDelete(r) -> mo_nest_write_end(m.update(t, ModelNest, MoKey(b.keys.id(r)), MoRemove), m_delete(r), s"$r.items")
+        SReadList(k) -> m.get(t, ModelLists, b.keys.id(k)) match
+            Ok(Some(img)) -> StepRan(Some(Mop(MRead, k, 0, ObsList(mo_list(img, 1).copy()), buf())))
+            Ok(None) -> StepRan(Some(m_read_unborn(k)))
+            Err(code) -> StepFailed(code, None)
+        SReadReg(k) -> m.get(t, ModelRegs, b.keys.id(k)) match
+            Ok(Some(img)) -> StepRan(Some(m_read_num(k, mo_int(img, 1))))
+            Ok(None) -> StepRan(Some(m_read_unborn(k)))
+            Err(code) -> StepFailed(code, None)
+        SAppendE(k, e) -> mo_write_end(m.update(t, ModelLists, MoKey(b.keys.id(k)), MoAppend(1, e)), m_append(k, e))
+        SPut(k, v) -> mo_write_end(m.update(t, ModelRegs, MoKey(b.keys.id(k)), MoSet(1, v)), m_write(k, v))
+        SAdd(k, d) -> mo_write_end(m.update(t, ModelRegs, MoKey(b.keys.id(k)), MoAdd(1, d)), m_add(k, d))
+        SSum(keys, name) ->
+            val ids = buf[i64]()
+            for k in keys
+                ids.push(b.keys.id(k))
+            m.scan(t, ModelRegs, MoKeys(ids), mo_cols([0, 1])) match
+                Ok(hits) ->
+                    var sum: i64 = 0
+                    for h in hits
+                        sum += mo_int(h.image, 1)
+                    StepRan(Some(m_read_num(name, sum)))
+                Err(code) -> StepFailed(code, None)
+        SPred(grp) -> m.scan(t, ModelGrp, MoEq(1, grp), mo_cols([1])) match
+            Ok(hits) ->
+                val rows = buf[string]()
+                for h in hits
+                    rows.push(b.keys.name_of(h.key))
+                StepRan(Some(Mop(MPred, s"g = $grp", 0, ObsRows, rows)))
+            Err(code) -> StepFailed(code, None)
+        SInsertKey(k, grp) -> mo_write_end(m.insert(t, ModelGrp, mo_row([MoInt(b.keys.id(k)), MoInt(grp), MoInt(0)])), m_write(k, grp))
+        SDelete(k) -> mo_write_end(m.update(t, ModelGrp, MoKey(b.keys.id(k)), MoRemove), m_delete(k))
+        // The driver makes these concrete (`SAppendE`, `SPut`, `SInsertKey`) or expands them before
+        // they reach a target.
+        SAppend(_) | SWrite(_) | SInsert(_, _) | SThen(_) -> StepRan(None)
+
+/** The store and the model in lock step: each call goes to both, the store first, and the answers
+ * must agree. Transactions are named by the store's ids; `ids` maps each to the model's, `back` the
+ * other way, so that a `Wait` names the same holder in both. `steps` counts the calls, so a
+ * divergence names its step, and `waits` the statements both answered with a wait; `failure` holds
+ * the first divergence.
+ */
+struct LockStep
+    store: &Bench
+    model: &ModelBench
+    seed: u64
+    steps: u64
+    waits: u64
+    ids: Map[u64, u64]
+    back: Map[u64, u64]
+    failure: Option[string]
+
+    private model_id(self, txn: u64) -> u64 = self.ids.get(txn) match
+        Some(m) -> m
+        None -> 0
+
+    // A model holder named by the store's id for it; a holder the store never began is named by an id
+    // no transaction has, so that it can only diverge.
+    private store_id(self, model: u64) -> u64 = self.back.get(model) match
+        Some(s) -> s
+        None -> 0xffffffffffffffff
+
+    private diverge(*self, txn: u64, what: string, store: string, model: string)
+        if self.failure.is_none()
+            self.failure = Some(s"lock-step divergence at step ${self.steps} (seed ${self.seed}): transaction $txn, $what: the store answered $store, the model $model")
+
+impl HTarget for LockStep
+    seed_rows(*self, lists: Buf[string], regs: Buf[string], init: i64)
+        self.store.seed_rows(lists, regs, init)
+        self.model.seed_rows(lists, regs, init)
+
+    fresh(*self) -> i64 = self.store.fresh()
+
+    begin(*self, level: Isolation, read_only: bool) -> (u64, u64)
+        self.steps += 1
+        val (s, ss) = self.store.begin(level, read_only)
+        val (m, ms) = self.model.begin(level, read_only)
+        self.ids.put(s, m)
+        self.back.put(m, s)
+        if ss != ms then self.diverge(s, s"begin at ${level_name(level)}", s"snapshot $ss", s"snapshot $ms")
+        (s, ss)
+
+    run(*self, txn: u64, step: HStep) -> StepEnd
+        self.steps += 1
+        val a = self.store.run(txn, step)
+        val b = self.model.run(self.model_id(txn), step) match
+            StepBlocked(h) -> StepBlocked(self.store_id(h))
+            other -> other
+        if a != b then self.diverge(txn, s"statement ${step_text(step)}", end_text(a), end_text(b))
+        a match
+            StepBlocked(_) -> self.waits += 1
+            _ -> ()
+        a
+
+    commit(*self, txn: u64) -> Result[u64, string]
+        self.steps += 1
+        val a = self.store.commit(txn)
+        val b = self.model.commit(self.model_id(txn))
+        if a != b then self.diverge(txn, "commit", outcome_text(a), outcome_text(b))
+        a
+
+    abort(*self, txn: u64)
+        self.store.abort(txn)
+        self.model.abort(self.model_id(txn))
+
+    live(*self, txn: u64) -> bool
+        val a = self.store.live(txn)
+        val b = self.model.live(self.model_id(txn))
+        if a != b then self.diverge(txn, "whether it is live", s"$a", s"$b")
+        a
+
+    trouble(self) -> Option[string] = self.failure
+
+/** The store with `faults` and the model, in lock step, for a run seeded with `seed`. */
+lockstep(faults: Faults, seed: u64) -> &LockStep
+    val keys = names()
+    LockStep(bench(faults, keys), model_bench(keys), seed, 0, 0, map(), map(), None)
+
+/** Runs `w` on the store with `faults` and on the model in lock step, driven by `opts`: the first
+ * divergence, or `None` when every answer agreed.
+ */
+lockstep_divergence(w: Workload, faults: Faults, opts: DriveOptions) -> Option[string]
+    val l = lockstep(faults, opts.seed)
+    l.seed_rows(w.lists, w.regs, w.init)
+    val clock: &SimClock = SimClock(0)
+
+    drive(l, clock, w.pre, w.clients, w.post, opts) match
+        Ok(_) -> l.failure
+        Err(m) -> Some(m)
+
+/** A driver step as text. */
+step_text(s: HStep) -> string = s match
+    SReadList(k) -> s"read list $k"
+    SReadReg(k) -> s"read $k"
+    SAppend(k) -> s"append to $k"
+    SAppendE(k, e) -> s"append $e to $k"
+    SWrite(k) -> s"write $k"
+    SPut(k, v) -> s"write $v to $k"
+    SAdd(k, d) -> s"add $d to $k"
+    SSum(keys, name) -> s"sum ${keys.len()} keys as $name"
+    SPred(grp) -> s"read g = $grp"
+    SInsert(prefix, grp) -> s"insert $prefix* in group $grp"
+    SInsertKey(k, grp) -> s"insert $k in group $grp"
+    SDelete(k) -> s"delete $k"
+    SNestExists(bound) -> s"read rows with ${nest_pred(bound)}"
+    SNestShape(tag, bound) -> s"read rows with tag = $tag shaped by price > $bound"
+    SNestDelete(r) -> s"delete row $r"
+    SThen(_) -> "an interactive step"
+
+/** A statement's end as text. */
+end_text(e: StepEnd) -> string = e match
+    StepRan(Some(m)) -> s"ran ${mop_text(m)}"
+    StepRan(None) -> "ran, changing no row"
+    StepRanAll(ms) ->
+        var sb = str_builder()
+        sb.push("ran [")
+        for i in 0..<ms.len()
+            if i > 0 then sb.push(", ")
+            json_mop(ms[i], &sb)
+        sb.push("]")
+        sb.finish()
+    StepBlocked(h) -> s"wait for transaction $h"
+    StepFailed(code, _) -> s"failed with $code"
+
+/** A commit's outcome as text. */
+outcome_text(r: Result[u64, string]) -> string = r match
+    Ok(n) -> s"committed at $n"
+    Err(code) -> s"failed with $code"
+
+/** A micro-operation in its JSON form (§2.5). */
+mop_text(m: Mop) -> string
+    var sb = str_builder()
+    json_mop(m, &sb)
+    sb.finish()

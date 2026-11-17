@@ -1,0 +1,172 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The structural check of the undo log and of the rows over it (`undo.sysl`): every rule of
+// `on-disk-format.md` §5.1–§5.3 the undo pages can break, the resident pages being exactly the range
+// from `undo_low` to the high-water mark, each transaction's rollback chain reaching exactly its
+// records, and each row's version chain well formed down to `undo_low`. A failure is
+// `data_corrupted` (`errors.md` §6), naming the page, record or row.
+
+/** What a check found: resident pages, records at or above `undo_low` (PAD not counted), rows in the
+ * leaf, and the ghosts among them.
+ */
+struct UndoStats derives Eq
+    pages: usize
+    records: usize
+    rows: usize
+    ghosts: usize
+
+private struct UndoAt
+    addr: u64
+    rec: UndoRecord
+
+private undo_bad[T](what: string) -> Result[T, CodecError] = corrupt(what)
+
+/** Where the record at `a` is among `recs`, sorted by address. */
+private undo_at(recs: Buf[UndoAt], a: u64) -> Option[usize]
+    var lo: usize = 0
+    var hi = recs.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if recs[mid].addr < a then lo = mid + 1 else hi = mid
+
+    if lo < recs.len() && recs[lo].addr == a then Some(lo) else None
+
+/** Checks undo page `n` of `sp` and appends its records at or above `undo_low` to `recs`; answers
+ * whether `undo_low` is one of its record boundaries.
+ */
+private check_undo_page(sp: &UndoSpace, n: u64, recs: Buf[UndoAt]) -> Result[bool, CodecError]
+    val f = sp.frame(n).unwrap()
+    val p = &*f
+    val pid = UndoSpaceTag | n
+    val at = s"undo page $n"
+    if f.pid != pid then return undo_bad(s"$at: its frame names another page")
+    if rd32(p, 0) != 0 || rd64(p, 8) != 0 || rd16(p, 30) != 0 then return undo_bad(s"$at: a checksum, LSN or key version in memory")
+    if rd16(p, 4) != DbPageFormat || p.page[6] != PageTypeUndo || p.page[7] != 0 then return undo_bad(s"$at: not an undo page of format 1")
+    if rd64(p, 16) != pid || page_owner(p) != 0 then return undo_bad(s"$at: the header names another page or an owner")
+    val stop = if sp.lane != 0 && sp.lane / 16384 == n then usize(sp.lane % 16384) else DbPageSize
+    var off = UndoPageStart
+    var low_seen = false
+
+    while off < stop
+        val addr = n * 16384 + u64(off)
+        if addr == sp.low then low_seen = true
+
+        val rec = decode_undo_record(f.page[off..<stop]) match
+            Ok(r) -> r
+            Err(e) -> return undo_bad(s"$at, offset $off: ${e.message}")
+
+        if addr >= sp.low && rec.kind != UndoPad then recs.push(UndoAt(addr, rec))
+        off += rec.len
+
+    for i in stop..<DbPageSize
+        if p.page[i] != 0 then return undo_bad(s"$at: a byte past the lane's position that is not zero")
+
+    Ok(low_seen)
+
+/** Checks the undo log of `u` and the rows over it. */
+check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
+    val sp = u.space
+
+    // The resident pages are exactly base up to the high-water mark, and undo_low is on the first.
+    if u64(sp.pages.len()) != sp.next_page - sp.base then return undo_bad("the resident undo pages are not the range below the high-water mark")
+    if sp.low % 16384 < u64(UndoPageStart) then return undo_bad("undo_low names a page header")
+
+    if sp.base < sp.next_page
+        if sp.low / 16384 != sp.base then return undo_bad("a resident undo page lies wholly below undo_low")
+    elif sp.low != undo_page_first(sp.next_page)
+        return undo_bad("no undo page is resident, but undo_low is not the next page's first address")
+
+    if sp.lane != 0 && (sp.lane / 16384 + 1 != sp.next_page || sp.lane % 16384 < u64(UndoPageStart))
+        return undo_bad("the lane's position is not on the newest undo page")
+
+    val recs = buf[UndoAt]()
+    var low_seen = sp.low == sp.end()
+
+    for n in sp.base..<sp.next_page
+        if check_undo_page(sp, n, recs)? then low_seen = true
+
+    if !low_seen then return undo_bad("undo_low is not a record boundary")
+
+    // Each record: a known transaction, and links that run backward.
+    val counts = buf[usize]()
+
+    for _ in 0..<u.txns.len()
+        counts.push(0)
+
+    for r in recs
+        if u.txn_of(r.rec.txn).is_none() then return undo_bad(s"undo record ${r.addr}: a transaction that never began")
+        if r.rec.prev_version >= r.addr || r.rec.txn_prev >= r.addr then return undo_bad(s"undo record ${r.addr}: a link that does not run backward")
+        counts[usize(r.rec.txn - 1)] += 1
+
+    // Each transaction's rollback chain reaches exactly its records at or above undo_low.
+    for i in 0..<u.txns.len()
+        val t = u.txns[i]
+        var a = t.last
+        var reached: usize = 0
+
+        while a != 0 && a >= sp.low
+            val j = undo_at(recs, a) match
+                Some(j) -> j
+                None -> return undo_bad(s"transaction ${i + 1}: its rollback chain names no record at $a")
+            if recs[j].rec.txn != u64(i + 1) then return undo_bad(s"transaction ${i + 1}: its rollback chain names another transaction's record")
+            reached += 1
+            a = recs[j].rec.txn_prev
+
+        if t.state == UndoTxnActive && a != 0 then return undo_bad(s"transaction ${i + 1} is active but its records fall below undo_low")
+        if reached != counts[i] then return undo_bad(s"transaction ${i + 1}: its rollback chain misses some of its records")
+
+    // Each row: sorted, flags it may carry, and a version chain well formed down to undo_low.
+    var ghosts: usize = 0
+
+    for k in 0..<u.rows.len()
+        val r = u.rows[k]
+        val hd = r.row.header
+        val at = s"row $k of table ${r.oid}"
+
+        if k > 0
+            val q = u.rows[k - 1]
+            if q.oid > r.oid || (q.oid == r.oid && q.key.view() >= r.key.view()) then return undo_bad(s"$at: the leaf is not in key order")
+
+        if hd.flags & ~RowDeleted != 0 then return undo_bad(s"$at: flags other than DELETED")
+        if hd.undo == 0 then return undo_bad(s"$at: no undo address")
+
+        val wt = u.txn_of(hd.txn) match
+            Some(t) -> t
+            None -> return undo_bad(s"$at: written by a transaction that never began")
+        if wt.state == UndoTxnAborted then return undo_bad(s"$at: still carries a rolled-back transaction")
+
+        if hd.flags & RowDeleted != 0
+            ghosts += 1
+            if hd.undo < sp.low then return undo_bad(s"$at: a ghost whose DELETE was purged is still in the leaf")
+
+        var txn = hd.txn
+        var a = hd.undo
+
+        while a != 0 && a >= sp.low
+            val j = undo_at(recs, a) match
+                Some(j) -> j
+                None -> return undo_bad(s"$at: its version chain names no record at $a")
+            val rec = recs[j].rec
+            if rec.txn != txn then return undo_bad(s"$at: its version chain names another transaction's record at $a")
+            if rec.oid != r.oid || rec.key != r.key then return undo_bad(s"$at: its version chain names another row's record at $a")
+            if rec.kind != UndoInsert && rec.kind != UndoUpdate && rec.kind != UndoDelete then return undo_bad(s"$at: its version chain names a LOCK or SECONDARY record")
+            if rec.kind == UndoInsert then break
+
+            if rec.prev_txn != rec.txn
+                val newer = u.txn_of(rec.txn).unwrap()
+
+                val older = u.txn_of(rec.prev_txn) match
+                    Some(t) -> t
+                    None -> return undo_bad(s"$at: its version chain names a transaction that never began")
+                if older.state != UndoTxnCommitted then return undo_bad(s"$at: an older version whose writer did not commit")
+                if newer.state == UndoTxnCommitted && newer.commit <= older.commit then return undo_bad(s"$at: its version chain is not in commit order")
+
+            txn = rec.prev_txn
+            a = rec.prev_version
+
+        if wt.state == UndoTxnActive && hd.undo < sp.low then return undo_bad(s"$at: written by a live transaction whose record is below undo_low")
+
+    Ok(UndoStats(sp.pages.len(), recs.len(), u.rows.len(), ghosts))
