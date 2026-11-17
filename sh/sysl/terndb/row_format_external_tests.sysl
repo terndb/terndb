@@ -1,0 +1,244 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+
+// `on-disk-format.md` §4.2 item 2: bit i of the external bitmap is the bit of the column's number among
+// the table's non-key columns, the number the null bitmap uses, and not the column's position among
+// the variable-width columns. Every case here puts fixed and variable columns where the two readings
+// give different octets: interleaved, first, last and only variable column, a bitmap of two octets,
+// and a column that stays where it was when another is dropped.
+
+private ex_stub() -> OverflowStub = OverflowStub(0x1122, 5000, 3000, 0xdeadbeef, 1)
+
+private ex_header() -> RowHeader = RowHeader(1, 2, 0, 3)
+
+private ex_stubs(n: usize, moved: []const usize) -> Buf[Option[OverflowStub]]
+    val b = buf[Option[OverflowStub]]()
+
+    for i in 0..<n
+        var hit = false
+
+        for m in moved
+            if m == i then hit = true
+
+        if hit then b.push(Some(ex_stub())) else b.push(None)
+
+    b
+
+private ex_val(t: Type) -> Value = t match
+    Type.Text -> Value.Text("abc")
+    Type.Bytes -> bytes_value([1, 2])
+    _ -> Int(1)
+
+private ex_vals(cols: []const Type) -> Buf[Value]
+    val b = buf[Value]()
+
+    for t in cols
+        b.push(ex_val(t))
+
+    b
+
+private ex_row(cols: []const Type, moved: []const usize) -> Buf[u8]
+    encode_row_with_stubs(ex_header(), cols, ex_vals(cols), ex_stubs(cols.len, moved)).unwrap()
+
+/** The external bitmap of a row of `cols` with the columns `moved` out of line, in hex. */
+private ex_bitmap(cols: []const Type, moved: []const usize) -> string
+    val bytes = ex_row(cols, moved)
+    val nb = (cols.len + 7) / 8
+
+    hex_string(bytes.view()[RowHeaderSize + nb..<RowHeaderSize + 2 * nb])
+
+/** Decoding the row gives a stub at exactly the columns `moved`, and HAS_EXTERNAL is set. */
+private ex_back(cols: []const Type, moved: []const usize, file: string = __FILE__, line: long = __LINE__)
+    val back = decode_row(cols, ex_row(cols, moved).view()).unwrap()
+
+    assert_eq(back.header.flags, RowHasExternal)
+
+    for i in 0..<cols.len
+        var hit = false
+
+        for m in moved
+            if m == i then hit = true
+
+        assert(back.stubs[i].is_some() == hit, s"column $i", file, line)
+
+        if hit then assert(back.stubs[i] == Some(ex_stub()), s"column $i holds the stub", file, line)
+
+private ex_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+// -- the bit is the column's number -------------------------------------------------------------
+
+@test
+an_interleaved_table_sets_the_bit_of_the_column_number()
+    val cols = [Int32, Type.Text, Int64, Type.Bytes, Int16, Type.Text]
+
+    // The variable columns are 1, 3 and 5, which are variable columns 0, 1 and 2.
+    assert_eq(ex_bitmap(cols, [1]), "02")
+    assert_eq(ex_bitmap(cols, [3]), "08")
+    assert_eq(ex_bitmap(cols, [5]), "20")
+    assert_eq(ex_bitmap(cols, [1, 3]), "0a")
+    assert_eq(ex_bitmap(cols, [3, 5]), "28")
+    assert_eq(ex_bitmap(cols, [1, 3, 5]), "2a")
+
+    ex_back(cols, [1])
+    ex_back(cols, [3])
+    ex_back(cols, [5])
+    ex_back(cols, [1, 3, 5])
+
+@test
+the_first_variable_column_after_fixed_columns_is_its_column_number()
+    assert_eq(ex_bitmap([Int32, Int32, Type.Text], [2]), "04")
+    assert_eq(ex_bitmap([Int8, Type.Text, Type.Text], [1]), "02")
+    assert_eq(ex_bitmap([Int8, Type.Text, Type.Text], [2]), "04")
+    ex_back([Int32, Int32, Type.Text], [2])
+    ex_back([Int8, Type.Text, Type.Text], [1])
+
+@test
+the_last_variable_column_before_fixed_columns_is_its_column_number()
+    assert_eq(ex_bitmap([Type.Text, Int64, Type.Text, Int32], [2]), "04")
+    assert_eq(ex_bitmap([Type.Text, Int64, Type.Text, Int32], [0]), "01")
+    assert_eq(ex_bitmap([Type.Text, Int64, Type.Text, Int32], [0, 2]), "05")
+    ex_back([Type.Text, Int64, Type.Text, Int32], [2])
+    ex_back([Type.Text, Int64, Type.Text, Int32], [0, 2])
+
+@test
+the_only_variable_column_is_its_column_number()
+    assert_eq(ex_bitmap([Type.Text], [0]), "01")
+    assert_eq(ex_bitmap([Int32, Type.Text, Int8], [1]), "02")
+    assert_eq(ex_bitmap([Int32, Int32, Int32, Type.Bytes], [3]), "08")
+    ex_back([Type.Text], [0])
+    ex_back([Int32, Type.Text, Int8], [1])
+    ex_back([Int32, Int32, Int32, Type.Bytes], [3])
+
+@test
+a_table_of_only_variable_columns_numbers_them_from_zero()
+    val cols = [Type.Text, Type.Bytes, Type.Text]
+
+    assert_eq(ex_bitmap(cols, [0]), "01")
+    assert_eq(ex_bitmap(cols, [1]), "02")
+    assert_eq(ex_bitmap(cols, [2]), "04")
+    assert_eq(ex_bitmap(cols, [0, 1, 2]), "07")
+    ex_back(cols, [0, 1, 2])
+
+@test
+a_nested_or_list_column_is_a_variable_column_with_its_column_number()
+    val rec = record([Field("x", Int32)])
+    val rel = list(Int32)
+    val cols = [Int32, rec, Int64, rel, Int8, union_of([Field("a", Int32)])]
+
+    assert_eq(ex_bitmap(cols, [1]), "02")
+    assert_eq(ex_bitmap(cols, [3]), "08")
+    assert_eq(ex_bitmap(cols, [5]), "20")
+    assert_eq(ex_bitmap(cols, [1, 3, 5]), "2a")
+
+@test
+a_bitmap_of_two_octets_numbers_columns_across_the_octet_boundary()
+    val nine = ex_nine_fixed()
+    val cols = [Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Type.Text, Int8, Type.Bytes]
+
+    assert_eq(nine.len, 9)
+    assert_eq(ex_bitmap(cols, [9]), "0002")
+    assert_eq(ex_bitmap(cols, [11]), "0008")
+    assert_eq(ex_bitmap(cols, [9, 11]), "000a")
+    ex_back(cols, [9])
+    ex_back(cols, [11])
+    ex_back(cols, [9, 11])
+
+    val eight = [Int32, Int32, Int32, Int32, Int32, Int32, Int32, Type.Text, Type.Text, Int8]
+
+    assert_eq(ex_bitmap(eight, [7]), "8000")
+    assert_eq(ex_bitmap(eight, [8]), "0001")
+    assert_eq(ex_bitmap(eight, [7, 8]), "8001")
+    ex_back(eight, [7, 8])
+
+private ex_nine_fixed() -> Buf[Type]
+    val b = buf[Type]()
+
+    for _ in 0..<9
+        b.push(Int32)
+
+    b
+
+@test
+the_external_bitmap_is_independent_of_the_null_bitmap()
+    val cols = [nullable(Int32), Type.Text, nullable(Type.Text), Type.Bytes]
+    val vals = [Value.Null, Value.Text("abc"), Value.Null, bytes_value([1])]
+    val bytes = encode_row_with_stubs(ex_header(), cols, vals, ex_stubs(4, [3])).unwrap()
+
+    // Null bitmap: columns 0 and 2. External bitmap: column 3.
+    assert_eq(hex_string(bytes.view()[RowHeaderSize..<RowHeaderSize + 2]), "0508")
+
+    val back = decode_row(cols, bytes.view()).unwrap()
+
+    assert(back.stubs[3] == Some(ex_stub()))
+    assert(back.stubs[1].is_none() && back.stubs[2].is_none())
+    assert(back.values[0].is_null() && back.values[2].is_null())
+
+// -- a dropped column renumbers the columns after it ----------------------------------------------
+
+@test
+a_dropped_column_shifts_the_bit_of_every_column_after_it()
+    // Schema version 1: a (int32), b (text), c (text), d (int8). Version 2 drops b.
+    val v1 = [Int32, Type.Text, Type.Text, Int8]
+    val v2 = [Int32, Type.Text, Int8]
+
+    assert_eq(ex_bitmap(v1, [2]), "04")
+    assert_eq(ex_bitmap(v2, [1]), "02")
+
+    // Dropping the first column shifts everything down by one, and the number of the column is the
+    // number in the schema version the row is written under, not the number it once had.
+    val v3 = [Type.Text, Int8]
+
+    assert_eq(ex_bitmap(v3, [0]), "01")
+    ex_back(v2, [1])
+    ex_back(v3, [0])
+
+@test
+a_row_is_read_under_the_schema_version_it_was_written_under()
+    val v1 = [Int32, Type.Text, Type.Text, Int8]
+    val v2 = [Int32, Type.Text, Int8]
+    val old = ex_row(v1, [2])
+    val back = decode_row(v1, old.view()).unwrap()
+
+    assert(back.stubs[2].is_some() && back.stubs[1].is_none())
+
+    // Read under the later version the same octets are not that row: the bit names column 2, an int8.
+    assert_eq(ex_code(decode_row(v2, old.view())), "D1001")
+
+// -- a reader holds the bit to the column's number --------------------------------------------------
+
+@test
+a_bit_on_a_fixed_column_is_corruption_though_it_could_be_a_variable_index()
+    val head = "0900000000000000" + "0000000000000000" + "0400" + "0100"
+    val stub = hex_string(encode_stub(ex_stub()).view())
+
+    // [int32, text]: the text is column 1. Bit 0 names the int32, so it is corrupt; bit 1 is right.
+    assert_eq(ex_code(decode_row([Int32, Type.Text], rf_unhex(head + "00" + "01" + "01000000" + "2000" + stub).view())), "D1001")
+    assert_eq(ex_code(decode_row([Int32, Type.Text], rf_unhex(head + "00" + "02" + "01000000" + "2000" + stub).view())), "ok")
+
+    // [text, int32, text]: bit 1 names the int32; bit 2 the second text.
+    val tail = "01000000" + "2000" + "4000" + stub + stub
+    assert_eq(ex_code(decode_row([Type.Text, Int32, Type.Text], rf_unhex(head + "00" + "02" + tail).view())), "D1001")
+    assert_eq(ex_code(decode_row([Type.Text, Int32, Type.Text], rf_unhex(head + "00" + "05" + tail).view())), "ok")
+
+@test
+a_bit_past_the_last_column_is_corruption()
+    val head = "0900000000000000" + "0000000000000000" + "0400" + "0100"
+    val stub = hex_string(encode_stub(ex_stub()).view())
+
+    assert_eq(ex_code(decode_row([Int32, Type.Text], rf_unhex(head + "00" + "0a" + "01000000" + "2000" + stub).view())), "D1001")
+    assert_eq(ex_code(decode_row([Int32, Type.Text], rf_unhex(head + "00" + "82" + "01000000" + "2000" + stub).view())), "D1001")
+
+@test
+a_stub_lands_on_the_column_whose_bit_is_set()
+    val head = "0900000000000000" + "0000000000000000" + "0400" + "0100"
+    val stub = hex_string(encode_stub(ex_stub()).view())
+    val back = decode_row([Type.Text, Int32, Type.Text], rf_unhex(head + "00" + "04" + "01000000" + "0100" + "2100" + "61" + stub).view()).unwrap()
+
+    assert(back.stubs[0].is_none())
+    assert(back.stubs[2] == Some(ex_stub()))
+    assert(back.values[0] == Value.Text("a"))

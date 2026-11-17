@@ -172,6 +172,7 @@ impl MemCatalog
 
         if changed then self.new_version(ti)?
         self.check_width(ti)?
+        self.check_row_fits(ti)?
         self.revalidate()
 
     /** Action `a` applied to table `ti`; answers whether it changed the column list (§5.1 rule 2). */

@@ -276,6 +276,12 @@ Page 0 of each data segment:
    reader can still hold a reference to it (epoch-based reclamation, as in LeanStore). Condition (b) is in-memory
    state only. After a restart no reader exists, so the bitmap alone is the truth.
 
+4. **Only data segments have one.** An undo page (§5.1) has no allocation bitmap and no bitmap page of its own:
+   undo pages are taken at the undo high-water mark and freed only by truncation below `undo_low` (§5.5), and
+   addresses are never reused, so the pages in use are always the one run from the page holding `undo_low` up to
+   the high-water mark, and that run is the whole allocation state. Truncation is what returns undo pages to the
+   page space. The rules above (bit 0, `allocated_count`, reuse after `PAGE_FREE`) apply to data segments only.
+
 B+tree pages need no per-page free-space tracking, because placement in a clustered tree is decided by the key.
 *Rationale:* this is why TernDB has no Postgres-style FSM fork. Only the allocation state is persisted.
 
@@ -390,8 +396,12 @@ After the header, in order:
 
 1. **Null bitmap**: ⌈n / 8⌉ bytes, where n is the number of non-key columns in `schema_version`. Bit i (byte
    `i >> 3`, bit `i & 7`) is 1 when column i is NULL. Columns are numbered in `ordinal` order, skipping the key.
-2. **External bitmap**, present only when `HAS_EXTERNAL`: same size, and bit i is 1 when variable column i is stored
-   out of line (§4.7).
+2. **External bitmap**, present only when `HAS_EXTERNAL`: the same size as the null bitmap, and **indexed the same
+   way**: bit i (byte `i >> 3`, bit `i & 7`) refers to column i, **the column's number among the non-key columns as
+   item 1 numbers them, fixed-width columns included**, and is 1 when that column is variable-width and stored out
+   of line (§4.7). It is not the column's position among the variable-width columns. A set bit on a fixed-width
+   column, on a NULL column, or at or past n is `data_corrupted`. The number is that of the row's `schema_version`:
+   a dropped column has no number there, and the columns after it are numbered without it.
 3. **Fixed area**: every fixed-width column (§4.4), in ordinal order, at its full width. A NULL column still takes
    its width and MUST be zero-filled. *Rationale:* fixed positions make an in-place update of a fixed column a
    byte overwrite and a small redo record.
@@ -602,7 +612,8 @@ An undo page:
 | 0  | 32 | common header, `type` 0x05, `owner` 0 |
 | 32 | 16352 | records, packed |
 
-1. Undo pages are ordinary pages: buffered, checksummed and written under the WAL rule. Every byte appended to
+1. Undo pages are ordinary pages: buffered, checksummed and written under the WAL rule. **They have no allocation
+   bitmap** (§3.7 rule 4): the log is freed by truncation (§5.5), never page by page. Every byte appended to
    one is covered by an `UNDO_APPEND` redo record (§6.4). **The undo log is never synced at commit**; it is
    recovered from the WAL. This is InnoDB's design, and it keeps one sync per commit group.
 2. A record MUST NOT span undo pages. The unused tail of a page MUST be covered by a PAD record (kind 0). A PAD
