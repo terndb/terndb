@@ -358,8 +358,8 @@ a_pending_retype_to_fixed_width_does_not_relax_the_limit_on_the_current_type()
 
 @test
 a_retype_in_the_same_statement_as_an_add_counts_both()
-    // Retyping f0 leaves 3,999 here, 28 + 234 + 2 + 3,734 + 2 - 1 less than the limit by one.
-    val c = cat_ok(fit_empty(), fit_small("t", 3, 1866))
+    // Retyping f0 alone takes the row to exactly 4,000; any added column then passes the limit.
+    val c = cat_ok(fit_empty(), fit_small("t", 3, 1867))
 
     assert_eq(cat_code(c, fit_retype("t", "f0")), "ok")
     assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), AddColumn(cat_col("n", nullable(Type.Text)))])), "Q6022")
