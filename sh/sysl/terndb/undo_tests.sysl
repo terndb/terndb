@@ -978,6 +978,9 @@ the_check_refuses_each_kind_of_damage()
     assert_eq(u6.abort(t6), Ok(true))
     u6.rows[0] = LeafRow(r0.oid, r0.key, RowImage(RowHeader(t6, r0.row.header.undo, 0, 1), r0.row.cols))
     ux_corrupt(check_undo(u6), "a row naming a rolled-back transaction")
-    // A row with LOCK_ONLY, which nothing here writes.
+    // A row flagged LOCK_ONLY whose undo names an INSERT, not a LOCK.
     u6.rows[0] = LeafRow(r0.oid, r0.key, RowImage(RowHeader(r0.row.header.txn, r0.row.header.undo, RowLockOnly, 1), r0.row.cols))
-    ux_corrupt(check_undo(u6), "a row flagged LOCK_ONLY")
+    ux_corrupt(check_undo(u6), "a LOCK_ONLY row over an INSERT record")
+    // A ghost that is LOCK_ONLY.
+    u6.rows[0] = LeafRow(r0.oid, r0.key, RowImage(RowHeader(r0.row.header.txn, r0.row.header.undo, RowLockOnly | RowDeleted, 1), r0.row.cols))
+    ux_corrupt(check_undo(u6), "a lock-only ghost")

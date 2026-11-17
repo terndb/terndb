@@ -42,6 +42,11 @@ const UndoOldDeleted: u8 = 1
 /** Record `flags` bit 1: an old value is out of line. */
 const UndoOldExternal: u8 = 2
 
+/** Record `flags` bit 2: the old version had `LOCK_ONLY` set, so its writer is not its `txn` but is
+ * found through the record at its `undo` (§5.2, §5.4).
+ */
+const UndoOldLockOnly: u8 = 4
+
 /** One non-key column of a row: null, or the bytes the row stores for it (§4.4), which for a column
  * stored out of line are its 32-byte stub. This is the grain at which an UPDATE record keeps old
  * values (§5.2), so the undo log needs no column types.
@@ -188,8 +193,11 @@ decode_undo_record(bytes: []const u8) -> Result[UndoRecord, CodecError]
     if kind == UndoInsert
         if prev_version != 0 || prev_txn != 0 then return corrupt("an INSERT undo record with a previous version")
         if flags & UndoOldDeleted != 0 then return corrupt("an INSERT undo record whose old version is a ghost")
+        if flags & UndoOldLockOnly != 0 then return corrupt("an INSERT undo record whose old version is lock-only")
     elif kind != UndoSecondary
         if prev_txn == 0 then return corrupt("an undo record with an old version and no old transaction")
+        if flags & UndoOldDeleted != 0 && flags & UndoOldLockOnly != 0 then return corrupt("an undo record whose old version is both a ghost and lock-only")
+        if kind == UndoLock && flags & UndoOldDeleted != 0 then return corrupt("a LOCK undo record over a ghost")
 
     if kind == UndoUpdate
         if at + 2 > len then return corrupt("an UPDATE undo record with no column count")
@@ -436,6 +444,19 @@ struct UndoRows
 
         (lo, lo < self.rows.len() && self.rows[lo].oid == oid && self.rows[lo].key.view() == key)
 
+    /** The current image of the row of `oid` and `key` in the leaf, ghost or not; a copy. */
+    current(self, oid: u64, key: []const u8) -> Option[RowImage]
+        val (at, found) = self.find(oid, key)
+        if found then Some(copy_row_image(self.rows[at].row)) else None
+
+    /** Puts `img` in the leaf as the row of `oid` and `key`, replacing any row there, with no undo
+     * record: what a test uses to damage the leaf.
+     */
+    put_row(*self, oid: u64, key: []const u8, img: RowImage)
+        val (at, found) = self.find(oid, key)
+        val r = LeafRow(oid, undo_bytes(key), copy_row_image(img))
+        if found then self.rows[at] = r else self.rows.insert(at, r)
+
     /** Whether a reader with snapshot `s`, running in transaction `own` (0 for none), sees the
      * writes of transaction `txn`: its own, or a commit at or before `s` (§4.1).
      */
@@ -509,7 +530,7 @@ struct UndoRows
         for i in 0..<row.cols.len()
             if whole || row.cols[i] != cols[i] then old.push(UndoColumn(i, copy_column(row.cols[i])))
 
-        val rec = UndoRecord(0, UndoUpdate, 0, row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+        val rec = UndoRecord(0, UndoUpdate, old_lock_flag(row), row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
             oid, undo_bytes(key), old, 0, buf[u8]())
         val addr = self.log(txn, rec)?
         self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols)))
@@ -526,12 +547,51 @@ struct UndoRows
         val h = self.holder(row, txn)
         if h != 0 then return Ok(UndoLocked(h))
         if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
-        val rec = UndoRecord(0, UndoDelete, 0, row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+        val rec = UndoRecord(0, UndoDelete, old_lock_flag(row), row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
             oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
         val addr = self.log(txn, rec)?
-        val hd = RowHeader(txn, addr, row.header.flags | RowDeleted, row.header.schema_version)
+        val hd = RowHeader(txn, addr, (row.header.flags & ~RowLockOnly) | RowDeleted, row.header.schema_version)
         self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(hd, row.cols))
         Ok(UndoDone(addr))
+
+    /** Takes the write lock of the live row of `oid` and `key` for `txn` without changing it
+     * (`LOCK_ONLY`, §4.1): a LOCK record, whose flag bit 2 says whether the version it locks was
+     * itself lock-only (a lock taken over a committed lock), and the row then carries `txn`, the
+     * record's address and `LOCK_ONLY`. A row `txn` already wrote or locked needs nothing more and
+     * answers the address it carries. The lock is released by `txn`'s commit or rollback, as any
+     * write lock is; a reader rebuilds through the record as if it were not there (§5.4).
+     */
+    lock(*self, txn: u64, oid: u64, key: []const u8) -> Result[UndoWrite, CodecError]
+        if !self.is_active(txn) then return Ok(UndoNotActive)
+        val (at, found) = self.find(oid, key)
+        if !found then return Ok(UndoMissing)
+        val row = self.rows[at].row
+        val h = self.holder(row, txn)
+        if h != 0 then return Ok(UndoLocked(h))
+        if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
+        if row.header.txn == txn then return Ok(UndoDone(row.header.undo))
+        val rec = UndoRecord(0, UndoLock, old_lock_flag(row), row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+            oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
+        val addr = self.log(txn, rec)?
+        val hd = RowHeader(txn, addr, row.header.flags | RowLockOnly, row.header.schema_version)
+        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(hd, row.cols))
+        Ok(UndoDone(addr))
+
+    /** The transaction that wrote the version `img` is: its `txn`, or, where `img` is `LOCK_ONLY`,
+     * the `prev_txn` of the LOCK record at its `undo`, past every LOCK record whose flag bit 2 says
+     * the version under it was lock-only too (§5.4 step 1). 0 when that record lies below
+     * `undo_low`: the version is then seen by every snapshot (§5.5 rule 2).
+     */
+    writer_of(self, img: RowImage) -> Result[u64, CodecError]
+        if img.header.flags & RowLockOnly == 0 then return Ok(img.header.txn)
+        var a = img.header.undo
+
+        loop
+            if a < self.space.low then return Ok(0)
+            val rec = self.space.read(a)?
+            if rec.kind != UndoLock then return corrupt("a LOCK_ONLY row whose undo names a record that is not a LOCK")
+            if rec.flags & UndoOldLockOnly == 0 then return Ok(rec.prev_txn)
+            a = rec.prev_version
 
     /** Commits `txn`: it takes commit sequence number `h + 1`, which is published at once (§4.1).
      * None when `txn` is not active.
@@ -593,7 +653,9 @@ struct UndoRows
         var cur = img
 
         loop
-            if self.sees(cur.header.txn, s, own)?
+            val w = self.writer_of(cur)?
+
+            if w == 0 || self.sees(w, s, own)?
                 return Ok(if cur.header.flags & RowDeleted != 0 then None else Some(copy_row_image(cur)))
 
             if cur.header.undo < self.space.low then return corrupt("a snapshot needs an undo record below undo_low (rule D17)")
@@ -648,22 +710,28 @@ struct UndoRows
         self.rows.remove(at)
         1
 
-/** Applies record `rec`, made by the writer of `img`, backward (§5.4 step 3): an INSERT answers "no
- * row"; a DELETE or UPDATE gives the old version, with `DELETED` as the record's flag bit 0 says,
- * `txn ← prev_txn` and `undo ← prev_version`, and an UPDATE restores the columns it lists and
- * `old_schema_version`. A record of another transaction, or of a kind no version chain holds, is
- * `data_corrupted`.
- */
-private undo_back(img: RowImage, rec: UndoRecord) -> Result[Option[RowImage], CodecError]
-    if rec.txn != img.header.txn then return corrupt("a row's undo address names another transaction's record")
-    if rec.kind == UndoInsert then return Ok(None)
-    var flags = img.header.flags & ~RowDeleted
-    if rec.flags & UndoOldDeleted != 0 then flags = flags | RowDeleted
+/** Flag bit 2 of a record written over `row`: set when `row` is lock-only (Q49). */
+private old_lock_flag(row: RowImage) -> u8 = if row.header.flags & RowLockOnly != 0 then UndoOldLockOnly else 0
 
-    if rec.kind == UndoDelete
+/** Applies record `rec`, made by the writer of `img`, backward (§5.4 step 3): an INSERT answers "no
+ * row"; a DELETE, LOCK or UPDATE gives the old version, with `DELETED` as the record's flag bit 0
+ * says and `LOCK_ONLY` as its bit 2 says, `txn ← prev_txn` and `undo ← prev_version`, and an UPDATE
+ * restores the columns it lists and `old_schema_version`. A LOCK changes no column. A record of
+ * another transaction, of a kind no version chain holds, or a LOCK record that is not under a
+ * `LOCK_ONLY` version (or the reverse) is `data_corrupted`.
+ */
+private[terndb] undo_back(img: RowImage, rec: UndoRecord) -> Result[Option[RowImage], CodecError]
+    if rec.txn != img.header.txn then return corrupt("a row's undo address names another transaction's record")
+    if (rec.kind == UndoLock) != (img.header.flags & RowLockOnly != 0) then return corrupt("a LOCK undo record and a LOCK_ONLY version that do not go together")
+    if rec.kind == UndoInsert then return Ok(None)
+    var flags = img.header.flags & ~(RowDeleted | RowLockOnly)
+    if rec.flags & UndoOldDeleted != 0 then flags = flags | RowDeleted
+    if rec.flags & UndoOldLockOnly != 0 then flags = flags | RowLockOnly
+
+    if rec.kind == UndoDelete || rec.kind == UndoLock
         return Ok(Some(RowImage(RowHeader(rec.prev_txn, rec.prev_version, flags, img.header.schema_version), img.cols)))
 
-    if rec.kind != UndoUpdate then return corrupt("a version chain names a PAD, LOCK or SECONDARY undo record")
+    if rec.kind != UndoUpdate then return corrupt("a version chain names a PAD or SECONDARY undo record")
     val cols = undo_columns_back(img, rec)?
     Ok(Some(RowImage(RowHeader(rec.prev_txn, rec.prev_version, flags, rec.old_schema_version), cols)))
 

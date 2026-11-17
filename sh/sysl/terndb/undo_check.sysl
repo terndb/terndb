@@ -130,7 +130,8 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
             val q = u.rows[k - 1]
             if q.oid > r.oid || (q.oid == r.oid && q.key.view() >= r.key.view()) then return undo_bad(s"$at: the leaf is not in key order")
 
-        if hd.flags & ~RowDeleted != 0 then return undo_bad(s"$at: flags other than DELETED")
+        if hd.flags & ~(RowDeleted | RowLockOnly) != 0 then return undo_bad(s"$at: flags other than DELETED and LOCK_ONLY")
+        if hd.flags == RowDeleted | RowLockOnly then return undo_bad(s"$at: a ghost that is LOCK_ONLY")
         if hd.undo == 0 then return undo_bad(s"$at: no undo address")
 
         val wt = u.txn_of(hd.txn) match
@@ -144,6 +145,9 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
 
         var txn = hd.txn
         var a = hd.undo
+        // Whether the version the chain has reached is lock-only: its record must then be a LOCK
+        // (Q49), and only then.
+        var lock_only = hd.flags & RowLockOnly != 0
 
         while a != 0 && a >= sp.low
             val j = undo_at(recs, a) match
@@ -152,10 +156,19 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
             val rec = recs[j].rec
             if rec.txn != txn then return undo_bad(s"$at: its version chain names another transaction's record at $a")
             if rec.oid != r.oid || rec.key != r.key then return undo_bad(s"$at: its version chain names another row's record at $a")
-            if rec.kind != UndoInsert && rec.kind != UndoUpdate && rec.kind != UndoDelete then return undo_bad(s"$at: its version chain names a LOCK or SECONDARY record")
+            if rec.kind == UndoPad || rec.kind == UndoSecondary then return undo_bad(s"$at: its version chain names a SECONDARY record")
+            if lock_only && rec.kind != UndoLock then return undo_bad(s"$at: a LOCK_ONLY version whose record at $a is not a LOCK")
+            if !lock_only && rec.kind == UndoLock then return undo_bad(s"$at: a LOCK record at $a under a version that is not LOCK_ONLY")
             if rec.kind == UndoInsert then break
+            val ordered = rec.kind != UndoLock && rec.flags & UndoOldLockOnly == 0
+            lock_only = rec.flags & UndoOldLockOnly != 0
 
-            if rec.prev_txn != rec.txn
+            if rec.prev_txn != rec.txn && !ordered
+                val older = u.txn_of(rec.prev_txn) match
+                    Some(t) -> t
+                    None -> return undo_bad(s"$at: its version chain names a transaction that never began")
+                if older.state != UndoTxnCommitted then return undo_bad(s"$at: an older version whose writer did not commit")
+            elif rec.prev_txn != rec.txn
                 val newer = u.txn_of(rec.txn).unwrap()
 
                 val older = u.txn_of(rec.prev_txn) match

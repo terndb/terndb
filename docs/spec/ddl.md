@@ -166,7 +166,9 @@ Every constraint has a name unique in the table's namespace, and is one of:
    holding it only through a commit after the snapshot is `serialization_failure` at snapshot and serializable and
    `unique_violation` at read committed. The check runs once every write of a statement to the table has been
    applied (and again after each cascade's writes to it), so a statement may exchange or shift values among its
-   rows, and a value a statement or an earlier statement of the transaction freed is free.
+   rows, and a value a statement or an earlier statement of the transaction freed is free. A value with a NULL
+   component is never checked (§2.5 rule 2), whichever of its components are NULL; its index entry takes the
+   non-unique form ([DISK] §4.9 rule 1).
 
 ### 2.7 Defaults, generated columns, identity and sequences
 
