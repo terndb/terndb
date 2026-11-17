@@ -11,7 +11,8 @@
 // machines of both ends, with the engine behind the server as an `Executor` (§2, §4.3–§4.6, §5, §7);
 // and the core of the vectorised executor: column vectors, expression kernels and the operators that
 // need no storage (`docs/design/executor.md`); and the server, which drives a session per connection
-// over sockets against one shared engine (`docs/design/engine.md` § The server). The `terndb` program
+// over sockets against one shared engine (`docs/design/engine.md` § The server); and the in-memory B+tree over
+// 16 KiB pages laid out as `docs/spec/on-disk-format.md` §3 specifies (`docs/design/btree.md`). The `terndb` program
 // is `server/`, a project of its own.
 
 package {

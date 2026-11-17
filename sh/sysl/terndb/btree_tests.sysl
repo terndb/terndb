@@ -1,0 +1,1075 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{get_u64_le, push_u64_le}
+
+// The B+tree's edge cases (`btree.sysl`, `page.sysl`, `btree_check.sysl`), each named: the empty
+// tree, one key, the key and entry limits of `on-disk-format.md` §3.6, a split at exactly a full page,
+// splits, merges and redistribution at every level, root growth and collapse, insert orders, scan
+// bounds on and between keys and on leaf boundaries, prefix compression, PID reuse, the bitmaps, the
+// byte layout of §3, and the structural check refusing each kind of damage. The randomized model test
+// is `btree_model_tests.sysl`.
+
+/** `s` as bytes. */
+bx(s: string) -> Buf[u8]
+    val b = buf[u8]()
+    b.extend(s.bytes)
+    b
+
+/** A copy of `s`. */
+bx_copy(s: []const u8) -> Buf[u8]
+    val b = buf[u8]()
+    b.extend(s)
+    b
+
+/** `n` copies of `c`. */
+bx_fill(c: u8, n: usize) -> Buf[u8]
+    val b = buf[u8]()
+
+    for _ in 0..<n
+        b.push(c)
+
+    b
+
+/** `head` then `n` copies of `c`. */
+bx_pad(head: string, c: u8, n: usize) -> Buf[u8]
+    val b = bx(head)
+    b.extend(bx_fill(c, n).view())
+    b
+
+/** Key `i` of an ordered run: "k" and `i` in six digits. */
+bx_num(i: usize) -> Buf[u8]
+    var digits = s"$i"
+
+    while digits.len < 6
+        digits = s"0$digits"
+
+    bx(s"k$digits")
+
+/** A fresh tree, owner 7, in a space of its own. */
+bx_tree() -> BTree = btree(page_space(), 7)
+
+/** The tree's check, which must pass. */
+bx_ok(t: BTree, file: string = __FILE__, line: long = __LINE__) -> BtStats = check_btree(t) match
+    Ok(s) -> s
+    Err(e) ->
+        assert(false, s"the check fails: ${e.message}", file, line)
+        BtStats(0, 0, 0, 0)
+
+bx_put(t: BTree, k: []const u8, v: []const u8, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(t.insert(k, v), Ok(true), "", file, line)
+
+/** The keys of `es` as text, space-separated; a key that is not text reads as `#` and its length. */
+bx_keys(es: Buf[BtEntry]) -> string
+    var out = ""
+
+    for e in es
+        val k = bx_text(e.key)
+        out = if out.len == 0 then k else s"$out $k"
+
+    out
+
+bx_text(k: Buf[u8]) -> string
+    var s = ""
+
+    for b in k
+        if b < 0x20 || b > 0x7e then return s"#${k.len()}"
+        s = s"$s${char(b)}"
+
+    if s.len == 0 then "<>" else s
+
+bx_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+bx_all(t: BTree, forward: bool) -> string = bx_keys(t.scan(KeyAny, KeyAny, forward))
+
+// -- empty, one key, duplicates, missing keys ---------------------------------------------------------
+
+@test
+an_empty_tree_finds_nothing_scans_nothing_and_deletes_nothing()
+    val t = bx_tree()
+    assert(t.get(bx("a").view()).is_none())
+    assert(t.get([]).is_none())
+    assert_eq(t.scan(KeyAny, KeyAny, true).len(), 0)
+    assert_eq(t.scan(KeyAny, KeyAny, false).len(), 0)
+    assert_eq(t.scan(KeyIncl(bx("a")), KeyIncl(bx("z")), true).len(), 0)
+    assert_eq(t.scan(KeyExcl(bx("a")), KeyExcl(bx("z")), false).len(), 0)
+    assert(!t.delete(bx("a").view()))
+    assert(!t.delete([]))
+    assert_eq(t.update(bx("a").view(), bx("1").view()), Ok(false))
+    assert_eq(bx_ok(t), BtStats(1, 1, 1, 0))
+    assert_eq(t.space.allocated(), 2)
+
+@test
+a_single_key_is_found_scanned_and_deleted()
+    val t = bx_tree()
+    bx_put(t, bx("m").view(), bx("v").view())
+    assert_eq(t.get(bx("m").view()), Some(bx("v")))
+    assert(t.get(bx("l").view()).is_none())
+    assert(t.get(bx("mm").view()).is_none())
+    assert_eq(bx_all(t, true), "m")
+    assert_eq(bx_all(t, false), "m")
+    assert_eq(bx_ok(t), BtStats(1, 1, 1, 1))
+    assert(t.delete(bx("m").view()))
+    assert(t.get(bx("m").view()).is_none())
+    assert(!t.delete(bx("m").view()))
+    assert_eq(bx_ok(t), BtStats(1, 1, 1, 0))
+
+@test
+inserting_an_existing_key_is_refused_and_keeps_the_old_value()
+    val t = bx_tree()
+    bx_put(t, bx("k").view(), bx("old").view())
+    assert_eq(t.insert(bx("k").view(), bx("new").view()), Ok(false))
+    assert_eq(t.get(bx("k").view()), Some(bx("old")))
+    assert_eq(bx_ok(t).entries, 1)
+
+@test
+deleting_or_updating_a_missing_key_changes_nothing()
+    val t = bx_tree()
+
+    for i in 0..<300
+        bx_put(t, bx_num(i * 2).view(), bx_fill(0x41, 100).view())
+
+    val before = bx_ok(t)
+    assert(before.depth >= 2)
+    assert(!t.delete(bx_num(301).view()))
+    assert(!t.delete(bx("").view()))
+    assert(!t.delete(bx("zzz").view()))
+    assert_eq(t.update(bx_num(3).view(), bx("x").view()), Ok(false))
+    assert_eq(bx_ok(t), before)
+    assert_eq(t.scan(KeyAny, KeyAny, true).len(), 300)
+
+// -- key and entry limits (§3.6) ----------------------------------------------------------------------
+
+@test
+keys_of_length_zero_and_one_order_first()
+    val t = bx_tree()
+    bx_put(t, bx("b").view(), bx("2").view())
+    bx_put(t, [], bx("empty").view())
+    bx_put(t, [0xff], bx("ff").view())
+    bx_put(t, [0x00], bx("00").view())
+    bx_put(t, bx("a").view(), bx("1").view())
+    assert_eq(t.get([]), Some(bx("empty")))
+    assert_eq(t.get([0x00]), Some(bx("00")))
+    assert_eq(t.get([0xff]), Some(bx("ff")))
+    val es = t.scan(KeyAny, KeyAny, true)
+    assert_eq(es.len(), 5)
+    assert_eq(es[0].key.len(), 0)
+    assert_eq(es[1].key, bx_fill(0x00, 1))
+    assert_eq(es[4].key, bx_fill(0xff, 1))
+    assert_eq(t.scan(KeyAny, KeyIncl(bx("")), true).len(), 1)
+    assert_eq(t.scan(KeyAny, KeyExcl(bx("")), true).len(), 0)
+    assert_eq(t.scan(KeyExcl(bx("")), KeyAny, false).len(), 4)
+    assert(t.delete([]))
+    assert(t.get([]).is_none())
+    assert_eq(bx_ok(t).entries, 4)
+
+@test
+a_key_of_exactly_1024_bytes_is_kept_and_one_of_1025_is_key_too_long()
+    val t = bx_tree()
+    val k = bx_fill(0x61, MaxKeyLen)
+    bx_put(t, k.view(), bx("v").view())
+    assert_eq(t.get(k.view()), Some(bx("v")))
+    val long = bx_fill(0x61, MaxKeyLen + 1)
+    assert_eq(bx_code(t.insert(long.view(), [])), "D2001")
+    assert_eq(bx_code(t.update(long.view(), [])), "D2001")
+    assert(t.get(long.view()).is_none())
+    // The key limit is checked before the entry limit.
+    assert_eq(bx_code(t.insert(long.view(), bx_fill(0, 3000).view())), "D2001")
+    assert_eq(bx_ok(t).entries, 1)
+
+@test
+an_entry_of_exactly_4000_bytes_is_kept_and_one_of_4001_is_entry_too_large()
+    val t = bx_tree()
+    val k = bx_fill(0x61, 1000)
+    bx_put(t, k.view(), bx_fill(0x76, 3000).view())
+    assert_eq(t.get(k.view()).unwrap().len(), 3000)
+    assert_eq(bx_code(t.insert(bx("b").view(), bx_fill(0, 4000).view())), "D2002")
+    assert_eq(bx_code(t.insert(bx("b").view(), bx_fill(0, 3999).view())), "ok")
+    assert_eq(bx_code(t.update(k.view(), bx_fill(0x76, 3001).view())), "D2002")
+    assert_eq(t.get(k.view()).unwrap().len(), 3000)
+    assert_eq(bx_code(t.update(k.view(), [])), "ok")
+    assert_eq(t.get(k.view()).unwrap().len(), 0)
+    // A key at the limit leaves room for a value of 2,976 bytes.
+    bx_put(t, bx_fill(0x7a, MaxKeyLen).view(), bx_fill(1, MaxLeafEntry - MaxKeyLen).view())
+    assert_eq(bx_code(t.insert(bx_pad("y", 0x7a, MaxKeyLen - 1).view(), bx_fill(1, MaxLeafEntry - MaxKeyLen + 1).view())), "D2002")
+    assert_eq(bx_ok(t).entries, 3)
+
+@test
+values_of_zero_bytes_are_entries_like_any_other()
+    val t = bx_tree()
+
+    for i in 0..<2000
+        bx_put(t, bx_num(i).view(), [])
+
+    assert_eq(t.get(bx_num(1234).view()), Some(buf[u8]()))
+    val s = bx_ok(t)
+    assert_eq(s.entries, 2000)
+    assert(s.depth >= 2)
+
+@test
+a_leaf_holds_four_maximal_entries_and_splits_on_the_fifth()
+    val t = bx_tree()
+
+    for i in 0..<60
+        val k = bx_pad(s"${char(0x41 + u8(i % 26))}${char(0x41 + u8(i / 26))}", 0x2d, MaxKeyLen - 2)
+        bx_put(t, k.view(), bx_fill(0x2e, MaxLeafEntry - MaxKeyLen).view())
+        val s = bx_ok(t)
+        if i == 3 then assert_eq(s.depth, 1)
+        if i == 4 then assert_eq(s.depth, 2)
+
+    assert_eq(bx_ok(t).entries, 60)
+
+// -- a split at exactly a full page -------------------------------------------------------------------
+
+/** A root leaf with four entries of 4,004 page bytes each, leaving 240 of its 16,256 free. */
+bx_nearly_full() -> BTree
+    val t = bx_tree()
+
+    for i in 0..<4
+        bx_put(t, bx(s"k00$i").view(), bx_fill(0x76, 3988).view())
+
+    assert_eq(node_free(t.root_frame()), 240)
+    t
+
+@test
+an_entry_that_fills_the_page_exactly_does_not_split_it()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 224).view())
+    assert_eq(node_free(t.root_frame()), 0)
+    assert_eq(bx_ok(t).depth, 1)
+    assert_eq(t.events.root_splits, 0)
+    // Now any entry splits it.
+    bx_put(t, bx("k005").view(), [])
+    assert_eq(bx_ok(t).depth, 2)
+    assert_eq(t.events.root_splits, 1)
+    assert_eq(bx_all(t, true), "k000 k001 k002 k003 k004 k005")
+
+@test
+an_entry_one_byte_short_of_the_page_does_not_split_it()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 223).view())
+    assert_eq(node_free(t.root_frame()), 1)
+    assert_eq(bx_ok(t).depth, 1)
+
+@test
+an_entry_one_byte_over_the_page_splits_it()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 225).view())
+    assert_eq(bx_ok(t), BtStats(2, 3, 2, 5))
+    assert_eq(t.events.root_splits, 1)
+    assert_eq(t.get(bx("k004").view()).unwrap().len(), 225)
+
+@test
+an_insert_that_needs_the_fragmented_space_compacts_instead_of_splitting()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 224).view())
+    assert(t.delete(bx("k001").view()))
+    assert_eq(node_frag(t.root_frame()), 3992)
+    assert_eq(node_free(t.root_frame()), 12)
+    bx_ok(t)
+    bx_put(t, bx("k009").view(), bx_fill(0x78, 3988).view())
+    assert_eq(node_frag(t.root_frame()), 0)
+    assert_eq(node_free(t.root_frame()), 0)
+    assert_eq(bx_ok(t).depth, 1)
+    assert_eq(bx_all(t, true), "k000 k002 k003 k004 k009")
+    assert_eq(t.get(bx("k003").view()), Some(bx_fill(0x76, 3988)))
+
+@test
+an_update_that_grows_a_value_past_the_page_splits_the_leaf()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 224).view())
+    assert_eq(t.update(bx("k004").view(), bx_fill(0x79, 225).view()), Ok(true))
+    assert_eq(bx_ok(t).depth, 2)
+    assert_eq(t.get(bx("k004").view()), Some(bx_fill(0x79, 225)))
+    assert_eq(t.events.root_splits, 1)
+
+@test
+an_update_of_the_same_length_overwrites_in_place_and_a_shorter_one_fragments()
+    val t = bx_tree()
+    bx_put(t, bx("a").view(), bx("12345").view())
+    val top = node_heap_top(t.root_frame())
+    assert_eq(t.update(bx("a").view(), bx("abcde").view()), Ok(true))
+    assert_eq(node_heap_top(t.root_frame()), top)
+    assert_eq(node_frag(t.root_frame()), 0)
+    assert_eq(t.get(bx("a").view()), Some(bx("abcde")))
+    assert_eq(t.update(bx("a").view(), bx("xy").view()), Ok(true))
+    assert_eq(node_heap_top(t.root_frame()), top)
+    assert_eq(node_frag(t.root_frame()), 3)
+    assert_eq(t.get(bx("a").view()), Some(bx("xy")))
+    bx_ok(t)
+    assert_eq(t.update(bx("a").view(), bx("longer value").view()), Ok(true))
+    assert_eq(t.get(bx("a").view()), Some(bx("longer value")))
+    assert_eq(node_frag(t.root_frame()), 6)
+    bx_ok(t)
+
+// -- splits, merges and redistribution at every level ------------------------------------------------
+
+/** Keys that keep separators long: `x`'s 11 binary digits, each written as 90 copies of `a` or `b`,
+ * so neighbours share long prefixes and an inner node holds few separators.
+ */
+bx_deep(x: usize) -> Buf[u8]
+    val k = buf[u8]()
+    var bit: usize = 11
+
+    while bit > 0
+        bit -= 1
+        k.extend(bx_fill(if (x >> bit) & 1 == 1 then 0x62 else 0x61, 90).view())
+
+    k
+
+@test
+ascending_inserts_split_leaves_inner_nodes_and_the_root_and_the_root_keeps_its_pid()
+    val t = bx_tree()
+    val root = t.root
+
+    for i in 0..<2048
+        bx_put(t, bx_deep(i).view(), bx_fill(0x76, 20).view())
+        if i % 64 == 0 then bx_ok(t)
+
+    val s = bx_ok(t)
+    assert_eq(s.entries, 2048)
+    assert(s.depth >= 3)
+    assert_eq(t.root, root)
+    assert(t.events.leaf_splits > 0)
+    assert(t.events.inner_splits > 0)
+    assert_eq(t.events.root_splits, u64(s.depth - 1))
+
+@test
+deleting_everything_merges_every_level_collapses_the_root_and_frees_every_page()
+    val t = bx_tree()
+    val root = t.root
+
+    for i in 0..<2048
+        bx_put(t, bx_deep(i).view(), bx_fill(0x76, 20).view())
+
+    val depth = bx_ok(t).depth
+
+    // Every third key first, then the rest, so nodes underflow beside full siblings too.
+    for phase in 0..<3
+        var i: usize = phase
+
+        while i < 2048
+            assert(t.delete(bx_deep(i).view()))
+            if i % 37 == 0 then bx_ok(t)
+            i += 3
+
+    assert_eq(bx_ok(t), BtStats(1, 1, 1, 0))
+    assert_eq(t.root, root)
+    assert_eq(t.space.allocated(), 2)
+    assert(t.events.leaf_merges > 0)
+    assert(t.events.inner_merges > 0)
+    assert(t.events.root_collapses >= u64(depth - 1))
+
+    // And it fills again from empty.
+    for k in 0..<500
+        bx_put(t, bx_deep(k * 3).view(), bx("again").view())
+
+    assert_eq(bx_ok(t).entries, 500)
+    assert_eq(t.get(bx_deep(300).view()), Some(bx("again")))
+
+@test
+a_root_of_two_leaves_collapses_back_to_a_leaf()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 225).view())
+    assert_eq(bx_ok(t).depth, 2)
+    val root = t.root
+
+    for i in 0..<4
+        assert(t.delete(bx(s"k00$i").view()))
+        bx_ok(t)
+
+    assert_eq(bx_ok(t), BtStats(1, 1, 1, 1))
+    assert_eq(t.root, root)
+    assert(node_is_leaf(t.root_frame()))
+    assert_eq(t.events.root_collapses, 1)
+    assert_eq(t.space.allocated(), 2)
+
+/** The number of entries in each child of the root, in key order. */
+bx_child_counts(t: BTree) -> Buf[usize]
+    val out = buf[usize]()
+    val r = t.root_frame()
+
+    for c in 0..node_count(r)
+        out.push(node_count(unswizzle(node_child(r, c))))
+
+    out
+
+@test
+a_leaf_under_a_quarter_full_beside_a_full_sibling_takes_entries_from_it_then_merges()
+    val t = bx_tree()
+
+    // Entries of 1,516 page bytes: ten fit a leaf, the eleventh splits the root.
+    for i in 0..<11
+        bx_put(t, bx(s"m${char(0x61 + u8(i))}").view(), bx_fill(0x76, 1502).view())
+
+    assert_eq(bx_child_counts(t).len(), 2)
+    // Fill the left leaf to ten entries with keys below every one so far.
+    var added: usize = 0
+
+    while bx_child_counts(t)[0] < 10
+        bx_put(t, bx(s"a${char(0x61 + u8(added))}").view(), bx_fill(0x76, 1502).view())
+        added += 1
+
+    assert_eq(bx_child_counts(t).len(), 2)
+    val right = bx_child_counts(t)[1]
+    // Empty the right leaf down to two entries: the delete that leaves two underflows it.
+    val all = t.scan(KeyAny, KeyAny, false)
+
+    for i in 0..<right - 2
+        assert(t.delete(all[i].key.view()))
+
+    assert_eq(t.events.leaf_shares, 1)
+    assert_eq(t.events.leaf_merges, 0)
+    val counts = bx_child_counts(t)
+    assert_eq(counts.len(), 2)
+    assert_eq(counts[0], 6)
+    assert_eq(counts[1], 6)
+    bx_ok(t)
+
+    // Emptying the left one now merges the two, and the root takes the merged leaf in.
+    val left = t.scan(KeyAny, KeyAny, true)
+
+    for i in 0..<4
+        assert(t.delete(left[i].key.view()))
+        bx_ok(t)
+
+    assert_eq(t.events.leaf_merges, 1)
+    assert_eq(t.events.root_collapses, 1)
+    assert_eq(bx_ok(t), BtStats(1, 1, 1, 8))
+
+/** Key `i` of the hand-built tree: one distinct byte, then 999 bytes of `x`. */
+bx_wide(i: usize) -> Buf[u8] = bx_pad(s"${char(0x41 + u8(i))}", 0x78, 999)
+
+/** A child reference for a new page of `t` holding `img`. */
+bx_page(t: BTree, img: NodeImage) -> u64
+    val f = &*t.space.new_frame(t.space.allocate())
+    write_image(f, t.owner, img)
+    swizzle(f)
+
+/** An inner image over `children`, whose separators are the keys `bx_wide(first + 1)` onward. */
+bx_inner(level: usize, lower: Option[Buf[u8]], upper: Option[Buf[u8]], first: usize, children: Buf[u64]) -> NodeImage
+    val es = buf[BtEntry]()
+
+    for c in 0..<children.len() - 1
+        val v = buf[u8]()
+        push_u64_le(v, children[c])
+        es.push(BtEntry(bx_wide(first + c + 1), v))
+
+    NodeImage(level, lower, upper, es, children[children.len() - 1])
+
+@test
+an_inner_node_under_a_quarter_full_beside_a_full_sibling_takes_separators_from_it()
+    // Root → N (14 separators of 1,000 bytes, 15 leaves) and S (2 separators, 3 leaves), one key a leaf.
+    val t = bx_tree()
+    val n: usize = 18
+    val leaves = buf[u64]()
+
+    for i in 0..<n
+        val lo = if i == 0 then None else Some(bx_wide(i))
+        val hi = if i == n - 1 then None else Some(bx_wide(i + 1))
+        val es = buf[BtEntry]()
+        es.push(BtEntry(bx_wide(i), bx("v")))
+        leaves.push(bx_page(t, NodeImage(0, lo, hi, es, 0)))
+
+    val left = buf[u64]()
+    val right = buf[u64]()
+
+    for i in 0..<15
+        left.push(leaves[i])
+
+    for i in 15..<n
+        right.push(leaves[i])
+
+    val nn = bx_page(t, bx_inner(1, None, Some(bx_wide(15)), 0, left))
+    val ss = bx_page(t, bx_inner(1, Some(bx_wide(15)), None, 15, right))
+    val v = buf[u8]()
+    push_u64_le(v, nn)
+    val top = buf[BtEntry]()
+    top.push(BtEntry(bx_wide(15), v))
+    write_image(t.root_frame(), t.owner, NodeImage(2, None, None, top, ss))
+    assert_eq(bx_ok(t), BtStats(3, 21, 18, 18))
+    assert(node_used(unswizzle(nn)) > 15000)
+
+    // The last key's leaf merges into its sibling, which leaves S one separator: under a quarter
+    // full, and too big to merge with N, so the two share.
+    assert(t.delete(bx_wide(17).view()))
+    assert_eq(t.events.leaf_merges, 1)
+    assert_eq(t.events.inner_shares, 1)
+    assert_eq(t.events.inner_merges, 0)
+    assert_eq(bx_ok(t), BtStats(3, 20, 17, 17))
+    val r = t.root_frame()
+    assert_eq(node_count(r), 1)
+    assert(node_count(unswizzle(node_child(r, 1))) >= 6)
+    assert(slot_key(r, 0) != bx_wide(15))
+
+    for i in 0..<17
+        assert_eq(t.get(bx_wide(i).view()), Some(bx("v")))
+
+    assert_eq(t.scan(KeyAny, KeyAny, false).len(), 17)
+
+@test
+ascending_descending_and_alternating_insert_orders_agree()
+    for order in 0..<3
+        val t = bx_tree()
+        val n: usize = 1500
+
+        for i in 0..<n
+            val k = if order == 0 then i elif order == 1 then n - 1 - i elif i % 2 == 0 then i / 2 else n - 1 - i / 2
+            bx_put(t, bx_num(k).view(), bx_num(k * 7).view())
+            if i % 100 == 0 then bx_ok(t)
+
+        val es = t.scan(KeyAny, KeyAny, true)
+        assert_eq(es.len(), n)
+
+        for i in 0..<n
+            assert_eq(es[i].key, bx_num(i))
+            assert_eq(es[i].value, bx_num(i * 7))
+
+        assert(bx_ok(t).depth >= 2)
+
+// -- scans --------------------------------------------------------------------------------------------
+
+/** The tree "b d f h j", one leaf. */
+bx_odd() -> BTree
+    val t = bx_tree()
+
+    for k in ["b", "d", "f", "h", "j"]
+        bx_put(t, bx(k).view(), [])
+
+    t
+
+bx_range(t: BTree, lo: KeyBound, hi: KeyBound) -> string = s"${bx_keys(t.scan(lo, hi, true))}|${bx_keys(t.scan(lo, hi, false))}"
+
+@test
+scan_bounds_before_after_between_and_on_keys_in_both_directions()
+    val t = bx_odd()
+    assert_eq(bx_range(t, KeyAny, KeyAny), "b d f h j|j h f d b")
+    assert_eq(bx_range(t, KeyIncl(bx("a")), KeyAny), "b d f h j|j h f d b")
+    assert_eq(bx_range(t, KeyAny, KeyIncl(bx("a"))), "|")
+    assert_eq(bx_range(t, KeyIncl(bx("k")), KeyAny), "|")
+    assert_eq(bx_range(t, KeyAny, KeyExcl(bx("k"))), "b d f h j|j h f d b")
+    assert_eq(bx_range(t, KeyIncl(bx("c")), KeyIncl(bx("g"))), "d f|f d")
+    assert_eq(bx_range(t, KeyExcl(bx("c")), KeyExcl(bx("g"))), "d f|f d")
+    assert_eq(bx_range(t, KeyIncl(bx("d")), KeyIncl(bx("h"))), "d f h|h f d")
+    assert_eq(bx_range(t, KeyExcl(bx("d")), KeyIncl(bx("h"))), "f h|h f")
+    assert_eq(bx_range(t, KeyIncl(bx("d")), KeyExcl(bx("h"))), "d f|f d")
+    assert_eq(bx_range(t, KeyExcl(bx("d")), KeyExcl(bx("h"))), "f|f")
+    assert_eq(bx_range(t, KeyExcl(bx("d")), KeyExcl(bx("f"))), "|")
+    assert_eq(bx_range(t, KeyIncl(bx("f")), KeyIncl(bx("f"))), "f|f")
+    assert_eq(bx_range(t, KeyExcl(bx("f")), KeyIncl(bx("f"))), "|")
+    assert_eq(bx_range(t, KeyIncl(bx("h")), KeyIncl(bx("d"))), "|")
+    assert_eq(bx_range(t, KeyIncl(bx("e")), KeyIncl(bx("e"))), "|")
+    assert_eq(bx_range(t, KeyIncl(bx("b")), KeyIncl(bx("j"))), "b d f h j|j h f d b")
+    assert_eq(bx_range(t, KeyExcl(bx("b")), KeyExcl(bx("j"))), "d f h|h f d")
+    assert_eq(bx_range(t, KeyExcl(bx("j")), KeyAny), "|")
+    assert_eq(bx_range(t, KeyAny, KeyExcl(bx("b"))), "|")
+    // A bound that is a prefix of a key, or has a key as its prefix.
+    assert_eq(bx_range(t, KeyIncl(bx("da")), KeyIncl(bx("h"))), "f h|h f")
+    assert_eq(bx_range(t, KeyIncl(bx("")), KeyExcl(bx("ha"))), "b d f h|h f d b")
+
+/** The entries of `es` with keys in the range, in key order (or reversed), as `bx_keys` writes them. */
+bx_expect(es: Buf[BtEntry], lo: KeyBound, hi: KeyBound, forward: bool) -> string
+    val keep = buf[BtEntry]()
+
+    for e in es
+        val above = lo match
+            KeyAny -> true
+            KeyIncl(l) -> e.key.view() >= l.view()
+            KeyExcl(l) -> e.key.view() > l.view()
+        val below = hi match
+            KeyAny -> true
+            KeyIncl(h) -> e.key.view() <= h.view()
+            KeyExcl(h) -> e.key.view() < h.view()
+        if above && below then keep.push(e)
+
+    if !forward
+        val rev = buf[BtEntry]()
+        var i = keep.len()
+
+        while i > 0
+            i -= 1
+            rev.push(keep[i])
+
+        return bx_keys(rev)
+
+    bx_keys(keep)
+
+/** The upper fence of every node below `p` that has a finite one, by walking the tree. */
+bx_fences(p: *PageFrame, out: Buf[Buf[u8]])
+    if !upper_infinite(p) then out.push(bx_copy(upper_fence(p)))
+    if node_is_leaf(p) then return
+
+    for c in 0..node_count(p)
+        bx_fences(unswizzle(node_child(p, c)), out)
+
+@test
+scans_whose_bounds_fall_on_leaf_boundaries_cross_them_in_both_directions()
+    val t = bx_tree()
+
+    for i in 0..<900
+        bx_put(t, bx_num(i * 3).view(), bx_fill(0x76, 200).view())
+
+    val all = t.scan(KeyAny, KeyAny, true)
+    val fences = buf[Buf[u8]]()
+    bx_fences(t.root_frame(), fences)
+    assert(fences.len() >= 10)
+    val stop = bx("k001500")
+
+    for f in fences
+        // A fence, and the keys just below and just above it.
+        val near = buf[Buf[u8]]()
+        near.push(f)
+        val lower = bx_copy(f.view())
+        lower.pop()
+        near.push(lower)
+        val upper = bx_copy(f.view())
+        upper.push(0x00)
+        near.push(upper)
+
+        for b in near
+            for fwd in [true, false]
+                assert_eq(bx_keys(t.scan(KeyIncl(b), KeyAny, fwd)), bx_expect(all, KeyIncl(b), KeyAny, fwd))
+                assert_eq(bx_keys(t.scan(KeyExcl(b), KeyAny, fwd)), bx_expect(all, KeyExcl(b), KeyAny, fwd))
+                assert_eq(bx_keys(t.scan(KeyAny, KeyIncl(b), fwd)), bx_expect(all, KeyAny, KeyIncl(b), fwd))
+                assert_eq(bx_keys(t.scan(KeyAny, KeyExcl(b), fwd)), bx_expect(all, KeyAny, KeyExcl(b), fwd))
+                assert_eq(bx_keys(t.scan(KeyExcl(b), KeyIncl(stop), fwd)), bx_expect(all, KeyExcl(b), KeyIncl(stop), fwd))
+                assert_eq(bx_keys(t.scan(KeyIncl(stop), KeyIncl(b), fwd)), bx_expect(all, KeyIncl(stop), KeyIncl(b), fwd))
+
+@test
+a_cursor_walks_every_leaf_forward_and_backward()
+    val t = bx_tree()
+
+    for i in 0..<3000
+        bx_put(t, bx_num(i).view(), [])
+
+    assert(bx_ok(t).leaves > 3)
+    var c = t.cursor(KeyAny, KeyAny, false)
+    var i: usize = 3000
+
+    loop
+        c.next() match
+            Some(e) ->
+                i -= 1
+                assert_eq(e.key, bx_num(i))
+            None -> break
+
+    assert_eq(i, 0)
+    assert(c.next().is_none())
+    var f = t.cursor(KeyIncl(bx_num(17)), KeyExcl(bx_num(2990)), true)
+    var n: usize = 17
+
+    loop
+        f.next() match
+            Some(e) ->
+                assert_eq(e.key, bx_num(n))
+                n += 1
+            None -> break
+
+    assert_eq(n, 2990)
+
+// -- prefixes -----------------------------------------------------------------------------------------
+
+@test
+keys_that_are_prefixes_of_other_keys_keep_their_order()
+    val t = bx_tree()
+    val keys = ["aaaa", "a", "", "aa", "ab", "aaa", "b", "aab"]
+
+    for k in keys
+        bx_put(t, bx(k).view(), bx(k).view())
+
+    assert_eq(bx_all(t, true), "<> a aa aaa aaaa aab ab b")
+    assert_eq(bx_all(t, false), "b ab aab aaaa aaa aa a <>")
+
+    for k in keys
+        assert_eq(t.get(bx(k).view()), Some(bx(k)))
+
+    assert_eq(bx_range(t, KeyExcl(bx("aa")), KeyExcl(bx("ab"))), "aaa aaaa aab|aab aaaa aaa")
+    assert(t.delete(bx("aa").view()))
+    assert_eq(bx_all(t, true), "<> a aaa aaaa aab ab b")
+    bx_ok(t)
+
+@test
+prefix_keys_across_many_leaves_keep_their_order()
+    val t = bx_tree()
+    var k = buf[u8]()
+
+    // "", "a", "aa", … up to 1,000 bytes, each with a sibling ending in "b".
+    for i in 0..<1000
+        bx_put(t, k.view(), bx_fill(0x76, 200).view())
+        val sib = bx_copy(k.view())
+        sib.push(0x62)
+        bx_put(t, sib.view(), [])
+        k.push(0x61)
+        if i % 50 == 0 then bx_ok(t)
+
+    val es = t.scan(KeyAny, KeyAny, true)
+    assert_eq(es.len(), 2000)
+
+    for i in 1..<es.len()
+        assert(es[i - 1].key.view() < es[i].key.view())
+
+    assert(bx_ok(t).depth >= 2)
+
+/** The longest node prefix at or below `p`. */
+bx_max_prefix(p: *PageFrame) -> usize
+    var best = node_prefix_len(p)
+    if node_is_leaf(p) then return best
+
+    for c in 0..node_count(p)
+        val m = bx_max_prefix(unswizzle(node_child(p, c)))
+        if m > best then best = m
+
+    best
+
+@test
+keys_sharing_a_long_prefix_are_stored_without_it()
+    val t = bx_tree()
+
+    for i in 0..<400
+        val k = bx_pad("", 0x70, 900)
+        k.extend(bx_num(i).view())
+        bx_put(t, k.view(), bx_fill(0x76, 40).view())
+
+    assert(bx_ok(t).depth >= 2)
+    // A node bounded by two separators strips their common prefix: the 900 bytes and "k000".
+    assert(bx_max_prefix(t.root_frame()) >= 904)
+
+    for i in 0..<400
+        val k = bx_pad("", 0x70, 900)
+        k.extend(bx_num(i).view())
+        assert(t.get(k.view()).is_some())
+
+@test
+a_leaf_split_separator_is_the_shortest_key_between_the_halves()
+    val t = bx_tree()
+
+    for i in 0..<12
+        bx_put(t, bx(s"${char(0x61 + u8(i))}pple-and-more").view(), bx_fill(0x76, 1400).view())
+
+    val r = t.root_frame()
+    assert_eq(node_count(r), 1)
+    assert_eq(slot_key(r, 0).len(), 1)
+    assert_eq(shortest_separator(bx("abc").view(), bx("abd").view()), bx("abd"))
+    assert_eq(shortest_separator(bx("ab").view(), bx("abcd").view()), bx("abc"))
+    assert_eq(shortest_separator(bx("a").view(), bx("zzz").view()), bx("z"))
+    assert_eq(shortest_separator([], bx("q").view()), bx("q"))
+    assert_eq(shortest_separator([0x00], [0x00, 0x00]), bx_fill(0, 2))
+
+// -- the data space -----------------------------------------------------------------------------------
+
+@test
+a_freed_pid_is_the_next_one_allocated()
+    val s = page_space()
+    assert_eq(s.allocated(), 1)
+    assert(s.is_allocated(0))
+    assert_eq(s.allocate(), 1)
+    assert_eq(s.allocate(), 2)
+    assert_eq(s.allocate(), 3)
+    s.release(2)
+    assert(!s.is_allocated(2))
+    assert_eq(s.allocated(), 3)
+    assert_eq(s.allocate(), 2)
+    assert_eq(s.allocate(), 4)
+    s.release(1)
+    s.release(3)
+    assert_eq(s.allocate(), 1)
+    assert_eq(s.allocate(), 3)
+    assert_eq(s.allocate(), 5)
+
+@test
+a_tree_reuses_the_pages_a_merge_freed()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 225).view())
+    assert_eq(t.space.allocated(), 4)
+
+    for i in 0..<4
+        assert(t.delete(bx(s"k00$i").view()))
+
+    assert_eq(t.space.allocated(), 2)
+    assert(!t.space.is_allocated(2))
+    assert(!t.space.is_allocated(3))
+    assert(t.space.frame(2).is_none())
+
+    for i in 0..<4
+        bx_put(t, bx(s"k00$i").view(), bx_fill(0x76, 3988).view())
+
+    assert_eq(bx_ok(t).depth, 2)
+    assert(t.space.is_allocated(2))
+    assert(t.space.is_allocated(3))
+    assert(!t.space.is_allocated(4))
+
+@test
+a_full_segment_opens_the_next_with_its_own_bitmap()
+    val s = page_space()
+    var last: u64 = 0
+
+    for _ in 1..<SegmentPages
+        last = s.allocate()
+
+    assert_eq(last, SegmentPages - 1)
+    assert_eq(s.bitmaps.len(), 1)
+    assert_eq(rd32(&*s.bitmaps[0], 52), u32(SegmentPages))
+    // The next page is in segment 1, past its bitmap at page 65536.
+    assert_eq(s.allocate(), SegmentPages + 1)
+    assert_eq(s.bitmaps.len(), 2)
+    assert(s.is_allocated(SegmentPages))
+    assert_eq(rd32(&*s.bitmaps[1], 48), 1)
+    assert_eq(rd32(&*s.bitmaps[1], 52), 2)
+    assert_eq(rd64(&*s.bitmaps[1], 16), SegmentPages)
+    assert_eq(s.bitmaps[1].page[6], PageTypeBitmap)
+    assert_eq(s.allocated(), SegmentPages + 2)
+    s.release(77)
+    assert_eq(s.allocate(), 77)
+    s.release(SegmentPages + 1)
+    assert_eq(rd32(&*s.bitmaps[1], 52), 1)
+    assert_eq(s.allocate(), SegmentPages + 1)
+    // Pages with no frame and no tree are leaked as far as the check is concerned.
+    assert_eq(bx_code(check_btrees(s, [])), "D1001")
+
+@test
+two_trees_share_a_space_without_sharing_a_page()
+    val s = page_space()
+    val a = btree(s, 1)
+    val b = btree(s, 2)
+
+    for i in 0..<1500
+        bx_put(a, bx_num(i).view(), bx_fill(0x61, 50).view())
+        bx_put(b, bx_num(i * 2).view(), bx_fill(0x62, 70).view())
+
+    val both = check_btrees(s, [a, b])
+    assert_eq(bx_code(both), "ok")
+    val stats = both.unwrap()
+    assert_eq(u64(stats[0].pages + stats[1].pages + 1), s.allocated())
+    // One tree alone does not account for the space.
+    assert_eq(bx_code(check_btree(a)), "D1001")
+
+    for i in 0..<1500
+        assert(a.delete(bx_num(i).view()))
+
+    assert_eq(bx_code(check_btrees(s, [a, b])), "ok")
+
+    for i in 0..<1500
+        bx_put(b, bx_num(i * 2 + 1).view(), bx_fill(0x62, 70).view())
+
+    assert_eq(bx_code(check_btrees(s, [a, b])), "ok")
+    assert_eq(b.scan(KeyAny, KeyAny, true).len(), 3000)
+    assert_eq(a.scan(KeyAny, KeyAny, true).len(), 0)
+
+// -- the byte layout of §3 ----------------------------------------------------------------------------
+
+@test
+a_leaf_page_is_laid_out_as_section_3_specifies()
+    val t = btree(page_space(), 0x123456789abc)
+    bx_put(t, bx("beta").view(), bx("2").view())
+    bx_put(t, bx("al").view(), bx("one").view())
+    val p = t.root_frame()
+    assert_eq(rd32(p, 0), 0)
+    assert_eq(rd16(p, 4), 1)
+    assert_eq(p.page[6], 0x03)
+    assert_eq(p.page[7], 0x07)
+    assert_eq(rd64(p, 8), 0)
+    assert_eq(rd64(p, 16), t.root)
+    assert_eq(p.page[24], 0xbc)
+    assert_eq(p.page[29], 0x12)
+    assert_eq(page_owner(p), 0x123456789abc)
+    assert_eq(rd16(p, 30), 0)
+    assert_eq(node_level(p), 0)
+    assert_eq(node_count(p), 2)
+    assert_eq(node_frag(p), 0)
+    assert_eq(node_prefix_len(p), 0)
+    assert_eq(rd16(p, 42), 0)
+    assert_eq(rd16(p, 44), 0)
+    assert_eq(rd16(p, 46), 0)
+    assert_eq(rd16(p, 48), 0)
+    assert_eq(node_extra(p), 0)
+    // "beta" + "2" went in first, at the top of the heap; "al" + "one" below it, but in slot 0.
+    assert_eq(node_heap_top(p), DbPageSize - 10)
+    assert_eq(slot_offset(p, 0), DbPageSize - 10)
+    assert_eq(slot_key_len(p, 0), 2)
+    assert_eq(slot_value_len(p, 0), 3)
+    assert_eq(slot_offset(p, 1), DbPageSize - 5)
+    assert_eq(rd16(p, 128 + 6), 0)
+    assert_eq(slot_head(p, 0), 0x616c0000)
+    assert_eq(slot_head(p, 1), 0x62657461)
+    assert_eq(p.page[DbPageSize - 5], 0x62)
+    assert_eq(p.page[DbPageSize - 1], 0x32)
+    // Hint j is the head of slot ⌊(j + 1) × 2 / 17⌋: slot 0 for j < 8, slot 1 from j = 8.
+    assert_eq(hint(p, 7), 0x616c0000)
+    assert_eq(hint(p, 8), 0x62657461)
+    assert_eq(hint(p, 15), 0x62657461)
+
+@test
+an_inner_page_holds_a_suffix_truncated_separator_and_swizzled_children()
+    val t = bx_nearly_full()
+    bx_put(t, bx("k004").view(), bx_fill(0x77, 225).view())
+    val r = t.root_frame()
+    assert_eq(r.page[6], 0x02)
+    assert_eq(r.page[7], 0x07)
+    assert_eq(node_level(r), 1)
+    assert_eq(node_count(r), 1)
+    assert_eq(slot_value_len(r, 0), 8)
+    val left = get_u64_le(slot_value(r, 0)).unwrap()
+    val right = node_extra(r)
+    assert(left & SwizzleTag != 0)
+    assert(right & SwizzleTag != 0)
+    // Unswizzling is one load from the frame (§3.8 rule 3): the child's own PID.
+    val l = unswizzle(left)
+    val rr = unswizzle(right)
+    assert_eq(l.pid, 2)
+    assert_eq(rr.pid, 3)
+    assert_eq(rd64(l, 16), 2)
+    // The halves are k000 k001 | k002 k003 k004, and the separator is "k002".
+    assert_eq(slot_key(r, 0), bx("k002"))
+    assert(lower_infinite(l))
+    assert(!upper_infinite(l))
+    assert_eq(upper_fence(l), bx("k002").view())
+    assert_eq(lower_fence(rr), bx("k002").view())
+    assert(upper_infinite(rr))
+    assert_eq(l.page[7], 0x05)
+    assert_eq(rr.page[7], 0x06)
+    assert_eq(node_count(l), 2)
+    assert_eq(node_count(rr), 3)
+    assert_eq(page_owner(l), 7)
+
+@test
+a_node_bounded_on_both_sides_stores_keys_without_the_fences_common_prefix()
+    val t = bx_tree()
+
+    for i in 0..<40
+        bx_put(t, bx(s"pre${char(0x61 + u8(i / 10))}${char(0x30 + u8(i % 10))}").view(), bx_fill(0x76, 1200).view())
+
+    val r = t.root_frame()
+    assert(node_count(r) >= 2)
+    val mid = unswizzle(node_child(r, 1))
+    val plen = node_prefix_len(mid)
+    assert(plen >= 3)
+    assert_eq(plen, common_prefix(lower_fence(mid), upper_fence(mid)))
+
+    for i in 0..<node_count(mid)
+        assert_eq(slot_key_len(mid, i) + plen, slot_key(mid, i).len())
+
+    bx_ok(t)
+
+@test
+an_empty_node_clears_its_hints()
+    val t = bx_tree()
+    val p = t.root_frame()
+    assert_eq(p.page[7] & NodeHintsValid, 0)
+    bx_put(t, bx("a").view(), [])
+    assert(p.page[7] & NodeHintsValid != 0)
+    assert(t.delete(bx("a").view()))
+    assert_eq(p.page[7] & NodeHintsValid, 0)
+    assert_eq(hint(p, 0), 0)
+
+@test
+the_hints_narrow_a_search_to_the_same_answer_as_the_slots()
+    val t = bx_tree()
+
+    for i in 0..<400
+        bx_put(t, bx_num(i * 2).view(), [])
+
+    val p = t.root_frame()
+    assert(node_count(p) >= 17)
+
+    for i in 0..<800
+        val k = bx_num(i)
+        val (pos, found) = node_search(p, k.view())
+        var want: usize = 0
+
+        while want < node_count(p) && slot_key(p, want).view() < k.view()
+            want += 1
+
+        assert_eq(pos, want)
+        assert_eq(found, want < node_count(p) && slot_key(p, want) == k)
+
+// -- the structural check refuses damage --------------------------------------------------------------
+
+/** A tree of two levels to damage. */
+bx_victim() -> BTree
+    val t = bx_tree()
+
+    for i in 0..<600
+        bx_put(t, bx_num(i).view(), bx_fill(0x76, 30).view())
+
+    assert_eq(bx_ok(t).depth, 2)
+    t
+
+bx_first_leaf(t: BTree) -> *PageFrame = unswizzle(node_child(t.root_frame(), 0))
+
+bx_refused(t: BTree, file: string = __FILE__, line: long = __LINE__) = assert_eq(bx_code(check_btree(t)), "D1001", "", file, line)
+
+@test
+the_check_refuses_a_wrong_hint()
+    val t = bx_victim()
+    val p = bx_first_leaf(t)
+    wr32(p, 64 + 4 * 5, hint(p, 5) + 1)
+    bx_refused(t)
+
+@test
+the_check_refuses_keys_out_of_order()
+    val t = bx_victim()
+    val p = bx_first_leaf(t)
+    val a = slot_offset(p, 3)
+    wr16(p, 128 + 12 * 3, slot_offset(p, 4))
+    wr16(p, 128 + 12 * 4, a)
+    bx_refused(t)
+
+@test
+the_check_refuses_a_wrong_slot_head()
+    val t = bx_victim()
+    wr32(bx_first_leaf(t), 128 + 8, 0)
+    bx_refused(t)
+
+@test
+the_check_refuses_a_miscounted_frag_bytes()
+    val t = bx_victim()
+    val p = bx_first_leaf(t)
+    wr16(p, 38, node_frag(p) + 1)
+    bx_refused(t)
+
+@test
+the_check_refuses_a_leaked_page()
+    val t = bx_victim()
+    t.space.allocate()
+    bx_refused(t)
+
+@test
+the_check_refuses_a_page_of_another_owner()
+    val t = bx_victim()
+    bx_first_leaf(t).page[24] = 8
+    bx_refused(t)
+
+@test
+the_check_refuses_a_fence_that_differs_from_the_parents_separator()
+    val t = bx_victim()
+    val p = bx_first_leaf(t)
+    val o = rd16(p, 46) + rd16(p, 48) - 1
+    p.page[o] = p.page[o] + 1
+    bx_refused(t)
+
+@test
+the_check_refuses_a_wrong_allocated_count()
+    val t = bx_victim()
+    val bm = &*t.space.bitmaps[0]
+    wr32(bm, 52, rd32(bm, 52) + 1)
+    bx_refused(t)
+
+@test
+the_check_refuses_a_checksum_in_memory_and_a_misdirected_pid()
+    val t = bx_victim()
+    wr32(bx_first_leaf(t), 0, 1)
+    bx_refused(t)
+    wr32(bx_first_leaf(t), 0, 0)
+    bx_ok(t)
+    wr64(bx_first_leaf(t), 16, 99)
+    bx_refused(t)
+
+@test
+the_check_refuses_a_child_reference_that_is_not_swizzled()
+    val t = bx_victim()
+    val r = t.root_frame()
+    wr64(r, 56, node_extra(r) & ~SwizzleTag)
+    bx_refused(t)

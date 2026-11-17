@@ -1,0 +1,229 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.get_u64_le
+import sysl.slices.sort_by
+
+// The structural check of B+trees and of the data space they live in: every rule of
+// `on-disk-format.md` §3.1–§3.8 a page's bytes can break, the shape of the tree (fences that chain
+// parent to child, every leaf at level 0), and the allocation bitmaps agreeing exactly with the
+// pages reachable from the roots. A failure is `data_corrupted` (`errors.md` §6), naming the page.
+
+/** What a check found: the tree's height in levels, its pages, its leaves, and its entries. */
+struct BtStats derives Eq
+    depth: usize
+    pages: usize
+    leaves: usize
+    entries: usize
+
+/** A frame's address and its page number, sorted by address, so that a child reference can be
+ * resolved without trusting it.
+ */
+private struct FrameAt
+    addr: u64
+    pid: u64
+
+private struct CheckState
+    space: &PageSpace
+    owner: u64
+    frames: Buf[FrameAt]
+    seen: Buf[bool]
+    pages: usize
+    leaves: usize
+    entries: usize
+
+/** Checks tree `t`, and checks that its pages and the bitmap pages are exactly the space's allocated
+ * pages: none leaked, none reached twice.
+ */
+check_btree(t: BTree) -> Result[BtStats, CodecError]
+    val stats = check_btrees(t.space, [t])?
+    Ok(stats[0])
+
+/** Checks every tree of `trees`, all in `space`, and that together with the bitmap pages they use
+ * exactly the space's allocated pages.
+ */
+check_btrees(space: &PageSpace, trees: []const BTree) -> Result[Buf[BtStats], CodecError]
+    var frames = buf[FrameAt]()
+
+    for i in 0..<space.frames.len()
+        space.frames[i] match
+            Some(f) ->
+                if u64(i) != f.pid then return corrupt(u64(i), "the frame table holds a frame of another page")
+                if !space.is_allocated(f.pid) then return corrupt(f.pid, "a free page still has a frame")
+                frames.push(FrameAt(u64(usize(&*f)), f.pid))
+            None -> ()
+
+    sort_by(frames.view_mut(), (a, b) -> a.addr < b.addr)
+    val st: &CheckState = CheckState(space, 0, frames, buf(), 0, 0, 0)
+
+    for i in 0..<space.frames.len()
+        st.seen.push(false)
+
+    check_bitmaps(st)?
+    val out = buf[BtStats]()
+
+    for t in trees
+        st.owner = t.owner
+        st.pages = 0
+        st.leaves = 0
+        st.entries = 0
+        val root = t.space.frame(t.root) match
+            Some(f) -> &*f
+            None -> return corrupt(t.root, "the root has no frame")
+        if !lower_infinite(root) || !upper_infinite(root) then return corrupt(t.root, "the root's fences are not infinite")
+        check_node(st, root, node_level(root), None, None, true)?
+        out.push(BtStats(node_level(root) + 1, st.pages, st.leaves, st.entries))
+
+    for i in 0..<st.seen.len()
+        if space.is_allocated(u64(i)) && !st.seen[i]
+            return corrupt(u64(i), "the page is allocated and no tree reaches it")
+
+    var n: u64 = 0
+
+    for i in 0..<st.seen.len()
+        if space.is_allocated(u64(i)) then n += 1
+
+    if n != space.allocated() then return corrupt(0, "an allocated page has no frame")
+    Ok(out)
+
+private corrupt[T](pid: u64, message: string) -> Result[T, CodecError] = fail("D1001", s"page $pid: $message")
+
+/** Each segment's bitmap page (§3.7): its header, its own bit, and its count. */
+private check_bitmaps(st: &CheckState) -> Result[unit, CodecError]
+    for s in 0..<st.space.bitmaps.len()
+        val p = &*st.space.bitmaps[s]
+        val pid = u64(s) * SegmentPages
+        if p.pid != pid || rd64(p, 16) != pid then return corrupt(pid, "the bitmap page is not page 0 of its segment")
+        if rd32(p, 0) != 0 || rd16(p, 4) != DbPageFormat || p.page[6] != PageTypeBitmap || page_owner(p) != 0
+            return corrupt(pid, "the bitmap page's header is wrong")
+        if rd32(p, 48) != u32(s) then return corrupt(pid, "the bitmap page names another segment")
+        if p.page[64] & 1 == 0 then return corrupt(pid, "the bitmap page does not mark itself allocated")
+        var count: u32 = 0
+
+        for b in 0..<8192
+            count += u32(p.page[64 + b].count_ones())
+
+        if count != rd32(p, 52) then return corrupt(pid, "allocated_count is not the bitmap's population")
+        st.seen[usize(pid)] = true
+
+    Ok(())
+
+private check_node(st: &CheckState, p: *PageFrame, level: usize, lower: Option[Buf[u8]], upper: Option[Buf[u8]], root: bool) -> Result[unit, CodecError]
+    val pid = p.pid
+    if usize(pid) >= st.seen.len() || !st.space.is_allocated(pid) then return corrupt(pid, "a reachable page is free")
+    if st.seen[usize(pid)] then return corrupt(pid, "the page is reached twice")
+    st.seen[usize(pid)] = true
+    st.pages += 1
+
+    // The common header (§3.1): no checksum in memory, and no LSN, encryption or reserved bits.
+    if rd32(p, 0) != 0 || rd16(p, 4) != DbPageFormat || rd64(p, 8) != 0 || rd16(p, 30) != 0
+        return corrupt(pid, "the common header is wrong")
+    if rd64(p, 16) != pid then return corrupt(pid, "the header names another page")
+    if page_owner(p) != st.owner then return corrupt(pid, "the page belongs to another object")
+    if node_level(p) != level then return corrupt(pid, s"the node is at level ${node_level(p)}, not $level")
+    if p.page[6] != (if level == 0 then PageTypeLeaf else PageTypeInner) then return corrupt(pid, "the page type does not match the level")
+    if p.page[7] & 0xf8 != 0 || rd16(p, 50) != 0 || rd32(p, 52) != 0 then return corrupt(pid, "a reserved field is set")
+
+    // The fences (§3.3) are exactly the bounds the parent gave.
+    check_fence(p, lower, lower_infinite(p), 42, lower_fence(p))?
+    check_fence(p, upper, upper_infinite(p), 46, upper_fence(p))?
+    val plen = image_prefix(lower, upper)
+    if node_prefix_len(p) != plen then return corrupt(pid, "prefix_len is not the fences' common prefix")
+
+    val n = node_count(p)
+    if !root && n == 0 then return corrupt(pid, "a node other than the root is empty")
+    if node_heap_top(p) > DbPageSize || node_heap_top(p) < NodeHeaderSize + SlotSize * n
+        return corrupt(pid, "the slot directory and the heap overlap")
+
+    // The heap: every entry and fence inside it, none overlapping, the rest counted as fragmented.
+    var spans = buf[(usize, usize)]()
+    if !lower_infinite(p) then spans.push((rd16(p, 42), rd16(p, 44)))
+    if !upper_infinite(p) then spans.push((rd16(p, 46), rd16(p, 48)))
+    var prev = buf[u8]()
+
+    for i in 0..<n
+        val o = slot_offset(p, i)
+        val klen = slot_key_len(p, i)
+        val vlen = slot_value_len(p, i)
+        if o < node_heap_top(p) || o + klen + vlen > DbPageSize then return corrupt(pid, s"slot $i points outside the heap")
+        if rd16(p, NodeHeaderSize + SlotSize * i + 6) != 0 then return corrupt(pid, s"slot $i has flags set")
+        if slot_head(p, i) != key_head(slot_suffix(p, i)) then return corrupt(pid, s"slot $i's head is wrong")
+        spans.push((o, klen + vlen))
+        val key = slot_key(p, i)
+        if key.len() > MaxKeyLen then return corrupt(pid, s"slot $i's key is longer than $MaxKeyLen")
+        if i > 0 && !(prev.view() < key.view()) then return corrupt(pid, s"slot $i's key is not above slot ${i - 1}'s")
+        lower match
+            Some(l) -> if key.view() < l.view() then return corrupt(pid, s"slot $i's key is below the lower fence")
+            None -> ()
+        upper match
+            Some(u) -> if key.view() >= u.view() then return corrupt(pid, s"slot $i's key is not below the upper fence")
+            None -> ()
+        if level == 0 && key.len() + vlen > MaxLeafEntry then return corrupt(pid, s"slot $i's entry is larger than $MaxLeafEntry")
+        if level > 0 && (vlen != 8 || get_u64_le(slot_value(p, i)).unwrap() & SwizzleTag == 0)
+            return corrupt(pid, s"slot $i is not a swizzled child reference")
+        prev = key
+
+    sort_by(spans.view_mut(), (a, b) -> a.0 < b.0)
+    var live: usize = 0
+    var end = node_heap_top(p)
+
+    for s in spans
+        if s.0 < end then return corrupt(pid, "two heap entries overlap")
+        end = s.0 + s.1
+        live += s.1
+
+    if node_frag(p) != DbPageSize - node_heap_top(p) - live then return corrupt(pid, "frag_bytes does not count the dead heap bytes")
+
+    // The hints (§3.5 rule 4).
+    if n == 0
+        if p.page[7] & NodeHintsValid != 0 then return corrupt(pid, "an empty node claims valid hints")
+        for j in 0..<HintCount
+            if hint(p, j) != 0 then return corrupt(pid, "an empty node has hints")
+    else
+        if p.page[7] & NodeHintsValid == 0 then return corrupt(pid, "the hints are not maintained")
+        for j in 0..<HintCount
+            if hint(p, j) != slot_head(p, (j + 1) * n / 17) then return corrupt(pid, s"hint $j is wrong")
+
+    if level == 0
+        if node_extra(p) != 0 then return corrupt(pid, "a clustered leaf's extra is not 0")
+        st.leaves += 1
+        st.entries += n
+        return Ok(())
+
+    // The children: child `c` holds keys in [key(c − 1), key(c)), the upper child those at or above
+    // the last key (§3.4), each one level down.
+    for c in 0..n
+        val r = node_child(p, c)
+        val child = resolve(st, pid, r)?
+        val lo = if c == 0 then lower else Some(slot_key(p, c - 1))
+        val hi = if c == n then upper else Some(slot_key(p, c))
+        check_node(st, child, level - 1, lo, hi, false)?
+
+    Ok(())
+end check_node
+
+/** The frame child reference `r` of page `parent` names, refusing one that is not swizzled or names
+ * no frame of the space.
+ */
+private resolve(st: &CheckState, parent: u64, r: u64) -> Result[*PageFrame, CodecError]
+    if r & SwizzleTag == 0 then return corrupt(parent, "a child reference is not swizzled")
+    val addr = r & ~SwizzleTag
+    var lo: usize = 0
+    var hi = st.frames.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if st.frames[mid].addr < addr then lo = mid + 1 else hi = mid
+
+    if lo == st.frames.len() || st.frames[lo].addr != addr then return corrupt(parent, "a child reference names no frame")
+    Ok(unswizzle(r))
+
+private check_fence(p: *PageFrame, want: Option[Buf[u8]], infinite: bool, at: usize, bytes: []const u8) -> Result[unit, CodecError]
+    want match
+        Some(k) ->
+            if infinite then return corrupt(p.pid, "a fence is infinite where the parent bounds it")
+            if bytes != k.view() then return corrupt(p.pid, "a fence differs from the parent's separator")
+        None ->
+            if !infinite then return corrupt(p.pid, "a fence is finite where the parent leaves it open")
+            if rd16(p, at) != 0 || rd16(p, at + 2) != 0 then return corrupt(p.pid, "an infinite fence has an offset or a length")
+    Ok(())

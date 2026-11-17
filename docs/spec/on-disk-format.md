@@ -239,9 +239,12 @@ index payload (§4.9).
    fence is infinite). The prefix is not stored separately: it is the first `prefix_len` bytes of the lower fence.
 2. Every key in the node MUST begin with that prefix, and is stored **without** it.
 3. Inner-node separators MUST be **suffix-truncated** on split: the separator is the shortest byte string `s` with
-   `left_max < s ≤ right_min`. *Rationale:* shorter separators raise fan-out (Bayer and Unterauer; LeanStore).
+   `left_max < s ≤ right_min`. An inner node splits around its middle separator, which moves up to the parent
+   unchanged: the left half keeps that separator's child as its upper child, and no shorter string is known to lie
+   above every key in it. *Rationale:* shorter separators raise fan-out (Bayer and Unterauer; LeanStore).
 4. When `flags` bit 2 is set, `hints[j]` (for j = 0..15) MUST equal the `head` of slot
-   `⌊(j + 1) × slot_count / 17⌋`. A search MAY use the hints to narrow the binary search before it reads slots.
+   `⌊(j + 1) × slot_count / 17⌋`. A search MAY use the hints to narrow the binary search before it reads slots. A node
+   with no slots has no slot for a hint to name, so its bit 2 MUST be clear and its `hints` zero.
 
 ### 3.6 Size limits
 

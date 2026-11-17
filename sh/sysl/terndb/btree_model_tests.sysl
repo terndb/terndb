@@ -1,0 +1,243 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// The B+tree against a model (`btree.sysl`): a seeded generator drives mixed inserts, updates,
+// deletes, lookups and scans into both the tree and a sorted buffer of entries, and every answer must
+// agree. Every few operations the structural check (`btree_check.sysl`) runs and a full scan must
+// equal the model; at the end every key is deleted in random order, down to the empty tree. Four key
+// distributions: short keys over a small alphabet (duplicates, prefixes, 0x00 and 0xff bytes), keys
+// behind a long shared prefix (prefix compression), keys near the 1,024-byte limit with entries near
+// 4,000 bytes (many splits), and keys whose neighbours share long prefixes (deep trees).
+
+/** Where `key` is in the model, or where it would go. */
+private bm_find(m: Buf[BtEntry], key: []const u8) -> (usize, bool)
+    var lo: usize = 0
+    var hi = m.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if m[mid].key.view() < key then lo = mid + 1 else hi = mid
+
+    (lo, lo < m.len() && m[lo].key.view() == key)
+
+private bm_byte(g: *Rng, alphabet: []const u8) -> u8 = alphabet[usize(g.below(u64(alphabet.len)))]
+
+/** A key of distribution `mode`. */
+private bm_key(g: *Rng, mode: usize) -> Buf[u8]
+    val k = buf[u8]()
+
+    if mode == 0
+        for _ in 0..<g.below(7)
+            k.push(bm_byte(g, [0x00, 0x01, 0x61, 0x62, 0xff]))
+    elif mode == 1
+        // Mostly the 300-byte prefix and a short tail; sometimes a cut of the prefix itself.
+        val plen = if g.below(10) == 0 then usize(g.below(301)) else 300
+
+        for _ in 0..<plen
+            k.push(0x70)
+
+        if plen == 300
+            for _ in 0..<g.below(9)
+                k.push(bm_byte(g, [0x61, 0x62, 0x63]))
+    elif mode == 2
+        val len = 1000 + usize(g.below(25))
+        k.push(bm_byte(g, [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48]))
+        k.push(bm_byte(g, [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48]))
+        val fill = bm_byte(g, [0x2d, 0x2e])
+
+        while k.len() < len - 1
+            k.push(fill)
+
+        k.push(bm_byte(g, [0x30, 0x31, 0x32, 0x33]))
+    else
+        // `x`'s 11 binary digits, each 90 copies of `a` or `b`: neighbours share long prefixes.
+        val x = g.below(2048)
+        var bit: u64 = 11
+
+        while bit > 0
+            bit -= 1
+            val c: u8 = if (x >> bit) & 1 == 1 then 0x62 else 0x61
+
+            for _ in 0..<90
+                k.push(c)
+
+    k
+
+/** A value for `key` under distribution `mode`. */
+private bm_value(g: *Rng, mode: usize, key: []const u8) -> Buf[u8]
+    val room = u64(MaxLeafEntry - key.len)
+    var len = g.below(64)
+
+    if mode == 0
+        len = g.below(200)
+    elif mode == 1
+        len = g.below(300)
+    elif mode == 2
+        len = if g.below(4) == 0 then room else g.below(room + 1)
+    val v = buf[u8]()
+
+    for _ in 0..<len
+        v.push(u8(g.below(256)))
+
+    v
+
+/** A key the model holds most of the time, else a fresh one. */
+private bm_pick(g: *Rng, m: Buf[BtEntry], mode: usize, held: u64) -> Buf[u8]
+    if m.len() > 0 && g.below(100) < held
+        val k = buf[u8]()
+        k.extend(m[usize(g.below(u64(m.len())))].key.view())
+        return k
+
+    bm_key(g, mode)
+
+private bm_bound(g: *Rng, m: Buf[BtEntry], mode: usize) -> KeyBound = g.below(3) match
+    0 -> KeyAny
+    1 -> KeyIncl(bm_pick(g, m, mode, 50))
+    _ -> KeyExcl(bm_pick(g, m, mode, 50))
+
+private bm_in(k: []const u8, lo: KeyBound, hi: KeyBound) -> bool
+    val above = lo match
+        KeyAny -> true
+        KeyIncl(l) -> k >= l.view()
+        KeyExcl(l) -> k > l.view()
+    val below = hi match
+        KeyAny -> true
+        KeyIncl(h) -> k <= h.view()
+        KeyExcl(h) -> k < h.view()
+    above && below
+
+/** Whether a scan of the tree answered what the model holds in the range, in its direction. */
+private bm_same_scan(got: Buf[BtEntry], m: Buf[BtEntry], lo: KeyBound, hi: KeyBound, forward: bool) -> bool
+    val want = buf[BtEntry]()
+
+    for e in m
+        if bm_in(e.key.view(), lo, hi) then want.push(e)
+
+    if got.len() != want.len() then return false
+
+    for i in 0..<got.len()
+        val w = if forward then want[i] else want[want.len() - 1 - i]
+        if got[i].key != w.key || got[i].value != w.value then return false
+
+    true
+
+/** The tree's check and a full scan against the model. */
+private bm_verify(t: BTree, m: Buf[BtEntry], what: string)
+    check_btree(t) match
+        Ok(s) -> assert_eq(s.entries, m.len(), what)
+        Err(e) -> assert(false, s"$what: ${e.message}")
+    assert(bm_same_scan(t.scan(KeyAny, KeyAny, true), m, KeyAny, KeyAny, true), s"$what: the full scan differs")
+
+/** `ops` random operations of distribution `mode` from `seed`, checked every `every`, then every key
+ * deleted. Answers the tree, emptied, for its event counts.
+ */
+private bm_run(seed: u64, mode: usize, ops: usize, every: usize) -> BTree
+    val t = btree(page_space(), 42)
+    val m = buf[BtEntry]()
+    var g = rng(seed, u64(mode))
+    var deepest: usize = 0
+
+    for i in 0..<ops
+        val what = s"seed $seed, mode $mode, op $i"
+        // The first half grows the tree and the second shrinks it, so merges meet full siblings too.
+        val growing = i < ops / 2
+        val r = g.below(100)
+
+        if r < (if growing then 55 else 20)
+            val k = bm_pick(&g, m, mode, 20)
+            val v = bm_value(&g, mode, k.view())
+            val (at, found) = bm_find(m, k.view())
+            assert_eq(t.insert(k.view(), v.view()), Ok(!found), what)
+            if !found then m.insert(at, BtEntry(k, v))
+        elif r < (if growing then 65 else 35)
+            val k = bm_pick(&g, m, mode, 70)
+            val v = bm_value(&g, mode, k.view())
+            val (at, found) = bm_find(m, k.view())
+            assert_eq(t.update(k.view(), v.view()), Ok(found), what)
+            if found then m[at] = BtEntry(k, v)
+        elif r < 75
+            val k = bm_pick(&g, m, mode, 70)
+            val (at, found) = bm_find(m, k.view())
+            assert_eq(t.delete(k.view()), found, what)
+            if found then m.remove(at)
+        elif r < 90
+            val k = bm_pick(&g, m, mode, 60)
+            val (at, found) = bm_find(m, k.view())
+            val want = if found then Some(m[at].value) else None
+            assert_eq(t.get(k.view()), want, what)
+        else
+            val lo = bm_bound(&g, m, mode)
+            val hi = bm_bound(&g, m, mode)
+            val forward = g.below(2) == 0
+            assert(bm_same_scan(t.scan(lo, hi, forward), m, lo, hi, forward), s"$what: a scan differs")
+
+        if i % every == every - 1
+            bm_verify(t, m, what)
+            val d = node_level(t.root_frame()) + 1
+            if d > deepest then deepest = d
+
+    bm_verify(t, m, s"seed $seed, mode $mode, after the run")
+    var n: usize = 0
+
+    while m.len() > 0
+        val at = usize(g.below(u64(m.len())))
+        assert(t.delete(m[at].key.view()), s"seed $seed, mode $mode, drain $n")
+        m.remove(at)
+        n += 1
+        if n % every == 0 then bm_verify(t, m, s"seed $seed, mode $mode, drain $n")
+
+    assert_eq(check_btree(t), Ok(BtStats(1, 1, 1, 0)))
+    assert_eq(t.space.allocated(), 2)
+    assert(deepest >= (if mode >= 2 then 3 else 2), s"seed $seed, mode $mode reached depth $deepest")
+    t
+
+@test
+the_tree_agrees_with_the_model_on_short_keys_over_a_small_alphabet()
+    for seed in [1, 2, 3]
+        bm_run(u64(seed), 0, 6000, 50)
+
+@test
+the_tree_agrees_with_the_model_on_keys_behind_a_long_shared_prefix()
+    for seed in [4, 5, 6]
+        bm_run(u64(seed), 1, 3000, 50)
+
+@test
+the_tree_agrees_with_the_model_on_keys_near_the_size_limit()
+    var e = BtEvents(0, 0, 0, 0, 0, 0, 0, 0)
+
+    for seed in [7, 8, 9]
+        val t = bm_run(u64(seed), 2, 2500, 50)
+        e = bm_add(e, *t.events)
+
+    bm_every_level(e)
+
+@test
+the_tree_agrees_with_the_model_on_keys_that_make_deep_trees()
+    var e = BtEvents(0, 0, 0, 0, 0, 0, 0, 0)
+
+    for seed in [10, 11, 12]
+        val t = bm_run(u64(seed), 3, 6000, 50)
+        e = bm_add(e, *t.events)
+
+    bm_every_level(e)
+
+private bm_add(a: BtEvents, b: BtEvents) -> BtEvents =
+    BtEvents(a.leaf_splits + b.leaf_splits, a.inner_splits + b.inner_splits, a.root_splits + b.root_splits,
+        a.leaf_merges + b.leaf_merges, a.inner_merges + b.inner_merges, a.leaf_shares + b.leaf_shares,
+        a.inner_shares + b.inner_shares, a.root_collapses + b.root_collapses)
+
+/** The runs split and merged at the leaves and above them, redistributed between leaves, and grew
+ * and collapsed the root. Redistribution between inner nodes needs a nearly full inner sibling, which
+ * random runs seldom leave; `btree_tests.sysl` builds one by hand.
+ */
+private bm_every_level(e: BtEvents)
+    assert(e.leaf_splits > 0, "no leaf split")
+    assert(e.inner_splits > 0, "no inner split")
+    assert(e.root_splits > 0, "no root split")
+    assert(e.leaf_merges > 0, "no leaf merge")
+    assert(e.inner_merges > 0, "no inner merge")
+    assert(e.leaf_shares > 0, "no leaf redistribution")
+    assert(e.root_collapses > 0, "no root collapse")

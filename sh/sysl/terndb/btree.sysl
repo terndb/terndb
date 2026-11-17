@@ -1,0 +1,425 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{get_u64_le, push_u64_le}
+
+// The B+tree over 16 KiB pages (`on-disk-format.md` §3.3–§3.8) in the in-memory mode (§8.1): keys
+// are encoded byte strings compared bytewise, values are bytes. Nodes carry fences and no sibling
+// links, so a scan finds the next leaf by descending again with the current leaf's fence; the root's
+// PID never changes (`docs/design/btree.md`).
+
+/** One end of a key range: open, or a key taken inclusively or exclusively. */
+enum KeyBound
+    KeyAny
+    KeyIncl(key: Buf[u8])
+    KeyExcl(key: Buf[u8])
+
+/** One inner node on the way down to a leaf, and which of its children the descent took (its slot
+ * count for the upper child).
+ */
+struct BtStep
+    node: *PageFrame
+    child: usize
+
+/** How often a tree has changed shape, by kind and by where: what a test reads to know that a run
+ * reached the split, merge and redistribution of every level.
+ */
+struct BtEvents derives Eq
+    leaf_splits: u64
+    inner_splits: u64
+    root_splits: u64
+    leaf_merges: u64
+    inner_merges: u64
+    leaf_shares: u64
+    inner_shares: u64
+    root_collapses: u64
+
+/** A B+tree: the PID of its root, which never changes (§3.3), the object id that owns its pages, the
+ * data space its pages are allocated from, and its shape changes so far.
+ */
+struct BTree
+    space: &PageSpace
+    root: u64
+    owner: u64
+    events: &BtEvents
+
+    /** The value of `key`, if the tree holds it. */
+    get(self, key: []const u8) -> Option[Buf[u8]]
+        val path = buf[BtStep]()
+        val leaf = self.descend(key, false, path)
+        val (pos, found) = node_search(leaf, key)
+        if !found then return None
+        val v = buf[u8]()
+        v.extend(slot_value(leaf, pos))
+        Some(v)
+
+    /** Adds `key` with `value`: true when added, false (the tree unchanged) when `key` is already
+     * there. A key longer than 1,024 bytes is `key_too_long`, and a key and value together longer
+     * than 4,000 bytes are `entry_too_large` (§3.6).
+     */
+    insert(self, key: []const u8, value: []const u8) -> Result[bool, CodecError]
+        check_entry(key, value)?
+        val path = buf[BtStep]()
+        val leaf = self.descend(key, false, path)
+        val (pos, found) = node_search(leaf, key)
+        if found then return Ok(false)
+        self.put_entry(path, leaf, pos, key, value)
+        Ok(true)
+
+    /** Replaces `key`'s value: true when replaced, false when the tree does not hold `key`. A value
+     * of the same length is overwritten in place, a shorter one shrinks in place, and a longer one
+     * is reinserted, splitting the leaf when it no longer fits. The limits are `insert`'s.
+     */
+    update(self, key: []const u8, value: []const u8) -> Result[bool, CodecError]
+        check_entry(key, value)?
+        val path = buf[BtStep]()
+        val leaf = self.descend(key, false, path)
+        val (pos, found) = node_search(leaf, key)
+        if !found then return Ok(false)
+        val old = slot_value_len(leaf, pos)
+
+        if value.len <= old
+            node_shrink_value(leaf, pos, value)
+            if value.len < old then self.rebalance(path, leaf)
+        else
+            node_remove(leaf, pos)
+            self.put_entry(path, leaf, pos, key, value)
+
+        Ok(true)
+
+    /** Removes `key`: true when it was there. A node left under a quarter full merges with a
+     * sibling, or takes entries from one, and a root left with one child absorbs it.
+     */
+    delete(self, key: []const u8) -> bool
+        val path = buf[BtStep]()
+        val leaf = self.descend(key, false, path)
+        val (pos, found) = node_search(leaf, key)
+        if !found then return false
+        node_remove(leaf, pos)
+        self.rebalance(path, leaf)
+        true
+
+    /** The entries with keys between `lo` and `hi`, in ascending key order when `forward`, else in
+     * descending order.
+     */
+    scan(self, lo: KeyBound, hi: KeyBound, forward: bool) -> Buf[BtEntry]
+        val out = buf[BtEntry]()
+        var c = self.cursor(lo, hi, forward)
+
+        loop
+            c.next() match
+                Some(e) -> out.push(e)
+                None -> return out
+
+    /** A cursor over the entries between `lo` and `hi`, in either direction. It reads the tree as
+     * it is when `next` is called, so the tree must not change while it is in use.
+     */
+    cursor(self, lo: KeyBound, hi: KeyBound, forward: bool) -> BtCursor
+        val path = buf[BtStep]()
+
+        if forward
+            val leaf = lo match
+                KeyAny -> self.descend([], false, path)
+                KeyIncl(k) -> self.descend(k.view(), false, path)
+                KeyExcl(k) -> self.descend(k.view(), false, path)
+
+            val pos = lo match
+                KeyAny -> 0
+                KeyIncl(k) -> node_search(leaf, k.view()).0
+                KeyExcl(k) ->
+                    val (at, found) = node_search(leaf, k.view())
+                    if found then at + 1 else at
+
+            return BtCursor(self, swizzle(leaf), pos, lo, hi, true, false)
+
+        val leaf = hi match
+            KeyAny -> self.rightmost()
+            KeyIncl(k) -> self.descend(k.view(), false, path)
+            KeyExcl(k) -> self.descend(k.view(), false, path)
+
+        val pos = hi match
+            KeyAny -> node_count(leaf)
+            KeyIncl(k) ->
+                val (at, found) = node_search(leaf, k.view())
+                if found then at + 1 else at
+            KeyExcl(k) -> node_search(leaf, k.view()).0
+
+        BtCursor(self, swizzle(leaf), pos, lo, hi, false, false)
+
+    /** The root's frame, found through the frame table (§8.1 rule 4). */
+    root_frame(self) -> *PageFrame = &*self.space.frame(self.root).unwrap()
+
+    /** The leaf whose key range holds `key`, recording the inner nodes passed in `path`. When
+     * `before`, the leaf whose range holds the keys just below `key` instead: the one a backward scan
+     * moves to from a leaf whose lower fence is `key`.
+     */
+    private[terndb] descend(self, key: []const u8, before: bool, path: Buf[BtStep]) -> *PageFrame
+        var p = self.root_frame()
+
+        while !node_is_leaf(p)
+            val (pos, found) = node_search(p, key)
+            val c = if found && !before then pos + 1 else pos
+            path.push(BtStep(p, c))
+            p = unswizzle(node_child(p, c))
+
+        p
+
+    /** The last leaf. */
+    private rightmost(self) -> *PageFrame
+        var p = self.root_frame()
+
+        while !node_is_leaf(p)
+            p = unswizzle(node_extra(p))
+
+        p
+
+    /** Inserts the entry `key` + `value` as slot `pos` of `node`, the last node of `path` or below
+     * it, splitting the node when it does not fit and carrying the split up the path.
+     */
+    private put_entry(self, path: Buf[BtStep], node: *PageFrame, pos: usize, key: []const u8, value: []const u8)
+        if node_try_insert(node, pos, key[node_prefix_len(node)..], value) then return
+
+        val img = read_image(node)
+        val k = buf[u8]()
+        k.extend(key)
+        val v = buf[u8]()
+        v.extend(value)
+        img.entries.insert(pos, BtEntry(k, v))
+        self.split(path, node, img)
+
+    /** Splits `node`, whose contents `img` no longer fit a page, carrying a separator up `path`
+     * (§3.3, §3.5 rule 3). The node keeps the left half and its PID, as `NODE_TRUNCATE` describes
+     * (§6.4), and a new page takes the right half. The root instead moves both halves into new
+     * children and stays in place, one level higher.
+     */
+    private split(self, path: Buf[BtStep], node: *PageFrame, img: NodeImage)
+        val (left, sep, right) = split_image(img)
+
+        if path.len() == 0
+            self.events.root_splits += 1
+            val l = self.new_node(left)
+            val r = self.new_node(right)
+            val v = buf[u8]()
+            push_u64_le(v, swizzle(l))
+            val entries = buf[BtEntry]()
+            entries.push(BtEntry(sep, v))
+            write_image(node, self.owner, NodeImage(img.level + 1, None, None, entries, swizzle(r)))
+            return
+
+        if img.level == 0 then self.events.leaf_splits += 1 else self.events.inner_splits += 1
+        write_image(node, self.owner, left)
+        val r = self.new_node(right)
+        val step = path.pop().unwrap()
+        set_node_child(step.node, step.child, swizzle(r))
+        val v = buf[u8]()
+        push_u64_le(v, swizzle(node))
+        self.put_entry(path, step.node, step.child, sep.view(), v.view())
+
+    /** A new page holding `img`. */
+    private new_node(self, img: NodeImage) -> *PageFrame
+        val pid = self.space.allocate()
+        val f = &*self.space.new_frame(pid)
+        write_image(f, self.owner, img)
+        f
+
+    /** Restores the fill of `node`, the node below the last of `path`, after it lost bytes: a node
+     * under a quarter full merges with its left sibling (its right one when it is the first child)
+     * when the two fit one page, and otherwise the two share their entries evenly, which changes
+     * the separator between them. A merge takes a separator from the parent, so the parent is
+     * checked in turn; a root left with no separator absorbs its one child.
+     */
+    private rebalance(self, path: Buf[BtStep], node: *PageFrame)
+        var p = node
+
+        while path.len() > 0
+            if node_used(p) >= DbPageSize / 4 then return
+
+            val step = path.pop().unwrap()
+            val parent = step.node
+            val n = node_count(parent)
+
+            if n > 0
+                val j = if step.child > 0 then step.child - 1 else 0
+                val left = unswizzle(node_child(parent, j))
+                val right = unswizzle(node_child(parent, j + 1))
+                val merged = merged_image(left, slot_key(parent, j), right)
+
+                if image_size(merged) <= DbPageSize
+                    // The right node keeps its PID and its place in the parent; the left one goes.
+                    write_image(right, self.owner, merged)
+                    node_remove(parent, j)
+                    self.space.release(left.pid)
+                    if node_level(right) == 0 then self.events.leaf_merges += 1 else self.events.inner_merges += 1
+                else
+                    val (l, sep, r) = split_image(merged)
+                    if merged.level == 0 then self.events.leaf_shares += 1 else self.events.inner_shares += 1
+                    write_image(left, self.owner, l)
+                    write_image(right, self.owner, r)
+                    node_remove(parent, j)
+                    val v = buf[u8]()
+                    push_u64_le(v, swizzle(left))
+                    self.put_entry(path, parent, j, sep.view(), v.view())
+                    return
+
+            p = parent
+
+        self.collapse_root()
+
+    /** While the root is an inner node with no separator, moves its one child's contents into it and
+     * frees the child, so the root drops a level and keeps its PID (§3.3).
+     */
+    private collapse_root(self)
+        val root = self.root_frame()
+
+        while !node_is_leaf(root) && node_count(root) == 0
+            val child = unswizzle(node_extra(root))
+            write_image(root, self.owner, read_image(child))
+            self.space.release(child.pid)
+            self.events.root_collapses += 1
+
+/** A cursor over a range of a tree (`BTree.cursor`): the leaf it reads, and the slot it reads next
+ * (forward) or the one after the slot it reads next (backward).
+ */
+struct BtCursor
+    tree: BTree
+    leaf: u64
+    pos: usize
+    lo: KeyBound
+    hi: KeyBound
+    forward: bool
+    done: bool
+
+    /** The next entry of the range, or none once it is exhausted. A leaf's end leads to the next
+     * leaf by a descent with its fence, since nodes have no sibling links (§3.3).
+     */
+    next(*self) -> Option[BtEntry]
+        while !self.done
+            val p = unswizzle(self.leaf)
+
+            if self.forward
+                if self.pos < node_count(p)
+                    val k = slot_key(p, self.pos)
+                    if !below_hi(k.view(), self.hi) then break
+                    val v = buf[u8]()
+                    v.extend(slot_value(p, self.pos))
+                    self.pos += 1
+                    return Some(BtEntry(k, v))
+
+                if upper_infinite(p) then break
+                val path = buf[BtStep]()
+                val next = self.tree.descend(upper_fence(p), false, path)
+                self.pos = node_search(next, upper_fence(p)).0
+                self.leaf = swizzle(next)
+            else
+                if self.pos > 0
+                    val k = slot_key(p, self.pos - 1)
+                    if !above_lo(k.view(), self.lo) then break
+                    val v = buf[u8]()
+                    v.extend(slot_value(p, self.pos - 1))
+                    self.pos -= 1
+                    return Some(BtEntry(k, v))
+
+                if lower_infinite(p) then break
+                val path = buf[BtStep]()
+                val prev = self.tree.descend(lower_fence(p), true, path)
+                self.pos = node_search(prev, lower_fence(p)).0
+                self.leaf = swizzle(prev)
+
+        self.done = true
+        None
+
+private below_hi(k: []const u8, hi: KeyBound) -> bool = hi match
+    KeyAny -> true
+    KeyIncl(h) -> k <= h.view()
+    KeyExcl(h) -> k < h.view()
+
+private above_lo(k: []const u8, lo: KeyBound) -> bool = lo match
+    KeyAny -> true
+    KeyIncl(l) -> k >= l.view()
+    KeyExcl(l) -> k > l.view()
+
+/** An empty tree owned by object `owner`: a root leaf with infinite fences, on a page of its own. */
+btree(space: &PageSpace, owner: u64) -> BTree
+    val pid = space.allocate()
+    val f = &*space.new_frame(pid)
+    write_image(f, owner, NodeImage(0, None, None, buf(), 0))
+    BTree(space, pid, owner, BtEvents(0, 0, 0, 0, 0, 0, 0, 0))
+
+/** Refuses an entry over the limits of §3.6. */
+private check_entry(key: []const u8, value: []const u8) -> Result[unit, CodecError]
+    if key.len > MaxKeyLen then return fail("D2001", s"a key of ${key.len} bytes is longer than $MaxKeyLen")
+    if key.len + value.len > MaxLeafEntry
+        return fail("D2002", s"an entry of ${key.len + value.len} bytes is larger than $MaxLeafEntry")
+    Ok(())
+
+/** The two halves of `img`, which does not fit a page, and the separator between them, chosen so
+ * that the larger half is as small as it can be.
+ *
+ * A leaf splits between two entries, and its separator is the shortest key above the left half's
+ * last and no greater than the right half's first (§3.5 rule 3). An inner node's middle separator
+ * moves up whole: the left half keeps its child as its upper child, and nothing shorter is known to
+ * lie above every key of that child. Each half takes the separator as one of its fences.
+ */
+private[terndb] split_image(img: NodeImage) -> (NodeImage, Buf[u8], NodeImage)
+    val n = img.entries.len()
+    val leaf = img.level == 0
+    var best: usize = 0
+    var best_size = DbPageSize * 2
+    var m: usize = 1
+
+    while m + (if leaf then 0 else 1) < n
+        val sep = separator_at(img, m)
+        val lsize = half_size(img, img.lower, Some(sep), 0, m)
+        val rsize = half_size(img, Some(sep), img.upper, if leaf then m else m + 1, n)
+        val big = if lsize > rsize then lsize else rsize
+
+        if big < best_size
+            best = m
+            best_size = big
+
+        m += 1
+
+    val sep = separator_at(img, best)
+    val l = buf[BtEntry]()
+    val r = buf[BtEntry]()
+
+    for i in 0..<best
+        l.push(img.entries[i])
+
+    for i in (if leaf then best else best + 1)..<n
+        r.push(img.entries[i])
+
+    val lextra = if leaf then img.extra else get_u64_le(img.entries[best].value.view()).unwrap()
+    (NodeImage(img.level, img.lower, Some(sep), l, lextra), sep, NodeImage(img.level, Some(sep), img.upper, r, img.extra))
+
+private separator_at(img: NodeImage, m: usize) -> Buf[u8] =
+    if img.level == 0 then shortest_separator(img.entries[m - 1].key.view(), img.entries[m].key.view())
+    else img.entries[m].key
+
+/** The page bytes of entries `from..<to` of `img` under fences `lower` and `upper`. */
+private half_size(img: NodeImage, lower: Option[Buf[u8]], upper: Option[Buf[u8]], from: usize, to: usize) -> usize
+    val plen = image_prefix(lower, upper)
+    var size = NodeHeaderSize + fence_len(lower) + fence_len(upper)
+
+    for i in from..<to
+        size += SlotSize + img.entries[i].key.len() - plen + img.entries[i].value.len()
+
+    size
+
+/** Adjacent siblings `left` and `right` with separator `sep` between them, as one node. An inner
+ * pair takes the separator down, with the left node's upper child as its child.
+ */
+private[terndb] merged_image(left: *PageFrame, sep: Buf[u8], right: *PageFrame) -> NodeImage
+    val l = read_image(left)
+    val r = read_image(right)
+    val entries = l.entries
+
+    if l.level > 0
+        val v = buf[u8]()
+        push_u64_le(v, l.extra)
+        entries.push(BtEntry(sep, v))
+
+    for e in r.entries
+        entries.push(e)
+
+    NodeImage(l.level, l.lower, r.upper, entries, r.extra)

@@ -1,0 +1,513 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{get_u16_le, get_u32_be, get_u32_le, get_u64_le, put_u16_le, put_u32_be, put_u32_le, put_u64_le}
+import sysl.raw.ptr_cast
+import sysl.slices.{copy, fill}
+
+// Pages in the in-memory mode (`on-disk-format.md` §3, §8.1): the frame a page lives in, the common
+// page header, the B+tree node layout read and written byte for byte, and the data space whose
+// allocation bitmaps hand out every page id (`docs/design/btree.md`).
+
+// -- the page and its frame ---------------------------------------------------------------------------
+
+/** The page size: 16 KiB, fixed for the life of a database (§1 rule 5). */
+const DbPageSize: usize = 16384
+
+/** The format version of every page this release writes (§7.1). */
+const DbPageFormat: usize = 1
+
+const PageTypeBitmap: u8 = 0x01
+const PageTypeInner: u8 = 0x02
+const PageTypeLeaf: u8 = 0x03
+
+/** Bit 63 of a child reference: set when the reference is a frame address rather than a PID (§3.8). */
+const SwizzleTag: u64 = 0x8000000000000000
+
+/** The frame a page lives in, and its descriptor (§3.1, §8.1 rule 1).
+ *
+ * `pid` is the page's own id, so unswizzling a reference is one load from the frame (§3.8 rule 3).
+ * `latch` is the optimistic latch word (a version counter and lock bits), which lives here and never
+ * in the page's bytes. The store is single-threaded, so the word is kept but no latching protocol
+ * advances it yet.
+ */
+struct PageFrame
+    pid: u64
+    latch: u64
+    page: [16384]u8
+
+private[terndb] rd16(p: *PageFrame, off: usize) -> usize = usize(get_u16_le(p.page[off..<off + 2]).unwrap())
+
+private[terndb] wr16(p: *PageFrame, off: usize, v: usize) = put_u16_le(p.page[off..<off + 2], u16(v))
+
+private[terndb] rd32(p: *PageFrame, off: usize) -> u32 = get_u32_le(p.page[off..<off + 4]).unwrap()
+
+private[terndb] wr32(p: *PageFrame, off: usize, v: u32) = put_u32_le(p.page[off..<off + 4], v)
+
+private[terndb] rd64(p: *PageFrame, off: usize) -> u64 = get_u64_le(p.page[off..<off + 8]).unwrap()
+
+private[terndb] wr64(p: *PageFrame, off: usize, v: u64) = put_u64_le(p.page[off..<off + 8], v)
+
+/** The 48-bit `owner` of the common header, at offset 24. */
+private[terndb] page_owner(p: *PageFrame) -> u64
+    var v: u64 = 0
+
+    for i in 0..<6
+        v = v | u64(p.page[24 + i]) << u64(8 * i)
+
+    v
+
+/** Writes the common header (§3.1) of a page of type `ty`: no checksum, which is computed only when
+ * a page is written out (§3.1 rule 3, §8.1 rule 3), no LSN, and no encryption key.
+ */
+private[terndb] write_page_header(p: *PageFrame, ty: u8, flags: u8, owner: u64)
+    wr32(p, 0, 0)
+    wr16(p, 4, DbPageFormat)
+    p.page[6] = ty
+    p.page[7] = flags
+    wr64(p, 8, 0)
+    wr64(p, 16, p.pid)
+
+    for i in 0..<6
+        p.page[24 + i] = u8((owner >> u64(8 * i)) & 0xff)
+
+    wr16(p, 30, 0)
+
+/** The reference to `p` an inner node holds in memory: its frame's address, tagged (§3.8 rule 2). */
+private[terndb] swizzle(p: *PageFrame) -> u64 = SwizzleTag | u64(usize(p))
+
+/** The frame a swizzled reference names. Every child reference is swizzled in memory (§8.1 rule 1). */
+private[terndb] unswizzle(r: u64) -> *PageFrame = ptr_cast(usize(r & ~SwizzleTag))
+
+// -- the data space and its allocation bitmaps ------------------------------------------------------
+
+/** Pages per data segment: a segment is 1 GiB (§2.1). */
+const SegmentPages: u64 = 65536
+
+/** The data space of one in-memory database: the allocation bitmap of each segment (§3.7), which
+ * assigns every PID exactly as it would be assigned on disk (§8.1 rule 2), and the frames of the
+ * allocated pages by page number.
+ *
+ * The frames are found through a plain table here. The persistent radix tree §8.1 rule 4 asks of a
+ * page map is a later item; nothing in a tree's own structure reads the table, since every child
+ * reference is swizzled.
+ */
+struct PageSpace
+    bitmaps: Buf[&PageFrame]
+    frames: Buf[Option[&PageFrame]]
+    /** Every page number below this one is allocated, so a search for a free page starts here. */
+    first_free: u64
+
+    /** A free data page, marked allocated in its segment's bitmap: the lowest free page number,
+     * opening a new segment when every one is full. A freed page is reused at once, which is sound
+     * while one thread runs and nothing is logged (§3.7 rule 3; `docs/design/btree.md` § Deferred).
+     */
+    allocate(*self) -> u64
+        var n = self.first_free
+
+        loop
+            val seg = n / SegmentPages
+
+            if seg >= u64(self.bitmaps.len()) then self.add_segment()
+
+            val bm = &*self.bitmaps[usize(seg)]
+            val bit = usize(n % SegmentPages)
+
+            if bm.page[64 + bit / 8] == 0xff
+                n = (n | 7) + 1
+            elif bm.page[64 + bit / 8] & (u8(1) << u8(bit % 8)) != 0
+                n += 1
+            else
+                bm.page[64 + bit / 8] = bm.page[64 + bit / 8] | u8(1) << u8(bit % 8)
+                wr32(bm, 52, rd32(bm, 52) + 1)
+                self.first_free = n + 1
+                return n
+
+    /** Marks data page `pid` free in its bitmap and drops its frame. */
+    release(*self, pid: u64)
+        val seg = usize(pid / SegmentPages)
+        val bit = usize(pid % SegmentPages)
+        val bm = &*self.bitmaps[seg]
+        bm.page[64 + bit / 8] = bm.page[64 + bit / 8] & ~(u8(1) << u8(bit % 8))
+        wr32(bm, 52, rd32(bm, 52) - 1)
+        if usize(pid) < self.frames.len() then self.frames[usize(pid)] = None
+        if pid < self.first_free then self.first_free = pid
+
+    /** Whether data page `pid` is marked allocated. */
+    is_allocated(self, pid: u64) -> bool
+        val seg = usize(pid / SegmentPages)
+        if seg >= self.bitmaps.len() then return false
+        val bit = usize(pid % SegmentPages)
+        self.bitmaps[seg].page[64 + bit / 8] & (u8(1) << u8(bit % 8)) != 0
+
+    /** How many pages are allocated, the bitmap pages included. */
+    allocated(self) -> u64
+        var total: u64 = 0
+
+        for bm in self.bitmaps
+            total += u64(rd32(&*bm, 52))
+
+        total
+
+    /** A zeroed frame for newly allocated page `pid`, entered in the frame table. */
+    new_frame(*self, pid: u64) -> &PageFrame
+        val f: &PageFrame = PageFrame(pid, 0, [0; 16384])
+
+        while self.frames.len() <= usize(pid)
+            self.frames.push(None)
+
+        self.frames[usize(pid)] = Some(f)
+        f
+
+    /** The frame of page `pid`, if it has one. */
+    frame(self, pid: u64) -> Option[&PageFrame] =
+        if usize(pid) < self.frames.len() then self.frames[usize(pid)] else None
+
+    /** Opens segment `bitmaps.len()`: its page 0 is its bitmap, which marks itself allocated
+     * (§3.7 rule 1).
+     */
+    add_segment(*self)
+        val seg = u64(self.bitmaps.len())
+        val f = self.new_frame(seg * SegmentPages)
+        val p = &*f
+        write_page_header(p, PageTypeBitmap, 0, 0)
+        wr32(p, 48, u32(seg))
+        wr32(p, 52, 1)
+        p.page[64] = 1
+        self.bitmaps.push(f)
+
+/** An empty data space: segment 0 and its bitmap. */
+page_space() -> &PageSpace
+    val s: &PageSpace = PageSpace(buf(), buf(), 0)
+    s.add_segment()
+    s
+
+// -- the B+tree node layout -------------------------------------------------------------------------
+
+/** The node header ends here and the slot directory begins (§3.3). */
+const NodeHeaderSize: usize = 128
+
+/** The size of one slot of the directory (§3.4). */
+const SlotSize: usize = 12
+
+const NodeLowerInfinite: u8 = 0x01
+const NodeUpperInfinite: u8 = 0x02
+const NodeHintsValid: u8 = 0x04
+
+/** The longest encoded key, before prefix removal (§3.6). */
+const MaxKeyLen: usize = 1024
+
+/** The longest leaf entry kept inline, key and value together (§3.6). */
+const MaxLeafEntry: usize = 4000
+
+/** How many key heads the `hints` array holds (§3.5 rule 4). */
+const HintCount: usize = 16
+
+private[terndb] node_level(p: *PageFrame) -> usize = rd16(p, 32)
+private[terndb] node_count(p: *PageFrame) -> usize = rd16(p, 34)
+private[terndb] node_heap_top(p: *PageFrame) -> usize = rd16(p, 36)
+private[terndb] node_frag(p: *PageFrame) -> usize = rd16(p, 38)
+private[terndb] node_prefix_len(p: *PageFrame) -> usize = rd16(p, 40)
+private[terndb] node_extra(p: *PageFrame) -> u64 = rd64(p, 56)
+private[terndb] node_is_leaf(p: *PageFrame) -> bool = p.page[6] == PageTypeLeaf
+private[terndb] lower_infinite(p: *PageFrame) -> bool = p.page[7] & NodeLowerInfinite != 0
+private[terndb] upper_infinite(p: *PageFrame) -> bool = p.page[7] & NodeUpperInfinite != 0
+
+/** The bytes in use: the header, the slots, and the live part of the heap. */
+private[terndb] node_used(p: *PageFrame) -> usize =
+    NodeHeaderSize + SlotSize * node_count(p) + (DbPageSize - node_heap_top(p)) - node_frag(p)
+
+/** Free space between the slot directory and the heap (§3.3). */
+private[terndb] node_free(p: *PageFrame) -> usize = node_heap_top(p) - (NodeHeaderSize + SlotSize * node_count(p))
+
+private slot_at(i: usize) -> usize = NodeHeaderSize + SlotSize * i
+
+private[terndb] slot_offset(p: *PageFrame, i: usize) -> usize = rd16(p, slot_at(i))
+private[terndb] slot_key_len(p: *PageFrame, i: usize) -> usize = rd16(p, slot_at(i) + 2)
+private[terndb] slot_value_len(p: *PageFrame, i: usize) -> usize = rd16(p, slot_at(i) + 4)
+private[terndb] slot_head(p: *PageFrame, i: usize) -> u32 = get_u32_le(p.page[slot_at(i) + 8..<slot_at(i) + 12]).unwrap()
+
+/** Slot `i`'s key suffix: its key without the node prefix. */
+private[terndb] slot_suffix(p: *PageFrame, i: usize) -> []const u8
+    val o = slot_offset(p, i)
+    p.page[o..<o + slot_key_len(p, i)]
+
+/** Slot `i`'s value. */
+private[terndb] slot_value(p: *PageFrame, i: usize) -> []const u8
+    val o = slot_offset(p, i) + slot_key_len(p, i)
+    p.page[o..<o + slot_value_len(p, i)]
+
+/** The lower fence's bytes; empty when it is −∞. */
+private[terndb] lower_fence(p: *PageFrame) -> []const u8
+    val o = rd16(p, 42)
+    p.page[o..<o + rd16(p, 44)]
+
+/** The upper fence's bytes; empty when it is +∞. */
+private[terndb] upper_fence(p: *PageFrame) -> []const u8
+    val o = rd16(p, 46)
+    p.page[o..<o + rd16(p, 48)]
+
+/** The node prefix: the first `prefix_len` bytes of the lower fence (§3.5 rule 1). */
+private[terndb] node_prefix(p: *PageFrame) -> []const u8 = lower_fence(p)[..<node_prefix_len(p)]
+
+/** Slot `i`'s whole key: the node prefix, then its suffix. */
+private[terndb] slot_key(p: *PageFrame, i: usize) -> Buf[u8]
+    val k = buf[u8]()
+    k.extend(node_prefix(p))
+    k.extend(slot_suffix(p, i))
+    k
+
+/** The first 4 bytes of `s` read big-endian, zero-padded when it is shorter (§3.4). */
+private[terndb] key_head(s: []const u8) -> u32
+    var four: [4]u8 = [0, 0, 0, 0]
+
+    for i in 0..<(if s.len < 4 then s.len else 4)
+        four[i] = s[i]
+
+    get_u32_be(four[..]).unwrap()
+
+/** The length of the longest common prefix of `a` and `b`. */
+private[terndb] common_prefix(a: []const u8, b: []const u8) -> usize
+    var i: usize = 0
+
+    while i < a.len && i < b.len && a[i] == b[i]
+        i += 1
+
+    i
+
+/** The shortest separator `s` with `a < s ≤ b`, for `a < b` (§3.5 rule 3): `b` cut just past the
+ * first byte where it differs from `a`.
+ */
+private[terndb] shortest_separator(a: []const u8, b: []const u8) -> Buf[u8]
+    val s = buf[u8]()
+    s.extend(b[..<common_prefix(a, b) + 1])
+    s
+
+/** Rewrites the `hints` array from the slots, or clears the valid bit of an empty node, which has no
+ * slot for a hint to name (§3.5 rule 4).
+ */
+private[terndb] refresh_hints(p: *PageFrame)
+    val n = node_count(p)
+
+    if n == 0
+        fill(p.page[64..<128], 0)
+        p.page[7] = p.page[7] & ~NodeHintsValid
+        return
+
+    for j in 0..<HintCount
+        put_u32_le(p.page[64 + 4 * j..<68 + 4 * j], slot_head(p, (j + 1) * n / 17))
+
+    p.page[7] = p.page[7] | NodeHintsValid
+
+private[terndb] hint(p: *PageFrame, j: usize) -> u32 = rd32(p, 64 + 4 * j)
+
+private write_slot(p: *PageFrame, i: usize, offset: usize, suffix: []const u8, value_len: usize)
+    val at = slot_at(i)
+    wr16(p, at, offset)
+    wr16(p, at + 2, suffix.len)
+    wr16(p, at + 4, value_len)
+    wr16(p, at + 6, 0)
+    put_u32_le(p.page[at + 8..<at + 12], key_head(suffix))
+
+/** Where `key` falls among `p`'s slots: the first slot whose key is not below it, and whether that
+ * slot's key equals it. The hints narrow the range before any slot is read (§3.5 rule 4); a slot's
+ * head settles most comparisons before its suffix is read.
+ */
+private[terndb] node_search(p: *PageFrame, key: []const u8) -> (usize, bool)
+    val n = node_count(p)
+    val plen = node_prefix_len(p)
+    val prefix = node_prefix(p)
+
+    // Every key of the node begins with the prefix; a key that does not lies wholly to one side.
+    if key.len < plen || key[..<plen] != prefix
+        return (if key < prefix then 0 else n, false)
+
+    val suffix = key[plen..]
+    val head = key_head(suffix)
+    var lo: usize = 0
+    var hi = n
+
+    if p.page[7] & NodeHintsValid != 0
+        for j in 0..<HintCount
+            val at = (j + 1) * n / 17
+            val h = hint(p, j)
+
+            if h < head
+                if at + 1 > lo then lo = at + 1
+            elif h > head
+                if at < hi then hi = at
+                break
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        val sh = slot_head(p, mid)
+        val below = if sh != head then sh < head else slot_suffix(p, mid) < suffix
+        if below then lo = mid + 1 else hi = mid
+
+    (lo, lo < n && slot_suffix(p, lo) == suffix)
+
+/** Inserts the entry `suffix` + `value` as slot `pos` in place, compacting first when only the
+ * fragmented space has room (§3.3). False, with the node unchanged, when it does not fit at all.
+ */
+private[terndb] node_try_insert(p: *PageFrame, pos: usize, suffix: []const u8, value: []const u8) -> bool
+    val need = SlotSize + suffix.len + value.len
+
+    if node_free(p) < need
+        if node_free(p) + node_frag(p) < need then return false
+        compact_node(p)
+
+    val n = node_count(p)
+    val top = node_heap_top(p) - suffix.len - value.len
+    copy(p.page[top..<top + suffix.len], suffix)
+    copy(p.page[top + suffix.len..<top + suffix.len + value.len], value)
+
+    var i = n
+
+    while i > pos
+        copy(p.page[slot_at(i)..<slot_at(i) + SlotSize], p.page[slot_at(i - 1)..<slot_at(i)])
+        i -= 1
+
+    write_slot(p, pos, top, suffix, value.len)
+    wr16(p, 34, n + 1)
+    wr16(p, 36, top)
+    refresh_hints(p)
+    true
+
+/** Removes slot `pos`; its heap bytes become fragmented space. */
+private[terndb] node_remove(p: *PageFrame, pos: usize)
+    val n = node_count(p)
+    wr16(p, 38, node_frag(p) + slot_key_len(p, pos) + slot_value_len(p, pos))
+
+    for i in pos..<n - 1
+        copy(p.page[slot_at(i)..<slot_at(i) + SlotSize], p.page[slot_at(i + 1)..<slot_at(i + 2)])
+
+    fill(p.page[slot_at(n - 1)..<slot_at(n)], 0)
+    wr16(p, 34, n - 1)
+    refresh_hints(p)
+
+/** Replaces slot `pos`'s value in place with one no longer than it; the bytes it frees become
+ * fragmented space.
+ */
+private[terndb] node_shrink_value(p: *PageFrame, pos: usize, value: []const u8)
+    val at = slot_offset(p, pos) + slot_key_len(p, pos)
+    val old = slot_value_len(p, pos)
+    copy(p.page[at..<at + value.len], value)
+    wr16(p, slot_at(pos) + 4, value.len)
+    wr16(p, 38, node_frag(p) + old - value.len)
+
+/** Inner node `p`'s child `c`: slot `c`'s, or the upper child when `c` is the slot count. */
+private[terndb] node_child(p: *PageFrame, c: usize) -> u64 =
+    if c == node_count(p) then node_extra(p) else get_u64_le(slot_value(p, c)).unwrap()
+
+/** Points inner node `p`'s child `c` at `r`. */
+private[terndb] set_node_child(p: *PageFrame, c: usize, r: u64)
+    if c == node_count(p)
+        wr64(p, 56, r)
+    else
+        wr64(p, slot_offset(p, c) + slot_key_len(p, c), r)
+
+// -- node images ------------------------------------------------------------------------------------
+
+/** One entry of a node image: a whole key (prefix included) and its value. */
+struct BtEntry derives Eq
+    key: Buf[u8]
+    value: Buf[u8]
+
+/** A node as a list of whole entries rather than bytes, which is what a split, a merge and a
+ * compaction rebuild a page from. A fence of `None` is infinite. An inner node's values are its
+ * 8-byte child references, and `extra` is its upper child (§3.3).
+ */
+struct NodeImage
+    level: usize
+    lower: Option[Buf[u8]]
+    upper: Option[Buf[u8]]
+    entries: Buf[BtEntry]
+    extra: u64
+
+private[terndb] fence_len(f: Option[Buf[u8]]) -> usize = f match
+    Some(k) -> k.len()
+    None -> 0
+
+/** The prefix length of a node with fences `lower` and `upper` (§3.5 rule 1). */
+private[terndb] image_prefix(lower: Option[Buf[u8]], upper: Option[Buf[u8]]) -> usize = lower match
+    Some(l) -> upper match
+        Some(u) -> common_prefix(l.view(), u.view())
+        None -> 0
+    None -> 0
+
+/** The bytes `img` takes as a page: header, fences, and its entries with the prefix removed. */
+private[terndb] image_size(img: NodeImage) -> usize
+    val plen = image_prefix(img.lower, img.upper)
+    var size = NodeHeaderSize + fence_len(img.lower) + fence_len(img.upper)
+
+    for e in img.entries
+        size += SlotSize + e.key.len() - plen + e.value.len()
+
+    size
+
+/** Node `p` as an image. */
+private[terndb] read_image(p: *PageFrame) -> NodeImage
+    val entries = buf[BtEntry]()
+
+    for i in 0..<node_count(p)
+        val v = buf[u8]()
+        v.extend(slot_value(p, i))
+        entries.push(BtEntry(slot_key(p, i), v))
+
+    NodeImage(node_level(p), fence_of(p, true), fence_of(p, false), entries, node_extra(p))
+
+private fence_of(p: *PageFrame, lower: bool) -> Option[Buf[u8]]
+    if lower && lower_infinite(p) || !lower && upper_infinite(p) then return None
+    val k = buf[u8]()
+    k.extend(if lower then lower_fence(p) else upper_fence(p))
+    Some(k)
+
+/** Writes `img` over page `p`, laid out afresh: fences at the top of the heap, then the entries in
+ * slot order below them, no fragmented space, and the hints maintained. The caller has checked that
+ * it fits.
+ */
+private[terndb] write_image(p: *PageFrame, owner: u64, img: NodeImage)
+    fill(p.page[..], 0)
+    var flags: u8 = 0
+
+    if img.lower.is_none() then flags = flags | NodeLowerInfinite
+    if img.upper.is_none() then flags = flags | NodeUpperInfinite
+
+    write_page_header(p, if img.level == 0 then PageTypeLeaf else PageTypeInner, flags, owner)
+    val plen = image_prefix(img.lower, img.upper)
+    var top = DbPageSize
+
+    img.lower match
+        Some(l) ->
+            top -= l.len()
+            copy(p.page[top..<top + l.len()], l.view())
+            wr16(p, 42, top)
+            wr16(p, 44, l.len())
+        None -> ()
+
+    img.upper match
+        Some(u) ->
+            top -= u.len()
+            copy(p.page[top..<top + u.len()], u.view())
+            wr16(p, 46, top)
+            wr16(p, 48, u.len())
+        None -> ()
+
+    for i in 0..<img.entries.len()
+        val e = img.entries[i]
+        val suffix = e.key.view()[plen..]
+        top -= suffix.len + e.value.len()
+        copy(p.page[top..<top + suffix.len], suffix)
+        copy(p.page[top + suffix.len..<top + suffix.len + e.value.len()], e.value.view())
+        write_slot(p, i, top, suffix, e.value.len())
+
+    wr16(p, 32, img.level)
+    wr16(p, 34, img.entries.len())
+    wr16(p, 36, top)
+    wr16(p, 38, 0)
+    wr16(p, 40, plen)
+    wr64(p, 56, img.extra)
+    refresh_hints(p)
+
+/** Rewrites `p`'s heap with no fragmented space (§3.3). */
+private[terndb] compact_node(p: *PageFrame) = write_image(p, page_owner(p), read_image(p))
