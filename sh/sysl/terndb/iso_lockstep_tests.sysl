@@ -1,0 +1,199 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The isolation model against the store and against §3 (`isolation.md` §7.4): every §7.2 workload
+// the driver has, at every level mix, run on the store and the model in lock step with no
+// divergence; each fault-injected store diverging from the model on some seed, at a named step,
+// where the real store does not; and the model's own histories checked by the history checker with
+// the expectations a store's must meet, including the anomalies a weaker level permits actually
+// occurring.
+
+/** How many seeds each lock-step sweep runs per workload and level mix. Raise it for a longer soak. */
+const LockstepSeeds: u64 = 6
+
+/** How far a search for a seed on which a faulty store diverges goes. */
+const DivergeSeeds: u64 = 40
+
+/** How many commits in a thousand lose their acknowledgement in a lock-step run (§5.4). */
+const LockstepLostAcks: u64 = 60
+
+private ls_mixes() -> Buf[LevelMix] = items_of([MixSer, MixSi, MixRc, MixAll])
+
+private ls_mix_name(m: LevelMix) -> string = m match
+    MixSer -> "serializable"
+    MixSi -> "snapshot"
+    MixRc -> "read committed"
+    MixAll -> "mixed"
+
+private ls_w1(seed: u64, mix: LevelMix) -> Workload = w1_list_append(seed, 4, 6, 4, mix)
+private ls_w2(seed: u64, mix: LevelMix) -> Workload = w2_register(seed, 4, 6, 4, mix)
+private ls_w3(seed: u64, mix: LevelMix) -> Workload = w3_bank(seed, 4, 6, 4, mix)
+private ls_w3b(seed: u64, mix: LevelMix) -> Workload = w3b_write_skew(seed, 4, 5, 2, mix)
+private ls_w4(seed: u64, mix: LevelMix) -> Workload = w4_phantom(seed, 4, 6, mix)
+private ls_w4c(seed: u64, mix: LevelMix) -> Workload = w4_on_call(seed, 2, 6, mix)
+private ls_w6(seed: u64, mix: LevelMix) -> Workload = w6_read_only(seed, 5, mix)
+
+private ls_faults(skip_validation: bool, skip_fuw: bool, statement_snapshot: bool, stale: bool) -> Faults =
+    Faults(skip_validation, skip_fuw, statement_snapshot, stale)
+
+/** Runs `seeds` seeds of `make` at every level mix on the real store and the model in lock step:
+ * none may diverge.
+ */
+lockstep_sweep(make: &Fn(u64, LevelMix) -> Workload, seeds: u64, file: string = __FILE__, line: long = __LINE__)
+    for mix in ls_mixes()
+        for seed in 1..seeds
+            lockstep_divergence(make(seed, mix), no_faults(), DriveOptions(seed, LockstepLostAcks)) match
+                Some(m) -> assert(false, s"${ls_mix_name(mix)}: $m", file, line)
+                None -> ()
+
+/** The first seed on which the store with `f` diverges from the model, at a named step; 0 if none
+ * does within the search. The real store must not diverge on that seed.
+ */
+private ls_diverging_seed(make: &Fn(u64, LevelMix) -> Workload, mix: LevelMix, f: Faults, file: string = __FILE__, line: long = __LINE__) -> u64
+    for seed in 1..DivergeSeeds
+        lockstep_divergence(make(seed, mix), f, DriveOptions(seed, 0)) match
+            Some(m) ->
+                assert(m.contains("lock-step divergence at step ") && m.contains(s"(seed $seed)"), m, file, line)
+                val clean = lockstep_divergence(make(seed, mix), no_faults(), DriveOptions(seed, 0))
+                assert(clean.is_none(), s"seed $seed on the real store: ${clean.unwrap_or("")}", file, line)
+                return seed
+            None -> ()
+    0
+
+/** Runs `seeds` seeds of `make` at every level mix on the model alone: the checker must find nothing
+ * forbidden in its histories.
+ */
+private ls_model_clean(make: &Fn(u64, LevelMix) -> Workload, seeds: u64, file: string = __FILE__, line: long = __LINE__)
+    for mix in ls_mixes()
+        for seed in 1..seeds
+            val run = run_workload_on(model_bench(), make(seed, mix), DriveOptions(seed, LockstepLostAcks))
+            val bad = run.report.forbidden()
+            assert(bad.len() == 0, s"seed $seed at ${ls_mix_name(mix)}:\n${run.report.summary()}", file, line)
+
+/** The first seed whose model history shows one of `wanted`, permitted; 0 if none does. */
+private ls_model_showing(make: &Fn(u64, LevelMix) -> Workload, mix: LevelMix, wanted: []const string) -> u64
+    for seed in 1..DivergeSeeds
+        val run = run_workload_on(model_bench(), make(seed, mix), DriveOptions(seed, 0))
+        for a in run.report.anomalies
+            for w in wanted
+                if a.name == w && !a.forbidden then return seed
+    0
+
+// -- lock step: the real store agrees with the model ------------------------------------------------
+
+@test
+w1_list_append_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w1(s, m), LockstepSeeds)
+
+@test
+w2_register_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w2(s, m), LockstepSeeds)
+
+@test
+w3_bank_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w3(s, m), LockstepSeeds)
+
+@test
+w3b_write_skew_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w3b(s, m), LockstepSeeds)
+
+@test
+w4_phantom_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w4(s, m), LockstepSeeds)
+
+@test
+w4_on_call_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w4c(s, m), LockstepSeeds)
+
+@test
+w6_read_only_agrees_with_the_model_at_every_level_mix()
+    lockstep_sweep((s, m) -> ls_w6(s, m), LockstepSeeds)
+
+@test
+a_lock_step_run_exercises_waits_aborts_and_every_answer()
+    // The sweeps are not vacuous: across them the store waits, aborts with each contention code and
+    // commits, and the model agreed with every one of those answers.
+    var waits: u64 = 0
+    var serialization: usize = 0
+    var commits: usize = 0
+    for seed in 1..LockstepSeeds
+        for w in items_of([ls_w1(seed, MixAll), ls_w3b(seed, MixAll)])
+            val l = lockstep(no_faults(), seed)
+            l.seed_rows(w.lists, w.regs, w.init)
+            val clock: &SimClock = SimClock(0)
+            val h = drive(l, clock, w.pre, w.clients, w.post, DriveOptions(seed, 0))
+            assert(h.is_ok() && l.failure.is_none(), l.failure.unwrap_or(""))
+            for e in h.unwrap()
+                if e.kind == HOk then commits += 1
+                if e.error == "serialization_failure" then serialization += 1
+            waits += l.waits
+    assert(waits > 0 && serialization > 0 && commits > 0, s"waits $waits, serialization failures $serialization, commits $commits")
+
+// -- prove the comparison can fail ------------------------------------------------------------------
+
+@test
+a_store_without_validation_diverges_from_the_model()
+    assert(ls_diverging_seed((s, m) -> ls_w3b(s, m), MixSer, ls_faults(true, false, false, false)) != 0)
+    assert(ls_diverging_seed((s, m) -> ls_w4(s, m), MixSer, ls_faults(true, false, false, false)) != 0)
+
+@test
+a_store_without_first_updater_wins_diverges_from_the_model()
+    assert(ls_diverging_seed((s, m) -> ls_w1(s, m), MixSi, ls_faults(false, true, false, false)) != 0)
+    assert(ls_diverging_seed((s, m) -> ls_w2(s, m), MixSer, ls_faults(false, true, false, false)) != 0)
+
+@test
+a_store_taking_a_snapshot_per_statement_at_snapshot_level_diverges_from_the_model()
+    assert(ls_diverging_seed((s, m) -> ls_w1(s, m), MixSi, ls_faults(false, false, true, false)) != 0)
+
+@test
+a_store_with_a_stale_snapshot_diverges_from_the_model_at_every_level()
+    for mix in ls_mixes()
+        assert(ls_diverging_seed((s, m) -> ls_w2(s, m), mix, ls_faults(false, false, false, true)) != 0, ls_mix_name(mix))
+
+@test
+a_divergence_names_its_step_its_seed_and_both_answers()
+    val d = lockstep_divergence(ls_w2(1, MixSer), ls_faults(false, false, false, true), DriveOptions(1, 0))
+    assert(d.is_some(), "a stale snapshot diverges at the first begin")
+    val m = d.unwrap()
+    assert(m.contains("at step 1 (seed 1)"), m)
+    assert(m.contains("the store answered snapshot 0, the model snapshot 1"), m)
+
+// -- the model's own histories (§3) -----------------------------------------------------------------
+
+@test
+the_models_w1_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w1(s, m), LockstepSeeds)
+
+@test
+the_models_w2_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w2(s, m), LockstepSeeds)
+
+@test
+the_models_w3_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w3(s, m), LockstepSeeds)
+
+@test
+the_models_w3b_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w3b(s, m), LockstepSeeds)
+
+@test
+the_models_w4_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w4(s, m), LockstepSeeds)
+
+@test
+the_models_w4_on_call_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w4c(s, m), LockstepSeeds)
+
+@test
+the_models_w6_histories_are_clean_at_every_level_mix()
+    ls_model_clean((s, m) -> ls_w6(s, m), LockstepSeeds)
+
+@test
+the_model_permits_what_snapshot_and_read_committed_permit()
+    // The model's checks are not vacuous: the anomalies a weaker level allows occur in its histories.
+    assert(ls_model_showing((s, m) -> ls_w2(s, m), MixSi, ["A5B", "G2-item"]) != 0, "write skew at snapshot")
+    assert(ls_model_showing((s, m) -> ls_w4(s, m), MixSi, ["G2"]) != 0, "a phantom at snapshot")
+    assert(ls_model_showing((s, m) -> ls_w6(s, m), MixSi, ["G2-item", "A5B"]) != 0, "the read-only anomaly at snapshot")
+    assert(ls_model_showing((s, m) -> ls_w1(s, m), MixRc, ["G-single", "P4", "G-nonadjacent"]) != 0, "read skew at read committed")
