@@ -1,0 +1,693 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.{get_u16_le, get_u32_le, get_u64_le, push_u16_le, push_u32_le, push_u64_le}
+import sysl.slices.{copy, fill}
+
+// The undo log of the in-memory mode (`on-disk-format.md` §5, §8.1): undo pages in their own page
+// space, records appended through one lane and chained per row (the version chain) and per
+// transaction (the rollback chain); the version a snapshot sees, rebuilt from a row's current image;
+// rollback; and purge, which removes ghosts and advances `undo_low`, dropping the pages below it
+// (`docs/design/undo.md`).
+
+// -- the record ------------------------------------------------------------------------------------
+
+const PageTypeUndo: u8 = 0x05
+
+/** Bits 62–60 of a PID name its space, and the undo space is space 1 (§2.1). */
+const UndoSpaceTag: u64 = 0x1000000000000000
+
+/** Where an undo page's records begin: past the common header (§5.1). */
+const UndoPageStart: usize = 32
+
+/** The bytes of an undo page that hold records. */
+const UndoPageRoom: usize = 16352
+
+/** The fixed part of every record but PAD (§5.2). */
+const UndoHeaderSize: usize = 48
+
+/** The shortest PAD: its `len` and `kind`. A writer never leaves a tail shorter than this. */
+const UndoPadMin: usize = 3
+
+const UndoPad: u8 = 0
+const UndoInsert: u8 = 1
+const UndoUpdate: u8 = 2
+const UndoDelete: u8 = 3
+const UndoLock: u8 = 4
+const UndoSecondary: u8 = 5
+
+/** Record `flags` bit 0: the old version had `DELETED` set. */
+const UndoOldDeleted: u8 = 1
+
+/** Record `flags` bit 1: an old value is out of line. */
+const UndoOldExternal: u8 = 2
+
+/** One non-key column of a row: null, or the bytes the row stores for it (§4.4), which for a column
+ * stored out of line are its 32-byte stub. This is the grain at which an UPDATE record keeps old
+ * values (§5.2), so the undo log needs no column types.
+ */
+struct ColumnImage derives Eq
+    is_null: bool
+    bytes: Buf[u8]
+
+/** One old value of an UPDATE record: the column's ordinal in `old_schema_version`, and its value. */
+struct UndoColumn derives Eq
+    ordinal: usize
+    col: ColumnImage
+
+/** A row as the clustered leaf holds it: the §4.1 header and its non-key columns. */
+struct RowImage derives Eq
+    header: RowHeader
+    cols: Buf[ColumnImage]
+
+/** A decoded undo record (§5.2). `cols` is an UPDATE's payload, and `index_oid` and `index_key` a
+ * SECONDARY's; both are empty for every other kind. `len` is the record's total length; a PAD has
+ * only `len` and `kind`.
+ */
+struct UndoRecord derives Eq
+    len: usize
+    kind: u8
+    flags: u8
+    old_schema_version: u16
+    txn: u64
+    prev_version: u64
+    txn_prev: u64
+    prev_txn: u64
+    oid: u64
+    key: Buf[u8]
+    cols: Buf[UndoColumn]
+    index_oid: u64
+    index_key: Buf[u8]
+
+private[terndb] undo_bytes(b: []const u8) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(b)
+    out
+
+private[terndb] copy_column(c: ColumnImage) -> ColumnImage = ColumnImage(c.is_null, undo_bytes(c.bytes.view()))
+
+private[terndb] copy_columns(cs: []const ColumnImage) -> Buf[ColumnImage]
+    val out = buf[ColumnImage]()
+
+    for c in cs
+        out.push(copy_column(c))
+
+    out
+
+/** A copy of `r` that shares no buffer with it. */
+copy_row_image(r: RowImage) -> RowImage = RowImage(r.header, copy_columns(r.cols.view()))
+
+/** The bytes of record `r`, whose `len` is computed rather than read. A PAD is never encoded this way;
+ * the lane writes it straight into the page.
+ */
+encode_undo_record(r: UndoRecord) -> Buf[u8]
+    val out = buf[u8]()
+    push_u16_le(out, 0)
+    out.push(r.kind)
+    out.push(r.flags)
+    push_u16_le(out, r.old_schema_version)
+    push_u16_le(out, u16(r.key.len()))
+    push_u64_le(out, r.txn)
+    push_u64_le(out, r.prev_version)
+    push_u64_le(out, r.txn_prev)
+    push_u64_le(out, r.prev_txn)
+    push_u64_le(out, r.oid)
+    out.extend(r.key.view())
+
+    if r.kind == UndoUpdate
+        push_u16_le(out, u16(r.cols.len()))
+
+        for c in r.cols
+            push_u16_le(out, u16(c.ordinal))
+            out.push(if c.col.is_null then 1 else 0)
+            push_u32_le(out, u32(c.col.bytes.len()))
+            out.extend(c.col.bytes.view())
+    elif r.kind == UndoSecondary
+        push_u64_le(out, r.index_oid)
+        out.extend(r.index_key.view())
+
+    out[0] = u8(out.len() & 0xff)
+    out[1] = u8((out.len() >> 8) & 0xff)
+    out
+
+/** Whether `a` can be an undo address field: none (0), or a position at or past byte 32 of its page
+ * (§5.1).
+ */
+private undo_address_ok(a: u64) -> bool = a == 0 || a % 16384 >= u64(UndoPageStart)
+
+private undo_u16(b: []const u8, at: usize) -> usize = usize(get_u16_le(b[at..<at + 2]).unwrap())
+
+private undo_u64(b: []const u8, at: usize) -> u64 = get_u64_le(b[at..<at + 8]).unwrap()
+
+private undo_empty_record(len: usize) -> UndoRecord =
+    UndoRecord(len, UndoPad, 0, 0, 0, 0, 0, 0, 0, buf[u8](), buf[UndoColumn](), 0, buf[u8]())
+
+/** The record at the start of `bytes`, which run to the end of the space it may occupy (the end of
+ * its page, or the lane's position on the page being filled). Anything that breaks §5.2 is
+ * `data_corrupted`: a length past the space or short of the fields it must hold, a reserved kind, a
+ * key over 1,024 bytes, transaction id 0, an address field naming the header of a page, an INSERT
+ * with a previous version, a DELETE or LOCK with a payload, an UPDATE whose old values overrun the
+ * record, leave bytes over, mark a value null with a length, or repeat or reorder an ordinal, and a
+ * PAD with a byte that is not zero.
+ */
+decode_undo_record(bytes: []const u8) -> Result[UndoRecord, CodecError]
+    if bytes.len < UndoPadMin then return corrupt("an undo record shorter than its length and kind")
+    val len = undo_u16(bytes, 0)
+    val kind = bytes[2]
+    if len > bytes.len then return corrupt("an undo record running past the end of its page")
+
+    if kind == UndoPad
+        if len < UndoPadMin then return corrupt("a PAD record shorter than its length and kind")
+
+        for i in UndoPadMin..<len
+            if bytes[i] != 0 then return corrupt("a PAD record with a byte that is not zero")
+
+        return Ok(undo_empty_record(len))
+
+    if kind > UndoSecondary then return corrupt("an undo record of a reserved kind")
+    if len < UndoHeaderSize then return corrupt("an undo record shorter than its header")
+    val flags = bytes[3]
+    val old_schema = u16(undo_u16(bytes, 4))
+    val key_len = undo_u16(bytes, 6)
+    if key_len > MaxKeyLen then return corrupt("an undo record with a key over 1,024 bytes")
+    if UndoHeaderSize + key_len > len then return corrupt("an undo record shorter than its key")
+    val txn = undo_u64(bytes, 8)
+    val prev_version = undo_u64(bytes, 16)
+    val txn_prev = undo_u64(bytes, 24)
+    val prev_txn = undo_u64(bytes, 32)
+    val oid = undo_u64(bytes, 40)
+    if txn == 0 then return corrupt("an undo record of transaction 0")
+    if !undo_address_ok(prev_version) then return corrupt("an undo record whose prev_version is not an undo address")
+    if !undo_address_ok(txn_prev) then return corrupt("an undo record whose txn_prev is not an undo address")
+    val key = undo_bytes(bytes[UndoHeaderSize..<UndoHeaderSize + key_len])
+    val cols = buf[UndoColumn]()
+    var index_oid: u64 = 0
+    val index_key = buf[u8]()
+    var at = UndoHeaderSize + key_len
+
+    if kind == UndoInsert
+        if prev_version != 0 || prev_txn != 0 then return corrupt("an INSERT undo record with a previous version")
+        if flags & UndoOldDeleted != 0 then return corrupt("an INSERT undo record whose old version is a ghost")
+    elif kind != UndoSecondary
+        if prev_txn == 0 then return corrupt("an undo record with an old version and no old transaction")
+
+    if kind == UndoUpdate
+        if at + 2 > len then return corrupt("an UPDATE undo record with no column count")
+        val n = undo_u16(bytes, at)
+        at += 2
+
+        for _ in 0..<n
+            if at + 7 > len then return corrupt("an UPDATE undo record whose old values run past it")
+            val ordinal = undo_u16(bytes, at)
+            val is_null = bytes[at + 2]
+            val vlen = usize(get_u32_le(bytes[at + 3..<at + 7]).unwrap())
+            at += 7
+            if is_null > 1 then return corrupt("an UPDATE undo record with an is_null that is neither 0 nor 1")
+            if is_null == 1 && vlen != 0 then return corrupt("an UPDATE undo record with a null old value that has bytes")
+            if vlen > len - at then return corrupt("an UPDATE undo record whose old values run past it")
+            if cols.len() > 0 && ordinal <= cols[cols.len() - 1].ordinal then return corrupt("an UPDATE undo record whose ordinals do not ascend")
+            cols.push(UndoColumn(ordinal, ColumnImage(is_null == 1, undo_bytes(bytes[at..<at + vlen]))))
+            at += vlen
+
+        if at != len then return corrupt("an UPDATE undo record with bytes past its old values")
+    elif kind == UndoSecondary
+        if at + 8 > len then return corrupt("a SECONDARY undo record with no index")
+        index_oid = undo_u64(bytes, at)
+        index_key.extend(bytes[at + 8..<len])
+    elif at != len
+        return corrupt("an INSERT, DELETE or LOCK undo record with a payload")
+
+    Ok(UndoRecord(len, kind, flags, old_schema, txn, prev_version, txn_prev, prev_txn, oid, key, cols, index_oid, index_key))
+
+// -- the undo space ---------------------------------------------------------------------------------
+
+/** The first undo address of undo page `n` (§5.1). */
+undo_page_first(n: u64) -> u64 = n * 16384 + u64(UndoPageStart)
+
+/** The address that follows a record of `len` bytes at `a`: the next byte, or the first address of
+ * the next page when the record ends its page.
+ */
+undo_next(a: u64, len: usize) -> u64
+    val n = a + u64(len)
+    if n % 16384 == 0 then n + u64(UndoPageStart) else n
+
+/** The undo space of one in-memory database (§5.1, §8.1): its resident pages, which are always the
+ * consecutive page numbers `base` up to `next_page`, the high-water mark; the one lane's write
+ * position (0 when it holds no page); and `low`, which is `undo_low`. Pages are taken at the
+ * high-water mark and dropped below `undo_low`, and addresses are never reused, so no bitmap is
+ * needed: the page range is the whole allocation state (`docs/design/undo.md` § Spec gaps).
+ */
+struct UndoSpace
+    pages: Buf[&PageFrame]
+    base: u64
+    next_page: u64
+    lane: u64
+    low: u64
+    /** Pages dropped so far. */
+    freed: u64
+
+    /** Where the log ends: the lane's position, or the first address of the next page. */
+    end(self) -> u64 = if self.lane != 0 then self.lane else undo_page_first(self.next_page)
+
+    /** The frame of resident undo page `n`. */
+    frame(self, n: u64) -> Option[&PageFrame] =
+        if n >= self.base && n < self.next_page then Some(self.pages[usize(n - self.base)]) else None
+
+    /** Appends record `rec` and answers its address. A record goes on the lane's page when it fills
+     * the page exactly or leaves at least a PAD's room; otherwise the lane covers the tail with PAD
+     * and takes the next page (§5.1 rules 2 and 3). A record longer than a page holds is
+     * `entry_too_large`.
+     */
+    append(*self, rec: []const u8) -> Result[u64, CodecError]
+        val n = rec.len
+        if n > UndoPageRoom then return fail("D2002", "an undo record longer than an undo page holds")
+
+        if self.lane != 0
+            val room = DbPageSize - usize(self.lane % 16384)
+            if n != room && n + UndoPadMin > room then self.leave_page()
+
+        if self.lane == 0 then self.take_page()
+        val addr = self.lane
+        val f = self.frame(addr / 16384).unwrap()
+        val p = &*f
+        val off = usize(addr % 16384)
+        copy(p.page[off..<off + n], rec)
+        self.lane = addr + u64(n)
+        if self.lane % 16384 == 0 then self.lane = 0
+        Ok(addr)
+
+    /** The lane leaves its page, covering the unused tail with one PAD record (§5.1 rule 2). */
+    leave_page(*self)
+        if self.lane == 0 then return
+        val p = &*self.frame(self.lane / 16384).unwrap()
+        val off = usize(self.lane % 16384)
+        val room = DbPageSize - off
+        fill(p.page[off..<DbPageSize], 0)
+        wr16(p, off, room)
+        self.lane = 0
+
+    /** The lane takes the page at the high-water mark. */
+    take_page(*self)
+        val n = self.next_page
+        val f: &PageFrame = PageFrame(UndoSpaceTag | n, 0, [0; 16384])
+        write_page_header(&*f, PageTypeUndo, 0, 0)
+        self.pages.push(f)
+        self.next_page = n + 1
+        self.lane = undo_page_first(n)
+
+    /** The record at address `a`, PAD included. An address that is 0, names a page header, lies
+     * below `undo_low` (rule D17) or at or past the end of the log is `data_corrupted`, as is a
+     * malformed record.
+     */
+    read(self, a: u64) -> Result[UndoRecord, CodecError]
+        if !undo_address_ok(a) || a == 0 then return corrupt("an invalid undo address")
+        if a < self.low then return corrupt("an undo address below undo_low (rule D17)")
+        if a >= self.end() then return corrupt("an undo address past the end of the undo log")
+        val n = a / 16384
+
+        self.frame(n) match
+            None -> corrupt("an undo address on a page that is not resident")
+            Some(f) ->
+                val stop = if self.lane != 0 && self.lane / 16384 == n then usize(self.lane % 16384) else DbPageSize
+                decode_undo_record(f.page[usize(a % 16384)..<stop])
+
+    /** Advances `undo_low` to `a`, a record boundary at or past it, and drops every page wholly below
+     * it (§5.5). When `a` is the end of the log, the lane leaves its page first, so that a log with
+     * nothing left in it holds no page at all.
+     */
+    truncate_to(*self, a: u64)
+        var to = a
+
+        if to == self.end()
+            self.leave_page()
+            to = undo_page_first(self.next_page)
+
+        while self.base < to / 16384
+            self.pages.remove(0)
+            self.base += 1
+            self.freed += 1
+
+        self.low = to
+
+/** An empty undo space: no page yet, and `undo_low` at the first address of page 0. */
+undo_space() -> &UndoSpace = UndoSpace(buf[&PageFrame](), 0, 0, 0, undo_page_first(0), 0)
+
+// -- rows over the undo log -------------------------------------------------------------------------
+
+const UndoTxnActive: u8 = 0
+const UndoTxnCommitted: u8 = 1
+const UndoTxnAborted: u8 = 2
+
+/** A transaction as the undo log knows it: active, committed with commit sequence number `commit`,
+ * or rolled back; and `last`, the newest record it wrote, where its rollback chain starts (§5.3).
+ */
+struct UndoTxn derives Eq
+    state: u8
+    commit: u64
+    last: u64
+
+/** One row of the clustered leaf: its table, its encoded primary key, and its current image. */
+struct LeafRow
+    oid: u64
+    key: Buf[u8]
+    row: RowImage
+
+/** What a write did: wrote the record at `addr`; found the row write-locked by the live transaction
+ * `holder`; found no live row to update or delete; found a live row where an insert was asked; or
+ * was asked of a transaction that is not active. Only the first changes anything.
+ */
+enum UndoWrite derives Eq
+    UndoDone(addr: u64)
+    UndoLocked(holder: u64)
+    UndoMissing
+    UndoExists
+    UndoNotActive
+
+/** What one purge did: the records it finished, the ghosts it removed, and the pages it dropped. */
+struct PurgeStats derives Eq
+    records: u64
+    ghosts: u64
+    pages: u64
+
+/** Rows whose earlier versions live in the undo log: the clustered leaf (rows sorted by table, then
+ * key), the transactions by id (id `i` at index `i − 1`, so 0 stays "none"), the visible horizon `h`
+ * (`isolation.md` §4.1) as `last_commit`, the live snapshots, and the horizon of the last purge,
+ * which never decreases (§5.6).
+ *
+ * Commit changes no row: a row's `txn` names its writer for ever, and whether a snapshot sees it is
+ * read from the transaction's commit number. Abort walks the rollback chain and restores each row
+ * before returning, so no row ever names a rolled-back transaction.
+ */
+struct UndoRows
+    space: &UndoSpace
+    rows: Buf[LeafRow]
+    txns: Buf[UndoTxn]
+    last_commit: u64
+    snapshots: Buf[u64]
+    purge_horizon: u64
+
+    /** Starts a transaction and answers its id. */
+    begin(*self) -> u64
+        self.txns.push(UndoTxn(UndoTxnActive, 0, 0))
+        u64(self.txns.len())
+
+    /** Transaction `id`, if it was ever begun. */
+    txn_of(self, id: u64) -> Option[UndoTxn] =
+        if id >= 1 && id <= u64(self.txns.len()) then Some(self.txns[usize(id - 1)]) else None
+
+    is_active(self, id: u64) -> bool = self.txn_of(id) match
+        Some(t) -> t.state == UndoTxnActive
+        None -> false
+
+    /** Takes a snapshot `s = h` and keeps it live until it is released (§4.1). */
+    take_snapshot(*self) -> u64
+        self.snapshots.push(self.last_commit)
+        self.last_commit
+
+    /** Releases one live snapshot of value `s`; false when there is none. */
+    release_snapshot(*self, s: u64) -> bool
+        for i in 0..<self.snapshots.len()
+            if self.snapshots[i] == s
+                self.snapshots.remove(i)
+                return true
+
+        false
+
+    /** The commit point before which every live snapshot sees everything (§5.5): the oldest live
+     * snapshot, or `h` when none is live.
+     */
+    horizon(self) -> u64
+        var h = self.last_commit
+
+        for s in self.snapshots
+            if s < h then h = s
+
+        h
+
+    /** Where the row of `oid` and `key` is in the leaf, or where it would go. */
+    find(self, oid: u64, key: []const u8) -> (usize, bool)
+        var lo: usize = 0
+        var hi = self.rows.len()
+
+        while lo < hi
+            val mid = lo + (hi - lo) / 2
+            val r = self.rows[mid]
+            if r.oid < oid || (r.oid == oid && r.key.view() < key) then lo = mid + 1 else hi = mid
+
+        (lo, lo < self.rows.len() && self.rows[lo].oid == oid && self.rows[lo].key.view() == key)
+
+    /** Whether a reader with snapshot `s`, running in transaction `own` (0 for none), sees the
+     * writes of transaction `txn`: its own, or a commit at or before `s` (§4.1).
+     */
+    sees(self, txn: u64, s: u64, own: u64) -> Result[bool, CodecError]
+        if txn != 0 && txn == own then return Ok(true)
+
+        self.txn_of(txn) match
+            None -> corrupt("a row version names a transaction that never began")
+            Some(t) -> Ok(t.state == UndoTxnCommitted && t.commit <= s)
+
+    /** The live transaction other than `txn` that holds `row`'s write lock, or 0 (§4.1). */
+    holder(self, row: RowImage, txn: u64) -> u64 =
+        if row.header.txn != txn && self.is_active(row.header.txn) then row.header.txn else 0
+
+    /** Appends `rec` for transaction `txn` and makes it the head of its rollback chain. */
+    log(*self, txn: u64, rec: UndoRecord) -> Result[u64, CodecError]
+        val addr = self.space.append(encode_undo_record(rec).view())?
+        val t = self.txns[usize(txn - 1)]
+        self.txns[usize(txn - 1)] = UndoTxn(t.state, t.commit, addr)
+        Ok(addr)
+
+    private last_of(self, txn: u64) -> u64 = self.txns[usize(txn - 1)].last
+
+    /** Inserts the row of `oid` and `key` with columns `cols` in schema version `schema`. Where no
+     * row is there, the record is an INSERT. Over a ghost it is an UPDATE flagged "the old version
+     * was a ghost" listing every column of the ghost, so the deleted version and those before it stay
+     * reachable for older snapshots (§5.2).
+     */
+    insert(*self, txn: u64, oid: u64, key: []const u8, schema: u16, cols: []const ColumnImage) -> Result[UndoWrite, CodecError]
+        if !self.is_active(txn) then return Ok(UndoNotActive)
+        val (at, found) = self.find(oid, key)
+
+        if !found
+            val rec = UndoRecord(0, UndoInsert, 0, 0, txn, 0, self.last_of(txn), 0, oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
+            val addr = self.log(txn, rec)?
+            self.rows.insert(at, LeafRow(oid, undo_bytes(key), RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols))))
+            return Ok(UndoDone(addr))
+
+        val row = self.rows[at].row
+        val h = self.holder(row, txn)
+        if h != 0 then return Ok(UndoLocked(h))
+        if row.header.flags & RowDeleted == 0 then return Ok(UndoExists)
+        val old = buf[UndoColumn]()
+
+        for i in 0..<row.cols.len()
+            old.push(UndoColumn(i, copy_column(row.cols[i])))
+
+        val rec = UndoRecord(0, UndoUpdate, UndoOldDeleted, row.header.schema_version, txn, row.header.undo, self.last_of(txn),
+            row.header.txn, oid, undo_bytes(key), old, 0, buf[u8]())
+        val addr = self.log(txn, rec)?
+        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols)))
+        Ok(UndoDone(addr))
+
+    /** Replaces the live row of `oid` and `key` with columns `cols` in schema version `schema`. The
+     * UPDATE record lists the columns whose value changes; when the schema version changes it lists
+     * every column of the old one (§5.2). Within one schema version the column count cannot change,
+     * and a different count is `type_mismatch`.
+     */
+    update(*self, txn: u64, oid: u64, key: []const u8, schema: u16, cols: []const ColumnImage) -> Result[UndoWrite, CodecError]
+        if !self.is_active(txn) then return Ok(UndoNotActive)
+        val (at, found) = self.find(oid, key)
+        if !found then return Ok(UndoMissing)
+        val row = self.rows[at].row
+        val h = self.holder(row, txn)
+        if h != 0 then return Ok(UndoLocked(h))
+        if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
+        val whole = schema != row.header.schema_version
+        if !whole && cols.len != row.cols.len() then return fail("Q3001", "an update within one schema version that changes the column count")
+        val old = buf[UndoColumn]()
+
+        for i in 0..<row.cols.len()
+            if whole || row.cols[i] != cols[i] then old.push(UndoColumn(i, copy_column(row.cols[i])))
+
+        val rec = UndoRecord(0, UndoUpdate, 0, row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+            oid, undo_bytes(key), old, 0, buf[u8]())
+        val addr = self.log(txn, rec)?
+        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols)))
+        Ok(UndoDone(addr))
+
+    /** Deletes the live row of `oid` and `key`: it becomes a ghost, its columns left as they were,
+     * until purge removes it (§4.1, §5.6).
+     */
+    delete(*self, txn: u64, oid: u64, key: []const u8) -> Result[UndoWrite, CodecError]
+        if !self.is_active(txn) then return Ok(UndoNotActive)
+        val (at, found) = self.find(oid, key)
+        if !found then return Ok(UndoMissing)
+        val row = self.rows[at].row
+        val h = self.holder(row, txn)
+        if h != 0 then return Ok(UndoLocked(h))
+        if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
+        val rec = UndoRecord(0, UndoDelete, 0, row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+            oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
+        val addr = self.log(txn, rec)?
+        val hd = RowHeader(txn, addr, row.header.flags | RowDeleted, row.header.schema_version)
+        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(hd, row.cols))
+        Ok(UndoDone(addr))
+
+    /** Commits `txn`: it takes commit sequence number `h + 1`, which is published at once (§4.1).
+     * None when `txn` is not active.
+     */
+    commit(*self, txn: u64) -> Option[u64]
+        if !self.is_active(txn) then return None
+        val c = self.last_commit + 1
+        self.txns[usize(txn - 1)] = UndoTxn(UndoTxnCommitted, c, self.last_of(txn))
+        self.last_commit = c
+        Some(c)
+
+    /** Rolls `txn` back by walking its rollback chain from the newest record (§5.3), applying each
+     * record backward to the row it names, which must still carry `txn` and that record's address.
+     * Restoring a ghost whose DELETE lies below `undo_low` removes the row instead: purge passed that
+     * DELETE while this transaction's insert hid the ghost from it. False when `txn` is not active.
+     */
+    abort(*self, txn: u64) -> Result[bool, CodecError]
+        if !self.is_active(txn) then return Ok(false)
+        var a = self.last_of(txn)
+
+        while a != 0
+            val rec = self.space.read(a)?
+            if rec.txn != txn then return corrupt("a rollback chain names another transaction's undo record")
+            val (at, found) = self.find(rec.oid, rec.key.view())
+            if !found then return corrupt("an undo record on a rollback chain names no row")
+            val row = self.rows[at].row
+            if row.header.txn != txn || row.header.undo != a then return corrupt("rollback finds a row its undo record did not write last")
+
+            undo_back(row, rec)? match
+                None -> self.rows.remove(at)
+                Some(prev) ->
+                    // A ghost whose DELETE purge has already passed is invisible to every snapshot,
+                    // and no later purge reaches it: it goes now, as purge would have removed it.
+                    if prev.header.flags & RowDeleted != 0 && prev.header.undo < self.space.low
+                        self.rows.remove(at)
+                    else
+                        self.rows[at] = LeafRow(rec.oid, self.rows[at].key, prev)
+
+            if rec.txn_prev >= a then return corrupt("a rollback chain that does not run backward")
+            a = rec.txn_prev
+
+        self.txns[usize(txn - 1)] = UndoTxn(UndoTxnAborted, 0, self.last_of(txn))
+        Ok(true)
+
+    /** The version of the row of `oid` and `key` that a reader with snapshot `s` in transaction `own`
+     * (0 for none) sees, or None where it sees no row. The answer shares no buffer with the leaf.
+     */
+    read(self, oid: u64, key: []const u8, s: u64, own: u64) -> Result[Option[RowImage], CodecError]
+        val (at, found) = self.find(oid, key)
+        if !found then return Ok(None)
+        self.version_of(self.rows[at].row, s, own)
+
+    /** The version of a row whose current image is `img` that snapshot `s` in transaction `own` sees
+     * (§5.4): the image itself once its writer is seen, absent if it is a ghost; else the image
+     * rebuilt by applying the record at `undo` backward, and so on down the version chain. Needing a
+     * record below `undo_low` is `data_corrupted` (rule D17).
+     */
+    version_of(self, img: RowImage, s: u64, own: u64) -> Result[Option[RowImage], CodecError]
+        var cur = img
+
+        loop
+            if self.sees(cur.header.txn, s, own)?
+                return Ok(if cur.header.flags & RowDeleted != 0 then None else Some(copy_row_image(cur)))
+
+            if cur.header.undo < self.space.low then return corrupt("a snapshot needs an undo record below undo_low (rule D17)")
+            val rec = self.space.read(cur.header.undo)?
+
+            undo_back(cur, rec)? match
+                None -> return Ok(None)
+                Some(prev) -> cur = prev
+
+    /** Purges up to the horizon, or up to `upto` where that is older (§5.5, §5.6), but never below
+     * the horizon of an earlier purge, which never decreases. In address order from `undo_low`, each
+     * record is finished when its transaction committed at or before that horizon (a DELETE then
+     * removes its ghost, if the row's `undo` is still the record's address) or was rolled back, and
+     * PAD always is. The walk stops at the first record that is not finished, and `undo_low`
+     * advances to it, dropping the pages below.
+     */
+    purge(*self, upto: u64) -> Result[PurgeStats, CodecError]
+        var hz = self.horizon()
+        if upto < hz then hz = upto
+        if hz < self.purge_horizon then hz = self.purge_horizon
+        self.purge_horizon = hz
+        var a = self.space.low
+        val end = self.space.end()
+        var records: u64 = 0
+        var ghosts: u64 = 0
+
+        while a < end
+            val rec = self.space.read(a)?
+
+            if rec.kind != UndoPad
+                val t = self.txn_of(rec.txn) match
+                    Some(t) -> t
+                    None -> return corrupt("an undo record of a transaction that never began")
+                if t.state == UndoTxnActive || (t.state == UndoTxnCommitted && t.commit > hz) then break
+                if t.state == UndoTxnCommitted && rec.kind == UndoDelete then ghosts += self.remove_ghost(rec, a)
+                records += 1
+
+            a = undo_next(a, rec.len)
+
+        val before = self.space.freed
+        self.space.truncate_to(a)
+        Ok(PurgeStats(records, ghosts, self.space.freed - before))
+
+    /** Removes the ghost a purged DELETE at `a` left, if the row still ends its chain there (§5.6):
+     * 1 when it did, 0 when a later writer has reused the key.
+     */
+    private remove_ghost(*self, rec: UndoRecord, a: u64) -> u64
+        val (at, found) = self.find(rec.oid, rec.key.view())
+        if !found then return 0
+        val row = self.rows[at].row
+        if row.header.undo != a || row.header.flags & RowDeleted == 0 then return 0
+        self.rows.remove(at)
+        1
+
+/** Applies record `rec`, made by the writer of `img`, backward (§5.4 step 3): an INSERT answers "no
+ * row"; a DELETE or UPDATE gives the old version, with `DELETED` as the record's flag bit 0 says,
+ * `txn ← prev_txn` and `undo ← prev_version`, and an UPDATE restores the columns it lists and
+ * `old_schema_version`. A record of another transaction, or of a kind no version chain holds, is
+ * `data_corrupted`.
+ */
+private undo_back(img: RowImage, rec: UndoRecord) -> Result[Option[RowImage], CodecError]
+    if rec.txn != img.header.txn then return corrupt("a row's undo address names another transaction's record")
+    if rec.kind == UndoInsert then return Ok(None)
+    var flags = img.header.flags & ~RowDeleted
+    if rec.flags & UndoOldDeleted != 0 then flags = flags | RowDeleted
+
+    if rec.kind == UndoDelete
+        return Ok(Some(RowImage(RowHeader(rec.prev_txn, rec.prev_version, flags, img.header.schema_version), img.cols)))
+
+    if rec.kind != UndoUpdate then return corrupt("a version chain names a PAD, LOCK or SECONDARY undo record")
+    val cols = undo_columns_back(img, rec)?
+    Ok(Some(RowImage(RowHeader(rec.prev_txn, rec.prev_version, flags, rec.old_schema_version), cols)))
+
+/** The columns of `img` with an UPDATE's old values restored. An UPDATE across schema versions must
+ * list every column of the old one, ordinals 0 up (§5.2); within one, an ordinal past the row's
+ * columns is `data_corrupted`.
+ */
+private undo_columns_back(img: RowImage, rec: UndoRecord) -> Result[Buf[ColumnImage], CodecError]
+    if rec.old_schema_version != img.header.schema_version
+        val out = buf[ColumnImage]()
+
+        for c in rec.cols
+            if c.ordinal != out.len() then return corrupt("an UPDATE across schema versions that does not list every old column")
+            out.push(copy_column(c.col))
+
+        return Ok(out)
+
+    val out = copy_columns(img.cols.view())
+
+    for c in rec.cols
+        if c.ordinal >= out.len() then return corrupt("an UPDATE undo record naming a column the row does not have")
+        out[c.ordinal] = copy_column(c.col)
+
+    Ok(out)
+
+/** Rows with no versions, over an empty undo space. */
+undo_rows() -> &UndoRows = UndoRows(undo_space(), buf[LeafRow](), buf[UndoTxn](), 0, buf[u64](), 0)

@@ -1,0 +1,337 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// The undo log against a model (`undo.sysl`): a seeded generator interleaves transactions that
+// begin, insert, update and delete rows by key, commit and abort, with snapshots taken and released
+// at random points and purges at random horizons. The same history goes to a reference that keeps,
+// per key, the list of committed versions (commit number, image) and, per live transaction, its own
+// newest write of each key. After every step, every live snapshot (each transaction's own, with its
+// writes, and each reader's) and the current horizon read every key, and the version rebuilt from the
+// undo log must equal the reference's visible one. Every write's outcome (written, locked, missing,
+// already there) must be the one the reference predicts. The structural check runs every few steps
+// and after every purge. At the end every transaction ends, a purge empties the log, and the log is
+// refilled.
+
+private struct UmImage derives Eq
+    schema: u16
+    cols: Buf[ColumnImage]
+
+private struct UmVersion
+    c: u64
+    img: Option[UmImage]
+
+private struct UmKey
+    oid: u64
+    key: Buf[u8]
+    versions: Buf[UmVersion]
+
+private struct UmPending
+    k: usize
+    img: Option[UmImage]
+
+private struct UmTxn
+    id: u64
+    s: u64
+    writes: Buf[UmPending]
+
+/** What a run reached, so that a test can insist it met each case. */
+private struct UmSeen
+    written: u64
+    locked: u64
+    missing: u64
+    exists: u64
+    reinserts: u64
+    commits: u64
+    aborts: u64
+    purges: u64
+    ghosts: u64
+    pages_freed: u64
+    longest_abort: u64
+
+private um_keys() -> Buf[UmKey]
+    val ks = buf[UmKey]()
+
+    for i in 0..<16
+        val k = buf[u8]()
+        val len = if i == 15 then 300 else 1 + i % 3
+
+        for _ in 0..<len
+            k.push(u8(0x61 + i / 2))
+
+        ks.push(UmKey(u64(1 + i % 2), k, buf[UmVersion]()))
+
+    ks
+
+private um_column(g: *Rng) -> ColumnImage
+    if g.below(5) == 0 then return ColumnImage(true, buf[u8]())
+    val n = if g.below(25) == 0 then 400 + g.below(1600) else g.below(24)
+    val b = buf[u8]()
+
+    for _ in 0..<n
+        b.push(u8(0x30 + g.below(4)))
+
+    ColumnImage(false, b)
+
+/** A fresh image in schema version 1 (three columns) or 2 (four). */
+private um_image(g: *Rng) -> UmImage
+    val schema = u16(1 + g.below(2))
+    val cols = buf[ColumnImage]()
+
+    for _ in 0..<(if schema == 1 then 3 else 4)
+        cols.push(um_column(g))
+
+    UmImage(schema, cols)
+
+/** A new image for a row that is `old`: mostly some of its columns changed, sometimes a fresh image,
+ * which may change the schema version.
+ */
+private um_change(g: *Rng, old: UmImage) -> UmImage
+    if g.below(5) == 0 then return um_image(g)
+    val cols = copy_columns(old.cols.view())
+
+    for i in 0..<cols.len()
+        if g.below(3) == 0 then cols[i] = um_column(g)
+
+    UmImage(old.schema, cols)
+
+/** The pending write of `k` in `t`, if it has one. */
+private um_pending(t: UmTxn, k: usize) -> Option[usize]
+    for j in 0..<t.writes.len()
+        if t.writes[j].k == k then return Some(j)
+
+    None
+
+/** The newest committed image of `k`. */
+private um_committed(m: Buf[UmKey], k: usize) -> Option[UmImage]
+    val vs = m[k].versions
+    if vs.len() == 0 then None else vs[vs.len() - 1].img
+
+/** The newest image of `k` that transaction `t` would write over. */
+private um_newest(m: Buf[UmKey], t: UmTxn, k: usize) -> Option[UmImage] = um_pending(t, k) match
+    Some(j) -> t.writes[j].img
+    None -> um_committed(m, k)
+
+/** The live transaction other than `t` holding `k`, or 0. */
+private um_holder(txns: Buf[UmTxn], t: u64, k: usize) -> u64
+    for x in txns
+        if x.id != t && um_pending(x, k).is_some() then return x.id
+
+    0
+
+/** The image snapshot `s` in transaction `own` sees of `k` (own writes first), or None. */
+private um_visible(m: Buf[UmKey], txns: Buf[UmTxn], k: usize, s: u64, own: u64) -> Option[UmImage]
+    for x in txns
+        if x.id == own
+            um_pending(x, k) match
+                Some(j) -> return x.writes[j].img
+                None -> ()
+
+    val vs = m[k].versions
+    var i = vs.len()
+
+    while i > 0
+        i -= 1
+        if vs[i].c <= s then return vs[i].img
+
+    None
+
+private um_read(u: &UndoRows, m: Buf[UmKey], k: usize, s: u64, own: u64, what: string) -> Option[UmImage] =
+    u.read(m[k].oid, m[k].key.view(), s, own) match
+        Ok(Some(r)) -> Some(UmImage(r.header.schema_version, r.cols))
+        Ok(None) -> None
+        Err(e) -> panic(s"$what: a read failed: ${e.message}")
+
+/** Every live view against the reference, for every key. */
+private um_verify(u: &UndoRows, m: Buf[UmKey], txns: Buf[UmTxn], readers: Buf[u64], h: u64, what: string)
+    for k in 0..<m.len()
+        assert_eq(um_read(u, m, k, h, 0, what), um_visible(m, txns, k, h, 0), s"$what: key $k at the horizon $h")
+
+        for s in readers
+            assert_eq(um_read(u, m, k, s, 0, what), um_visible(m, txns, k, s, 0), s"$what: key $k, reader at $s")
+
+        for t in txns
+            assert_eq(um_read(u, m, k, t.s, t.id, what), um_visible(m, txns, k, t.s, t.id), s"$what: key $k, transaction ${t.id} at ${t.s}")
+
+private um_check(u: &UndoRows, what: string) -> UndoStats = check_undo(u) match
+    Ok(st) -> st
+    Err(e) -> panic(s"$what: the undo check failed: ${e.message}")
+
+/** The rows the reference says the leaf holds after a purge to the newest commit with nothing live:
+ * one per key whose newest committed version is a row.
+ */
+private um_live(m: Buf[UmKey]) -> usize
+    var n: usize = 0
+
+    for k in 0..<m.len()
+        if um_committed(m, k).is_some() then n += 1
+
+    n
+
+/** Ends transaction `i` of `txns`: commits it (stamping its writes into the reference) or aborts it. */
+private um_end(u: &UndoRows, m: Buf[UmKey], txns: Buf[UmTxn], i: usize, commit: bool, seen: *UmSeen, h: u64) -> u64
+    val t = txns[i]
+    var nh = h
+
+    if commit
+        val c = u.commit(t.id).unwrap()
+        assert_eq(c, h + 1, "commit numbers are consecutive")
+        nh = c
+
+        for w in t.writes
+            m[w.k].versions.push(UmVersion(c, w.img))
+
+        seen.commits += 1
+    else
+        assert_eq(u.abort(t.id), Ok(true), "an abort")
+        seen.aborts += 1
+        if u64(t.writes.len()) > seen.longest_abort then seen.longest_abort = u64(t.writes.len())
+
+    assert(u.release_snapshot(t.s), "a transaction's snapshot is live")
+    txns.remove(i)
+    nh
+
+/** `ops` random steps from `seed` against `u` and the reference `m`. `purge_pct` is how often, in
+ * percent, a step purges, and `abort_pct` how often a transaction that ends aborts.
+ */
+private um_steps(u: &UndoRows, m: Buf[UmKey], g: *Rng, ops: usize, purge_pct: u64, abort_pct: u64, seen: *UmSeen, label: string)
+    val txns = buf[UmTxn]()
+    val readers = buf[u64]()
+    var h = u.last_commit
+
+    for i in 0..<ops
+        val what = s"$label, step $i"
+        val r = g.below(100)
+        var purged = false
+
+        if r < 8 || txns.len() == 0
+            if txns.len() < 4
+                val t = u.begin()
+                txns.push(UmTxn(t, u.take_snapshot(), buf[UmPending]()))
+        elif r < 62
+            val t = txns[usize(g.below(u64(txns.len())))]
+            val k = usize(g.below(u64(m.len())))
+            val old = um_newest(m, t, k)
+            val holder = um_holder(txns, t.id, k)
+            val pick = g.below(100)
+            // Mostly the write that applies; sometimes one the row's state refuses.
+            val op = old match
+                Some(_) -> if pick < 60 then 1 elif pick < 90 then 2 else 0
+                None -> if pick < 85 then 0 elif pick < 93 then 1 else 2
+            var img: Option[UmImage] = None
+            var got: Result[UndoWrite, CodecError] = Ok(UndoNotActive)
+
+            if op == 0
+                val fresh = um_image(g)
+                img = Some(fresh)
+                got = u.insert(t.id, m[k].oid, m[k].key.view(), fresh.schema, fresh.cols.view())
+            elif op == 1
+                val next = old match
+                    Some(o) -> um_change(g, o)
+                    None -> um_image(g)
+                img = Some(next)
+                got = u.update(t.id, m[k].oid, m[k].key.view(), next.schema, next.cols.view())
+            else
+                got = u.delete(t.id, m[k].oid, m[k].key.view())
+
+            val outcome = got match
+                Ok(o) -> o
+                Err(e) -> panic(s"$what: a write failed: ${e.message}")
+
+            if holder != 0
+                assert_eq(outcome, UndoLocked(holder), what)
+                seen.locked += 1
+            elif op == 0 && old.is_some()
+                assert_eq(outcome, UndoExists, what)
+                seen.exists += 1
+            elif op != 0 && old.is_none()
+                assert_eq(outcome, UndoMissing, what)
+                seen.missing += 1
+            else
+                outcome match
+                    UndoDone(_) -> ()
+                    _ -> assert(false, s"$what: a write that applies was refused")
+                seen.written += 1
+                if op == 0 && m[k].versions.len() > 0 then seen.reinserts += 1
+                val w = UmPending(k, if op == 2 then None else img)
+
+                um_pending(t, k) match
+                    Some(j) -> t.writes[j] = w
+                    None -> t.writes.push(w)
+        elif r < 72
+            h = um_end(u, m, txns, usize(g.below(u64(txns.len()))), g.below(100) >= abort_pct, seen, h)
+        elif r < 80
+            if readers.len() < 4 then readers.push(u.take_snapshot())
+        elif r < 87
+            if readers.len() > 0
+                val j = usize(g.below(u64(readers.len())))
+                assert(u.release_snapshot(readers[j]), "a reader's snapshot is live")
+                readers.remove(j)
+        elif r < 87 + purge_pct
+            val upto = if g.below(3) == 0 then 0xffffffffffffffff else g.below(h + 2)
+
+            val p = u.purge(upto) match
+                Ok(p) -> p
+                Err(e) -> panic(s"$what: a purge failed: ${e.message}")
+
+            seen.purges += 1
+            seen.ghosts += p.ghosts
+            seen.pages_freed += p.pages
+            purged = true
+        else
+            // A write by a transaction that has ended changes nothing.
+            if u.txn_of(1).is_some() && !u.is_active(1)
+                assert_eq(u.delete(1, m[0].oid, m[0].key.view()), Ok(UndoNotActive), what)
+
+        um_verify(u, m, txns, readers, h, what)
+        if purged || i % 20 == 19 then um_check(u, what)
+
+    // Every transaction ends and every reader goes; a purge then empties the log.
+    while txns.len() > 0
+        h = um_end(u, m, txns, 0, g.below(100) >= abort_pct, seen, h)
+
+    for s in readers
+        assert(u.release_snapshot(s), "a reader's snapshot is live")
+
+    readers.clear()
+    um_verify(u, m, txns, readers, h, s"$label, all ended")
+    val p = u.purge(0xffffffffffffffff).unwrap()
+    seen.ghosts += p.ghosts
+    seen.pages_freed += p.pages
+    assert_eq(u.space.pages.len(), 0, s"$label: the purge left pages")
+    assert_eq(um_check(u, s"$label, emptied"), UndoStats(0, 0, um_live(m), 0))
+    um_verify(u, m, txns, readers, h, s"$label, emptied")
+
+/** A run of `ops` steps from `seed`, then the log refilled for a fifth as many, and the coverage it
+ * reached.
+ */
+private um_run(seed: u64, ops: usize, purge_pct: u64, abort_pct: u64) -> UmSeen
+    val u = undo_rows()
+    val m = um_keys()
+    var g = rng(seed, 7)
+    var seen = UmSeen(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    um_steps(u, m, &g, ops, purge_pct, abort_pct, &seen, s"seed $seed")
+    val taken = u.space.next_page
+    um_steps(u, m, &g, ops / 5, purge_pct, abort_pct, &seen, s"seed $seed, refilled")
+    assert(u.space.base >= taken, "the refilled log took new pages")
+    seen
+
+@test
+undo_rows_agree_with_the_model_under_frequent_purges()
+    for seed in [1, 2, 3, 4]
+        val s = um_run(u64(seed), 2500, 6, 30)
+        assert(s.locked > 0 && s.missing > 0 && s.exists > 0, s"seed $seed: every refusal")
+        assert(s.reinserts > 0, s"seed $seed: an insert over a deleted key")
+        assert(s.ghosts > 0, s"seed $seed: a purged ghost")
+        assert(s.pages_freed > 5, s"seed $seed: pages freed")
+        assert(s.commits > 100 && s.aborts > 30, s"seed $seed: commits and aborts")
+
+@test
+undo_rows_agree_with_the_model_with_long_chains_and_rare_purges()
+    for seed in [5, 6, 7, 8]
+        val s = um_run(u64(seed), 2500, 1, 50)
+        assert(s.purges > 0, s"seed $seed: a purge")
+        assert(s.pages_freed > 2, s"seed $seed: pages freed")
+        assert(s.aborts > 60, s"seed $seed: aborts")

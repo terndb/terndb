@@ -605,7 +605,9 @@ An undo page:
 1. Undo pages are ordinary pages: buffered, checksummed and written under the WAL rule. Every byte appended to
    one is covered by an `UNDO_APPEND` redo record (§6.4). **The undo log is never synced at commit**; it is
    recovered from the WAL. This is InnoDB's design, and it keeps one sync per commit group.
-2. A record MUST NOT span undo pages. The unused tail of a page MUST be covered by a PAD record (kind 0).
+2. A record MUST NOT span undo pages. The unused tail of a page MUST be covered by a PAD record (kind 0). A PAD
+   is its `len` and `kind`, 3 bytes at least, and its other bytes MUST be zero. A writer MUST NOT leave a tail
+   of 1 or 2 bytes: a record that would leave one goes to the next page instead.
 3. **Lanes.** Each core appends to its own lane: the undo page it currently owns, where it places records with no
    synchronisation. A lane takes its next page from the global undo high-water mark by one atomic fetch-and-add of
    a whole page, and covers the unused tail of the page it leaves with PAD (rule 2). A transaction's records need
@@ -667,7 +669,8 @@ Reconstruction reads the undo log only. It never writes, and it never latches th
 
 `undo_low` is the lowest undo address the engine retains. The **horizon** is the commit point before which every
 live snapshot sees everything. The engine MAY advance `undo_low` to address A only when every record below A
-belongs to a committed transaction that every live snapshot sees, and, on a primary with replica feedback enabled,
+belongs to a committed transaction that every live snapshot sees, or to a transaction whose rollback has finished
+(no row names its records any more), and, on a primary with replica feedback enabled,
 every replica snapshot. **Replica feedback is opt-in** (`replica_feedback`, default off): with it a replica reports
 its oldest snapshot and may hold back the primary's horizon and `undo_low`, within the bounds of `replication.md`
 §7.6; without it the primary purges and truncates regardless, and a replica transaction whose versions that removes
