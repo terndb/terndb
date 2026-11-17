@@ -1,0 +1,945 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.text.from_utf8
+
+// The row format of `on-disk-format.md` §4: the row header (§4.1), the row body and the record that
+// shares its layout (§4.2), type descriptors (§4.3), the scalar encodings (§4.4), relation, record
+// and union values (§4.5), and the in-place versus out-of-line decision with its 32-byte stub (§4.7).
+// The order-preserving key encoding is `key_encoding.sysl`.
+//
+// Every integer here is little-endian (§1 rule 1) except a uuid's sixteen octets, which are in
+// RFC 9562 order. A decoder raises `data_corrupted` (`D1001`) for any input that breaks the layout;
+// an encoder handed a value that does not belong to its type raises `type_mismatch` (`Q3001`), and
+// one handed a type that has no stored form raises the `Q` code `ddl.md` would have refused it with.
+
+/** The 20-octet header every stored row begins with (§4.1). */
+struct RowHeader derives Eq
+    txn: u64
+    undo: u64
+    flags: u16
+    schema_version: u16
+
+/** The octets of a row header. */
+const RowHeaderSize: usize = 20
+
+/** `flags` bit 0: the row is a ghost, deleted as of `txn`. */
+const RowDeleted: u16 = 1
+
+/** `flags` bit 1: `txn` holds the write lock without having changed the row. */
+const RowLockOnly: u16 = 2
+
+/** `flags` bit 2: an external bitmap follows the null bitmap. The encoder sets it, never a caller. */
+const RowHasExternal: u16 = 4
+
+/** The largest entry, key plus value, that is stored inline (§4.7 rule 1). */
+const InlineEntryLimit: usize = 4000
+
+/** The smallest column encoding that §4.7 rule 2 may move out of line. */
+const OutOfLineMinimum: usize = 256
+
+/** The octets an out-of-line column occupies in the variable area (§4.7 rule 3). */
+const OverflowStubSize: usize = 32
+
+/** What stands in a row for a column stored out of line: where its overflow chain starts, how long
+ * the value is before and after compression, the CRC32C of the uncompressed value and the codec
+ * (0 none, 1 LZ4 block, 2 Zstandard frame).
+ */
+struct OverflowStub derives Eq
+    first_pid: u64
+    raw_len: u64
+    stored_len: u64
+    raw_crc: u32
+    codec: u8
+
+/** A decoded row: its header, then one value per non-key column. A column stored out of line has
+ * `Null` in `values` and its stub at the same index of `stubs`; every other column has `None` there.
+ */
+struct DecodedRow derives Eq
+    header: RowHeader
+    values: Buf[Value]
+    stubs: Buf[Option[OverflowStub]]
+
+/** Where an entry's columns go (§4.7): all inline, or these columns, by index among the non-key
+ * columns and ascending, moved out of line.
+ */
+enum Placement derives Eq
+    Inline
+    OutOfLine(columns: Buf[usize])
+
+// -- errors and octet helpers -------------------------------------------------------------------
+
+private[terndb] corrupt[T](what: string) -> Result[T, CodecError] = fail("D1001", what)
+
+private[terndb] wrong_value[T](what: string) -> Result[T, CodecError] = fail("Q3001", what)
+
+/** The low `w` octets of `v`, most significant first. */
+private[terndb] push_be(out: Buf[u8], v: u128, w: usize)
+    for i in 0..<w
+        out.push(u8.wrap(v >> (8 * (w - 1 - i))))
+
+/** `n` fits a two's-complement integer of `w` octets. */
+private[terndb] fits_octets(n: i128, w: usize) -> bool
+    if w >= 16 then return true
+
+    val half = i128(1) << (8 * w - 1)
+    n >= -half && n < half
+
+/** `raw`, the low `w` octets of a two's-complement integer, sign-extended. */
+private[terndb] sign_extend(raw: u128, w: usize) -> i128
+    if w >= 16 then return i128.wrap(raw)
+
+    val v = i128.wrap(raw)
+
+    if raw & u128(1) << (8 * w - 1) == 0 then v else v - (i128(1) << (8 * w))
+
+/** `n` has at most `p` decimal digits: it is an unscaled value of `decimal(p, s)`. */
+private[terndb] within_precision(n: i128, p: u8) -> bool
+    val bound = pow10(int(p))
+    n > -bound && n < bound
+
+/** A float32 value is a `real` that a `f32` holds exactly, or a NaN. */
+private[terndb] is_float32(x: real) -> bool = x.is_nan() || real(f32(x)) == x
+
+private all_zero_octets(b: []const u8) -> bool
+    for x in b
+        if x != 0 then return false
+
+    true
+
+/** A read position in stored octets. `flip` is XORed into every octet `byte` and `be` return: 0xFF
+ * reads a descending key component, 0 everything else.
+ */
+private[terndb] struct ByteCursor
+    bytes: []const u8
+    at: usize
+    flip: u8
+
+    left(self) -> usize = self.bytes.len - self.at
+
+    take(*self, n: usize) -> Result[[]const u8, CodecError]
+        if n > self.left() then return corrupt("the stored octets end early")
+
+        val from = self.at
+        self.at += n
+        Ok(self.bytes[from..<self.at])
+
+    byte(*self) -> Result[u8, CodecError]
+        if self.at >= self.bytes.len then return corrupt("the stored octets end early")
+
+        val b = self.bytes[self.at] ^ self.flip
+        self.at += 1
+        Ok(b)
+
+    /** `w` octets, least significant first. */
+    le(*self, w: usize) -> Result[u128, CodecError]
+        val b = self.take(w)?
+        var v: u128 = 0
+
+        for i in 0..<w
+            v = v | u128(b[i]) << (8 * i)
+
+        Ok(v)
+
+    /** `w` octets, most significant first, each XORed with `flip`. */
+    be(*self, w: usize) -> Result[u128, CodecError]
+        var v: u128 = 0
+
+        for _ in 0..<w
+            v = v << 8 | u128(self.byte()?)
+
+        Ok(v)
+
+    /** An octet that is 0 or 1. */
+    flag(*self) -> Result[bool, CodecError]
+        val b = self.byte()?
+
+        if b > 1 then return corrupt("a flag octet is neither 0 nor 1")
+
+        Ok(b == 1)
+end ByteCursor
+
+private[terndb] cursor(bytes: []const u8) -> ByteCursor = ByteCursor(bytes, 0, 0)
+
+// -- widths -------------------------------------------------------------------------------------
+
+/** The octets a value of the non-null type `t` takes in a row's fixed area (§4.4), or 0 where `t` is
+ * variable-width: `text`, `bytes`, `json`, a record, a union or a relation.
+ */
+row_width(t: Type) -> usize = t match
+    Bool | Int8 | UInt8 -> 1
+    Int16 | UInt16 -> 2
+    Int32 | UInt32 | Float32 | Date -> 4
+    Int64 | UInt64 | Float64 | Time | DateTime | Timestamp -> 8
+    Decimal(p, _) -> if p <= 18 then 8 else 16
+    Int128 | Interval | Uuid -> 16
+    _ -> 0
+
+private types_of(fields: Buf[Field]) -> Buf[Type]
+    val tys = buf[Type]()
+
+    for f in fields
+        tys.push(f.ty)
+
+    tys
+
+private no_stubs() -> Buf[Option[OverflowStub]] = buf[Option[OverflowStub]]()
+
+private unstorable[T](t: Type) -> Result[T, CodecError] = t match
+    Named(_, _) -> fail("Q6005", "a named type has no stored form: its structure is stored")
+    Nullable(_) -> fail("Q3001", "a nullable type was given where a non-null one was expected")
+    _ -> fail("Q3001", "the type has no stored form")
+
+// -- encoding values ----------------------------------------------------------------------------
+
+/** The encoding of `v`, a non-null value of `t` (§4.4, §4.5): what a column of type `t` stores in the
+ * fixed or variable area, and exactly what an overflow chain holds for it (§4.7 rule 4). `t` may be
+ * nullable; the encoding is that of its base type.
+ */
+encode_value(t: Type, v: Value) -> Result[Buf[u8], CodecError]
+    if v.is_null() then return wrong_value("a null has no encoding of its own")
+
+    val out = buf[u8]()
+    put_value(out, t.base(), v)?
+    Ok(out)
+
+private put_value(out: Buf[u8], t: Type, v: Value) -> Result[unit, CodecError] =
+    if row_width(t) > 0 then put_fixed(out, t, v) else put_variable(out, t, v)
+
+private put_fixed(out: Buf[u8], t: Type, v: Value) -> Result[unit, CodecError]
+    val w = row_width(t)
+
+    t match
+        Bool -> v match
+            Bool(b) -> out.push(if b then 1 else 0)
+            _ -> return wrong_value("a bool was expected")
+        UInt8 | UInt16 | UInt32 | UInt64 -> v match
+            UInt(n) ->
+                if w < 8 && n >= u64(1) << (8 * w) then return wrong_value("an unsigned value is out of its type's range")
+                push_le(out, u128(n), w)
+            _ -> return wrong_value("an unsigned integer was expected")
+        Float32 -> v match
+            Float(x) ->
+                if !is_float32(x) then return wrong_value("a float32 value is not exactly a float32")
+                push_le(out, u128(f32(x).bits()), 4)
+            _ -> return wrong_value("a float was expected")
+        Float64 -> v match
+            Float(x) -> push_le(out, u128(x.bits()), 8)
+            _ -> return wrong_value("a float was expected")
+        Interval -> v match
+            Interval(months, days, micros) ->
+                push_le(out, u128(u32.wrap(months)), 4)
+                push_le(out, u128(u32.wrap(days)), 4)
+                push_le(out, u128(u64.wrap(micros)), 8)
+            _ -> return wrong_value("an interval was expected")
+        Uuid -> v match
+            Uuid(bits) -> push_be(out, bits, 16)
+            _ -> return wrong_value("a uuid was expected")
+        Decimal(p, _) -> v match
+            Int(n) ->
+                if !within_precision(n, p) then return wrong_value("a decimal has more digits than its precision")
+                push_le(out, u128.wrap(n), w)
+            _ -> return wrong_value("a decimal's unscaled integer was expected")
+        _ -> v match
+            Int(n) ->
+                if !fits_octets(n, w) then return wrong_value("an integer is out of its type's range")
+                push_le(out, u128.wrap(n), w)
+            _ -> return wrong_value("an integer was expected")
+
+    Ok(())
+end put_fixed
+
+private put_variable(out: Buf[u8], t: Type, v: Value) -> Result[unit, CodecError]
+    t match
+        Text | Json -> v match
+            Text(s) -> out.extend(s.bytes)
+            _ -> return wrong_value("text was expected")
+        Bytes -> v match
+            Bytes(b) -> out.extend(b.view())
+            _ -> return wrong_value("bytes were expected")
+        Record(fs) -> v match
+            Record(xs) -> put_body(out, types_of(fs).view(), xs.view(), true, no_stubs())?
+            _ -> return wrong_value("a record was expected")
+        Union(vs) -> v match
+            Variant(tag, payload) -> put_union(out, vs, tag, *payload)?
+            _ -> return wrong_value("a union value was expected")
+        Bag(e) | List(e) -> v match
+            Relation(xs) -> put_relation(out, *e, xs.view())?
+            _ -> return wrong_value("a relation was expected")
+        _ -> return unstorable(t)
+
+    Ok(())
+end put_variable
+
+// A union value (§4.5): the `u16` discriminant, then the payload record.
+private put_union(out: Buf[u8], vs: Buf[Field], tag: usize, payload: Value) -> Result[unit, CodecError]
+    if vs.len() == 0 || vs.len() > 65536 then return fail("Q3016", "a union has from 1 to 65,536 variants")
+    if tag >= vs.len() then return wrong_value("a union value's variant is not one of its type's")
+
+    push_le(out, u128(tag), 2)
+
+    vs[tag].ty match
+        Record(fs) -> payload match
+            Record(xs) -> put_body(out, types_of(fs).view(), xs.view(), true, no_stubs())
+            _ -> wrong_value("a union payload must be a record value")
+        _ -> fail("Q3014", "a union variant's payload must be a non-null record")
+
+// A relation value (§4.5): form 0, three reserved octets, the count, the end offset of each element
+// relative to the first, then the elements, each behind a 0/1 octet when the element is nullable.
+private put_relation(out: Buf[u8], e: Type, xs: []const Value) -> Result[unit, CodecError]
+    if e.base().is_relation() then return fail("Q3014", "a relation's element must not be a relation")
+    if u64(xs.len) > 0xFFFFFFFF then return fail("D2002", "a relation has more elements than its count holds")
+
+    for _ in 0..<4
+        out.push(0)
+
+    push_le(out, u128(xs.len), 4)
+
+    val body = buf[u8]()
+
+    for x in xs
+        if x.is_null()
+            if !e.is_nullable() then return wrong_value("a null element in a relation whose element is not nullable")
+            body.push(0)
+        else
+            if e.is_nullable() then body.push(1)
+            put_value(body, e.base(), x)?
+
+        if u64(body.len()) > 0xFFFFFFFF then return fail("D2002", "a relation's elements exceed 4 GiB")
+        push_le(out, u128(body.len()), 4)
+
+    out.extend(body.view())
+    Ok(())
+end put_relation
+
+// The body of a row (`wide` false: `u16` offsets) or a record (`wide` true: `u32` offsets), §4.2:
+// the null bitmap, the external bitmap where any column has a stub, the fixed area, the variable
+// offsets and the variable area. `tys` carry each column's nullability.
+private put_body(out: Buf[u8], tys: []const Type, vals: []const Value, wide: bool, stubs: Buf[Option[OverflowStub]]) -> Result[unit, CodecError]
+    val n = tys.len
+
+    if vals.len != n then return wrong_value(s"$n values were expected, not ${vals.len}")
+    if stubs.len() != 0 && stubs.len() != n then return wrong_value("a stub list must name every column or none")
+
+    var external = false
+
+    for s in stubs
+        if s.is_some() then external = true
+
+    val bitmap = (n + 7) / 8
+    val null_at = out.len()
+
+    for _ in 0..<bitmap
+        out.push(0)
+
+    for i in 0..<n
+        if vals[i].is_null()
+            if !tys[i].is_nullable() then return wrong_value(s"column $i is not nullable and holds a null")
+            out[null_at + i / 8] = out[null_at + i / 8] | u8(1) << (i % 8)
+
+    if external
+        val ext_at = out.len()
+
+        for _ in 0..<bitmap
+            out.push(0)
+
+        for i in 0..<n
+            if stubs[i].is_some()
+                if row_width(tys[i].base()) > 0 then return wrong_value(s"column $i is fixed-width and cannot be stored out of line")
+                if vals[i].is_null() then return wrong_value(s"column $i is null and cannot be stored out of line")
+                out[ext_at + i / 8] = out[ext_at + i / 8] | u8(1) << (i % 8)
+
+    for i in 0..<n
+        val t = tys[i].base()
+        val w = row_width(t)
+
+        if w > 0
+            if vals[i].is_null()
+                for _ in 0..<w
+                    out.push(0)
+            else
+                put_fixed(out, t, vals[i])?
+
+    val area = buf[u8]()
+    val ends = buf[usize]()
+
+    for i in 0..<n
+        val t = tys[i].base()
+
+        if row_width(t) == 0
+            val stub = if external then stubs[i] else None
+
+            stub match
+                Some(s) -> put_stub(area, s)
+                None -> if !vals[i].is_null() then put_variable(area, t, vals[i])?
+
+            ends.push(area.len())
+
+    for e in ends
+        if wide
+            if u64(e) > 0xFFFFFFFF then return fail("D2002", "a record's variable area exceeds 4 GiB")
+            push_le(out, u128(e), 4)
+        else
+            if e > 0xFFFF then return fail("D2002", "a row's variable area exceeds what a u16 offset holds")
+            push_le(out, u128(e), 2)
+
+    out.extend(area.view())
+    Ok(())
+end put_body
+
+// -- decoding values ----------------------------------------------------------------------------
+
+/** The value of the non-null type `t` (or of a nullable type's base) that is the whole of `bytes`:
+ * the inverse of `encode_value`.
+ */
+decode_value(t: Type, bytes: []const u8) -> Result[Value, CodecError] = get_value(bytes, t.base())
+
+private get_value(bytes: []const u8, t: Type) -> Result[Value, CodecError]
+    val w = row_width(t)
+
+    if w > 0
+        if bytes.len != w then return corrupt(s"a fixed-width value of $w octets has ${bytes.len}")
+
+        var c = cursor(bytes)
+        return get_fixed(&c, t)
+
+    t match
+        Text | Json -> from_utf8(bytes) match
+            Ok(s) -> Ok(Value.Text(s))
+            Err(_) -> corrupt("a text value is not valid UTF-8")
+        Bytes -> Ok(bytes_value(bytes))
+        Record(fs) -> get_record(bytes, fs)
+        Union(vs) -> get_union(bytes, vs)
+        Bag(e) | List(e) -> get_relation(bytes, *e)
+        _ -> unstorable(t)
+
+private get_fixed(c: *ByteCursor, t: Type) -> Result[Value, CodecError]
+    val w = row_width(t)
+
+    t match
+        Uuid -> return Ok(Value.Uuid(c.be(16)?))
+        Interval ->
+            val months = i32.wrap(u32(c.le(4)?))
+            val days = i32.wrap(u32(c.le(4)?))
+            val micros = i64.wrap(u64(c.le(8)?))
+            return Ok(Value.Interval(months, days, micros))
+        _ -> ()
+
+    val raw = c.le(w)?
+
+    t match
+        Bool -> if raw > 1 then corrupt("a bool is neither 0 nor 1") else Ok(Value.Bool(raw == 1))
+        UInt8 | UInt16 | UInt32 | UInt64 -> Ok(UInt(u64(raw)))
+        Float32 -> Ok(Float(real(f32.from_bits(u32(raw)))))
+        Float64 -> Ok(Float(real.from_bits(u64(raw))))
+        Decimal(p, _) ->
+            val n = sign_extend(raw, w)
+            if within_precision(n, p) then Ok(Int(n)) else corrupt("a decimal has more digits than its precision")
+        _ -> Ok(Int(sign_extend(raw, w)))
+end get_fixed
+
+private get_record(bytes: []const u8, fs: Buf[Field]) -> Result[Value, CodecError]
+    val body = get_body(bytes, types_of(fs).view(), true, false)?
+    Ok(Value.Record(body.values))
+
+private get_union(bytes: []const u8, vs: Buf[Field]) -> Result[Value, CodecError]
+    var c = cursor(bytes)
+    val tag = usize(c.le(2)?)
+
+    if tag >= vs.len() then return corrupt("a union discriminant is not below its variant count")
+
+    vs[tag].ty match
+        Record(fs) -> Ok(variant(tag, get_record(bytes[2..], fs)?))
+        _ -> fail("Q3014", "a union variant's payload must be a non-null record")
+
+private get_relation(bytes: []const u8, e: Type) -> Result[Value, CodecError]
+    if e.base().is_relation() then return fail("Q3014", "a relation's element must not be a relation")
+
+    var c = cursor(bytes)
+    val form = c.byte()?
+
+    if form != 0 then return corrupt(s"relation form $form is not written in this format version")
+
+    c.take(3)?
+
+    val count = c.le(4)?
+
+    if count * 4 > u128(c.left()) then return corrupt("a relation's offsets run past its end")
+
+    val ends = c.take(usize(count) * 4)?
+    val elems = c.take(c.left())?
+    val out = buf[Value]()
+    var start: usize = 0
+
+    for i in 0..<usize(count)
+        var at = cursor(ends[4 * i..<4 * i + 4])
+        val end = usize(at.le(4)?)
+
+        if end < start || end > elems.len then return corrupt("a relation's element offsets are out of order")
+
+        val one = elems[start..<end]
+
+        if e.is_nullable()
+            if one.len == 0 then return corrupt("a nullable element has no presence octet")
+            if one[0] > 1 then return corrupt("an element's presence octet is neither 0 nor 1")
+
+            if one[0] == 0
+                if one.len != 1 then return corrupt("a null element is followed by octets")
+                out.push(Value.Null)
+            else
+                out.push(get_value(one[1..], e.base())?)
+        else
+            out.push(get_value(one, e)?)
+
+        start = end
+
+    if start != elems.len then return corrupt("octets follow a relation's last element")
+
+    Ok(Relation(out))
+end get_relation
+
+private struct Body
+    values: Buf[Value]
+    stubs: Buf[Option[OverflowStub]]
+
+private bit_at(bitmap: []const u8, i: usize) -> bool = bitmap[i / 8] >> (i % 8) & 1 == 1
+
+// Every bit of a bitmap from `n` on, which no column owns, is zero.
+private check_tail(bitmap: []const u8, n: usize, what: string) -> Result[unit, CodecError]
+    for i in n..<bitmap.len * 8
+        if bit_at(bitmap, i) then return corrupt(s"a bit past the last column is set in the $what bitmap")
+
+    Ok(())
+
+// The inverse of `put_body`. `bytes` is exactly the body: nothing may follow its variable area.
+private get_body(bytes: []const u8, tys: []const Type, wide: bool, external: bool) -> Result[Body, CodecError]
+    val n = tys.len
+    val bitmap = (n + 7) / 8
+    var c = cursor(bytes)
+    val nulls = c.take(bitmap)?
+
+    check_tail(nulls, n, "null")?
+
+    val exts = if external then c.take(bitmap)? else bytes[0..<0]
+
+    if external
+        check_tail(exts, n, "external")?
+
+        var any = false
+
+        for i in 0..<n
+            if bit_at(exts, i)
+                any = true
+                if row_width(tys[i].base()) > 0 then return corrupt(s"fixed-width column $i is marked out of line")
+                if bit_at(nulls, i) then return corrupt(s"null column $i is marked out of line")
+
+        if !any then return corrupt("HAS_EXTERNAL is set and no column is out of line")
+
+    val values = buf[Value]()
+    val stubs = buf[Option[OverflowStub]]()
+    var vars: usize = 0
+
+    for i in 0..<n
+        val t = tys[i].base()
+        val w = row_width(t)
+        val absent = bit_at(nulls, i)
+
+        if absent && !tys[i].is_nullable() then return corrupt(s"column $i is not nullable and is marked null")
+
+        stubs.push(None)
+
+        if w == 0
+            vars += 1
+            values.push(Value.Null)
+        else
+            val slot = c.take(w)?
+
+            if absent
+                if !all_zero_octets(slot) then return corrupt(s"null column $i is not zero-filled")
+                values.push(Value.Null)
+            else
+                values.push(get_value(slot, t)?)
+
+    val ow: usize = if wide then 4 else 2
+    val offsets = c.take(vars * ow)?
+    val area = c.take(c.left())?
+    var k: usize = 0
+    var start: usize = 0
+
+    for i in 0..<n
+        val t = tys[i].base()
+
+        if row_width(t) == 0
+            var at = cursor(offsets[k * ow..<k * ow + ow])
+            val end = usize(at.le(ow)?)
+
+            k += 1
+
+            if end < start || end > area.len then return corrupt("a variable offset is out of order")
+
+            val one = area[start..<end]
+
+            if bit_at(nulls, i)
+                if one.len != 0 then return corrupt(s"null column $i has octets")
+            elif external && bit_at(exts, i)
+                stubs[i] = Some(decode_stub(one)?)
+            else
+                values[i] = get_value(one, t)?
+
+            start = end
+
+    if start != area.len then return corrupt("octets follow the last variable column")
+
+    Ok(Body(values, stubs))
+end get_body
+
+// -- stubs --------------------------------------------------------------------------------------
+
+private put_stub(out: Buf[u8], s: OverflowStub)
+    push_le(out, u128(s.first_pid), 8)
+    push_le(out, u128(s.raw_len), 8)
+    push_le(out, u128(s.stored_len), 8)
+    push_le(out, u128(s.raw_crc), 4)
+    out.push(s.codec)
+
+    for _ in 0..<3
+        out.push(0)
+
+/** The 32 octets of an out-of-line column's stub (§4.7 rule 3). */
+encode_stub(s: OverflowStub) -> Buf[u8]
+    val out = buf[u8]()
+    put_stub(out, s)
+    out
+
+/** The stub that is the whole of `bytes`. A codec other than 0, 1 or 2 is `data_corrupted`; the
+ * reserved octets are ignored (§1 rule 3).
+ */
+decode_stub(bytes: []const u8) -> Result[OverflowStub, CodecError]
+    if bytes.len != OverflowStubSize then return corrupt(s"a stub is 32 octets, not ${bytes.len}")
+
+    var c = cursor(bytes)
+    val first_pid = u64(c.le(8)?)
+    val raw_len = u64(c.le(8)?)
+    val stored_len = u64(c.le(8)?)
+    val raw_crc = u32(c.le(4)?)
+    val codec = c.byte()?
+
+    if codec > 2 then return corrupt(s"overflow codec $codec is reserved")
+
+    Ok(OverflowStub(first_pid, raw_len, stored_len, raw_crc, codec))
+
+// -- rows ---------------------------------------------------------------------------------------
+
+/** A row stored wholly inline: `header`, then the body over the non-key columns `cols` (each type
+ * nullable where the column is) holding `vals`. `HAS_EXTERNAL` is cleared and reserved flag bits are
+ * written zero. The 4,000-octet limit is `place_row`'s decision, not this function's.
+ */
+encode_row(header: RowHeader, cols: []const Type, vals: []const Value) -> Result[Buf[u8], CodecError] =
+    encode_row_with_stubs(header, cols, vals, no_stubs())
+
+/** A row in which each column with `Some` stub is stored out of line (§4.7). `stubs` is empty or has
+ * one entry per column; a stubbed column must be variable-width and non-null, and its value in
+ * `vals` is otherwise not read. `HAS_EXTERNAL` is set exactly when some column has a stub.
+ */
+encode_row_with_stubs(header: RowHeader, cols: []const Type, vals: []const Value, stubs: Buf[Option[OverflowStub]]) -> Result[Buf[u8], CodecError]
+    var external = false
+
+    for s in stubs
+        if s.is_some() then external = true
+
+    val flags = header.flags & (RowDeleted | RowLockOnly) | (if external then RowHasExternal else 0)
+    val out = buf[u8]()
+
+    push_le(out, u128(header.txn), 8)
+    push_le(out, u128(header.undo), 8)
+    push_le(out, u128(flags), 2)
+    push_le(out, u128(header.schema_version), 2)
+    put_body(out, cols, vals, false, stubs)?
+    Ok(out)
+
+/** The header of a stored row, which says which `schema_version` its body was encoded with. Reserved
+ * flag bits are dropped: a reader ignores them (§1 rule 3).
+ */
+decode_row_header(bytes: []const u8) -> Result[RowHeader, CodecError]
+    if bytes.len < RowHeaderSize then return corrupt("a row is shorter than its 20-octet header")
+
+    var c = cursor(bytes)
+    val txn = u64(c.le(8)?)
+    val undo = u64(c.le(8)?)
+    val flags = u16(c.le(2)?) & (RowDeleted | RowLockOnly | RowHasExternal)
+    val schema_version = u16(c.le(2)?)
+
+    Ok(RowHeader(txn, undo, flags, schema_version))
+
+/** The row that is the whole of `bytes`, whose non-key columns are `cols`: those of its header's
+ * `schema_version`.
+ */
+decode_row(cols: []const Type, bytes: []const u8) -> Result[DecodedRow, CodecError]
+    val header = decode_row_header(bytes)?
+    val body = get_body(bytes[RowHeaderSize..], cols, false, header.flags & RowHasExternal != 0)?
+
+    Ok(DecodedRow(header, body.values, body.stubs))
+
+/** The §4.7 decision for an entry whose encoded key is `key_len` octets: inline when key plus row is
+ * at most 4,000 octets; otherwise the variable columns whose encoding is at least 256 octets, largest
+ * first and the lower index first among equals, until the entry fits, counting the external bitmap
+ * and a 32-octet stub for each; and `entry_too_large` when even that does not fit.
+ */
+place_row(key_len: usize, cols: []const Type, vals: []const Value) -> Result[Placement, CodecError]
+    val n = cols.len
+
+    if vals.len != n then return wrong_value(s"$n values were expected, not ${vals.len}")
+
+    val bitmap = (n + 7) / 8
+    var size = RowHeaderSize + bitmap
+    val lens = buf[usize]()
+    val order = buf[usize]()
+
+    for i in 0..<n
+        val t = cols[i].base()
+        val w = row_width(t)
+        var len: usize = 0
+
+        if vals[i].is_null()
+            if !cols[i].is_nullable() then return wrong_value(s"column $i is not nullable and holds a null")
+            size += if w > 0 then w else 2
+        elif w > 0
+            put_fixed(buf[u8](), t, vals[i])?
+            size += w
+        else
+            len = encode_value(t, vals[i])?.len()
+            size += 2 + len
+
+        lens.push(len)
+
+        if len >= OutOfLineMinimum
+            var j = order.len()
+
+            while j > 0 && lens[order[j - 1]] < len
+                j -= 1
+
+            order.insert(j, i)
+
+    if key_len + size <= InlineEntryLimit then return Ok(Inline)
+
+    size += bitmap
+
+    val moved = buf[usize]()
+
+    for i in order
+        size = size - lens[i] + OverflowStubSize
+
+        var j = moved.len()
+
+        while j > 0 && moved[j - 1] > i
+            j -= 1
+
+        moved.insert(j, i)
+
+        if key_len + size <= InlineEntryLimit then return Ok(OutOfLine(moved))
+
+    fail("D2002", "the entry cannot be brought within 4,000 octets by moving columns out of line")
+end place_row
+
+// -- type descriptors ---------------------------------------------------------------------------
+
+/** The descriptor of a column of type `t` (§4.3), which is that of its base type: the column's own
+ * nullability is stored beside it, in `sys.columns.nullable`.
+ */
+column_descriptor(t: Type) -> Result[Buf[u8], CodecError]
+    val out = buf[u8]()
+    encode_descriptor(t.base(), out)?
+    Ok(out)
+
+/** The type of a column whose descriptor is `bytes` and whose `nullable` flag is as given. */
+column_type(bytes: []const u8, nullable: bool) -> Result[Type, CodecError]
+    val t = decode_descriptor(bytes)?
+    Ok(if nullable then Nullable(t) else t)
+
+/** Appends the descriptor of the non-null type `t` (§4.3). A type with no descriptor is refused with
+ * the code `ddl.md` refuses it with: a named or nullable type at the top, a relation of relations or
+ * a union payload that is not a record (`Q3014`), an empty or repeated name (`Q3015`), a union of no
+ * variants or more than 65,536 (`Q3016`), a record of more than 65,535 fields (`Q6011`).
+ */
+encode_descriptor(t: Type, out: Buf[u8]) -> Result[unit, CodecError]
+    t match
+        Bool -> out.push(0x01)
+        Int8 -> out.push(0x02)
+        Int16 -> out.push(0x03)
+        Int32 -> out.push(0x04)
+        Int64 -> out.push(0x05)
+        Int128 -> out.push(0x06)
+        Float32 -> out.push(0x07)
+        Float64 -> out.push(0x08)
+        Decimal(p, s) ->
+            if p < 1 || p > 38 || s > p then return fail("Q3001", "a decimal's precision is 1 to 38 and its scale 0 to its precision")
+            out.push(0x09)
+            out.push(p)
+            out.push(s)
+        Text -> out.push(0x0A)
+        Bytes -> out.push(0x0B)
+        Date -> out.push(0x0C)
+        Time -> out.push(0x0D)
+        DateTime -> out.push(0x0E)
+        Timestamp -> out.push(0x0F)
+        Interval -> out.push(0x10)
+        Uuid -> out.push(0x11)
+        UInt8 -> out.push(0x13)
+        UInt16 -> out.push(0x14)
+        UInt32 -> out.push(0x15)
+        UInt64 -> out.push(0x16)
+        Json -> out.push(0x17)
+        Bag(e) -> put_relation_descriptor(out, false, *e)?
+        List(e) -> put_relation_descriptor(out, true, *e)?
+        Union(vs) ->
+            if vs.len() == 0 || vs.len() > 65536 then return fail("Q3016", "a union has from 1 to 65,536 variants")
+            check_names(vs)?
+            out.push(0x21)
+            push_le(out, u128(vs.len()), 4)
+
+            for v in vs
+                v.ty match
+                    Record(_) -> ()
+                    _ -> return fail("Q3014", "a union variant's payload must be a non-null record")
+
+                put_name(out, v.name)
+                encode_descriptor(v.ty, out)?
+        Record(fs) ->
+            if fs.len() > 65535 then return fail("Q6011", "a record has at most 65,535 fields")
+            check_names(fs)?
+            out.push(0x23)
+            push_le(out, u128(fs.len()), 2)
+
+            for f in fs
+                put_name(out, f.name)
+                out.push(if f.ty.is_nullable() then 1 else 0)
+                encode_descriptor(f.ty.base(), out)?
+        _ -> return unstorable(t)
+
+    Ok(())
+end encode_descriptor
+
+private put_relation_descriptor(out: Buf[u8], ordered: bool, e: Type) -> Result[unit, CodecError]
+    if e.base().is_relation() then return fail("Q3014", "a relation's element must not be a relation")
+
+    out.push(0x20)
+    out.push(if ordered then 1 else 0)
+    out.push(if e.is_nullable() then 1 else 0)
+    encode_descriptor(e.base(), out)
+
+private check_names(members: Buf[Field]) -> Result[unit, CodecError]
+    val seen = set[string]()
+
+    for m in members
+        if m.name.len == 0 || !seen.add(m.name) then return fail("Q3015", "a member name is empty or repeated")
+        if m.name.len > 0xFFFF then return fail("Q3015", "a member name is longer than 65,535 octets")
+
+    Ok(())
+
+private put_name(out: Buf[u8], name: string)
+    push_le(out, u128(name.len), 2)
+    out.extend(name.bytes)
+
+/** The non-null type whose descriptor is the whole of `bytes`. An unknown or reserved tag, an octet
+ * that should be 0 or 1 and is not, an empty or repeated name, invalid UTF-8, a decimal outside
+ * `p` 1–38 and `s` 0–`p`, a union of no variants, a union payload that is not a record, a relation of
+ * relations, nesting past 256 levels and trailing octets are all `data_corrupted`.
+ */
+decode_descriptor(bytes: []const u8) -> Result[Type, CodecError]
+    var c = cursor(bytes)
+    val t = read_descriptor(&c, 0)?
+
+    if c.left() != 0 then return corrupt("octets follow the type descriptor")
+
+    Ok(t)
+
+private read_descriptor(c: *ByteCursor, depth: usize) -> Result[Type, CodecError]
+    if depth >= MaxTypeDepth then return corrupt("a type descriptor nests too deeply")
+
+    val tag = c.byte()?
+
+    tag match
+        0x01 -> Ok(Type.Bool)
+        0x02 -> Ok(Type.Int8)
+        0x03 -> Ok(Type.Int16)
+        0x04 -> Ok(Type.Int32)
+        0x05 -> Ok(Type.Int64)
+        0x06 -> Ok(Type.Int128)
+        0x07 -> Ok(Type.Float32)
+        0x08 -> Ok(Type.Float64)
+        0x09 ->
+            val p = c.byte()?
+            val s = c.byte()?
+            if p < 1 || p > 38 || s > p then corrupt("a decimal descriptor's precision or scale is out of range") else Ok(Type.Decimal(p, s))
+        0x0A -> Ok(Type.Text)
+        0x0B -> Ok(Type.Bytes)
+        0x0C -> Ok(Type.Date)
+        0x0D -> Ok(Type.Time)
+        0x0E -> Ok(Type.DateTime)
+        0x0F -> Ok(Type.Timestamp)
+        0x10 -> Ok(Type.Interval)
+        0x11 -> Ok(Type.Uuid)
+        0x13 -> Ok(Type.UInt8)
+        0x14 -> Ok(Type.UInt16)
+        0x15 -> Ok(Type.UInt32)
+        0x16 -> Ok(Type.UInt64)
+        0x17 -> Ok(Type.Json)
+        0x20 ->
+            val ordered = c.flag()?
+            val nullable = c.flag()?
+            val e = read_descriptor(c, depth + 1)?
+
+            if e.is_relation() then return corrupt("a relation descriptor's element is a relation")
+
+            val elem = if nullable then Nullable(e) else e
+            Ok(if ordered then Type.List(elem) else Type.Bag(elem))
+        0x21 -> read_union_descriptor(c, depth)
+        0x23 -> read_record_descriptor(c, depth)
+        _ -> corrupt(s"type tag $tag is unknown or reserved")
+end read_descriptor
+
+private read_name(c: *ByteCursor, seen: Set[string]) -> Result[string, CodecError]
+    val len = usize(c.le(2)?)
+    val raw = c.take(len)?
+    val name = from_utf8(raw) match
+        Ok(s) -> s
+        Err(_) -> return corrupt("a member name is not valid UTF-8")
+
+    if name.len == 0 || !seen.add(name) then return corrupt("a member name is empty or repeated")
+
+    Ok(name)
+
+private read_union_descriptor(c: *ByteCursor, depth: usize) -> Result[Type, CodecError]
+    val n = c.le(4)?
+
+    if n == 0 || n > 65536 then return corrupt("a union descriptor has from 1 to 65,536 variants")
+
+    val seen = set[string]()
+    val vs = buf[Field]()
+
+    for _ in 0..<usize(n)
+        val name = read_name(c, seen)?
+        val payload = read_descriptor(c, depth + 1)?
+
+        payload match
+            Record(_) -> ()
+            _ -> return corrupt("a union variant's payload descriptor is not a record")
+
+        vs.push(Field(name, payload))
+
+    Ok(Type.Union(vs))
+
+private read_record_descriptor(c: *ByteCursor, depth: usize) -> Result[Type, CodecError]
+    val n = usize(c.le(2)?)
+    val seen = set[string]()
+    val fs = buf[Field]()
+
+    for _ in 0..<n
+        val name = read_name(c, seen)?
+        val nullable = c.flag()?
+        val t = read_descriptor(c, depth + 1)?
+
+        fs.push(Field(name, if nullable then Nullable(t) else t))
+
+    Ok(Type.Record(fs))

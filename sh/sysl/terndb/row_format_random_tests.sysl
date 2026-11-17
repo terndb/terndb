@@ -1,0 +1,377 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// Seeded random round trips of `on-disk-format.md` §4: random types, nested to depth 4 through
+// records, unions and relations, with values that lean on each type's edges; and random corruption
+// of what was encoded, which a decoder must reject with `data_corrupted` or read as some value, and
+// never crash on. The generators are shared with `key_encoding_tests.sysl`.
+
+/** Two values are the same octets' worth: a float by its bits, except that any two NaNs agree (a
+ * float32 NaN may come back quieted).
+ */
+rf_same_value(a: Value, b: Value) -> bool = (a, b) match
+    (Float(x), Float(y)) -> (x.is_nan() && y.is_nan()) || x.bits() == y.bits()
+    (Record(xs), Record(ys)) -> rf_same_values(xs.view(), ys.view())
+    (Relation(xs), Relation(ys)) -> rf_same_values(xs.view(), ys.view())
+    (Variant(ta, pa), Variant(tb, pb)) -> ta == tb && rf_same_value(*pa, *pb)
+    _ -> a == b
+
+rf_same_values(xs: []const Value, ys: []const Value) -> bool
+    if xs.len != ys.len then return false
+
+    for i in 0..<xs.len
+        if !rf_same_value(xs[i], ys[i]) then return false
+
+    true
+
+private rf_pick[T](r: *Rng, xs: []const T) -> T = xs[usize(r.below(u64(xs.len)))]
+
+/** A scalar type, every one of them alike likely; a decimal of random precision and scale. */
+rf_scalar_type(r: *Rng) -> Type
+    val k = r.below(22)
+
+    if k == 21
+        val p = u8(1 + r.below(38))
+        return Decimal(p, u8(r.below(u64(p) + 1)))
+
+    rf_pick(r, [Type.Bool, Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, Float32, Float64,
+        Type.Text, Type.Bytes, Json, Date, Time, DateTime, Timestamp, Type.Interval, Type.Uuid])
+
+private rf_maybe_nullable(r: *Rng, t: Type) -> Type = if r.below(3) == 0 then nullable(t) else t
+
+private rf_record_type(r: *Rng, depth: usize) -> Type
+    val fs = buf[Field]()
+
+    for i in 0..<usize(r.below(6))
+        fs.push(Field(s"f$i", rf_maybe_nullable(r, rf_type(r, depth + 1))))
+
+    Type.Record(fs)
+
+/** A non-null type nested at most to depth 4: a scalar, a record, a union of records or a relation
+ * whose element is a record, a union or a scalar, nullable or not.
+ */
+rf_type(r: *Rng, depth: usize) -> Type
+    if depth >= 4 then return rf_scalar_type(r)
+
+    r.below(8) match
+        0 -> rf_record_type(r, depth)
+        1 ->
+            val vs = buf[Field]()
+
+            for i in 0..<usize(1 + r.below(4))
+                vs.push(Field(s"v$i", rf_record_type(r, depth)))
+
+            Type.Union(vs)
+        2 | 3 ->
+            val e = r.below(3) match
+                0 -> rf_record_type(r, depth)
+                1 ->
+                    val vs = buf[Field]()
+
+                    for i in 0..<usize(1 + r.below(3))
+                        vs.push(Field(s"v$i", rf_record_type(r, depth)))
+
+                    Type.Union(vs)
+                _ -> rf_scalar_type(r)
+
+            val elem = rf_maybe_nullable(r, e)
+            if r.boolean() then list(elem) else bag(elem)
+        _ -> rf_scalar_type(r)
+
+private rf_signed(r: *Rng, w: usize) -> i128
+    val mask: u128 = if w >= 16 then u128(0) -% 1 else (u128(1) << (8 * w)) - 1
+    val max = i128.wrap(mask >> 1)
+
+    r.below(6) match
+        0 -> -max - 1
+        1 -> max
+        2 -> 0
+        3 -> rf_pick(r, [i128(-1), i128(1)])
+        _ -> sign_extend((u128(r.next_u64()) << 64 | u128(r.next_u64())) & mask, w)
+
+private rf_unsigned(r: *Rng, w: usize) -> u64
+    val max: u64 = if w >= 8 then 0xFFFFFFFFFFFFFFFF else (u64(1) << (8 * w)) - 1
+
+    r.below(4) match
+        0 -> 0
+        1 -> max
+        _ -> r.next_u64() & max
+
+private rf_float64(r: *Rng) -> real
+    r.below(8) match
+        0 -> rf_pick(r, [0.0, -0.0, 1.0, -1.0])
+        1 -> rf_pick(r, [real.from_bits(0x7FF0000000000000), real.from_bits(0xFFF0000000000000)])
+        2 -> rf_pick(r, [real.from_bits(0x7FF8000000000000), real.from_bits(0xFFF8000000000001), real.from_bits(0x7FF0000000000001)])
+        3 -> rf_pick(r, [real.from_bits(1), real.from_bits(0x8000000000000001), real.from_bits(0x7FEFFFFFFFFFFFFF), real.from_bits(0xFFEFFFFFFFFFFFFF)])
+        4 -> real(r.range(-5, 5))
+        _ -> real.from_bits(r.next_u64())
+
+private rf_float32(r: *Rng) -> real
+    r.below(6) match
+        0 -> rf_pick(r, [0.0, -0.0, 1.0, -1.0, real(f32.from_bits(0x7F800000)), real(f32.from_bits(0xFF800000))])
+        1 -> rf_pick(r, [real(f32.from_bits(1)), real(f32.from_bits(0x7F7FFFFF)), real(f32.from_bits(0xFF7FFFFF)), real(f32.from_bits(0x7FC00000))])
+        2 -> real(r.range(-5, 5))
+        _ -> real(f32.from_bits(r.next_u32()))
+
+/** Octets of UTF-8 that lean on what an encoding can get wrong: NUL, 0x01, 0x7F, two-, three- and
+ * four-octet sequences, and runs that are prefixes of one another.
+ */
+rf_text_value(r: *Rng) -> Value
+    var s = ""
+
+    for _ in 0..<usize(r.below(7))
+        s = s + rf_pick(r, ["\0", "\u{1}", "a", "b", "\u{7f}", "\u{e9}", "\u{ffff}", "\u{1F600}"])
+
+    Value.Text(s)
+
+rf_bytes_value(r: *Rng) -> Value
+    val out = buf[u8]()
+
+    for _ in 0..<usize(r.below(7))
+        out.push(rf_pick(r, [u8(0x00), u8(0xFF), u8(0x01), u8(0xFE), u8(r.below(256))]))
+
+    Value.Bytes(out)
+
+/** A value of the scalar or enum type `t`, leaning on its edges. */
+rf_scalar_value(r: *Rng, t: Type) -> Value = t match
+    Type.Bool -> Value.Bool(r.boolean())
+    Int8 | Int16 | Int32 | Int64 | Int128 | Date | Time | DateTime | Timestamp -> Int(rf_signed(r, row_width(t)))
+    UInt8 | UInt16 | UInt32 | UInt64 -> UInt(rf_unsigned(r, row_width(t)))
+    Float32 -> Float(rf_float32(r))
+    Float64 -> Float(rf_float64(r))
+    Decimal(p, _) ->
+        val bound = pow10(int(p))
+
+        r.below(4) match
+            0 -> Int(bound - 1)
+            1 -> Int(1 - bound)
+            2 -> Int(i128(r.range(-3, 3)))
+            _ -> Int((i128.wrap(u128(r.next_u64()) << 64 | u128(r.next_u64())) % bound))
+    Type.Text | Json -> rf_text_value(r)
+    Type.Bytes -> rf_bytes_value(r)
+    Type.Interval ->
+        Value.Interval(i32(rf_signed(r, 4)), i32(rf_signed(r, 4)), i64(rf_signed(r, 8)))
+    Type.Uuid -> Value.Uuid(rf_pick(r, [u128(0), u128(0) -% 1, u128(r.next_u64()) << 64 | u128(r.next_u64())]))
+    Union(vs) -> variant(usize(r.below(u64(vs.len()))), rec([]))
+    _ -> panic("a scalar type was expected")
+
+/** A value of `t`, null a quarter of the time where `t` is nullable. */
+rf_value(r: *Rng, t: Type) -> Value
+    if t.is_nullable() && r.below(4) == 0 then return Value.Null
+
+    t.base() match
+        Record(fs) ->
+            val xs = buf[Value]()
+
+            for f in fs
+                xs.push(rf_value(r, f.ty))
+
+            Value.Record(xs)
+        Union(vs) ->
+            val tag = usize(r.below(u64(vs.len())))
+            variant(tag, rf_value(r, vs[tag].ty))
+        Bag(e) | List(e) ->
+            val xs = buf[Value]()
+
+            for _ in 0..<usize(r.below(5))
+                xs.push(rf_value(r, *e))
+
+            Relation(xs)
+        _ -> rf_scalar_value(r, t.base())
+
+// -- round trips --------------------------------------------------------------------------------
+
+@test
+random_values_of_random_types_round_trip()
+    var r = rng(0x5eed_0001, 1)
+
+    for _ in 0..<3000
+        val t = rf_type(&r, 0)
+        val v = rf_value(&r, t)
+        val bytes = encode_value(t, v).unwrap()
+        val back = decode_value(t, bytes.view()).unwrap()
+
+        assert(rf_same_value(back, v), "a value came back changed: " + type_text(t))
+        assert(encode_value(t, back).unwrap().view() == bytes.view(), "a value re-encodes differently")
+
+@test
+random_types_round_trip_through_their_descriptors()
+    var r = rng(0x5eed_0002, 1)
+
+    for _ in 0..<3000
+        val t = rf_type(&r, 0)
+        val d = column_descriptor(t).unwrap()
+
+        assert(decode_descriptor(d.view()).unwrap() == t, "a descriptor came back changed: " + type_text(t))
+
+private rf_columns(r: *Rng) -> Buf[Type]
+    val cols = buf[Type]()
+
+    for _ in 0..<usize(r.below(13))
+        cols.push(rf_maybe_nullable(r, rf_type(r, 1)))
+
+    cols
+
+private rf_row_values(r: *Rng, cols: Buf[Type]) -> Buf[Value]
+    val vals = buf[Value]()
+
+    for c in cols
+        vals.push(rf_value(r, c))
+
+    vals
+
+@test
+random_rows_round_trip()
+    var r = rng(0x5eed_0003, 1)
+
+    for _ in 0..<2000
+        val cols = rf_columns(&r)
+        val vals = rf_row_values(&r, cols)
+        val h = RowHeader(r.next_u64(), r.next_u64(), u16(r.below(4)), u16(r.below(65536)))
+        val bytes = encode_row(h, cols.view(), vals.view()).unwrap()
+        val back = decode_row(cols.view(), bytes.view()).unwrap()
+
+        assert(back.header == h)
+        assert(rf_same_values(back.values.view(), vals.view()), "a row came back changed")
+        assert(encode_row(back.header, cols.view(), back.values.view()).unwrap().view() == bytes.view())
+
+@test
+random_rows_with_random_stubs_round_trip()
+    var r = rng(0x5eed_0004, 1)
+
+    for _ in 0..<2000
+        val cols = rf_columns(&r)
+        val vals = rf_row_values(&r, cols)
+        val stubs = buf[Option[OverflowStub]]()
+        var any = false
+
+        for i in 0..<cols.len()
+            if row_width(cols[i].base()) == 0 && !vals[i].is_null() && r.boolean()
+                stubs.push(Some(OverflowStub(r.next_u64(), r.next_u64(), r.next_u64(), r.next_u32(), u8(r.below(3)))))
+                any = true
+            else
+                stubs.push(None)
+
+        val bytes = encode_row_with_stubs(RowHeader(1, 2, 0, 3), cols.view(), vals.view(), stubs).unwrap()
+        val back = decode_row(cols.view(), bytes.view()).unwrap()
+
+        assert_eq(back.header.flags & RowHasExternal != 0, any)
+
+        for i in 0..<cols.len()
+            assert(back.stubs[i] == stubs[i], "a stub came back changed")
+
+            if stubs[i].is_none() then assert(rf_same_value(back.values[i], vals[i]), "a column came back changed")
+
+@test
+random_placements_fit_and_move_largest_first()
+    var r = rng(0x5eed_0005, 1)
+
+    for _ in 0..<500
+        val cols = buf[Type]()
+        val vals = buf[Value]()
+
+        for _ in 0..<usize(1 + r.below(10))
+            cols.push(Type.Bytes)
+
+            val b = buf[u8]()
+
+            for _ in 0..<usize(r.below(2000))
+                b.push(0xAB)
+
+            vals.push(Value.Bytes(b))
+
+        val key = usize(r.below(1025))
+        val inline = encode_row(RowHeader(0, 0, 0, 0), cols.view(), vals.view())
+
+        place_row(key, cols.view(), vals.view()) match
+            Ok(Inline) -> assert(key + inline.unwrap().len() <= InlineEntryLimit)
+            Ok(OutOfLine(moved)) ->
+                val stubs = buf[Option[OverflowStub]]()
+
+                for i in 0..<cols.len()
+                    stubs.push(None)
+
+                for i in moved
+                    assert(encode_value(cols[i], vals[i]).unwrap().len() >= OutOfLineMinimum)
+                    stubs[i] = Some(OverflowStub(1, 1, 1, 1, 0))
+
+                val placed = encode_row_with_stubs(RowHeader(0, 0, 0, 0), cols.view(), vals.view(), stubs).unwrap()
+
+                assert(key + placed.len() <= InlineEntryLimit, "a placed entry does not fit")
+
+                // Every column left inline that could have moved is no larger than any that moved.
+                for i in 0..<cols.len()
+                    if stubs[i].is_none()
+                        for j in moved
+                            assert(encode_value(cols[i], vals[i]).unwrap().len() <= encode_value(cols[j], vals[j]).unwrap().len())
+            Err(e) -> assert_eq(e.code, "D2002")
+
+// -- corruption ---------------------------------------------------------------------------------
+
+private rf_rejects_or_reads(r: Result[DecodedRow, CodecError]) -> bool = r match
+    Ok(_) -> true
+    Err(e) -> e.code == "D1001"
+
+@test
+random_corruption_of_a_row_is_rejected_or_read_never_a_crash()
+    var r = rng(0x5eed_0006, 1)
+
+    for _ in 0..<2000
+        val cols = rf_columns(&r)
+        val vals = rf_row_values(&r, cols)
+        val bytes = encode_row(RowHeader(1, 2, 0, 3), cols.view(), vals.view()).unwrap()
+
+        r.below(3) match
+            0 -> if bytes.len() > 0 then bytes[usize(r.below(u64(bytes.len())))] = u8(r.below(256))
+            1 -> bytes.push(u8(r.below(256)))
+            _ ->
+                if bytes.len() > 0
+                    val cut = usize(r.below(u64(bytes.len())))
+                    assert_eq(rf_code_of(decode_row(cols.view(), bytes.view()[0..<cut])), "D1001")
+
+        assert(rf_rejects_or_reads(decode_row(cols.view(), bytes.view())))
+
+private rf_code_of[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+@test
+every_truncation_of_a_random_value_is_corruption()
+    var r = rng(0x5eed_0007, 1)
+
+    for _ in 0..<300
+        val t = rf_type(&r, 0)
+        val bytes = encode_value(t, rf_value(&r, t)).unwrap()
+
+        // A value whose length its type fixes, or whose structure records its own length, refuses
+        // every cut; text and bytes read any length.
+        val free = t match
+            Type.Text | Json | Type.Bytes -> true
+            _ -> false
+
+        if !free
+            for n in 0..<bytes.len()
+                decode_value(t, bytes.view()[0..<n]) match
+                    Ok(_) -> assert(false, "a truncated value read as a whole one: " + type_text(t))
+                    Err(e) -> assert_eq(e.code, "D1001")
+
+@test
+random_corruption_of_a_descriptor_is_rejected_or_read()
+    var r = rng(0x5eed_0008, 1)
+
+    for _ in 0..<2000
+        val d = column_descriptor(rf_type(&r, 0)).unwrap()
+
+        for n in 0..<d.len()
+            decode_descriptor(d.view()[0..<n]) match
+                Ok(_) -> assert(false, "a truncated descriptor read as a type")
+                Err(e) -> assert_eq(e.code, "D1001")
+
+        d[usize(r.below(u64(d.len())))] = u8(r.below(256))
+
+        decode_descriptor(d.view()) match
+            Ok(_) -> ()
+            Err(e) -> assert_eq(e.code, "D1001")

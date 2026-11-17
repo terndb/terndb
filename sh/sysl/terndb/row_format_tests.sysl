@@ -1,0 +1,790 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+
+// `on-disk-format.md` §4.1–§4.5 and §4.7, checked octet for octet against encodings worked out by hand
+// from the spec's text, so that an encoder consistent with its own decoder but not with the spec
+// fails here. The random round trips are `row_format_random_tests.sysl`.
+
+private rf_hex(r: Result[Buf[u8], CodecError]) -> string = r match
+    Ok(b) -> hex_string(b.view())
+    Err(e) -> e.code
+
+private rf_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** The octets that `text` spells in hex, two digits each. */
+rf_unhex(text: string) -> Buf[u8]
+    val out = buf[u8]()
+    val b = text.bytes
+    var i: usize = 0
+
+    while i + 1 < b.len
+        out.push(rf_nibble(b[i]) << 4 | rf_nibble(b[i + 1]))
+        i += 2
+
+    out
+
+private rf_nibble(c: u8) -> u8 = if c >= 0x61 then c - 0x61 + 10 else c - 0x30
+
+private rf_value(t: Type, v: Value) -> string = rf_hex(encode_value(t, v))
+
+/** `v` encodes under `t` to `want` and decodes back to the same value. */
+private rf_golden(t: Type, v: Value, want: string, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(rf_value(t, v), want, "", file, line)
+
+    decode_value(t, rf_unhex(want).view()) match
+        Ok(back) -> assert(rf_same_value(back, v), "the golden octets decode to another value", file, line)
+        Err(e) -> assert(false, "the golden octets do not decode: " + e.code, file, line)
+
+private rf_dec_code(t: Type, hex: string) -> string = rf_code(decode_value(t, rf_unhex(hex).view()))
+
+private rf_desc(t: Type) -> string = rf_hex(column_descriptor(t))
+
+/** `t`'s descriptor is `want`, and `want` decodes to `t`. */
+private rf_desc_golden(t: Type, want: string, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(rf_desc(t), want, "", file, line)
+
+    decode_descriptor(rf_unhex(want).view()) match
+        Ok(back) -> assert(back == t, "the golden descriptor decodes to another type", file, line)
+        Err(e) -> assert(false, "the golden descriptor does not decode: " + e.code, file, line)
+
+private rf_desc_code(hex: string) -> string = rf_code(decode_descriptor(rf_unhex(hex).view()))
+
+private rf_hdr() -> RowHeader = RowHeader(1, 2, RowDeleted, 3)
+
+private rf_row(cols: []const Type, vals: []const Value) -> string = rf_hex(encode_row(rf_hdr(), cols, vals))
+
+private rf_text(n: usize) -> Value
+    var s = ""
+
+    for _ in 0..<n
+        s = s + "x"
+
+    Value.Text(s)
+
+private rf_types(t: Type, n: usize) -> Buf[Type]
+    val b = buf[Type]()
+
+    for _ in 0..<n
+        b.push(t)
+
+    b
+
+private rf_values(v: Value, n: usize) -> Buf[Value]
+    val b = buf[Value]()
+
+    for _ in 0..<n
+        b.push(v)
+
+    b
+
+private rf_shape() -> Type = union_of([Field("circle", record([Field("r", Int32)])), Field("empty", record([]))])
+
+// -- §4.4 scalar encodings ----------------------------------------------------------------------
+
+@test
+bool_is_one_octet_zero_or_one()
+    rf_golden(Type.Bool, Value.Bool(true), "01")
+    rf_golden(Type.Bool, Value.Bool(false), "00")
+
+@test
+a_bool_octet_other_than_zero_or_one_is_corruption()
+    assert_eq(rf_dec_code(Type.Bool, "02"), "D1001")
+    assert_eq(rf_dec_code(Type.Bool, "ff"), "D1001")
+
+@test
+signed_integers_are_little_endian_twos_complement()
+    rf_golden(Int8, Int(-1), "ff")
+    rf_golden(Int8, Int(-128), "80")
+    rf_golden(Int16, Int(0x1234), "3412")
+    rf_golden(Int32, Int(1), "01000000")
+    rf_golden(Int32, Int(-2147483648), "00000080")
+    rf_golden(Int64, Int(-2), "feffffffffffffff")
+    rf_golden(Int64, Int(9223372036854775807), "ffffffffffffff7f")
+    rf_golden(Int128, Int(1), "01000000000000000000000000000000")
+    rf_golden(Int128, Int(-1), "ffffffffffffffffffffffffffffffff")
+
+@test
+unsigned_integers_are_little_endian()
+    rf_golden(UInt8, UInt(255), "ff")
+    rf_golden(UInt16, UInt(258), "0201")
+    rf_golden(UInt32, UInt(0xdeadbeef), "efbeadde")
+    rf_golden(UInt64, UInt(0xffffffffffffffff), "ffffffffffffffff")
+
+@test
+an_integer_out_of_its_width_is_a_type_mismatch()
+    assert_eq(rf_value(Int8, Int(128)), "Q3001")
+    assert_eq(rf_value(Int8, Int(-129)), "Q3001")
+    assert_eq(rf_value(Int32, Int(2147483648)), "Q3001")
+    assert_eq(rf_value(UInt8, UInt(256)), "Q3001")
+    assert_eq(rf_value(UInt16, UInt(65536)), "Q3001")
+    assert_eq(rf_value(Date, Int(2147483648)), "Q3001")
+
+@test
+floats_are_their_ieee_bits()
+    rf_golden(Float32, Float(1.0), "0000803f")
+    rf_golden(Float32, Float(-2.5), "000020c0")
+    rf_golden(Float64, Float(1.0), "000000000000f03f")
+    rf_golden(Float64, Float(-0.0), "0000000000000080")
+
+@test
+a_negative_zero_keeps_its_sign_in_a_row()
+    val back = decode_value(Float64, rf_unhex("0000000000000080").view()).unwrap()
+
+    back match
+        Float(x) -> assert_eq(x.bits(), 0x8000000000000000)
+        _ -> assert(false, "a float was expected")
+
+@test
+a_float32_value_that_a_float32_cannot_hold_is_a_type_mismatch()
+    assert_eq(rf_value(Float32, Float(0.1)), "Q3001")
+    assert_eq(rf_value(Float32, Float(1.0e300)), "Q3001")
+
+@test
+a_decimal_is_eight_octets_to_precision_18_and_sixteen_beyond()
+    rf_golden(Decimal(5, 2), Int(12345), "3930000000000000")
+    rf_golden(Decimal(18, 0), Int(-1), "ffffffffffffffff")
+    rf_golden(Decimal(19, 0), Int(-1), "ffffffffffffffffffffffffffffffff")
+    rf_golden(Decimal(38, 10), Int(1), "01000000000000000000000000000000")
+
+@test
+a_decimal_with_more_digits_than_its_precision_is_refused_and_is_corruption_when_read()
+    assert_eq(rf_value(Decimal(2, 0), Int(100)), "Q3001")
+    assert_eq(rf_value(Decimal(2, 0), Int(-100)), "Q3001")
+    rf_golden(Decimal(2, 0), Int(99), "6300000000000000")
+    rf_golden(Decimal(2, 0), Int(-99), "9dffffffffffffff")
+    assert_eq(rf_dec_code(Decimal(2, 0), "6400000000000000"), "D1001")
+
+@test
+text_and_json_are_their_utf8_and_bytes_are_raw()
+    rf_golden(Type.Text, Value.Text("a\u{e9}"), "61c3a9")
+    rf_golden(Type.Text, Value.Text(""), "")
+    rf_golden(Json, Value.Text("{\"a\":1}"), "7b2261223a317d")
+    rf_golden(Type.Bytes, bytes_value([0x00, 0xff]), "00ff")
+    rf_golden(Type.Bytes, bytes_value([]), "")
+
+@test
+text_that_is_not_utf8_is_corruption_when_read()
+    assert_eq(rf_dec_code(Type.Text, "ff"), "D1001")
+    assert_eq(rf_dec_code(Json, "c3"), "D1001")
+    assert_eq(rf_dec_code(Type.Bytes, "ff"), "ok")
+
+@test
+the_time_types_count_from_their_epochs()
+    rf_golden(Date, Int(1), "01000000")
+    rf_golden(Date, Int(-1), "ffffffff")
+    rf_golden(Time, Int(1000000), "40420f0000000000")
+    rf_golden(DateTime, Int(-1), "ffffffffffffffff")
+    rf_golden(Timestamp, Int(1), "0100000000000000")
+
+@test
+an_interval_is_months_days_and_microseconds()
+    rf_golden(Type.Interval, Value.Interval(1, 2, 3), "01000000020000000300000000000000")
+    rf_golden(Type.Interval, Value.Interval(-1, 0, -1), "ffffffff00000000ffffffffffffffff")
+
+@test
+a_uuid_is_its_sixteen_octets_in_rfc_order()
+    rf_golden(Type.Uuid, Value.Uuid(0x00112233445566778899aabbccddeeff), "00112233445566778899aabbccddeeff")
+
+@test
+a_fixed_value_of_the_wrong_length_is_corruption()
+    assert_eq(rf_dec_code(Int32, "010000"), "D1001")
+    assert_eq(rf_dec_code(Int32, "0100000000"), "D1001")
+    assert_eq(rf_dec_code(Type.Uuid, ""), "D1001")
+
+@test
+a_value_of_the_wrong_kind_is_a_type_mismatch()
+    assert_eq(rf_value(Int32, Value.Text("1")), "Q3001")
+    assert_eq(rf_value(Type.Text, Int(1)), "Q3001")
+    assert_eq(rf_value(Type.Bool, Int(1)), "Q3001")
+    assert_eq(rf_value(Float64, Int(1)), "Q3001")
+    assert_eq(rf_value(Type.Uuid, UInt(1)), "Q3001")
+    assert_eq(rf_value(Int32, Value.Null), "Q3001")
+    assert_eq(rf_value(record([]), rel([])), "Q3001")
+    assert_eq(rf_value(list(Int32), rec([])), "Q3001")
+
+@test
+a_named_type_has_no_stored_form()
+    assert_eq(rf_value(Named("app", "t"), Int(1)), "Q6005")
+    assert_eq(rf_desc(Named("app", "t")), "Q6005")
+
+// -- §4.5 records, unions and relations ---------------------------------------------------------
+
+@test
+a_record_is_the_row_body_with_u32_offsets()
+    val t = record([Field("a", Int16), Field("b", nullable(Type.Text))])
+
+    rf_golden(t, rec([Int(7), Value.Null]), "02" + "0700" + "00000000")
+    rf_golden(t, rec([Int(7), Value.Text("hi")]), "00" + "0700" + "02000000" + "6869")
+
+@test
+the_empty_record_is_zero_octets()
+    rf_golden(record([]), rec([]), "")
+
+@test
+a_record_with_nine_fields_has_a_two_octet_null_bitmap()
+    val t = record([Field("a", nullable(Int8)), Field("b", nullable(Int8)), Field("c", nullable(Int8)),
+        Field("d", nullable(Int8)), Field("e", nullable(Int8)), Field("f", nullable(Int8)),
+        Field("g", nullable(Int8)), Field("h", nullable(Int8)), Field("i", nullable(Int8))])
+
+    rf_golden(t, rec([Int(1), Value.Null, Int(3), Int(4), Int(5), Int(6), Int(7), Int(8), Value.Null]),
+        "0201" + "01" + "00" + "030405060708" + "00")
+
+@test
+a_union_is_its_discriminant_then_its_payload_record()
+    rf_golden(rf_shape(), variant(0, rec([Int(5)])), "0000" + "00" + "05000000")
+    rf_golden(rf_shape(), variant(1, rec([])), "0100")
+
+@test
+an_enum_value_is_its_two_octet_discriminant()
+    val t = union_of([Field("red", record([])), Field("green", record([])), Field("blue", record([]))])
+
+    rf_golden(t, variant(2, rec([])), "0200")
+
+@test
+a_union_discriminant_past_its_variants_is_refused_and_is_corruption_when_read()
+    assert_eq(rf_value(rf_shape(), variant(2, rec([]))), "Q3001")
+    assert_eq(rf_dec_code(rf_shape(), "0200"), "D1001")
+    assert_eq(rf_dec_code(rf_shape(), "00"), "D1001")
+    assert_eq(rf_dec_code(rf_shape(), "010000"), "D1001")
+
+@test
+a_relation_of_nullable_scalars_puts_a_presence_octet_before_each_element()
+    rf_golden(list(nullable(Int16)), rel([Int(1), Value.Null, Int(2)]),
+        "00000000" + "03000000" + "03000000" + "04000000" + "07000000" + "010100" + "00" + "010200")
+
+@test
+an_empty_relation_is_its_eight_octet_head()
+    rf_golden(bag(Type.Text), rel([]), "0000000000000000")
+
+@test
+a_relation_of_records_holds_records_and_of_text_holds_raw_octets()
+    rf_golden(list(record([Field("x", Type.Bool)])), rel([rec([Value.Bool(true)])]),
+        "00000000" + "01000000" + "02000000" + "0001")
+    rf_golden(bag(Type.Text), rel([Value.Text("ab"), Value.Text(""), Value.Text("c")]),
+        "00000000" + "03000000" + "02000000" + "02000000" + "03000000" + "616263")
+
+@test
+a_relation_of_unions_holds_union_values()
+    rf_golden(list(rf_shape()), rel([variant(1, rec([])), variant(0, rec([Int(-1)]))]),
+        "00000000" + "02000000" + "02000000" + "09000000" + "0100" + "0000" + "00" + "ffffffff")
+
+@test
+a_null_element_where_the_element_is_not_nullable_is_a_type_mismatch()
+    assert_eq(rf_value(list(Int16), rel([Value.Null])), "Q3001")
+
+@test
+a_relation_of_relations_has_no_stored_form()
+    assert_eq(rf_value(list(list(Int16)), rel([])), "Q3014")
+    assert_eq(rf_desc(list(list(Int16))), "Q3014")
+    assert_eq(rf_desc(bag(nullable(list(Int16)))), "Q3014")
+
+@test
+a_malformed_relation_is_corruption()
+    val t = list(nullable(Int16))
+
+    assert_eq(rf_dec_code(t, ""), "D1001")
+    assert_eq(rf_dec_code(t, "01000000" + "00000000"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "02000000" + "03000000"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "01000000" + "04000000" + "010100"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "01000000" + "03000000" + "010100" + "ff"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "01000000" + "03000000" + "020100"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "01000000" + "02000000" + "0001"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "01000000" + "00000000"), "D1001")
+    assert_eq(rf_dec_code(t, "00000000" + "02000000" + "03000000" + "01000000" + "010100"), "D1001")
+    assert_eq(rf_dec_code(list(Int16), "00000000" + "01000000" + "03000000" + "010100"), "D1001")
+
+@test
+a_relations_reserved_octets_are_ignored()
+    assert_eq(rf_dec_code(list(Int16), "00abcdef" + "01000000" + "02000000" + "0100"), "ok")
+
+@test
+a_huge_relation_count_is_corruption_not_an_allocation()
+    assert_eq(rf_dec_code(list(Int16), "00000000" + "ffffffff"), "D1001")
+
+@test
+a_malformed_record_is_corruption()
+    val t = record([Field("a", Int16), Field("b", nullable(Type.Text))])
+
+    assert_eq(rf_dec_code(t, ""), "D1001")
+    assert_eq(rf_dec_code(t, "00" + "0700"), "D1001")
+    assert_eq(rf_dec_code(t, "00" + "0700" + "03000000" + "6869"), "D1001")
+    assert_eq(rf_dec_code(t, "00" + "0700" + "01000000" + "6869"), "D1001")
+    assert_eq(rf_dec_code(t, "02" + "0700" + "02000000" + "6869"), "D1001")
+    assert_eq(rf_dec_code(t, "01" + "0000" + "00000000"), "D1001")
+    assert_eq(rf_dec_code(t, "04" + "0700" + "00000000"), "D1001")
+    assert_eq(rf_dec_code(t, "02" + "0700" + "00000000" + "00"), "D1001")
+
+@test
+a_null_fixed_field_must_be_zero_filled()
+    val t = record([Field("a", nullable(Int16))])
+
+    assert_eq(rf_dec_code(t, "01" + "0000"), "ok")
+    assert_eq(rf_dec_code(t, "01" + "0100"), "D1001")
+
+// -- §4.1–§4.2 rows -----------------------------------------------------------------------------
+
+@test
+a_row_is_its_header_then_its_body_with_u16_offsets()
+    val cols = [Int32, nullable(Type.Text), Type.Bool, nullable(Int64), Type.Text]
+    val vals = [Int(-2), Value.Text("hi"), Value.Bool(true), Value.Null, Value.Text("")]
+    val want = "0100000000000000" + "0200000000000000" + "0100" + "0300" + "08" + "feffffff" + "01" +
+        "0000000000000000" + "0200" + "0200" + "6869"
+
+    assert_eq(rf_row(cols, vals), want)
+
+    val back = decode_row(cols, rf_unhex(want).view()).unwrap()
+
+    assert(back.header == rf_hdr())
+    assert(rf_same_values(back.values.view(), vals))
+
+    for s in back.stubs
+        assert(s.is_none())
+
+@test
+the_header_round_trips_its_fields_at_their_limits()
+    val h = RowHeader(0xffffffffffffffff, 0x0102030405060708, RowLockOnly, 0xffff)
+    val bytes = encode_row(h, [], []).unwrap()
+
+    assert_eq(hex_string(bytes.view()), "ffffffffffffffff" + "0807060504030201" + "0200" + "ffff")
+    assert(decode_row(buf[Type]().view(), bytes.view()).unwrap().header == h)
+
+@test
+the_encoder_writes_reserved_flag_bits_and_has_external_as_zero()
+    val bytes = encode_row(RowHeader(0, 0, 0xfffc | RowDeleted, 0), [], []).unwrap()
+
+    assert_eq(hex_string(bytes.view()), "0000000000000000" + "0000000000000000" + "0100" + "0000")
+
+@test
+a_reader_ignores_reserved_flag_bits()
+    val h = decode_row_header(rf_unhex("0000000000000000" + "0000000000000000" + "0b80" + "0000").view()).unwrap()
+
+    assert_eq(h.flags, RowDeleted | RowLockOnly)
+
+@test
+the_empty_row_is_its_header_alone()
+    val bytes = encode_row(RowHeader(5, 0, 0, 1), [], []).unwrap()
+
+    assert_eq(bytes.len(), RowHeaderSize)
+    assert(decode_row(buf[Type]().view(), bytes.view()).unwrap().values.len() == 0)
+
+@test
+a_row_with_every_column_null_zero_fills_the_fixed_area_and_has_empty_variable_columns()
+    val cols = [nullable(Int32), nullable(Type.Text), nullable(Type.Uuid), nullable(list(Int8)), nullable(rf_shape())]
+    val vals = [Value.Null, Value.Null, Value.Null, Value.Null, Value.Null]
+    val want = "0100000000000000" + "0200000000000000" + "0100" + "0300" + "1f" + "00000000" +
+        "00000000000000000000000000000000" + "0000" + "0000" + "0000"
+
+    assert_eq(rf_row(cols, vals), want)
+    assert(rf_same_values(decode_row(cols, rf_unhex(want).view()).unwrap().values.view(), vals))
+
+@test
+a_null_in_a_column_that_is_not_nullable_is_refused_and_is_corruption_when_read()
+    assert_eq(rf_row([Int32], [Value.Null]), "Q3001")
+    assert_eq(rf_row([Type.Text], [Value.Null]), "Q3001")
+
+    val nulled = "0100000000000000" + "0200000000000000" + "0100" + "0300" + "01" + "00000000"
+
+    assert_eq(rf_code(decode_row([Int32], rf_unhex(nulled).view())), "D1001")
+    assert_eq(rf_code(decode_row([nullable(Int32)], rf_unhex(nulled).view())), "ok")
+
+@test
+a_value_count_other_than_the_column_count_is_a_type_mismatch()
+    assert_eq(rf_row([Int32], []), "Q3001")
+    assert_eq(rf_row([], [Int(1)]), "Q3001")
+
+@test
+a_truncated_row_is_corruption_at_every_length()
+    val cols = [Int32, nullable(Type.Text), Type.Bool, nullable(Int64), Type.Text]
+    val bytes = encode_row(rf_hdr(), cols, [Int(-2), Value.Text("hi"), Value.Bool(true), Value.Null, Value.Text("")]).unwrap()
+
+    for n in 0..<bytes.len()
+        assert_eq(rf_code(decode_row(cols, bytes.view()[0..<n])), "D1001")
+
+@test
+trailing_octets_after_a_row_are_corruption()
+    val cols = [Int32, Type.Text]
+    val bytes = encode_row(rf_hdr(), cols, [Int(1), Value.Text("a")]).unwrap()
+
+    bytes.push(0)
+    assert_eq(rf_code(decode_row(cols, bytes.view())), "D1001")
+
+    val fixed = encode_row(rf_hdr(), [Int32], [Int(1)]).unwrap()
+
+    fixed.push(0)
+    assert_eq(rf_code(decode_row([Int32], fixed.view())), "D1001")
+
+@test
+a_bad_value_inside_a_row_is_corruption()
+    val bytes = encode_row(rf_hdr(), [Type.Bool, Type.Text], [Value.Bool(true), Value.Text("a")]).unwrap()
+
+    bytes[21] = 2
+    assert_eq(rf_code(decode_row([Type.Bool, Type.Text], bytes.view())), "D1001")
+    bytes[21] = 1
+    bytes[bytes.len() - 1] = 0xff
+    assert_eq(rf_code(decode_row([Type.Bool, Type.Text], bytes.view())), "D1001")
+
+@test
+a_row_with_the_maximum_column_count_round_trips()
+    val cols = rf_types(nullable(Type.Text), 65535)
+    val vals = rf_values(Value.Null, 65535)
+    val bytes = encode_row(rf_hdr(), cols.view(), vals.view()).unwrap()
+
+    assert_eq(bytes.len(), RowHeaderSize + 8192 + 2 * 65535)
+    assert(rf_same_values(decode_row(cols.view(), bytes.view()).unwrap().values.view(), vals.view()))
+
+@test
+a_row_with_the_maximum_column_count_of_bools_round_trips()
+    val cols = rf_types(Type.Bool, 65535)
+    val vals = rf_values(Value.Bool(true), 65535)
+    val bytes = encode_row(rf_hdr(), cols.view(), vals.view()).unwrap()
+
+    assert_eq(bytes.len(), RowHeaderSize + 8192 + 65535)
+    assert(rf_same_values(decode_row(cols.view(), bytes.view()).unwrap().values.view(), vals.view()))
+
+@test
+a_row_variable_area_past_what_a_u16_offset_holds_is_entry_too_large()
+    assert_eq(rf_code(encode_row(rf_hdr(), [Type.Text], [rf_text(65535)])), "ok")
+    assert_eq(rf_code(encode_row(rf_hdr(), [Type.Text], [rf_text(65536)])), "D2002")
+
+// -- §4.7 placement and stubs -------------------------------------------------------------------
+
+private rf_place(key_len: usize, cols: []const Type, vals: []const Value) -> string =
+    place_row(key_len, cols, vals) match
+        Ok(Inline) -> "inline"
+        Ok(OutOfLine(cs)) ->
+            var s = "out"
+
+            for c in cs
+                s = s + s" $c"
+
+            s
+        Err(e) -> e.code
+
+@test
+an_entry_of_exactly_4000_octets_is_inline_and_one_more_is_not()
+    // Header 20, a 1-octet null bitmap, one u16 offset: 23 octets before the text.
+    assert_eq(rf_place(0, [Type.Text], [rf_text(3977)]), "inline")
+    assert_eq(encode_row(rf_hdr(), [Type.Text], [rf_text(3977)]).unwrap().len(), 4000)
+    assert_eq(rf_place(0, [Type.Text], [rf_text(3978)]), "out 0")
+    assert_eq(rf_place(100, [Type.Text], [rf_text(3877)]), "inline")
+    assert_eq(rf_place(100, [Type.Text], [rf_text(3878)]), "out 0")
+
+@test
+the_largest_column_moves_first_and_only_as_many_as_needed()
+    val cols = [Type.Text, Type.Text, Type.Text]
+
+    assert_eq(rf_place(0, cols, [rf_text(1500), rf_text(2000), rf_text(1000)]), "out 1")
+    assert_eq(rf_place(0, cols, [rf_text(3000), rf_text(3000), rf_text(3000)]), "out 0 1")
+
+@test
+equal_columns_move_lower_index_first()
+    assert_eq(rf_place(0, [Type.Text, Type.Text], [rf_text(2500), rf_text(2500)]), "out 0")
+
+@test
+a_column_under_256_octets_never_moves()
+    val cols = rf_types(Type.Text, 20)
+    val vals = rf_values(rf_text(255), 20)
+
+    assert_eq(rf_place(0, cols.view(), vals.view()), "D2002")
+
+    vals[7] = rf_text(256)
+    assert_eq(rf_place(0, cols.view(), vals.view()), "D2002")
+
+    val big = rf_values(rf_text(256), 20)
+
+    // 20 + 3 + 40 + 5,120 = 5,183, plus the 3-octet external bitmap; each move saves 224.
+    assert_eq(rf_place(0, cols.view(), big.view()), "out 0 1 2 3 4 5")
+
+@test
+a_column_of_exactly_256_octets_may_move()
+    // 23 + 256 = 279 with a key of 3,800 is past the limit; moved, it is 23 + 1 + 32 = 56.
+    assert_eq(rf_place(3800, [Type.Text], [rf_text(256)]), "out 0")
+    assert_eq(rf_place(3800, [Type.Text], [rf_text(255)]), "D2002")
+
+@test
+the_external_bitmap_counts_against_the_limit()
+    // After the first move: 20 + 1 + 1 (external bitmap) + 4 + 32 + 300 = 358. With a key of 3,642
+    // that is 4,000 and fits; with 3,643 it fits only without the external bitmap, so the second
+    // column must move too.
+    val cols = [Type.Text, Type.Text]
+    val vals = [rf_text(300), rf_text(300)]
+
+    assert_eq(rf_place(3642, cols, vals), "out 0")
+    assert_eq(rf_place(3643, cols, vals), "out 0 1")
+
+@test
+an_entry_that_cannot_fit_is_entry_too_large()
+    val cols = rf_types(Int64, 400)
+    val vals = rf_values(Int(1), 400)
+
+    assert_eq(rf_place(1000, cols.view(), vals.view()), "D2002")
+
+@test
+the_maximum_column_count_can_never_be_placed()
+    val cols = rf_types(nullable(Type.Text), 65535)
+    val vals = rf_values(Value.Null, 65535)
+
+    assert_eq(rf_place(0, cols.view(), vals.view()), "D2002")
+
+@test
+the_widest_row_of_variable_columns_that_fits_has_1872_of_them()
+    val ok = rf_types(nullable(Type.Text), 1872)
+
+    assert_eq(rf_place(0, ok.view(), rf_values(Value.Null, 1872).view()), "inline")
+
+    val over = rf_types(nullable(Type.Text), 1873)
+
+    assert_eq(rf_place(0, over.view(), rf_values(Value.Null, 1873).view()), "D2002")
+
+@test
+a_column_too_long_for_a_u16_offset_is_placed_out_of_line_not_refused()
+    assert_eq(rf_place(0, [Type.Text, Int64], [rf_text(70000), Int(1)]), "out 0")
+
+@test
+placement_checks_its_values()
+    assert_eq(rf_place(0, [Int32], [Value.Null]), "Q3001")
+    assert_eq(rf_place(0, [Int32], [Value.Text("x")]), "Q3001")
+    assert_eq(rf_place(0, [Int32], []), "Q3001")
+
+@test
+a_nested_relation_moves_whole()
+    val elems = buf[Value]()
+
+    for i in 0..<1000
+        elems.push(Int(i))
+
+    assert_eq(rf_place(0, [list(Int32)], [Relation(elems)]), "out 0")
+
+private rf_stub() -> OverflowStub = OverflowStub(0x1122, 5000, 3000, 0xdeadbeef, 1)
+
+@test
+a_stub_is_32_octets()
+    assert_eq(hex_string(encode_stub(rf_stub()).view()),
+        "2211000000000000" + "8813000000000000" + "b80b000000000000" + "efbeadde" + "01" + "000000")
+    assert(decode_stub(encode_stub(rf_stub()).view()).unwrap() == rf_stub())
+
+@test
+a_stubs_reserved_octets_are_ignored_and_a_reserved_codec_is_corruption()
+    val ok = "2211000000000000" + "8813000000000000" + "b80b000000000000" + "efbeadde" + "02" + "abcdef"
+
+    assert(decode_stub(rf_unhex(ok).view()).unwrap().codec == 2)
+    assert_eq(rf_code(decode_stub(rf_unhex("2211000000000000" + "8813000000000000" + "b80b000000000000" + "efbeadde" + "03" + "000000").view())), "D1001")
+    assert_eq(rf_code(decode_stub(rf_unhex("00").view())), "D1001")
+
+@test
+a_row_with_an_out_of_line_column_sets_has_external_and_the_external_bitmap()
+    val cols = [Int16, nullable(Type.Text), Type.Bytes]
+    val stubs = buf[Option[OverflowStub]]()
+
+    stubs.push(None)
+    stubs.push(None)
+    stubs.push(Some(rf_stub()))
+
+    val vals = [Int(1), Value.Null, bytes_value([1, 2, 3])]
+    val bytes = encode_row_with_stubs(RowHeader(9, 0, 0, 1), cols, vals, stubs).unwrap()
+    val want = "0900000000000000" + "0000000000000000" + "0400" + "0100" + "02" + "04" + "0100" + "0000" + "2000" +
+        hex_string(encode_stub(rf_stub()).view())
+
+    assert_eq(hex_string(bytes.view()), want)
+
+    val back = decode_row(cols, bytes.view()).unwrap()
+
+    assert_eq(back.header.flags, RowHasExternal)
+    assert(back.stubs[2] == Some(rf_stub()))
+    assert(back.stubs[0].is_none())
+    assert(back.values[2].is_null())
+
+@test
+a_stub_on_a_fixed_or_null_column_is_refused()
+    val stubs = buf[Option[OverflowStub]]()
+
+    stubs.push(Some(rf_stub()))
+    assert_eq(rf_code(encode_row_with_stubs(rf_hdr(), [Int32], [Int(1)], stubs)), "Q3001")
+    assert_eq(rf_code(encode_row_with_stubs(rf_hdr(), [nullable(Type.Text)], [Value.Null], stubs)), "Q3001")
+    assert_eq(rf_code(encode_row_with_stubs(rf_hdr(), [Type.Text, Type.Text], [Value.Text("a"), Value.Text("b")], stubs)), "Q3001")
+
+@test
+a_malformed_external_bitmap_is_corruption()
+    val head = "0900000000000000" + "0000000000000000" + "0400" + "0100"
+    val stub = hex_string(encode_stub(rf_stub()).view())
+
+    assert_eq(rf_code(decode_row([Type.Text], rf_unhex(head + "00" + "01" + "2000" + stub).view())), "ok")
+    assert_eq(rf_code(decode_row([Type.Text], rf_unhex(head + "00" + "00" + "2000" + stub).view())), "D1001")
+    assert_eq(rf_code(decode_row([Type.Text], rf_unhex(head + "00" + "03" + "2000" + stub).view())), "D1001")
+    assert_eq(rf_code(decode_row([nullable(Type.Text)], rf_unhex(head + "01" + "01" + "2000" + stub).view())), "D1001")
+    assert_eq(rf_code(decode_row([Int32], rf_unhex(head + "00" + "01" + "01000000").view())), "D1001")
+    assert_eq(rf_code(decode_row([Type.Text], rf_unhex(head + "00" + "01" + "0100" + "61").view())), "D1001")
+
+@test
+a_row_whose_columns_all_moved_holds_only_stubs()
+    val cols = [Type.Text, Type.Text]
+    val vals = [rf_text(3990), rf_text(3990)]
+
+    assert_eq(rf_place(0, cols, vals), "out 0 1")
+
+    val stubs = buf[Option[OverflowStub]]()
+
+    stubs.push(Some(rf_stub()))
+    stubs.push(Some(OverflowStub(7, 3000, 3000, 1, 0)))
+
+    val bytes = encode_row_with_stubs(rf_hdr(), cols, vals, stubs).unwrap()
+
+    assert_eq(bytes.len(), 20 + 1 + 1 + 4 + 64)
+    assert(decode_row(cols, bytes.view()).unwrap().stubs[1] == Some(OverflowStub(7, 3000, 3000, 1, 0)))
+
+// -- §4.3 type descriptors ----------------------------------------------------------------------
+
+@test
+every_scalar_has_its_tag()
+    rf_desc_golden(Type.Bool, "01")
+    rf_desc_golden(Int8, "02")
+    rf_desc_golden(Int16, "03")
+    rf_desc_golden(Int32, "04")
+    rf_desc_golden(Int64, "05")
+    rf_desc_golden(Int128, "06")
+    rf_desc_golden(Float32, "07")
+    rf_desc_golden(Float64, "08")
+    rf_desc_golden(Decimal(10, 2), "090a02")
+    rf_desc_golden(Type.Text, "0a")
+    rf_desc_golden(Type.Bytes, "0b")
+    rf_desc_golden(Date, "0c")
+    rf_desc_golden(Time, "0d")
+    rf_desc_golden(DateTime, "0e")
+    rf_desc_golden(Timestamp, "0f")
+    rf_desc_golden(Type.Interval, "10")
+    rf_desc_golden(Type.Uuid, "11")
+    rf_desc_golden(UInt8, "13")
+    rf_desc_golden(UInt16, "14")
+    rf_desc_golden(UInt32, "15")
+    rf_desc_golden(UInt64, "16")
+    rf_desc_golden(Json, "17")
+
+@test
+a_record_descriptor_names_each_field_with_its_nullability()
+    rf_desc_golden(record([Field("a", Int64), Field("b", nullable(Type.Text))]),
+        "23" + "0200" + "0100" + "61" + "00" + "05" + "0100" + "62" + "01" + "0a")
+    rf_desc_golden(record([]), "230000")
+
+@test
+a_union_descriptor_names_each_variant_and_its_payload_record()
+    rf_desc_golden(union_of([Field("x", record([])), Field("y", record([Field("n", Type.Bool)]))]),
+        "21" + "02000000" + "0100" + "78" + "23" + "0000" + "0100" + "79" + "23" + "0100" + "0100" + "6e" + "00" + "01")
+
+@test
+a_relation_descriptor_says_its_order_and_element_nullability()
+    rf_desc_golden(list(nullable(Int32)), "20" + "01" + "01" + "04")
+    rf_desc_golden(bag(record([])), "20" + "00" + "00" + "230000")
+    rf_desc_golden(bag(rf_shape()), "20" + "00" + "00" + hex_string(column_descriptor(rf_shape()).unwrap().view()))
+
+@test
+a_nested_relation_descriptor_nests_through_a_record_field()
+    val t = bag(record([Field("id", Int64), Field("posts", list(record([Field("id", Int64)])))]))
+
+    rf_desc_golden(t, "200000" + "23" + "0200" + "0200" + "6964" + "00" + "05" + "0500" + "706f737473" + "00" +
+        "200100" + "23" + "0100" + "0200" + "6964" + "00" + "05")
+
+@test
+a_column_descriptor_is_of_its_base_type_and_its_nullability_is_beside_it()
+    assert_eq(rf_desc(nullable(Int32)), "04")
+    assert(column_type(rf_unhex("04").view(), true).unwrap() == nullable(Int32))
+    assert(column_type(rf_unhex("04").view(), false).unwrap() == Int32)
+
+@test
+a_nullable_type_inside_a_descriptor_only_where_a_field_or_element_is()
+    val out = buf[u8]()
+
+    assert_eq(rf_code(encode_descriptor(nullable(Int32), out)), "Q3001")
+    assert_eq(rf_desc(union_of([Field("a", nullable(record([])))])), "Q3014")
+
+@test
+a_descriptor_that_breaks_the_type_rules_is_refused()
+    assert_eq(rf_desc(union_of([])), "Q3016")
+    assert_eq(rf_desc(union_of([Field("a", Int32)])), "Q3014")
+    assert_eq(rf_desc(record([Field("", Int32)])), "Q3015")
+    assert_eq(rf_desc(record([Field("a", Int32), Field("a", Int64)])), "Q3015")
+    assert_eq(rf_desc(union_of([Field("a", record([])), Field("a", record([]))])), "Q3015")
+    assert_eq(rf_desc(Decimal(0, 0)), "Q3001")
+    assert_eq(rf_desc(Decimal(39, 0)), "Q3001")
+    assert_eq(rf_desc(Decimal(5, 6)), "Q3001")
+
+@test
+an_unknown_or_reserved_tag_is_corruption()
+    assert_eq(rf_desc_code("00"), "D1001")
+    assert_eq(rf_desc_code("12"), "D1001")
+    assert_eq(rf_desc_code("18"), "D1001")
+    assert_eq(rf_desc_code("1f"), "D1001")
+    assert_eq(rf_desc_code("22"), "D1001")
+    assert_eq(rf_desc_code("24"), "D1001")
+    assert_eq(rf_desc_code("ff"), "D1001")
+
+@test
+a_malformed_descriptor_is_corruption()
+    assert_eq(rf_desc_code(""), "D1001")
+    assert_eq(rf_desc_code("0400"), "D1001")
+    assert_eq(rf_desc_code("09"), "D1001")
+    assert_eq(rf_desc_code("090a"), "D1001")
+    assert_eq(rf_desc_code("090002"), "D1001")
+    assert_eq(rf_desc_code("092700"), "D1001")
+    assert_eq(rf_desc_code("090506"), "D1001")
+    assert_eq(rf_desc_code("2002" + "0004"), "D1001")
+    assert_eq(rf_desc_code("2000" + "0204"), "D1001")
+    assert_eq(rf_desc_code("200000" + "20000004"), "D1001")
+    assert_eq(rf_desc_code("21" + "00000000"), "D1001")
+    assert_eq(rf_desc_code("21" + "01000000" + "0100" + "61" + "04"), "D1001")
+    assert_eq(rf_desc_code("21" + "01000000" + "0000" + "230000"), "D1001")
+    assert_eq(rf_desc_code("21" + "01000100"), "D1001")
+    assert_eq(rf_desc_code("23" + "0200" + "0100" + "61" + "00" + "04" + "0100" + "61" + "00" + "04"), "D1001")
+    assert_eq(rf_desc_code("23" + "0100" + "0100" + "ff" + "00" + "04"), "D1001")
+    assert_eq(rf_desc_code("23" + "0100" + "0100" + "61" + "02" + "04"), "D1001")
+    assert_eq(rf_desc_code("23" + "0100" + "0500" + "61"), "D1001")
+    assert_eq(rf_desc_code("23" + "0100"), "D1001")
+
+@test
+a_union_of_65536_variants_has_a_descriptor_and_65537_is_refused()
+    val vs = buf[Field]()
+
+    for i in 0..<65536
+        vs.push(Field(s"v$i", record([])))
+
+    val t = Type.Union(vs)
+    val d = column_descriptor(t).unwrap()
+
+    assert(decode_descriptor(d.view()).unwrap() == t)
+    rf_golden(t, variant(65535, rec([])), "ffff")
+
+    vs.push(Field("over", record([])))
+    assert_eq(rf_desc(Type.Union(vs)), "Q3016")
+    assert_eq(rf_value(Type.Union(vs), variant(0, rec([]))), "Q3016")
+
+@test
+a_record_of_65535_fields_has_a_descriptor_and_65536_is_refused()
+    val fs = buf[Field]()
+
+    for i in 0..<65535
+        fs.push(Field(s"f$i", Type.Bool))
+
+    val d = column_descriptor(Type.Record(fs)).unwrap()
+
+    assert(decode_descriptor(d.view()).unwrap() == Type.Record(fs))
+
+    fs.push(Field("over", Type.Bool))
+    assert_eq(rf_desc(Type.Record(fs)), "Q6011")
+
+@test
+a_descriptor_nesting_past_256_levels_is_corruption()
+    var deep = ""
+    var t = record([])
+
+    for _ in 0..<255
+        deep = deep + "23" + "0100" + "0100" + "61" + "00"
+        t = record([Field("a", t)])
+
+    val ok = deep + "230000"
+
+    assert(decode_descriptor(rf_unhex(ok).view()).unwrap() == t)
+    assert_eq(rf_desc_code("23" + "0100" + "0100" + "61" + "00" + ok), "D1001")

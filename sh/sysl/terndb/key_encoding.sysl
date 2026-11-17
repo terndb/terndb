@@ -1,0 +1,339 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// The order-preserving key encoding of `on-disk-format.md` §4.6 and the secondary-index entries of
+// §4.9. Two keys of one key type compare under unsigned `memcmp` exactly as their values do under
+// `cmp` (`query-tree.md` §3.3), a descending component reversing its part of the order.
+//
+// Every integer is big-endian here, a signed one with its sign bit inverted so that negatives sort
+// first. `text` and `bytes` escape each 0x00 as 0x00 0xFF and end with 0x00 0x00, so no encoding is a
+// proper prefix of another, which is what lets a descending component simply invert its octets and
+// lets components be concatenated. A key is decodable: an index-only scan reads its column values out
+// of the index key (§4.9 rule 3).
+
+/** One component of a key: its type, nullable where the component may be null (only in a secondary
+ * index: a primary-key column is NOT NULL), and its direction.
+ */
+struct KeyColumn derives Eq
+    ty: Type
+    descending: bool
+
+/** The longest encoded key, full and before prefix removal (§3.6). */
+const KeyLimit: usize = 1024
+
+/** A secondary-index entry: its B+tree key and value (§4.9 rule 1). */
+struct IndexEntry derives Eq
+    key: Buf[u8]
+    value: Buf[u8]
+
+/** A decoded secondary-index entry: the index columns' values, then the primary key's. */
+struct IndexRow derives Eq
+    index: Buf[Value]
+    primary: Buf[Value]
+
+/** `t` may be a key component (§4.6 rule 4): every scalar but `json`, and an enum, which is a union
+ * whose payloads are all `{}`. Nullability does not matter.
+ */
+key_able(t: Type) -> bool = t.base() match
+    Json | Record(_) | Bag(_) | List(_) | Named(_, _) | Nullable(_) -> false
+    Union(vs) -> is_enum(vs)
+    _ -> true
+
+private is_enum(vs: Buf[Field]) -> bool
+    if vs.len() == 0 || vs.len() > 65536 then return false
+
+    for v in vs
+        v.ty match
+            Record(fs) -> if fs.len() != 0 then return false
+            _ -> return false
+
+    true
+
+/** The key of `vals` under `cols`: the concatenation of each component (§4.6 rule 3). A key longer
+ * than 1,024 octets is `key_too_long` (§3.6); a component type that cannot be a key is `Q6005`.
+ */
+encode_key(cols: []const KeyColumn, vals: []const Value) -> Result[Buf[u8], CodecError]
+    if cols.len != vals.len then return wrong_value(s"${cols.len} key values were expected, not ${vals.len}")
+
+    val out = buf[u8]()
+
+    for i in 0..<cols.len
+        push_key_component(out, cols[i], vals[i])?
+
+    if out.len() > KeyLimit then return fail("D2001", s"an encoded key of ${out.len()} octets exceeds 1,024")
+
+    Ok(out)
+
+/** Appends one key component: the 0x00 (null) or 0x01 prefix when the component is nullable (rule 1),
+ * the value's encoding, and every one of those octets inverted when it is descending (rule 2).
+ */
+push_key_component(out: Buf[u8], col: KeyColumn, v: Value) -> Result[unit, CodecError]
+    val t = col.ty.base()
+
+    if !key_able(t) then return fail("Q6005", "a key component must be a scalar other than json, or an enum")
+
+    val start = out.len()
+
+    if col.ty.is_nullable()
+        out.push(if v.is_null() then 0 else 1)
+    elif v.is_null()
+        return wrong_value("a key component that is not nullable holds a null")
+
+    if !v.is_null() then put_key_value(out, t, v)?
+
+    if col.descending
+        for i in start..<out.len()
+            out[i] = out[i] ^ 0xFF
+
+    Ok(())
+end push_key_component
+
+/** A float64's key bits: −0 as +0, every NaN as the canonical quiet NaN, then the sign bit inverted
+ * for a non-negative value and every bit for a negative one.
+ */
+private float64_key(x: real) -> u64
+    val bits: u64 = if x.is_nan() then 0x7FF8000000000000 elif x == 0.0 then 0 else x.bits()
+    val sign: u64 = 0x8000000000000000
+
+    if bits & sign != 0 then bits ^ 0xFFFFFFFFFFFFFFFF else bits ^ sign
+
+private float32_key(x: real) -> u32
+    val bits: u32 = if x.is_nan() then 0x7FC00000 elif x == 0.0 then 0 else f32(x).bits()
+    val sign: u32 = 0x80000000
+
+    if bits & sign != 0 then bits ^ 0xFFFFFFFF else bits ^ sign
+
+private put_key_value(out: Buf[u8], t: Type, v: Value) -> Result[unit, CodecError]
+    val w = row_width(t)
+
+    t match
+        Bool -> v match
+            Bool(b) -> out.push(if b then 1 else 0)
+            _ -> return wrong_value("a bool was expected")
+        UInt8 | UInt16 | UInt32 | UInt64 -> v match
+            UInt(n) ->
+                if w < 8 && n >= u64(1) << (8 * w) then return wrong_value("an unsigned value is out of its type's range")
+                push_be(out, u128(n), w)
+            _ -> return wrong_value("an unsigned integer was expected")
+        Float32 -> v match
+            Float(x) ->
+                if !is_float32(x) then return wrong_value("a float32 value is not exactly a float32")
+                push_be(out, u128(float32_key(x)), 4)
+            _ -> return wrong_value("a float was expected")
+        Float64 -> v match
+            Float(x) -> push_be(out, u128(float64_key(x)), 8)
+            _ -> return wrong_value("a float was expected")
+        Interval -> v match
+            Interval(months, days, micros) ->
+                push_be(out, u128(u32.wrap(months) ^ 0x80000000), 4)
+                push_be(out, u128(u32.wrap(days) ^ 0x80000000), 4)
+                push_be(out, u128(u64.wrap(micros) ^ 0x8000000000000000), 8)
+            _ -> return wrong_value("an interval was expected")
+        Uuid -> v match
+            Uuid(bits) -> push_be(out, bits, 16)
+            _ -> return wrong_value("a uuid was expected")
+        Text -> v match
+            Text(s) -> push_escaped(out, s.bytes)
+            _ -> return wrong_value("text was expected")
+        Bytes -> v match
+            Bytes(b) -> push_escaped(out, b.view())
+            _ -> return wrong_value("bytes were expected")
+        Union(vs) -> v match
+            Variant(tag, payload) ->
+                if tag >= vs.len() then return wrong_value("an enum value's variant is not one of its type's")
+
+                (*payload) match
+                    Record(xs) -> if xs.len() != 0 then return wrong_value("an enum value's payload must be {}")
+                    _ -> return wrong_value("an enum value's payload must be {}")
+
+                push_be(out, u128(tag), 2)
+            _ -> return wrong_value("an enum value was expected")
+        Decimal(p, _) -> v match
+            Int(n) ->
+                if !within_precision(n, p) then return wrong_value("a decimal has more digits than its precision")
+                push_signed_key(out, n, w)
+            _ -> return wrong_value("a decimal's unscaled integer was expected")
+        _ -> v match
+            Int(n) ->
+                if !fits_octets(n, w) then return wrong_value("an integer is out of its type's range")
+                push_signed_key(out, n, w)
+            _ -> return wrong_value("an integer was expected")
+
+    Ok(())
+end put_key_value
+
+private push_signed_key(out: Buf[u8], n: i128, w: usize) =
+    push_be(out, u128.wrap(n) ^ u128(1) << (8 * w - 1), w)
+
+private push_escaped(out: Buf[u8], octets: []const u8)
+    for b in octets
+        out.push(b)
+        if b == 0 then out.push(0xFF)
+
+    out.push(0)
+    out.push(0)
+
+// -- decoding -----------------------------------------------------------------------------------
+
+/** The values of the key that is the whole of `bytes`, under `cols`. A key that is truncated, has
+ * octets left over, a prefix or flag octet that is neither 0 nor 1, a bad escape, invalid UTF-8, an
+ * enum discriminant past its variants or a float that is not in its canonical form is
+ * `data_corrupted`.
+ */
+decode_key(cols: []const KeyColumn, bytes: []const u8) -> Result[Buf[Value], CodecError]
+    var c = cursor(bytes)
+    val vals = read_key_values(&c, cols)?
+
+    if c.left() != 0 then return corrupt("octets follow the key's last component")
+
+    Ok(vals)
+
+private read_key_values(c: *ByteCursor, cols: []const KeyColumn) -> Result[Buf[Value], CodecError]
+    val vals = buf[Value]()
+
+    for col in cols
+        val t = col.ty.base()
+
+        if !key_able(t) then return fail("Q6005", "a key component must be a scalar other than json, or an enum")
+
+        c.flip = if col.descending then 0xFF else 0
+
+        var present = true
+
+        if col.ty.is_nullable() then present = c.flag()?
+
+        vals.push(if present then read_key_value(c, t)? else Value.Null)
+
+    c.flip = 0
+    Ok(vals)
+
+private read_key_value(c: *ByteCursor, t: Type) -> Result[Value, CodecError]
+    val w = row_width(t)
+
+    t match
+        Bool -> Ok(Value.Bool(c.flag()?))
+        UInt8 | UInt16 | UInt32 | UInt64 -> Ok(UInt(u64(c.be(w)?)))
+        Float32 ->
+            val k = u32(c.be(4)?)
+            val bits = if k & 0x80000000 != 0 then k ^ 0x80000000 else k ^ 0xFFFFFFFF
+            val x = real(f32.from_bits(bits))
+
+            if float32_key(x) != k then return corrupt("a float32 key is not canonical")
+
+            Ok(Float(x))
+        Float64 ->
+            val k = u64(c.be(8)?)
+            val bits = if k & 0x8000000000000000 != 0 then k ^ 0x8000000000000000 else k ^ 0xFFFFFFFFFFFFFFFF
+            val x = real.from_bits(bits)
+
+            if float64_key(x) != k then return corrupt("a float64 key is not canonical")
+
+            Ok(Float(x))
+        Interval ->
+            val months = i32.wrap(u32(c.be(4)?) ^ 0x80000000)
+            val days = i32.wrap(u32(c.be(4)?) ^ 0x80000000)
+            val micros = i64.wrap(u64(c.be(8)?) ^ 0x8000000000000000)
+            Ok(Value.Interval(months, days, micros))
+        Uuid -> Ok(Value.Uuid(c.be(16)?))
+        Text ->
+            val raw = read_escaped(c)?
+
+            from_utf8(raw.view()) match
+                Ok(s) -> Ok(Value.Text(s))
+                Err(_) -> corrupt("a text key component is not valid UTF-8")
+        Bytes -> Ok(Value.Bytes(read_escaped(c)?))
+        Union(vs) ->
+            val tag = usize(c.be(2)?)
+
+            if tag >= vs.len() then return corrupt("an enum key's discriminant is not below its variant count")
+
+            Ok(variant(tag, rec([])))
+        Decimal(p, _) ->
+            val n = read_signed_key(c, w)?
+            if within_precision(n, p) then Ok(Int(n)) else corrupt("a decimal key has more digits than its precision")
+        _ -> Ok(Int(read_signed_key(c, w)?))
+end read_key_value
+
+private read_signed_key(c: *ByteCursor, w: usize) -> Result[i128, CodecError] =
+    Ok(sign_extend(c.be(w)? ^ u128(1) << (8 * w - 1), w))
+
+private read_escaped(c: *ByteCursor) -> Result[Buf[u8], CodecError]
+    val out = buf[u8]()
+
+    loop
+        val b = c.byte()?
+
+        if b != 0
+            out.push(b)
+            continue
+
+        val next = c.byte()?
+
+        if next == 0 then return Ok(out)
+        if next != 0xFF then return corrupt("a 0x00 in a key is followed by neither 0x00 nor 0xFF")
+
+        out.push(0)
+end read_escaped
+
+// -- secondary indexes, §4.9 --------------------------------------------------------------------
+
+/** The entry of a secondary index over `index` for a row whose index values are `index_vals` and whose
+ * primary key, under `primary`, is `primary_vals`.
+ *
+ * A non-unique index's key is the index components then the primary key's, and its value is empty. A
+ * unique index's key is the index components alone and its value the encoded primary key, except
+ * where an index component is null: a row with a null component never conflicts (`ddl.md` §2.5 rule
+ * 2), so its entry takes the non-unique form, and two such rows cannot collide on one key. The
+ * primary key's components keep their own directions, so its octets are the clustered key's.
+ */
+index_entry(index: []const KeyColumn, index_vals: []const Value, primary: []const KeyColumn, primary_vals: []const Value, unique: bool) -> Result[IndexEntry, CodecError]
+    for p in primary
+        if p.ty.is_nullable() then return fail("Q6005", "a primary-key column is NOT NULL")
+
+    if index.len != index_vals.len then return wrong_value(s"${index.len} index values were expected, not ${index_vals.len}")
+
+    val key = buf[u8]()
+
+    for i in 0..<index.len
+        push_key_component(key, index[i], index_vals[i])?
+
+    val pk = encode_key(primary, primary_vals)?
+    var has_null = false
+
+    for v in index_vals
+        if v.is_null() then has_null = true
+
+    if unique && !has_null
+        if key.len() > KeyLimit then return fail("D2001", s"an encoded key of ${key.len()} octets exceeds 1,024")
+        return Ok(IndexEntry(key, pk))
+
+    key.extend(pk.view())
+
+    if key.len() > KeyLimit then return fail("D2001", s"an encoded key of ${key.len()} octets exceeds 1,024")
+
+    Ok(IndexEntry(key, buf[u8]()))
+end index_entry
+
+/** The index and primary-key values of a secondary-index entry: the inverse of `index_entry`. */
+decode_index_entry(index: []const KeyColumn, primary: []const KeyColumn, unique: bool, key: []const u8, value: []const u8) -> Result[IndexRow, CodecError]
+    var c = cursor(key)
+    val iv = read_key_values(&c, index)?
+    var has_null = false
+
+    for v in iv
+        if v.is_null() then has_null = true
+
+    if unique && !has_null
+        if c.left() != 0 then return corrupt("a unique index entry's key holds more than its index columns")
+        return Ok(IndexRow(iv, decode_key(primary, value)?))
+
+    if value.len != 0 then return corrupt("a non-unique index entry has a value")
+
+    val pv = read_key_values(&c, primary)?
+
+    if c.left() != 0 then return corrupt("octets follow an index entry's primary key")
+
+    Ok(IndexRow(iv, pv))
+end decode_index_entry
