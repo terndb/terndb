@@ -1,0 +1,4 @@
+module i03_const
+
+@export("i03_len")
+len_of(s: *const u8, n: usize) -> usize = n

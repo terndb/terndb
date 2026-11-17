@@ -1,0 +1,196 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The recorder, the JSON-lines form of `isolation.md` §2.5 and the seeded driver.
+
+@test
+a_history_round_trips_through_json_lines()
+    val clock: &SimClock = SimClock(1000)
+    var r = recorder(clock)
+    val ops = buf[Mop]()
+    ops.push(m_append("k3", 41))
+    ops.push(m_read_list("k1", [1, 5, 41]))
+    ops.push(m_pred_rows("g = 2", ["k1", "k7"]))
+    ops.push(m_write("k2", 9))
+    ops.push(m_delete("k9"))
+    ops.push(m_add("c1", -3))
+    ops.push(m_read_num("r1", 7))
+    ops.push(m_read_unborn("r2"))
+    val _ = r.add(3, HOk, LevelSer, 4711, 9000, 9012, "", ops)
+    val _ = r.add(4, HFail, LevelRc, 0, 0, 0, "serialization_failure", buf())
+    val text = history_jsonl(r.events)
+    assert_eq(parse_history(text).unwrap(), r.events)
+
+@test
+the_simulated_clock_reads_milliseconds_as_an_engine_clock()
+    val c: &SimClock = SimClock(5000000)
+    val clock: &Clock = c
+    assert_eq(clock.now_ms(), 5)
+    c.ns += 2000000
+    assert_eq(clock.now_ms(), 7)
+
+// Two clients, each appending to and reading one key twice, at `level`.
+private hot_key(level: Isolation, seed: u64, lost: u64, retry: bool) -> Buf[HEvent]
+    val b = bench(no_faults())
+    b.seed_rows(items_of(["l0"]), buf(), 0)
+    val clock: &SimClock = SimClock(0)
+    val clients = buf[Buf[Plan]]()
+    for _ in 0..<3
+        val ps = buf[Plan]()
+        for _ in 0..<3
+            ps.push(Plan(level, false, retry, items_of([SReadList("l0"), SAppend("l0"), SReadList("l0")])))
+        clients.push(ps)
+    drive(b, clock, buf(), clients, buf(), DriveOptions(seed, lost)).unwrap()
+
+private count_kind(h: Buf[HEvent], k: HKind) -> usize
+    var n: usize = 0
+    for e in h
+        if e.kind == k then n += 1
+    n
+
+@test
+a_seed_replays_the_same_history_and_another_seed_differs()
+    val a = history_jsonl(hot_key(Snapshot, 7, 100, true))
+    val b = history_jsonl(hot_key(Snapshot, 7, 100, true))
+    assert_eq(a, b)
+    var differ = false
+    for seed in 8..16
+        if history_jsonl(hot_key(Snapshot, seed, 100, true)) != a then differ = true
+    assert(differ)
+
+@test
+records_are_indexed_in_order_and_their_times_strictly_increase()
+    val h = hot_key(Serializable, 3, 0, true)
+    for i in 0..<h.len()
+        assert_eq(h[i].index, u64(i))
+        if i > 0 then assert(h[i].time > h[i - 1].time)
+
+@test
+every_invoke_is_completed_and_a_process_runs_one_transaction_at_a_time()
+    val h = hot_key(Snapshot, 5, 0, true)
+    val open = buf[bool]()
+    for _ in 0..<8
+        open.push(false)
+    for e in h
+        val p = usize(e.process)
+        if e.kind == HInvoke
+            assert(!open[p])
+            open[p] = true
+        else
+            assert(open[p])
+            open[p] = false
+    for o in open
+        assert(!o)
+    assert_eq(count_kind(h, HInvoke), count_kind(h, HOk) + count_kind(h, HFail) + count_kind(h, HInfo))
+
+@test
+contention_on_one_key_aborts_and_retries_at_snapshot()
+    var retried = false
+    for seed in 1..20
+        val h = hot_key(Snapshot, seed, 0, true)
+        // Every plan commits in the end: retried attempts make up the difference.
+        assert_eq(count_kind(h, HOk), 9)
+        if count_kind(h, HFail) > 0
+            retried = true
+            for e in h
+                if e.kind == HFail then assert_eq(e.error, "serialization_failure")
+    assert(retried)
+
+@test
+a_plan_that_is_not_retried_ends_at_its_first_failure()
+    var failed = false
+    for seed in 1..20
+        val h = hot_key(Snapshot, seed, 0, false)
+        assert_eq(count_kind(h, HInvoke), 9)
+        if count_kind(h, HFail) > 0 then failed = true
+    assert(failed)
+
+@test
+read_committed_appends_wait_and_never_fail()
+    for seed in 1..10
+        val h = hot_key(ReadCommitted, seed, 0, true)
+        assert_eq(count_kind(h, HFail), 0)
+        assert_eq(count_kind(h, HOk), 9)
+        assert_eq(check_history(h, check_all()).forbidden().len(), 0)
+
+@test
+every_acknowledgement_lost_records_every_completion_as_info()
+    val h = hot_key(Serializable, 2, 1000, true)
+    // Statement failures are known to the client; only a commit's answer is lost, and an unknown
+    // transaction is not retried, so each plan ends in one `info`.
+    assert_eq(count_kind(h, HOk), 0)
+    assert_eq(count_kind(h, HInfo), 9)
+
+@test
+a_committed_record_carries_the_white_box_fields()
+    val h = hot_key(Serializable, 4, 0, true)
+    var last_commit: u64 = 0
+    for e in h
+        if e.kind == HOk
+            assert(e.txid != 0)
+            assert(e.commit >= e.snapshot)
+            assert(e.commit > last_commit)
+            last_commit = e.commit
+        if e.kind == HInvoke then assert(e.txid == 0 && e.commit == 0)
+
+@test
+the_invoke_lists_the_writes_known_in_advance_with_the_values_they_will_write()
+    val h = hot_key(Serializable, 6, 0, true)
+    for i in 0..<h.len()
+        val e = h[i]
+        if e.kind != HInvoke then continue
+        assert_eq(e.value.len(), 3)
+        assert(e.value[0] == m_read("l0"))
+        assert(e.value[1].kind == MAppend)
+        for j in (i + 1)..<h.len()
+            if h[j].process == e.process
+                if h[j].kind == HOk then assert_eq(h[j].value[1], e.value[1])
+                break
+
+@test
+a_recorded_run_round_trips_through_json_lines()
+    val run = run_workload(w4_phantom(9, 3, 4, MixAll), no_faults(), DriveOptions(9, 100))
+    assert_eq(parse_history(history_jsonl(run.history)).unwrap(), run.history)
+
+@test
+the_driver_runs_predicate_reads_inserts_and_deletes()
+    val b = bench(no_faults())
+    val clock: &SimClock = SimClock(0)
+    val pre = buf[Plan]()
+    pre.push(hplan(Serializable, items_of([SInsertKey("k1", 1), SInsertKey("k2", 1), SInsertKey("k3", 2)])))
+    val clients = buf[Buf[Plan]]()
+    val ps = buf[Plan]()
+    ps.push(hplan(Snapshot, items_of([SPred(1), SDelete("k1"), SPred(1)])))
+    clients.push(ps)
+    val post = buf[Plan]()
+    post.push(hplan(Serializable, items_of([SPred(1), SPred(2)])))
+    val h = drive(b, clock, pre, clients, post, DriveOptions(1, 0)).unwrap()
+    val last = h[h.len() - 1]
+    assert(last.value[0] == m_pred_rows("g = 1", ["k2"]))
+    assert(last.value[1] == m_pred_rows("g = 2", ["k3"]))
+    val mine = h[3]
+    assert(mine.value[0] == m_pred_rows("g = 1", ["k1", "k2"]))
+    assert(mine.value[1] == m_delete("k1"))
+    assert(mine.value[2] == m_pred_rows("g = 1", ["k2"]))
+    assert_eq(check_history(h, check_all()).anomalies.len(), 0)
+
+@test
+the_driver_runs_sums_adds_and_interactive_steps()
+    val b = bench(no_faults())
+    b.seed_rows(buf(), items_of(["a", "b"]), 10)
+    val clock: &SimClock = SimClock(0)
+    val clients = buf[Buf[Plan]]()
+    val ps = buf[Plan]()
+    ps.push(hplan(Serializable, items_of([SReadReg("a"), SThen(m -> items_of([SAdd("a", -read_value(m, "a")), SAdd("b", read_value(m, "a"))]))])))
+    ps.push(hplan(Serializable, items_of([SSum(items_of(["a", "b"]), "total"), SReadReg("a"), SReadReg("b")])))
+    clients.push(ps)
+    val h = drive(b, clock, buf(), clients, buf(), DriveOptions(1, 0)).unwrap()
+    val second = h[h.len() - 1]
+    assert(second.value[0] == m_read_num("total", 20))
+    assert(second.value[1] == m_read_num("a", 0))
+    assert(second.value[2] == m_read_num("b", 20))
+    val first = h[1]
+    assert(first.value[1] == m_add("a", -10))
+    assert(first.value[2] == m_add("b", 10))

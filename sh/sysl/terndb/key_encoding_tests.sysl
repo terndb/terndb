@@ -1,0 +1,611 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+import sysl.rand.{Rng, rng}
+
+// `on-disk-format.md` §4.6 and §4.9: golden keys worked out by hand from the spec's table, the order
+// agreement with `cmp` (`query-tree.md` §3.3) on hand-picked tricky values and on seeded random ones,
+// single and composite, ascending and descending, with nulls in every position; key decoding and its
+// refusals; and secondary-index entries.
+
+private kc(t: Type) -> KeyColumn = KeyColumn(t, false)
+
+private kd(t: Type) -> KeyColumn = KeyColumn(t, true)
+
+private ke_hex(cols: []const KeyColumn, vals: []const Value) -> string = encode_key(cols, vals) match
+    Ok(b) -> hex_string(b.view())
+    Err(e) -> e.code
+
+private ke_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** `v`'s key under the one ascending component `t` is `want`, and decodes to a value `cmp` says is
+ * the same.
+ */
+private ke_golden(t: Type, v: Value, want: string, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(ke_hex([kc(t)], [v]), want, "", file, line)
+
+    decode_key([kc(t)], rf_unhex(want).view()) match
+        Ok(back) -> assert(cmp(t, back[0], v) == 0, "the golden key decodes to another value", file, line)
+        Err(e) -> assert(false, "the golden key does not decode: " + e.code, file, line)
+
+private ke_dec(cols: []const KeyColumn, hex: string) -> string = ke_code(decode_key(cols, rf_unhex(hex).view()))
+
+/** Unsigned lexicographic order of octets: −1, 0 or +1. */
+ke_memcmp(x: []const u8, y: []const u8) -> int
+    val n = if x.len < y.len then x.len else y.len
+
+    for i in 0..<n
+        if x[i] != y[i] then return if x[i] < y[i] then -1 else 1
+
+    if x.len < y.len then -1 elif x.len > y.len then 1 else 0
+
+/** The order `cols` puts two tuples in: the first component `cmp` separates, reversed where it is
+ * descending.
+ */
+ke_tuple_cmp(cols: []const KeyColumn, a: []const Value, b: []const Value) -> int
+    for i in 0..<cols.len
+        val c = cmp(cols[i].ty, a[i], b[i])
+
+        if c != 0 then return if cols[i].descending then -c else c
+
+    0
+
+/** The keys of `a` and `b` under `cols` compare exactly as `cmp` orders the tuples. */
+private ke_agree(cols: []const KeyColumn, a: []const Value, b: []const Value, file: string = __FILE__, line: long = __LINE__)
+    val ka = encode_key(cols, a).unwrap()
+    val kb = encode_key(cols, b).unwrap()
+
+    assert_eq(ke_memcmp(ka.view(), kb.view()), ke_tuple_cmp(cols, a, b), "", file, line)
+
+/** `vs` are strictly ascending under `t`; their keys are strictly ascending, and strictly descending
+ * under a descending component; and every key decodes to its value.
+ */
+private ke_ascending(t: Type, vs: []const Value, file: string = __FILE__, line: long = __LINE__)
+    for i in 0..<vs.len
+        for j in 0..<vs.len
+            assert(cmp(t, vs[i], vs[j]) == (if i < j then -1 elif i > j then 1 else 0), "the values are not ascending", file, line)
+            ke_agree([kc(t)], [vs[i]], [vs[j]], file, line)
+            ke_agree([kd(t)], [vs[i]], [vs[j]], file, line)
+
+        for col in [kc(t), kd(t)]
+            val back = decode_key([col], encode_key([col], [vs[i]]).unwrap().view()).unwrap()
+            assert(cmp(t, back[0], vs[i]) == 0, "a key decodes to another value", file, line)
+
+/** `a` and `b` are distinct values that `cmp` calls equal, and their keys are identical. */
+private ke_equal(t: Type, a: Value, b: Value, file: string = __FILE__, line: long = __LINE__)
+    assert(cmp(t, a, b) == 0, "the values are not equal under cmp", file, line)
+    assert_eq(ke_hex([kc(t)], [a]), ke_hex([kc(t)], [b]), "", file, line)
+    assert_eq(ke_hex([kd(t)], [a]), ke_hex([kd(t)], [b]), "", file, line)
+
+private ke_f(bits: u64) -> Value = Float(real.from_bits(bits))
+
+private ke_f32(bits: u32) -> Value = Float(real(f32.from_bits(bits)))
+
+private ke_color() -> Type = union_of([Field("red", record([])), Field("green", record([])), Field("blue", record([]))])
+
+// -- golden keys --------------------------------------------------------------------------------
+
+@test
+a_signed_integer_key_is_big_endian_with_its_sign_bit_inverted()
+    ke_golden(Int32, Int(1), "80000001")
+    ke_golden(Int32, Int(-1), "7fffffff")
+    ke_golden(Int8, Int(-128), "00")
+    ke_golden(Int8, Int(127), "ff")
+    ke_golden(Int16, Int(0x1234), "9234")
+    ke_golden(Int64, Int(0), "8000000000000000")
+    ke_golden(Int128, Int(-1), "7fffffffffffffffffffffffffffffff")
+
+@test
+the_time_types_and_decimals_are_keyed_as_signed_integers_of_their_row_width()
+    ke_golden(Date, Int(0), "80000000")
+    ke_golden(Time, Int(1), "8000000000000001")
+    ke_golden(DateTime, Int(-1), "7fffffffffffffff")
+    ke_golden(Timestamp, Int(256), "8000000000000100")
+    ke_golden(Decimal(5, 2), Int(-12345), "7fffffffffffcfc7")
+    ke_golden(Decimal(19, 0), Int(1), "80000000000000000000000000000001")
+
+@test
+bool_and_unsigned_keys_are_big_endian_unsigned()
+    ke_golden(Type.Bool, Value.Bool(false), "00")
+    ke_golden(Type.Bool, Value.Bool(true), "01")
+    ke_golden(UInt8, UInt(255), "ff")
+    ke_golden(UInt16, UInt(258), "0102")
+    ke_golden(UInt32, UInt(1), "00000001")
+    ke_golden(UInt64, UInt(0xfffffffffffffffe), "fffffffffffffffe")
+
+@test
+a_float_key_inverts_the_sign_bit_of_a_positive_and_every_bit_of_a_negative()
+    ke_golden(Float64, Float(1.0), "bff0000000000000")
+    ke_golden(Float64, Float(-1.0), "400fffffffffffff")
+    ke_golden(Float64, ke_f(0x7FF0000000000000), "fff0000000000000")
+    ke_golden(Float64, ke_f(0xFFF0000000000000), "000fffffffffffff")
+    ke_golden(Float32, Float(1.0), "bf800000")
+    ke_golden(Float32, Float(-1.0), "407fffff")
+
+@test
+negative_zero_is_keyed_as_positive_zero()
+    ke_golden(Float64, Float(-0.0), "8000000000000000")
+    ke_golden(Float32, Float(-0.0), "80000000")
+
+@test
+every_nan_is_keyed_as_the_one_canonical_quiet_nan()
+    ke_golden(Float64, ke_f(0x7FF8000000000000), "fff8000000000000")
+    ke_golden(Float64, ke_f(0xFFF8000000000000), "fff8000000000000")
+    ke_golden(Float64, ke_f(0x7FF0000000000001), "fff8000000000000")
+    ke_golden(Float64, ke_f(0xFFFFFFFFFFFFFFFF), "fff8000000000000")
+    ke_golden(Float32, ke_f32(0x7FC00000), "ffc00000")
+    ke_golden(Float32, ke_f32(0xFFC00001), "ffc00000")
+
+@test
+an_interval_key_is_its_three_fields_each_as_a_signed_key()
+    ke_golden(Type.Interval, Value.Interval(1, -1, 0), "80000001" + "7fffffff" + "8000000000000000")
+
+@test
+a_uuid_key_is_its_sixteen_octets()
+    ke_golden(Type.Uuid, Value.Uuid(0x00112233445566778899aabbccddeeff), "00112233445566778899aabbccddeeff")
+
+@test
+a_text_or_bytes_key_escapes_nul_and_ends_with_two_nuls()
+    ke_golden(Type.Text, Value.Text(""), "0000")
+    ke_golden(Type.Text, Value.Text("a\0b"), "6100ff620000")
+    ke_golden(Type.Text, Value.Text("\u{e9}"), "c3a90000")
+    ke_golden(Type.Bytes, bytes_value([0xff]), "ff0000")
+    ke_golden(Type.Bytes, bytes_value([0x00, 0x00]), "00ff00ff0000")
+    ke_golden(Type.Bytes, bytes_value([]), "0000")
+
+@test
+an_enum_key_is_its_discriminant_as_a_big_endian_u16()
+    ke_golden(ke_color(), variant(2, rec([])), "0002")
+    ke_golden(ke_color(), variant(0, rec([])), "0000")
+
+@test
+a_nullable_component_is_prefixed_00_for_null_and_01_for_a_value()
+    assert_eq(ke_hex([kc(nullable(Int32))], [Value.Null]), "00")
+    assert_eq(ke_hex([kc(nullable(Int32))], [Int(1)]), "0180000001")
+    assert_eq(ke_hex([kc(nullable(Type.Text))], [Value.Text("")]), "010000")
+
+@test
+a_descending_component_inverts_every_octet_prefix_included()
+    assert_eq(ke_hex([kd(Int32)], [Int(1)]), "7ffffffe")
+    assert_eq(ke_hex([kd(nullable(Int32))], [Value.Null]), "ff")
+    assert_eq(ke_hex([kd(nullable(Int32))], [Int(1)]), "fe7ffffffe")
+    assert_eq(ke_hex([kd(Type.Text)], [Value.Text("a")]), "9effff")
+
+@test
+a_composite_key_is_its_components_concatenated()
+    assert_eq(ke_hex([kc(Int32), kd(Type.Text), kc(nullable(Type.Bool))], [Int(1), Value.Text("a"), Value.Null]),
+        "80000001" + "9effff" + "00")
+
+@test
+the_empty_key_is_zero_octets()
+    assert_eq(ke_hex([], []), "")
+    assert(decode_key(buf[KeyColumn]().view(), buf[u8]().view()).unwrap().len() == 0)
+
+// -- refusals -----------------------------------------------------------------------------------
+
+@test
+relations_records_json_and_unions_with_payloads_cannot_be_key_components()
+    assert(!key_able(Json))
+    assert(!key_able(record([Field("a", Int32)])))
+    assert(!key_able(record([])))
+    assert(!key_able(list(Int32)))
+    assert(!key_able(bag(Int32)))
+    assert(!key_able(rf_shape_k()))
+    assert(!key_able(Named("app", "color")))
+    assert(key_able(ke_color()))
+    assert(key_able(nullable(ke_color())))
+    assert(key_able(nullable(Int32)))
+    assert_eq(ke_hex([kc(Json)], [Value.Text("1")]), "Q6005")
+    assert_eq(ke_hex([kc(list(Int32))], [rel([])]), "Q6005")
+    assert_eq(ke_dec([kc(Json)], "310000"), "Q6005")
+
+private rf_shape_k() -> Type = union_of([Field("circle", record([Field("r", Int32)])), Field("empty", record([]))])
+
+@test
+a_null_in_a_component_that_is_not_nullable_is_a_type_mismatch()
+    assert_eq(ke_hex([kc(Int32)], [Value.Null]), "Q3001")
+
+@test
+a_key_value_of_the_wrong_kind_or_range_is_a_type_mismatch()
+    assert_eq(ke_hex([kc(Int32)], [Value.Text("1")]), "Q3001")
+    assert_eq(ke_hex([kc(Int8)], [Int(128)]), "Q3001")
+    assert_eq(ke_hex([kc(UInt8)], [UInt(256)]), "Q3001")
+    assert_eq(ke_hex([kc(Float32)], [Float(0.1)]), "Q3001")
+    assert_eq(ke_hex([kc(Decimal(2, 0))], [Int(100)]), "Q3001")
+    assert_eq(ke_hex([kc(ke_color())], [variant(3, rec([]))]), "Q3001")
+    assert_eq(ke_hex([kc(ke_color())], [variant(0, rec([Int(1)]))]), "Q3001")
+    assert_eq(ke_hex([kc(Int32)], []), "Q3001")
+
+private ke_text(n: usize, c: string) -> Value
+    var s = ""
+
+    for _ in 0..<n
+        s = s + c
+
+    Value.Text(s)
+
+@test
+a_key_of_exactly_1024_octets_is_accepted_and_one_more_is_key_too_long()
+    assert_eq(ke_code(encode_key([kc(Type.Text)], [ke_text(1022, "a")])), "ok")
+    assert_eq(ke_code(encode_key([kc(Type.Text)], [ke_text(1023, "a")])), "D2001")
+    // Each NUL doubles: 511 of them and the terminator are 1,024 octets.
+    assert_eq(ke_code(encode_key([kc(Type.Text)], [ke_text(511, "\0")])), "ok")
+    assert_eq(ke_code(encode_key([kc(Type.Text)], [ke_text(512, "\0")])), "D2001")
+
+@test
+a_malformed_key_is_corruption()
+    assert_eq(ke_dec([kc(Int32)], ""), "D1001")
+    assert_eq(ke_dec([kc(Int32)], "800000"), "D1001")
+    assert_eq(ke_dec([kc(Int32)], "8000000100"), "D1001")
+    assert_eq(ke_dec([kc(Type.Bool)], "02"), "D1001")
+    assert_eq(ke_dec([kc(nullable(Int32))], "02"), "D1001")
+    assert_eq(ke_dec([kc(nullable(Int32))], "0080000001"), "D1001")
+    assert_eq(ke_dec([kd(nullable(Int32))], "fd"), "D1001")
+    assert_eq(ke_dec([kc(Type.Text)], "61"), "D1001")
+    assert_eq(ke_dec([kc(Type.Text)], "6100"), "D1001")
+    assert_eq(ke_dec([kc(Type.Text)], "610001"), "D1001")
+    assert_eq(ke_dec([kc(Type.Text)], "ff0000"), "D1001")
+    assert_eq(ke_dec([kc(Type.Bytes)], "ff0000"), "ok")
+    assert_eq(ke_dec([kc(ke_color())], "0003"), "D1001")
+    assert_eq(ke_dec([kc(Decimal(2, 0))], "8000000000000064"), "D1001")
+
+@test
+a_float_key_that_is_not_canonical_is_corruption()
+    assert_eq(ke_dec([kc(Float64)], "7fffffffffffffff"), "D1001")
+    assert_eq(ke_dec([kc(Float64)], "fff8000000000001"), "D1001")
+    assert_eq(ke_dec([kc(Float64)], "0007ffffffffffff"), "D1001")
+    assert_eq(ke_dec([kc(Float32)], "7fffffff"), "D1001")
+    assert_eq(ke_dec([kc(Float32)], "ffc00001"), "D1001")
+    assert_eq(ke_dec([kc(Float64)], "fff8000000000000"), "ok")
+
+@test
+a_descending_key_decodes_through_its_inversion()
+    val cols = [kc(Int32), kd(Type.Text), kd(nullable(Type.Bytes)), kd(nullable(Int8))]
+    val vals = [Int(-5), Value.Text("a\0"), bytes_value([0x00, 0xff]), Value.Null]
+    val back = decode_key(cols, encode_key(cols, vals).unwrap().view()).unwrap()
+
+    assert(rf_same_values(back.view(), vals))
+
+// -- order agreement on tricky values -----------------------------------------------------------
+
+@test
+integers_order_from_min_to_max_at_every_width()
+    ke_ascending(Int8, [Int(-128), Int(-1), Int(0), Int(1), Int(127)])
+    ke_ascending(Int16, [Int(-32768), Int(-256), Int(-1), Int(0), Int(255), Int(256), Int(32767)])
+    ke_ascending(Int32, [Int(-2147483648), Int(-65536), Int(-1), Int(0), Int(1), Int(65536), Int(2147483647)])
+    ke_ascending(Int64, [Int(-9223372036854775808), Int(-1), Int(0), Int(1), Int(9223372036854775807)])
+    ke_ascending(Int128, [Int(-170141183460469231731687303715884105728), Int(-9223372036854775809), Int(-1), Int(0),
+        Int(9223372036854775808), Int(170141183460469231731687303715884105727)])
+
+@test
+unsigned_integers_order_from_zero_to_max_at_every_width()
+    ke_ascending(UInt8, [UInt(0), UInt(1), UInt(127), UInt(128), UInt(255)])
+    ke_ascending(UInt16, [UInt(0), UInt(255), UInt(256), UInt(65535)])
+    ke_ascending(UInt32, [UInt(0), UInt(0x7fffffff), UInt(0x80000000), UInt(0xffffffff)])
+    ke_ascending(UInt64, [UInt(0), UInt(1), UInt(0x7fffffffffffffff), UInt(0x8000000000000000), UInt(0xffffffffffffffff)])
+
+@test
+bools_order_false_then_true()
+    ke_ascending(Type.Bool, [Value.Bool(false), Value.Bool(true)])
+
+@test
+floats_order_negative_infinity_to_nan()
+    ke_ascending(Float64, [ke_f(0xFFF0000000000000), ke_f(0xFFEFFFFFFFFFFFFF), Float(-1.0), ke_f(0x8000000000000001),
+        Float(0.0), ke_f(1), Float(1.0), ke_f(0x7FEFFFFFFFFFFFFF), ke_f(0x7FF0000000000000), ke_f(0x7FF8000000000000)])
+    ke_ascending(Float32, [ke_f32(0xFF800000), ke_f32(0xFF7FFFFF), Float(-1.0), ke_f32(0x80000001), Float(0.0),
+        ke_f32(1), Float(1.0), ke_f32(0x7F7FFFFF), ke_f32(0x7F800000), ke_f32(0x7FC00000)])
+
+@test
+negative_and_positive_zero_and_every_nan_are_equal_keys()
+    ke_equal(Float64, Float(0.0), Float(-0.0))
+    ke_equal(Float64, ke_f(0x7FF8000000000000), ke_f(0xFFF8000000000000))
+    ke_equal(Float64, ke_f(0x7FF8000000000000), ke_f(0x7FF0000000000001))
+    ke_equal(Float32, Float(0.0), Float(-0.0))
+    ke_equal(Float32, ke_f32(0x7FC00000), ke_f32(0xFFC00001))
+
+@test
+decimals_order_by_their_unscaled_value_at_both_widths()
+    ke_ascending(Decimal(18, 4), [Int(-999999999999999999), Int(-1), Int(0), Int(1), Int(999999999999999999)])
+    ke_ascending(Decimal(38, 0), [Int(-99999999999999999999999999999999999999), Int(-1), Int(0),
+        Int(99999999999999999999999999999999999999)])
+
+@test
+decimals_of_differing_scale_that_compare_equal_have_equal_keys_once_coerced_to_the_columns_type()
+    // 1.5 as decimal(4, 1) and 1.50 as decimal(5, 2) meet in decimal(5, 2): a key column has one type,
+    // and its key is that of the coerced value.
+    val t = common_type(Decimal(4, 1), Decimal(5, 2)).unwrap()
+    val a = coerce(Int(15), Decimal(4, 1), t).unwrap()
+    val b = coerce(Int(150), Decimal(5, 2), t).unwrap()
+
+    ke_equal(t, a, b)
+    ke_ascending(t, [coerce(Int(-15), Decimal(4, 1), t).unwrap(), Int(149), a, Int(151)])
+
+@test
+dates_times_and_timestamps_order_to_their_range_ends()
+    ke_ascending(Date, [Int(-2147483648), Int(-1), Int(0), Int(2147483647)])
+    ke_ascending(Time, [Int(0), Int(1), Int(86399999999)])
+    ke_ascending(DateTime, [Int(-9223372036854775808), Int(0), Int(9223372036854775807)])
+    ke_ascending(Timestamp, [Int(-9223372036854775808), Int(-1), Int(0), Int(1), Int(9223372036854775807)])
+
+@test
+intervals_order_by_months_then_days_then_microseconds_to_their_range_ends()
+    ke_ascending(Type.Interval, [Value.Interval(-2147483648, -2147483648, -9223372036854775808),
+        Value.Interval(-1, 2147483647, 9223372036854775807), Value.Interval(0, -1, 0), Value.Interval(0, 0, -1),
+        Value.Interval(0, 0, 0), Value.Interval(0, 0, 1), Value.Interval(0, 1, -9223372036854775808),
+        Value.Interval(1, -2147483648, 0), Value.Interval(2147483647, 2147483647, 9223372036854775807)])
+
+@test
+uuids_order_as_their_128_bits()
+    ke_ascending(Type.Uuid, [Value.Uuid(0), Value.Uuid(1), Value.Uuid(0xff), Value.Uuid(0x0100),
+        Value.Uuid(0x7fffffffffffffffffffffffffffffff), Value.Uuid(0x80000000000000000000000000000000),
+        Value.Uuid(0xffffffffffffffffffffffffffffffff)])
+
+@test
+text_orders_by_its_utf8_octets_with_prefixes_and_nuls_first()
+    ke_ascending(Type.Text, [Value.Text(""), Value.Text("\0"), Value.Text("\0\0"), Value.Text("\0a"), Value.Text("\u{1}"),
+        Value.Text("A"), Value.Text("a"), Value.Text("a\0"), Value.Text("a\0\0"), Value.Text("a\0b"), Value.Text("a\u{1}"),
+        Value.Text("aa"), Value.Text("ab"), Value.Text("b"), Value.Text("\u{7f}"), Value.Text("\u{e9}"),
+        Value.Text("\u{ffff}"), Value.Text("\u{1F600}")])
+
+@test
+bytes_order_with_00_and_ff_octets_in_every_position()
+    ke_ascending(Type.Bytes, [bytes_value([]), bytes_value([0x00]), bytes_value([0x00, 0x00]), bytes_value([0x00, 0xff]),
+        bytes_value([0x00, 0xff, 0x00]), bytes_value([0x01]), bytes_value([0xfe, 0xff]), bytes_value([0xff]),
+        bytes_value([0xff, 0x00]), bytes_value([0xff, 0xff]), bytes_value([0xff, 0xff, 0xff])])
+
+@test
+enums_order_by_declaration()
+    ke_ascending(ke_color(), [variant(0, rec([])), variant(1, rec([])), variant(2, rec([]))])
+
+@test
+null_sorts_first_ascending_and_last_descending()
+    ke_ascending(nullable(Int32), [Value.Null, Int(-2147483648), Int(0), Int(2147483647)])
+    ke_ascending(nullable(Type.Text), [Value.Null, Value.Text(""), Value.Text("\0"), Value.Text("a")])
+    ke_ascending(nullable(Type.Bytes), [Value.Null, bytes_value([]), bytes_value([0x00])])
+    ke_ascending(nullable(Float64), [Value.Null, ke_f(0xFFF0000000000000), Float(0.0), ke_f(0x7FF8000000000000)])
+    ke_ascending(nullable(Type.Bool), [Value.Null, Value.Bool(false), Value.Bool(true)])
+    ke_ascending(nullable(ke_color()), [Value.Null, variant(0, rec([])), variant(2, rec([]))])
+
+@test
+composite_keys_mixing_directions_order_component_by_component()
+    val cols = [kc(nullable(Type.Text)), kd(Int32), kd(nullable(Type.Bytes)), kc(nullable(Float64))]
+    val pool = [
+        [Value.Null, Int(0), Value.Null, Value.Null],
+        [Value.Null, Int(0), Value.Null, Float(0.0)],
+        [Value.Null, Int(0), bytes_value([]), Value.Null],
+        [Value.Null, Int(1), Value.Null, Value.Null],
+        [Value.Text(""), Int(0), Value.Null, Value.Null],
+        [Value.Text(""), Int(-1), bytes_value([0x00]), Float(-0.0)],
+        [Value.Text("\0"), Int(5), bytes_value([0xff]), ke_f(0x7FF8000000000000)],
+        [Value.Text("a"), Int(5), bytes_value([0x00, 0xff]), Float(1.0)],
+        [Value.Text("a"), Int(5), bytes_value([0x00]), Float(1.0)],
+        [Value.Text("a"), Int(5), bytes_value([0x00]), Value.Null],
+        [Value.Text("a\0"), Int(-2147483648), Value.Null, Float(1.0)],
+        [Value.Text("ab"), Int(2147483647), bytes_value([]), Float(1.0)]]
+
+    for a in pool
+        for b in pool
+            ke_agree(cols, a, b)
+
+@test
+a_shorter_text_component_sorts_before_a_longer_one_whatever_follows()
+    // Without the terminator ("a" ‖ 0xFF… against "a\0" ‖ …) the second component would decide.
+    val cols = [kc(Type.Text), kc(Type.Bytes)]
+
+    ke_agree(cols, [Value.Text("a"), bytes_value([0xff, 0xff])], [Value.Text("a\0"), bytes_value([])])
+    ke_agree(cols, [Value.Text("a"), bytes_value([0xff])], [Value.Text("ab"), bytes_value([0x00])])
+    ke_agree([kd(Type.Text), kd(Type.Bytes)], [Value.Text("a"), bytes_value([0xff, 0xff])], [Value.Text("a\0"), bytes_value([])])
+
+// -- order agreement on random values -----------------------------------------------------------
+
+/** A key-able type: any scalar but `json`, or an enum. */
+private ke_key_type(r: *Rng) -> Type
+    loop
+        val t = rf_scalar_type(r)
+
+        if t == Json then continue
+        if r.below(12) == 0
+            val vs = buf[Field]()
+
+            for i in 0..<usize(1 + r.below(5))
+                vs.push(Field(s"e$i", record([])))
+
+            return Type.Union(vs)
+
+        return t
+
+/** A value of the key-able `t`, often one of a small pool so that ties and near-ties are common. */
+private ke_key_value(r: *Rng, t: Type, pool: Buf[Value]) -> Value
+    if t.is_nullable() && r.below(5) == 0 then return Value.Null
+    if pool.len() > 0 && r.below(3) == 0 then return pool[usize(r.below(u64(pool.len())))]
+
+    val v = rf_scalar_value(r, t.base())
+
+    pool.push(v)
+    v
+
+@test
+random_single_component_keys_agree_with_cmp_in_both_directions()
+    var r = rng(0x5eed_1001, 1)
+
+    for _ in 0..<400
+        val t = if r.boolean() then nullable(ke_key_type(&r)) else ke_key_type(&r)
+        val pool = buf[Value]()
+
+        for _ in 0..<40
+            val a = ke_key_value(&r, t, pool)
+            val b = ke_key_value(&r, t, pool)
+
+            ke_agree([kc(t)], [a], [b])
+            ke_agree([kd(t)], [a], [b])
+
+@test
+random_composite_keys_agree_with_cmp()
+    var r = rng(0x5eed_1002, 1)
+
+    for _ in 0..<400
+        val cols = buf[KeyColumn]()
+        val pools = buf[Buf[Value]]()
+
+        for _ in 0..<usize(1 + r.below(4))
+            val t = if r.boolean() then nullable(ke_key_type(&r)) else ke_key_type(&r)
+
+            cols.push(KeyColumn(t, r.boolean()))
+            pools.push(buf[Value]())
+
+        for _ in 0..<40
+            val a = buf[Value]()
+            val b = buf[Value]()
+
+            for i in 0..<cols.len()
+                a.push(ke_key_value(&r, cols[i].ty, pools[i]))
+                b.push(if r.below(3) == 0 then a[i] else ke_key_value(&r, cols[i].ty, pools[i]))
+
+            ke_agree(cols.view(), a.view(), b.view())
+
+@test
+random_keys_decode_to_values_cmp_calls_the_same()
+    var r = rng(0x5eed_1003, 1)
+
+    for _ in 0..<2000
+        val cols = buf[KeyColumn]()
+        val vals = buf[Value]()
+        val pool = buf[Value]()
+
+        for _ in 0..<usize(r.below(5))
+            val t = if r.boolean() then nullable(ke_key_type(&r)) else ke_key_type(&r)
+
+            cols.push(KeyColumn(t, r.boolean()))
+            vals.push(ke_key_value(&r, t, pool))
+            pool.clear()
+
+        val key = encode_key(cols.view(), vals.view()).unwrap()
+        val back = decode_key(cols.view(), key.view()).unwrap()
+
+        assert_eq(ke_tuple_cmp(cols.view(), back.view(), vals.view()), 0)
+        assert(encode_key(cols.view(), back.view()).unwrap().view() == key.view())
+
+        for n in 0..<key.len()
+            assert_eq(ke_code(decode_key(cols.view(), key.view()[0..<n])), "D1001")
+
+@test
+random_corruption_of_a_key_is_rejected_or_read()
+    var r = rng(0x5eed_1004, 1)
+
+    for _ in 0..<2000
+        val cols = buf[KeyColumn]()
+        val vals = buf[Value]()
+        val pool = buf[Value]()
+
+        for _ in 0..<usize(1 + r.below(4))
+            val t = if r.boolean() then nullable(ke_key_type(&r)) else ke_key_type(&r)
+
+            cols.push(KeyColumn(t, r.boolean()))
+            vals.push(ke_key_value(&r, t, pool))
+            pool.clear()
+
+        val key = encode_key(cols.view(), vals.view()).unwrap()
+
+        if key.len() > 0 then key[usize(r.below(u64(key.len())))] = u8(r.below(256))
+
+        decode_key(cols.view(), key.view()) match
+            Ok(_) -> ()
+            Err(e) -> assert_eq(e.code, "D1001")
+
+// -- §4.9 secondary-index entries ---------------------------------------------------------------
+
+private ke_pk() -> Buf[KeyColumn]
+    val b = buf[KeyColumn]()
+    b.push(kc(Int64))
+    b.push(kd(Type.Text))
+    b
+
+private ke_entry(e: Result[IndexEntry, CodecError]) -> string = e match
+    Ok(x) -> hex_string(x.key.view()) + "/" + hex_string(x.value.view())
+    Err(err) -> err.code
+
+@test
+a_non_unique_entry_is_index_columns_then_the_primary_key_with_an_empty_value()
+    val got = index_entry([kc(nullable(Int32))], [Int(1)], ke_pk().view(), [Int(7), Value.Text("a")], false)
+
+    assert_eq(ke_entry(got), "0180000001" + "8000000000000007" + "9effff" + "/")
+
+@test
+a_unique_entry_is_index_columns_with_the_encoded_primary_key_as_its_value()
+    val got = index_entry([kc(nullable(Int32))], [Int(1)], ke_pk().view(), [Int(7), Value.Text("a")], true)
+
+    assert_eq(ke_entry(got), "0180000001" + "/" + "8000000000000007" + "9effff")
+
+@test
+a_unique_entry_with_a_null_component_takes_the_non_unique_form()
+    val got = index_entry([kc(Int32), kc(nullable(Type.Text))], [Int(1), Value.Null], ke_pk().view(), [Int(7), Value.Text("a")], true)
+
+    assert_eq(ke_entry(got), "80000001" + "00" + "8000000000000007" + "9effff" + "/")
+
+    val other = index_entry([kc(Int32), kc(nullable(Type.Text))], [Int(1), Value.Null], ke_pk().view(), [Int(8), Value.Text("a")], true)
+
+    assert(got.unwrap().key != other.unwrap().key)
+
+@test
+the_primary_keys_octets_in_an_entry_are_the_clustered_keys()
+    val pk = encode_key(ke_pk().view(), [Int(-3), Value.Text("zz")]).unwrap()
+    val e = index_entry([kc(Type.Bool)], [Value.Bool(true)], ke_pk().view(), [Int(-3), Value.Text("zz")], false).unwrap()
+
+    assert(e.key.view()[1..] == pk.view())
+    assert(index_entry([kc(Type.Bool)], [Value.Bool(true)], ke_pk().view(), [Int(-3), Value.Text("zz")], true).unwrap().value == pk)
+
+@test
+index_entries_decode_back_to_their_values()
+    val ix = [kc(nullable(Int32)), kd(nullable(Type.Text))]
+
+    for unique in [false, true]
+        for ivals in [[Int(1), Value.Text("q")], [Value.Null, Value.Text("q")], [Int(1), Value.Null], [Value.Null, Value.Null]]
+            val e = index_entry(ix, ivals, ke_pk().view(), [Int(7), Value.Text("a\0")], unique).unwrap()
+            val back = decode_index_entry(ix, ke_pk().view(), unique, e.key.view(), e.value.view()).unwrap()
+
+            assert(rf_same_values(back.index.view(), ivals))
+            assert(rf_same_values(back.primary.view(), [Int(7), Value.Text("a\0")]))
+
+@test
+non_unique_entries_order_by_index_value_then_primary_key()
+    val ix = [kc(nullable(Int32))]
+    val rows = [[Value.Null, Int(1)], [Value.Null, Int(2)], [Int(0), Int(-5)], [Int(0), Int(3)], [Int(1), Int(-9)]]
+
+    for i in 0..<rows.len
+        for j in 0..<rows.len
+            val a = index_entry(ix, rows[i][0..<1], [kc(Int64)], rows[i][1..], false).unwrap()
+            val b = index_entry(ix, rows[j][0..<1], [kc(Int64)], rows[j][1..], false).unwrap()
+
+            assert_eq(ke_memcmp(a.key.view(), b.key.view()), if i < j then -1 elif i > j then 1 else 0)
+
+@test
+a_malformed_index_entry_is_corruption()
+    val ix = [kc(nullable(Int32))]
+    val pk = [kc(Int64)]
+    val ne = index_entry(ix, [Int(1)], pk, [Int(7)], false).unwrap()
+    val ue = index_entry(ix, [Int(1)], pk, [Int(7)], true).unwrap()
+
+    assert_eq(ke_code(decode_index_entry(ix, pk, false, ne.key.view(), rf_unhex("00").view())), "D1001")
+    assert_eq(ke_code(decode_index_entry(ix, pk, false, ue.key.view(), ue.value.view())), "D1001")
+    assert_eq(ke_code(decode_index_entry(ix, pk, true, ne.key.view(), ne.value.view())), "D1001")
+    assert_eq(ke_code(decode_index_entry(ix, pk, true, ue.key.view(), buf[u8]().view())), "D1001")
+    assert_eq(ke_code(decode_index_entry(ix, pk, true, ue.key.view(), ue.value.view())), "ok")
+
+@test
+a_nullable_primary_key_column_is_refused()
+    assert_eq(ke_entry(index_entry([kc(Int32)], [Int(1)], [kc(nullable(Int64))], [Int(1)], false)), "Q6005")
+
+@test
+an_index_entry_key_past_1024_octets_is_key_too_long()
+    val ix = [kc(Type.Text)]
+    val pk = [kc(Int64)]
+
+    // 1,014 + 2 + 8 = 1,024 octets in the non-unique form.
+    assert_eq(ke_code(index_entry(ix, [ke_text(1014, "a")], pk, [Int(1)], false)), "ok")
+    assert_eq(ke_code(index_entry(ix, [ke_text(1015, "a")], pk, [Int(1)], false)), "D2001")
+    assert_eq(ke_code(index_entry(ix, [ke_text(1015, "a")], pk, [Int(1)], true)), "ok")
+    assert_eq(ke_code(index_entry(ix, [ke_text(1023, "a")], pk, [Int(1)], true)), "D2001")

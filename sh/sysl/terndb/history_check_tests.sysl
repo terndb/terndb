@@ -1,0 +1,848 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The checker on hand-built histories: for each phenomenon of `isolation.md` §2.4 a minimal history
+// that shows it, which must be found with its cycle, and a near miss, which must not be flagged;
+// then the edges of the history model: nothing, one transaction, only aborts, unknown outcomes read
+// both ways, duplicates, garbage, a very long cycle, the white-box checks and the levels of §3.4.
+
+/** Builds a history by hand. A transaction is invoked with `inv` and completed with `ok`, `fail` or
+ * `info` on its process, so that invoking several before completing any makes them concurrent;
+ * `tx` invokes and completes one at once, after everything before it.
+ */
+struct Hb
+    events: Buf[HEvent]
+    time: u64
+    txns: usize
+
+    inv(*self, p: u64, level: string) -> usize
+        self.push(p, HInvoke, level, buf(), "", 0, 0, 0)
+        self.txns += 1
+        self.txns - 1
+
+    ok(*self, p: u64, ops: []const Mop) = self.push(p, HOk, "", items_of(ops), "", 0, 0, 0)
+
+    ok_wb(*self, p: u64, ops: []const Mop, txid: u64, snapshot: u64, commit: u64) = self.push(p, HOk, "", items_of(ops), "", txid, snapshot, commit)
+
+    fail(*self, p: u64, ops: []const Mop, error: string = "serialization_failure") = self.push(p, HFail, "", items_of(ops), error, 0, 0, 0)
+
+    info(*self, p: u64, ops: []const Mop) = self.push(p, HInfo, "", items_of(ops), "", 0, 0, 0)
+
+    tx(*self, p: u64, level: string, ops: []const Mop) -> usize
+        val t = self.inv(p, level)
+        self.ok(p, ops)
+        t
+
+    push(*self, p: u64, kind: HKind, level: string, ops: Buf[Mop], error: string, txid: u64, snapshot: u64, commit: u64)
+        // A completion carries its invocation's level.
+        var lv = level
+        if lv.len == 0
+            var i = self.events.len()
+            while i > 0
+                i -= 1
+                if self.events[i].process == p && self.events[i].kind == HInvoke
+                    lv = self.events[i].level
+                    break
+        self.events.push(HEvent(u64(self.events.len()), self.time, p, "primary", kind, lv, true, txid, snapshot, commit, error, ops))
+        self.time += 10
+
+    check(self) -> HistoryReport = check_history(self.events, check_all())
+
+hb() -> Hb = Hb(buf(), 100, 0)
+
+/** The transactions of `a`'s cycle, in order. */
+cyc_txns(a: Anomaly) -> Buf[usize] = a.txns
+
+assert_clean(r: HistoryReport, file: string = __FILE__, line: long = __LINE__)
+    assert(r.anomalies.len() == 0, s"expected no anomaly, found:\n${r.summary()}", file, line)
+
+assert_forbidden(r: HistoryReport, name: string, file: string = __FILE__, line: long = __LINE__)
+    assert(r.found_forbidden(name), s"expected a forbidden $name, found:\n${r.summary()}", file, line)
+    if name != "malformed" then assert(!r.found("malformed"), s"the history is malformed:\n${r.summary()}", file, line)
+
+assert_permitted(r: HistoryReport, name: string, file: string = __FILE__, line: long = __LINE__)
+    assert(r.found(name) && !r.found_forbidden(name), s"expected a permitted $name, found:\n${r.summary()}", file, line)
+    assert(r.forbidden().len() == 0, s"expected nothing forbidden, found:\n${r.summary()}", file, line)
+
+assert_set(got: Buf[usize], want: []const usize, file: string = __FILE__, line: long = __LINE__)
+    assert(got.len() == want.len, s"expected transactions $want, got $got", file, line)
+    for w in want
+        var hit = false
+        for g in got
+            if g == w then hit = true
+        assert(hit, s"expected transactions $want, got $got", file, line)
+
+// -- the empty and the trivial ---------------------------------------------------------------------
+
+@test
+an_empty_history_has_no_anomaly()
+    val r = hb().check()
+    assert_clean(r)
+    assert_eq(r.txns.len(), 0)
+
+@test
+a_history_of_one_transaction_has_no_anomaly()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("x", 1), m_read_list("x", [1]), m_write("r", 5), m_read_num("r", 5)])
+    assert_clean(h.check())
+
+@test
+a_history_of_only_aborted_transactions_has_no_anomaly()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSi)
+    h.fail(1, [m_append("x", 1), m_read_list("x", [1])])
+    h.fail(2, [m_write("r", 3)], "deadlock_detected")
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[0].outcome == TAborted && r.txns[1].outcome == TAborted)
+
+@test
+an_invoke_never_completed_is_unknown_and_harmless()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[0].outcome == TUnknown)
+
+@test
+a_completion_without_an_invoke_is_malformed()
+    var h = hb()
+    h.ok(1, [m_append("x", 1)])
+    assert_forbidden(h.check(), "malformed")
+
+@test
+a_second_invoke_on_an_open_process_is_malformed()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(1, LevelSer)
+    assert_forbidden(h.check(), "malformed")
+
+// -- G0 ------------------------------------------------------------------------------------------
+
+@test
+g0_a_write_cycle_is_found_with_its_cycle()
+    var h = hb()
+    val t0 = h.inv(1, LevelRc)
+    val t1 = h.inv(2, LevelRc)
+    h.ok(1, [m_append("x", 1), m_append("y", 1)])
+    h.ok(2, [m_append("x", 2), m_append("y", 2)])
+    val _ = h.tx(3, LevelRc, [m_read_list("x", [1, 2]), m_read_list("y", [2, 1])])
+    val r = h.check()
+    assert_forbidden(r, "G0")
+    val a = r.first("G0")
+    assert_set(a.txns, [t0, t1])
+    for e in a.edges
+        assert(e.kind == EWw)
+
+@test
+g0_near_miss_one_order_on_both_keys_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_append("x", 1), m_append("y", 1)])
+    h.ok(2, [m_append("x", 2), m_append("y", 2)])
+    val _ = h.tx(3, LevelRc, [m_read_list("x", [1, 2]), m_read_list("y", [1, 2])])
+    assert_clean(h.check())
+
+@test
+g0_through_registers_is_found()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_read_num("x", 0), m_write("x", 1), m_read_num("y", 2), m_write("y", 3)])
+    h.ok(2, [m_read_num("x", 1), m_write("x", 4), m_read_num("y", 0), m_write("y", 2)])
+    // Each reads the other's write before writing over it: also G1c, but the ww cycle is G0.
+    val r = h.check()
+    assert(r.found_forbidden("G0") || r.found_forbidden("G1c"), r.summary())
+
+// -- G1a -----------------------------------------------------------------------------------------
+
+@test
+g1a_an_aborted_append_read_is_found()
+    var h = hb()
+    val t0 = h.inv(1, LevelSer)
+    val t1 = h.inv(2, LevelSer)
+    h.fail(1, [m_append("x", 1)])
+    h.ok(2, [m_read_list("x", [1])])
+    val r = h.check()
+    assert_forbidden(r, "G1a")
+    assert_set(r.first("G1a").txns, [t0, t1])
+
+@test
+g1a_near_miss_the_aborted_append_unread_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.fail(1, [m_append("x", 1)])
+    h.ok(2, [m_read_list("x", [])])
+    assert_clean(h.check())
+
+@test
+g1a_an_aborted_register_write_read_is_found()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.fail(1, [m_write("r", 7)])
+    h.ok(2, [m_read_num("r", 7)])
+    assert_forbidden(h.check(), "G1a")
+
+@test
+g1a_an_aborted_insert_in_a_predicate_read_is_found()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.fail(1, [m_write("k1", 1)])
+    h.ok(2, [m_pred_rows("g = 1", ["k1"])])
+    assert_forbidden(h.check(), "G1a")
+
+// -- G1b -----------------------------------------------------------------------------------------
+
+@test
+g1b_an_intermediate_list_version_is_found()
+    var h = hb()
+    val t0 = h.inv(1, LevelSi)
+    val t1 = h.inv(2, LevelSi)
+    h.ok(1, [m_append("x", 1), m_append("x", 2)])
+    h.ok(2, [m_read_list("x", [1])])
+    val r = h.check()
+    assert_forbidden(r, "G1b")
+    assert_set(r.first("G1b").txns, [t0, t1])
+
+@test
+g1b_near_miss_the_final_version_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    val _ = h.inv(2, LevelSi)
+    h.ok(1, [m_append("x", 1), m_append("x", 2)])
+    h.ok(2, [m_read_list("x", [1, 2])])
+    assert_clean(h.check())
+
+@test
+g1b_an_intermediate_register_write_is_found()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_write("r", 1), m_write("r", 2)])
+    h.ok(2, [m_read_num("r", 1)])
+    assert_forbidden(h.check(), "G1b")
+
+@test
+g1b_near_miss_a_transaction_reading_its_own_intermediate_write_is_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_write("r", 1), m_read_num("r", 1), m_write("r", 2), m_read_num("r", 2)])
+    assert_clean(h.check())
+
+// -- G1c -----------------------------------------------------------------------------------------
+
+@test
+g1c_circular_information_flow_is_found_with_its_cycle()
+    var h = hb()
+    val t0 = h.inv(1, LevelRc)
+    val t1 = h.inv(2, LevelRc)
+    h.ok(1, [m_append("x", 1), m_read_list("y", [1])])
+    h.ok(2, [m_append("y", 1), m_read_list("x", [1])])
+    val r = h.check()
+    assert_forbidden(r, "G1c")
+    val a = r.first("G1c")
+    assert_set(a.txns, [t0, t1])
+    for e in a.edges
+        assert(e.kind == EWr)
+
+@test
+g1c_near_miss_one_way_flow_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_append("x", 1), m_read_list("y", [])])
+    h.ok(2, [m_append("y", 1), m_read_list("x", [1])])
+    assert_clean(h.check())
+
+// -- G-single ------------------------------------------------------------------------------------
+
+// Read skew: t0 misses t1's append to x but sees its append to y.
+private read_skew(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("x", []), m_read_list("y", [1])])
+    h.ok(2, [m_append("x", 1), m_append("y", 1)])
+    val _ = h.inv(3, LevelSer)
+    h.ok(3, [m_read_list("x", [1]), m_read_list("y", [1])])
+    h.check()
+
+@test
+g_single_read_skew_is_forbidden_at_snapshot_with_its_cycle()
+    val r = read_skew(LevelSi)
+    assert_forbidden(r, "G-single")
+    val a = r.first("G-single")
+    assert_set(a.txns, [0, 1])
+    var rws: usize = 0
+    for e in a.edges
+        if e.kind == ERw then rws += 1
+    assert_eq(rws, 1)
+
+@test
+g_single_read_skew_is_forbidden_at_serializable()
+    assert_forbidden(read_skew(LevelSer), "G-single")
+
+@test
+g_single_read_skew_is_permitted_at_read_committed()
+    assert_permitted(read_skew(LevelRc), "G-single")
+
+@test
+g_single_near_miss_a_consistent_read_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    val _ = h.inv(2, LevelSi)
+    h.ok(1, [m_read_list("x", [1]), m_read_list("y", [1])])
+    h.ok(2, [m_append("x", 1), m_append("y", 1)])
+    assert_clean(h.check())
+
+// -- G-nonadjacent -------------------------------------------------------------------------------
+
+@test
+g_nonadjacent_is_forbidden_at_snapshot()
+    var h = hb()
+    for p in 1..4
+        val _ = h.inv(u64(p), LevelSi)
+    h.ok(1, [m_read_list("a", []), m_read_list("d", [1])])
+    h.ok(2, [m_append("a", 1), m_append("b", 1)])
+    h.ok(3, [m_read_list("b", [1]), m_read_list("c", [])])
+    h.ok(4, [m_append("c", 1), m_append("d", 1)])
+    val _ = h.tx(5, LevelSer, [m_read_list("a", [1]), m_read_list("c", [1])])
+    val r = h.check()
+    assert_forbidden(r, "G-nonadjacent")
+    assert_set(r.first("G-nonadjacent").txns, [0, 1, 2, 3])
+    assert(!r.found("G-single"), r.summary())
+
+@test
+g_nonadjacent_near_miss_adjacent_rw_edges_are_write_skew_and_permitted_at_snapshot()
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    val _ = h.inv(2, LevelSi)
+    h.ok(1, [m_read_list("a", []), m_read_list("b", []), m_append("a", 1)])
+    h.ok(2, [m_read_list("a", []), m_read_list("b", []), m_append("b", 1)])
+    val _ = h.tx(3, LevelSer, [m_read_list("a", [1]), m_read_list("b", [1])])
+    val r = h.check()
+    assert(!r.found("G-nonadjacent"), r.summary())
+    assert_permitted(r, "A5B")
+
+// -- G2-item and A5B -----------------------------------------------------------------------------
+
+private write_skew(l0: string, l1: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, l0)
+    val _ = h.inv(2, l1)
+    h.ok(1, [m_read_num("x", 0), m_read_num("y", 0), m_write("x", 1)])
+    h.ok(2, [m_read_num("x", 0), m_read_num("y", 0), m_write("y", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_num("x", 1), m_read_num("y", 2)])
+    h.check()
+
+@test
+a5b_write_skew_is_forbidden_at_serializable_with_its_cycle()
+    val r = write_skew(LevelSer, LevelSer)
+    assert_forbidden(r, "A5B")
+    val a = r.first("A5B")
+    assert_set(a.txns, [0, 1])
+    for e in a.edges
+        assert(e.kind == ERw && !e.pred)
+
+@test
+a5b_write_skew_is_permitted_at_snapshot()
+    assert_permitted(write_skew(LevelSi, LevelSi), "A5B")
+
+@test
+a5b_write_skew_with_one_snapshot_transaction_is_permitted()
+    // §3.4: the cycle involves a snapshot transaction, whose level allows it.
+    assert_permitted(write_skew(LevelSer, LevelSi), "A5B")
+
+@test
+a5b_near_miss_the_second_reads_the_first_write_is_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_read_num("x", 0), m_read_num("y", 0), m_write("x", 1)])
+    val _ = h.tx(2, LevelSer, [m_read_num("x", 1), m_read_num("y", 0), m_write("y", 2)])
+    assert_clean(h.check())
+
+@test
+g2_item_with_three_transactions_is_forbidden_at_serializable()
+    // t0 -rw(x)-> t1 -rw(y)-> t2 -rw(z)-> t0: three rw edges, each adjacent to the next.
+    var h = hb()
+    for p in 1..3
+        val _ = h.inv(u64(p), LevelSer)
+    h.ok(1, [m_read_num("x", 0), m_write("z", 3)])
+    h.ok(2, [m_read_num("y", 0), m_write("x", 1)])
+    h.ok(3, [m_read_num("z", 0), m_write("y", 2)])
+    val r = h.check()
+    assert_forbidden(r, "G2-item")
+    assert_set(r.first("G2-item").txns, [0, 1, 2])
+
+// -- P4 lost update ------------------------------------------------------------------------------
+
+private lost_append(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("x", []), m_append("x", 1)])
+    h.ok(2, [m_read_list("x", []), m_append("x", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1, 2])])
+    h.check()
+
+@test
+p4_a_lost_append_is_forbidden_at_snapshot()
+    val r = lost_append(LevelSi)
+    assert_forbidden(r, "P4")
+    assert_set(r.first("P4").txns, [0, 1])
+
+@test
+p4_a_lost_append_is_permitted_at_read_committed()
+    val r = lost_append(LevelRc)
+    assert(r.found("P4") && !r.found_forbidden("P4"), r.summary())
+    assert_eq(r.forbidden().len(), 0)
+
+@test
+p4_a_lost_register_update_is_forbidden_at_serializable()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok(1, [m_read_num("r", 0), m_write("r", 1)])
+    h.ok(2, [m_read_num("r", 0), m_write("r", 2)])
+    assert_forbidden(h.check(), "P4")
+
+@test
+p4_near_miss_the_second_read_the_first_append_is_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelSi, [m_read_list("x", []), m_append("x", 1)])
+    val _ = h.tx(2, LevelSi, [m_read_list("x", [1]), m_append("x", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1, 2])])
+    assert_clean(h.check())
+
+// -- G2 with predicates --------------------------------------------------------------------------
+
+private phantom(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows("g = 1", []), m_write("k2", 2)])
+    h.ok(2, [m_pred_rows("g = 2", []), m_write("k1", 1)])
+    h.check()
+
+@test
+g2_a_phantom_is_forbidden_at_serializable_with_predicate_edges()
+    val r = phantom(LevelSer)
+    assert_forbidden(r, "G2")
+    val a = r.first("G2")
+    assert_set(a.txns, [0, 1])
+    for e in a.edges
+        assert(e.kind == ERw && e.pred)
+
+@test
+g2_a_phantom_is_permitted_at_snapshot()
+    assert_permitted(phantom(LevelSi), "G2")
+
+@test
+g2_near_miss_the_second_sees_the_first_insert_is_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_pred_rows("g = 1", []), m_write("k2", 2)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows("g = 2", ["k2"]), m_write("k1", 1)])
+    assert_clean(h.check())
+
+@test
+a_predicate_read_lacking_a_deleted_row_is_legal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_write("k1", 1)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows("g = 1", ["k1"]), m_delete("k1")])
+    val _ = h.tx(3, LevelSer, [m_pred_rows("g = 1", [])])
+    assert_clean(h.check())
+
+@test
+a_predicate_read_of_a_row_in_another_group_is_garbage()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_write("k1", 2)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows("g = 1", ["k1"])])
+    assert_forbidden(h.check(), "garbage")
+
+@test
+a_malformed_predicate_is_reported()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_pred_rows("v > 3", [])])
+    assert_forbidden(h.check(), "malformed")
+
+// -- G-stale, G-session, G-rt --------------------------------------------------------------------
+
+@test
+g_stale_a_read_missing_an_acknowledged_append_is_found()
+    var h = hb()
+    val t0 = h.tx(1, LevelSi, [m_append("x", 1)])
+    val t1 = h.tx(2, LevelSi, [m_read_list("x", [])])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1])])
+    val r = h.check()
+    assert_forbidden(r, "G-stale")
+    assert_set(r.first("G-stale").txns, [t0, t1])
+
+@test
+g_stale_is_forbidden_at_read_committed_too()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_read_num("r", 0), m_write("r", 1)])
+    val _ = h.tx(2, LevelRc, [m_read_num("r", 0)])
+    assert_forbidden(h.check(), "G-stale")
+
+@test
+g_stale_of_a_predicate_read_is_found()
+    var h = hb()
+    val _ = h.tx(1, LevelSi, [m_write("k1", 1)])
+    val _ = h.tx(2, LevelSi, [m_pred_rows("g = 1", [])])
+    assert_forbidden(h.check(), "G-stale")
+
+@test
+g_stale_near_miss_a_concurrent_reader_may_miss_the_append()
+    var h = hb()
+    val _ = h.inv(2, LevelSi)
+    val _ = h.tx(1, LevelSi, [m_append("x", 1)])
+    h.ok(2, [m_read_list("x", [])])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1])])
+    assert_clean(h.check())
+
+@test
+g_session_a_read_from_a_later_transaction_of_the_session_is_found()
+    var h = hb()
+    val t0 = h.inv(1, LevelRc)
+    val t2 = h.inv(2, LevelRc)
+    h.ok(1, [m_read_list("y", [1])])
+    val t1 = h.tx(1, LevelRc, [m_append("y", 1)])
+    h.ok(2, [])
+    val r = h.check()
+    assert_forbidden(r, "G-session")
+    assert_set(r.first("G-session").txns, [t0, t1])
+
+@test
+g_session_near_miss_another_session_may_read_ahead()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.ok(1, [m_read_list("y", [1])])
+    h.ok(2, [m_append("y", 1)])
+    assert_clean(h.check())
+
+@test
+g_rt_a_serializable_read_missing_an_acknowledged_commit_is_found()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("x", 1)])
+    val _ = h.tx(2, LevelSer, [m_read_list("x", [])])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1])])
+    val r = h.check()
+    assert_forbidden(r, "G-rt")
+    assert_forbidden(r, "G-stale")
+
+@test
+g_rt_near_miss_concurrent_serializable_transactions_may_order_either_way()
+    var h = hb()
+    val _ = h.inv(2, LevelSer)
+    val _ = h.tx(1, LevelSer, [m_append("x", 1)])
+    h.ok(2, [m_read_list("x", [])])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1])])
+    assert_clean(h.check())
+
+// -- unknown outcomes (§5.4) ---------------------------------------------------------------------
+
+@test
+an_unknown_transaction_whose_append_is_read_committed()
+    var h = hb()
+    val t0 = h.inv(1, LevelSer)
+    h.info(1, [m_append("x", 1)])
+    val _ = h.tx(2, LevelSer, [m_read_list("x", [1])])
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[t0].outcome == TCommitted)
+    assert(r.txns[t0].info)
+
+@test
+an_unknown_transaction_whose_append_is_never_read_may_have_aborted()
+    var h = hb()
+    val t0 = h.inv(1, LevelSer)
+    h.info(1, [m_append("x", 1)])
+    val _ = h.tx(2, LevelSer, [m_read_list("x", [])])
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[t0].outcome == TUnknown)
+
+@test
+an_unknown_register_write_read_by_a_predicate_or_item_read_committed()
+    var h = hb()
+    val t0 = h.inv(1, LevelSer)
+    h.info(1, [m_write("k1", 1), m_write("r", 4)])
+    val _ = h.tx(2, LevelSer, [m_pred_rows("g = 1", ["k1"]), m_read_num("r", 4)])
+    val r = h.check()
+    assert_clean(r)
+    assert(r.txns[t0].outcome == TCommitted)
+
+@test
+an_unknown_transaction_in_a_cycle_is_judged_once_resolved()
+    // t0's outcome is unknown, but t1 read its append, so it committed, and the G1c stands.
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    val _ = h.inv(2, LevelRc)
+    h.info(1, [m_append("x", 1), m_read_list("y", [1])])
+    h.ok(2, [m_append("y", 1), m_read_list("x", [1])])
+    assert_forbidden(h.check(), "G1c")
+
+// -- duplicates, garbage, internal consistency ---------------------------------------------------
+
+@test
+the_same_element_appended_twice_is_a_duplicate_write()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok(1, [m_append("x", 1)])
+    h.ok(2, [m_append("x", 1)])
+    assert_forbidden(h.check(), "duplicate-write")
+
+@test
+a_retry_reusing_an_aborted_attempts_value_is_not_a_duplicate()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.fail(1, [m_append("x", 1)])
+    val _ = h.tx(1, LevelSer, [m_append("x", 1)])
+    val _ = h.tx(2, LevelSer, [m_read_list("x", [1])])
+    assert_clean(h.check())
+
+@test
+a_read_holding_an_element_twice_is_found()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("x", 1)])
+    val _ = h.tx(2, LevelSer, [m_read_list("x", [1, 1])])
+    assert_forbidden(h.check(), "duplicate-elements")
+
+@test
+a_read_of_an_element_never_appended_is_garbage()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_read_list("x", [7])])
+    assert_forbidden(h.check(), "garbage")
+
+@test
+a_read_of_a_register_value_never_written_is_garbage()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_read_num("r", 9)])
+    assert_forbidden(h.check(), "garbage")
+
+@test
+two_reads_no_one_order_explains_are_an_incompatible_order()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok(1, [m_append("x", 1)])
+    h.ok(2, [m_append("x", 2)])
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1, 2])])
+    val _ = h.tx(4, LevelSer, [m_read_list("x", [2, 1])])
+    assert_forbidden(h.check(), "incompatible-order")
+
+@test
+a_read_missing_its_own_append_is_internal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_append("x", 1), m_read_list("x", [])])
+    assert_forbidden(h.check(), "internal")
+
+@test
+a_read_missing_its_own_register_write_is_internal()
+    var h = hb()
+    val _ = h.tx(1, LevelSer, [m_write("r", 1), m_read_num("r", 0)])
+    assert_forbidden(h.check(), "internal")
+
+// -- a very long cycle ---------------------------------------------------------------------------
+
+@test
+a_very_long_cycle_is_found_whole()
+    val n: usize = 60
+    var h = hb()
+    for i in 0..<n
+        val _ = h.inv(u64(i + 1), LevelRc)
+    for i in 0..<n
+        val prev = (i + n - 1) % n
+        h.ok(u64(i + 1), [m_append(s"k$i", i64(i + 1)), m_read_list(s"k$prev", [i64(prev + 1)])])
+    val r = h.check()
+    assert_forbidden(r, "G1c")
+    assert_eq(r.first("G1c").txns.len(), n)
+    assert_eq(r.first("G1c").edges.len(), n)
+
+@test
+a_very_long_chain_without_a_cycle_is_legal()
+    val n: usize = 60
+    var h = hb()
+    for i in 0..<n
+        val _ = h.inv(u64(i + 1), LevelRc)
+    for i in 0..<n
+        if i == 0
+            h.ok(1, [m_append("k0", 1)])
+        else
+            h.ok(u64(i + 1), [m_append(s"k$i", i64(i + 1)), m_read_list(s"k${i - 1}", [i64(i)])])
+    assert_clean(h.check())
+
+// -- counters (I14) and read-only aborts (I16) ---------------------------------------------------
+
+@test
+a_counter_read_missing_an_acknowledged_increment_is_a_lost_increment()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_add("c", 1)])
+    val _ = h.tx(2, LevelRc, [m_add("c", 1)])
+    val _ = h.tx(3, LevelRc, [m_read_num("c", 1)])
+    assert_forbidden(h.check(), "lost-increment")
+
+@test
+a_counter_read_counting_an_increment_never_made_is_found()
+    var h = hb()
+    val _ = h.tx(1, LevelRc, [m_add("c", 1)])
+    val _ = h.tx(2, LevelRc, [m_read_num("c", 2)])
+    assert_forbidden(h.check(), "lost-increment")
+
+@test
+a_counter_read_concurrent_with_increments_may_see_any_of_them()
+    var h = hb()
+    val _ = h.inv(3, LevelRc)
+    val _ = h.inv(4, LevelRc)
+    val _ = h.tx(1, LevelRc, [m_add("c", 1)])
+    val _ = h.inv(2, LevelRc)
+    h.info(2, [m_add("c", 1)])
+    h.ok(3, [m_read_num("c", 0)])
+    h.ok(4, [m_read_num("c", 2)])
+    assert_clean(h.check())
+
+@test
+a_read_only_transaction_aborted_with_serialization_failure_is_i16()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    h.fail(1, [m_read_num("r", 0)])
+    assert_forbidden(h.check(), "I16")
+
+@test
+a_read_committed_transaction_aborted_with_serialization_failure_is_i16()
+    var h = hb()
+    val _ = h.inv(1, LevelRc)
+    h.fail(1, [m_write("r", 1)])
+    assert_forbidden(h.check(), "I16")
+
+@test
+a_writer_aborted_with_serialization_failure_at_snapshot_is_legal()
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    h.fail(1, [m_write("r", 1)])
+    val _ = h.inv(2, LevelSer)
+    h.fail(2, [m_read_num("r", 0)], "deadlock_detected")
+    assert_clean(h.check())
+
+// -- white box (I5 and the read rule) ------------------------------------------------------------
+
+@test
+i5_a_list_order_against_commit_order_is_found_and_the_black_box_check_does_not_see_it()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok_wb(1, [m_append("x", 1)], 10, 1, 5)
+    h.ok_wb(2, [m_append("x", 2)], 11, 1, 3)
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1, 2])])
+    assert_forbidden(h.check(), "I5")
+    assert_clean(check_history(strip_white_box(h.events), check_all()))
+
+@test
+i5_a_register_order_against_commit_order_is_found()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok_wb(1, [m_read_num("r", 0), m_write("r", 1)], 10, 1, 5)
+    h.ok_wb(2, [m_read_num("r", 1), m_write("r", 2)], 11, 1, 3)
+    assert_forbidden(h.check(), "I5")
+
+@test
+wb_read_a_read_older_than_its_snapshot_is_found()
+    var h = hb()
+    val _ = h.inv(2, LevelSi)
+    val _ = h.inv(1, LevelSi)
+    h.ok_wb(1, [m_append("x", 1)], 10, 1, 2)
+    h.ok_wb(2, [m_read_list("x", [])], 11, 2, 2)
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1])])
+    assert_forbidden(h.check(), "wb-read")
+    assert_clean(check_history(strip_white_box(h.events), check_all()))
+
+@test
+wb_read_near_miss_a_read_at_an_earlier_snapshot_is_legal()
+    var h = hb()
+    val _ = h.inv(2, LevelSi)
+    val _ = h.inv(1, LevelSi)
+    h.ok_wb(1, [m_append("x", 1)], 10, 1, 2)
+    h.ok_wb(2, [m_read_list("x", [])], 11, 1, 1)
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1])])
+    assert_clean(h.check())
+
+@test
+wb_read_of_a_register_and_a_predicate_is_found()
+    var h = hb()
+    val _ = h.inv(2, LevelSer)
+    val _ = h.inv(1, LevelSer)
+    h.ok_wb(1, [m_read_num("r", 0), m_write("r", 1), m_write("k1", 1)], 10, 1, 2)
+    h.ok_wb(2, [m_read_num("r", 0), m_pred_rows("g = 1", [])], 11, 3, 3)
+    val r = h.check()
+    var n: usize = 0
+    for a in r.anomalies
+        if a.name == "wb-read" then n += 1
+    assert_eq(n, 2)
+
+// -- the recorded form ---------------------------------------------------------------------------
+
+@test
+a_history_read_back_from_json_lines_checks_the_same()
+    var h = hb()
+    val _ = h.inv(1, LevelSer)
+    val _ = h.inv(2, LevelSer)
+    h.ok(1, [m_read_num("x", 0), m_read_num("y", 0), m_write("x", 1)])
+    h.ok(2, [m_read_num("x", 0), m_read_num("y", 0), m_write("y", 2)])
+    val back = parse_history(history_jsonl(h.events)).unwrap()
+    val r = check_history(back, check_all())
+    assert_forbidden(r, "A5B")
+    assert_eq(r.summary(), h.check().summary())
+
+@test
+a_history_written_by_hand_as_json_lines_is_checked()
+    val text = "{\"index\": 0, \"time\": 1, \"process\": 1, \"type\": \"invoke\", \"level\": \"snapshot\", \"value\": [[\"r\", \"x\", null]]}\n" +
+        "{\"index\": 1, \"time\": 2, \"process\": 2, \"type\": \"invoke\", \"level\": \"snapshot\", \"value\": []}\n" +
+        "{\"index\": 2, \"time\": 3, \"process\": 1, \"type\": \"ok\", \"level\": \"snapshot\", \"value\": [[\"r\", \"x\", []], [\"r\", \"y\", [1]]]}\n" +
+        "\n" +
+        "{\"index\": 3, \"time\": 4, \"process\": 2, \"type\": \"ok\", \"level\": \"snapshot\", \"value\": [[\"append\", \"x\", 1], [\"append\", \"y\", 1]]}\n" +
+        "{\"index\": 4, \"time\": 5, \"process\": 3, \"type\": \"invoke\", \"level\": \"serializable\", \"value\": []}\n" +
+        "{\"index\": 5, \"time\": 6, \"process\": 3, \"type\": \"ok\", \"level\": \"serializable\", \"value\": [[\"r\", \"x\", [1]]]}\n"
+    val r = check_history(parse_history(text).unwrap(), check_all())
+    assert_forbidden(r, "G-single")
+
+@test
+malformed_json_lines_are_refused_with_the_line()
+    assert(parse_history("{\"type\": \"ok\", \"level\": \"snapshot\"}\n{\"type\": \"bogus\", \"level\": \"snapshot\"}").is_err())
+    assert(parse_history("{\"type\": \"ok\", \"level\": \"eventual\"}").is_err())
+    assert(parse_history("[1, 2]").is_err())
+    assert(parse_history("{\"type\": \"ok\", \"level\": \"snapshot\", \"value\": [[\"cas\", \"x\", 1]]}").is_err())
+    assert(parse_history("{\"type\": \"ok\", \"level\": \"snapshot\"").is_err())
+    val e = parse_history("{\"type\": \"ok\", \"level\": \"snapshot\"}\n{\"type\": 7, \"level\": \"snapshot\"}")
+    assert(e.is_err())
+    e match
+        Err(m) -> assert(m.starts_with("line 2"), m)
+        Ok(_) -> ()
+
+@test
+a_json_string_with_escapes_round_trips()
+    val ops = buf[Mop]()
+    ops.push(m_pred_rows("g = 1", ["a\"b", "c\\d", "e\nf", "\u{1}"]))
+    val events = buf[HEvent]()
+    events.push(HEvent(0, 0, 1, "primary", HOk, LevelSer, false, 0, 0, 0, "", ops))
+    assert_eq(parse_history(history_jsonl(events)).unwrap(), events)
+
+@test
+the_black_box_check_finds_the_same_cycles_without_the_white_box_fields()
+    var h = hb()
+    val _ = h.inv(1, LevelSi)
+    val _ = h.inv(2, LevelSi)
+    h.ok_wb(1, [m_read_list("x", []), m_read_list("y", [1])], 10, 0, 0)
+    h.ok_wb(2, [m_append("x", 1), m_append("y", 1)], 11, 0, 1)
+    val _ = h.tx(3, LevelSer, [m_read_list("x", [1]), m_read_list("y", [1])])
+    val white = h.check()
+    val black = check_history(strip_white_box(h.events), check_all())
+    assert_forbidden(white, "G-single")
+    assert_forbidden(black, "G-single")

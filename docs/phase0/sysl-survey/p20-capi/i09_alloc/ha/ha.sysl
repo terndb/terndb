@@ -1,0 +1,46 @@
+module ha
+
+import sysl.buf.{Buf, buf}
+
+// item 9: every allocation the module makes (Buf, string, box) goes through a pair the host installs.
+extern "malloc" c_malloc(n: usize) -> *u8
+extern "free" c_free(p: *u8) -> unit
+
+@export("ha_alloc_fn")
+type AllocFn = *extern(usize) -> *u8
+@export("ha_free_fn")
+type FreeFn = *extern(*u8) -> unit
+
+var hook_alloc: Option[AllocFn] = None
+var hook_free: Option[FreeFn] = None
+var live: i64 = 0
+
+@export("ha_set")
+set(a: AllocFn, f: FreeFn) -> unit
+    hook_alloc = Some(a)
+    hook_free = Some(f)
+
+@export("ha_live")
+live_count() -> i64 = live
+
+@export
+ha_alloc(n: usize) -> *u8
+    live += 1
+    hook_alloc match
+        Some(a) -> a(n)
+        None -> c_malloc(n)
+
+@export
+ha_free(p: *u8) -> unit
+    live -= 1
+    hook_free match
+        Some(f) -> f(p)
+        None -> c_free(p)
+
+@export("ha_work")
+work(n: i32) -> i64
+    var b: Buf[i64] = buf()
+    for i in 0..int(n)
+        b.push(i64(i))
+    val s = s"len ${b.len()}"
+    i64(s.len) + i64(b.len())

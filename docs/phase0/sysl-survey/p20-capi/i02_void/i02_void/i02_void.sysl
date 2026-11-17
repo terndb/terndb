@@ -1,0 +1,8 @@
+module i02_void
+
+@export("i02_alloc_fn")
+type AllocFn = *extern(usize) -> *u8
+
+@export("i02_set")
+set(a: AllocFn, ctx: *u8) -> unit
+    ()

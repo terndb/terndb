@@ -1,0 +1,25 @@
+import sysl.io.poll.{Event, Poller}
+import sysl.process.pipe
+import sysl.threads.scope
+import sysl.time.millis
+
+extern "write" c_write(fd: i32, p: *u8, n: usize) -> isize
+
+main()
+    val p = Poller.open().unwrap()
+    var (r, w) = pipe().unwrap()
+    val rfd = r.fd().unwrap()
+    val wfd = i32(w.into_raw_fd().unwrap())
+    p.register(rfd, [sysl.io.wait.Readable], 7).unwrap()
+    var got = [Event.none; 4]
+    var byte: u8 = 1
+    scope((s) ->
+        s.spawn(() ->
+            sysl.time.sleep(millis(300))
+            c_write(wfd, &byte, 1)
+        )
+        val n = p.wait(got[..], None).unwrap()
+        print("events", n, "token", got[0].token, "readable", got[0].readable)
+        val n2 = p.wait(got[..], Some(millis(10))).unwrap()
+        print("level-triggered, second wait events", n2)
+    )

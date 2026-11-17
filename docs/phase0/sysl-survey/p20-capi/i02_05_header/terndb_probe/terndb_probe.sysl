@@ -1,0 +1,31 @@
+module terndb_probe
+
+// items 2-5: what the emitted header can say
+val TERNDB_ABI_VERSION: u32 = 1
+const TERNDB_DIGEST_LEN: usize = 32
+
+@export("terndb_db")
+opaque struct Db
+    n: i64
+
+@export("terndb_stmt")
+opaque struct Stmt
+    n: i64
+
+@export("terndb_alloc_fn")
+type AllocFn = *extern(usize, usize) -> *u8
+
+@export("terndb_probe_void")
+take_ptr(p: *u8, n: usize) -> *u8 = p
+
+@export("terndb_probe_const")
+take_const(db: *Db, s: *u8, n: usize) -> bool = n > 0
+
+@export("terndb_probe_num")
+nums(a: f32, b: f64, c: usize, d: bool) -> f64 = b
+
+@export("terndb_probe_arrp")
+arrp(digest: *[32]u8, out: *[16]u8) -> i32 = 0
+
+@export("terndb_probe_stmt")
+mk(db: *Db, a: AllocFn, s: *Stmt) -> *Stmt = s

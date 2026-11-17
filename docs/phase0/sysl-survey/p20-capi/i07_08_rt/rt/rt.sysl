@@ -1,0 +1,28 @@
+module rt
+
+import sysl.threads.current
+
+// item 8: which thread is the engine thread. A thread marks itself; any thread asks.
+@thread_local var engine: bool = false
+
+@export("rt_mark_engine")
+mark_engine() -> unit
+    engine = true
+
+@export("rt_is_engine")
+is_engine() -> bool = engine
+
+@export("rt_thread_id")
+thread_id() -> u64 = u64(current().id)
+
+// item 7: a panic inside an exported function; and one raised below a C frame (C -> sysl -> C -> sysl)
+@export("rt_panic")
+boom(n: i32) -> i32
+    val xs: [2]i32 = [1, 2]
+    xs[int(n)]
+
+@export("rt_cb")
+type Cb = *extern(i32) -> i32
+
+@export("rt_call_cb")
+call_cb(f: Cb, n: i32) -> i32 = f(n) + 1

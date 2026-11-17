@@ -1,0 +1,7 @@
+module i05_define
+
+@export("i05_limit")
+val LIMIT: u32 = 7
+
+@export("i05_get")
+get() -> u32 = LIMIT

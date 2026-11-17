@@ -1,0 +1,17 @@
+module i01b_into_raw
+
+// item 1: hand C a counted &T and take it back.
+@export("i01b_db")
+opaque struct Db
+    n: i64
+
+// (a) an exported &T parameter or result is refused by the header emitter (see FINDINGS)
+// (b) is there any call that turns a &T into a *T that owns one count, and back?
+@export("i01b_open")
+open() -> *Db
+    val d: &Db = Db(5)
+    d.into_raw()
+
+@export("i01b_close")
+close(p: *Db) -> unit
+    val d: &Db = from_raw(p)
