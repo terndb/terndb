@@ -181,9 +181,20 @@ impl MemCatalog
     /** That table `ti`'s smallest entry, with every variable-width column (text, bytes, json, record,
      * union, enum, relation) null or empty, is within the inline limit (`ddl.md` §2.13 rule 6, `Q6022`).
      * The key columns are counted at their key width and the rest at their row width; the bitmap and
-     * the offsets cannot leave the row.
+     * the offsets cannot leave the row. A column being retyped (`converting`) holds rows of its old
+     * type until its job finishes and of its new type afterwards, so the table is checked twice: once
+     * with every column at its current type and once with each converting column at its target.
      */
     check_row_fits(self, ti: usize) -> Result[(), CodecError]
+        self.check_row_fits_at(ti, false)?
+
+        for c in self.tables[ti].columns
+            if c.target.is_some() then return self.check_row_fits_at(ti, true)
+
+        Ok(())
+
+    /** `check_row_fits` with every converting column counted at its target type when `retyped`. */
+    check_row_fits_at(self, ti: usize, retyped: bool) -> Result[(), CodecError]
         val t = self.tables[ti]
         var key: usize = 0
         var fixed: usize = 0
@@ -191,7 +202,7 @@ impl MemCatalog
         var variable: usize = 0
 
         for c in t.columns
-            val ty = resolve_type(self, c.ty)?
+            val ty = if retyped then resolve_type(self, c.target.unwrap_or(c.ty))? else resolve_type(self, c.ty)?
 
             if contains_u32(t.primary_key, c.id)
                 key += key_width(ty)

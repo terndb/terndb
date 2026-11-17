@@ -272,3 +272,171 @@ a_constraint_only_alter_on_a_table_at_the_limit_is_accepted()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
 
     assert_eq(cat_code(c, fit_alter("t", [AddConstraint(cat_unique("t_v0", ["v0"]), false)])), "ok")
+
+// -- RETYPE COLUMN -----------------------------------------------------------------------------------
+
+// `ddl.md` §2.13 rule 10 and §8.5: a retype counts the column at its new type as well as its current
+// one. An int8 costs one fixed octet and a text column costs a two-octet offset, so each int8 column
+// retyped to text adds one octet to the smallest row. The sizes below are 28 (header and the int64
+// key) + ceil(columns / 8) + the remaining fixed octets + 2 per variable column.
+
+/** Table `name` keyed on an int64 `id`, with `fixed` int8 columns `f0`… and then `vars` text columns. */
+private fit_small(name: string, fixed: usize, vars: usize) -> Statement
+    val cols = buf[ColumnDef]()
+
+    cols.push(cat_col("id", Int64))
+
+    for i in 0..<fixed
+        cols.push(cat_col(s"f$i", Int8))
+
+    for i in 0..<vars
+        cols.push(cat_col(s"v$i", Type.Text))
+
+    CreateTable(cat_q(name), cols, items_of(["id"]), buf[ConstraintDef](), false)
+
+private fit_retype(name: string, column: string, ty: Type = Type.Text) -> Statement = fit_alter(name, [RetypeColumn(column, ty, None)])
+
+@test
+the_retype_test_tables_have_the_sizes_the_arithmetic_says()
+    assert_eq(min_entry_size(8, 1, 1869, 1868), 3999)
+    assert_eq(min_entry_size(8, 0, 1869, 1869), 4000)
+    assert_eq(min_entry_size(8, 0, 1870, 1870), 4002)
+    assert_eq(min_entry_size(8, 2, 1870, 1868), 4000)
+    assert_eq(min_entry_size(8, 1, 1870, 1869), 4001)
+
+@test
+a_retype_to_variable_width_that_lands_exactly_on_the_limit_is_accepted()
+    // Before: 3,999. After: 28 + 234 + 3,738 = 4,000.
+    val c = cat_ok(fit_empty(), fit_small("t", 1, 1868))
+
+    assert_eq(cat_code(c, fit_retype("t", "f0")), "ok")
+    assert_eq(cat_code(c, fit_retype("t", "f0", Type.Bytes)), "ok")
+
+@test
+a_retype_to_variable_width_one_octet_over_the_limit_is_refused()
+    // Before: 4,000. After: 4,001.
+    val c = cat_ok(fit_empty(), fit_small("t", 2, 1868))
+
+    assert_eq(cat_code(c, fit_retype("t", "f0")), "Q6022")
+    assert_eq(cat_code(c, fit_retype("t", "f1")), "Q6022")
+    assert_eq(cat_code(c, fit_retype("t", "f0", Type.Bytes)), "Q6022")
+
+    // One variable column fewer leaves room for exactly this one.
+    assert_eq(cat_code(cat_ok(fit_empty(), fit_small("t", 2, 1867)), fit_retype("t", "f0")), "ok")
+
+@test
+a_retype_to_variable_width_far_from_the_limit_is_accepted()
+    assert_eq(cat_code(cat_ok(fit_empty(), fit_small("t", 1, 3)), fit_retype("t", "f0")), "ok")
+    assert_eq(cat_code(cat_ok(fit_empty(), fit_small("t", 1, 0)), fit_retype("t", "f0")), "ok")
+
+@test
+a_retype_to_a_fixed_width_type_never_adds_to_the_row()
+    // An int8 widened to int16 costs one more fixed octet, so the retype is also held to the limit
+    // at its target: 4,000 fits and 4,001 does not.
+    val c = cat_ok(fit_empty(), fit_small("t", 2, 1868))
+
+    assert_eq(cat_code(c, fit_retype("t", "f0", Int16)), "Q6022")
+    assert_eq(cat_code(cat_ok(fit_empty(), fit_small("t", 2, 1867)), fit_retype("t", "f0", Int16)), "ok")
+
+@test
+a_retype_from_variable_to_fixed_width_is_not_refused_on_a_full_table()
+    val c = cat_ok(fit_empty(), fit_table("t", 1869))
+
+    assert_eq(cat_code(c, fit_retype("t", "v0", Int64)), "ok")
+
+    val d = cat_ok(fit_empty(), fit_small("t", 0, 1868))
+
+    assert_eq(cat_code(d, fit_retype("t", "v0", Int8)), "ok")
+
+@test
+a_pending_retype_to_fixed_width_does_not_relax_the_limit_on_the_current_type()
+    // `v0` holds text until its conversion finishes, so a later add is counted with it as text.
+    val c = cat_ok(fit_empty(), fit_table("t", 1869))
+    val d = cat_ok(c, fit_retype("t", "v0", Int64))
+
+    assert_eq(cat_code(d, fit_alter("t", fit_adds(1).view())), "Q6022")
+
+@test
+a_retype_in_the_same_statement_as_an_add_counts_both()
+    // Retyping f0 leaves 3,999 here, 28 + 234 + 2 + 3,734 + 2 - 1 less than the limit by one.
+    val c = cat_ok(fit_empty(), fit_small("t", 3, 1866))
+
+    assert_eq(cat_code(c, fit_retype("t", "f0")), "ok")
+    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), AddColumn(cat_col("n", nullable(Type.Text)))])), "Q6022")
+    assert_eq(cat_code(c, fit_alter("t", [AddColumn(cat_col("n", nullable(Type.Text))), RetypeColumn("f0", Type.Text, None)])), "Q6022")
+
+@test
+a_retype_in_the_same_statement_as_a_drop_is_counted_without_the_dropped_column()
+    val c = cat_ok(fit_empty(), fit_small("t", 2, 1868))
+
+    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), DropColumn("v0", false)])), "ok")
+    assert_eq(cat_code(c, fit_alter("t", [DropColumn("v0", false), RetypeColumn("f0", Type.Text, None)])), "ok")
+    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), DropColumn("f1", false)])), "ok")
+
+    // Dropping the retyped column itself leaves nothing to retype.
+    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), DropColumn("f0", false)])), "ok")
+
+@test
+a_retype_with_a_pending_retype_on_the_table_counts_the_pending_one_at_its_target()
+    // Three int8 columns and 1,867 text ones: 3,999 now, 4,000 with f0 retyped, 4,001 with f0 and f1.
+    val c = cat_ok(fit_empty(), fit_small("t", 3, 1867))
+    val d = cat_ok(c, fit_retype("t", "f0"))
+
+    assert(cat_table_of(d, "t").columns[1].state == ColumnConverting)
+    assert_eq(cat_code(d, fit_retype("t", "f1")), "Q6022")
+    assert_eq(cat_code(d, fit_retype("t", "f2")), "Q6022")
+
+    // The same two retypes in one statement are refused alike.
+    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), RetypeColumn("f1", Type.Text, None)])), "Q6022")
+
+    // The pending column may be retyped again: it still counts once, at its newest target.
+    assert_eq(cat_code(d, fit_retype("t", "f0", Type.Bytes)), "ok")
+
+@test
+a_pending_retype_counts_against_a_later_add_column()
+    val c = cat_ok(fit_empty(), fit_small("t", 3, 1867))
+    val d = cat_ok(c, fit_retype("t", "f0"))
+
+    assert_eq(cat_code(c, fit_alter("t", [AddColumn(cat_col("n", nullable(Int8)))])), "ok")
+    assert_eq(cat_code(d, fit_alter("t", [AddColumn(cat_col("n", nullable(Int8)))])), "Q6022")
+
+@test
+a_refused_retype_leaves_the_catalog_unchanged()
+    val c = cat_ok(fit_empty(), fit_small("t", 2, 1868))
+    var d = c
+
+    assert_eq(d.apply(envelope([], fit_retype("t", "f0")), BootstrapRole).unwrap_err().code, "Q6022")
+    assert_eq(d.version, c.version)
+    assert_eq(cat_table_of(d, "t").schema_version(), 1)
+    assert_eq(cat_table_of(d, "t").columns.len(), 1871)
+    assert(cat_table_of(d, "t").columns[1].ty == Int8)
+    assert(cat_table_of(d, "t").columns[1].state == ColumnReady)
+    assert(cat_table_of(d, "t").columns[1].target.is_none())
+    assert(cat_table_of(d, "t").columns[1].using.is_none())
+    assert_eq(cat_table_of(d, "t").next_column, cat_table_of(c, "t").next_column)
+
+    // The same table still takes a statement that fits.
+    assert_eq(cat_code(d, fit_alter("t", [RenameColumn("v0", "renamed")])), "ok")
+
+@test
+a_refused_retype_applies_none_of_its_other_actions()
+    val c = cat_ok(fit_empty(), fit_small("t", 2, 1868))
+    var d = c
+
+    assert_eq(d.apply(envelope([], fit_alter("t", [RenameColumn("v0", "renamed"), RetypeColumn("f0", Type.Text, None)])), BootstrapRole).unwrap_err().code, "Q6022")
+    assert(cat_table_of(d, "t").column_named("renamed").is_none())
+    assert(cat_table_of(d, "t").columns[1].state == ColumnReady)
+
+@test
+the_same_retype_is_accepted_once_a_drop_has_made_room()
+    val c = cat_ok(fit_empty(), fit_small("t", 2, 1868))
+
+    assert_eq(cat_code(c, fit_retype("t", "f0")), "Q6022")
+
+    val d = cat_ok(c, fit_alter("t", [DropColumn("v0", false)]))
+
+    assert_eq(cat_code(d, fit_retype("t", "f0")), "ok")
+
+    val e = cat_ok(c, fit_alter("t", [DropColumn("f1", false)]))
+
+    assert_eq(cat_code(e, fit_retype("t", "f0")), "ok")

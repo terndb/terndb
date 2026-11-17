@@ -393,8 +393,13 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
     them), `fixed` is the width of the fixed-width ones, and v counts the variable-width ones. The statement is
     `Q6022` when `min` exceeds the inline limit (4,000 octets, [DISK] §4.7 rule 1, derived from the engine's row
     constants and never written into a statement). A column with a default or a null counts the same; a column
-    being dropped by the same `AlterTable` does not count. `Q6011` (rule 2) is checked first. The statement has no
-    effect when refused.
+    being dropped by the same `AlterTable` does not count. A column being retyped (§8.5) is counted at its new
+    type as well as at its current one: the statement is `Q6022` when `min` exceeds the limit with every column
+    at its current type, and again when it exceeds it with every `converting` column (one this statement makes
+    `converting` or one still converting from an earlier statement) at its target type, so the table fits before
+    and after each conversion finishes. A retype to a variable-width type of a table with no room is refused
+    here, before anything is recorded; a retype to a fixed-width type is never refused by this rule alone.
+    `Q6011` (rule 2) is checked first. The statement has no effect when refused.
 
 ## 3. DDL statement trees
 
@@ -953,6 +958,7 @@ that record rolls it back like any write.
   column needs a constant default (else `Q3005`).
 - **Row limit:** the added column counts toward the smallest-row limit of §2.13 rule 10; an `add_column` that
   leaves the table past it is `Q6022` and changes nothing.
+  A `retype_column` is held to the same limit with the column at its new type (§8.5, §2.13 rule 10).
 - **Running transactions:** none conflicts unless it read the whole column list (§6.2 rule 3). A transaction that
   inserts at the old version and commits later produces rows that read the fill, which is what an insert after the
   change would have written; if the default has since changed, reconciliation rewrites them (§6.4 rule 4).
@@ -998,6 +1004,9 @@ that record rolls it back like any write.
 - **Old rows:** unchanged; they are matched by column id.
 
 ### 8.5 Retype a column
+
+**Row limit:** a retype leaves the table within the smallest-row limit of §2.13 rule 10 both with the column at
+its old type and at its new one (`Q6022`, nothing recorded), whether the retype is metadata-only or `converting`.
 
 1. **Lossless** (§5.3 rule 3, with no `using`), and either not used by any index key, index predicate or the
    primary key, or one that leaves the key encoding unchanged ([DISK] §4.6): appending variants to an enum, or
