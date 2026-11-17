@@ -310,7 +310,6 @@ a_retype_to_variable_width_that_lands_exactly_on_the_limit_is_accepted()
     val c = cat_ok(fit_empty(), fit_small("t", 1, 1868))
 
     assert_eq(cat_code(c, fit_retype("t", "f0")), "ok")
-    assert_eq(cat_code(c, fit_retype("t", "f0", Type.Bytes)), "ok")
 
 @test
 a_retype_to_variable_width_one_octet_over_the_limit_is_refused()
@@ -319,7 +318,6 @@ a_retype_to_variable_width_one_octet_over_the_limit_is_refused()
 
     assert_eq(cat_code(c, fit_retype("t", "f0")), "Q6022")
     assert_eq(cat_code(c, fit_retype("t", "f1")), "Q6022")
-    assert_eq(cat_code(c, fit_retype("t", "f0", Type.Bytes)), "Q6022")
 
     // One variable column fewer leaves room for exactly this one.
     assert_eq(cat_code(cat_ok(fit_empty(), fit_small("t", 2, 1867)), fit_retype("t", "f0")), "ok")
@@ -339,10 +337,15 @@ a_retype_to_a_fixed_width_type_never_adds_to_the_row()
     assert_eq(cat_code(cat_ok(fit_empty(), fit_small("t", 2, 1867)), fit_retype("t", "f0", Int16)), "ok")
 
 @test
-a_retype_from_variable_to_fixed_width_is_not_refused_on_a_full_table()
+a_retype_from_variable_to_a_narrow_fixed_width_is_not_refused_on_a_full_table()
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
 
-    assert_eq(cat_code(c, fit_retype("t", "v0", Int64)), "ok")
+    assert_eq(cat_code(c, fit_retype("t", "v0", Int8)), "ok")
+    assert_eq(cat_code(c, fit_retype("t", "v0", Int16)), "ok")
+
+    // An int64 takes eight octets against the two of the offset it replaces: that is a growth, and
+    // the table has no room for it.
+    assert_eq(cat_code(c, fit_retype("t", "v0", Int64)), "Q6022")
 
     val d = cat_ok(fit_empty(), fit_small("t", 0, 1868))
 
@@ -352,7 +355,7 @@ a_retype_from_variable_to_fixed_width_is_not_refused_on_a_full_table()
 a_pending_retype_to_fixed_width_does_not_relax_the_limit_on_the_current_type()
     // `v0` holds text until its conversion finishes, so a later add is counted with it as text.
     val c = cat_ok(fit_empty(), fit_table("t", 1869))
-    val d = cat_ok(c, fit_retype("t", "v0", Int64))
+    val d = cat_ok(c, fit_retype("t", "v0", Int8))
 
     assert_eq(cat_code(d, fit_alter("t", fit_adds(1).view())), "Q6022")
 
@@ -373,8 +376,8 @@ a_retype_in_the_same_statement_as_a_drop_is_counted_without_the_dropped_column()
     assert_eq(cat_code(c, fit_alter("t", [DropColumn("v0", false), RetypeColumn("f0", Type.Text, None)])), "ok")
     assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), DropColumn("f1", false)])), "ok")
 
-    // Dropping the retyped column itself leaves nothing to retype.
-    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), DropColumn("f0", false)])), "ok")
+    // Two actions on one column are refused before the limit is looked at.
+    assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), DropColumn("f0", false)])), "Q6016")
 
 @test
 a_retype_with_a_pending_retype_on_the_table_counts_the_pending_one_at_its_target()
@@ -390,7 +393,7 @@ a_retype_with_a_pending_retype_on_the_table_counts_the_pending_one_at_its_target
     assert_eq(cat_code(c, fit_alter("t", [RetypeColumn("f0", Type.Text, None), RetypeColumn("f1", Type.Text, None)])), "Q6022")
 
     // The pending column may be retyped again: it still counts once, at its newest target.
-    assert_eq(cat_code(d, fit_retype("t", "f0", Type.Bytes)), "ok")
+    assert_eq(cat_code(d, fit_retype("t", "f0", nullable(Type.Text))), "ok")
 
 @test
 a_pending_retype_counts_against_a_later_add_column()

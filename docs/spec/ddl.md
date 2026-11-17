@@ -397,8 +397,9 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
     type as well as at its current one: the statement is `Q6022` when `min` exceeds the limit with every column
     at its current type, and again when it exceeds it with every `converting` column (one this statement makes
     `converting` or one still converting from an earlier statement) at its target type, so the table fits before
-    and after each conversion finishes. A retype to a variable-width type of a table with no room is refused
-    here, before anything is recorded; a retype to a fixed-width type is never refused by this rule alone.
+    and after each conversion finishes. A retype to a type that makes the smallest row larger (an int8 to text, a text to an int64) of
+    a table with no room is refused here, before anything is recorded; a retype that does not enlarge it (a text to
+    an int8, an int64 to an int8) never is, because the table already fitted.
     `Q6011` (rule 2) is checked first. The statement has no effect when refused.
 
 ## 3. DDL statement trees
