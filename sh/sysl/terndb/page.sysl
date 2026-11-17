@@ -86,15 +86,12 @@ const SegmentPages: u64 = 65536
 
 /** The data space of one in-memory database: the allocation bitmap of each segment (§3.7), which
  * assigns every PID exactly as it would be assigned on disk (§8.1 rule 2), and the frames of the
- * allocated pages by page number.
- *
- * The frames are found through a plain table here. The persistent radix tree §8.1 rule 4 asks of a
- * page map is a later item; nothing in a tree's own structure reads the table, since every child
- * reference is swizzled.
+ * allocated pages, found through the page map (§8.1 rule 4, `page_map.sysl`). Nothing in a tree's own
+ * structure reads the map, since every child reference is swizzled; a tree's root is found through it.
  */
 struct PageSpace
     bitmaps: Buf[&PageFrame]
-    frames: Buf[Option[&PageFrame]]
+    map: PageMap
     /** Every page number below this one is allocated, so a search for a free page starts here. */
     first_free: u64
 
@@ -130,7 +127,7 @@ struct PageSpace
         val bm = &*self.bitmaps[seg]
         bm.page[64 + bit / 8] = bm.page[64 + bit / 8] & ~(u8(1) << u8(bit % 8))
         wr32(bm, 52, rd32(bm, 52) - 1)
-        if usize(pid) < self.frames.len() then self.frames[usize(pid)] = None
+        self.map = self.map.remove(pid)
         if pid < self.first_free then self.first_free = pid
 
     /** Whether data page `pid` is marked allocated. */
@@ -149,19 +146,14 @@ struct PageSpace
 
         total
 
-    /** A zeroed frame for newly allocated page `pid`, entered in the frame table. */
+    /** A zeroed frame for newly allocated page `pid`, entered in the page map. */
     new_frame(*self, pid: u64) -> &PageFrame
         val f: &PageFrame = PageFrame(pid, 0, [0; 16384])
-
-        while self.frames.len() <= usize(pid)
-            self.frames.push(None)
-
-        self.frames[usize(pid)] = Some(f)
+        self.map = self.map.set(pid, f)
         f
 
     /** The frame of page `pid`, if it has one. */
-    frame(self, pid: u64) -> Option[&PageFrame] =
-        if usize(pid) < self.frames.len() then self.frames[usize(pid)] else None
+    frame(self, pid: u64) -> Option[&PageFrame] = self.map.get(pid)
 
     /** Opens segment `bitmaps.len()`: its page 0 is its bitmap, which marks itself allocated
      * (§3.7 rule 1).
@@ -178,7 +170,7 @@ struct PageSpace
 
 /** An empty data space: segment 0 and its bitmap. */
 page_space() -> &PageSpace
-    val s: &PageSpace = PageSpace(buf(), buf(), 0)
+    val s: &PageSpace = PageSpace(buf(), page_map(), 0)
     s.add_segment()
     s
 

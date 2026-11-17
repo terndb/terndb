@@ -45,18 +45,18 @@ check_btree(t: BTree) -> Result[BtStats, CodecError]
 check_btrees(space: &PageSpace, trees: []const BTree) -> Result[Buf[BtStats], CodecError]
     var frames = buf[FrameAt]()
 
-    for i in 0..<space.frames.len()
-        space.frames[i] match
-            Some(f) ->
-                if u64(i) != f.pid then return corrupt(u64(i), "the frame table holds a frame of another page")
-                if !space.is_allocated(f.pid) then return corrupt(f.pid, "a free page still has a frame")
-                frames.push(FrameAt(u64(usize(&*f)), f.pid))
-            None -> ()
+    for (pid, f) in space.map.iter()
+        if pid != f.pid then return corrupt(pid, "the page map holds a frame of another page")
+        if !space.is_allocated(f.pid) then return corrupt(f.pid, "a free page still has a frame")
+        frames.push(FrameAt(u64(usize(&*f)), f.pid))
 
     sort_by(frames.view_mut(), (a, b) -> a.addr < b.addr)
     val st: &CheckState = CheckState(space, 0, frames, buf(), 0, 0, 0)
+    val mapped = space.map.last() match
+        Some((pid, _)) -> usize(pid) + 1
+        None -> 0
 
-    for i in 0..<space.frames.len()
+    for i in 0..<mapped
         st.seen.push(false)
 
     check_bitmaps(st)?

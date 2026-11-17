@@ -11,17 +11,17 @@ and `btree_model_tests.sysl` (a seeded model test).
 
 - **`PageFrame`** is a page's frame and descriptor (§3.1, §8.1 rule 1): the page's own PID, the optimistic latch
   word, and the 16,384 bytes. The latch word is kept and never advanced (§ Concurrency).
-- **`PageSpace`** is the data space of one database: a bitmap page per segment (§3.7), the frames by page number,
-  and the lowest page number that may be free. `allocate` answers the lowest free page, opening a segment (whose
+- **`PageSpace`** is the data space of one database: a bitmap page per segment (§3.7), the page map from PID to frame
+  (`page-map.md`), and the lowest page number that may be free. `allocate` answers the lowest free page, opening a segment (whose
   page 0 is its bitmap and marks itself) when every one is full; `release` clears the bit and drops the frame.
   The PIDs are exactly the ones disk would assign (§8.1 rule 2). PID 0 is segment 0's bitmap, so "none" (§1 rule 8)
   never names a node.
 - **`BTree`** is a root PID, which never changes (§3.3, root stability), the owner object id written into every
   page's header, the space, and `BtEvents`, the count of each kind of shape change, which the tests read.
 - A child reference is **swizzled** in memory, always (§3.8 rule 2, §8.1 rule 1): bit 63 set and the frame's
-  address in the rest, made and followed through `sysl.raw.ptr_cast`. The frame table holds the counted reference
+  address in the rest, made and followed through `sysl.raw.ptr_cast`. The page map holds the counted reference
   that keeps each frame alive, so an address in a page is valid exactly while its page is allocated. The root is
-  found through the frame table (§8.1 rule 4).
+  found through the page map (§8.1 rule 4).
 - **Checksums are not computed in memory** (§3.1 rule 3, §8.1 rule 3): `crc` stays 0, as do `page_lsn` and
   `key_version`. Every page is `format` 1.
 
@@ -100,6 +100,5 @@ optimistic latch coupling reads or advances it, and a freed page is reused at on
   reclamation, without which §3.7 rule 3's condition (b) does not hold once readers run beside a writer.
 - WAL records for every page change (§6.4), so also condition (a) of §3.7 rule 3: a freed PID is reused before
   any `PAGE_FREE` could be durable. Undo and MVCC in the tree.
-- The persistent radix-tree page map of §8.1 rule 4; the frame table stands in.
 - Overflow chains (§4.8), secondary-index leaves (`max_txn`, delete marks, §4.9) and the node flag bit 3.
 - Snapshots (§8.2), with checksums computed and references unswizzled in the write copy (§3.8 rule 4).
