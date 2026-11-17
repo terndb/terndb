@@ -1,0 +1,942 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.rand.{Rng, rng}
+import sysl.text.{StrBuilder, char_from_u32, parse_long, str_builder}
+
+// The recorded history of `isolation.md` §2.5 and the harness that records it: one record per
+// operation, written as one JSON object per line in the Elle style, with `time` read from a
+// simulated clock; and a seeded interleaving driver that runs logical clients' transactions against
+// the in-memory store one step at a time, honouring `Wait` answers, retrying where a plan asks for it
+// (§5.3) and recording commits, aborts and unknown outcomes (§5.4). The checker is
+// `history_check.sysl`, the workloads of §7.2 `history_workloads.sysl` (`docs/design/history.md`).
+
+// -- the history model --------------------------------------------------------------------------
+
+/** What a record says (§2.5): the transaction was invoked, committed, aborted, or its outcome is
+ * unknown.
+ */
+enum HKind
+    HInvoke
+    HOk
+    HFail
+    HInfo
+
+/** What a read observed: nothing yet (an `invoke`, or a read whose answer was lost), no row, an
+ * integer, a list, or, for a predicate read, the keys in the operation's `rows`.
+ */
+enum Obs derives Eq
+    ObsNone
+    ObsUnborn
+    ObsNum(n: i64)
+    ObsList(list: Buf[i64])
+    ObsRows
+
+/** The kind of one micro-operation of a transaction's `value` (§2.5). `MDelete` is `["w", k,
+ * null]`, a write of the dead version; `MAdd` is `["add", k, d]`, a relative update `SET v = v + d`
+ * whose result the client does not see (W2's increments, W3's transfers).
+ */
+enum MopKind
+    MAppend
+    MRead
+    MWrite
+    MDelete
+    MAdd
+    MPred
+
+/** One micro-operation: its kind, its key (a predicate read's predicate text), its argument (the
+ * element appended, the value written, the amount added) and what it observed.
+ */
+struct Mop derives Eq
+    kind: MopKind
+    key: string
+    arg: i64
+    seen: Obs
+    rows: Buf[string]
+
+    /** Whether the operation writes. */
+    writes(self) -> bool = self.kind == MAppend || self.kind == MWrite || self.kind == MDelete || self.kind == MAdd
+
+m_append(key: string, e: i64) -> Mop = Mop(MAppend, key, e, ObsNone, buf())
+
+/** A read whose answer is not known yet. */
+m_read(key: string) -> Mop = Mop(MRead, key, 0, ObsNone, buf())
+
+m_read_list(key: string, list: []const i64) -> Mop = Mop(MRead, key, 0, ObsList(items_of(list)), buf())
+
+m_read_num(key: string, n: i64) -> Mop = Mop(MRead, key, 0, ObsNum(n), buf())
+
+m_read_unborn(key: string) -> Mop = Mop(MRead, key, 0, ObsUnborn, buf())
+
+m_write(key: string, v: i64) -> Mop = Mop(MWrite, key, v, ObsNone, buf())
+
+m_delete(key: string) -> Mop = Mop(MDelete, key, 0, ObsNone, buf())
+
+m_add(key: string, delta: i64) -> Mop = Mop(MAdd, key, delta, ObsNone, buf())
+
+/** A predicate read of `pred` whose answer is not known yet. */
+m_pred(pred: string) -> Mop = Mop(MPred, pred, 0, ObsNone, buf())
+
+m_pred_rows(pred: string, rows: []const string) -> Mop = Mop(MPred, pred, 0, ObsRows, items_of(rows))
+
+/** The level names the history uses (§2.5). */
+const LevelSer = "serializable"
+const LevelSi = "snapshot"
+const LevelRc = "read_committed"
+
+level_name(l: Isolation) -> string = l match
+    Serializable -> LevelSer
+    Snapshot -> LevelSi
+    ReadCommitted -> LevelRc
+
+/** A level's strength: read committed 0, snapshot 1, serializable 2; an unknown name is -1. */
+level_rank(name: string) -> i32 =
+    if name == LevelSer then 2 elif name == LevelSi then 1 elif name == LevelRc then 0 else -1
+
+/** One record (§2.5). `txid`, `snapshot` and `commit` are the white-box fields, 0 where absent;
+ * `error` is the name of the code a `fail` carries, empty otherwise.
+ */
+struct HEvent derives Eq
+    index: u64
+    time: u64
+    process: u64
+    node: string
+    kind: HKind
+    level: string
+    sync: bool
+    txid: u64
+    snapshot: u64
+    commit: u64
+    error: string
+    value: Buf[Mop]
+
+/** The name §2.5 gives a §5.2 code; a code with no name here is written as itself. */
+error_name(code: string) -> string =
+    if code == "T1001" then "serialization_failure"
+    elif code == "T1002" then "deadlock_detected"
+    elif code == "T1003" then "lock_timeout"
+    elif code == "T1004" then "schema_changed"
+    elif code == "T3001" then "unique_violation"
+    elif code == "W2003" then "transaction_aborted"
+    else code
+
+/** Whether a code is retryable (`errors.md` §4): the transaction aborted and had no effect. */
+retryable_code(code: string) -> bool = code == "T1001" || code == "T1002" || code == "T1003" || code == "T1004"
+
+// -- the simulated clock and the recorder -------------------------------------------------------
+
+/** The harness's monotonic clock in simulated nanoseconds (§2.5): it moves only when the driver
+ * moves it, so a history is a function of its seed. As an engine `Clock` it reads milliseconds.
+ */
+struct SimClock
+    ns: u64
+
+impl Clock for SimClock
+    now_ms(self) -> u64 = self.ns / 1000000
+
+/** Records a history: each record takes the next index and the clock's reading, and the clock then
+ * moves on by one nanosecond, so that no two records share a time.
+ */
+struct Recorder
+    clock: &SimClock
+    events: Buf[HEvent]
+
+    add(*self, process: u64, kind: HKind, level: string, txid: u64, snapshot: u64, commit: u64, error: string, value: Buf[Mop]) -> usize
+        val i = self.events.len()
+        self.events.push(HEvent(u64(i), self.clock.ns, process, "primary", kind, level, true, txid, snapshot, commit, error, value))
+        self.clock.ns += 1
+        i
+
+recorder(clock: &SimClock) -> Recorder = Recorder(clock, buf())
+
+// -- JSON lines -----------------------------------------------------------------------------------
+
+/** The history as JSON lines (§2.5), one record per line, each ending in a newline. */
+history_jsonl(events: Buf[HEvent]) -> string
+    var sb = str_builder()
+
+    for e in events
+        json_event(e, &sb)
+        sb.push("\n")
+
+    sb.finish()
+
+private kind_named(name: string) -> Option[HKind] =
+    if name == "invoke" then Some(HInvoke)
+    elif name == "ok" then Some(HOk)
+    elif name == "fail" then Some(HFail)
+    elif name == "info" then Some(HInfo)
+    else None
+
+private kind_name(k: HKind) -> string = k match
+    HInvoke -> "invoke"
+    HOk -> "ok"
+    HFail -> "fail"
+    HInfo -> "info"
+
+private json_event(e: HEvent, sb: *StrBuilder)
+    sb.push("{\"index\": ")
+    sb.push_uint(e.index)
+    sb.push(", \"time\": ")
+    sb.push_uint(e.time)
+    sb.push(", \"process\": ")
+    sb.push_uint(e.process)
+    sb.push(", \"node\": ")
+    json_string(e.node, sb)
+    sb.push(", \"type\": \"")
+    sb.push(kind_name(e.kind))
+    sb.push("\", \"level\": ")
+    json_string(e.level, sb)
+    sb.push(if e.sync then ", \"sync\": \"on\"" else ", \"sync\": \"off\"")
+
+    if e.txid != 0
+        sb.push(", \"txid\": ")
+        sb.push_uint(e.txid)
+
+    if e.snapshot != 0
+        sb.push(", \"snapshot\": ")
+        sb.push_uint(e.snapshot)
+
+    if e.commit != 0
+        sb.push(", \"commit\": ")
+        sb.push_uint(e.commit)
+
+    if e.error.len != 0
+        sb.push(", \"error\": ")
+        json_string(e.error, sb)
+
+    sb.push(", \"value\": [")
+
+    for i in 0..<e.value.len()
+        if i > 0 then sb.push(", ")
+        json_mop(e.value[i], sb)
+
+    sb.push("]}")
+
+private json_mop(m: Mop, sb: *StrBuilder)
+    val name = m.kind match
+        MAppend -> "append"
+        MRead -> "r"
+        MWrite | MDelete -> "w"
+        MAdd -> "add"
+        MPred -> "pr"
+
+    sb.push("[\"")
+    sb.push(name)
+    sb.push("\", ")
+    json_string(m.key, sb)
+    sb.push(", ")
+
+    m.kind match
+        MAppend | MWrite | MAdd -> sb.push_int(m.arg)
+        MDelete -> sb.push("null")
+        MRead | MPred -> m.seen match
+            ObsNone | ObsUnborn -> sb.push("null")
+            ObsNum(n) -> sb.push_int(n)
+            ObsList(list) ->
+                sb.push("[")
+                for i in 0..<list.len()
+                    if i > 0 then sb.push(", ")
+                    sb.push_int(list[i])
+                sb.push("]")
+            ObsRows ->
+                sb.push("[")
+                for i in 0..<m.rows.len()
+                    if i > 0 then sb.push(", ")
+                    json_string(m.rows[i], sb)
+                sb.push("]")
+
+    sb.push("]")
+
+private json_string(s: string, sb: *StrBuilder)
+    sb.push("\"")
+    var run: usize = 0
+
+    for i in 0..<s.len
+        val c = s.bytes[i]
+
+        if c == u8('"') || c == u8('\\') || c < 0x20
+            sb.push(s[run..<i])
+            if c == u8('"')
+                sb.push("\\\"")
+            elif c == u8('\\')
+                sb.push("\\\\")
+            elif c == u8('\n')
+                sb.push("\\n")
+            else
+                sb.push("\\u00")
+                sb.push(hex_digit(c >> 4))
+                sb.push(hex_digit(c & 0xf))
+            run = i + 1
+
+    sb.push(s[run..<s.len])
+    sb.push("\"")
+
+private hex_digit(n: u8) -> string = "0123456789abcdef"[usize(n)..<usize(n) + 1]
+
+/** A JSON value, as far as a history needs one: integers only. */
+private enum JNode
+    JNull
+    JBool(b: bool)
+    JNum(n: i64)
+    JStr(s: string)
+    JArr(items: Buf[JNode])
+    JObj(names: Buf[string], vals: Buf[JNode])
+
+private struct JReader
+    text: string
+    at: usize
+
+    peek(self) -> u8 = if self.at < self.text.len then self.text.bytes[self.at] else 0
+
+    space(*self)
+        while self.at < self.text.len && (self.peek() == u8(' ') || self.peek() == u8('\t') || self.peek() == u8('\r'))
+            self.at += 1
+
+    value(*self) -> Result[JNode, string]
+        self.space()
+
+        self.peek() match
+            u8('{') -> self.object()
+            u8('[') -> self.array()
+            u8('"') -> Ok(JStr(self.string()?))
+            u8('n') -> self.word("null", JNull)
+            u8('t') -> self.word("true", JBool(true))
+            u8('f') -> self.word("false", JBool(false))
+            _ -> self.number()
+
+    word(*self, w: string, node: JNode) -> Result[JNode, string]
+        val end = self.at + w.len
+        if end > self.text.len || self.text[self.at..<end] != w then return Err(s"expected $w at ${self.at}")
+        self.at = end
+        Ok(node)
+
+    number(*self) -> Result[JNode, string]
+        val start = self.at
+        if self.peek() == u8('-') then self.at += 1
+        while self.peek() >= u8('0') && self.peek() <= u8('9')
+            self.at += 1
+        if self.at == start then return Err(s"unexpected character at $start")
+
+        parse_long(self.text[start..<self.at]) match
+            Ok(n) -> Ok(JNum(i64(n)))
+            Err(_) -> Err(s"a number out of range at $start")
+
+    string(*self) -> Result[string, string]
+        var sb = str_builder()
+        self.at += 1
+        var run = self.at
+
+        loop
+            if self.at >= self.text.len then return Err("an unterminated string")
+            val c = self.text.bytes[self.at]
+
+            if c == u8('"')
+                sb.push(self.text[run..<self.at])
+                self.at += 1
+                return Ok(sb.finish())
+
+            if c == u8('\\')
+                sb.push(self.text[run..<self.at])
+                self.at += 1
+                val e = self.peek()
+                self.at += 1
+
+                if e == u8('"')
+                    sb.push("\"")
+                elif e == u8('\\')
+                    sb.push("\\")
+                elif e == u8('/')
+                    sb.push("/")
+                elif e == u8('n')
+                    sb.push("\n")
+                elif e == u8('t')
+                    sb.push("\t")
+                elif e == u8('r')
+                    sb.push("\r")
+                elif e == u8('u') && self.at + 4 <= self.text.len
+                    var n: u32 = 0
+                    for _ in 0..<4
+                        val d = hex_value_of(self.peek())
+                        if d > 15 then return Err("a bad \\u escape")
+                        n = n << 4 | d
+                        self.at += 1
+                    char_from_u32(n) match
+                        Some(ch) -> sb.push_char(ch)
+                        None -> return Err("a \\u escape that is not a character")
+                else
+                    return Err("a bad escape")
+
+                run = self.at
+            else
+                self.at += 1
+    end string
+
+    array(*self) -> Result[JNode, string]
+        self.at += 1
+        val items = buf[JNode]()
+        self.space()
+
+        if self.peek() == u8(']')
+            self.at += 1
+            return Ok(JArr(items))
+
+        loop
+            items.push(self.value()?)
+            self.space()
+            val c = self.peek()
+            self.at += 1
+            if c == u8(']') then return Ok(JArr(items))
+            if c != u8(',') then return Err(s"expected , or ] at ${self.at - 1}")
+
+    object(*self) -> Result[JNode, string]
+        self.at += 1
+        val names = buf[string]()
+        val vals = buf[JNode]()
+        self.space()
+
+        if self.peek() == u8('}')
+            self.at += 1
+            return Ok(JObj(names, vals))
+
+        loop
+            self.space()
+            if self.peek() != u8('"') then return Err(s"expected a member name at ${self.at}")
+            names.push(self.string()?)
+            self.space()
+            if self.peek() != u8(':') then return Err(s"expected : at ${self.at}")
+            self.at += 1
+            vals.push(self.value()?)
+            self.space()
+            val c = self.peek()
+            self.at += 1
+            if c == u8('}') then return Ok(JObj(names, vals))
+            if c != u8(',') then return Err(s"expected , or } at ${self.at - 1}")
+
+// A hexadecimal digit's value, 16 for a byte that is not one.
+private hex_value_of(h: u8) -> u32 =
+    if h >= u8('0') && h <= u8('9') then u32(h - u8('0'))
+    elif h >= u8('a') && h <= u8('f') then u32(h - u8('a')) + 10
+    elif h >= u8('A') && h <= u8('F') then u32(h - u8('A')) + 10
+    else 16
+
+private member(names: Buf[string], vals: Buf[JNode], name: string) -> JNode
+    for i in 0..<names.len()
+        if names[i] == name then return vals[i]
+
+    JNull
+
+private j_u64(n: JNode, what: string) -> Result[u64, string] = n match
+    JNull -> Ok(0)
+    JNum(x) -> if x < 0 then Err(s"a negative $what") else Ok(u64(x))
+    _ -> Err(s"$what is not a number")
+
+private j_str(n: JNode, what: string) -> Result[string, string] = n match
+    JNull -> Ok("")
+    JStr(s) -> Ok(s)
+    _ -> Err(s"$what is not a string")
+
+/** The history in `text`, JSON lines as `history_jsonl` writes them (§2.5); blank lines are
+ * skipped. A `null` read result is a missing row in a completion and not yet known in an `invoke`.
+ */
+parse_history(text: string) -> Result[Buf[HEvent], string]
+    val out = buf[HEvent]()
+    var line: usize = 0
+    var start: usize = 0
+
+    while start < text.len
+        var end = start
+        while end < text.len && text.bytes[end] != u8('\n')
+            end += 1
+        line += 1
+
+        val one = text[start..<end]
+        start = end + 1
+        var blank = true
+
+        for i in 0..<one.len
+            if one.bytes[i] != u8(' ') && one.bytes[i] != u8('\t') && one.bytes[i] != u8('\r') then blank = false
+
+        if blank then continue
+
+        parse_event(one) match
+            Ok(e) -> out.push(e)
+            Err(m) -> return Err(s"line $line: $m")
+
+    Ok(out)
+
+private parse_event(line: string) -> Result[HEvent, string]
+    var r = JReader(line, 0)
+    val root = r.value()?
+    r.space()
+    if r.at != line.len then return Err("text after the record")
+
+    val (names, vals) = root match
+        JObj(n, v) -> (n, v)
+        _ -> return Err("a record is not an object")
+
+    val type_name = j_str(member(names, vals, "type"), "type")?
+    val kind = kind_named(type_name) match
+        Some(k) -> k
+        None -> return Err(s"an unknown type '$type_name'")
+
+    val level = j_str(member(names, vals, "level"), "level")?
+    if level_rank(level) < 0 then return Err(s"an unknown level '$level'")
+
+    val sync = j_str(member(names, vals, "sync"), "sync")? != "off"
+    val node = j_str(member(names, vals, "node"), "node")?
+    val value = buf[Mop]()
+
+    member(names, vals, "value") match
+        JArr(ops) ->
+            for op in ops
+                value.push(parse_mop(op, kind == HInvoke)?)
+        JNull -> ()
+        _ -> return Err("value is not an array")
+
+    Ok(HEvent(j_u64(member(names, vals, "index"), "index")?, j_u64(member(names, vals, "time"), "time")?,
+        j_u64(member(names, vals, "process"), "process")?, if node.len == 0 then "primary" else node, kind, level, sync,
+        j_u64(member(names, vals, "txid"), "txid")?, j_u64(member(names, vals, "snapshot"), "snapshot")?,
+        j_u64(member(names, vals, "commit"), "commit")?, j_str(member(names, vals, "error"), "error")?, value))
+
+private parse_mop(op: JNode, invoke: bool) -> Result[Mop, string]
+    val parts = op match
+        JArr(p) -> p
+        _ -> return Err("an operation is not an array")
+
+    if parts.len() != 3 then return Err("an operation is not [f, k, v]")
+
+    val f = j_str(parts[0], "an operation's name")?
+    val key = j_str(parts[1], "an operation's key")?
+    val v = parts[2]
+
+    if f == "append" || f == "add"
+        val n = v match
+            JNum(x) -> x
+            _ -> return Err(s"$f takes a number")
+        return Ok(if f == "append" then m_append(key, n) else m_add(key, n))
+
+    if f == "w"
+        return v match
+            JNum(x) -> Ok(m_write(key, x))
+            JNull -> Ok(m_delete(key))
+            _ -> Err("w takes a number or null")
+
+    if f == "r"
+        return v match
+            JNull -> Ok(if invoke then m_read(key) else m_read_unborn(key))
+            JNum(x) -> Ok(m_read_num(key, x))
+            JArr(xs) ->
+                val list = buf[i64]()
+                for x in xs
+                    x match
+                        JNum(n) -> list.push(n)
+                        _ -> return Err("a list read holds a non-number")
+                Ok(Mop(MRead, key, 0, ObsList(list), buf()))
+            _ -> Err("r takes null, a number or a list")
+
+    if f == "pr"
+        return v match
+            JNull -> Ok(m_pred(key))
+            JArr(xs) ->
+                val rows = buf[string]()
+                for x in xs
+                    x match
+                        JStr(s) -> rows.push(s)
+                        _ -> return Err("a predicate read's rows are keys")
+                Ok(Mop(MPred, key, 0, ObsRows, rows))
+            _ -> Err("pr takes null or a list of keys")
+
+    Err(s"an unknown operation '$f'")
+
+// -- the driver -----------------------------------------------------------------------------------
+
+/** One step of a transaction's plan. `SAppend` and `SWrite` take a fresh unique value when the
+ * transaction is invoked, so a retried attempt writes values of its own; `SInsert` likewise a fresh
+ * key `prefix<n>`. `SSum` reads every key of `keys` in one statement and records the total as a read
+ * of `name` (W3's `SELECT sum`, I13). `SThen` is the interactive part: once the steps before it have
+ * run, it is replaced by the steps its function makes of the operations recorded so far.
+ */
+enum HStep
+    SReadList(key: string)
+    SReadReg(key: string)
+    SAppend(key: string)
+    SAppendE(key: string, e: i64)
+    SWrite(key: string)
+    SPut(key: string, v: i64)
+    SAdd(key: string, delta: i64)
+    SSum(keys: Buf[string], name: string)
+    SPred(group: i64)
+    SInsert(prefix: string, group: i64)
+    SInsertKey(key: string, group: i64)
+    SDelete(key: string)
+    SThen(f: &Fn(Buf[Mop]) -> Buf[HStep])
+
+/** One transaction a client runs: its level, whether it is declared read-only, whether a retryable
+ * failure re-runs it from the beginning (§5.3), and its steps.
+ */
+struct Plan
+    level: Isolation
+    read_only: bool
+    retry: bool
+    steps: Buf[HStep]
+
+hplan(level: Isolation, steps: Buf[HStep]) -> Plan = Plan(level, false, true, steps)
+
+/** The in-memory store a history is recorded against and its three tables: `lists(k, v list<int64>)`
+ * for list-append keys, `regs(k, v int64)` for registers, counters and accounts, and `grp(k, g, v)`
+ * for W4's rows. A history's keys are names; each is given an integer row key on first use.
+ */
+struct Bench
+    store: &Store
+    lists: u64
+    regs: u64
+    grp: u64
+    list_cols: Buf[u32]
+    reg_cols: Buf[u32]
+    grp_cols: Buf[u32]
+    names: Buf[string]
+    ids: Map[string, i64]
+    next_value: i64
+
+    /** The row key of `name`. */
+    id(*self, name: string) -> i64 = self.ids.get(name) match
+        Some(i) -> i
+        None ->
+            self.names.push(name)
+            val i = i64(self.names.len())
+            self.ids.put(name, i)
+            i
+
+    /** The name of row key `i`. */
+    name_of(self, i: i64) -> string = if i >= 1 && i <= i64(self.names.len()) then self.names[usize(i - 1)] else s"?$i"
+
+    fresh(*self) -> i64
+        self.next_value += 1
+        self.next_value
+
+    /** Creates, unrecorded, the rows the keys start in: each list empty, each register `init`. */
+    seed_rows(*self, lists: Buf[string], regs: Buf[string], init: i64)
+        val t = self.store.begin(Serializable)
+
+        for k in lists
+            val _ = self.store.insert(t, self.lists, store_row(self.store, self.lists, rec([Int(i128(self.id(k))), Relation(buf())])))
+
+        for k in regs
+            val _ = self.store.insert(t, self.regs, store_row(self.store, self.regs, rec([Int(i128(self.id(k))), Int(i128(init))])))
+
+        val _ = self.store.commit(t)
+
+/** A bench over a fresh store whose faults are `faults`. */
+bench(faults: Faults) -> &Bench
+    var c = mem_catalog()
+    bench_ddl(&c, CreateNamespace("app", false))
+    bench_ddl(&c, bench_table("lists", [bench_col("k", Int64), bench_col("v", List(Int64))]))
+    bench_ddl(&c, bench_table("regs", [bench_col("k", Int64), bench_col("v", Int64)]))
+    bench_ddl(&c, bench_table("grp", [bench_col("k", Int64), bench_col("g", Int64), bench_col("v", Int64)]))
+    val s = mem_store(c)
+    s.faults = faults
+    val lists = c.tables[c.table_at(QualName("app", "lists")).unwrap()]
+    val grp = c.tables[c.table_at(QualName("app", "grp")).unwrap()]
+    val regs = c.tables[c.table_at(QualName("app", "regs")).unwrap()]
+    Bench(s, lists.oid, regs.oid, grp.oid, column_ids(lists, ["k", "v"]), column_ids(regs, ["k", "v"]), column_ids(grp, ["k", "g"]),
+        buf(), map(), 0)
+
+private column_ids(t: CatTable, names: []const string) -> Buf[u32]
+    val out = buf[u32]()
+    for n in names
+        out.push(t.column_named(n).unwrap().id)
+    out
+
+/** No fault: the real store. */
+no_faults() -> Faults = Faults(false, false, false, false)
+
+private bench_ddl(c: *MemCatalog, s: Statement)
+    c.apply(envelope([], s), BootstrapRole) match
+        Ok(_) -> ()
+        Err(e) -> panic(s"the history bench's catalog refused a statement: ${e.message}")
+
+private bench_col(name: string, ty: Type) -> ColumnDef = ColumnDef(name, ty, None, None, NoIdentity, None)
+
+private bench_table(name: string, columns: []const ColumnDef) -> Statement =
+    CreateTable(QualName("app", name), items_of(columns), items_of(["k"]), buf(), false)
+
+/** How a run is driven: the seed of its scheduler, and how many commits in a thousand lose their
+ * acknowledgement, recorded as `info` (§5.4) whatever the store did.
+ */
+struct DriveOptions
+    seed: u64
+    lost_acks: u64
+
+/** How many times a plan is attempted before its last failure stands. */
+const MaxAttempts: usize = 8
+
+/** What one statement came to. */
+private enum StepEnd
+    StepRan(mop: Option[Mop])
+    StepBlocked(holder: u64)
+    StepFailed(code: string, mop: Option[Mop])
+
+private struct HClient
+    process: u64
+    plans: Buf[Plan]
+    next: usize
+    attempts: usize
+    txn: Option[&Txn]
+    begun_at: u64
+    steps: Buf[HStep]
+    at: usize
+    mops: Buf[Mop]
+    waiting: u64
+
+/** Runs `pre` one after another on process 0, then each client's plans (`clients[i]` is process
+ * `i + 1`) interleaved by a scheduler seeded with `opts.seed`, which at each step lets one client
+ * whose wait (if any) is over take its next action: begin, one statement, or commit. Then `post`
+ * runs one after another on the process after the last client. Answers the recorded history, or why
+ * the run could not finish.
+ */
+drive(b: &Bench, clock: &SimClock, pre: Buf[Plan], clients: Buf[Buf[Plan]], post: Buf[Plan], opts: DriveOptions) -> Result[Buf[HEvent], string]
+    var r = recorder(clock)
+    var g = rng(opts.seed, 0x4859)
+    val cs = buf[HClient]()
+
+    cs.push(new_client(0, pre))
+    run_alone(b, &r, &g, cs, 0, opts)?
+
+    val first = cs.len()
+    for i in 0..<clients.len()
+        cs.push(new_client(u64(i + 1), clients[i]))
+
+    val runnable = buf[usize]()
+
+    loop
+        runnable.clear()
+        var unfinished: usize = 0
+
+        for i in first..<cs.len()
+            if cs[i].next >= cs[i].plans.len() then continue
+            unfinished += 1
+            if cs[i].waiting == 0 || !txn_live(b.store, cs[i].waiting) then runnable.push(i)
+
+        if unfinished == 0 then break
+        if runnable.len() == 0 then return Err("every unfinished client waits for a live transaction")
+
+        clock.ns += 1000
+        act(b, &r, &g, cs, runnable[usize(g.below(u64(runnable.len())))], opts)?
+
+    cs.push(new_client(u64(clients.len() + 1), post))
+    run_alone(b, &r, &g, cs, cs.len() - 1, opts)?
+    Ok(r.events)
+
+private new_client(process: u64, plans: Buf[Plan]) -> HClient = HClient(process, plans, 0, 0, None, 0, buf(), 0, buf(), 0)
+
+private run_alone(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: DriveOptions) -> Result[unit, string]
+    // A plan run alone never waits for long: nothing else is live.
+    var guard: usize = 0
+    while cs[i].next < cs[i].plans.len()
+        act(b, r, g, cs, i, DriveOptions(opts.seed, 0))?
+        guard += 1
+        if guard > 100000 then return Err("a plan run alone did not finish")
+    Ok(())
+
+private txn_live(s: &Store, id: u64) -> bool
+    for t in s.active
+        if t.id == id && t.state == Live then return true
+    false
+
+// One action of client `i`: begin its next plan, run its next statement, or commit.
+private act(b: &Bench, r: *Recorder, g: *Rng, cs: Buf[HClient], i: usize, opts: DriveOptions) -> Result[unit, string]
+    val c = cs[i]
+    val p = c.plans[c.next]
+
+    val t = c.txn match
+        Some(t) -> t
+        None ->
+            // Invoke: the steps known in advance, with their fresh values, are the invoke's value.
+            val steps = concrete(b, p.steps)
+            val known = buf[Mop]()
+            for s in steps
+                s match
+                    SThen(_) -> break
+                    _ -> step_mop(s) match
+                        Some(m) -> known.push(m)
+                        None -> ()
+            val _ = r.add(c.process, HInvoke, level_name(p.level), 0, 0, 0, "", known)
+            val t = b.store.begin(p.level, p.read_only)
+            cs[i].txn = Some(t)
+            cs[i].begun_at = t.snapshot
+            cs[i].steps = steps
+            cs[i].at = 0
+            cs[i].mops = buf()
+            cs[i].waiting = 0
+            return Ok(())
+
+    // Expand interactive steps whose turn has come.
+    loop
+        if cs[i].at >= cs[i].steps.len() then break
+        val f = cs[i].steps[cs[i].at] match
+            SThen(f) -> f
+            _ -> break
+        val made = concrete(b, f(cs[i].mops.copy()))
+        val steps = buf[HStep]()
+        steps.extend(cs[i].steps.view()[0..<cs[i].at])
+        steps.extend(made.view())
+        steps.extend(cs[i].steps.view()[(cs[i].at + 1)..<cs[i].steps.len()])
+        cs[i].steps = steps
+
+    if cs[i].at < cs[i].steps.len()
+        exec(b, t, cs[i].steps[cs[i].at]) match
+            StepRan(m) ->
+                m match
+                    Some(x) -> cs[i].mops.push(x)
+                    None -> ()
+                cs[i].at += 1
+                cs[i].waiting = 0
+            StepBlocked(h) -> cs[i].waiting = h
+            StepFailed(code, m) ->
+                m match
+                    Some(x) -> cs[i].mops.push(x)
+                    None -> ()
+                val _ = b.store.abort(t)
+                finish(r, cs, i, p, HFail, code, 0)
+        return Ok(())
+
+    b.store.commit(t) match
+        Ok(n) ->
+            val lost = opts.lost_acks > 0 && g.below(1000) < opts.lost_acks
+            finish(r, cs, i, p, if lost then HInfo else HOk, "", n)
+        Err(e) ->
+            val lost = opts.lost_acks > 0 && g.below(1000) < opts.lost_acks
+            finish(r, cs, i, p, if lost then HInfo else HFail, e.code, 0)
+
+    Ok(())
+
+// Records the end of client `i`'s transaction and moves it on: to the same plan again where a
+// retryable failure may be retried, to its next plan otherwise.
+private finish(r: *Recorder, cs: Buf[HClient], i: usize, p: Plan, kind: HKind, code: string, commit: u64)
+    val c = cs[i]
+    val t = c.txn.unwrap()
+    val err = if kind == HFail then error_name(code) else ""
+    val _ = r.add(c.process, kind, level_name(p.level), t.id, c.begun_at, commit, err, c.mops)
+
+    cs[i].txn = None
+    cs[i].waiting = 0
+
+    if kind == HFail && p.retry && retryable_code(code) && c.attempts + 1 < MaxAttempts
+        cs[i].attempts += 1
+    else
+        cs[i].attempts = 0
+        cs[i].next += 1
+
+// `steps` with fresh values in place of `SAppend`, `SWrite` and `SInsert`.
+private concrete(b: &Bench, steps: Buf[HStep]) -> Buf[HStep]
+    val out = buf[HStep]()
+    for s in steps
+        out.push(s match
+            SAppend(k) -> SAppendE(k, b.fresh())
+            SWrite(k) -> SPut(k, b.fresh())
+            SInsert(prefix, grp) -> SInsertKey(s"$prefix${b.fresh()}", grp)
+            _ -> s)
+    out
+
+// What a step will record before it has run: its writes in full, its reads unanswered.
+private step_mop(s: HStep) -> Option[Mop] = s match
+    SReadList(k) | SReadReg(k) -> Some(m_read(k))
+    SAppendE(k, e) -> Some(m_append(k, e))
+    SPut(k, v) -> Some(m_write(k, v))
+    SAdd(k, d) -> Some(m_add(k, d))
+    SSum(_, name) -> Some(m_read(name))
+    SPred(grp) -> Some(m_pred(s"g = $grp"))
+    SInsertKey(k, grp) -> Some(m_write(k, grp))
+    SDelete(k) -> Some(m_delete(k))
+    _ -> None
+
+private int_value(v: Value) -> i64 = v match
+    Int(n) -> i64(n)
+    _ -> 0
+
+// The rows keyed `id`, the read using the columns `cols` names: the key, and the value where the
+// statement's change reads it.
+private key_pred(cols: Buf[u32], id: i64, reads_value: bool) -> Pred
+    val used = buf[u32]()
+    used.push(cols[0])
+    if reads_value then used.push(cols[1])
+    Pred(r -> int_value(r.at(0)) == id, used, false)
+
+private write_end(r: Result[WriteOutcome, CodecError], m: Mop) -> StepEnd = r match
+    Ok(Done(n)) -> if n == 0 then StepRan(None) else StepRan(Some(m))
+    Ok(Wait(h)) -> StepBlocked(h)
+    Err(e) -> StepFailed(e.code, Some(m))
+
+// Runs one statement of a transaction.
+private exec(b: &Bench, t: &Txn, step: HStep) -> StepEnd
+    val s = b.store
+    s.statement(t)
+
+    step match
+        SReadList(k) -> s.get(t, b.lists, rec([Int(i128(b.id(k)))])) match
+            Ok(Some(row)) ->
+                val list = buf[i64]()
+                row.at(1) match
+                    Relation(es) ->
+                        for e in es
+                            list.push(int_value(e))
+                    _ -> ()
+                StepRan(Some(Mop(MRead, k, 0, ObsList(list), buf())))
+            Ok(None) -> StepRan(Some(m_read_unborn(k)))
+            Err(e) -> StepFailed(e.code, None)
+        SReadReg(k) -> s.get(t, b.regs, rec([Int(i128(b.id(k)))])) match
+            Ok(Some(row)) -> StepRan(Some(m_read_num(k, int_value(row.at(1)))))
+            Ok(None) -> StepRan(Some(m_read_unborn(k)))
+            Err(e) -> StepFailed(e.code, None)
+        SAppendE(k, e) ->
+            val change: &Fn(StoredRow) -> Value = r ->
+                val list = r.at(1) match
+                    Relation(es) -> es.copy()
+                    _ -> buf[Value]()
+                list.push(Int(i128(e)))
+                rec([r.at(0), Relation(list)])
+            write_end(s.update_where(t, b.lists, key_pred(b.list_cols, b.id(k), true), change), m_append(k, e))
+        SPut(k, v) ->
+            val change: &Fn(StoredRow) -> Value = r -> rec([r.at(0), Int(i128(v))])
+            write_end(s.update_where(t, b.regs, key_pred(b.reg_cols, b.id(k), false), change), m_write(k, v))
+        SAdd(k, d) ->
+            val change: &Fn(StoredRow) -> Value = r -> rec([r.at(0), Int(i128(int_value(r.at(1)) + d))])
+            write_end(s.update_where(t, b.regs, key_pred(b.reg_cols, b.id(k), true), change), m_add(k, d))
+        SSum(keys, name) ->
+            val ids = buf[i64]()
+            for k in keys
+                ids.push(b.id(k))
+            val cols = b.reg_cols
+            val wanted: &Fn(StoredRow) -> bool = r ->
+                val id = int_value(r.at(0))
+                var hit = false
+                for x in ids
+                    if x == id then hit = true
+                hit
+            s.scan(t, b.regs, Pred(wanted, cols, false)) match
+                Ok(hits) ->
+                    var sum: i64 = 0
+                    for h in hits
+                        sum += int_value(h.row.at(1))
+                    StepRan(Some(m_read_num(name, sum)))
+                Err(e) -> StepFailed(e.code, None)
+        SPred(grp) ->
+            val cols = buf[u32]()
+            cols.push(b.grp_cols[1])
+            s.scan(t, b.grp, Pred(r -> int_value(r.at(1)) == grp, cols, false)) match
+                Ok(hits) ->
+                    val rows = buf[string]()
+                    for h in hits
+                        h.key match
+                            Record(fs) -> rows.push(b.name_of(int_value(fs[0])))
+                            _ -> ()
+                    StepRan(Some(Mop(MPred, s"g = $grp", 0, ObsRows, rows)))
+                Err(e) -> StepFailed(e.code, None)
+        SInsertKey(k, grp) ->
+            val row = store_row(s, b.grp, rec([Int(i128(b.id(k))), Int(i128(grp)), Int(0)]))
+            write_end(s.insert(t, b.grp, row), m_write(k, grp))
+        SDelete(k) ->
+            write_end(s.delete_where(t, b.grp, key_pred(b.grp_cols, b.id(k), false)), m_delete(k))
+        _ -> StepRan(None)

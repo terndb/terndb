@@ -1,0 +1,1241 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{StrBuilder, parse_long, str_builder}
+
+// The checker of `isolation.md` §7.1: from a recorded history (§2.5) it infers each object's version
+// order from the values alone (Elle's inference: a list key's order is its longest read, every other
+// read a prefix of it; a register key's order follows from unique written values, a read followed by
+// a write of the same key in one transaction, and a delete coming after the row's insert), builds the
+// direct serialization graph of §2.3, and finds every phenomenon of §2.4 that a transaction's level
+// forbids (§3.1–§3.5), judged per level as §3.4 says. The white-box checks then take `commit` and
+// `snapshot` as the claimed version and serial orders; the black-box checks never read them.
+
+// -- transactions --------------------------------------------------------------------------------
+
+/** What became of a transaction: committed (an `ok`, or an `info` whose writes were read), aborted
+ * (a `fail`), or unknown (an `info` nobody's read explains, or an `invoke` never completed). §5.4:
+ * an unknown transaction may have committed, so its writes are never an aborted read; and since
+ * nothing read them, they sit nowhere in a version order and add no edge either way.
+ */
+enum TxnOutcome
+    TCommitted
+    TAborted
+    TUnknown
+
+/** One transaction of a history, gathered from its invoke and completion records. `id` is its
+ * ordinal among the history's invokes; `end` is the time of its `ok`, 0 where there is none.
+ */
+struct HTxn
+    id: usize
+    process: u64
+    level: string
+    outcome: TxnOutcome
+    info: bool
+    invoked: u64
+    end: u64
+    ops: Buf[Mop]
+    error: string
+    txid: u64
+    snapshot: u64
+    commit: u64
+
+    rank(self) -> i32 = level_rank(self.level)
+
+    /** Whether the transaction wrote anything. */
+    writes(self) -> bool
+        for m in self.ops
+            if m.writes() then return true
+        false
+
+/** An edge of the DSG (§2.3), or one of its session and real-time extensions. */
+enum EdgeKind
+    EWw
+    EWr
+    ERw
+    ESo
+    ERt
+
+/** An edge `from -> to` of `kind`; `pred` marks a predicate dependency (§2.3), `key` names the object
+ * (or the predicate) it is about.
+ */
+struct HEdge derives Eq
+    from: usize
+    to: usize
+    kind: EdgeKind
+    pred: bool
+    key: string
+
+/** One anomaly found: its §2.4 name (or the name of a history-level check), whether a level of the
+ * transactions involved forbids it, the transactions (a cycle's in order), the edges of a cycle, and
+ * a sentence saying what was seen.
+ */
+struct Anomaly
+    name: string
+    forbidden: bool
+    txns: Buf[usize]
+    edges: Buf[HEdge]
+    detail: string
+
+/** What the checker infers and checks. `registers`: integer keys hold unique written values, so
+ * their version orders can be inferred (off for a bank, whose balances repeat). `counters`: a key
+ * only ever `add`ed to, by positive amounts, is a counter checked against the increments that
+ * committed (I14). `white_box`: also check `commit` and `snapshot` (I5 and the read rule).
+ */
+struct CheckOptions
+    registers: bool
+    counters: bool
+    white_box: bool
+
+check_all() -> CheckOptions = CheckOptions(true, true, true)
+
+/** The checker's answer: the transactions it gathered, the DSG and its extensions, and every anomaly
+ * found, forbidden or permitted.
+ */
+struct HistoryReport
+    txns: Buf[HTxn]
+    edges: Buf[HEdge]
+    anomalies: Buf[Anomaly]
+
+    /** The anomalies some transaction's level forbids. */
+    forbidden(self) -> Buf[Anomaly]
+        val out = buf[Anomaly]()
+        for a in self.anomalies
+            if a.forbidden then out.push(a)
+        out
+
+    /** Whether an anomaly called `name` was found, forbidden or not. */
+    found(self, name: string) -> bool
+        for a in self.anomalies
+            if a.name == name then return true
+        false
+
+    /** Whether an anomaly called `name` was found and is forbidden. */
+    found_forbidden(self, name: string) -> bool
+        for a in self.anomalies
+            if a.name == name && a.forbidden then return true
+        false
+
+    /** The first anomaly called `name`; it must exist. */
+    first(self, name: string) -> Anomaly
+        for a in self.anomalies
+            if a.name == name then return a
+        Anomaly("none", false, buf(), buf(), s"no anomaly called $name")
+
+    /** Each anomaly on a line of its own. */
+    summary(self) -> string
+        var sb = str_builder()
+        for a in self.anomalies
+            sb.push(if a.forbidden then "FORBIDDEN " else "permitted ")
+            sb.push(a.name)
+            sb.push(": ")
+            sb.push(a.detail)
+            sb.push("\n")
+        sb.finish()
+
+/** `edges` as a cycle, `T3 -rw(k1)-> T5 -wr(k2)-> T3`. */
+describe_cycle(edges: Buf[HEdge]) -> string
+    var sb = str_builder()
+    for i in 0..<edges.len()
+        val e = edges[i]
+        if i == 0
+            sb.push("T")
+            sb.push_uint(u64(e.from))
+        sb.push(" -")
+        sb.push(edge_name(e))
+        sb.push("(")
+        sb.push(e.key)
+        sb.push(")-> T")
+        sb.push_uint(u64(e.to))
+    sb.finish()
+
+edge_name(e: HEdge) -> string = e.kind match
+    EWw -> "ww"
+    EWr -> if e.pred then "wr-p" else "wr"
+    ERw -> if e.pred then "rw-p" else "rw"
+    ESo -> "so"
+    ERt -> "rt"
+
+/** Checks `events` (§7.1): every anomaly found, each judged against the levels of the transactions
+ * involved.
+ */
+check_history(events: Buf[HEvent], opts: CheckOptions) -> HistoryReport
+    var c = HChecker(opts, buf(), buf(), buf(), buf(), buf(), map(), map(), buf())
+    c.gather(events)
+    c.index_writes()
+    c.resolve_info()
+    c.objects()
+    c.session_edges()
+    c.cycles()
+    HistoryReport(c.txns, c.edges, c.anomalies)
+
+/** `events` with the white-box fields dropped, so that a check of it is black-box only (§2.5). */
+strip_white_box(events: Buf[HEvent]) -> Buf[HEvent]
+    val out = buf[HEvent]()
+    for e in events
+        out.push(HEvent(e.index, e.time, e.process, e.node, e.kind, e.level, e.sync, 0, 0, 0, e.error, e.value))
+    out
+
+// -- the checker ---------------------------------------------------------------------------------
+
+/** No transaction. */
+private const NoTxn: usize = 0xffffffffffffffff
+
+/** One write of a key a transaction made: the element appended or the value written (`del` for a
+ * delete), and whether it is the transaction's last write of that key. `ambiguous` marks a value two
+ * transactions that did not abort both wrote, which no read can be attributed by.
+ */
+private struct WriteRec
+    txn: usize
+    key: string
+    value: i64
+    del: bool
+    last: bool
+    ambiguous: bool
+
+/** A read by a committed transaction: which transaction, and which of its operations. */
+private struct ReadRef
+    txn: usize
+    op: usize
+
+/** Everything known about one key. */
+private struct KeyInfo
+    key: string
+    list: bool
+    counter: bool
+    writes: Buf[usize]
+    reads: Buf[ReadRef]
+
+private struct HChecker
+    opts: CheckOptions
+    txns: Buf[HTxn]
+    edges: Buf[HEdge]
+    out: Buf[Buf[usize]]
+    anomalies: Buf[Anomaly]
+    recs: Buf[WriteRec]
+    by_value: Map[string, usize]
+    by_key: Map[string, usize]
+    keys: Buf[KeyInfo]
+
+    // -- gathering ------------------------------------------------------------------------------
+
+    gather(*self, events: Buf[HEvent])
+        val open_proc = buf[u64]()
+        val open_txn = buf[usize]()
+
+        for e in events
+            var slot = NoTxn
+            for i in 0..<open_proc.len()
+                if open_proc[i] == e.process then slot = i
+
+            if e.kind == HInvoke
+                if slot != NoTxn
+                    self.malformed(open_txn[slot], s"process ${e.process} invoked a transaction while T${open_txn[slot]} was open")
+                    open_proc.remove(slot)
+                    open_txn.remove(slot)
+
+                val id = self.txns.len()
+                self.txns.push(HTxn(id, e.process, e.level, TUnknown, false, e.time, 0, e.value, "", 0, 0, 0))
+                self.out.push(buf())
+                open_proc.push(e.process)
+                open_txn.push(id)
+            elif slot == NoTxn
+                self.anomalies.push(Anomaly("malformed", true, buf(), buf(), s"record ${e.index} completes a transaction process ${e.process} never invoked"))
+            else
+                val id = open_txn[slot]
+                open_proc.remove(slot)
+                open_txn.remove(slot)
+                val t = self.txns[id]
+                val ops = if e.value.len() > 0 then e.value else t.ops
+                val outcome = e.kind match
+                    HOk -> TCommitted
+                    HFail -> TAborted
+                    _ -> TUnknown
+                val end = if e.kind == HOk then e.time else 0
+                self.txns[id] = HTxn(id, t.process, t.level, outcome, e.kind == HInfo, t.invoked, end, ops, e.error, e.txid, e.snapshot, e.commit)
+
+    malformed(*self, t: usize, detail: string)
+        val ts = buf[usize]()
+        ts.push(t)
+        self.anomalies.push(Anomaly("malformed", true, ts, buf(), detail))
+
+    committed(self, t: usize) -> bool = t != NoTxn && self.txns[t].outcome == TCommitted
+
+    key_info(*self, key: string) -> usize = self.by_key.get(key) match
+        Some(i) -> i
+        None ->
+            val i = self.keys.len()
+            self.keys.push(KeyInfo(key, false, false, buf(), buf()))
+            self.by_key.put(key, i)
+            i
+
+    // Every write of every transaction, found by key and value; every read by a committed
+    // transaction, by key.
+    index_writes(*self)
+        for t in self.txns
+            for i in 0..<t.ops.len()
+                val m = t.ops[i]
+                if m.kind == MPred then continue
+                val k = self.key_info(m.key)
+
+                if m.kind == MAppend || (m.kind == MRead && is_list(m.seen)) then self.keys[k].list = true
+                if m.kind == MAdd then self.keys[k].counter = true
+
+                if m.kind == MAppend || m.kind == MWrite || m.kind == MDelete
+                    var last = true
+                    for j in (i + 1)..<t.ops.len()
+                        val n = t.ops[j]
+                        if n.key == m.key && n.kind == m.kind || n.key == m.key && (n.kind == MWrite || n.kind == MDelete) && (m.kind == MWrite || m.kind == MDelete)
+                            last = false
+                    self.add_write(WriteRec(t.id, m.key, m.arg, m.kind == MDelete, last, false))
+
+    add_write(*self, w: WriteRec)
+        val vk = value_key(w.key, w.value, w.del)
+
+        self.by_value.get(vk) match
+            Some(r) ->
+                val old = self.recs[r]
+                if old.txn == w.txn then return
+                // A value is written once: where an unknown transaction and a committed one wrote
+                // the same, the unknown one aborted (§5.4), and only two that did not are ambiguous.
+                val old_live = self.txns[old.txn].outcome != TAborted
+                val new_live = self.txns[w.txn].outcome != TAborted
+                val old_ok = self.txns[old.txn].outcome == TCommitted
+                val new_ok = self.txns[w.txn].outcome == TCommitted
+
+                if old_live && new_live && old_ok != new_ok
+                    if new_ok then self.recs[r] = w
+                elif old_live && new_live && !old_ok
+                    self.recs[r] = WriteRec(old.txn, old.key, old.value, old.del, old.last, true)
+                elif old_live && new_live
+                    val ts = buf[usize]()
+                    ts.push(old.txn)
+                    ts.push(w.txn)
+                    self.anomalies.push(Anomaly("duplicate-write", true, ts, buf(),
+                        s"T${old.txn} and T${w.txn} both wrote ${value_text(w)} to ${w.key}, so a read of it names no one writer"))
+                    self.recs[r] = WriteRec(old.txn, old.key, old.value, old.del, old.last, true)
+                elif new_live
+                    // The aborted write gives way: the key's list of writes names record `r` still.
+                    self.recs[r] = w
+            None ->
+                val r = self.recs.len()
+                self.recs.push(w)
+                self.by_value.put(vk, r)
+                self.keys[self.key_info(w.key)].writes.push(r)
+
+    writer(self, key: string, v: i64, del: bool) -> usize = self.by_value.get(value_key(key, v, del)) match
+        Some(r) -> r
+        None -> NoTxn
+
+    // §5.4: an unknown transaction whose write a committed transaction read committed.
+    resolve_info(*self)
+        var changed = true
+
+        while changed
+            changed = false
+            for t in self.txns
+                if t.outcome != TCommitted then continue
+                for m in t.ops
+                    val ws = self.observed(t, m)
+                    for r in ws
+                        val w = self.recs[r]
+                        if self.txns[w.txn].outcome == TUnknown && !w.ambiguous
+                            self.set_outcome(w.txn, TCommitted)
+                            changed = true
+
+        for t in self.txns
+            if t.outcome != TCommitted then continue
+            for i in 0..<t.ops.len()
+                val m = t.ops[i]
+                if m.kind == MRead && m.seen != ObsNone
+                    self.keys[self.key_info(m.key)].reads.push(ReadRef(t.id, i))
+
+    set_outcome(*self, id: usize, o: TxnOutcome)
+        val t = self.txns[id]
+        self.txns[id] = HTxn(t.id, t.process, t.level, o, t.info, t.invoked, t.end, t.ops, t.error, t.txid, t.snapshot, t.commit)
+
+    // The write records a read observed: a list's elements, a register's value, a predicate's rows.
+    observed(self, t: HTxn, m: Mop) -> Buf[usize]
+        val out = buf[usize]()
+
+        if m.kind == MRead
+            m.seen match
+                ObsList(list) ->
+                    for e in list
+                        val r = self.writer(m.key, e, false)
+                        if r != NoTxn then out.push(r)
+                ObsNum(n) ->
+                    val r = self.writer(m.key, n, false)
+                    if r != NoTxn then out.push(r)
+                _ -> ()
+        elif m.kind == MPred && m.seen == ObsRows
+            pred_group(m.key) match
+                Some(g) ->
+                    for k in m.rows
+                        val r = self.writer(k, g, false)
+                        if r != NoTxn then out.push(r)
+                None -> ()
+
+        out
+
+    // -- edges ----------------------------------------------------------------------------------
+
+    edge(*self, from: usize, to: usize, kind: EdgeKind, pred: bool, key: string)
+        if from == to || from == NoTxn || to == NoTxn then return
+        if !self.committed(from) || !self.committed(to) then return
+
+        for i in self.out[from]
+            val e = self.edges[i]
+            if e.to == to && e.kind == kind && e.pred == pred then return
+
+        self.out[from].push(self.edges.len())
+        self.edges.push(HEdge(from, to, kind, pred, key))
+
+    anomaly(*self, name: string, forbidden: bool, ts: []const usize, es: Buf[HEdge], detail: string)
+        self.anomalies.push(Anomaly(name, forbidden, items_of(ts), es, detail))
+
+    // -- objects --------------------------------------------------------------------------------
+
+    objects(*self)
+        for ki in 0..<self.keys.len()
+            val k = self.keys[ki]
+            if k.list
+                self.list_key(k)
+            elif k.counter
+                if self.opts.counters then self.counter_key(k)
+            elif self.opts.registers
+                self.register_key(k)
+
+        if self.opts.registers then self.predicates()
+        self.read_only_aborts()
+
+    // The appends `t` made to `key` before its operation `op`, in order.
+    own_appends(self, t: HTxn, key: string, op: usize) -> Buf[i64]
+        val out = buf[i64]()
+        for j in 0..<op
+            val m = t.ops[j]
+            if m.kind == MAppend && m.key == key then out.push(m.arg)
+        out
+
+    // A read of `key` by `t`, with `t`'s own earlier appends taken off its end: the version of the
+    // other transactions' writes it saw. The second answer is whether the own appends were there.
+    external_list(self, t: HTxn, op: usize) -> (Buf[i64], bool)
+        val m = t.ops[op]
+        val list = m.seen match
+            ObsList(l) -> l
+            _ -> buf[i64]()
+        val own = self.own_appends(t, m.key, op)
+
+        if own.len() > list.len() then return (list, own.len() == 0)
+        val cut = list.len() - own.len()
+
+        for j in 0..<own.len()
+            if list[cut + j] != own[j] then return (list, false)
+
+        val out = buf[i64]()
+        out.extend(list.view()[0..<cut])
+        (out, true)
+
+    list_key(*self, k: KeyInfo)
+        // The checks on each read: its own appends, duplicates, garbage, aborted and intermediate
+        // reads. The longest read gives the version order.
+        var longest = buf[i64]()
+        var longest_txn = NoTxn
+
+        for rr in k.reads
+            val t = self.txns[rr.txn]
+            val m = t.ops[rr.op]
+            val full = m.seen match
+                ObsList(l) -> l
+                _ -> continue
+            val (ext, own_ok) = self.external_list(t, rr.op)
+
+            if !own_ok
+                self.anomaly("internal", true, [t.id], buf(), s"T${t.id} read ${k.key} as ${list_text(full)}, which does not end with its own earlier appends")
+
+            for i in 0..<full.len()
+                for j in (i + 1)..<full.len()
+                    if full[i] == full[j]
+                        self.anomaly("duplicate-elements", true, [t.id], buf(), s"T${t.id} read ${k.key} as ${list_text(full)}, holding ${full[i]} twice")
+
+            for i in 0..<ext.len()
+                val r = self.writer(k.key, ext[i], false)
+
+                if r == NoTxn
+                    self.anomaly("garbage", true, [t.id], buf(), s"T${t.id} read ${ext[i]} in ${k.key}, which no transaction appended")
+                    continue
+
+                val w = self.recs[r]
+                if w.ambiguous || w.txn == t.id then continue
+
+                if self.txns[w.txn].outcome == TAborted
+                    self.anomaly("G1a", true, [w.txn, t.id], buf(), s"T${t.id} read ${ext[i]} in ${k.key}, appended by T${w.txn}, which aborted")
+                elif !w.last && !self.later_of_same(ext, i, w)
+                    self.anomaly("G1b", true, [w.txn, t.id], buf(), s"T${t.id} read ${k.key} as ${list_text(ext)}, an intermediate version of T${w.txn}")
+
+            if full.len() > longest.len()
+                longest = full
+                longest_txn = t.id
+
+        // Every read is a prefix of the longest.
+        for rr in k.reads
+            val t = self.txns[rr.txn]
+            val full = t.ops[rr.op].seen match
+                ObsList(l) -> l
+                _ -> continue
+            if !is_prefix(full, longest)
+                self.anomaly("incompatible-order", true, [t.id, longest_txn], buf(),
+                    s"T${t.id} read ${k.key} as ${list_text(full)} and T${longest_txn} as ${list_text(longest)}: no one order of appends explains both")
+
+        // The writer of each position of the order, NoTxn where none commits.
+        val order = buf[usize]()
+        for e in longest
+            val r = self.writer(k.key, e, false)
+            order.push(if r == NoTxn || self.recs[r].ambiguous || !self.committed(self.recs[r].txn) then NoTxn else self.recs[r].txn)
+
+        var prev = NoTxn
+        for w in order
+            if w == NoTxn then continue
+            if prev != NoTxn && prev != w then self.edge(prev, w, EWw, false, k.key)
+            if self.opts.white_box && prev != NoTxn && prev != w
+                val a = self.txns[prev]
+                val b = self.txns[w]
+                if a.commit != 0 && b.commit != 0 && a.commit >= b.commit
+                    self.anomaly("I5", true, [prev, w], buf(), s"${k.key} orders T${prev}'s append before T${w}'s, but their commits are ${a.commit} and ${b.commit}")
+            prev = w
+
+        // The version each committed read saw, and what follows it.
+        val lost_base = buf[usize]()
+        val lost_txn = buf[usize]()
+
+        for rr in k.reads
+            val t = self.txns[rr.txn]
+            val (ext, _) = self.external_list(t, rr.op)
+            if !is_prefix(ext, longest) then continue
+            val n = ext.len()
+
+            if n > 0
+                val r = self.writer(k.key, ext[n - 1], false)
+                if r != NoTxn && !self.recs[r].ambiguous then self.edge(self.recs[r].txn, t.id, EWr, false, k.key)
+
+            var j = n
+            while j < order.len()
+                if order[j] != NoTxn
+                    if order[j] != t.id then self.edge(t.id, order[j], ERw, false, k.key)
+                    break
+                j += 1
+
+            // A committed append no read holds follows the longest read, every read being a prefix
+            // of the order: the version this read saw precedes it.
+            for wr in k.writes
+                val w = self.recs[wr]
+                if w.last && w.txn != t.id && self.committed(w.txn) && index_in(longest, w.value) == NoTxn
+                    self.edge(t.id, w.txn, ERw, false, k.key)
+
+            // G-stale: a writer acknowledged before this transaction began, whose append it missed.
+            for wr in k.writes
+                val w = self.recs[wr]
+                if w.txn == t.id || !w.last || !self.committed(w.txn) then continue
+                val wt = self.txns[w.txn]
+                if wt.end == 0 || wt.end >= t.invoked then continue
+                val p = index_in(longest, w.value)
+                if p == NoTxn || p >= n
+                    val es = buf[HEdge]()
+                    es.push(HEdge(w.txn, t.id, ERt, false, k.key))
+                    es.push(HEdge(t.id, w.txn, ERw, false, k.key))
+                    self.anomaly("G-stale", true, [w.txn, t.id], es, s"T${t.id} began after T${w.txn} was acknowledged, but read ${k.key} without its append ${w.value}")
+                    break
+
+            // White box: the read is exactly the appends committed at or before the snapshot.
+            if self.opts.white_box && t.txid != 0 && t.rank() >= 1
+                var expect: usize = 0
+                var known = true
+                for w in order
+                    if w == NoTxn
+                        known = false
+                    elif w != t.id && self.txns[w].commit == 0
+                        known = false
+                    elif w != t.id && self.txns[w].commit <= t.snapshot
+                        expect += 1
+                if known && expect != n
+                    self.anomaly("wb-read", true, [t.id], buf(),
+                        s"T${t.id} read ${n} elements of ${k.key} at snapshot ${t.snapshot}, where ${expect} were committed")
+
+            // P4 candidates: the version a later append of the same transaction was based on.
+            if self.appends_after(t, k.key, rr.op) && self.last_read_before_append(t, k.key) == rr.op
+                lost_base.push(n)
+                lost_txn.push(t.id)
+
+        self.lost_updates(k.key, lost_base, lost_txn)
+
+    later_of_same(self, list: Buf[i64], i: usize, w: WriteRec) -> bool
+        for j in (i + 1)..<list.len()
+            val r = self.writer(w.key, list[j], false)
+            if r != NoTxn && self.recs[r].txn == w.txn && self.recs[r].last then return true
+        false
+
+    appends_after(self, t: HTxn, key: string, op: usize) -> bool
+        for j in (op + 1)..<t.ops.len()
+            val m = t.ops[j]
+            if m.key == key && m.writes() then return true
+        false
+
+    // The last read of `key` by `t` before its first write of `key`; NoTxn where there is none.
+    last_read_before_append(self, t: HTxn, key: string) -> usize
+        var at = NoTxn
+        for j in 0..<t.ops.len()
+            val m = t.ops[j]
+            if m.key != key then continue
+            if m.writes() then return at
+            if m.kind == MRead && m.seen != ObsNone then at = j
+        at
+
+    // P4 (§2.4): two committed transactions read the same version of `key` and then both wrote it.
+    lost_updates(*self, key: string, base: Buf[usize], txn: Buf[usize])
+        for i in 0..<base.len()
+            for j in (i + 1)..<base.len()
+                if base[i] != base[j] || txn[i] == txn[j] then continue
+                val a = txn[i]
+                val b = txn[j]
+                val forbidden = self.txns[a].rank() >= 1 && self.txns[b].rank() >= 1
+                val es = buf[HEdge]()
+                es.push(HEdge(a, b, ERw, false, key))
+                es.push(HEdge(b, a, ERw, false, key))
+                self.anomaly("P4", forbidden, [a, b], es, s"T${a} and T${b} both read the same version of ${key} and both wrote it: one update is lost")
+
+    // -- registers ------------------------------------------------------------------------------
+
+    // The version a read of a register saw: `init` (no write), a write record, or NoTxn where it
+    // names nothing (garbage, reported) or the read was of the transaction's own write.
+    reg_version(*self, t: HTxn, op: usize, k: KeyInfo) -> (usize, bool)
+        val m = t.ops[op]
+
+        // The transaction's own last write of the key before the read.
+        var own = NoTxn
+        for j in 0..<op
+            val n = t.ops[j]
+            if n.key == m.key && (n.kind == MWrite || n.kind == MDelete) then own = j
+
+        if own != NoTxn
+            val w = t.ops[own]
+            val ok = if w.kind == MDelete then m.seen == ObsUnborn else m.seen == ObsNum(w.arg)
+            if !ok then self.anomaly("internal", true, [t.id], buf(), s"T${t.id} read ${k.key} after writing it, but not its own write")
+            return (NoTxn, false)
+
+        m.seen match
+            ObsUnborn -> (InitVersion, true)
+            ObsNum(v) ->
+                if v == 0 then return (InitVersion, true)
+                val r = self.writer(k.key, v, false)
+
+                if r == NoTxn
+                    self.anomaly("garbage", true, [t.id], buf(), s"T${t.id} read ${v} from ${k.key}, which no transaction wrote")
+                    return (NoTxn, false)
+
+                val w = self.recs[r]
+                if w.ambiguous then return (NoTxn, false)
+
+                if self.txns[w.txn].outcome == TAborted
+                    self.anomaly("G1a", true, [w.txn, t.id], buf(), s"T${t.id} read ${v} from ${k.key}, written by T${w.txn}, which aborted")
+                    return (NoTxn, false)
+
+                if !w.last
+                    self.anomaly("G1b", true, [w.txn, t.id], buf(), s"T${t.id} read ${v} from ${k.key}, an intermediate write of T${w.txn}")
+                    return (NoTxn, false)
+
+                (r, true)
+            _ -> (NoTxn, false)
+
+    register_key(*self, k: KeyInfo)
+        // Versions: the key's committed last writes. `after[i]` lists the versions known to follow
+        // version i directly; index `n` is the initial version.
+        val vs = buf[usize]()
+        for r in k.writes
+            val w = self.recs[r]
+            if w.last && !w.ambiguous && self.committed(w.txn) then vs.push(r)
+
+        val n = vs.len()
+        val after = buf[Buf[usize]]()
+        for _ in 0..<(n + 1)
+            after.push(buf())
+
+        val read_ver = buf[usize]()
+        val read_txn = buf[usize]()
+        val read_ok = buf[bool]()
+
+        for rr in k.reads
+            val t = self.txns[rr.txn]
+            val (r, ok) = self.reg_version(t, rr.op, k)
+            read_txn.push(t.id)
+            read_ok.push(ok)
+            read_ver.push(if !ok then NoTxn elif r == InitVersion then n else version_index(vs, r))
+
+        // A read followed by a write of the same key: the written version follows the one read.
+        val lost_base = buf[usize]()
+        val lost_txn = buf[usize]()
+
+        for i in 0..<k.reads.len()
+            val rr = k.reads[i]
+            val t = self.txns[rr.txn]
+            if !read_ok[i] || read_ver[i] == NoTxn then continue
+            if self.last_read_before_append(t, k.key) != rr.op then continue
+
+            val mine = self.final_write(t, k, vs)
+            if mine == NoTxn then continue
+            if !contains_usize(after[read_ver[i]], mine) then after[read_ver[i]].push(mine)
+            lost_base.push(read_ver[i])
+            lost_txn.push(t.id)
+
+        // A delete follows the row's every other version: keys are never reused.
+        for i in 0..<n
+            if !self.recs[vs[i]].del then continue
+            for j in 0..<n
+                if !self.recs[vs[j]].del && !contains_usize(after[j], i) then after[j].push(i)
+
+        // ww edges between versions known to be adjacent in the order, and I5.
+        for i in 0..<n
+            for j in after[i]
+                val a = self.recs[vs[i]].txn
+                val b = self.recs[vs[j]].txn
+                self.edge(a, b, EWw, false, k.key)
+                if self.opts.white_box
+                    val ca = self.txns[a].commit
+                    val cb = self.txns[b].commit
+                    if ca != 0 && cb != 0 && ca >= cb
+                        self.anomaly("I5", true, [a, b], buf(), s"${k.key}'s version by T${a} precedes T${b}'s, but their commits are ${ca} and ${cb}")
+
+        // Everything known to follow each version: a few writes per key, so a walk per version.
+        val later = buf[Buf[bool]]()
+        for i in 0..<(n + 1)
+            val seen = buf[bool]()
+            for _ in 0..<n
+                seen.push(i == n)
+            if i < n
+                val stack = buf[usize]()
+                stack.extend(after[i].view())
+                while stack.len() > 0
+                    val x = stack.pop().unwrap()
+                    if seen[x] then continue
+                    seen[x] = true
+                    stack.extend(after[x].view())
+            later.push(seen)
+
+        for i in 0..<k.reads.len()
+            val v = read_ver[i]
+            if v == NoTxn then continue
+            val t = self.txns[read_txn[i]]
+
+            if v < n then self.edge(self.recs[vs[v]].txn, t.id, EWr, false, k.key)
+
+            for j in 0..<n
+                if later[v][j] then self.edge(t.id, self.recs[vs[j]].txn, ERw, false, k.key)
+
+            // G-stale: a version acknowledged before this transaction began and known to follow
+            // the one it read.
+            for j in 0..<n
+                val w = self.txns[self.recs[vs[j]].txn]
+                if w.id == t.id || w.end == 0 || w.end >= t.invoked || !later[v][j] then continue
+                val es = buf[HEdge]()
+                es.push(HEdge(w.id, t.id, ERt, false, k.key))
+                es.push(HEdge(t.id, w.id, ERw, false, k.key))
+                self.anomaly("G-stale", true, [w.id, t.id], es, s"T${t.id} began after T${w.id} was acknowledged, but read a version of ${k.key} older than its write")
+                break
+
+            // White box: the version read is the newest committed at or before the snapshot.
+            if self.opts.white_box && t.txid != 0 && t.rank() >= 1
+                var best = n
+                var best_c: u64 = 0
+                var known = true
+                for j in 0..<n
+                    val c = self.txns[self.recs[vs[j]].txn].commit
+                    if c == 0
+                        known = false
+                    elif c <= t.snapshot && c > best_c
+                        best = j
+                        best_c = c
+                if known && best != v
+                    self.anomaly("wb-read", true, [t.id], buf(), s"T${t.id} read a version of ${k.key} that is not the newest at its snapshot ${t.snapshot}")
+
+        self.lost_updates(k.key, lost_base, lost_txn)
+
+    // The version index of `t`'s last write of `key`, NoTxn where it has none among `vs`.
+    final_write(self, t: HTxn, k: KeyInfo, vs: Buf[usize]) -> usize
+        for i in 0..<vs.len()
+            if self.recs[vs[i]].txn == t.id then return i
+        NoTxn
+
+    // -- predicate reads (W4) -------------------------------------------------------------------
+
+    // A predicate read `g = n` over rows whose `g` is set once at insert and never updated: the
+    // row matches from its insert until its delete. §7.2 W4's edges: a row in the result read its
+    // insert (wr) and anti-depends on its delete (rw); a committed insert the result lacks, of a row
+    // with no delete, anti-depends on the read (rw).
+    predicates(*self)
+        for t in self.txns
+            if t.outcome != TCommitted then continue
+            for op in 0..<t.ops.len()
+                val m = t.ops[op]
+                if m.kind != MPred || m.seen != ObsRows then continue
+                pred_group(m.key) match
+                    Some(g) -> self.predicate_read(t, op, m, g)
+                    None -> self.anomaly("malformed", true, [t.id], buf(), s"T${t.id}'s predicate '${m.key}' is not of the form g = n")
+
+    predicate_read(*self, t: HTxn, op: usize, m: Mop, g: i64)
+        // The rows the read returned.
+        for key in m.rows
+            val r = self.writer(key, g, false)
+
+            if r == NoTxn
+                self.anomaly("garbage", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${key}, which no transaction inserted with g = ${g}")
+                continue
+
+            val w = self.recs[r]
+            if w.ambiguous then continue
+
+            if self.txns[w.txn].outcome == TAborted
+                self.anomaly("G1a", true, [w.txn, t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${key}, inserted by T${w.txn}, which aborted")
+                continue
+
+            if self.own_write_before(t, key, op, true)
+                self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${key}, which it had deleted")
+
+            self.edge(w.txn, t.id, EWr, true, m.key)
+            val d = self.writer(key, 0, true)
+
+            if d != NoTxn && self.committed(self.recs[d].txn)
+                val dt = self.txns[self.recs[d].txn]
+                self.edge(t.id, dt.id, ERw, true, m.key)
+                if dt.id != t.id && dt.end != 0 && dt.end < t.invoked
+                    val es = buf[HEdge]()
+                    es.push(HEdge(dt.id, t.id, ERt, true, m.key))
+                    es.push(HEdge(t.id, dt.id, ERw, true, m.key))
+                    self.anomaly("G-stale", true, [dt.id, t.id], es, s"T${t.id} began after T${dt.id}'s delete of ${key} was acknowledged, but its read of '${m.key}' returned it")
+
+        // The committed inserts into the group that the read lacks.
+        for w in self.recs
+            if w.del || w.value != g || w.ambiguous || !self.committed(w.txn) || contains_str(m.rows, w.key) || !self.row_key(w.key) then continue
+            if w.txn == t.id
+                if self.own_write_before(t, w.key, op, false)
+                    self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' lacks ${w.key}, which it had inserted")
+                continue
+
+            // A delete that committed, or may have (§5.4), explains the absence.
+            val d = self.writer(w.key, 0, true)
+            if d != NoTxn && self.txns[self.recs[d].txn].outcome != TAborted then continue
+
+            self.edge(t.id, w.txn, ERw, true, m.key)
+            val it = self.txns[w.txn]
+
+            if it.end != 0 && it.end < t.invoked
+                val es = buf[HEdge]()
+                es.push(HEdge(it.id, t.id, ERt, true, m.key))
+                es.push(HEdge(t.id, it.id, ERw, true, m.key))
+                self.anomaly("G-stale", true, [it.id, t.id], es, s"T${t.id} began after T${it.id}'s insert of ${w.key} was acknowledged, but its read of '${m.key}' lacks it")
+
+        if self.opts.white_box && t.txid != 0 && t.rank() >= 1 then self.predicate_white_box(t, m, g)
+
+    // White box: the rows are exactly those inserted into the group at or before the snapshot and
+    // not deleted by then.
+    predicate_white_box(*self, t: HTxn, m: Mop, g: i64)
+        val expect = buf[string]()
+        for w in self.recs
+            if w.del || w.value != g || w.ambiguous || !self.committed(w.txn) || !self.row_key(w.key) then continue
+            if w.txn == t.id then return
+            val c = self.txns[w.txn].commit
+            if c == 0 then return
+            if c > t.snapshot then continue
+            val d = self.writer(w.key, 0, true)
+            if d != NoTxn && self.txns[self.recs[d].txn].outcome == TUnknown then return
+            if d != NoTxn && self.committed(self.recs[d].txn)
+                if self.recs[d].txn == t.id then return
+                val dc = self.txns[self.recs[d].txn].commit
+                if dc == 0 then return
+                if dc <= t.snapshot then continue
+            expect.push(w.key)
+
+        var same = expect.len() == m.rows.len()
+        for k in expect
+            if !contains_str(m.rows, k) then same = false
+
+        if !same
+            self.anomaly("wb-read", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' is not the rows committed at its snapshot ${t.snapshot}")
+
+    // Whether `key` is a row a predicate may select: written, but neither a list nor a counter.
+    row_key(self, key: string) -> bool = self.by_key.get(key) match
+        Some(i) -> !self.keys[i].list && !self.keys[i].counter
+        None -> false
+
+    own_write_before(self, t: HTxn, key: string, op: usize, del: bool) -> bool
+        for j in 0..<op
+            val m = t.ops[j]
+            if m.key == key && (if del then m.kind == MDelete else m.kind == MWrite) then return true
+        false
+
+    // -- counters (I14) -------------------------------------------------------------------------
+
+    // A counter read must lie between the increments acknowledged before the reader began and every
+    // increment that may have committed before it ended.
+    counter_key(*self, k: KeyInfo)
+        val adds = buf[usize]()
+        val amounts = buf[i64]()
+
+        for t in self.txns
+            var sum: i64 = 0
+            for m in t.ops
+                if m.kind == MAdd && m.key == k.key
+                    if m.arg <= 0 then return
+                    sum += m.arg
+            if sum > 0
+                adds.push(t.id)
+                amounts.push(sum)
+
+        for rr in k.reads
+            val t = self.txns[rr.txn]
+            val v = t.ops[rr.op].seen match
+                ObsNum(x) -> x
+                ObsUnborn -> 0
+                _ -> continue
+            if contains_usize(adds, t.id) then continue
+
+            var lo: i64 = 0
+            var hi: i64 = 0
+            for i in 0..<adds.len()
+                val a = self.txns[adds[i]]
+                if a.outcome == TCommitted && a.end != 0 && a.end < t.invoked then lo += amounts[i]
+                if a.outcome != TAborted && (t.end == 0 || a.invoked < t.end) then hi += amounts[i]
+
+            if v < lo || v > hi
+                self.anomaly("lost-increment", true, [t.id], buf(), s"T${t.id} read ${v} from counter ${k.key}, outside the ${lo}..${hi} the increments allow")
+
+    // -- aborts (I16) ---------------------------------------------------------------------------
+
+    read_only_aborts(*self)
+        for t in self.txns
+            if t.outcome != TAborted || t.error != "serialization_failure" then continue
+            if !t.writes()
+                self.anomaly("I16", true, [t.id], buf(), s"T${t.id} wrote nothing, yet aborted with serialization_failure")
+            elif t.rank() == 0
+                self.anomaly("I16", true, [t.id], buf(), s"T${t.id} ran at read committed, yet aborted with serialization_failure")
+
+    // -- session and real-time edges ------------------------------------------------------------
+
+    session_edges(*self)
+        // so: consecutive committed transactions of one process, the first acknowledged.
+        val last_proc = buf[u64]()
+        val last_txn = buf[usize]()
+
+        for t in self.txns
+            if t.outcome != TCommitted then continue
+            var at = NoTxn
+            for i in 0..<last_proc.len()
+                if last_proc[i] == t.process then at = i
+
+            if at == NoTxn
+                last_proc.push(t.process)
+                last_txn.push(t.id)
+            else
+                val p = self.txns[last_txn[at]]
+                if p.end != 0 && p.end < t.invoked then self.raw_edge(p.id, t.id, ESo, "session")
+                last_txn[at] = t.id
+
+        // rt among serializable transactions: acknowledged before the other was invoked.
+        for a in self.txns
+            if a.outcome != TCommitted || a.end == 0 || a.rank() < 2 then continue
+            for b in self.txns
+                if b.outcome == TCommitted && b.rank() == 2 && a.end < b.invoked then self.raw_edge(a.id, b.id, ERt, "time")
+
+    raw_edge(*self, from: usize, to: usize, kind: EdgeKind, key: string)
+        self.out[from].push(self.edges.len())
+        self.edges.push(HEdge(from, to, kind, false, key))
+
+    // -- cycles ---------------------------------------------------------------------------------
+
+    cycles(*self)
+        val n = self.txns.len()
+        val f0 = buf[bool]()
+        val f1 = buf[bool]()
+        val f2 = buf[bool]()
+
+        for t in self.txns
+            val c = t.outcome == TCommitted
+            f0.push(c)
+            f1.push(c && t.rank() >= 1)
+            f2.push(c && t.rank() >= 2)
+
+        val covered = buf[bool]()
+        for _ in 0..<n
+            covered.push(false)
+
+        // Forbidden: each class among the transactions whose level forbids it (§3.4).
+        self.search("G0", f0, MaskWw, MaxRw0, SeedWw, 0, covered)
+        self.search("G1c", f0, MaskWw | MaskWr, MaxRw0, SeedWr, 0, covered)
+        self.search("G-single", f1, MaskDsg, MaxRw1, SeedRw, 1, covered)
+        self.search("G-nonadjacent", f1, MaskDsg, NonAdjacent, SeedRw, 1, covered)
+        self.search("G2-item", f2, MaskDsg, AnyRw, SeedItemRw, 2, covered)
+        self.search("G2", f2, MaskDsg, AnyRw, SeedPredRw, 2, covered)
+
+        // Sessions (§3.5), at each level's strength, and real time among serializable ones (§3.1).
+        self.search("G-session", f0, MaskWw | MaskWr | MaskSo, MaxRw0, SeedSo, 0, covered)
+        self.search("G-session", f1, MaskDsg | MaskSo, MaxRw1, SeedSo, 1, covered)
+        self.search("G-session", f2, MaskDsg | MaskSo, AnyRw, SeedSo, 2, covered)
+        self.search("G-rt", f2, MaskDsg | MaskSo | MaskRt, AnyRw, SeedRt, 2, covered)
+
+        // Permitted: the same classes over every committed transaction, where some transaction's
+        // level allows the cycle.
+        self.search("G-single", f0, MaskDsg, MaxRw1, SeedRw, 1, covered)
+        self.search("G-nonadjacent", f0, MaskDsg, NonAdjacent, SeedRw, 1, covered)
+        self.search("G2-item", f0, MaskDsg, AnyRw, SeedItemRw, 2, covered)
+        self.search("G2", f0, MaskDsg, AnyRw, SeedPredRw, 2, covered)
+
+    // One cycle of class `name` per strongly connected region of the graph `mask` draws over the
+    // transactions `f`, through an edge `seed` admits, under the rw rule `mode`. A cycle is
+    // forbidden when every transaction on it is at least `need` strong.
+    search(*self, name: string, f: Buf[bool], mask: u32, mode: u32, seed: u32, need: i32, covered: Buf[bool])
+        val comp = self.scc(f, mask)
+
+        for e0 in 0..<self.edges.len()
+            val e = self.edges[e0]
+            if !seed_admits(seed, e) || !f[e.from] || !f[e.to] then continue
+            if comp[e.from] == NoTxn || comp[e.from] != comp[e.to] then continue
+            if covered[e.from] || covered[e.to] then continue
+
+            val cyc = self.cycle_through(e0, f, mask, mode, comp)
+            if cyc.len() == 0 then continue
+
+            var rws: usize = 0
+            var item_rws: usize = 0
+            var weakest: i32 = 2
+            val ts = buf[usize]()
+            val es = buf[HEdge]()
+
+            for i in cyc
+                val x = self.edges[i]
+                es.push(x)
+                ts.push(x.from)
+                if x.kind == ERw
+                    rws += 1
+                    if !x.pred then item_rws += 1
+                val r = self.txns[x.from].rank()
+                if r < weakest then weakest = r
+
+            if mode == NonAdjacent && rws < 2 then continue
+
+            val forbidden = weakest >= need
+            if !forbidden && need == 0 then continue
+
+            var label = name
+            if name == "G2-item" && rws == 2 && item_rws == 2 && ts.len() == 2 then label = "A5B"
+
+            for x in ts
+                covered[x] = true
+
+            self.anomalies.push(Anomaly(label, forbidden, ts, es, describe_cycle(es)))
+
+    // Tarjan's strongly connected components of the graph `mask` draws over `f`; NoTxn outside `f`.
+    scc(self, f: Buf[bool], mask: u32) -> Buf[usize]
+        val n = self.txns.len()
+        var st = Tarjan(buf(), buf(), buf(), buf(), buf(), 0, 0)
+
+        for _ in 0..<n
+            st.index.push(NoTxn)
+            st.low.push(0)
+            st.on.push(false)
+            st.comp.push(NoTxn)
+
+        for v in 0..<n
+            if f[v] && st.index[v] == NoTxn then self.connect(&st, v, f, mask)
+
+        st.comp
+
+    connect(self, st: *Tarjan, v: usize, f: Buf[bool], mask: u32)
+        st.index[v] = st.next
+        st.low[v] = st.next
+        st.next += 1
+        st.stack.push(v)
+        st.on[v] = true
+
+        for i in self.out[v]
+            val e = self.edges[i]
+            if !in_mask(mask, e) || !f[e.to] then continue
+            val w = e.to
+            if st.index[w] == NoTxn
+                self.connect(st, w, f, mask)
+                if st.low[w] < st.low[v] then st.low[v] = st.low[w]
+            elif st.on[w] && st.index[w] < st.low[v]
+                st.low[v] = st.index[w]
+
+        if st.low[v] == st.index[v]
+            loop
+                val w = st.stack.pop().unwrap()
+                st.on[w] = false
+                st.comp[w] = st.comps
+                if w == v then break
+            st.comps += 1
+
+    // A cycle that begins with edge `e0` and returns to its source through edges of `mask` over
+    // `f`, within `e0`'s component, keeping to `mode`'s rule on rw edges; empty where there is none.
+    // A breadth-first search over (transaction, rw edges so far, whether the last edge was rw).
+    cycle_through(self, e0: usize, f: Buf[bool], mask: u32, mode: u32, comp: Buf[usize]) -> Buf[usize]
+        val n = self.txns.len()
+        val first = self.edges[e0]
+        val u = first.from
+        val region = comp[u]
+        val prev_edge = buf[usize]()
+        val prev_state = buf[usize]()
+
+        for _ in 0..<(n * 6)
+            prev_edge.push(NoTxn)
+            prev_state.push(NoTxn)
+
+        val rw0: usize = if first.kind == ERw then 1 else 0
+        val start = state_of(first.to, rw0, rw0 == 1)
+        if first.to == u then return buf()
+        prev_edge[start] = e0
+        val queue = buf[usize]()
+        queue.push(start)
+        var head: usize = 0
+
+        while head < queue.len()
+            val s = queue[head]
+            head += 1
+            val x = s / 6
+            val rc = (s % 6) / 2
+            val last_rw = s % 2 == 1
+
+            for i in self.out[x]
+                val e = self.edges[i]
+                if !in_mask(mask, e) || !f[e.to] || comp[e.to] != region then continue
+                val is_rw = e.kind == ERw
+                if mode == NonAdjacent && last_rw && is_rw then continue
+                var nrc = rc + (if is_rw then 1 else 0)
+                if mode == MaxRw0 && nrc > 0 then continue
+                if mode == MaxRw1 && nrc > 1 then continue
+                if nrc > 2 then nrc = 2
+
+                if e.to == u
+                    if mode == NonAdjacent && is_rw && first.kind == ERw then continue
+                    val path = buf[usize]()
+                    path.push(i)
+                    var cur = s
+                    while cur != start
+                        path.push(prev_edge[cur])
+                        cur = prev_state[cur]
+                    path.push(e0)
+                    val cyc = buf[usize]()
+                    var j = path.len()
+                    while j > 0
+                        j -= 1
+                        cyc.push(path[j])
+                    return cyc
+
+                val ns = state_of(e.to, nrc, is_rw)
+                if prev_edge[ns] != NoTxn then continue
+                prev_edge[ns] = i
+                prev_state[ns] = s
+                queue.push(ns)
+
+        buf()
+
+private struct Tarjan
+    index: Buf[usize]
+    low: Buf[usize]
+    on: Buf[bool]
+    comp: Buf[usize]
+    stack: Buf[usize]
+    next: usize
+    comps: usize
+
+private const InitVersion: usize = 0xfffffffffffffffe
+
+private const MaskWw: u32 = 1
+private const MaskWr: u32 = 2
+private const MaskRw: u32 = 4
+private const MaskSo: u32 = 8
+private const MaskRt: u32 = 16
+private const MaskDsg: u32 = 7
+
+private const MaxRw0: u32 = 0
+private const MaxRw1: u32 = 1
+private const AnyRw: u32 = 2
+private const NonAdjacent: u32 = 3
+
+private const SeedWw: u32 = 0
+private const SeedWr: u32 = 1
+private const SeedRw: u32 = 2
+private const SeedItemRw: u32 = 3
+private const SeedPredRw: u32 = 4
+private const SeedSo: u32 = 5
+private const SeedRt: u32 = 6
+
+private state_of(x: usize, rc: usize, last_rw: bool) -> usize = x * 6 + rc * 2 + (if last_rw then 1 else 0)
+
+private kind_bit(k: EdgeKind) -> u32 = k match
+    EWw -> MaskWw
+    EWr -> MaskWr
+    ERw -> MaskRw
+    ESo -> MaskSo
+    ERt -> MaskRt
+
+private in_mask(mask: u32, e: HEdge) -> bool = mask & kind_bit(e.kind) != 0
+
+private seed_admits(seed: u32, e: HEdge) -> bool =
+    if seed == SeedWw then e.kind == EWw
+    elif seed == SeedWr then e.kind == EWr
+    elif seed == SeedRw then e.kind == ERw
+    elif seed == SeedItemRw then e.kind == ERw && !e.pred
+    elif seed == SeedPredRw then e.kind == ERw && e.pred
+    elif seed == SeedSo then e.kind == ESo
+    else e.kind == ERt
+
+// -- helpers -------------------------------------------------------------------------------------
+
+private is_list(s: Obs) -> bool = s match
+    ObsList(_) -> true
+    _ -> false
+
+private value_key(key: string, v: i64, del: bool) -> string = if del then s"$key\u{1f}d" else s"$key\u{1f}$v"
+
+private value_text(w: WriteRec) -> string = if w.del then "a delete" else s"${w.value}"
+
+private list_text(list: Buf[i64]) -> string
+    var sb = str_builder()
+    sb.push("[")
+    for i in 0..<list.len()
+        if i > 0 then sb.push(" ")
+        sb.push_int(list[i])
+    sb.push("]")
+    sb.finish()
+
+private is_prefix(a: Buf[i64], b: Buf[i64]) -> bool
+    if a.len() > b.len() then return false
+    for i in 0..<a.len()
+        if a[i] != b[i] then return false
+    true
+
+private index_in(list: Buf[i64], v: i64) -> usize
+    for i in 0..<list.len()
+        if list[i] == v then return i
+    NoTxn
+
+private version_index(vs: Buf[usize], r: usize) -> usize
+    for i in 0..<vs.len()
+        if vs[i] == r then return i
+    NoTxn
+
+private contains_usize(xs: Buf[usize], x: usize) -> bool
+    for y in xs
+        if y == x then return true
+    false
+
+private contains_str(xs: Buf[string], x: string) -> bool
+    for y in xs
+        if y == x then return true
+    false
+
+/** The group `n` of a predicate `g = n`, the one predicate shape W4 reads. */
+pred_group(p: string) -> Option[i64]
+    if p.len < 5 || p[0..<4] != "g = " then return None
+    parse_long(p[4..<p.len]) match
+        Ok(n) -> Some(i64(n))
+        Err(_) -> None
