@@ -372,3 +372,132 @@ a_renamed_member_applies_unless_a_definition_reads_the_old_name()
     val check = cat_check("p_east", call("gt", [Field(cat_row("p"), "x"), Literal(Int32, Int(0))]))
     val d = cat_ok(with_status(), cat_alter("u", [AddConstraint(check, false)]))
     assert_eq(cat_code(d, AlterType(cat_q("point"), RenameMember("x", "east"))), "Q6007")
+
+// -- retype_column of a converting column (§8.5 rule 4) ------------------------------------------------
+
+/** `a` of `cat_base`, retyped to a type that makes it `converting`. */
+private converting_base() -> MemCatalog = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]))
+
+/** `c` with the conversion of column `name` of `table` finished: the target is the type and the column is ready. */
+private finish_conversion(c: MemCatalog, table: string, name: string) -> MemCatalog
+    var x = c
+    val ti = x.table_at(cat_q(table)).unwrap()
+    val ci = x.tables[ti].column_at(name).unwrap()
+    x.tables[ti].columns[ci].ty = x.tables[ti].columns[ci].target.unwrap()
+    x.tables[ti].columns[ci].state = ColumnReady
+    x.tables[ti].columns[ci].target = None
+    x.tables[ti].columns[ci].using = None
+    x
+
+/** `c` with the conversion of column `name` of `table` failed: the column is ready in its old type. */
+private abandon_conversion(c: MemCatalog, table: string, name: string) -> MemCatalog
+    var x = c
+    val ti = x.table_at(cat_q(table)).unwrap()
+    val ci = x.tables[ti].column_at(name).unwrap()
+    x.tables[ti].columns[ci].state = ColumnReady
+    x.tables[ti].columns[ci].target = None
+    x.tables[ti].columns[ci].using = None
+    x
+
+@test
+a_second_retype_of_a_converting_column_is_refused_with_its_own_code()
+    val d = converting_base()
+    assert(column_of(d, "t", "a").state == ColumnConverting)
+
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Int8), None)])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Int32), None)])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Int16), None)])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Int64), Some(call("length", [cat_text("x")])))])), "Q6023")
+
+@test
+a_second_retype_of_a_converting_column_is_refused_before_the_conversion_is_looked_at()
+    val d = converting_base()
+
+    // Neither a type with no conversion (Q6008), a bad `using` (Q3001), a primary-key type (Q6005) nor a name (Q6004) is reported.
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Date), None)])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", Int64, Some(cat_text("x")))])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", Json, None)])), "Q6023")
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", Named("app", "nope"), None)])), "Q6023")
+
+@test
+a_refused_second_retype_leaves_the_catalog_and_the_other_actions_unapplied()
+    val d = converting_base()
+    val before = column_of(d, "t", "a")
+    val columns = cat_table_of(d, "t").columns.len()
+    val version = version_of(d, "t")
+
+    var first = d
+    val added = cat_alter("t", [AddColumn(cat_col("n", nullable(Int64))), RenameColumn("b", "bb"), RetypeColumn("a", nullable(Int64), None)])
+    assert_eq(first.apply(envelope([], added), BootstrapRole).unwrap_err().code, "Q6023")
+    assert_eq(cat_table_of(first, "t").columns.len(), columns)
+    assert(cat_table_of(first, "t").column_named("n").is_none())
+    assert(cat_table_of(first, "t").column_named("bb").is_none() && cat_table_of(first, "t").column_named("b").is_some())
+    assert_eq(version_of(first, "t"), version)
+    assert(column_of(first, "t", "a").state == ColumnConverting && column_of(first, "t", "a").ty == before.ty && column_of(first, "t", "a").target == before.target)
+
+    // The retype may come first or last among the actions.
+    var second = d
+    val last = cat_alter("t", [RetypeColumn("a", nullable(Int64), None), AddColumn(cat_col("n", nullable(Int64)))])
+    assert_eq(second.apply(envelope([], last), BootstrapRole).unwrap_err().code, "Q6023")
+    assert(cat_table_of(second, "t").column_named("n").is_none())
+    assert_eq(version_of(second, "t"), version)
+
+@test
+a_converting_column_is_retyped_again_once_the_conversion_finishes()
+    val done = finish_conversion(converting_base(), "t", "a")
+    assert(column_of(done, "t", "a").state == ColumnReady && column_of(done, "t", "a").ty == nullable(Int16))
+
+    assert_eq(cat_code(done, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "ok")
+    assert_eq(cat_code(done, cat_alter("t", [RetypeColumn("a", nullable(Int8), None)])), "ok")
+
+    // A column that converts again is again refused until that conversion finishes.
+    val again = cat_ok(done, cat_alter("t", [RetypeColumn("a", nullable(Int8), None)]))
+    assert(column_of(again, "t", "a").state == ColumnConverting)
+    assert_eq(cat_code(again, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "Q6023")
+    assert_eq(cat_code(finish_conversion(again, "t", "a"), cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "ok")
+
+@test
+a_column_whose_conversion_failed_is_retyped_again()
+    val failed = abandon_conversion(converting_base(), "t", "a")
+    assert(column_of(failed, "t", "a").state == ColumnReady && column_of(failed, "t", "a").ty == nullable(Int32))
+    assert_eq(cat_code(failed, cat_alter("t", [RetypeColumn("a", nullable(Int16), None)])), "ok")
+
+@test
+a_retype_of_another_column_while_one_converts_is_accepted()
+    val d = converting_base()
+    val using = call("length", [cat_row("b")])
+    val e = cat_ok(d, cat_alter("t", [RetypeColumn("b", Int64, Some(using))]))
+    assert(column_of(e, "t", "b").state == ColumnConverting && column_of(e, "t", "a").state == ColumnConverting)
+
+    // Both then refuse a second retype, and each finishes on its own.
+    assert_eq(cat_code(e, cat_alter("t", [RetypeColumn("b", Int32, Some(using))])), "Q6023")
+    assert_eq(cat_code(e, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "Q6023")
+    val f = finish_conversion(e, "t", "a")
+    assert_eq(cat_code(f, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "ok")
+    assert_eq(cat_code(f, cat_alter("t", [RetypeColumn("b", Int32, Some(using))])), "Q6023")
+
+    // A lossless retype of another column and the retype of a column of another table.
+    val g = cat_ok(cat_base(), cat_table("u", [cat_col("id", Int64), cat_col("a", nullable(Int32))], ["id"]))
+    val h = cat_ok(g, cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]))
+    assert_eq(cat_code(h, cat_alter("u", [RetypeColumn("a", nullable(Int16), None)])), "ok")
+    assert_eq(cat_code(h, cat_alter("t", [RetypeColumn("id", nullable(Int64), None)])), "Q6005")
+
+@test
+a_metadata_only_retype_never_blocks_another_retype()
+    val c = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Int64), None)]))
+    assert(column_of(c, "t", "a").state == ColumnReady)
+    assert_eq(cat_code(c, cat_alter("t", [RetypeColumn("a", nullable(Int16), None)])), "ok")
+    assert_eq(cat_code(c, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "ok")
+
+    // A conversion that follows it blocks the next as any other does.
+    val d = cat_ok(c, cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]))
+    assert_eq(cat_code(d, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), "Q6023")
+
+@test
+a_converting_column_is_invisible_to_a_constraint_added_over_it()
+    // `ddl.md` §2.3 rule 3, §2.13 rule 3: a check names only ready columns, so a converting one is `Q2003`.
+    val d = converting_base()
+    val check = cat_check("a_pos", call("gt", [cat_row("a"), Literal(Int32, Int(0))]))
+    assert_eq(cat_code(d, cat_alter("t", [AddConstraint(check, false)])), "Q2003")
+    assert_eq(cat_code(finish_conversion(d, "t", "a"), cat_alter("t", [AddConstraint(check, false)])), "ok")

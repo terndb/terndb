@@ -42,6 +42,9 @@ const OutOfLineMinimum: usize = 256
 /** The octets an out-of-line column occupies in the variable area (§4.7 rule 3). */
 const OverflowStubSize: usize = 32
 
+/** The octets of one variable offset in a row (§4.2 item 4). */
+const RowOffsetSize: usize = 2
+
 /** What stands in a row for a column stored out of line: where its overflow chain starts, how long
  * the value is before and after compression, the CRC32C of the uncompressed value and the codec
  * (0 none, 1 LZ4 block, 2 Zstandard frame).
@@ -703,13 +706,13 @@ place_row(key_len: usize, cols: []const Type, vals: []const Value) -> Result[Pla
 
         if vals[i].is_null()
             if !cols[i].is_nullable() then return wrong_value(s"column $i is not nullable and holds a null")
-            size += if w > 0 then w else 2
+            size += if w > 0 then w else RowOffsetSize
         elif w > 0
             put_fixed(buf[u8](), t, vals[i])?
             size += w
         else
             len = encode_value(t, vals[i])?.len()
-            size += 2 + len
+            size += RowOffsetSize + len
 
         lens.push(len)
 
@@ -741,6 +744,30 @@ place_row(key_len: usize, cols: []const Type, vals: []const Value) -> Result[Pla
 
     fail("D2002", "the entry cannot be brought within 4,000 octets by moving columns out of line")
 end place_row
+
+/** The octets of the smallest entry a table can ever store (§4.2, §4.7): the row header, the key, the
+ * null bitmap of `columns` non-key columns, the `fixed_octets` of the fixed-width ones, which a null
+ * still takes in full, and one offset for each of `variable` variable-width columns, every one of them
+ * null or empty. No value can be smaller, and no column can be moved out of line to make it so: the
+ * bitmap and the offsets are always inline.
+ */
+min_entry_size(key_octets: usize, fixed_octets: usize, columns: usize, variable: usize) -> usize =
+    RowHeaderSize + key_octets + (columns + 7) / 8 + fixed_octets + variable * RowOffsetSize
+
+/** The most variable-width columns a table can have beside `fixed_columns` fixed-width non-key columns
+ * of `fixed_octets` in all and a key of `key_octets`, so that its smallest entry is within
+ * `InlineEntryLimit`; `None` when even none fits. With no key and no fixed column it is 1,872.
+ */
+max_variable_columns(key_octets: usize, fixed_octets: usize, fixed_columns: usize) -> Option[usize]
+    if min_entry_size(key_octets, fixed_octets, fixed_columns, 0) > InlineEntryLimit then return None
+
+    var v = (InlineEntryLimit - min_entry_size(key_octets, fixed_octets, fixed_columns, 0)) / RowOffsetSize
+
+    while min_entry_size(key_octets, fixed_octets, fixed_columns + v, v) > InlineEntryLimit
+        v -= 1
+
+    Some(v)
+end max_variable_columns
 
 // -- type descriptors ---------------------------------------------------------------------------
 

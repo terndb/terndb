@@ -172,6 +172,7 @@ impl MemCatalog
 
         if changed then self.new_version(ti)?
         self.check_width(ti)?
+        self.check_row_fits(ti)?
         self.revalidate()
 
     /** Action `a` applied to table `ti`; answers whether it changed the column list (§5.1 rule 2). */
@@ -339,11 +340,13 @@ impl MemCatalog
     /** `retype_column` (§8.5): metadata-only when the conversion is lossless and leaves every key
      * encoding as it was, else the column becomes `converting` toward the new type. A conversion
      * `query-tree.md` §7.6 does not permit and no `using` provides is `Q6008`; a column a view reads is
-     * `Q6007` (§2.9 rule 2).
+     * `Q6007` (§2.9 rule 2); a column whose earlier retype is still `converting` is `Q6023`, raised
+     * before any conversion is looked at.
      */
     retype_column(*self, ti: usize, name: string, ty: Type, using: Option[Expr], who: u64) -> Result[bool, CodecError]
         val ci = self.column_of(ti, name)?
         val c = self.tables[ti].columns[ci]
+        if c.state == ColumnConverting then return fail("Q6023", s"column '$name' is being retyped; wait for the conversion to finish")
         val to = self.usable_type(ty, who)?
         val from = resolve_type(*self, c.ty)?
         val columns = self.tables[ti].columns

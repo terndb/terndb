@@ -63,6 +63,12 @@ in the same statement, in dependency order (§2.11).
    row identity, and an `identity` column (§2.7) costs one line.*
 3. A table has at most 65,535 columns (`Q6011`), and its fixed area plus its widest key MUST fit the limit of [DISK]
    §4.7 rule 2 (`Q6011`).
+4. A table's **smallest row** MUST fit the inline limit of [DISK] §4.7 rule 1 (`Q6022`): the row header, the key,
+   the null bitmap, every fixed-width column at its full width and one `u16` offset for each variable-width column
+   must total at most 4,000 octets, because none of these can be moved out of line however small the values are.
+   Variable-width columns are `text`, `bytes`, `json`, records, unions, enums and relations (nested and list
+   columns included). With no key and no fixed column that is 1,872 variable-width columns. `CreateTable` and
+   `AlterTable` (`AddColumn`) refuse a statement that leaves the table past it; §2.13 rule 10 gives the count.
 
 ### 2.3 Columns
 
@@ -382,7 +388,23 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
    outputs it (§2.9 rule 2). A conversion that is lossless (§5.3 rule 3), has no `using` and leaves the encoding of
    every key the column is in unchanged gives the column its new type at once; any other makes it `converting`
    (§8.5 rule 2), keeping its type and recording the target and the conversion. Either adds a schema version, the
-   column's type or state being part of it (§5.1 rule 1).
+   column's type or state being part of it (§5.1 rule 1). A `retype_column` of a column that is still `converting`
+   from an earlier statement is `Q6023` (§8.5 rule 4), checked before the conversion is looked at, so it is never
+   `Q6008`; the statement has no effect when refused.
+10. **The smallest-row limit** (§2.2 rule 4) is `min = 20 + key + ⌈n / 8⌉ + fixed + 2v` octets, where 20 is the
+    row header ([DISK] §4.1), `key` is the sum of the key widths of the primary-key columns (rule 2), n counts the
+    columns that are not in the primary key (fixed-width and variable-width, as the current schema version has
+    them), `fixed` is the width of the fixed-width ones, and v counts the variable-width ones. The statement is
+    `Q6022` when `min` exceeds the inline limit (4,000 octets, [DISK] §4.7 rule 1, derived from the engine's row
+    constants and never written into a statement). A column with a default or a null counts the same; a column
+    being dropped by the same `AlterTable` does not count. A column being retyped (§8.5) is counted at its new
+    type as well as at its current one: the statement is `Q6022` when `min` exceeds the limit with every column
+    at its current type, and again when it exceeds it with every `converting` column (one this statement makes
+    `converting` or one still converting from an earlier statement) at its target type, so the table fits before
+    and after each conversion finishes. A retype to a type that makes the smallest row larger (an int8 to text, a text to an int64) of
+    a table with no room is refused here, before anything is recorded; a retype that does not enlarge it (a text to
+    an int8, an int64 to an int8) never is, because the table already fitted.
+    `Q6011` (rule 2) is checked first. The statement has no effect when refused.
 
 ## 3. DDL statement trees
 
@@ -939,6 +961,9 @@ that record rolls it back like any write.
 
 - **Kind:** metadata-only. One new schema version with the column `ready` and its fill (§5.1 rule 3). A non-null
   column needs a constant default (else `Q3005`).
+- **Row limit:** the added column counts toward the smallest-row limit of §2.13 rule 10; an `add_column` that
+  leaves the table past it is `Q6022` and changes nothing.
+  A `retype_column` is held to the same limit with the column at its new type (§8.5, §2.13 rule 10).
 - **Running transactions:** none conflicts unless it read the whole column list (§6.2 rule 3). A transaction that
   inserts at the old version and commits later produces rows that read the fill, which is what an insert after the
   change would have written; if the default has since changed, reconciliation rewrites them (§6.4 rule 4).
@@ -985,6 +1010,9 @@ that record rolls it back like any write.
 
 ### 8.5 Retype a column
 
+**Row limit:** a retype leaves the table within the smallest-row limit of §2.13 rule 10 both with the column at
+its old type and at its new one (`Q6022`, nothing recorded), whether the retype is metadata-only or `converting`.
+
 1. **Lossless** (§5.3 rule 3, with no `using`), and either not used by any index key, index predicate or the
    primary key, or one that leaves the key encoding unchanged ([DISK] §4.6): appending variants to an enum, or
    renaming a tag:
@@ -1012,6 +1040,14 @@ that record rolls it back like any write.
      version a snapshot after step 2 can see. Rows are not rewritten; `rewrite` does that when wanted.
 3. Any other retype of a primary-key column is a table rebuild (§8.11). A conversion that [QT] §7.6 does not permit and no
    `using` provides is `Q6008`.
+4. **A column that is still `converting` is not retyped again.** A `retype_column` naming a column in state
+   `converting` is refused with `Q6023` ("the column is being retyped; wait for the conversion to finish"), whatever
+   the new type or `using`, and the statement has no effect: the catalog is unchanged and the other actions of the
+   same `AlterTable` are not applied. This is checked before the conversion of rule 2 and the limits of §2.13 rule
+   10, so it takes precedence over `Q6008` and `Q6022`. The column can be retyped again once the job's final
+   transaction has made it `ready`, including after a failed job, which returns it to `ready` in its old type. A
+   metadata-only retype (rule 1) completes within its statement, so a later retype of the column is never refused
+   for it, and a retype of another column of the same table is unaffected by one that converts.
 
 ### 8.6 Set or drop a default; drop or set not null
 

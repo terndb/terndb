@@ -39,7 +39,7 @@ form the code `ddl.md` refuses it with (`Q3014`, `Q3015`, `Q3016`, `Q6005`, `Q60
 Places where `on-disk-format.md` is silent or ambiguous, and the reading the code takes. The spec text
 is unchanged; items 1, 4 and 7 deserve a decision recorded in `docs/decisions.md`.
 
-1. **The external bitmap is indexed by column number.** §4.2 says "bit i is 1 when variable column i
+1. **The external bitmap is indexed by column number** (decided, Q50; §4.2 item 2 now says so). §4.2 says "bit i is 1 when variable column i
    is stored out of line" and also that the bitmap has the null bitmap's size. The code reads i as the
    column number among non-key columns (as in the null bitmap), which is what "same size" implies.
 2. **Unused bitmap bits, a null fixed column, and `HAS_EXTERNAL`.** Bits past the last column in the
@@ -65,7 +65,8 @@ is unchanged; items 1, 4 and 7 deserve a decision recorded in `docs/decisions.md
    checks only that the fixed area plus key is at most 3,000 octets (§4.7 rule 2), but the null
    bitmap and the `u16` offset of every variable column are also always inline. With no key, at most
    1,872 variable-width columns fit even when all are null; a table with more always fails with
-   `entry_too_large`. `CREATE TABLE` should count bitmap and offsets too.
+   `entry_too_large`. `CREATE TABLE` and `ADD COLUMN` now count the bitmap and offsets and refuse such a
+   table with `Q6022` (`ddl.md` §2.13 rule 10); the limit is `min_entry_size` against `InlineEntryLimit`.
 8. **Descriptor nesting** is limited to 256 levels, the query tree's limit (`MaxTypeDepth`); deeper is
    `data_corrupted`.
 9. **Decimal digits.** An unscaled value with more digits than the precision is refused when written

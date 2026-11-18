@@ -178,6 +178,51 @@ impl MemCatalog
         if fixed > 3000 then return fail("Q6011", s"table '${t.name}' has a fixed area and key of $fixed octets, beyond 3,000")
         Ok(())
 
+    /** That table `ti`'s smallest entry, with every variable-width column (text, bytes, json, record,
+     * union, enum, relation) null or empty, is within the inline limit (`ddl.md` §2.13 rule 6, `Q6022`).
+     * The key columns are counted at their key width and the rest at their row width; the bitmap and
+     * the offsets cannot leave the row. A column being retyped (`converting`) holds rows of its old
+     * type until its job finishes and of its new type afterwards, so the table is checked twice: once
+     * with every column at its current type and once with each converting column at its target.
+     */
+    check_row_fits(self, ti: usize) -> Result[(), CodecError]
+        self.check_row_fits_at(ti, false)?
+
+        for c in self.tables[ti].columns
+            if c.target.is_some() then return self.check_row_fits_at(ti, true)
+
+        Ok(())
+
+    /** `check_row_fits` with every converting column counted at its target type when `retyped`. */
+    check_row_fits_at(self, ti: usize, retyped: bool) -> Result[(), CodecError]
+        val t = self.tables[ti]
+        var key: usize = 0
+        var fixed: usize = 0
+        var columns: usize = 0
+        var variable: usize = 0
+
+        for c in t.columns
+            val ty = if retyped then resolve_type(self, c.target.unwrap_or(c.ty))? else resolve_type(self, c.ty)?
+
+            if contains_u32(t.primary_key, c.id)
+                key += key_width(ty)
+            else
+                columns += 1
+
+                if row_width(ty.base()) == 0 then variable += 1 else fixed += row_width(ty.base())
+
+        val size = min_entry_size(key, fixed, columns, variable)
+
+        if size > InlineEntryLimit
+            val room = max_variable_columns(key, fixed, columns - variable)
+            val most = room match
+                Some(m) -> s"at most $m"
+                None -> "none"
+
+            return fail("Q6022", s"table '${t.name}' has $variable variable-width columns, and its smallest row takes $size octets, beyond $InlineEntryLimit; with its other columns it can have $most")
+
+        Ok(())
+
     create_table(*self, name: QualName, defs: Buf[ColumnDef], pk: Buf[string], cons: Buf[ConstraintDef], if_not_exists: bool, who: u64) -> Result[(), CodecError]
         val nsi = self.namespace_of(name.schema)?
         val ns = self.namespaces[nsi].oid
@@ -215,7 +260,8 @@ impl MemCatalog
                 ForeignKey(_, _, _, _, _, _) -> self.add_constraint(ti, c, true, false, who)?
                 _ -> ()
 
-        self.check_width(ti)
+        self.check_width(ti)?
+        self.check_row_fits(ti)
     end create_table
 
     /** Constraint `def` added to table `ti` (§2.6): validated when the table is being created, else

@@ -717,6 +717,59 @@ an_undo_page_has_the_common_header_and_records_from_byte_32()
     assert_eq(sp.end(), 132)
 
 @test
+undo_pages_carry_no_allocation_bitmap_and_truncation_returns_whole_pages()
+    // §3.7: only data segments have a bitmap page. Undo pages are taken at the high-water mark and
+    // dropped by truncation, so the resident pages are always the one range `base ..< next_page` and
+    // no page of the space is a bitmap page (type 0x01).
+    val sp = undo_space()
+    val at = buf[u64]()
+
+    for _ in 0..<6
+        at.push(ux_append(sp, 9000))
+
+    assert_eq(sp.next_page, 6)
+    assert_eq(sp.pages.len(), 6)
+    assert_eq(sp.base, 0)
+    assert_eq(sp.freed, 0)
+
+    for n in 0..<6
+        val p = &*sp.frame(u64(n)).unwrap()
+        assert_eq(p.page[6], PageTypeUndo)
+        assert(p.page[6] != 0x01, "no undo page is an allocation bitmap")
+
+    // Truncating at the fourth record drops exactly the three pages below it.
+    sp.truncate_to(at[3])
+    assert_eq(sp.low, at[3])
+    assert_eq(sp.base, 3)
+    assert_eq(sp.freed, 3)
+    assert_eq(sp.pages.len(), 3)
+    assert_eq(sp.next_page, 6)
+
+    for n in 0..<3
+        assert(sp.frame(u64(n)).is_none(), "a page below undo_low is not resident")
+
+    for n in 3..<6
+        assert(sp.frame(u64(n)).is_some(), "a page at or above undo_low stays")
+
+    // A truncation that stays inside a page drops no page.
+    sp.truncate_to(at[3] + 9000)
+    assert_eq(sp.freed, 3)
+    assert_eq(sp.base, 3)
+
+    // Pages come back by truncation only, and a new page is never a freed number.
+    val fresh = ux_append(sp, 9000)
+    assert_eq(fresh, undo_page_first(6))
+    assert_eq(sp.next_page, 7)
+
+    // Truncating to the end of the log leaves no page at all, and a log of nothing is still usable.
+    sp.truncate_to(sp.end())
+    assert_eq(sp.pages.len(), 0)
+    assert_eq(sp.freed, 7)
+    assert_eq(sp.base, sp.next_page)
+    val next = undo_page_first(sp.next_page)
+    assert_eq(ux_append(sp, 100), next)
+
+@test
 a_record_that_exactly_fills_a_page_stays_on_it()
     val sp = undo_space()
     ux_append(sp, 16352 - 1000)
