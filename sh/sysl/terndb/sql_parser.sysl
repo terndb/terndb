@@ -1,0 +1,1621 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The grammar of TernDB's SQL dialect (`docs/spec/sql.md` §3–§5): a recursive-descent parser from
+// the lexer's tokens to a syntax tree of statements, queries and expressions. The syntax tree keeps
+// names as written (folded by the lexer) and constants as text; the translator (`sql_translate.sysl`)
+// gives them meaning. Type names are read into query-tree types here, since their spelling is the
+// whole of their meaning. Every node keeps the byte offset of the token it starts at, which is where
+// an error about it is reported.
+
+/** A table, view or index name as written, its schema absent when unqualified. */
+struct SqlName derives Eq
+    schema: Option[string]
+    name: string
+    at: u64
+
+/** One `WHEN … THEN …` of a `CASE`. */
+struct SqlWhen derives Eq
+    cond: SqlExpr
+    value: SqlExpr
+
+/** An `ORDER BY` key; `nulls_first` absent takes the default of `sql.md` §5.6. */
+struct SqlOrder derives Eq
+    expr: SqlExpr
+    desc: bool
+    nulls_first: Option[bool]
+
+/** An expression as written. */
+enum SqlExpr derives Eq
+    SqColumn(qualifier: Option[string], name: string, at: u64)
+    SqStar(qualifier: Option[string], at: u64)
+    SqNumber(text: string, at: u64)
+    SqString(value: string, at: u64)
+    SqTyped(ty: Type, text: string, at: u64)
+    SqBool(value: bool, at: u64)
+    SqNull(at: u64)
+    SqParam(index: u64, at: u64)
+    SqDefault(at: u64)
+    SqNeg(arg: &SqlExpr, at: u64)
+    SqNot(arg: &SqlExpr, at: u64)
+    SqBinary(op: string, left: &SqlExpr, right: &SqlExpr, at: u64)
+    SqIsNull(arg: &SqlExpr, negated: bool, at: u64)
+    SqBetween(arg: &SqlExpr, low: &SqlExpr, high: &SqlExpr, negated: bool, at: u64)
+    SqInList(arg: &SqlExpr, items: Buf[SqlExpr], negated: bool, at: u64)
+    SqInQuery(args: Buf[SqlExpr], query: &SqlQuery, negated: bool, at: u64)
+    SqLike(arg: &SqlExpr, pattern: &SqlExpr, escape: Option[&SqlExpr], negated: bool, at: u64)
+    SqCase(operand: Option[&SqlExpr], arms: Buf[SqlWhen], otherwise: Option[&SqlExpr], at: u64)
+    SqCast(arg: &SqlExpr, ty: Type, at: u64)
+    SqCall(name: string, args: Buf[SqlExpr], distinct: bool, star: bool, filter: Option[&SqlExpr], order: Buf[SqlOrder], at: u64)
+    SqExists(query: &SqlQuery, at: u64)
+    SqSubquery(query: &SqlQuery, at: u64)
+    SqRow(items: Buf[SqlExpr], at: u64)
+
+    /** The offset of the token the expression starts at. */
+    pos(self) -> u64 = self match
+        SqColumn(_, _, at) -> at
+        SqStar(_, at) -> at
+        SqNumber(_, at) -> at
+        SqString(_, at) -> at
+        SqTyped(_, _, at) -> at
+        SqBool(_, at) -> at
+        SqNull(at) -> at
+        SqParam(_, at) -> at
+        SqDefault(at) -> at
+        SqNeg(_, at) -> at
+        SqNot(_, at) -> at
+        SqBinary(_, _, _, at) -> at
+        SqIsNull(_, _, at) -> at
+        SqBetween(_, _, _, _, at) -> at
+        SqInList(_, _, _, at) -> at
+        SqInQuery(_, _, _, at) -> at
+        SqLike(_, _, _, _, at) -> at
+        SqCase(_, _, _, at) -> at
+        SqCast(_, _, at) -> at
+        SqCall(_, _, _, _, _, _, at) -> at
+        SqExists(_, at) -> at
+        SqSubquery(_, at) -> at
+        SqRow(_, at) -> at
+end SqlExpr
+
+/** A select-list or `RETURNING` item: an expression (or a `*`) and its alias. */
+struct SqlItem derives Eq
+    expr: SqlExpr
+    alias: Option[string]
+
+enum SqlJoin
+    JnInner
+    JnLeft
+    JnRight
+    JnFull
+    JnCross
+
+/** A `FROM` item. */
+enum SqlFrom derives Eq
+    FrTable(name: SqlName, alias: Option[string], columns: Buf[string], at: u64)
+    FrQuery(query: &SqlQuery, alias: Option[string], columns: Buf[string], at: u64)
+    FrJoin(kind: SqlJoin, left: &SqlFrom, right: &SqlFrom, on: Option[SqlExpr], using: Buf[string], at: u64)
+
+/** `SELECT [DISTINCT] items [FROM …] [WHERE …] [GROUP BY …] [HAVING …]`. */
+struct SqlSelect derives Eq
+    distinct: bool
+    items: Buf[SqlItem]
+    from: Buf[SqlFrom]
+    where: Option[SqlExpr]
+    group: Buf[SqlExpr]
+    having: Option[SqlExpr]
+    at: u64
+
+/** What follows a query's body: `ORDER BY`, `LIMIT`/`FETCH` and `OFFSET`. */
+struct SqlTail derives Eq
+    order: Buf[SqlOrder]
+    count: Option[SqlExpr]
+    offset: Option[SqlExpr]
+    ties: bool
+    at: u64
+
+    is_empty(self) -> bool = self.order.len() == 0 && self.count.is_none() && self.offset.is_none()
+
+/** A `WITH` list entry. */
+struct SqlCte derives Eq
+    name: string
+    columns: Buf[string]
+    query: SqlQuery
+    at: u64
+
+/** A query: a select, a `VALUES` list, a set operation or a `WITH`, the first three with their tail. */
+enum SqlQuery derives Eq
+    QySelect(select: SqlSelect, tail: SqlTail)
+    QyValues(rows: Buf[Buf[SqlExpr]], tail: SqlTail, at: u64)
+    QySetOp(op: SetOpKind, all: bool, left: &SqlQuery, right: &SqlQuery, tail: SqlTail, at: u64)
+    QyWith(ctes: Buf[SqlCte], body: &SqlQuery, at: u64)
+
+    tail_of(self) -> Option[SqlTail] = self match
+        QySelect(_, t) -> Some(t)
+        QyValues(_, t, _) -> Some(t)
+        QySetOp(_, _, _, _, t, _) -> Some(t)
+        QyWith(_, _, _) -> None
+
+    /** The same query with tail `t`. */
+    with_tail(self, t: SqlTail) -> SqlQuery = self match
+        QySelect(s, _) -> QySelect(s, t)
+        QyValues(rows, _, at) -> QyValues(rows, t, at)
+        QySetOp(op, all, l, r, _, at) -> QySetOp(op, all, *l, *r, t, at)
+        QyWith(c, b, at) -> QyWith(c, *b, at)
+end SqlQuery
+
+/** `column = value` of an `UPDATE` or `ON CONFLICT DO UPDATE`. */
+struct SqlSet derives Eq
+    column: string
+    value: SqlExpr
+    at: u64
+
+/** `ON CONFLICT [target] DO NOTHING | DO UPDATE SET … [WHERE …]`; `sets` absent is `DO NOTHING`. */
+struct SqlConflict derives Eq
+    columns: Buf[string]
+    constraint: Option[string]
+    sets: Option[Buf[SqlSet]]
+    where: Option[SqlExpr]
+    at: u64
+
+enum SqlConstraintBody derives Eq
+    CoPrimary(columns: Buf[string])
+    CoUnique(columns: Buf[string])
+    CoCheck(expr: SqlExpr)
+    CoForeign(columns: Buf[string], table: SqlName, ref_columns: Buf[string], on_delete: FkAction, on_update: FkAction, deferred: bool)
+
+/** A constraint, of a column (its `columns` are that column) or of a table. */
+struct SqlConstraint derives Eq
+    name: Option[string]
+    body: SqlConstraintBody
+    not_valid: bool
+    at: u64
+
+/** A column definition of `CREATE TABLE` or `ADD COLUMN`. */
+struct SqlColumn derives Eq
+    name: string
+    ty: Type
+    not_null: bool
+    default: Option[SqlExpr]
+    generated: Option[SqlExpr]
+    identity: Identity
+    constraints: Buf[SqlConstraint]
+    at: u64
+
+enum SqlElement derives Eq
+    ElColumn(column: SqlColumn)
+    ElConstraint(constraint: SqlConstraint)
+
+enum SqlAlter derives Eq
+    AlAddColumn(column: SqlColumn)
+    AlAddConstraint(constraint: SqlConstraint)
+    AlDropColumn(name: string, cascade: bool, at: u64)
+    AlDropConstraint(name: string, if_exists: bool, at: u64)
+    AlRenameColumn(name: string, to: string, at: u64)
+    AlRenameConstraint(name: string, to: string, at: u64)
+    AlRenameTable(to: string, at: u64)
+    AlType(name: string, ty: Type, using: Option[SqlExpr], at: u64)
+    AlSetDefault(name: string, default: Option[SqlExpr], at: u64)
+    AlNullable(name: string, nullable: bool, at: u64)
+    AlValidate(name: string, at: u64)
+
+/** An index key: a column or a parenthesised expression, ascending or not. */
+struct SqlIndexKey derives Eq
+    column: Option[string]
+    expr: Option[SqlExpr]
+    desc: bool
+
+/** A transaction-control statement (`sql.md` §6): what a shell sends as the wire's own requests. */
+enum SqlTxn derives Eq
+    SqlBegin(options: TxnOptions)
+    SqlCommit
+    SqlRollback
+    SqlSavepoint(name: string)
+    SqlRelease(name: string)
+    SqlRollbackTo(name: string)
+
+/** A statement as written. */
+enum SqlStmt derives Eq
+    StQuery(query: SqlQuery)
+    StInsert(table: SqlName, alias: Option[string], columns: Buf[string], source: Option[SqlQuery], conflict: Option[SqlConflict], returning: Buf[SqlItem], at: u64)
+    StUpdate(table: SqlName, alias: Option[string], sets: Buf[SqlSet], from: Buf[SqlFrom], where: Option[SqlExpr], returning: Buf[SqlItem], at: u64)
+    StDelete(table: SqlName, alias: Option[string], using: Buf[SqlFrom], where: Option[SqlExpr], returning: Buf[SqlItem], at: u64)
+    StCreateTable(table: SqlName, elements: Buf[SqlElement], if_not_exists: bool, at: u64)
+    StDropTable(table: SqlName, if_exists: bool, cascade: bool, at: u64)
+    StAlterTable(table: SqlName, actions: Buf[SqlAlter], at: u64)
+    StCreateIndex(name: string, table: SqlName, unique: bool, keys: Buf[SqlIndexKey], where: Option[SqlExpr], if_not_exists: bool, at: u64)
+    StDropIndex(index: SqlName, if_exists: bool, at: u64)
+    StCreateSchema(name: string, if_not_exists: bool, at: u64)
+    StDropSchema(name: string, if_exists: bool, cascade: bool, at: u64)
+    StCreateView(view: SqlName, query: SqlQuery, replace: bool, at: u64)
+    StDropView(view: SqlName, if_exists: bool, cascade: bool, at: u64)
+    StTxn(control: SqlTxn, at: u64)
+
+/** A parsed statement and the bytes `start ..< end` of the text it was read from, without its `;`. */
+struct SqlParsed derives Eq
+    stmt: SqlStmt
+    start: u64
+    end: u64
+
+/** Whether `w` is a reserved word (`sql.md` §2.2): one that is an identifier only when quoted. */
+private[terndb] sql_reserved(w: string) -> bool = w match
+    "all" | "and" | "any" | "as" | "asc" | "between" | "both" | "case" | "cast" | "check" | "collate" -> true
+    "constraint" | "create" | "cross" | "current_timestamp" | "default" | "desc" | "distinct" | "do" -> true
+    "else" | "end" | "except" | "exists" | "false" | "fetch" | "for" | "foreign" | "from" | "full" -> true
+    "group" | "having" | "ilike" | "in" | "inner" | "intersect" | "into" | "is" | "join" | "lateral" -> true
+    "left" | "like" | "limit" | "natural" | "not" | "null" | "offset" | "on" | "only" | "or" | "order" -> true
+    "outer" | "over" | "primary" | "references" | "returning" | "right" | "select" | "similar" | "some" -> true
+    "table" | "then" | "true" | "union" | "unique" | "using" | "values" | "when" | "where" | "window" -> true
+    "with" -> true
+    else false
+
+/** The type a one-word type name names (`sql.md` §4), or `None`. */
+private[terndb] sql_simple_type(w: string) -> Option[Type] = w match
+    "bool" | "boolean" -> Some(Bool)
+    "int8" -> Some(Int8)
+    "int16" | "smallint" -> Some(Int16)
+    "int32" | "int" | "integer" -> Some(Int32)
+    "int64" | "bigint" -> Some(Int64)
+    "int128" -> Some(Int128)
+    "uint8" -> Some(UInt8)
+    "uint16" -> Some(UInt16)
+    "uint32" -> Some(UInt32)
+    "uint64" -> Some(UInt64)
+    "float32" | "real" -> Some(Float32)
+    "float64" | "float" -> Some(Float64)
+    "text" -> Some(Text)
+    "bytes" | "bytea" -> Some(Bytes)
+    "json" -> Some(Json)
+    "date" -> Some(Date)
+    "time" -> Some(Time)
+    "datetime" -> Some(DateTime)
+    "timestamp" | "timestamptz" -> Some(Timestamp)
+    "interval" -> Some(Interval)
+    "uuid" -> Some(Uuid)
+    else None
+
+/** A token as an error message names it. */
+private sql_token_text(t: SqlTok) -> string = t match
+    TkIdent(n, q) -> if q then s"\"$n\"" else n
+    TkString(_) -> "a string constant"
+    TkNumber(n) -> n
+    TkParam(n) -> s"$$$n"
+    TkOp(o) -> o
+    TkEnd -> "the end of the input"
+
+/** A recursive-descent parser over a token list that ends with `TkEnd`. */
+struct SqlParser
+    toks: Buf[SqlToken]
+    pos: usize
+
+    tok(self) -> SqlTok = self.toks[self.pos].tok
+
+    tok_at(self, k: usize) -> SqlTok = if self.pos + k < self.toks.len() then self.toks[self.pos + k].tok else TkEnd
+
+    at(self) -> u64 = self.toks[self.pos].start
+
+    /** The end offset of the last token consumed. */
+    last_end(self) -> u64 = if self.pos == 0 then 0 else self.toks[self.pos - 1].end
+
+    advance(*self) = if self.pos + 1 < self.toks.len() then self.pos += 1
+
+    kw_at(self, k: usize, kw: string) -> bool = self.tok_at(k) match
+        TkIdent(n, q) -> !q && n == kw
+        _ -> false
+
+    is_kw(self, kw: string) -> bool = self.kw_at(0, kw)
+
+    eat_kw(*self, kw: string) -> bool
+        if !self.is_kw(kw) then return false
+        self.advance()
+        true
+
+    /** Consumes keyword `kw` if it is the current token. */
+    skip_kw(*self, kw: string)
+        if self.is_kw(kw) then self.advance()
+
+    op_at(self, k: usize, op: string) -> bool = self.tok_at(k) match
+        TkOp(o) -> o == op
+        _ -> false
+
+    is_op(self, op: string) -> bool = self.op_at(0, op)
+
+    eat_op(*self, op: string) -> bool
+        if !self.is_op(op) then return false
+        self.advance()
+        true
+
+    /** `Q8001` at the current token. */
+    unexpected[T](self, wanted: string) -> Result[T, SqlError] =
+        sql_fail("Q8001", s"syntax error at ${sql_token_text(self.tok())}: expected $wanted", self.at())
+
+    expect_kw(*self, kw: string) -> Result[unit, SqlError]
+        if self.eat_kw(kw) then return Ok(())
+        self.unexpected(kw.to_upper())
+
+    expect_op(*self, op: string) -> Result[unit, SqlError]
+        if self.eat_op(op) then return Ok(())
+        self.unexpected(s"'$op'")
+
+    /** Whether the current token is a name: a quoted identifier or an unreserved one. */
+    is_name(self) -> bool = self.tok() match
+        TkIdent(n, q) -> q || !sql_reserved(n)
+        _ -> false
+
+    /** A name: a quoted identifier, or an unquoted one that is not reserved. */
+    name(*self) -> Result[string, SqlError]
+        self.tok() match
+            TkIdent(n, q) ->
+                if !q && sql_reserved(n) then return sql_fail("Q8001", s"syntax error at $n: a reserved word is a name only when quoted", self.at())
+                self.advance()
+                Ok(n)
+            _ -> self.unexpected("a name")
+
+    /** `name [, name]*` inside parentheses. */
+    name_list(*self) -> Result[Buf[string], SqlError]
+        self.expect_op("(")?
+        val out = buf[string]()
+        loop
+            out.push(self.name()?)
+            if !self.eat_op(",") then break
+        self.expect_op(")")?
+        Ok(out)
+
+    /** `[schema.]name`. */
+    qual_name(*self) -> Result[SqlName, SqlError]
+        val at = self.at()
+        val first = self.name()?
+        if !self.eat_op(".") then return Ok(SqlName(None, first, at))
+        val second = self.name()?
+        if self.is_op(".") then return sql_fail("Q8005", "a name has at most two parts, schema and name", self.at())
+        Ok(SqlName(Some(first), second, at))
+
+    /** An optional alias: `AS name`, or a bare unreserved name. */
+    alias(*self) -> Result[Option[string], SqlError]
+        if self.eat_kw("as") then return Ok(Some(self.name()?))
+        if self.is_name() then return Ok(Some(self.name()?))
+        Ok(None)
+
+    /** `IF NOT EXISTS`, if present. */
+    if_not_exists(*self) -> Result[bool, SqlError]
+        if !self.is_kw("if") then return Ok(false)
+        self.advance()
+        self.expect_kw("not")?
+        self.expect_kw("exists")?
+        Ok(true)
+
+    if_exists(*self) -> Result[bool, SqlError]
+        if !self.is_kw("if") then return Ok(false)
+        self.advance()
+        self.expect_kw("exists")?
+        Ok(true)
+
+    /** `CASCADE` or `RESTRICT`, if present: whether it was `CASCADE`. */
+    cascade(*self) -> bool
+        if self.eat_kw("cascade") then return true
+        val _ = self.eat_kw("restrict")
+        false
+
+    // -- types --------------------------------------------------------------------------------------
+
+    /** A type name (`sql.md` §4). */
+    type_name(*self) -> Result[Type, SqlError]
+        val at = self.at()
+        val word = self.tok() match
+            TkIdent(n, false) -> n
+            _ -> return self.unexpected("a type name")
+        self.advance()
+
+        val ty = word match
+            "double" ->
+                self.expect_kw("precision")?
+                Float64
+            "decimal" | "numeric" ->
+                if !self.eat_op("(") then return sql_fail("Q8006", s"$word needs a precision: write $word(p) or $word(p, s)", at)
+                val p = self.small_int()?
+                var scale: u64 = 0
+                if self.eat_op(",") then scale = self.small_int()?
+                self.expect_op(")")?
+                if p < 1 || p > 38 || scale > p then return sql_fail("Q8006", s"$word($p, $scale) is outside 1 ≤ p ≤ 38, 0 ≤ s ≤ p", at)
+                Decimal(u8(p), u8(scale))
+            "timestamp" | "time" ->
+                if self.is_kw("with") || self.is_kw("without")
+                    val with = self.eat_kw("with")
+                    if !with then self.advance()
+                    self.expect_kw("time")?
+                    self.expect_kw("zone")?
+                    if word == "time" && with then return sql_fail("Q8006", "time with time zone has no meaning in TernDB", at)
+                    if word == "time" then Time else if with then Timestamp else DateTime
+                else
+                    sql_simple_type(word).unwrap()
+            "varchar" | "char" | "character" | "nchar" | "bpchar" ->
+                return sql_fail("Q8006", s"TernDB has no $word type: use text, with a CHECK constraint for a length limit", at)
+            "serial" | "bigserial" | "smallserial" | "serial4" | "serial8" | "serial2" ->
+                return sql_fail("Q8006", s"$word is only a column's type in CREATE TABLE and ADD COLUMN", at)
+            else
+                sql_simple_type(word) match
+                    Some(t) -> t
+                    None -> return sql_fail("Q8006", s"unknown type name $word", at)
+
+        if self.is_op("(") then return sql_fail("Q8006", s"the type $word takes no modifier", self.at())
+        if self.is_kw("array") then return sql_fail("Q8005", "array types are not supported", self.at())
+        Ok(ty)
+    end type_name
+
+    /** A non-negative integer constant of at most nine digits. */
+    small_int(*self) -> Result[u64, SqlError]
+        val at = self.at()
+        self.tok() match
+            TkNumber(text) ->
+                if text.len > 9 then return sql_fail("Q8004", s"$text is too large here", at)
+                var n: u64 = 0
+                for c in text.bytes
+                    if c < u8('0') || c > u8('9') then return sql_fail("Q8001", s"syntax error at $text: expected an integer", at)
+                    n = n * 10 + u64(c - u8('0'))
+                self.advance()
+                Ok(n)
+            _ -> self.unexpected("an integer")
+end SqlParser
+
+/** The statements of `text`, each with its source range (`sql.md` §3.1). Empty statements (`;` with
+ * nothing before it) are skipped.
+ */
+sql_parse(text: string) -> Result[Buf[SqlParsed], SqlError]
+    var p = SqlParser(sql_tokens(text)?, 0)
+    val out = buf[SqlParsed]()
+
+    loop
+        while p.is_op(";")
+            p.advance()
+        if p.tok() == TkEnd then break
+
+        val start = p.at()
+        val stmt = sql_stmt(&p)?
+        val end = p.last_end()
+
+        if !p.eat_op(";") && p.tok() != TkEnd then return p.unexpected("';' or the end of the statement")
+        out.push(SqlParsed(stmt, start, end))
+
+    Ok(out)
+
+// -- statements --------------------------------------------------------------------------------------
+
+private sql_stmt(p: *SqlParser) -> Result[SqlStmt, SqlError]
+    val at = p.at()
+
+    if p.is_kw("select") || p.is_kw("with") || p.is_kw("values") || p.is_kw("table") || p.is_op("(") then return Ok(StQuery(sql_query(p)?))
+    if p.eat_kw("insert") then return sql_insert(p, at)
+    if p.eat_kw("update") then return sql_update(p, at)
+    if p.eat_kw("delete") then return sql_delete(p, at)
+    if p.eat_kw("create") then return sql_create(p, at)
+    if p.eat_kw("drop") then return sql_drop(p, at)
+    if p.eat_kw("alter") then return sql_alter(p, at)
+    if p.is_kw("begin") || p.is_kw("start") || p.is_kw("commit") || p.is_kw("end") || p.is_kw("rollback") || p.is_kw("abort") || p.is_kw("savepoint") || p.is_kw("release")
+        return Ok(StTxn(sql_txn(p)?, at))
+
+    p.tok() match
+        TkIdent(n, false) -> if sql_other_statement(n) then sql_fail("Q8005", s"the statement ${n.to_upper()} is not supported", at) else p.unexpected("a statement")
+        _ -> p.unexpected("a statement")
+
+/** The first words of SQL statements the dialect does not have (`sql.md` §8). */
+private sql_other_statement(w: string) -> bool = w match
+    "grant" | "revoke" | "copy" | "explain" | "set" | "show" | "reset" | "prepare" | "execute" | "deallocate" -> true
+    "truncate" | "vacuum" | "analyze" | "lock" | "declare" | "fetch" | "close" | "listen" | "notify" | "comment" -> true
+    "call" | "do" | "merge" | "discard" | "checkpoint" | "reindex" | "cluster" | "refresh" | "import" | "load" -> true
+    else false
+
+/** The transaction statements of `sql.md` §6. */
+private sql_txn(p: *SqlParser) -> Result[SqlTxn, SqlError]
+    if p.eat_kw("begin")
+        val _ = p.eat_kw("work") || p.eat_kw("transaction")
+        return Ok(SqlBegin(sql_txn_modes(p)?))
+
+    if p.eat_kw("start")
+        p.expect_kw("transaction")?
+        return Ok(SqlBegin(sql_txn_modes(p)?))
+
+    if p.eat_kw("commit") || p.eat_kw("end")
+        val _ = p.eat_kw("work") || p.eat_kw("transaction")
+        if p.is_kw("and") then return sql_fail("Q8005", "COMMIT AND CHAIN is not supported", p.at())
+        return Ok(SqlCommit)
+
+    if p.eat_kw("rollback") || p.eat_kw("abort")
+        val _ = p.eat_kw("work") || p.eat_kw("transaction")
+        if p.eat_kw("to")
+            val _ = p.eat_kw("savepoint")
+            return Ok(SqlRollbackTo(p.name()?))
+        if p.is_kw("and") then return sql_fail("Q8005", "ROLLBACK AND CHAIN is not supported", p.at())
+        return Ok(SqlRollback)
+
+    if p.eat_kw("savepoint") then return Ok(SqlSavepoint(p.name()?))
+
+    p.expect_kw("release")?
+    val _ = p.eat_kw("savepoint")
+    Ok(SqlRelease(p.name()?))
+
+/** `[mode [, mode]*]`: `ISOLATION LEVEL …`, `READ ONLY`, `READ WRITE`. */
+private sql_txn_modes(p: *SqlParser) -> Result[TxnOptions, SqlError]
+    var o = TxnOptions(None, None, None, None, None, None, None)
+
+    loop
+        val at = p.at()
+        if p.eat_kw("isolation")
+            p.expect_kw("level")?
+            if o.isolation.is_some() then return sql_fail("Q8001", "syntax error: the isolation level is given twice", at)
+            if p.eat_kw("serializable")
+                o.isolation = Some(Serializable)
+            else if p.eat_kw("snapshot")
+                o.isolation = Some(Snapshot)
+            else if p.eat_kw("repeatable")
+                p.expect_kw("read")?
+                o.isolation = Some(Snapshot)
+            else if p.eat_kw("read")
+                if p.eat_kw("committed")
+                    o.isolation = Some(ReadCommitted)
+                else
+                    p.expect_kw("uncommitted")?
+                    o.isolation = Some(ReadCommitted)
+            else
+                return p.unexpected("SERIALIZABLE, SNAPSHOT, REPEATABLE READ, READ COMMITTED or READ UNCOMMITTED")
+        else if p.eat_kw("read")
+            if o.read_only.is_some() then return sql_fail("Q8001", "syntax error: READ ONLY or READ WRITE is given twice", at)
+            if p.eat_kw("only")
+                o.read_only = Some(true)
+            else
+                p.expect_kw("write")?
+                o.read_only = Some(false)
+        else if p.is_kw("deferrable") || p.is_kw("not")
+            return sql_fail("Q8005", "DEFERRABLE transactions are not supported", at)
+        else
+            break
+
+        if !p.eat_op(",") && !p.is_kw("isolation") && !p.is_kw("read") then break
+
+    Ok(o)
+end sql_txn_modes
+
+/** `INSERT INTO name [[AS] alias] [(cols)] {query | DEFAULT VALUES} [ON CONFLICT …] [RETURNING …]`. */
+private sql_insert(p: *SqlParser, at: u64) -> Result[SqlStmt, SqlError]
+    p.expect_kw("into")?
+    val table = p.qual_name()?
+    var alias: Option[string] = None
+    if p.eat_kw("as") then alias = Some(p.name()?)
+
+    var columns = buf[string]()
+    if p.is_op("(") && !p.kw_at(1, "select") && !p.kw_at(1, "with") && !p.kw_at(1, "values") then columns = p.name_list()?
+
+    var source: Option[SqlQuery] = None
+    if p.eat_kw("default")
+        p.expect_kw("values")?
+    else
+        source = Some(sql_query(p)?)
+
+    var conflict: Option[SqlConflict] = None
+    if p.is_kw("on")
+        val cat = p.at()
+        p.advance()
+        p.expect_kw("conflict")?
+        var cols = buf[string]()
+        var constraint: Option[string] = None
+        if p.is_op("(")
+            cols = p.name_list()?
+        else if p.eat_kw("on")
+            p.expect_kw("constraint")?
+            constraint = Some(p.name()?)
+        p.expect_kw("do")?
+        if p.eat_kw("nothing")
+            conflict = Some(SqlConflict(cols, constraint, None, None, cat))
+        else
+            p.expect_kw("update")?
+            p.expect_kw("set")?
+            val sets = sql_sets(p)?
+            var where: Option[SqlExpr] = None
+            if p.eat_kw("where") then where = Some(sql_expr(p)?)
+            conflict = Some(SqlConflict(cols, constraint, Some(sets), where, cat))
+
+    Ok(StInsert(table, alias, columns, source, conflict, sql_returning(p)?, at))
+end sql_insert
+
+/** `column = expr [, …]`. */
+private sql_sets(p: *SqlParser) -> Result[Buf[SqlSet], SqlError]
+    val out = buf[SqlSet]()
+
+    loop
+        val at = p.at()
+        if p.is_op("(") then return sql_fail("Q8005", "assigning a row of columns is not supported", at)
+        val column = p.name()?
+        if p.is_op(".") then return sql_fail("Q8005", "a SET target is a column name, without a qualifier", p.at())
+        p.expect_op("=")?
+        out.push(SqlSet(column, sql_value(p)?, at))
+        if !p.eat_op(",") then break
+
+    Ok(out)
+
+/** `[RETURNING item [, …]]`. */
+private sql_returning(p: *SqlParser) -> Result[Buf[SqlItem], SqlError]
+    if !p.eat_kw("returning") then return Ok(buf[SqlItem]())
+    sql_items(p)
+
+/** `UPDATE name [[AS] alias] SET … [FROM …] [WHERE …] [RETURNING …]`. */
+private sql_update(p: *SqlParser, at: u64) -> Result[SqlStmt, SqlError]
+    val table = p.qual_name()?
+    var alias: Option[string] = None
+    if p.eat_kw("as") then alias = Some(p.name()?) else if p.is_name() && !p.is_kw("set") then alias = Some(p.name()?)
+    p.expect_kw("set")?
+    val sets = sql_sets(p)?
+    var from = buf[SqlFrom]()
+    if p.eat_kw("from") then from = sql_from_list(p)?
+    var where: Option[SqlExpr] = None
+    if p.eat_kw("where") then where = Some(sql_expr(p)?)
+    Ok(StUpdate(table, alias, sets, from, where, sql_returning(p)?, at))
+
+/** `DELETE FROM name [[AS] alias] [USING …] [WHERE …] [RETURNING …]`. */
+private sql_delete(p: *SqlParser, at: u64) -> Result[SqlStmt, SqlError]
+    p.expect_kw("from")?
+    val table = p.qual_name()?
+    val alias = p.alias()?
+    var using = buf[SqlFrom]()
+    if p.eat_kw("using") then using = sql_from_list(p)?
+    var where: Option[SqlExpr] = None
+    if p.eat_kw("where") then where = Some(sql_expr(p)?)
+    Ok(StDelete(table, alias, using, where, sql_returning(p)?, at))
+
+/** `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, `CREATE SCHEMA`, `CREATE [OR REPLACE] VIEW`. */
+private sql_create(p: *SqlParser, at: u64) -> Result[SqlStmt, SqlError]
+    if p.eat_kw("table")
+        val ine = p.if_not_exists()?
+        val table = p.qual_name()?
+        p.expect_op("(")?
+        val elements = buf[SqlElement]()
+        loop
+            elements.push(sql_element(p)?)
+            if !p.eat_op(",") then break
+        p.expect_op(")")?
+        if p.is_kw("as") then return sql_fail("Q8005", "CREATE TABLE AS is not supported", p.at())
+        return Ok(StCreateTable(table, elements, ine, at))
+
+    val unique = p.eat_kw("unique")
+    if p.eat_kw("index")
+        if p.is_kw("concurrently") then return sql_fail("Q8005", "every index is built online; CONCURRENTLY is not needed", p.at())
+        val ine = p.if_not_exists()?
+        if p.is_kw("on") then return sql_fail("Q8001", "syntax error at ON: an index needs a name", p.at())
+        val name = p.name()?
+        p.expect_kw("on")?
+        val table = p.qual_name()?
+        p.expect_op("(")?
+        val keys = buf[SqlIndexKey]()
+        loop
+            var key = if p.eat_op("(")
+                val e = sql_expr(p)?
+                p.expect_op(")")?
+                SqlIndexKey(None, Some(e), false)
+            else
+                SqlIndexKey(Some(p.name()?), None, false)
+            key.desc = p.eat_kw("desc")
+            if !key.desc then p.skip_kw("asc")
+            if p.is_kw("nulls") then return sql_fail("Q8005", "an index orders nulls first ascending and last descending; NULLS is not supported", p.at())
+            keys.push(key)
+            if !p.eat_op(",") then break
+        p.expect_op(")")?
+        var where: Option[SqlExpr] = None
+        if p.eat_kw("where") then where = Some(sql_expr(p)?)
+        return Ok(StCreateIndex(name, table, unique, keys, where, ine, at))
+
+    if unique then return p.unexpected("INDEX")
+
+    if p.eat_kw("schema")
+        val ine = p.if_not_exists()?
+        return Ok(StCreateSchema(p.name()?, ine, at))
+
+    var replace = false
+    if p.eat_kw("or")
+        p.expect_kw("replace")?
+        replace = true
+    if p.eat_kw("view")
+        val view = p.qual_name()?
+        if p.is_op("(") then return sql_fail("Q8005", "a view's column list is not supported: alias the query's columns", p.at())
+        p.expect_kw("as")?
+        return Ok(StCreateView(view, sql_query(p)?, replace, at))
+    if replace then return p.unexpected("VIEW")
+
+    p.tok() match
+        TkIdent(n, false) -> sql_fail("Q8005", s"CREATE ${n.to_upper()} is not supported", p.at())
+        _ -> p.unexpected("TABLE, INDEX, SCHEMA or VIEW")
+end sql_create
+
+/** A `CREATE TABLE` element: a column definition or a table constraint. */
+private sql_element(p: *SqlParser) -> Result[SqlElement, SqlError]
+    if p.is_kw("constraint") || p.is_kw("primary") || p.is_kw("unique") || p.is_kw("check") || p.is_kw("foreign")
+        return Ok(ElConstraint(sql_table_constraint(p)?))
+    if p.is_kw("like") || p.is_kw("exclude") then return sql_fail("Q8005", "LIKE and EXCLUDE are not supported in CREATE TABLE", p.at())
+    Ok(ElColumn(sql_column(p)?))
+
+/** `name type [column constraint]*`; the serial types are an identity column (`sql.md` §4.2). */
+private sql_column(p: *SqlParser) -> Result[SqlColumn, SqlError]
+    val at = p.at()
+    val name = p.name()?
+    var identity = NoIdentity
+    var not_null = false
+
+    val serial = p.tok() match
+        TkIdent(n, false) -> n match
+            "smallserial" | "serial2" -> Some(Int16)
+            "serial" | "serial4" -> Some(Int32)
+            "bigserial" | "serial8" -> Some(Int64)
+            else None
+        _ -> None
+
+    val ty = serial match
+        Some(t) ->
+            p.advance()
+            identity = ByDefault
+            not_null = true
+            t
+        None -> p.type_name()?
+
+    var c = SqlColumn(name, ty, not_null, None, None, identity, buf[SqlConstraint](), at)
+    var nullable_written = false
+
+    loop
+        val cat = p.at()
+        var cname: Option[string] = None
+        if p.eat_kw("constraint") then cname = Some(p.name()?)
+
+        if p.eat_kw("not")
+            p.expect_kw("null")?
+            if nullable_written && !c.not_null then return sql_fail("Q8013", s"column $name is declared both NULL and NOT NULL", cat)
+            c.not_null = true
+            nullable_written = true
+        else if p.eat_kw("null")
+            if c.not_null then return sql_fail("Q8013", s"column $name is declared both NULL and NOT NULL", cat)
+            nullable_written = true
+        else if p.eat_kw("default")
+            if c.default.is_some() then return sql_fail("Q8013", s"column $name has two defaults", cat)
+            c.default = Some(sql_bexpr(p)?)
+        else if p.eat_kw("generated")
+            if p.eat_kw("always")
+                p.expect_kw("as")?
+                if p.eat_op("(")
+                    c.generated = Some(sql_expr(p)?)
+                    p.expect_op(")")?
+                    p.expect_kw("stored")?
+                else
+                    p.expect_kw("identity")?
+                    c.identity = Always
+            else
+                p.expect_kw("by")?
+                p.expect_kw("default")?
+                p.expect_kw("as")?
+                p.expect_kw("identity")?
+                c.identity = ByDefault
+            if p.is_op("(") then return sql_fail("Q8005", "identity options are not supported", p.at())
+        else if p.eat_kw("primary")
+            p.expect_kw("key")?
+            c.constraints.push(SqlConstraint(cname, CoPrimary(sql_one(name)), false, cat))
+        else if p.eat_kw("unique")
+            c.constraints.push(SqlConstraint(cname, CoUnique(sql_one(name)), false, cat))
+        else if p.eat_kw("check")
+            p.expect_op("(")?
+            val e = sql_expr(p)?
+            p.expect_op(")")?
+            c.constraints.push(SqlConstraint(cname, CoCheck(e), false, cat))
+        else if p.eat_kw("references")
+            c.constraints.push(SqlConstraint(cname, sql_references(p, sql_one(name))?, false, cat))
+        else if cname.is_some()
+            return p.unexpected("a constraint")
+        else
+            break
+
+    Ok(c)
+end sql_column
+
+private sql_one(name: string) -> Buf[string]
+    val b = buf[string]()
+    b.push(name)
+    b
+
+/** `[CONSTRAINT name] {PRIMARY KEY (…) | UNIQUE (…) | CHECK (…) | FOREIGN KEY (…) REFERENCES …}`. */
+private sql_table_constraint(p: *SqlParser) -> Result[SqlConstraint, SqlError]
+    val at = p.at()
+    var name: Option[string] = None
+    if p.eat_kw("constraint") then name = Some(p.name()?)
+
+    val body = if p.eat_kw("primary")
+        p.expect_kw("key")?
+        CoPrimary(p.name_list()?)
+    else if p.eat_kw("unique")
+        CoUnique(p.name_list()?)
+    else if p.eat_kw("check")
+        p.expect_op("(")?
+        val e = sql_expr(p)?
+        p.expect_op(")")?
+        CoCheck(e)
+    else if p.eat_kw("foreign")
+        p.expect_kw("key")?
+        val cols = p.name_list()?
+        p.expect_kw("references")?
+        sql_references(p, cols)?
+    else
+        return p.unexpected("PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY")
+
+    var not_valid = false
+    if p.is_kw("not") && p.kw_at(1, "valid")
+        p.advance()
+        p.advance()
+        not_valid = true
+
+    Ok(SqlConstraint(name, body, not_valid, at))
+
+/** What follows `REFERENCES`: `table [(cols)] [ON DELETE a] [ON UPDATE a] [[NOT] DEFERRABLE …]`. */
+private sql_references(p: *SqlParser, columns: Buf[string]) -> Result[SqlConstraintBody, SqlError]
+    val table = p.qual_name()?
+    var refs = buf[string]()
+    if p.is_op("(") then refs = p.name_list()?
+    var on_delete = FkNoAction
+    var on_update = FkNoAction
+    var deferred = false
+
+    loop
+        if p.is_kw("on") && p.kw_at(1, "delete")
+            p.advance()
+            p.advance()
+            on_delete = sql_fk_action(p)?
+        else if p.is_kw("on") && p.kw_at(1, "update")
+            p.advance()
+            p.advance()
+            on_update = sql_fk_action(p)?
+        else if p.eat_kw("deferrable")
+            if p.eat_kw("initially")
+                if p.eat_kw("deferred") then deferred = true else p.expect_kw("immediate")?
+        else if p.is_kw("not") && p.kw_at(1, "deferrable")
+            p.advance()
+            p.advance()
+        else if p.eat_kw("match")
+            if !p.eat_kw("simple") then return sql_fail("Q8005", "a foreign key matches simply; only MATCH SIMPLE is supported", p.at())
+        else
+            break
+
+    Ok(CoForeign(columns, table, refs, on_delete, on_update, deferred))
+
+private sql_fk_action(p: *SqlParser) -> Result[FkAction, SqlError]
+    if p.eat_kw("cascade") then return Ok(FkCascade)
+    if p.eat_kw("restrict") then return Ok(FkRestrict)
+    if p.eat_kw("no")
+        p.expect_kw("action")?
+        return Ok(FkNoAction)
+    p.expect_kw("set")?
+    if p.eat_kw("null") then return Ok(FkSetNull)
+    p.expect_kw("default")?
+    Ok(FkSetDefault)
+
+/** `DROP {TABLE | VIEW | INDEX | SCHEMA} [IF EXISTS] name [CASCADE | RESTRICT]`. */
+private sql_drop(p: *SqlParser, at: u64) -> Result[SqlStmt, SqlError]
+    val kind = p.tok() match
+        TkIdent(n, false) -> n
+        _ -> return p.unexpected("TABLE, VIEW, INDEX or SCHEMA")
+    if kind != "table" && kind != "view" && kind != "index" && kind != "schema"
+        return sql_fail("Q8005", s"DROP ${kind.to_upper()} is not supported", p.at())
+    p.advance()
+
+    val ie = p.if_exists()?
+    val name = p.qual_name()?
+    if p.is_op(",") then return sql_fail("Q8005", "drop one object per statement", p.at())
+
+    kind match
+        "table" -> Ok(StDropTable(name, ie, p.cascade(), at))
+        "view" -> Ok(StDropView(name, ie, p.cascade(), at))
+        "index" ->
+            if p.is_kw("cascade") then return sql_fail("Q8005", "DROP INDEX takes no CASCADE", p.at())
+            val _ = p.eat_kw("restrict")
+            Ok(StDropIndex(name, ie, at))
+        else
+            if name.schema.is_some() then return sql_fail("Q8001", "syntax error: a schema's name has one part", name.at)
+            Ok(StDropSchema(name.name, ie, p.cascade(), at))
+
+/** `ALTER TABLE name action [, action]*` (`sql.md` §3.4). */
+private sql_alter(p: *SqlParser, at: u64) -> Result[SqlStmt, SqlError]
+    if !p.is_kw("table")
+        p.tok() match
+            TkIdent(n, false) -> return sql_fail("Q8005", s"ALTER ${n.to_upper()} is not supported", p.at())
+            _ -> return p.unexpected("TABLE")
+    p.advance()
+    if p.is_kw("if") then return sql_fail("Q8005", "ALTER TABLE IF EXISTS is not supported", p.at())
+    val table = p.qual_name()?
+    val actions = buf[SqlAlter]()
+
+    loop
+        actions.push(sql_alter_action(p)?)
+        if !p.eat_op(",") then break
+
+    Ok(StAlterTable(table, actions, at))
+
+private sql_alter_action(p: *SqlParser) -> Result[SqlAlter, SqlError]
+    val at = p.at()
+
+    if p.eat_kw("add")
+        if p.is_kw("constraint") || p.is_kw("primary") || p.is_kw("unique") || p.is_kw("check") || p.is_kw("foreign")
+            return Ok(AlAddConstraint(sql_table_constraint(p)?))
+        val _ = p.eat_kw("column")
+        if p.is_kw("if") then return sql_fail("Q8005", "ADD COLUMN IF NOT EXISTS is not supported", p.at())
+        return Ok(AlAddColumn(sql_column(p)?))
+
+    if p.eat_kw("drop")
+        if p.eat_kw("constraint")
+            val ie = p.if_exists()?
+            val name = p.name()?
+            if p.is_kw("cascade") then return sql_fail("Q8005", "DROP CONSTRAINT takes no CASCADE", p.at())
+            val _ = p.eat_kw("restrict")
+            return Ok(AlDropConstraint(name, ie, at))
+        val _ = p.eat_kw("column")
+        if p.is_kw("if") then return sql_fail("Q8005", "DROP COLUMN IF EXISTS is not supported", p.at())
+        val name = p.name()?
+        return Ok(AlDropColumn(name, p.cascade(), at))
+
+    if p.eat_kw("rename")
+        if p.eat_kw("to") then return Ok(AlRenameTable(p.name()?, at))
+        if p.eat_kw("constraint")
+            val name = p.name()?
+            p.expect_kw("to")?
+            return Ok(AlRenameConstraint(name, p.name()?, at))
+        val _ = p.eat_kw("column")
+        val name = p.name()?
+        p.expect_kw("to")?
+        return Ok(AlRenameColumn(name, p.name()?, at))
+
+    if p.eat_kw("validate")
+        p.expect_kw("constraint")?
+        return Ok(AlValidate(p.name()?, at))
+
+    if p.eat_kw("alter")
+        val _ = p.eat_kw("column")
+        val name = p.name()?
+        if p.eat_kw("set")
+            if p.eat_kw("default") then return Ok(AlSetDefault(name, Some(sql_bexpr(p)?), at))
+            if p.eat_kw("not")
+                p.expect_kw("null")?
+                return Ok(AlNullable(name, false, at))
+            p.expect_kw("data")?
+            p.expect_kw("type")?
+            return sql_alter_type(p, name, at)
+        if p.eat_kw("drop")
+            if p.eat_kw("default") then return Ok(AlSetDefault(name, None, at))
+            p.expect_kw("not")?
+            p.expect_kw("null")?
+            return Ok(AlNullable(name, true, at))
+        if p.eat_kw("type") then return sql_alter_type(p, name, at)
+        return p.unexpected("SET, DROP or TYPE")
+
+    p.unexpected("ADD, DROP, RENAME, ALTER or VALIDATE")
+end sql_alter_action
+
+private sql_alter_type(p: *SqlParser, name: string, at: u64) -> Result[SqlAlter, SqlError]
+    val ty = p.type_name()?
+    var using: Option[SqlExpr] = None
+    if p.eat_kw("using") then using = Some(sql_expr(p)?)
+    Ok(AlType(name, ty, using, at))
+
+// -- queries -----------------------------------------------------------------------------------------
+
+private sql_empty_tail(at: u64) -> SqlTail = SqlTail(buf[SqlOrder](), None, None, false, at)
+
+/** `[WITH …] body [ORDER BY …] [LIMIT …] [OFFSET …] [FETCH …]` (`sql.md` §5). */
+private[terndb] sql_query(p: *SqlParser) -> Result[SqlQuery, SqlError]
+    val at = p.at()
+
+    if p.eat_kw("with")
+        if p.is_kw("recursive") then return sql_fail("Q8005", "WITH RECURSIVE is not supported", p.at())
+        val ctes = buf[SqlCte]()
+        loop
+            val cat = p.at()
+            val name = p.name()?
+            var columns = buf[string]()
+            if p.is_op("(") then columns = p.name_list()?
+            p.expect_kw("as")?
+            if p.is_kw("materialized") || p.is_kw("not") then return sql_fail("Q8005", "MATERIALIZED is not supported", p.at())
+            p.expect_op("(")?
+            val q = sql_query(p)?
+            p.expect_op(")")?
+            ctes.push(SqlCte(name, columns, q, cat))
+            if !p.eat_op(",") then break
+        return Ok(QyWith(ctes, sql_query(p)?, at))
+
+    val body = sql_set_expr(p)?
+    val tail = sql_tail(p)?
+    if tail.is_empty() then return Ok(body)
+
+    val old = body.tail_of().unwrap()
+    if old.order.len() > 0 && tail.order.len() > 0 then return sql_fail("Q8001", "syntax error: a query has one ORDER BY", tail.at)
+    if (old.count.is_some() || old.offset.is_some()) && (tail.count.is_some() || tail.offset.is_some())
+        return sql_fail("Q8001", "syntax error: a query has one LIMIT and one OFFSET", tail.at)
+
+    val order = if tail.order.len() > 0 then tail.order else old.order
+    val count = if tail.count.is_some() then tail.count else old.count
+    val offset = if tail.offset.is_some() then tail.offset else old.offset
+    Ok(body.with_tail(SqlTail(order, count, offset, tail.ties || old.ties, if old.is_empty() then tail.at else old.at)))
+end sql_query
+
+/** `ORDER BY …`, `LIMIT n | LIMIT ALL`, `OFFSET n [ROW | ROWS]`, `FETCH {FIRST | NEXT} [n] {ROW | ROWS}
+ * {ONLY | WITH TIES}`, in any order a query may have them.
+ */
+private sql_tail(p: *SqlParser) -> Result[SqlTail, SqlError]
+    var t = sql_empty_tail(p.at())
+
+    if p.eat_kw("order")
+        p.expect_kw("by")?
+        t.order = sql_order_list(p)?
+
+    var limited = false
+    loop
+        val at = p.at()
+        if p.eat_kw("limit")
+            if limited then return sql_fail("Q8001", "syntax error: a query has one LIMIT", at)
+            limited = true
+            if !p.eat_kw("all") then t.count = Some(sql_expr(p)?)
+        else if p.eat_kw("offset")
+            if t.offset.is_some() then return sql_fail("Q8001", "syntax error: a query has one OFFSET", at)
+            t.offset = Some(sql_expr(p)?)
+            val _ = p.eat_kw("row") || p.eat_kw("rows")
+        else if p.eat_kw("fetch")
+            if limited then return sql_fail("Q8001", "syntax error: a query has one LIMIT", at)
+            limited = true
+            if !p.eat_kw("first") then p.expect_kw("next")?
+            if !p.is_kw("row") && !p.is_kw("rows") then t.count = Some(sql_primary(p)?) else t.count = Some(SqNumber("1", at))
+            if !p.eat_kw("row") then p.expect_kw("rows")?
+            if p.eat_kw("with")
+                p.expect_kw("ties")?
+                t.ties = true
+            else
+                p.expect_kw("only")?
+        else
+            break
+
+    Ok(t)
+end sql_tail
+
+private sql_order_list(p: *SqlParser) -> Result[Buf[SqlOrder], SqlError]
+    val out = buf[SqlOrder]()
+
+    loop
+        val e = sql_expr(p)?
+        val desc = p.eat_kw("desc")
+        if !desc then p.skip_kw("asc")
+        if p.is_kw("using") then return sql_fail("Q8005", "ORDER BY … USING is not supported", p.at())
+        var nulls: Option[bool] = None
+        if p.eat_kw("nulls")
+            if p.eat_kw("first")
+                nulls = Some(true)
+            else
+                p.expect_kw("last")?
+                nulls = Some(false)
+        out.push(SqlOrder(e, desc, nulls))
+        if !p.eat_op(",") then break
+
+    Ok(out)
+
+/** `term {UNION | EXCEPT} [ALL | DISTINCT] term …`, left-associative; `INTERSECT` binds tighter. */
+private sql_set_expr(p: *SqlParser) -> Result[SqlQuery, SqlError]
+    var left = sql_set_term(p)?
+
+    loop
+        val at = p.at()
+        val op = if p.eat_kw("union") then Union else if p.eat_kw("except") then Except else break
+        val all = sql_set_all(p)
+        val right = sql_set_term(p)?
+        left = QySetOp(op, all, left, right, sql_empty_tail(at), at)
+
+    Ok(left)
+
+private sql_set_term(p: *SqlParser) -> Result[SqlQuery, SqlError]
+    var left = sql_set_primary(p)?
+
+    loop
+        val at = p.at()
+        if !p.eat_kw("intersect") then break
+        val all = sql_set_all(p)
+        val right = sql_set_primary(p)?
+        left = QySetOp(Intersect, all, left, right, sql_empty_tail(at), at)
+
+    Ok(left)
+
+private sql_set_all(p: *SqlParser) -> bool
+    if p.eat_kw("all") then return true
+    val _ = p.eat_kw("distinct")
+    false
+
+/** `SELECT …`, `VALUES …`, or a parenthesised query. */
+private sql_set_primary(p: *SqlParser) -> Result[SqlQuery, SqlError]
+    val at = p.at()
+
+    if p.eat_op("(")
+        val q = sql_query(p)?
+        p.expect_op(")")?
+        return Ok(q)
+
+    if p.eat_kw("values")
+        val rows = buf[Buf[SqlExpr]]()
+        loop
+            p.expect_op("(")?
+            val row = buf[SqlExpr]()
+            loop
+                row.push(sql_value(p)?)
+                if !p.eat_op(",") then break
+            p.expect_op(")")?
+            rows.push(row)
+            if !p.eat_op(",") then break
+        return Ok(QyValues(rows, sql_empty_tail(at), at))
+
+    if p.is_kw("table") then return sql_fail("Q8005", "TABLE as a query is not supported: write SELECT * FROM", at)
+    p.expect_kw("select")?
+    Ok(QySelect(sql_select_body(p, at)?, sql_empty_tail(at)))
+
+/** A `VALUES` or `SET` value: an expression or `DEFAULT`. */
+private sql_value(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    val at = p.at()
+    if p.eat_kw("default") then return Ok(SqDefault(at))
+    sql_expr(p)
+
+/** What follows `SELECT`. */
+private sql_select_body(p: *SqlParser, at: u64) -> Result[SqlSelect, SqlError]
+    var distinct = false
+    if p.eat_kw("distinct")
+        if p.is_kw("on") then return sql_fail("Q8005", "SELECT DISTINCT ON is not supported", p.at())
+        distinct = true
+    else
+        val _ = p.eat_kw("all")
+
+    val items = sql_items(p)?
+    if p.is_kw("into") then return sql_fail("Q8005", "SELECT INTO is not supported", p.at())
+
+    var from = buf[SqlFrom]()
+    if p.eat_kw("from") then from = sql_from_list(p)?
+
+    var where: Option[SqlExpr] = None
+    if p.eat_kw("where") then where = Some(sql_expr(p)?)
+
+    val group = buf[SqlExpr]()
+    if p.eat_kw("group")
+        p.expect_kw("by")?
+        if p.is_kw("rollup") || p.is_kw("cube") || p.is_kw("grouping") then return sql_fail("Q8005", "grouping sets are not supported", p.at())
+        loop
+            group.push(sql_expr(p)?)
+            if !p.eat_op(",") then break
+
+    var having: Option[SqlExpr] = None
+    if p.eat_kw("having") then having = Some(sql_expr(p)?)
+    if p.is_kw("window") then return sql_fail("Q8005", "window functions are not supported", p.at())
+
+    Ok(SqlSelect(distinct, items, from, where, group, having, at))
+end sql_select_body
+
+/** A select or `RETURNING` list. */
+private sql_items(p: *SqlParser) -> Result[Buf[SqlItem], SqlError]
+    val out = buf[SqlItem]()
+
+    loop
+        val at = p.at()
+        if p.eat_op("*")
+            out.push(SqlItem(SqStar(None, at), None))
+        else
+            val e = sql_expr(p)?
+            e match
+                SqStar(_, _) -> out.push(SqlItem(e, None))
+                _ -> out.push(SqlItem(e, p.alias()?))
+        if !p.eat_op(",") then break
+
+    Ok(out)
+
+/** `item [, item]*` of `FROM`, `USING` and `UPDATE … FROM`. */
+private sql_from_list(p: *SqlParser) -> Result[Buf[SqlFrom], SqlError]
+    val out = buf[SqlFrom]()
+
+    loop
+        out.push(sql_from_item(p)?)
+        if !p.eat_op(",") then break
+
+    Ok(out)
+
+/** A `FROM` item and the joins that follow it, left-associative. */
+private sql_from_item(p: *SqlParser) -> Result[SqlFrom, SqlError]
+    var left = sql_from_primary(p)?
+
+    loop
+        val at = p.at()
+        if p.is_kw("natural") then return sql_fail("Q8005", "NATURAL JOIN is not supported: write USING", at)
+
+        val kind = if p.eat_kw("cross")
+            JnCross
+        else if p.eat_kw("inner")
+            JnInner
+        else if p.eat_kw("left")
+            val _ = p.eat_kw("outer")
+            JnLeft
+        else if p.eat_kw("right")
+            val _ = p.eat_kw("outer")
+            JnRight
+        else if p.eat_kw("full")
+            val _ = p.eat_kw("outer")
+            JnFull
+        else if p.is_kw("join")
+            JnInner
+        else
+            break
+
+        p.expect_kw("join")?
+        val right = sql_from_primary(p)?
+
+        if kind == JnCross
+            left = FrJoin(JnCross, left, right, None, buf[string](), at)
+        else if p.eat_kw("on")
+            left = FrJoin(kind, left, right, Some(sql_expr(p)?), buf[string](), at)
+        else if p.eat_kw("using")
+            left = FrJoin(kind, left, right, None, p.name_list()?, at)
+        else
+            return p.unexpected("ON or USING")
+
+    Ok(left)
+end sql_from_item
+
+/** A table, a parenthesised query or a parenthesised join, with its alias. */
+private sql_from_primary(p: *SqlParser) -> Result[SqlFrom, SqlError]
+    val at = p.at()
+    if p.is_kw("lateral") then return sql_fail("Q8005", "LATERAL is not supported", at)
+    if p.is_kw("only") then return sql_fail("Q8005", "ONLY is not supported", at)
+
+    if p.is_op("(")
+        if p.kw_at(1, "select") || p.kw_at(1, "with") || p.kw_at(1, "values") || p.op_at(1, "(")
+            if !p.op_at(1, "(") || sql_parens_query(p)
+                p.advance()
+                val q = sql_query(p)?
+                p.expect_op(")")?
+                val alias = p.alias()?
+                var columns = buf[string]()
+                if alias.is_some() && p.is_op("(") then columns = p.name_list()?
+                return Ok(FrQuery(q, alias, columns, at))
+        p.advance()
+        val inner = sql_from_item(p)?
+        p.expect_op(")")?
+        if p.is_kw("as") || p.is_name() then return sql_fail("Q8005", "an alias on a parenthesised join is not supported", p.at())
+        return Ok(inner)
+
+    val name = p.qual_name()?
+    if p.is_op("(") then return sql_fail("Q8005", "table functions are not supported", p.at())
+    val alias = p.alias()?
+    var columns = buf[string]()
+    if alias.is_some() && p.is_op("(") then columns = p.name_list()?
+    Ok(FrTable(name, alias, columns, at))
+end sql_from_primary
+
+/** Whether the parentheses at the current token open a query (`((SELECT …) UNION …)`) rather than a
+ * parenthesised join: the first token after the run of `(` starts a query.
+ */
+private sql_parens_query(p: *SqlParser) -> bool
+    var k: usize = 0
+    while p.op_at(k, "(")
+        k += 1
+    p.kw_at(k, "select") || p.kw_at(k, "with") || p.kw_at(k, "values")
+
+// -- expressions (`sql.md` §5.8, precedence lowest first) -------------------------------------------
+
+/** An expression. */
+private[terndb] sql_expr(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var left = sql_and(p)?
+
+    loop
+        val at = p.at()
+        if !p.eat_kw("or") then break
+        left = SqBinary("or", left, sql_and(p)?, at)
+
+    Ok(left)
+
+/** An expression that stops before `NOT NULL`, `NULL` and the column constraints after a `DEFAULT`:
+ * a `DEFAULT` takes no `AND`, `OR` or `NOT` at its top unless parenthesised.
+ */
+private sql_bexpr(p: *SqlParser) -> Result[SqlExpr, SqlError] = sql_comparison(p)
+
+private sql_and(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var left = sql_not(p)?
+
+    loop
+        val at = p.at()
+        if !p.eat_kw("and") then break
+        left = SqBinary("and", left, sql_not(p)?, at)
+
+    Ok(left)
+
+private sql_not(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    val at = p.at()
+    if p.eat_kw("not") then return Ok(SqNot(sql_not(p)?, at))
+    sql_is(p)
+
+/** `x IS [NOT] NULL`, repeatable. */
+private sql_is(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var left = sql_comparison(p)?
+
+    loop
+        val at = p.at()
+        if !p.eat_kw("is") then break
+        val negated = p.eat_kw("not")
+        if p.eat_kw("null")
+            left = SqIsNull(left, negated, at)
+        else
+            p.tok() match
+                TkIdent(n, false) -> if n == "true" || n == "false" || n == "unknown" || n == "distinct"
+                    return sql_fail("Q8005", s"IS ${n.to_upper()} is not supported", p.at())
+                _ -> ()
+            return p.unexpected("NULL")
+
+    Ok(left)
+
+private sql_cmp_op(p: *SqlParser) -> Option[string]
+    for op in ["=", "<>", "<", "<=", ">", ">="]
+        if p.is_op(op) then return Some(op)
+    None
+
+/** `a op b` with `op` a comparison: non-associative, so `a < b < c` is refused. */
+private sql_comparison(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    val left = sql_predicate(p)?
+    val at = p.at()
+
+    val op = sql_cmp_op(p) match
+        Some(o) -> o
+        None -> return Ok(left)
+    p.advance()
+    if p.is_kw("any") || p.is_kw("all") || p.is_kw("some") then return sql_fail("Q8005", "ANY, SOME and ALL comparisons are not supported", p.at())
+
+    val right = sql_predicate(p)?
+    if sql_cmp_op(p).is_some() then return sql_fail("Q8001", "syntax error: comparisons do not chain; parenthesise one", p.at())
+    Ok(SqBinary(op, left, right, at))
+
+/** `x [NOT] BETWEEN a AND b`, `x [NOT] IN (…)`, `x [NOT] LIKE p [ESCAPE e]`. */
+private sql_predicate(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    val left = sql_concat(p)?
+    val at = p.at()
+    var negated = false
+
+    if p.is_kw("not") && (p.kw_at(1, "between") || p.kw_at(1, "in") || p.kw_at(1, "like") || p.kw_at(1, "ilike") || p.kw_at(1, "similar"))
+        p.advance()
+        negated = true
+
+    if p.eat_kw("between")
+        if p.is_kw("symmetric") || p.is_kw("asymmetric") then return sql_fail("Q8005", "BETWEEN SYMMETRIC is not supported", p.at())
+        val low = sql_concat(p)?
+        p.expect_kw("and")?
+        val high = sql_concat(p)?
+        return Ok(SqBetween(left, low, high, negated, at))
+
+    if p.eat_kw("in")
+        p.expect_op("(")?
+        if p.is_kw("select") || p.is_kw("with") || p.is_kw("values")
+            val q = sql_query(p)?
+            p.expect_op(")")?
+            val args = left match
+                SqRow(items, _) -> items
+                _ -> sql_exprs_of(left)
+            return Ok(SqInQuery(args, q, negated, at))
+        val items = buf[SqlExpr]()
+        loop
+            items.push(sql_expr(p)?)
+            if !p.eat_op(",") then break
+        p.expect_op(")")?
+        return Ok(SqInList(left, items, negated, at))
+
+    if p.eat_kw("like")
+        val pattern = sql_concat(p)?
+        var escape: Option[&SqlExpr] = None
+        if p.eat_kw("escape") then escape = Some(sql_concat(p)?)
+        return Ok(SqLike(left, pattern, escape, negated, at))
+
+    if p.is_kw("ilike") || p.is_kw("similar") then return sql_fail("Q8005", "ILIKE and SIMILAR TO are not supported", p.at())
+    Ok(left)
+end sql_predicate
+
+private sql_exprs_of(e: SqlExpr) -> Buf[SqlExpr]
+    val b = buf[SqlExpr]()
+    b.push(e)
+    b
+
+/** `a || b`, left-associative. */
+private sql_concat(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var left = sql_additive(p)?
+
+    loop
+        val at = p.at()
+        if !p.eat_op("||") then break
+        left = SqBinary("||", left, sql_additive(p)?, at)
+
+    Ok(left)
+
+private sql_additive(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var left = sql_multiplicative(p)?
+
+    loop
+        val at = p.at()
+        val op = if p.eat_op("+") then "+" else if p.eat_op("-") then "-" else break
+        left = SqBinary(op, left, sql_multiplicative(p)?, at)
+
+    Ok(left)
+
+private sql_multiplicative(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var left = sql_unary(p)?
+
+    loop
+        val at = p.at()
+        val op = if p.eat_op("*") then "*" else if p.eat_op("/") then "/" else if p.eat_op("%") then "%" else break
+        left = SqBinary(op, left, sql_unary(p)?, at)
+
+    Ok(left)
+
+/** Unary `-` and `+`, which bind tighter than every binary operator and looser than `::`. */
+private sql_unary(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    val at = p.at()
+    if p.eat_op("-") then return Ok(SqNeg(sql_unary(p)?, at))
+    if p.eat_op("+") then return sql_unary(p)
+    sql_postfix(p)
+
+/** A primary followed by any number of `:: type`. */
+private sql_postfix(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    var e = sql_primary(p)?
+
+    loop
+        val at = p.at()
+        if !p.eat_op("::") then break
+        e = SqCast(e, p.type_name()?, at)
+
+    Ok(e)
+
+/** A constant, parameter, column reference, function call, parenthesised expression or subquery,
+ * `CASE`, `CAST`, `EXISTS` or typed constant.
+ */
+private[terndb] sql_primary(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    val at = p.at()
+
+    p.tok() match
+        TkNumber(text) ->
+            p.advance()
+            return Ok(SqNumber(text, at))
+        TkString(s) ->
+            p.advance()
+            return Ok(SqString(s, at))
+        TkParam(n) ->
+            p.advance()
+            return Ok(SqParam(n, at))
+        TkOp(o) ->
+            if o != "(" then return p.unexpected("an expression")
+            p.advance()
+            if p.is_kw("select") || p.is_kw("with") || p.is_kw("values")
+                val q = sql_query(p)?
+                p.expect_op(")")?
+                return Ok(SqSubquery(q, at))
+            val first = sql_expr(p)?
+            if !p.eat_op(",")
+                p.expect_op(")")?
+                return Ok(first)
+            val items = sql_exprs_of(first)
+            loop
+                items.push(sql_expr(p)?)
+                if !p.eat_op(",") then break
+            p.expect_op(")")?
+            return Ok(SqRow(items, at))
+        TkEnd -> return p.unexpected("an expression")
+        TkIdent(_, _) -> ()
+
+    val (word, quoted) = p.tok() match
+        TkIdent(n, q) -> (n, q)
+        _ -> ("", false)
+
+    if !quoted
+        word match
+            "null" ->
+                p.advance()
+                return Ok(SqNull(at))
+            "true" | "false" ->
+                p.advance()
+                return Ok(SqBool(word == "true", at))
+            "case" ->
+                p.advance()
+                return sql_case(p, at)
+            "cast" ->
+                p.advance()
+                p.expect_op("(")?
+                val e = sql_expr(p)?
+                p.expect_kw("as")?
+                val ty = p.type_name()?
+                p.expect_op(")")?
+                return Ok(SqCast(e, ty, at))
+            "exists" ->
+                p.advance()
+                p.expect_op("(")?
+                val q = sql_query(p)?
+                p.expect_op(")")?
+                return Ok(SqExists(q, at))
+            "current_timestamp" ->
+                p.advance()
+                return Ok(SqCall("current_timestamp", buf[SqlExpr](), false, false, None, buf[SqlOrder](), at))
+            "array" | "row" ->
+                if p.op_at(1, "(") then return sql_fail("Q8005", s"${word.to_upper()} constructors are not supported", at)
+            else ()
+
+        if sql_reserved(word) then return sql_fail("Q8001", s"syntax error at $word: expected an expression", at)
+
+        // A typed constant: a type name, then a string.
+        if sql_is_string(p.tok_at(1)) || (word == "double" && sql_is_string(p.tok_at(2))) then return sql_typed(p, at)
+
+    p.advance()
+
+    if p.is_op("(")
+        if quoted then return sql_fail("Q8005", "a function's name is not quoted", at)
+        return sql_call(p, word, at)
+
+    if !p.eat_op(".") then return Ok(SqColumn(None, word, at))
+    if p.eat_op("*") then return Ok(SqStar(Some(word), at))
+    val name = p.name()?
+    if p.is_op(".") then return sql_fail("Q8005", "a column reference has at most two parts, table and column", p.at())
+    if p.is_op("(") then return sql_fail("Q8005", "schema-qualified functions are not supported", p.at())
+    Ok(SqColumn(Some(word), name, at))
+end sql_primary
+
+private sql_is_string(t: SqlTok) -> bool = t match
+    TkString(_) -> true
+    _ -> false
+
+/** `type 'text'`: a constant of a type, read from its text form (`sql.md` §2.5). */
+private sql_typed(p: *SqlParser, at: u64) -> Result[SqlExpr, SqlError]
+    val ty = p.type_name()?
+    p.tok() match
+        TkString(s) ->
+            p.advance()
+            Ok(SqTyped(ty, s, at))
+        _ -> p.unexpected("a string constant")
+
+/** `CASE [operand] WHEN … THEN … [ELSE …] END`. */
+private sql_case(p: *SqlParser, at: u64) -> Result[SqlExpr, SqlError]
+    var operand: Option[&SqlExpr] = None
+    if !p.is_kw("when") then operand = Some(sql_expr(p)?)
+    val arms = buf[SqlWhen]()
+
+    while p.eat_kw("when")
+        val cond = sql_expr(p)?
+        p.expect_kw("then")?
+        arms.push(SqlWhen(cond, sql_expr(p)?))
+
+    if arms.len() == 0 then return p.unexpected("WHEN")
+    var otherwise: Option[&SqlExpr] = None
+    if p.eat_kw("else") then otherwise = Some(sql_expr(p)?)
+    p.expect_kw("end")?
+    Ok(SqCase(operand, arms, otherwise, at))
+
+/** `name(…)` after its name: `count(*)`, `f([DISTINCT] args [ORDER BY …])`, then `FILTER (WHERE …)`. */
+private sql_call(p: *SqlParser, name: string, at: u64) -> Result[SqlExpr, SqlError]
+    p.expect_op("(")?
+    val args = buf[SqlExpr]()
+    var distinct = false
+    var star = false
+    var order = buf[SqlOrder]()
+
+    if p.eat_op("*")
+        star = true
+    else if !p.is_op(")")
+        distinct = p.eat_kw("distinct")
+        if !distinct then p.skip_kw("all")
+        loop
+            args.push(sql_expr(p)?)
+            if !p.eat_op(",") then break
+        if p.eat_kw("order")
+            p.expect_kw("by")?
+            order = sql_order_list(p)?
+
+    p.expect_op(")")?
+
+    if p.is_kw("within") then return sql_fail("Q8005", "WITHIN GROUP is not supported", p.at())
+    var filter: Option[&SqlExpr] = None
+    if p.is_kw("filter") && p.op_at(1, "(")
+        p.advance()
+        p.advance()
+        p.expect_kw("where")?
+        filter = Some(sql_expr(p)?)
+        p.expect_op(")")?
+    if p.is_kw("over") then return sql_fail("Q8005", "window functions are not supported", p.at())
+
+    Ok(SqCall(name, args, distinct, star, filter, order, at))
+end sql_call

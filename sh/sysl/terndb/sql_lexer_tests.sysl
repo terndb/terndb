@@ -1,0 +1,223 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `sql.md` §2: the tokens of SQL text, each with its byte range, and every lexical error with its
+// code and position.
+
+/** The tokens of `text` without the closing `TkEnd`, each written as one word: `id:name`,
+ * `qid:name`, `str:value`, `num:text`, `$n`, or the operator itself.
+ */
+private sl_words(text: string) -> string
+    val toks = sql_tokens(text).unwrap()
+    var out = ""
+
+    for t in toks
+        val w = t.tok match
+            TkIdent(n, q) -> if q then s"qid:$n" else s"id:$n"
+            TkString(s) -> s"str:$s"
+            TkNumber(n) -> s"num:$n"
+            TkParam(n) -> s"$$$n"
+            TkOp(o) -> o
+            TkEnd -> ""
+        if w.len == 0 then continue
+        out = if out.len == 0 then w else s"$out $w"
+
+    out
+
+/** The error of `text` as `code@line:column`. */
+private sl_error(text: string) -> string = sql_tokens(text) match
+    Ok(_) -> "ok"
+    Err(e) ->
+        val l = sql_located(text, e)
+        s"${l.code}@${l.line}:${l.column}"
+
+/** The value of the one string constant `text` is. */
+private sl_string(text: string) -> string = sql_tokens(text).unwrap()[0].tok match
+    TkString(s) -> s
+    _ -> "<not a string>"
+
+@test
+identifiers_fold_to_lower_case_unless_quoted()
+    assert_eq(sl_words("SELECT Foo, fOO, \"Foo\", \"fOO\""), "id:select id:foo , id:foo , qid:Foo , qid:fOO")
+    assert_eq(sl_words("_a1 a$b x_"), "id:_a1 id:a$b id:x_")
+    // Only ASCII letters fold; other letters are kept as written.
+    assert_eq(sl_words("ÉTÉ Été"), "id:ÉtÉ id:Été")
+
+@test
+a_quoted_identifier_may_be_a_keyword_and_hold_any_character()
+    assert_eq(sl_words("\"select\" \"from\""), "qid:select qid:from")
+    assert_eq(sl_words("\"a b\" \"a\"\"b\" \"1x\""), "qid:a b qid:a\"b qid:1x")
+    assert_eq(sl_words("\"semi;colon\" \"--not a comment\""), "qid:semi;colon qid:--not a comment")
+
+@test
+an_empty_or_unterminated_quoted_identifier_is_refused()
+    assert_eq(sl_error("select \"\""), "Q8003@1:8")
+    assert_eq(sl_error("select \"abc"), "Q8002@1:8")
+    assert_eq(sl_error("select \"ab\"\""), "Q8002@1:8")
+
+@test
+strings_double_their_quotes()
+    assert_eq(sl_string("'it''s'"), "it's")
+    assert_eq(sl_string("''''"), "'")
+    assert_eq(sl_string("''"), "")
+    assert_eq(sl_string("'a\\nb'"), "a\\nb")
+    assert_eq(sl_string("'-- no comment /* here */'"), "-- no comment /* here */")
+    assert_eq(sl_string("'\"'"), "\"")
+
+@test
+strings_separated_by_a_newline_are_one_constant()
+    assert_eq(sl_string("'foo'\n'bar'"), "foobar")
+    assert_eq(sl_string("'a'  \n\t 'b'\n'c'"), "abc")
+    // Without a newline between them, they are two constants.
+    assert_eq(sl_words("'foo' 'bar'"), "str:foo str:bar")
+    // A comment is not whitespace for this purpose.
+    assert_eq(sl_words("'a' -- c\n'b'"), "str:a str:b")
+
+@test
+an_unterminated_string_is_refused_where_it_opens()
+    assert_eq(sl_error("select 'abc"), "Q8002@1:8")
+    assert_eq(sl_error("select\n  'it''s"), "Q8002@2:3")
+    assert_eq(sl_error("select 'a'\n'b"), "Q8002@2:1")
+    assert_eq(sl_error("'"), "Q8002@1:1")
+
+@test
+e_strings_decode_backslash_escapes()
+    assert_eq(sl_string("E'a\\nb'"), "a\nb")
+    assert_eq(sl_string("e'\\t\\r'"), "\t\r")
+    assert_eq(sl_string("E'\\\\'"), "\\")
+    assert_eq(sl_string("E'\\''"), "'")
+    assert_eq(sl_string("E'it''s'"), "it's")
+    assert_eq(sl_string("E'\\\"'"), "\"")
+    assert_eq(sl_string("E'\\u00e9t\\u00E9'"), "été")
+    assert_eq(sl_string("E'\\U0001F600'"), "😀")
+    assert_eq(sl_string("E'\\b\\f'"), string(char(8)) + string(char(12)))
+
+@test
+an_e_string_s_bad_escapes_are_refused()
+    assert_eq(sl_error("E'\\q'"), "Q8003@1:3")
+    assert_eq(sl_error("E'\\u12'"), "Q8003@1:3")
+    assert_eq(sl_error("E'\\u12g4'"), "Q8003@1:3")
+    assert_eq(sl_error("E'\\ud800'"), "Q8003@1:3")
+    assert_eq(sl_error("E'\\U00110000'"), "Q8003@1:3")
+    assert_eq(sl_error("E'\\UFFFFFFFF'"), "Q8003@1:3")
+    assert_eq(sl_error("E'abc"), "Q8002@1:1")
+    assert_eq(sl_error("E'abc\\'"), "Q8002@1:1")
+    assert_eq(sl_error("E'\\"), "Q8002@1:3")
+
+@test
+an_e_inside_an_identifier_is_not_an_e_string()
+    assert_eq(sl_words("namE'x'"), "id:name str:x")
+    assert_eq(sl_words("E 'x'"), "id:e str:x")
+    // Without the E, a backslash is an ordinary character.
+    assert_eq(sl_string("'\\'"), "\\")
+
+@test
+numbers_keep_their_text()
+    assert_eq(sl_words("1 1. .5 1.5 1e10 1E+3 2.5e-3 .5e2 007"), "num:1 num:1. num:.5 num:1.5 num:1e10 num:1E+3 num:2.5e-3 num:.5e2 num:007")
+    // A sign is an operator, not part of the number.
+    assert_eq(sl_words("-1 +2"), "- num:1 + num:2")
+    assert_eq(sl_words("1-2"), "num:1 - num:2")
+
+@test
+a_malformed_number_is_refused()
+    assert_eq(sl_error("1e"), "Q8003@1:1")
+    assert_eq(sl_error("1e+"), "Q8003@1:1")
+    assert_eq(sl_error("select 12abc"), "Q8003@1:10")
+    assert_eq(sl_error("1.2.3"), "Q8003@1:4")
+    assert_eq(sl_error("1_000"), "Q8003@1:2")
+
+@test
+a_dot_alone_is_an_operator()
+    assert_eq(sl_words("t.a t.*"), "id:t . id:a id:t . *")
+
+@test
+parameters_are_numbered_from_one()
+    assert_eq(sl_words("$1 $23"), "$1 $23")
+    assert_eq(sl_error("$0"), "Q8003@1:1")
+    assert_eq(sl_error("select $"), "Q8003@1:8")
+    assert_eq(sl_error("$$body$$"), "Q8003@1:1")
+    assert_eq(sl_error("$1a"), "Q8003@1:3")
+    assert_eq(sl_error("$99999999999"), "Q8003@1:1")
+
+@test
+operators_take_their_longest_spelling()
+    assert_eq(sl_words("a<=b>=c<>d!=e||f::g"), "id:a <= id:b >= id:c <> id:d <> id:e || id:f :: id:g")
+    assert_eq(sl_words("( ) , ; . + - * / % = < >"), "( ) , ; . + - * / % = < >")
+    assert_eq(sl_words("a<b>c"), "id:a < id:b > id:c")
+
+@test
+a_character_that_starts_no_token_is_refused()
+    assert_eq(sl_error("select a ^ b"), "Q8003@1:10")
+    assert_eq(sl_error("select a & b"), "Q8003@1:10")
+    assert_eq(sl_error("select a[1]"), "Q8003@1:9")
+    assert_eq(sl_error("select !a"), "Q8003@1:8")
+    assert_eq(sl_error("select a | b"), "Q8003@1:10")
+    assert_eq(sl_error("select a : b"), "Q8003@1:10")
+    assert_eq(sl_error("select ?"), "Q8003@1:8")
+
+@test
+comments_are_whitespace()
+    assert_eq(sl_words("a -- comment\nb"), "id:a id:b")
+    assert_eq(sl_words("a --"), "id:a")
+    assert_eq(sl_words("a/* c */b"), "id:a id:b")
+    assert_eq(sl_words("a /* x /* nested */ still comment */ b"), "id:a id:b")
+    assert_eq(sl_words("a /**/ b /*/ */ c"), "id:a id:b id:c")
+    assert_eq(sl_words("a - - b"), "id:a - - id:b")
+    assert_eq(sl_words("a / * b"), "id:a / * id:b")
+
+@test
+an_unterminated_block_comment_is_refused_where_it_opens()
+    assert_eq(sl_error("a /* b"), "Q8002@1:3")
+    assert_eq(sl_error("a /* /* b */"), "Q8002@1:3")
+    assert_eq(sl_error("x\n  /* /* */ */ /*"), "Q8002@2:15")
+
+@test
+whitespace_includes_tabs_carriage_returns_and_form_feeds()
+    assert_eq(sl_words("a\tb\r\nc" + string(char(12)) + "d"), "id:a id:b id:c id:d")
+
+@test
+tokens_carry_their_byte_ranges()
+    val toks = sql_tokens("select  'it''s', \"x\"").unwrap()
+    assert_eq(toks.len(), 5)
+    assert_eq(toks[0].start, 0)
+    assert_eq(toks[0].end, 6)
+    assert_eq(toks[1].start, 8)
+    assert_eq(toks[1].end, 15)
+    assert_eq(toks[3].start, 17)
+    assert_eq(toks[3].end, 20)
+    assert(toks[4].tok == TkEnd)
+    assert_eq(toks[4].start, 20)
+
+@test
+an_error_s_column_counts_characters_not_bytes()
+    assert_eq(sl_error("'é' ^"), "Q8003@1:5")
+    assert_eq(sl_error("été\n é ^"), "Q8003@2:4")
+
+@test
+complete_input_ends_with_a_semicolon_outside_strings_and_comments()
+    assert(sql_complete("select 1;"))
+    assert(sql_complete("select 1;  \n"))
+    assert(sql_complete("select 1; -- trailing comment"))
+    assert(sql_complete("select 1; /* trailing */"))
+    assert(sql_complete("select ';';"))
+    assert(sql_complete("select 1; select 2;"))
+    assert(sql_complete(";"))
+    assert(!sql_complete(""))
+    assert(!sql_complete("   "))
+    assert(!sql_complete("select 1"))
+    assert(!sql_complete("select 1; select 2"))
+    assert(!sql_complete("select ';'"))
+    assert(!sql_complete("select 'a;"))
+    assert(!sql_complete("select \"a;"))
+    assert(!sql_complete("select 1 -- ;"))
+    assert(!sql_complete("select 1 /* ; */"))
+    assert(!sql_complete("select 1; /* open"))
+    assert(!sql_complete("select E'\\';"))
+    assert(sql_complete("select E'\\'';"))
+    assert(sql_complete("select 'it''s';"))
+    assert(!sql_complete("select 'a'\n'b;"))
+    // A lexical error other than an unterminated construct leaves the decision to the semicolon.
+    assert(sql_complete("select ^;"))
+    assert(sql_complete("select \"\";"))
