@@ -172,7 +172,9 @@ Every constraint has a name unique in the table's namespace, and is one of:
    holding it only through a commit after the snapshot is `serialization_failure` at snapshot and serializable and
    `unique_violation` at read committed. The check runs once every write of a statement to the table has been
    applied (and again after each cascade's writes to it), so a statement may exchange or shift values among its
-   rows, and a value a statement or an earlier statement of the transaction freed is free.
+   rows, and a value a statement or an earlier statement of the transaction freed is free. A value with a NULL
+   component is never checked (§2.5 rule 2), whichever of its components are NULL; its index entry takes the
+   non-unique form ([DISK] §4.9 rule 1).
 
 ### 2.7 Defaults, generated columns, identity and sequences
 
@@ -386,7 +388,9 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
    outputs it (§2.9 rule 2). A conversion that is lossless (§5.3 rule 3), has no `using` and leaves the encoding of
    every key the column is in unchanged gives the column its new type at once; any other makes it `converting`
    (§8.5 rule 2), keeping its type and recording the target and the conversion. Either adds a schema version, the
-   column's type or state being part of it (§5.1 rule 1).
+   column's type or state being part of it (§5.1 rule 1). A `retype_column` of a column that is still `converting`
+   from an earlier statement is `Q6023` (§8.5 rule 4), checked before the conversion is looked at, so it is never
+   `Q6008`; the statement has no effect when refused.
 10. **The smallest-row limit** (§2.2 rule 4) is `min = 20 + key + ⌈n / 8⌉ + fixed + 2v` octets, where 20 is the
     row header ([DISK] §4.1), `key` is the sum of the key widths of the primary-key columns (rule 2), n counts the
     columns that are not in the primary key (fixed-width and variable-width, as the current schema version has
@@ -1036,6 +1040,14 @@ its old type and at its new one (`Q6022`, nothing recorded), whether the retype 
      version a snapshot after step 2 can see. Rows are not rewritten; `rewrite` does that when wanted.
 3. Any other retype of a primary-key column is a table rebuild (§8.11). A conversion that [QT] §7.6 does not permit and no
    `using` provides is `Q6008`.
+4. **A column that is still `converting` is not retyped again.** A `retype_column` naming a column in state
+   `converting` is refused with `Q6023` ("the column is being retyped; wait for the conversion to finish"), whatever
+   the new type or `using`, and the statement has no effect: the catalog is unchanged and the other actions of the
+   same `AlterTable` are not applied. This is checked before the conversion of rule 2 and the limits of §2.13 rule
+   10, so it takes precedence over `Q6008` and `Q6022`. The column can be retyped again once the job's final
+   transaction has made it `ready`, including after a failed job, which returns it to `ready` in its old type. A
+   metadata-only retype (rule 1) completes within its statement, so a later retype of the column is never refused
+   for it, and a retype of another column of the same table is unaffected by one that converts.
 
 ### 8.6 Set or drop a default; drop or set not null
 

@@ -42,6 +42,11 @@ const UndoOldDeleted: u8 = 1
 /** Record `flags` bit 1: an old value is out of line. */
 const UndoOldExternal: u8 = 2
 
+/** Record `flags` bit 2: the old version had `LOCK_ONLY` set, so its writer is not its `txn` but is
+ * found through the record at its `undo` (§5.2, §5.4).
+ */
+const UndoOldLockOnly: u8 = 4
+
 /** One non-key column of a row: null, or the bytes the row stores for it (§4.4), which for a column
  * stored out of line are its 32-byte stub. This is the grain at which an UPDATE record keeps old
  * values (§5.2), so the undo log needs no column types.
@@ -188,8 +193,11 @@ decode_undo_record(bytes: []const u8) -> Result[UndoRecord, CodecError]
     if kind == UndoInsert
         if prev_version != 0 || prev_txn != 0 then return corrupt("an INSERT undo record with a previous version")
         if flags & UndoOldDeleted != 0 then return corrupt("an INSERT undo record whose old version is a ghost")
+        if flags & UndoOldLockOnly != 0 then return corrupt("an INSERT undo record whose old version is lock-only")
     elif kind != UndoSecondary
         if prev_txn == 0 then return corrupt("an undo record with an old version and no old transaction")
+        if flags & UndoOldDeleted != 0 && flags & UndoOldLockOnly != 0 then return corrupt("an undo record whose old version is both a ghost and lock-only")
+        if kind == UndoLock && flags & UndoOldDeleted != 0 then return corrupt("a LOCK undo record over a ghost")
 
     if kind == UndoUpdate
         if at + 2 > len then return corrupt("an UPDATE undo record with no column count")
@@ -369,8 +377,25 @@ struct PurgeStats derives Eq
     ghosts: u64
     pages: u64
 
-/** Rows whose earlier versions live in the undo log: the clustered leaf (rows sorted by table, then
- * key), the transactions by id (id `i` at index `i − 1`, so 0 stays "none"), the visible horizon `h`
+/** One table's clustered B+tree (§3, §4): its oid and the tree, whose entries are the table's rows
+ * keyed by encoded primary key, each value a §4.1 header and §4.2 body.
+ */
+struct LeafTree
+    oid: u64
+    tree: BTree
+
+/** How the rows of table `oid` in schema version `schema` lay out their non-key columns (§4.2): the
+ * fixed width of each column in ordinal order, 0 for a variable-width one. The body of a row needs
+ * exactly this beyond its column images, so the undo log itself still needs no types.
+ */
+struct RowLayout
+    oid: u64
+    schema: u16
+    widths: Buf[usize]
+
+/** Rows whose earlier versions live in the undo log: the clustered leaf, one B+tree per table over
+ * the data space `data` (trees sorted by oid), the column layout of each table and schema version,
+ * the transactions by id (id `i` at index `i − 1`, so 0 stays "none"), the visible horizon `h`
  * (`isolation.md` §4.1) as `last_commit`, the live snapshots, and the horizon of the last purge,
  * which never decreases (§5.6).
  *
@@ -380,11 +405,17 @@ struct PurgeStats derives Eq
  */
 struct UndoRows
     space: &UndoSpace
-    rows: Buf[LeafRow]
+    data: &PageSpace
+    trees: Buf[LeafTree]
+    layouts: Buf[RowLayout]
     txns: Buf[UndoTxn]
     last_commit: u64
     snapshots: Buf[u64]
     purge_horizon: u64
+    /** The records at or above `undo_low` that `rollback_to` rolled back: off their transaction's
+     * rollback chain and named by no row.
+     */
+    undone: Buf[u64]
 
     /** Starts a transaction and answers its id. */
     begin(*self) -> u64
@@ -424,17 +455,154 @@ struct UndoRows
 
         h
 
-    /** Where the row of `oid` and `key` is in the leaf, or where it would go. */
-    find(self, oid: u64, key: []const u8) -> (usize, bool)
-        var lo: usize = 0
-        var hi = self.rows.len()
+    // -- the leaf ------------------------------------------------------------------------------
 
-        while lo < hi
-            val mid = lo + (hi - lo) / 2
-            val r = self.rows[mid]
-            if r.oid < oid || (r.oid == oid && r.key.view() < key) then lo = mid + 1 else hi = mid
+    /** Declares how rows of table `oid` in schema version `schema` lay out their columns: `widths`
+     * as `RowLayout` says. A row written in a version never declared fixes its layout at its first
+     * write, every column variable-width, which is how bytes the caller gives no type are stored.
+     */
+    layout(*self, oid: u64, schema: u16, widths: []const usize)
+        val w = buf[usize]()
+        w.extend(widths)
 
-        (lo, lo < self.rows.len() && self.rows[lo].oid == oid && self.rows[lo].key.view() == key)
+        for i in 0..<self.layouts.len()
+            if self.layouts[i].oid == oid && self.layouts[i].schema == schema
+                self.layouts[i] = RowLayout(oid, schema, w)
+                return
+
+        self.layouts.push(RowLayout(oid, schema, w))
+
+    private widths_of(self, oid: u64, schema: u16) -> Option[Buf[usize]]
+        for l in self.layouts
+            if l.oid == oid && l.schema == schema then return Some(l.widths)
+
+        None
+
+    /** The tree of table `oid`, if any row of it was ever written. */
+    tree_of(self, oid: u64) -> Option[BTree]
+        for t in self.trees
+            if t.oid == oid then return Some(t.tree)
+
+        None
+
+    private tree_for(*self, oid: u64) -> BTree
+        var at: usize = 0
+
+        while at < self.trees.len() && self.trees[at].oid < oid
+            at += 1
+
+        if at < self.trees.len() && self.trees[at].oid == oid then return self.trees[at].tree
+        val t = btree(self.data, oid)
+        self.trees.insert(at, LeafTree(oid, t))
+        t
+
+    /** Every table's tree, in oid order. */
+    all_trees(self) -> Buf[BTree]
+        val out = buf[BTree]()
+
+        for t in self.trees
+            out.push(t.tree)
+
+        out
+
+    /** The current image of the row of `oid` and `key` in the leaf, ghost or not. */
+    current(self, oid: u64, key: []const u8) -> Result[Option[RowImage], CodecError]
+        val t = self.tree_of(oid) match
+            Some(t) -> t
+            None -> return Ok(None)
+
+        t.get(key) match
+            None -> Ok(None)
+            Some(bytes) -> Ok(Some(self.decode_leaf(oid, bytes.view())?))
+
+    /** The image `bytes` of a row of table `oid`, read through its schema version's layout. */
+    decode_leaf(self, oid: u64, bytes: []const u8) -> Result[RowImage, CodecError]
+        val hd = decode_row_header(bytes)?
+
+        val widths = self.widths_of(oid, hd.schema_version) match
+            Some(w) -> w
+            None -> return corrupt("a row encoded in a schema version with no layout")
+
+        decode_leaf_row(bytes, widths.view())
+
+    /** Writes `img` as the row of `oid` and `key`, replacing any row there. */
+    private store_row(*self, oid: u64, key: []const u8, img: RowImage) -> Result[unit, CodecError]
+        val widths = self.widths_of(oid, img.header.schema_version) match
+            Some(w) -> w
+            None ->
+                val w = buf[usize]()
+
+                for _ in 0..<img.cols.len()
+                    w.push(0)
+
+                self.layout(oid, img.header.schema_version, w.view())
+                w
+
+        val bytes = encode_leaf_row(img, widths.view())?
+        val t = self.tree_for(oid)
+        if !t.update(key, bytes.view())? then val _ = t.insert(key, bytes.view())?
+        Ok(())
+
+    private drop_row(*self, oid: u64, key: []const u8)
+        self.tree_of(oid) match
+            Some(t) ->
+                val _ = t.delete(key)
+            None -> ()
+
+    /** Puts `img` in the leaf as the row of `oid` and `key`, replacing any row there, with no undo
+     * record: what a test uses to damage the leaf.
+     */
+    put_row(*self, oid: u64, key: []const u8, img: RowImage)
+        val _ = self.store_row(oid, key, img)
+
+    /** Every row of the leaf, by table and then key. */
+    leaf_rows(self) -> Result[Buf[LeafRow], CodecError]
+        val out = buf[LeafRow]()
+
+        for t in self.trees
+            for e in t.tree.scan(KeyAny, KeyAny, true)
+                out.push(LeafRow(t.oid, e.key, self.decode_leaf(t.oid, e.value.view())?))
+
+        Ok(out)
+
+    /** The rows of table `oid` with keys between `lo` and `hi`, ascending, ghosts included. */
+    table_rows(self, oid: u64, lo: KeyBound, hi: KeyBound) -> Result[Buf[LeafRow], CodecError]
+        val out = buf[LeafRow]()
+
+        self.tree_of(oid) match
+            Some(t) ->
+                for e in t.scan(lo, hi, true)
+                    out.push(LeafRow(oid, e.key, self.decode_leaf(oid, e.value.view())?))
+            None -> ()
+
+        Ok(out)
+
+    /** How many rows the leaf holds, ghosts included. */
+    row_count(self) -> usize
+        var n: usize = 0
+
+        for t in self.trees
+            n += t.tree.scan(KeyAny, KeyAny, true).len()
+
+        n
+
+    /** Forgets table `oid`: its tree's pages are freed and its layouts dropped. Its undo records
+     * stay until purge passes them, and name no row any more.
+     */
+    drop_table(*self, oid: u64)
+        for i in 0..<self.trees.len()
+            if self.trees[i].oid == oid
+                val t = self.trees[i].tree
+                free_tree_pages(self.data, t.root_frame())
+                self.trees.remove(i)
+                break
+
+        val kept = buf[RowLayout]()
+
+        for l in self.layouts
+            if l.oid != oid then kept.push(l)
+
+        self.layouts = kept
 
     /** Whether a reader with snapshot `s`, running in transaction `own` (0 for none), sees the
      * writes of transaction `txn`: its own, or a commit at or before `s` (§4.1).
@@ -466,18 +634,21 @@ struct UndoRows
      */
     insert(*self, txn: u64, oid: u64, key: []const u8, schema: u16, cols: []const ColumnImage) -> Result[UndoWrite, CodecError]
         if !self.is_active(txn) then return Ok(UndoNotActive)
-        val (at, found) = self.find(oid, key)
+        val fresh = RowImage(RowHeader(txn, 0, 0, schema), copy_columns(cols))
 
-        if !found
-            val rec = UndoRecord(0, UndoInsert, 0, 0, txn, 0, self.last_of(txn), 0, oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
-            val addr = self.log(txn, rec)?
-            self.rows.insert(at, LeafRow(oid, undo_bytes(key), RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols))))
-            return Ok(UndoDone(addr))
+        val row = self.current(oid, key)? match
+            Some(r) -> r
+            None ->
+                self.admit(oid, key, fresh)?
+                val rec = UndoRecord(0, UndoInsert, 0, 0, txn, 0, self.last_of(txn), 0, oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
+                val addr = self.log(txn, rec)?
+                self.store_row(oid, key, RowImage(RowHeader(txn, addr, 0, schema), fresh.cols))?
+                return Ok(UndoDone(addr))
 
-        val row = self.rows[at].row
         val h = self.holder(row, txn)
         if h != 0 then return Ok(UndoLocked(h))
         if row.header.flags & RowDeleted == 0 then return Ok(UndoExists)
+        self.admit(oid, key, fresh)?
         val old = buf[UndoColumn]()
 
         for i in 0..<row.cols.len()
@@ -486,8 +657,29 @@ struct UndoRows
         val rec = UndoRecord(0, UndoUpdate, UndoOldDeleted, row.header.schema_version, txn, row.header.undo, self.last_of(txn),
             row.header.txn, oid, undo_bytes(key), old, 0, buf[u8]())
         val addr = self.log(txn, rec)?
-        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols)))
+        self.store_row(oid, key, RowImage(RowHeader(txn, addr, 0, schema), fresh.cols))?
         Ok(UndoDone(addr))
+
+    /** Refuses, before anything is written, a row `img` of `oid` and `key` that the leaf could not
+     * hold: a column count or fixed width its schema version's layout does not have (`type_mismatch`),
+     * a key over 1,024 bytes (`key_too_long`), or a key and row over 4,000 bytes together
+     * (`entry_too_large`, §3.6, §4.7: no column is moved out of line).
+     */
+    admit(self, oid: u64, key: []const u8, img: RowImage) -> Result[unit, CodecError]
+        if key.len > MaxKeyLen then return fail("D2001", "an encoded key longer than 1,024 bytes")
+
+        val bytes = self.widths_of(oid, img.header.schema_version) match
+            Some(w) -> encode_leaf_row(img, w.view())?
+            None ->
+                val w = buf[usize]()
+
+                for _ in 0..<img.cols.len()
+                    w.push(0)
+
+                encode_leaf_row(img, w.view())?
+
+        if key.len + bytes.len() > MaxLeafEntry then return fail("D2002", "a row and its key longer than 4,000 bytes, which would need an overflow chain")
+        Ok(())
 
     /** Replaces the live row of `oid` and `key` with columns `cols` in schema version `schema`. The
      * UPDATE record lists the columns whose value changes; when the schema version changes it lists
@@ -496,23 +688,27 @@ struct UndoRows
      */
     update(*self, txn: u64, oid: u64, key: []const u8, schema: u16, cols: []const ColumnImage) -> Result[UndoWrite, CodecError]
         if !self.is_active(txn) then return Ok(UndoNotActive)
-        val (at, found) = self.find(oid, key)
-        if !found then return Ok(UndoMissing)
-        val row = self.rows[at].row
+
+        val row = self.current(oid, key)? match
+            Some(r) -> r
+            None -> return Ok(UndoMissing)
+
         val h = self.holder(row, txn)
         if h != 0 then return Ok(UndoLocked(h))
         if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
         val whole = schema != row.header.schema_version
         if !whole && cols.len != row.cols.len() then return fail("Q3001", "an update within one schema version that changes the column count")
+        val fresh = RowImage(RowHeader(txn, 0, 0, schema), copy_columns(cols))
+        self.admit(oid, key, fresh)?
         val old = buf[UndoColumn]()
 
         for i in 0..<row.cols.len()
             if whole || row.cols[i] != cols[i] then old.push(UndoColumn(i, copy_column(row.cols[i])))
 
-        val rec = UndoRecord(0, UndoUpdate, 0, row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+        val rec = UndoRecord(0, UndoUpdate, old_lock_flag(row), row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
             oid, undo_bytes(key), old, 0, buf[u8]())
         val addr = self.log(txn, rec)?
-        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(RowHeader(txn, addr, 0, schema), copy_columns(cols)))
+        self.store_row(oid, key, RowImage(RowHeader(txn, addr, 0, schema), fresh.cols))?
         Ok(UndoDone(addr))
 
     /** Deletes the live row of `oid` and `key`: it becomes a ghost, its columns left as they were,
@@ -520,18 +716,61 @@ struct UndoRows
      */
     delete(*self, txn: u64, oid: u64, key: []const u8) -> Result[UndoWrite, CodecError]
         if !self.is_active(txn) then return Ok(UndoNotActive)
-        val (at, found) = self.find(oid, key)
-        if !found then return Ok(UndoMissing)
-        val row = self.rows[at].row
+
+        val row = self.current(oid, key)? match
+            Some(r) -> r
+            None -> return Ok(UndoMissing)
+
         val h = self.holder(row, txn)
         if h != 0 then return Ok(UndoLocked(h))
         if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
-        val rec = UndoRecord(0, UndoDelete, 0, row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+        val rec = UndoRecord(0, UndoDelete, old_lock_flag(row), row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
             oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
         val addr = self.log(txn, rec)?
-        val hd = RowHeader(txn, addr, row.header.flags | RowDeleted, row.header.schema_version)
-        self.rows[at] = LeafRow(oid, self.rows[at].key, RowImage(hd, row.cols))
+        val hd = RowHeader(txn, addr, (row.header.flags & ~RowLockOnly) | RowDeleted, row.header.schema_version)
+        self.store_row(oid, key, RowImage(hd, row.cols))?
         Ok(UndoDone(addr))
+
+    /** Takes the write lock of the live row of `oid` and `key` for `txn` without changing it
+     * (`LOCK_ONLY`, §4.1): a LOCK record, whose flag bit 2 says whether the version it locks was
+     * itself lock-only (a lock taken over a committed lock), and the row then carries `txn`, the
+     * record's address and `LOCK_ONLY`. A row `txn` already wrote or locked needs nothing more and
+     * answers the address it carries. The lock is released by `txn`'s commit or rollback, as any
+     * write lock is; a reader rebuilds through the record as if it were not there (§5.4).
+     */
+    lock(*self, txn: u64, oid: u64, key: []const u8) -> Result[UndoWrite, CodecError]
+        if !self.is_active(txn) then return Ok(UndoNotActive)
+
+        val row = self.current(oid, key)? match
+            Some(r) -> r
+            None -> return Ok(UndoMissing)
+
+        val h = self.holder(row, txn)
+        if h != 0 then return Ok(UndoLocked(h))
+        if row.header.flags & RowDeleted != 0 then return Ok(UndoMissing)
+        if row.header.txn == txn then return Ok(UndoDone(row.header.undo))
+        val rec = UndoRecord(0, UndoLock, old_lock_flag(row), row.header.schema_version, txn, row.header.undo, self.last_of(txn), row.header.txn,
+            oid, undo_bytes(key), buf[UndoColumn](), 0, buf[u8]())
+        val addr = self.log(txn, rec)?
+        val hd = RowHeader(txn, addr, row.header.flags | RowLockOnly, row.header.schema_version)
+        self.store_row(oid, key, RowImage(hd, row.cols))?
+        Ok(UndoDone(addr))
+
+    /** The transaction that wrote the version `img` is: its `txn`, or, where `img` is `LOCK_ONLY`,
+     * the `prev_txn` of the LOCK record at its `undo`, past every LOCK record whose flag bit 2 says
+     * the version under it was lock-only too (§5.4 step 1). 0 when that record lies below
+     * `undo_low`: the version is then seen by every snapshot (§5.5 rule 2).
+     */
+    writer_of(self, img: RowImage) -> Result[u64, CodecError]
+        if img.header.flags & RowLockOnly == 0 then return Ok(img.header.txn)
+        var a = img.header.undo
+
+        loop
+            if a < self.space.low then return Ok(0)
+            val rec = self.space.read(a)?
+            if rec.kind != UndoLock then return corrupt("a LOCK_ONLY row whose undo names a record that is not a LOCK")
+            if rec.flags & UndoOldLockOnly == 0 then return Ok(rec.prev_txn)
+            a = rec.prev_version
 
     /** Commits `txn`: it takes commit sequence number `h + 1`, which is published at once (§4.1).
      * None when `txn` is not active.
@@ -550,39 +789,76 @@ struct UndoRows
      */
     abort(*self, txn: u64) -> Result[bool, CodecError]
         if !self.is_active(txn) then return Ok(false)
+        self.roll_back(txn, 0, false)?
+        self.txns[usize(txn - 1)] = UndoTxn(UndoTxnAborted, 0, self.last_of(txn))
+        Ok(true)
+
+    /** The head of `txn`'s rollback chain: where a savepoint or a statement taken now would roll
+     * back to.
+     */
+    last_record(self, txn: u64) -> u64 = self.last_of(txn)
+
+    /** Ends `txn`, which wrote no version, as committed at `c`, an existing commit point (its
+     * snapshot), without publishing a new one: `isolation.md` §5.5's transaction with an empty write
+     * set. Its LOCK records, which no reader needs, are then finished for purge once `c` is below the
+     * horizon. False when `txn` is not active.
+     */
+    commit_at(*self, txn: u64, c: u64) -> bool
+        if !self.is_active(txn) then return false
+        self.txns[usize(txn - 1)] = UndoTxn(UndoTxnCommitted, c, self.last_of(txn))
+        true
+
+    /** Rolls back the records `txn` wrote after `stop`, an address its rollback chain held as its
+     * head earlier (`last_record`), newest first, as `abort` would; `txn` stays active, with `stop`
+     * the head of its chain again. The records rolled back stay in the log, named by no row, until
+     * purge passes them. False when `txn` is not active.
+     */
+    rollback_to(*self, txn: u64, stop: u64) -> Result[bool, CodecError]
+        if !self.is_active(txn) then return Ok(false)
+        self.roll_back(txn, stop, true)?
+        val t = self.txns[usize(txn - 1)]
+        self.txns[usize(txn - 1)] = UndoTxn(t.state, t.commit, stop)
+        Ok(true)
+
+    // Applies backward each record of `txn`'s rollback chain above `stop`; `partial` when `txn`
+    // stays active, so that the records rolled back are remembered as off its chain.
+    private roll_back(*self, txn: u64, stop: u64, partial: bool) -> Result[unit, CodecError]
         var a = self.last_of(txn)
 
-        while a != 0
+        while a != stop
+            if a < stop then return corrupt("a rollback stop that is not on the transaction's rollback chain")
             val rec = self.space.read(a)?
             if rec.txn != txn then return corrupt("a rollback chain names another transaction's undo record")
-            val (at, found) = self.find(rec.oid, rec.key.view())
-            if !found then return corrupt("an undo record on a rollback chain names no row")
-            val row = self.rows[at].row
+
+            val row = self.current(rec.oid, rec.key.view())? match
+                Some(r) -> r
+                None -> return corrupt("an undo record on a rollback chain names no row")
+
             if row.header.txn != txn || row.header.undo != a then return corrupt("rollback finds a row its undo record did not write last")
 
             undo_back(row, rec)? match
-                None -> self.rows.remove(at)
+                None -> self.drop_row(rec.oid, rec.key.view())
                 Some(prev) ->
                     // A ghost whose DELETE purge has already passed is invisible to every snapshot,
                     // and no later purge reaches it: it goes now, as purge would have removed it.
                     if prev.header.flags & RowDeleted != 0 && prev.header.undo < self.space.low
-                        self.rows.remove(at)
+                        self.drop_row(rec.oid, rec.key.view())
                     else
-                        self.rows[at] = LeafRow(rec.oid, self.rows[at].key, prev)
+                        self.store_row(rec.oid, rec.key.view(), prev)?
 
+            if partial then self.undone.push(a)
             if rec.txn_prev >= a then return corrupt("a rollback chain that does not run backward")
             a = rec.txn_prev
 
-        self.txns[usize(txn - 1)] = UndoTxn(UndoTxnAborted, 0, self.last_of(txn))
-        Ok(true)
+        Ok(())
 
     /** The version of the row of `oid` and `key` that a reader with snapshot `s` in transaction `own`
      * (0 for none) sees, or None where it sees no row. The answer shares no buffer with the leaf.
      */
     read(self, oid: u64, key: []const u8, s: u64, own: u64) -> Result[Option[RowImage], CodecError]
-        val (at, found) = self.find(oid, key)
-        if !found then return Ok(None)
-        self.version_of(self.rows[at].row, s, own)
+        self.current(oid, key)? match
+            Some(r) -> self.version_of(r, s, own)
+            None -> Ok(None)
 
     /** The version of a row whose current image is `img` that snapshot `s` in transaction `own` sees
      * (§5.4): the image itself once its writer is seen, absent if it is a ghost; else the image
@@ -593,7 +869,9 @@ struct UndoRows
         var cur = img
 
         loop
-            if self.sees(cur.header.txn, s, own)?
+            val w = self.writer_of(cur)?
+
+            if w == 0 || self.sees(w, s, own)?
                 return Ok(if cur.header.flags & RowDeleted != 0 then None else Some(copy_row_image(cur)))
 
             if cur.header.undo < self.space.low then return corrupt("a snapshot needs an undo record below undo_low (rule D17)")
@@ -628,42 +906,55 @@ struct UndoRows
                     Some(t) -> t
                     None -> return corrupt("an undo record of a transaction that never began")
                 if t.state == UndoTxnActive || (t.state == UndoTxnCommitted && t.commit > hz) then break
-                if t.state == UndoTxnCommitted && rec.kind == UndoDelete then ghosts += self.remove_ghost(rec, a)
+                if t.state == UndoTxnCommitted && rec.kind == UndoDelete then ghosts += self.remove_ghost(rec, a)?
                 records += 1
 
             a = undo_next(a, rec.len)
 
         val before = self.space.freed
         self.space.truncate_to(a)
+        val kept = buf[u64]()
+
+        for x in self.undone
+            if x >= self.space.low then kept.push(x)
+
+        self.undone = kept
         Ok(PurgeStats(records, ghosts, self.space.freed - before))
 
     /** Removes the ghost a purged DELETE at `a` left, if the row still ends its chain there (§5.6):
      * 1 when it did, 0 when a later writer has reused the key.
      */
-    private remove_ghost(*self, rec: UndoRecord, a: u64) -> u64
-        val (at, found) = self.find(rec.oid, rec.key.view())
-        if !found then return 0
-        val row = self.rows[at].row
-        if row.header.undo != a || row.header.flags & RowDeleted == 0 then return 0
-        self.rows.remove(at)
-        1
+    private remove_ghost(*self, rec: UndoRecord, a: u64) -> Result[u64, CodecError]
+        val row = self.current(rec.oid, rec.key.view())? match
+            Some(r) -> r
+            None -> return Ok(0)
+
+        if row.header.undo != a || row.header.flags & RowDeleted == 0 then return Ok(0)
+        self.drop_row(rec.oid, rec.key.view())
+        Ok(1)
+
+/** Flag bit 2 of a record written over `row`: set when `row` is lock-only (Q49). */
+private old_lock_flag(row: RowImage) -> u8 = if row.header.flags & RowLockOnly != 0 then UndoOldLockOnly else 0
 
 /** Applies record `rec`, made by the writer of `img`, backward (§5.4 step 3): an INSERT answers "no
- * row"; a DELETE or UPDATE gives the old version, with `DELETED` as the record's flag bit 0 says,
- * `txn ← prev_txn` and `undo ← prev_version`, and an UPDATE restores the columns it lists and
- * `old_schema_version`. A record of another transaction, or of a kind no version chain holds, is
- * `data_corrupted`.
+ * row"; a DELETE, LOCK or UPDATE gives the old version, with `DELETED` as the record's flag bit 0
+ * says and `LOCK_ONLY` as its bit 2 says, `txn ← prev_txn` and `undo ← prev_version`, and an UPDATE
+ * restores the columns it lists and `old_schema_version`. A LOCK changes no column. A record of
+ * another transaction, of a kind no version chain holds, or a LOCK record that is not under a
+ * `LOCK_ONLY` version (or the reverse) is `data_corrupted`.
  */
-private undo_back(img: RowImage, rec: UndoRecord) -> Result[Option[RowImage], CodecError]
+private[terndb] undo_back(img: RowImage, rec: UndoRecord) -> Result[Option[RowImage], CodecError]
     if rec.txn != img.header.txn then return corrupt("a row's undo address names another transaction's record")
+    if (rec.kind == UndoLock) != (img.header.flags & RowLockOnly != 0) then return corrupt("a LOCK undo record and a LOCK_ONLY version that do not go together")
     if rec.kind == UndoInsert then return Ok(None)
-    var flags = img.header.flags & ~RowDeleted
+    var flags = img.header.flags & ~(RowDeleted | RowLockOnly)
     if rec.flags & UndoOldDeleted != 0 then flags = flags | RowDeleted
+    if rec.flags & UndoOldLockOnly != 0 then flags = flags | RowLockOnly
 
-    if rec.kind == UndoDelete
+    if rec.kind == UndoDelete || rec.kind == UndoLock
         return Ok(Some(RowImage(RowHeader(rec.prev_txn, rec.prev_version, flags, img.header.schema_version), img.cols)))
 
-    if rec.kind != UndoUpdate then return corrupt("a version chain names a PAD, LOCK or SECONDARY undo record")
+    if rec.kind != UndoUpdate then return corrupt("a version chain names a PAD or SECONDARY undo record")
     val cols = undo_columns_back(img, rec)?
     Ok(Some(RowImage(RowHeader(rec.prev_txn, rec.prev_version, flags, rec.old_schema_version), cols)))
 
@@ -689,5 +980,129 @@ private undo_columns_back(img: RowImage, rec: UndoRecord) -> Result[Buf[ColumnIm
 
     Ok(out)
 
-/** Rows with no versions, over an empty undo space. */
-undo_rows() -> &UndoRows = UndoRows(undo_space(), buf[LeafRow](), buf[UndoTxn](), 0, buf[u64](), 0)
+/** Rows with no versions, over an empty undo space and an empty data space. */
+undo_rows() -> &UndoRows =
+    UndoRows(undo_space(), page_space(), buf[LeafTree](), buf[RowLayout](), buf[UndoTxn](), 0, buf[u64](), 0, buf[u64]())
+
+// -- the leaf row ------------------------------------------------------------------------------------
+
+/** The clustered-leaf value of `img` (§4.1, §4.2): its header, then the body over its columns as
+ * `widths` lay them out. A fixed column holds exactly its width (zeros when null), a variable one its
+ * bytes. A column count or fixed width other than the layout's is `type_mismatch`; a variable area
+ * past what a `u16` offset holds is `entry_too_large`. `HAS_EXTERNAL` is never set: no column is
+ * written out of line.
+ */
+encode_leaf_row(img: RowImage, widths: []const usize) -> Result[Buf[u8], CodecError]
+    val n = widths.len
+    if img.cols.len() != n then return fail("Q3001", s"a row of ${img.cols.len()} columns where its schema version has $n")
+    val out = buf[u8]()
+    push_u64_le(out, img.header.txn)
+    push_u64_le(out, img.header.undo)
+    push_u16_le(out, img.header.flags & (RowDeleted | RowLockOnly))
+    push_u16_le(out, img.header.schema_version)
+    val bitmap = (n + 7) / 8
+    val nulls = out.len()
+
+    for _ in 0..<bitmap
+        out.push(0)
+
+    for i in 0..<n
+        if img.cols[i].is_null then out[nulls + i / 8] = out[nulls + i / 8] | u8(1) << u8(i % 8)
+
+    for i in 0..<n
+        val w = widths[i]
+
+        if w > 0
+            val c = img.cols[i]
+
+            if c.is_null
+                for _ in 0..<w
+                    out.push(0)
+            else
+                if c.bytes.len() != w then return fail("Q3001", s"column $i is $w bytes wide, not ${c.bytes.len()}")
+                out.extend(c.bytes.view())
+
+    var end: usize = 0
+
+    for i in 0..<n
+        if widths[i] == 0
+            if !img.cols[i].is_null then end += img.cols[i].bytes.len()
+            if end > 0xFFFF then return fail("D2002", "a row's variable area exceeds what a u16 offset holds")
+            push_u16_le(out, u16(end))
+
+    for i in 0..<n
+        if widths[i] == 0 && !img.cols[i].is_null then out.extend(img.cols[i].bytes.view())
+
+    Ok(out)
+
+/** The image of the clustered-leaf value `bytes` laid out as `widths` say: the inverse of
+ * `encode_leaf_row`. Anything that breaks §4.2 is `data_corrupted`: a short body, a bit set past the
+ * last column, a null fixed column that is not zero-filled, a null variable column with bytes,
+ * offsets out of order, bytes after the last column, and a column out of line (`HAS_EXTERNAL`),
+ * which needs an overflow chain this store never writes.
+ */
+decode_leaf_row(bytes: []const u8, widths: []const usize) -> Result[RowImage, CodecError]
+    val hd = decode_row_header(bytes)?
+    if hd.flags & RowHasExternal != 0 then return corrupt("a row with a column out of line, which needs an overflow chain")
+    val n = widths.len
+    val bitmap = (n + 7) / 8
+    var at = RowHeaderSize
+    if at + bitmap > bytes.len then return corrupt("a row shorter than its null bitmap")
+    val nulls = bytes[at..<at + bitmap]
+    at += bitmap
+
+    for i in n..<bitmap * 8
+        if nulls[i / 8] >> u8(i % 8) & 1 == 1 then return corrupt("a bit past the last column is set in the null bitmap")
+
+    val cols = buf[ColumnImage]()
+    var vars: usize = 0
+
+    for i in 0..<n
+        val absent = nulls[i / 8] >> u8(i % 8) & 1 == 1
+        val w = widths[i]
+
+        if w == 0
+            vars += 1
+            cols.push(ColumnImage(absent, buf[u8]()))
+        else
+            if at + w > bytes.len then return corrupt("a row shorter than its fixed area")
+            val one = bytes[at..<at + w]
+            at += w
+
+            if absent
+                for b in one
+                    if b != 0 then return corrupt(s"null column $i is not zero-filled")
+
+                cols.push(ColumnImage(true, buf[u8]()))
+            else
+                cols.push(ColumnImage(false, undo_bytes(one)))
+
+    if at + 2 * vars > bytes.len then return corrupt("a row shorter than its variable offsets")
+    val offsets = at
+    val area = at + 2 * vars
+    var k: usize = 0
+    var start: usize = 0
+
+    for i in 0..<n
+        if widths[i] == 0
+            val end = undo_u16(bytes, offsets + 2 * k)
+            k += 1
+            if end < start || area + end > bytes.len then return corrupt("a variable offset is out of order")
+
+            if cols[i].is_null
+                if end != start then return corrupt(s"null column $i has bytes")
+            else
+                cols[i] = ColumnImage(false, undo_bytes(bytes[area + start..<area + end]))
+
+            start = end
+
+    if area + start != bytes.len then return corrupt("bytes follow the last variable column")
+    Ok(RowImage(hd, cols))
+
+/** Frees every page of the tree under `p`, children first. */
+private[terndb] free_tree_pages(space: &PageSpace, p: *PageFrame)
+    if !node_is_leaf(p)
+        for c in 0..<node_count(p) + 1
+            free_tree_pages(space, unswizzle(node_child(p, c)))
+
+    space.release(p.pid)

@@ -141,6 +141,62 @@ update at read committed; the faults are caught as for W1 and W4 (G2 and G2-item
 P4/G-single without first-updater-wins or with a snapshot per statement, G-stale and G-rt with a stale
 snapshot).
 
+## The anomaly catalogue
+
+`history_anomaly_tests.sysl` holds one minimal hand-built history for each phenomenon of `isolation.md` §2.4
+and §3, judged with all of its transactions at serializable, snapshot and read committed. **F** is found and
+forbidden under that name, **P** found and permitted (nothing forbidden), **–** not reported. Every test name
+begins `catalogue_`, left off here.
+
+| Anomaly | Test | SER | SI | RC |
+|---|---|---|---|---|
+| G0, dirty write | `g0_dirty_write` | F | F | F |
+| G1a, aborted read: list, register, predicate insert | `g1a_aborted_read_of_a_list`, `g1a_aborted_read_of_a_register`, `g1a_aborted_insert_in_a_predicate_read` | F | F | F |
+| G1b, intermediate read: list, register, predicate row, nested predicate row | `g1b_intermediate_read_of_a_list`, `g1b_intermediate_read_of_a_register`, `g1b_intermediate_row_in_a_predicate_read`, `g1b_intermediate_row_in_a_nested_predicate_read` | F | F | F |
+| G1c, circular information flow | `g1c_circular_information_flow` | F | F | F |
+| G-single, read skew | `g_single_read_skew` | F | F | P |
+| G-single, fractured read | `g_single_fractured_read` | F | F | P |
+| G-nonadjacent | `g_nonadjacent` | F | F | P |
+| P4, lost update: list, register | `p4_lost_update_of_a_list`, `p4_lost_update_of_a_register` | F | F | P |
+| A5B, write skew | `a5b_write_skew` | F | P | P |
+| G2-item, three transactions | `g2_item_three_transactions` | F | P | P |
+| G2-item, the read-only anomaly [Fekete] | `g2_item_the_read_only_anomaly` | F | P | P |
+| G2, predicate write skew | `g2_predicate_write_skew` | F | P | P |
+| G2, nested predicate write skew (I18) | `g2_nested_predicate_write_skew` | F | P | P |
+| G-single, phantom | `g_single_phantom` | F | F | P |
+| G-single, nested phantom | `g_single_nested_phantom` | F | F | P |
+| internal: a read missing its own append, write, insert | `internal_a_read_missing_its_own_append`, `internal_a_read_missing_its_own_write`, `internal_a_predicate_missing_its_own_insert` | F | F | F |
+| G-stale, a read missing an acknowledged write | `g_stale_a_read_missing_an_acknowledged_write` | F | F | F |
+| G-rt, the same history | `g_rt_a_read_missing_an_acknowledged_write` | F | – | – |
+| G-stale, a predicate absence a later delete cannot excuse | `a_predicate_read_lacking_a_row_deleted_only_after_it_is_stale` | F | F | F |
+| G-stale, the same over a nested predicate | `a_nested_predicate_lacking_a_row_deleted_only_after_it_is_stale` | F | F | F |
+| G-session, monotonic reads | `g_session_monotonic_reads` | F | F | F |
+| G-session, read your writes through a later version | `g_session_read_your_writes_through_a_later_version` | F | F | F |
+| I5, version order against real time (also G-rt) | `i5_version_order_against_real_time` | F (G-rt F) | F (G-rt –) | F (G-rt –) |
+| garbage: element, value, row nobody wrote | `garbage_an_element_nobody_appended`, `garbage_a_value_nobody_wrote`, `garbage_a_row_nobody_inserted` | F | F | F |
+| duplicate elements | `duplicate_elements` | F | F | F |
+| incompatible-order: a read not a prefix of a later one | `incompatible_order_a_read_not_a_prefix_of_a_later_one` | F | F | F |
+| incompatible-order: one transaction's appends reversed, with a gap | `incompatible_order_one_transactions_appends_reversed`, `incompatible_order_one_transactions_appends_with_a_gap` | F | F | F |
+
+Each anomaly has a near miss one edge away from it, clean at every level: `g0_near_miss_one_order_on_both_keys`,
+`g1a_near_miss_the_aborted_write_unread`, `g1b_near_miss_the_final_version`, `g1c_near_miss_one_way_flow`,
+`g_single_near_miss_a_consistent_read`, `g_nonadjacent_near_miss_t2_reads_t3s_append`,
+`p4_near_miss_the_second_reads_the_first_write`, `g2_item_near_miss`, `g2_near_miss_the_predicate_sees_the_insert`,
+`internal_near_miss_reading_its_own_writes`, `real_time_near_miss_reads_and_writes_in_order`,
+`garbage_near_miss_the_value_written`, `list_near_miss_reads_in_the_order_of_appends`, and
+`g_session_near_miss_a_cycle_through_a_later_statement_at_read_committed` (a DSG+so cycle whose rw edge does not
+follow its so edge, legal at read committed, which takes a snapshot per statement). The degenerate histories,
+clean at every level: `an_empty_history`, `only_aborted_transactions`, `only_unknown_transactions`,
+`an_unknown_write_nobody_read_may_have_aborted`, `a_single_transaction`, `reads_of_the_initial_state`,
+`transactions_with_no_operations` and `a_read_after_a_delete`.
+
+What the catalogue found in the checker: G-session through an rw edge was searched only at serializable and
+snapshot (now a search of its own, at every level); a list read holding one transaction's appends out of order or
+with a gap went unreported (now `incompatible-order`, with no false G1b); a register read finding no row after an
+acknowledged delete was taken for the initial version (a false G-stale and G-rt); a predicate read returning a row
+its own inserter deleted was not G1b; and a predicate's absence was excused by a delete that began after the read
+ended (a delete must be able to precede the read).
+
 ## Not yet
 
 - W7 (replicas), W8 (crash, I22–I25, I28) and W9 (DDL) need replicas, the WAL and recovery, and concurrent DDL
