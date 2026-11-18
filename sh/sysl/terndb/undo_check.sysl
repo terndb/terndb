@@ -23,6 +23,13 @@ private struct UndoAt
 
 private undo_bad[T](what: string) -> Result[T, CodecError] = corrupt(what)
 
+/** Whether the record at `a` was rolled back to a savepoint. */
+private rolled_back(u: &UndoRows, a: u64) -> bool
+    for x in u.undone
+        if x == a then return true
+
+    false
+
 /** Where the record at `a` is among `recs`, sorted by address. */
 private undo_at(recs: Buf[UndoAt], a: u64) -> Option[usize]
     var lo: usize = 0
@@ -96,10 +103,23 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
     for _ in 0..<u.txns.len()
         counts.push(0)
 
+    val undone = buf[usize]()
+
+    for _ in 0..<u.txns.len()
+        undone.push(0)
+
     for r in recs
         if u.txn_of(r.rec.txn).is_none() then return undo_bad(s"undo record ${r.addr}: a transaction that never began")
         if r.rec.prev_version >= r.addr || r.rec.txn_prev >= r.addr then return undo_bad(s"undo record ${r.addr}: a link that does not run backward")
         counts[usize(r.rec.txn - 1)] += 1
+
+    // A record rolled back to a savepoint is off its transaction's chain, and is named by no row:
+    // a version chain below that reached one would find it off the chain's transaction's records.
+    for x in u.undone
+        val j = undo_at(recs, x) match
+            Some(j) -> j
+            None -> return undo_bad(s"a record rolled back at $x is not a record at or above undo_low")
+        undone[usize(recs[j].rec.txn - 1)] += 1
 
     // Each transaction's rollback chain reaches exactly its records at or above undo_low.
     for i in 0..<u.txns.len()
@@ -116,21 +136,21 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
             a = recs[j].rec.txn_prev
 
         if t.state == UndoTxnActive && a != 0 then return undo_bad(s"transaction ${i + 1} is active but its records fall below undo_low")
-        if reached != counts[i] then return undo_bad(s"transaction ${i + 1}: its rollback chain misses some of its records")
+        if reached + undone[i] != counts[i] then return undo_bad(s"transaction ${i + 1}: its rollback chain misses some of its records")
 
-    // Each row: sorted, flags it may carry, and a version chain well formed down to undo_low.
+    // Each row: flags it may carry, and a version chain well formed down to undo_low. The trees'
+    // own structure, and so the key order, is the B+tree check's.
+    check_btrees(u.data, u.all_trees().view())?
     var ghosts: usize = 0
+    val rows = u.leaf_rows()?
 
-    for k in 0..<u.rows.len()
-        val r = u.rows[k]
+    for k in 0..<rows.len()
+        val r = rows[k]
         val hd = r.row.header
         val at = s"row $k of table ${r.oid}"
 
-        if k > 0
-            val q = u.rows[k - 1]
-            if q.oid > r.oid || (q.oid == r.oid && q.key.view() >= r.key.view()) then return undo_bad(s"$at: the leaf is not in key order")
-
-        if hd.flags & ~RowDeleted != 0 then return undo_bad(s"$at: flags other than DELETED")
+        if hd.flags & ~(RowDeleted | RowLockOnly) != 0 then return undo_bad(s"$at: flags other than DELETED and LOCK_ONLY")
+        if hd.flags == RowDeleted | RowLockOnly then return undo_bad(s"$at: a ghost that is LOCK_ONLY")
         if hd.undo == 0 then return undo_bad(s"$at: no undo address")
 
         val wt = u.txn_of(hd.txn) match
@@ -144,6 +164,9 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
 
         var txn = hd.txn
         var a = hd.undo
+        // Whether the version the chain has reached is lock-only: its record must then be a LOCK
+        // (Q49), and only then.
+        var lock_only = hd.flags & RowLockOnly != 0
 
         while a != 0 && a >= sp.low
             val j = undo_at(recs, a) match
@@ -152,10 +175,20 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
             val rec = recs[j].rec
             if rec.txn != txn then return undo_bad(s"$at: its version chain names another transaction's record at $a")
             if rec.oid != r.oid || rec.key != r.key then return undo_bad(s"$at: its version chain names another row's record at $a")
-            if rec.kind != UndoInsert && rec.kind != UndoUpdate && rec.kind != UndoDelete then return undo_bad(s"$at: its version chain names a LOCK or SECONDARY record")
+            if rec.kind == UndoPad || rec.kind == UndoSecondary then return undo_bad(s"$at: its version chain names a SECONDARY record")
+            if rolled_back(u, a) then return undo_bad(s"$at: its version chain names a record rolled back at $a")
+            if lock_only && rec.kind != UndoLock then return undo_bad(s"$at: a LOCK_ONLY version whose record at $a is not a LOCK")
+            if !lock_only && rec.kind == UndoLock then return undo_bad(s"$at: a LOCK record at $a under a version that is not LOCK_ONLY")
             if rec.kind == UndoInsert then break
+            val ordered = rec.kind != UndoLock && rec.flags & UndoOldLockOnly == 0
+            lock_only = rec.flags & UndoOldLockOnly != 0
 
-            if rec.prev_txn != rec.txn
+            if rec.prev_txn != rec.txn && !ordered
+                val older = u.txn_of(rec.prev_txn) match
+                    Some(t) -> t
+                    None -> return undo_bad(s"$at: its version chain names a transaction that never began")
+                if older.state != UndoTxnCommitted then return undo_bad(s"$at: an older version whose writer did not commit")
+            elif rec.prev_txn != rec.txn
                 val newer = u.txn_of(rec.txn).unwrap()
 
                 val older = u.txn_of(rec.prev_txn) match
@@ -169,4 +202,4 @@ check_undo(u: &UndoRows) -> Result[UndoStats, CodecError]
 
         if wt.state == UndoTxnActive && hd.undo < sp.low then return undo_bad(s"$at: written by a live transaction whose record is below undo_low")
 
-    Ok(UndoStats(sp.pages.len(), recs.len(), u.rows.len(), ghosts))
+    Ok(UndoStats(sp.pages.len(), recs.len(), rows.len(), ghosts))
