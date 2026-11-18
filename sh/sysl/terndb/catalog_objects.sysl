@@ -410,6 +410,8 @@ is_reserved_namespace(ns: string) -> bool = ns == "sys" || ns == "catalog"
 
 impl Catalog for MemCatalog
     table(self, name: QualName) -> Option[TableInfo]
+        if name.schema == "catalog" then return catalog_relation_info(name.name)
+
         self.table_at(name) match
             Some(i) -> return Some(self.table_info(self.tables[i]))
             None -> ()

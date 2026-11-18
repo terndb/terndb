@@ -1261,6 +1261,18 @@ A `Col(b, c)` prints as `b.c`; a `Param(i)` as `$i`; a `Literal` as its §3.5 te
 `list<…>`, `union<T: {…}, …>`, and a named type reference (§12.3 kind 32) as its qualified name,
 `app.status`. A field holding its default is omitted.
 
+A node's `kind` is its name from §6 or §7 in snake case (`scan`, `param_scan`, `set_op`, `cte_ref`, `null`,
+`variant`), and its fields are named and ordered as those tables list them, the binder field as `as`; a reader
+matches fields by name. A field's default is its empty value: an absent option, `false`, an empty list, or an
+enumeration's first value as the spec lists them (`inner`, `cross`, `union`, `strict`, `rows`,
+`unbounded_preceding`, `none`); every other enumeration value prints as its name (`mark`, `try`, `current`). A
+`Call` prints as `(call f arg …)`, its arguments positional. An `AggCall` or `WinCall` prints as `(f arg …)`
+followed by its other fields (`(count)`, `(sum x.a :distinct true)`, `(row_number :partition [x.k])`). The other
+auxiliary records print as nodes named after them: `(if_arm :cond … :value …)`, `(match_arm :tag … :binder …
+:expr …)`, `(cte_def :name … :columns […] :rel …)`, `(frame :unit … :start … :end … :exclude …)`, `(bound :kind …
+:offset …)`. A `ParamScan`'s `param` prints as `$i`, like a `Param`. A list of lists (`Values.rows`) nests
+brackets: `[['1'::int64] ['2'::int64]]`.
+
 ## 16. Worked examples
 
 ### 16.1 Users, their 3 newest posts with comments, and a post count

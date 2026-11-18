@@ -1,0 +1,335 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The catalog as relations (`ddl.md` §4): the system views of the reserved namespace `catalog`, their
+// column lists (§4.2), and their rows, built from the catalog a statement sees — the committed catalog
+// of its snapshot with its transaction's own DDL applied (`catalog_mvcc.sysl`), so that DDL of the
+// same transaction is visible and another's uncommitted DDL is not (§4.1 rule 5). A type is reported
+// structurally as `type` and `type_text`, a definition expression in its text form (§4.1 rule 4,
+// `text_tree.sysl`). They are read-only: the type checker sees them as views, which DML refuses
+// (`Q5003`).
+//
+// `catalog.jobs` and `catalog.schema_versions` are not served: no background job is run or recorded,
+// so no job row exists, and a schema version keeps neither the commit that created it nor whether a
+// stored row may still carry it. A `job` inside a state is reported as 0 for the same reason.
+
+/** The column list of relation `name` of namespace `catalog`, or `None` where §4.2 serves none. */
+catalog_relation(name: string) -> Option[Buf[Field]]
+    val fs = name match
+        "version" -> items_of([Field("catalog_version", UInt64), Field("tree_schema", record([Field("major", UInt32), Field("minor", UInt32)]))])
+        "namespaces" -> items_of([oid_f("oid"), text_f("name"), text_f("owner")])
+        "tables" -> items_of([oid_f("oid"), text_f("namespace"), text_f("name"), text_f("owner"), Field("schema_version", UInt16),
+            Field("primary_key", list(Text)), Field("state", union_of([empty_f("ready"), job_f("rebuilding")]))])
+        "columns" -> items_of([oid_f("table_oid"), Field("column_id", UInt32), Field("ordinal", UInt16), text_f("name"), bytes_f("type"),
+            text_f("type_text"), Field("type_name", nullable(qual_type())), Field("nullable", Bool), Field("in_primary_key", Bool),
+            Field("default", nullable(Text)), Field("generated", nullable(Text)),
+            Field("identity", nullable(union_of([empty_f("always"), empty_f("by_default")]))),
+            Field("state", union_of([empty_f("ready"), job_f("filling"),
+                Field("converting", record([oid_f("job"), bytes_f("to_type"), text_f("to_type_text")]))]))])
+        "indexes" -> items_of([oid_f("oid"), oid_f("table_oid"), text_f("namespace"), text_f("name"), Field("unique", Bool),
+            Field("keys", list(record([Field("column", nullable(Text)), text_f("expr"), Field("descending", Bool)]))),
+            Field("predicate", nullable(Text)), Field("state", union_of([job_f("building"), empty_f("ready"), job_f("failed")]))])
+        "constraints" -> items_of([oid_f("oid"), oid_f("table_oid"), text_f("namespace"), text_f("name"), Field("validated", Bool),
+            Field("kind", constraint_kind_type())])
+        "types" -> items_of([oid_f("oid"), text_f("namespace"), text_f("name"), text_f("owner"),
+            Field("kind", union_of([empty_f("record"), empty_f("union"), empty_f("enum")])), bytes_f("type"), text_f("type_text"),
+            Field("members", list(record([text_f("name"), bytes_f("type"), text_f("type_text"), Field("type_name", nullable(qual_type()))])))])
+        "sequences" -> items_of([oid_f("oid"), text_f("namespace"), text_f("name"), bytes_f("type"), Field("start", Int64),
+            Field("increment", Int64), Field("min", Int64), Field("max", Int64), Field("cycle", Bool), Field("cache", UInt32),
+            Field("owned_by", nullable(record([oid_f("table_oid"), Field("column_id", UInt32)])))])
+        "views" -> items_of([oid_f("oid"), text_f("namespace"), text_f("name"), text_f("owner"), text_f("query"), bytes_f("query_tree")])
+        "roles" -> items_of([text_f("name"), Field("login", Bool), Field("superuser", Bool), Field("member_of", list(Text))])
+        "grants" -> items_of([oid_f("object_oid"),
+            Field("object_kind", union_of([empty_f("table"), empty_f("view"), empty_f("namespace"), empty_f("sequence"), empty_f("type")])),
+            text_f("grantee"), text_f("privilege"), Field("grantable", Bool)])
+        "depends" -> items_of([oid_f("oid"), oid_f("ref_oid")])
+        else return None
+
+    Some(fs)
+end catalog_relation
+
+/** Relation `name` of `catalog` as the type checker sees it: a view, read-only, with no unique key. */
+catalog_relation_info(name: string) -> Option[TableInfo]
+    val fs = catalog_relation(name)?
+    val cs = buf[ColumnInfo]()
+
+    for f in fs
+        cs.push(ColumnInfo(f.name, f.ty, false))
+
+    Some(TableInfo(cs, buf[UniqueKey](), true))
+
+private oid_f(name: string) -> Field = Field(name, UInt64)
+
+private text_f(name: string) -> Field = Field(name, Text)
+
+private bytes_f(name: string) -> Field = Field(name, Bytes)
+
+private empty_f(name: string) -> Field = Field(name, record([]))
+
+private job_f(name: string) -> Field = Field(name, record([oid_f("job")]))
+
+/** `QualName` in a column (§4.2). */
+private qual_type() -> Type = record([text_f("namespace"), text_f("name")])
+
+private fk_action_type() -> Type =
+    union_of([empty_f("no_action"), empty_f("restrict"), empty_f("cascade"), empty_f("set_null"), empty_f("set_default")])
+
+private constraint_kind_type() -> Type
+    val names = Field("columns", list(Text))
+
+    union_of([
+        Field("primary_key", record([names])),
+        Field("unique", record([names, oid_f("index_oid")])),
+        Field("not_null", record([text_f("column")])),
+        Field("check", record([text_f("expr")])),
+        Field("foreign_key", record([names, oid_f("ref_table_oid"), Field("ref_columns", list(Text)), Field("on_delete", fk_action_type()),
+            Field("on_update", fk_action_type()), Field("deferred", Bool)]))])
+
+// -- the rows --------------------------------------------------------------------------------------
+
+/** The rows of relation `name` of `catalog` (one `catalog_relation` serves) as `c` holds them. */
+catalog_rows(c: MemCatalog, name: string) -> Buf[Value]
+    val out = buf[Value]()
+
+    name match
+        "version" -> out.push(rec([UInt(c.version), rec([UInt(TreeMajor), UInt(TreeMinor)])]))
+        "namespaces" ->
+            for n in c.namespaces
+                out.push(rec([UInt(n.oid), Text(n.name), Text(role_name(c, n.owner))]))
+        "tables" ->
+            for t in c.tables
+                out.push(rec([UInt(t.oid), Text(ns_name(c, t.ns)), Text(t.name), Text(role_name(c, t.owner)), UInt(t.schema_version()),
+                    texts(c.column_names(t, t.primary_key)), variant(0, rec([]))]))
+        "columns" -> column_rows(c, out)
+        "indexes" ->
+            for x in c.indexes
+                out.push(index_row(c, x))
+        "constraints" -> constraint_rows(c, out)
+        "types" ->
+            for t in c.types
+                out.push(type_row(c, t))
+        "sequences" ->
+            for q in c.sequences
+                val owned = if q.owner_table == 0 then Null else rec([UInt(q.owner_table), UInt(u64(q.owner_column))])
+                out.push(rec([UInt(q.oid), Text(ns_name(c, q.ns)), Text(q.name), type_bytes(c, q.ty), Int(i128(q.start)),
+                    Int(i128(q.increment)), Int(i128(q.min)), Int(i128(q.max)), Bool(q.cycle), UInt(q.cache), owned]))
+        "views" ->
+            for v in c.views
+                val tree: Value = encode_statement(Query(v.query)) match
+                    Ok(b) -> Bytes(b)
+                    Err(_) -> Bytes(buf[u8]())
+
+                out.push(rec([UInt(v.oid), Text(ns_name(c, v.ns)), Text(v.name), Text(role_name(c, v.owner)), Text(query_text(v.query)), tree]))
+        "roles" ->
+            for r in c.roles
+                val member_of = buf[string]()
+
+                for m in r.member_of
+                    member_of.push(role_name(c, m))
+
+                out.push(rec([Text(r.name), Bool(r.login), Bool(r.superuser), texts(member_of)]))
+        "grants" ->
+            for g in c.grants
+                out.push(rec([UInt(g.object.oid), variant(object_kind_tag(g.object.kind), rec([])), Text(role_name(c, g.grantee)),
+                    Text(privilege_text(g.privilege)), Bool(g.grantable)]))
+        "depends" ->
+            for d in c.depends()
+                val row = rec([UInt(d.dependent.oid), UInt(d.referenced.oid)])
+                if !has_value(out, row) then out.push(row)
+        else ()
+
+    out
+end catalog_rows
+
+private has_value(xs: Buf[Value], v: Value) -> bool
+    for x in xs
+        if x == v then return true
+
+    false
+
+private role_name(c: MemCatalog, oid: u64) -> string = c.role_by_oid(oid) match
+    Some(i) -> c.roles[i].name
+    None -> ""
+
+private ns_name(c: MemCatalog, oid: u64) -> string = c.namespace_by_oid(oid).name
+
+private texts(names: Buf[string]) -> Value
+    val out = buf[Value]()
+
+    for n in names
+        out.push(Text(n))
+
+    Relation(out)
+
+/** `ty` with every named type resolved: what a `type` column reports (§4.1 rule 4). */
+private structural(c: MemCatalog, ty: Type) -> Type = resolve_type(c, ty) match
+    Ok(t) -> t
+    Err(_) -> ty
+
+private type_bytes(c: MemCatalog, ty: Type) -> Value
+    val out = buf[u8]()
+    encode_type(structural(c, ty), out)
+    Bytes(out)
+
+private type_text_of(c: MemCatalog, ty: Type) -> Value = Text(type_text(structural(c, ty)))
+
+/** The named type `ty` was declared with, nullable or not, as a `QualName`; null for any other. */
+private type_name_of(ty: Type) -> Value = ty match
+    Named(schema, name) -> rec([Text(schema), Text(name)])
+    Nullable(inner) -> type_name_of(*inner)
+    _ -> Null
+
+private opt_text(e: Option[Expr]) -> Value = e match
+    Some(x) -> Text(expr_text(x))
+    None -> Null
+
+/** One row per column of each table's current schema version, then one per column of each view. */
+private column_rows(c: MemCatalog, out: Buf[Value])
+    for t in c.tables
+        for i in 0..<t.columns.len()
+            val col = t.columns[i]
+
+            val identity = col.identity match
+                NoIdentity -> Null
+                Always -> variant(0, rec([]))
+                ByDefault -> variant(1, rec([]))
+
+            val state = col.state match
+                ColumnReady -> variant(0, rec([]))
+                ColumnFilling -> variant(1, rec([UInt(0)]))
+                ColumnConverting ->
+                    val to = col.target.unwrap_or(col.ty)
+                    variant(2, rec([UInt(0), type_bytes(c, to), type_text_of(c, to)]))
+
+            out.push(rec([UInt(t.oid), UInt(u64(col.id)), UInt(u64(i)), Text(col.name), type_bytes(c, col.ty), type_text_of(c, col.ty),
+                type_name_of(col.ty), Bool(col.ty.is_nullable()), Bool(contains_id(t.primary_key, col.id)), opt_text(col.default),
+                opt_text(col.generated), identity, state]))
+
+    for v in c.views
+        for i in 0..<v.columns.len()
+            val f = v.columns[i]
+            out.push(rec([UInt(v.oid), UInt(u64(i) + 1), UInt(u64(i)), Text(f.name), type_bytes(c, f.ty), type_text_of(c, f.ty),
+                type_name_of(f.ty), Bool(f.ty.is_nullable()), Bool(false), Null, Null, Null, variant(0, rec([]))]))
+end column_rows
+
+private contains_id(ids: Buf[u32], id: u32) -> bool
+    for x in ids
+        if x == id then return true
+
+    false
+
+private index_row(c: MemCatalog, x: CatIndex) -> Value
+    val t = c.tables[c.table_by_oid(x.table).unwrap()]
+    val keys = buf[Value]()
+
+    for k in x.keys
+        val key = k.key match
+            KeyOn(id) ->
+                val name = t.column_by_id(id).map(col -> col.name).unwrap_or("")
+                rec([Text(name), Text(expr_text(Col("row", name))), Bool(k.descending)])
+            KeyOver(e) -> rec([Null, Text(expr_text(e)), Bool(k.descending)])
+
+        keys.push(key)
+
+    val state = x.state match
+        IndexBuilding -> variant(0, rec([UInt(0)]))
+        IndexReady -> variant(1, rec([]))
+        IndexFailed -> variant(2, rec([UInt(0)]))
+
+    rec([UInt(x.oid), UInt(x.table), Text(ns_name(c, t.ns)), Text(x.name), Bool(x.unique), Relation(keys), opt_text(x.predicate), state])
+
+/** The constraints of each table, then its not-null columns, each listed as a `not_null` constraint
+ * though it is no object (§2.6): oid 0, named `<table>_<column>_not_null`, validated.
+ */
+private constraint_rows(c: MemCatalog, out: Buf[Value])
+    for t in c.tables
+        val ns: Value = Text(ns_name(c, t.ns))
+
+        for k in c.constraints_of(t.oid)
+            val kind = k.kind match
+                ConPrimaryKey(ids) -> variant(0, rec([texts(c.column_names(t, ids))]))
+                ConUnique(ids) -> variant(1, rec([texts(c.column_names(t, ids)), UInt(k.index)]))
+                ConCheck(e) -> variant(3, rec([Text(expr_text(e))]))
+                ConForeignKey(ids, target, ref_ids, on_delete, on_update, deferred) ->
+                    val ref_names = c.table_by_oid(target) match
+                        Some(j) -> c.column_names(c.tables[j], ref_ids)
+                        None -> buf[string]()
+
+                    variant(4, rec([texts(c.column_names(t, ids)), UInt(target), texts(ref_names), fk_action(on_delete),
+                        fk_action(on_update), Bool(deferred)]))
+
+            out.push(rec([UInt(k.oid), UInt(t.oid), ns, Text(k.name), Bool(k.validated), kind]))
+
+        for col in t.columns
+            if !col.ty.is_nullable()
+                out.push(rec([UInt(0), UInt(t.oid), ns, Text(s"${t.name}_${col.name}_not_null"), Bool(true),
+                    variant(2, rec([Text(col.name)]))]))
+end constraint_rows
+
+private fk_action(a: FkAction) -> Value
+    val tag: usize = a match
+        FkNoAction -> 0
+        FkRestrict -> 1
+        FkCascade -> 2
+        FkSetNull -> 3
+        FkSetDefault -> 4
+
+    variant(tag, rec([]))
+
+private type_row(c: MemCatalog, t: CatType) -> Value
+    val resolved = structural(c, t.ty)
+
+    val kind: usize = resolved match
+        Record(_) -> 0
+        _ -> if is_enum(resolved) then 2 else 1
+
+    val members = buf[Value]()
+
+    val declared = t.ty match
+        Record(fs) | Union(fs) -> fs
+        _ -> buf[Field]()
+
+    for m in declared
+        members.push(rec([Text(m.name), type_bytes(c, m.ty), type_text_of(c, m.ty), type_name_of(m.ty)]))
+
+    rec([UInt(t.oid), Text(ns_name(c, t.ns)), Text(t.name), Text(role_name(c, t.owner)), variant(kind, rec([])), type_bytes(c, t.ty),
+        type_text_of(c, t.ty), Relation(members)])
+
+private object_kind_tag(k: ObjKind) -> usize = k match
+    KindTable -> 0
+    KindView -> 1
+    KindNamespace -> 2
+    KindSequence -> 3
+    _ -> 4
+
+private privilege_text(p: Privilege) -> string = p match
+    PrivSelect -> "select"
+    PrivInsert -> "insert"
+    PrivUpdate -> "update"
+    PrivDelete -> "delete"
+    PrivReferences -> "references"
+    PrivUsage -> "usage"
+    PrivCreate -> "create"
+
+// -- the scan --------------------------------------------------------------------------------------
+
+/** The operator reading relation `name` of `catalog` as rows of `elem`, from the catalog installed
+ * for the statement's transaction.
+ */
+private[terndb] catalog_scan_op(d: Db, name: string, elem: Type) -> &Operator =
+    CatalogScanOp(batches_of(vector_of(elem, catalog_rows(d.store.catalog, name).view())), 0)
+
+struct CatalogScanOp
+    batches: Buf[ColumnVector]
+    at: usize
+
+impl Operator for CatalogScanOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        while self.at < self.batches.len()
+            val b = self.batches[self.at]
+            self.at += 1
+
+            if b.len > 0 then return Ok(Some(b))
+
+        Ok(None)

@@ -142,9 +142,12 @@ private row_passes(p: TExpr, binder: string, elem: Type, version: u64, ctx: Ctx,
 
 /** The operator reading `table` under `binder` from `d`'s store at its transaction's snapshot, its
  * read logged with `filter` as its predicate. A view reads its stored query in its place
- * (`exec_view.sysl`), whose scans log their own reads.
+ * (`exec_view.sysl`), whose scans log their own reads; a relation of `catalog` reads the catalog the
+ * transaction sees (`catalog_relations.sysl`), and logs nothing.
  */
 private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filter: Option[TExpr], ctx: Ctx) -> &Operator
+    if table.schema == "catalog" then return catalog_scan_op(d, table.name, elem)
+
     val i = d.store.catalog.table_at(table) match
         Some(i) -> i
         None -> return view_op(d, table, elem, ctx)

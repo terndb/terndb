@@ -550,7 +550,7 @@ changes in one statement.
   :columns [(column :name id :type int64 :identity always)
             (column :name email :type text)
             (column :name status :type app.status
-                    :default (variant :type app.status :tag active :value (record)))
+                    :default (variant :type app.status :tag active :expr (record)))
             (column :name addresses :type list<{city: text, zip: text?}>)]
   :primary_key [id]
   :constraints [(constraint :name users_email_key :unique [email])])
@@ -675,15 +675,17 @@ each phase in pre-order. They need nothing but the tree, so a client library MAY
 
 1. The relations below are system views in the reserved namespace `catalog`. They are read with an ordinary `Scan`
    ([QT] §6.1), at the statement's snapshot, like any relation, and every role may read them (§2.10 rule 5). They
-   are read-only (`Q5003`).
+   are read-only (`Q5003`). A read of them is neither part of the statement's catalog read (§6.2) nor logged as a
+   read of rows ([ISO] §4.4): a DDL committed while the reader runs does not abort it.
 2. They are the **stable** interface to the catalog. The stored system trees (`sys.*`, [DISK] §3.9) are an internal
    format, may change with the on-disk format, and MUST NOT be scanned by name (`Q2001`).
 3. Their column lists are versioned with the tree schema ([QT] §13): a minor version MAY append columns and MAY add
    relations, a variant to a union column, or a field to a record column at its end; anything else is a major
    change. A generator SHOULD name the columns it reads rather than read whole rows.
 4. A type is reported twice: `type` is its canonical [QT] §12.3 encoding (structural, with the nullable wrapper,
-   never a named reference), which a client decodes with the decoder it already has; `type_text` is its [QT] §15
-   text form. An expression is reported as its [QT] §15 text form.
+   never a named reference), which a client decodes with the decoder it already has; `type_text` is the [QT] §15
+   text form of the same structural type, so it names no named type either (`type_name` does, where there is one).
+   An expression is reported as its [QT] §15 text form, its row binder `row` (§2.12).
 5. Objects not yet visible to the reader's snapshot are absent; objects in a non-`ready` state are present with
    their state, so a tool can watch a change in progress. A generator SHOULD use only `ready` columns.
 
@@ -703,7 +705,8 @@ uint32}`.
 `type_text: text`, `type_name: QualName?`, `nullable: bool`, `in_primary_key: bool`, `default: text?`,
 `generated: text?`, `identity: union<always: {}, by_default: {}>?`, `state: union<ready: {}, filling: {job:
 uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`. One row per column of the table's current
-schema version, including the columns of views (`table_oid` the view's oid, no key, no default).
+schema version, in every state, including the columns of views (`table_oid` the view's oid, no key, no default,
+`ready`). `ordinal` counts from 0 in the current schema version; a view's column has `column_id` its ordinal plus 1.
 
 **`catalog.indexes`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `unique: bool`, `keys:
 list<{column: text?, expr: text, descending: bool}>` (`column` set when the component is a plain column),
@@ -713,7 +716,8 @@ list<{column: text?, expr: text, descending: bool}>` (`column` set when the comp
 union<primary_key: {columns: list<text>}, unique: {columns: list<text>, index_oid: uint64}, not_null: {column:
 text}, check: {expr: text}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
 on_delete: FkAction, on_update: FkAction, deferred: bool}>`, where `FkAction` is `union<no_action: {}, restrict:
-{}, cascade: {}, set_null: {}, set_default: {}>`.
+{}, cascade: {}, set_null: {}, set_default: {}>`. A `not_null` row is listed for each column whose type is not
+nullable; it is no object (§2.6), so its `oid` is 0, its name `<table>_<column>_not_null`, and it is validated.
 
 **`catalog.types`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `kind: union<record: {}, union: {},
 enum: {}>` (`enum` for a union whose payloads are all `{}`), `type: bytes`, `type_text: text`, `members:
@@ -726,7 +730,7 @@ int64`, `min: int64`, `max: int64`, `cycle: bool`, `cache: uint32`, `owned_by: {
 uint32}?`. The current value is not reported, since it is not transactional.
 
 **`catalog.views`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `query: text` (its [QT] §15 form),
-`query_tree: bytes` (the canonical encoding of its `Query` node).
+`query_tree: bytes` (the canonical encoding of its `Query` node). `query` is that node's text form, `(query :rel …)`.
 
 **`catalog.roles`** — `name: text`, `login: bool`, `superuser: bool`, `member_of: list<text>`.
 
