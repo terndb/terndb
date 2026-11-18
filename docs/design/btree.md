@@ -73,6 +73,17 @@ It then checks each bitmap page (header, own bit, `allocated_count` its populati
 with the bitmaps, are exactly the allocated pages: a page reached twice, a free page reached, an allocated page
 reached by no tree, and a frame left on a free page each fail. `check_btree(t)` is the one-tree case.
 
+## Differential tests
+
+`btree_fuzz_tests.sysl` drives seeded random operation sequences against the tree and a sorted model, comparing
+every answer and running `btree_check` every 1 to 4 operations. It complements `btree_model_tests.sysl` (mixed
+operations over four key distributions) with shapes that stress structure: a tiny key space with heavy churn,
+ascending and descending inserts, entries at the key and entry size limits, keys that are prefixes of one another,
+and repeated drains and refills down to an empty tree. Each run is a function of `(seed, mode)`, so a failure
+message naming the seed, the mode and the operation index reproduces exactly by calling `fz_run(seed, mode, ops,
+every)`. A failing sequence is shrunk by lowering `ops` to the failing index and then becomes a fixed regression
+test in `btree_tests.sysl`.
+
 ## Spec gaps
 
 - **Hints of an empty node.** §3.5 rule 4 names slot `⌊(j + 1) × slot_count / 17⌋`, which does not exist when

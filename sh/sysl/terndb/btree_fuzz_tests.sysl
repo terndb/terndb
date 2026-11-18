@@ -1,0 +1,281 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// Differential tests of the B+tree (`btree.sysl`) against a sorted buffer, from seeded generators
+// shaped at the hard paths: a tiny key space with heavy churn, ascending and descending insert
+// orders, entries at the size limits, keys that are prefixes of one another, and repeated drain and
+// refill. Every operation's answer is compared with the model's, cursors are consumed part-way from
+// boundary keys (a held key, its successor, a cut of it, the empty key, 0xff runs), and the
+// structural check runs after every operation (every `every` operations on the long runs). A
+// failure names the seed, the mode and the operation index; `fz_run(seed, mode, ops, every)`
+// reproduces it.
+
+private fz_find(m: Buf[BtEntry], key: []const u8) -> (usize, bool)
+    var lo: usize = 0
+    var hi = m.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if m[mid].key.view() < key then lo = mid + 1 else hi = mid
+
+    (lo, lo < m.len() && m[lo].key.view() == key)
+
+private fz_in(k: []const u8, lo: KeyBound, hi: KeyBound) -> bool
+    val above = lo match
+        KeyAny -> true
+        KeyIncl(l) -> k >= l.view()
+        KeyExcl(l) -> k > l.view()
+    val below = hi match
+        KeyAny -> true
+        KeyIncl(h) -> k <= h.view()
+        KeyExcl(h) -> k < h.view()
+    above && below
+
+/** The model's entries in the range, in the direction asked. */
+private fz_want(m: Buf[BtEntry], lo: KeyBound, hi: KeyBound, forward: bool) -> Buf[BtEntry]
+    val want = buf[BtEntry]()
+
+    for e in m
+        if fz_in(e.key.view(), lo, hi) then want.push(e)
+
+    if forward then return want
+
+    val rev = buf[BtEntry]()
+    var i = want.len()
+
+    while i > 0
+        i -= 1
+        rev.push(want[i])
+
+    rev
+
+private fz_same(got: Buf[BtEntry], want: Buf[BtEntry], upto: usize) -> bool
+    if got.len() != upto then return false
+
+    for i in 0..<upto
+        if got[i].key != want[i].key || got[i].value != want[i].value then return false
+
+    true
+
+private fz_bytes(g: *Rng, alphabet: []const u8, len: usize) -> Buf[u8]
+    val k = buf[u8]()
+
+    for _ in 0..<len
+        k.push(alphabet[usize(g.below(u64(alphabet.len)))])
+
+    k
+
+private fz_be(n: u64, pad: usize) -> Buf[u8]
+    val k = buf[u8]()
+    var shift: u64 = 64
+
+    while shift > 0
+        shift -= 8
+        k.push(u8((n >> shift) & 255))
+
+    for _ in 0..<pad
+        k.push(0x70)
+
+    k
+
+/** The next key of `mode`. Modes: 0 tiny key space, 1 ascending, 2 descending, 3 size limits,
+ * 4 prefixes of one another, 5 drain and refill.
+ */
+private fz_key(g: *Rng, mode: usize, n: u64) -> Buf[u8]
+    if mode == 0
+        return fz_bytes(g, [0x00, 0x01], usize(g.below(3)))
+    if mode == 1 then return fz_be(n, 200)
+    if mode == 2 then return fz_be(0x00ffffffffffffff - n, 200)
+
+    if mode == 3
+        val len = g.below(3) match
+            0 -> 1024
+            1 -> 1
+            _ -> 1 + usize(g.below(1024))
+        val k = fz_bytes(g, [0x41, 0x42], 3)
+
+        while k.len() < len
+            k.push(0x2d)
+
+        val cut = buf[u8]()
+        cut.extend(k.view()[0..<len])
+        return cut
+
+    if mode == 4
+        val k = fz_bytes(g, [0x61], usize(g.below(60)))
+        k.extend(fz_bytes(g, [0x62, 0x00, 0xff], usize(g.below(2))).view())
+        return k
+
+    fz_be(g.below(400), 40)
+
+private fz_value(g: *Rng, mode: usize, klen: usize) -> Buf[u8]
+    val room = u64(MaxLeafEntry - klen)
+    var len = g.below(120)
+
+    if mode == 1 || mode == 2 then len = g.below(800)
+    if mode == 3 then len = if g.below(3) == 0 then room else g.below(room + 1)
+
+    fz_bytes(g, [0x00, 0x30, 0xff, 0x7a], usize(len))
+
+/** A key the model holds, else one of `mode`. */
+private fz_held(g: *Rng, m: Buf[BtEntry], mode: usize, n: u64) -> Buf[u8]
+    if m.len() > 0 && g.below(100) < 70
+        val k = buf[u8]()
+        k.extend(m[usize(g.below(u64(m.len())))].key.view())
+        return k
+
+    fz_key(g, mode, n)
+
+/** A bound key near the model's keys: a held key, its successor, a cut of it, the empty key, or a
+ * run of 0xff above everything.
+ */
+private fz_edge(g: *Rng, m: Buf[BtEntry], mode: usize, n: u64) -> Buf[u8]
+    val r = g.below(8)
+
+    if r == 0 then return buf[u8]()
+    if r == 1 then return fz_bytes(g, [0xff], 1 + usize(g.below(4)))
+
+    val k = fz_held(g, m, mode, n)
+
+    if r == 2 then k.push(0x00)
+    if r == 3 && k.len() > 0
+        val cut = buf[u8]()
+        cut.extend(k.view()[0..<k.len() - 1])
+        return cut
+
+    k
+
+private fz_bound(g: *Rng, m: Buf[BtEntry], mode: usize, n: u64) -> KeyBound = g.below(3) match
+    0 -> KeyAny
+    1 -> KeyIncl(fz_edge(g, m, mode, n))
+    _ -> KeyExcl(fz_edge(g, m, mode, n))
+
+private fz_verify(t: BTree, m: Buf[BtEntry], what: string)
+    check_btree(t) match
+        Ok(s) -> assert_eq(s.entries, m.len(), what)
+        Err(e) -> assert(false, s"$what: ${e.message}")
+    assert(fz_same(t.scan(KeyAny, KeyAny, true), fz_want(m, KeyAny, KeyAny, true), m.len()), s"$what: the full scan differs")
+
+/** One range query, as a whole scan and as a cursor consumed part-way, both directions' answers. */
+private fz_range(g: *Rng, t: BTree, m: Buf[BtEntry], mode: usize, n: u64, what: string)
+    val lo = fz_bound(g, m, mode, n)
+    val hi = fz_bound(g, m, mode, n)
+    val forward = g.below(2) == 0
+    val want = fz_want(m, lo, hi, forward)
+    assert(fz_same(t.scan(lo, hi, forward), want, want.len()), s"$what: a scan differs")
+    var c = t.cursor(lo, hi, forward)
+    val take = usize(g.below(u64(want.len() + 2)))
+    var got = buf[BtEntry]()
+
+    for _ in 0..<take
+        c.next() match
+            Some(e) -> got.push(e)
+            None -> break
+
+    val expect = if take < want.len() then take else want.len()
+    assert(fz_same(got, want, expect), s"$what: a cursor differs")
+    if take > want.len() then assert(c.next() == None, s"$what: a cursor went past its range")
+
+/** `ops` operations of `mode` from `seed`, checked every `every`, then the tree drained. */
+private fz_run(seed: u64, mode: usize, ops: usize, every: usize) -> BTree
+    val t = btree(page_space(), 7)
+    val m = buf[BtEntry]()
+    var g = rng(seed, u64(mode) + 100)
+    var n: u64 = 0
+
+    for i in 0..<ops
+        val what = s"seed $seed, mode $mode, op $i"
+        val phase = i * 4 / ops
+        val filling = mode != 5 || phase % 2 == 0
+        val r = g.below(100)
+        val monotonic = (mode == 1 || mode == 2) && g.below(100) < 85
+
+        if r < (if filling then 45 else 8)
+            val k = if monotonic then fz_key(&g, mode, n) else fz_held(&g, m, mode, n)
+            n += 1
+            val v = fz_value(&g, mode, k.len())
+            val (at, found) = fz_find(m, k.view())
+            assert_eq(t.insert(k.view(), v.view()), Ok(!found), what)
+            if !found then m.insert(at, BtEntry(k, v))
+        elif r < (if filling then 55 else 15)
+            val k = fz_held(&g, m, mode, n)
+            val v = fz_value(&g, mode, k.len())
+            val (at, found) = fz_find(m, k.view())
+            assert_eq(t.update(k.view(), v.view()), Ok(found), what)
+            if found then m[at] = BtEntry(k, v)
+        elif r < (if filling then 70 else 88)
+            // The drained phases take the smallest, the largest or a random key.
+            var k = fz_held(&g, m, mode, n)
+
+            if !filling && m.len() > 0
+                val pick = g.below(3) match
+                    0 -> 0
+                    1 -> m.len() - 1
+                    _ -> usize(g.below(u64(m.len())))
+                k = buf[u8]()
+                k.extend(m[pick].key.view())
+
+            val (at, found) = fz_find(m, k.view())
+            assert_eq(t.delete(k.view()), found, what)
+            if found then m.remove(at)
+        elif r < 82
+            val k = fz_edge(&g, m, mode, n)
+            val (at, found) = fz_find(m, k.view())
+            assert_eq(t.get(k.view()), if found then Some(m[at].value) else None, what)
+        elif r < 98
+            fz_range(&g, t, m, mode, n, what)
+        elif mode == 3
+            // Refused entries change nothing.
+            val k = if g.below(2) == 0 then fz_bytes(&g, [0x41], 1025) else fz_bytes(&g, [0x42], 10)
+            val v = fz_bytes(&g, [0x30], if k.len() > MaxKeyLen then 0 else MaxLeafEntry - k.len() + 1)
+            val want = if k.len() > MaxKeyLen then "D2001" else "D2002"
+            assert_eq(bx_code(t.insert(k.view(), v.view())), want, what)
+
+        if i % every == every - 1 then fz_verify(t, m, what)
+
+    fz_verify(t, m, s"seed $seed, mode $mode, after the run")
+    var d: usize = 0
+
+    while m.len() > 0
+        val at = usize(g.below(u64(m.len())))
+        assert(t.delete(m[at].key.view()), s"seed $seed, mode $mode, drain $d")
+        m.remove(at)
+        d += 1
+        if d % every == 0 then fz_verify(t, m, s"seed $seed, mode $mode, drain $d")
+
+    assert_eq(check_btree(t), Ok(BtStats(1, 1, 1, 0)))
+    assert_eq(t.space.allocated(), 2)
+    t
+
+@test
+the_tree_agrees_with_the_model_on_a_tiny_key_space_with_heavy_churn()
+    for seed in 1..<41
+        fz_run(u64(seed), 0, 1500, 1)
+
+@test
+the_tree_agrees_with_the_model_on_ascending_inserts()
+    for seed in 1..<7
+        fz_run(u64(seed), 1, 700, 4)
+
+@test
+the_tree_agrees_with_the_model_on_descending_inserts()
+    for seed in 1..<7
+        fz_run(u64(seed), 2, 700, 4)
+
+@test
+the_tree_agrees_with_the_model_on_entries_at_the_size_limits()
+    for seed in 1..<11
+        fz_run(u64(seed), 3, 500, 2)
+
+@test
+the_tree_agrees_with_the_model_on_keys_that_are_prefixes_of_one_another()
+    for seed in 1..<21
+        fz_run(u64(seed), 4, 1200, 2)
+
+@test
+the_tree_agrees_with_the_model_across_repeated_drains_and_refills()
+    for seed in 1..<11
+        fz_run(u64(seed), 5, 1600, 4)
