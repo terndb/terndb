@@ -104,6 +104,7 @@ during the handshake.
 | `Q6020` | `circular_membership` | A role membership that would make a role a member of itself, directly or through others (`ddl.md` §2.10 rule 9). |
 | `Q6021` | `privilege_not_applicable` | A `Grant` or `Revoke` of a privilege that does not apply to the object's kind (`ddl.md` §2.10 rules 3, 9). |
 | `Q6022` | `row_cannot_fit` | A table whose smallest row (header, key, null bitmap, fixed-width columns, one offset per variable-width column) exceeds the 4,000-octet inline limit, so no row of it could ever be stored; raised by `CreateTable` and by `AlterTable` adding columns (`ddl.md` §2.2 rule 4, §2.13 rule 10). |
+| `Q6023` | `column_retyping` | A `retype_column` of a column whose earlier retype is still `converting`: the conversion must finish first (`ddl.md` §2.13 rule 9, §8.5 rule 4). |
 | `Q7001` | `substrait_relation_unsupported` | Substrait relation not supported. |
 | `Q7002` | `substrait_type_unsupported` | Substrait type not supported. |
 | `Q7003` | `substrait_function_unmapped` | Substrait function not in the mapping. |

@@ -3,8 +3,8 @@
 `sh/sysl/terndb/btree.sysl` is the B+tree of the in-memory mode, over pages laid out byte for byte as
 `on-disk-format.md` §3 specifies; `page.sysl` holds the frame, the page header, the node layout and the data space
 with its allocation bitmaps, and `btree_check.sysl` the structural check. Keys are already-encoded,
-order-preserving byte strings (§4.6 is a separate layer) compared bytewise; values are bytes. Nothing calls it yet:
-wiring it under the store (`store.sysl`) is a later item. Its tests are `btree_tests.sysl` (each edge case by name)
+order-preserving byte strings (§4.6 is a separate layer) compared bytewise; values are bytes. The store keeps each
+table's rows in one, through the undo log's leaf (`undo.md`, `store.md`). Its tests are `btree_tests.sysl` (each edge case by name)
 and `btree_model_tests.sysl` (a seeded model test).
 
 ## Structure
@@ -72,6 +72,17 @@ a non-root node never empty; a leaf's `extra` 0; every child reference swizzled 
 It then checks each bitmap page (header, own bit, `allocated_count` its population) and that the pages reached,
 with the bitmaps, are exactly the allocated pages: a page reached twice, a free page reached, an allocated page
 reached by no tree, and a frame left on a free page each fail. `check_btree(t)` is the one-tree case.
+
+## Differential tests
+
+`btree_fuzz_tests.sysl` drives seeded random operation sequences against the tree and a sorted model, comparing
+every answer and running `btree_check` every 1 to 4 operations. It complements `btree_model_tests.sysl` (mixed
+operations over four key distributions) with shapes that stress structure: a tiny key space with heavy churn,
+ascending and descending inserts, entries at the key and entry size limits, keys that are prefixes of one another,
+and repeated drains and refills down to an empty tree. Each run is a function of `(seed, mode)`, so a failure
+message naming the seed, the mode and the operation index reproduces exactly by calling `fz_run(seed, mode, ops,
+every)`. A failing sequence is shrunk by lowering `ops` to the failing index and then becomes a fixed regression
+test in `btree_tests.sysl`.
 
 ## Spec gaps
 
