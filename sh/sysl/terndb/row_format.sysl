@@ -105,6 +105,26 @@ private[terndb] within_precision(n: i128, p: u8) -> bool
 /** A float32 value is a `real` that a `f32` holds exactly, or a NaN. */
 private[terndb] is_float32(x: real) -> bool = x.is_nan() || real(f32(x)) == x
 
+/** The IEEE bits of a float32 value. A NaN is mapped bit for bit (sign, quiet bit and payload move to the
+ * float64 NaN's top mantissa bits), because a hardware widening or narrowing would set the quiet bit and
+ * so change a signalling NaN that a row keeps as given.
+ */
+private[terndb] float32_bits(x: real) -> u32
+    if !x.is_nan() then return f32(x).bits()
+
+    val b = x.bits()
+    val sign = u32(b >> 63) << 31
+
+    sign | 0x7F800000 | u32((b >> 29) & 0x7FFFFF)
+
+/** The inverse of `float32_bits`. */
+private[terndb] float32_from_bits(bits: u32) -> real
+    if bits & 0x7F800000 != 0x7F800000 || bits & 0x7FFFFF == 0 then return real(f32.from_bits(bits))
+
+    val sign = u64(bits >> 31) << 63
+
+    real.from_bits(sign | 0x7FF0000000000000 | (u64(bits & 0x7FFFFF) << 29))
+
 private all_zero_octets(b: []const u8) -> bool
     for x in b
         if x != 0 then return false
@@ -225,7 +245,7 @@ private put_fixed(out: Buf[u8], t: Type, v: Value) -> Result[unit, CodecError]
         Float32 -> v match
             Float(x) ->
                 if !is_float32(x) then return wrong_value("a float32 value is not exactly a float32")
-                push_le(out, u128(f32(x).bits()), 4)
+                push_le(out, u128(float32_bits(x)), 4)
             _ -> return wrong_value("a float was expected")
         Float64 -> v match
             Float(x) -> push_le(out, u128(x.bits()), 8)
@@ -434,7 +454,7 @@ private get_fixed(c: *ByteCursor, t: Type) -> Result[Value, CodecError]
     t match
         Bool -> if raw > 1 then corrupt("a bool is neither 0 nor 1") else Ok(Value.Bool(raw == 1))
         UInt8 | UInt16 | UInt32 | UInt64 -> Ok(UInt(u64(raw)))
-        Float32 -> Ok(Float(real(f32.from_bits(u32(raw)))))
+        Float32 -> Ok(Float(float32_from_bits(u32(raw))))
         Float64 -> Ok(Float(real.from_bits(u64(raw))))
         Decimal(p, _) ->
             val n = sign_extend(raw, w)

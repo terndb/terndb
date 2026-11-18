@@ -1,0 +1,685 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+import sysl.rand.{Rng, rng}
+
+// Seeded properties of the key encoding (`on-disk-format.md` §4.6) and the row format (§4.1-§4.2,
+// §4.7), run over many seeds. Every failure names its seed, which `pr_rng` turns back into the same
+// stream, and the type and the encoded octets involved. Values come from per-type pools of edge
+// values (the extremes, one either side of them, NaN payloads, escape octets) as often as from the
+// shared random generators of `row_format_random_tests.sysl`.
+
+const PropSeeds: usize = 40
+
+private pr_rng(seed: usize) -> Rng = rng(0x9e37_0000 + u64(seed), 7)
+
+private pr_kc(t: Type, descending: bool) -> KeyColumn = KeyColumn(t, descending)
+
+private pr_pick[T](r: *Rng, xs: []const T) -> T = xs[usize(r.below(u64(xs.len)))]
+
+private pr_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+// -- edge value pools ---------------------------------------------------------------------------
+
+private pr_signed_pool(w: usize) -> Buf[Value]
+    val mask: u128 = if w >= 16 then u128(0) -% 1 else (u128(1) << (8 * w)) - 1
+    val max = i128.wrap(mask >> 1)
+    val out = buf[Value]()
+
+    for v in [-max - 1, -max, i128(-2), i128(-1), i128(0), i128(1), i128(2), max - 1, max]
+        out.push(Int(v))
+
+    out
+
+private pr_unsigned_pool(w: usize) -> Buf[Value]
+    val max: u64 = if w >= 8 then 0xFFFFFFFFFFFFFFFF else (u64(1) << (8 * w)) - 1
+    val out = buf[Value]()
+
+    for v in [u64(0), u64(1), u64(2), max / 2, max / 2 + 1, max - 1, max]
+        out.push(UInt(v))
+
+    out
+
+private pr_float64_pool() -> Buf[Value]
+    val out = buf[Value]()
+
+    for b in [u64(0), 0x8000000000000000, 0x3FF0000000000000, 0xBFF0000000000000, 0x7FF0000000000000,
+        0xFFF0000000000000, 0x7FF8000000000000, 0xFFF8000000000000, 0x7FF8000000000001, 0xFFF8000000000001,
+        0x7FF0000000000001, 0xFFFFFFFFFFFFFFFF, 0x7FF4000000000000, 0x0000000000000001, 0x8000000000000001,
+        0x000FFFFFFFFFFFFF, 0x800FFFFFFFFFFFFF, 0x0010000000000000, 0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF]
+        out.push(Float(real.from_bits(b)))
+
+    out
+
+private pr_float32_pool() -> Buf[Value]
+    val out = buf[Value]()
+
+    for b in [u32(0), 0x80000000, 0x3F800000, 0xBF800000, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000,
+        0x7FC00001, 0xFFC00001, 0x7F800001, 0xFFFFFFFF, 0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF,
+        0x00800000, 0x7F7FFFFF, 0xFF7FFFFF]
+        out.push(Float(float32_from_bits(b)))
+
+    out
+
+private pr_decimal_pool(p: u8) -> Buf[Value]
+    val bound = pow10(int(p))
+    val out = buf[Value]()
+
+    for v in [i128(0), i128(1), i128(-1), bound - 1, 1 - bound, bound - 2, 2 - bound, pow10(int(p) - 1), -pow10(int(p) - 1)]
+        out.push(Int(v))
+
+    out
+
+private pr_text_pool() -> Buf[Value]
+    val out = buf[Value]()
+
+    for s in ["", "\0", "\0\0", "a", "a\0", "a\0b", "ab", "b", "\u{ff}", "\u{e9}", "\u{7f}", "\u{ffff}", "\u{1F600}",
+        "\u{e9}\0\u{1F600}", "\0a", "\u{1}"]
+        out.push(Value.Text(s))
+
+    var long = ""
+    for _ in 0..<150
+        long = long + "z"
+    out.push(Value.Text(long))
+    out.push(Value.Text(long + "\0"))
+    out
+
+private pr_bytes_pool() -> Buf[Value]
+    val out = buf[Value]()
+
+    for h in ["", "00", "0000", "ff", "00ff", "ff00", "ffff", "01", "feff", "0000ffff00"]
+        out.push(Value.Bytes(rf_unhex(h)))
+
+    val zeros = buf[u8]()
+    val ones = buf[u8]()
+    for _ in 0..<100
+        zeros.push(0x00)
+        ones.push(0xFF)
+    out.push(Value.Bytes(zeros))
+    out.push(Value.Bytes(ones))
+    out
+
+/** The edge values of the key-able scalar or enum type `t`. */
+private pr_pool(t: Type) -> Buf[Value] = t match
+    Type.Bool ->
+        val out = buf[Value]()
+        out.push(Value.Bool(false))
+        out.push(Value.Bool(true))
+        out
+    Int8 | Int16 | Int32 | Int64 | Int128 | Date | Time | DateTime | Timestamp -> pr_signed_pool(row_width(t))
+    UInt8 | UInt16 | UInt32 | UInt64 -> pr_unsigned_pool(row_width(t))
+    Float32 -> pr_float32_pool()
+    Float64 -> pr_float64_pool()
+    Decimal(p, _) -> pr_decimal_pool(p)
+    Type.Text -> pr_text_pool()
+    Type.Bytes -> pr_bytes_pool()
+    Type.Interval ->
+        val out = buf[Value]()
+        val i32s = [i32(-2147483648), i32(-1), i32(0), i32(1), i32(2147483647)]
+        val i64s = [i64(-9223372036854775807) - 1, i64(-1), i64(0), i64(1), i64(9223372036854775807)]
+
+        for m in i32s
+            for d in [i32(-2147483648), i32(0), i32(2147483647)]
+                for us in i64s
+                    out.push(Value.Interval(m, d, us))
+
+        out
+    Type.Uuid -> pr_uuid_pool()
+    Union(vs) ->
+        val out = buf[Value]()
+        for i in 0..<vs.len()
+            out.push(variant(i, rec([])))
+        out
+    _ -> panic("a key-able type was expected")
+
+private pr_uuid_pool() -> Buf[Value]
+    val out = buf[Value]()
+
+    for u in [u128(0), u128(1), u128(1) << 64, (u128(1) << 64) - 1, u128(0) -% 1, (u128(0) -% 1) >> 1, ((u128(0) -% 1) >> 1) + 1]
+        out.push(Value.Uuid(u))
+
+    out
+
+/** Every key-able type the encodings cover: each width, decimals at 1 and 38 digits with every scale,
+ * and an enum of three and of one variant.
+ */
+private pr_key_types() -> Buf[Type]
+    val out = buf[Type]()
+
+    for t in [Type.Bool, Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Type.Text,
+        Type.Bytes, Date, Time, DateTime, Timestamp, Type.Interval, Type.Uuid]
+        out.push(t)
+
+    for p in [u8(1), 2, 18, 19, 37, 38]
+        for s in 0..<(usize(p) + 1)
+            out.push(Decimal(p, u8(s)))
+
+    val one = buf[Field]()
+    one.push(Field("only", record([])))
+    out.push(Type.Union(one))
+
+    val three = buf[Field]()
+    for n in ["red", "green", "blue"]
+        three.push(Field(n, record([])))
+    out.push(Type.Union(three))
+    out
+
+private pr_key_value(r: *Rng, t: Type) -> Value
+    if t.is_nullable() && r.below(5) == 0 then return Value.Null
+
+    val pool = pr_pool(t.base())
+
+    if r.below(4) == 0 then return rf_scalar_value(r, t.base())
+
+    pool[usize(r.below(u64(pool.len())))]
+
+private pr_key_text(cols: []const KeyColumn) -> string
+    var s = ""
+
+    for c in cols
+        s = s + type_text(c.ty) + (if c.descending then " desc; " else " asc; ")
+
+    s
+
+// -- key order, exhaustively over the edge pools -------------------------------------------------
+
+@test
+keys_order_exactly_as_cmp_over_every_pair_of_edge_values()
+    for t in pr_key_types()
+        val pool = pr_pool(t)
+
+        for col_t in [t, nullable(t)]
+            val vals = buf[Value]()
+
+            for v in pool
+                vals.push(v)
+
+            if col_t.is_nullable() then vals.push(Value.Null)
+
+            for desc in [false, true]
+                val cols = [pr_kc(col_t, desc)]
+
+                for a in vals
+                    for b in vals
+                        val ka = encode_key(cols, [a]).unwrap()
+                        val kb = encode_key(cols, [b]).unwrap()
+                        val want = ke_tuple_cmp(cols, [a], [b])
+
+                        if ke_memcmp(ka.view(), kb.view()) != want
+                            assert(false, s"order: ${type_text(col_t)} desc=$desc ${hex_string(ka.view())} vs ${hex_string(kb.view())}, cmp says $want")
+
+@test
+every_edge_value_round_trips_through_a_key_in_its_canonical_form()
+    for t in pr_key_types()
+        for col_t in [t, nullable(t)]
+            for desc in [false, true]
+                val cols = [pr_kc(col_t, desc)]
+
+                for v in pr_pool(t)
+                    val key = encode_key(cols, [v]).unwrap()
+                    val back = decode_key(cols, key.view()).unwrap()
+                    val canon = pr_canonical(t, v)
+
+                    if !rf_same_value(back[0], canon)
+                        assert(false, s"round trip: ${type_text(col_t)} desc=$desc key ${hex_string(key.view())} came back ${back[0]}, wanted $canon")
+
+                    if encode_key(cols, back.view()).unwrap().view() != key.view()
+                        assert(false, s"re-encode: ${type_text(col_t)} desc=$desc key ${hex_string(key.view())}")
+
+/** What a key hands back for `v`: −0.0 is +0.0 and every NaN the one canonical quiet NaN. */
+private pr_canonical(t: Type, v: Value) -> Value = (t, v) match
+    (Float64, Float(x)) -> Float(if x.is_nan() then real.from_bits(0x7FF8000000000000) elif x == 0.0 then 0.0 else x)
+    (Float32, Float(x)) -> Float(if x.is_nan() then real(f32.from_bits(0x7FC00000)) elif x == 0.0 then 0.0 else x)
+    _ -> v
+
+@test
+a_null_key_component_sorts_first_ascending_and_last_descending_and_nan_sorts_last()
+    for t in [Float32, Float64]
+        for col in [pr_kc(nullable(t), false), pr_kc(nullable(t), true)]
+            val cols = [col]
+            val nan = encode_key(cols, [Float(real.from_bits(0x7FF8000000000000))]).unwrap()
+            val inf = encode_key(cols, [Float(real.from_bits(0x7FF0000000000000))]).unwrap()
+            val nul = encode_key(cols, [Value.Null]).unwrap()
+            val sign = if col.descending then -1 else 1
+
+            assert_eq(ke_memcmp(nan.view(), inf.view()), sign)
+            assert_eq(ke_memcmp(nul.view(), inf.view()), -sign)
+            assert_eq(ke_memcmp(nul.view(), nan.view()), -sign)
+
+// -- random composite keys over many seeds -------------------------------------------------------
+
+private pr_random_cols(r: *Rng, types: []const Type, max_cols: u64) -> Buf[KeyColumn]
+    val cols = buf[KeyColumn]()
+
+    for _ in 0..<usize(1 + r.below(max_cols))
+        val t = pr_pick(r, types)
+        cols.push(KeyColumn(if r.boolean() then nullable(t) else t, r.boolean()))
+
+    cols
+
+private pr_random_tuple(r: *Rng, cols: []const KeyColumn) -> Buf[Value]
+    val vals = buf[Value]()
+
+    for c in cols
+        vals.push(pr_key_value(r, c.ty))
+
+    vals
+
+@test
+random_composite_keys_order_like_cmp_and_no_key_is_a_prefix_of_another_over_many_seeds()
+    val types = pr_key_types()
+
+    for seed in 0..<PropSeeds
+        var r = pr_rng(seed)
+
+        for _ in 0..<12
+            val cols = pr_random_cols(&r, types.view(), 4)
+            val keys = buf[Buf[u8]]()
+            val tuples = buf[Buf[Value]]()
+
+            for _ in 0..<24
+                val vals = pr_random_tuple(&r, cols.view())
+
+                if r.below(3) == 0 && tuples.len() > 0
+                    // A near neighbour: the same tuple with one component changed.
+                    val prev = tuples[usize(r.below(u64(tuples.len())))]
+                    val n = buf[Value]()
+
+                    for v in prev
+                        n.push(v)
+
+                    val i = usize(r.below(u64(cols.len())))
+                    n[i] = vals[i]
+                    keys.push(encode_key(cols.view(), n.view()).unwrap())
+                    tuples.push(n)
+                else
+                    keys.push(encode_key(cols.view(), vals.view()).unwrap())
+                    tuples.push(vals)
+
+            for i in 0..<keys.len()
+                for j in 0..<keys.len()
+                    val want = ke_tuple_cmp(cols.view(), tuples[i].view(), tuples[j].view())
+                    val got = ke_memcmp(keys[i].view(), keys[j].view())
+
+                    if got != want
+                        assert(false, s"seed $seed: ${pr_key_text(cols.view())} ${hex_string(keys[i].view())} vs ${hex_string(keys[j].view())}: memcmp $got, cmp $want")
+
+                    if got != 0 && keys[i].len() <= keys[j].len() && keys[i].view() == keys[j].view()[0..<keys[i].len()]
+                        assert(false, s"seed $seed: ${pr_key_text(cols.view())} ${hex_string(keys[i].view())} is a prefix of ${hex_string(keys[j].view())}")
+
+@test
+random_composite_keys_round_trip_in_canonical_form_over_many_seeds()
+    val types = pr_key_types()
+
+    for seed in 0..<PropSeeds
+        var r = pr_rng(seed + 1000)
+
+        for _ in 0..<50
+            val cols = pr_random_cols(&r, types.view(), 4)
+            val vals = pr_random_tuple(&r, cols.view())
+            val key = encode_key(cols.view(), vals.view()).unwrap()
+            val back = decode_key(cols.view(), key.view()).unwrap()
+
+            for i in 0..<cols.len()
+                if !rf_same_value(back[i], pr_canonical(cols[i].ty.base(), vals[i]))
+                    assert(false, s"seed $seed: ${pr_key_text(cols.view())} key ${hex_string(key.view())} column $i came back ${back[i]}, wanted ${vals[i]}")
+
+// -- key corruption -------------------------------------------------------------------------------
+
+/** Every cut of `key` is `data_corrupted`; a byte appended is `data_corrupted`; and a key with one
+ * byte changed is `data_corrupted` or reads as a value whose canonical encoding is exactly the
+ * changed octets, so that no two byte strings read as one value and no mutation reads as a value
+ * the type does not hold.
+ */
+private pr_check_key_corruption(r: *Rng, seed: usize, cols: []const KeyColumn, key: Buf[u8])
+    for n in 0..<key.len()
+        if pr_code(decode_key(cols, key.view()[0..<n])) != "D1001"
+            assert(false, s"seed $seed: ${pr_key_text(cols)} cut of ${hex_string(key.view())} to $n octets is not data_corrupted")
+
+    val longer = buf[u8]()
+    for o in key
+        longer.push(o)
+    longer.push(u8(r.below(256)))
+
+    if pr_code(decode_key(cols, longer.view())) != "D1001"
+        assert(false, s"seed $seed: ${pr_key_text(cols)} ${hex_string(longer.view())} with an octet appended is not data_corrupted")
+
+    for i in 0..<key.len()
+        val m = buf[u8]()
+        for o in key
+            m.push(o)
+
+        m[i] = m[i] ^ u8(1 + r.below(255))
+
+        decode_key(cols, m.view()) match
+            Err(e) -> if e.code != "D1001" then assert(false, s"seed $seed: ${pr_key_text(cols)} ${hex_string(m.view())} refused with ${e.code}")
+            Ok(vals) ->
+                encode_key(cols, vals.view()) match
+                    Ok(again) ->
+                        if again.view() != m.view()
+                            assert(false, s"seed $seed: ${pr_key_text(cols)} ${hex_string(m.view())} read as a value that encodes to ${hex_string(again.view())}")
+                    Err(e) -> assert(false, s"seed $seed: ${pr_key_text(cols)} ${hex_string(m.view())} read as a value that does not encode: ${e.code}")
+
+@test
+every_cut_and_every_single_octet_mutation_of_a_random_key_is_detected_or_canonical_over_many_seeds()
+    val types = pr_key_types()
+
+    for seed in 0..<PropSeeds
+        var r = pr_rng(seed + 2000)
+
+        for _ in 0..<30
+            val cols = pr_random_cols(&r, types.view(), 3)
+            val vals = pr_random_tuple(&r, cols.view())
+            val key = encode_key(cols.view(), vals.view()).unwrap()
+
+            pr_check_key_corruption(&r, seed, cols.view(), key)
+
+// -- the row format: schemas, versions, dropped columns -------------------------------------------
+
+/** A column count that leans on the null bitmap's octet boundaries. */
+private pr_column_count(r: *Rng) -> usize
+    if r.below(3) == 0 then return pr_pick(r, [usize(0), 1, 7, 8, 9, 15, 16, 17, 24, 25])
+
+    usize(r.below(14))
+
+private pr_columns(r: *Rng, n: usize, all_nullable: bool) -> Buf[Type]
+    val cols = buf[Type]()
+
+    for _ in 0..<n
+        val t = rf_type(r, 1)
+        cols.push(if all_nullable || r.below(3) == 0 then nullable(t) else t)
+
+    cols
+
+private pr_row(r: *Rng, cols: []const Type, all_null: bool) -> Buf[Value]
+    val vals = buf[Value]()
+
+    for t in cols
+        vals.push(if all_null && t.is_nullable() then Value.Null else rf_value(r, t))
+
+    vals
+
+private pr_type_text(cols: []const Type) -> string
+    var s = ""
+
+    for t in cols
+        s = s + type_text(t) + "; "
+
+    s
+
+private pr_header(r: *Rng, version: u16) -> RowHeader = RowHeader(r.next_u64(), r.next_u64(), u16(r.below(4)), version)
+
+@test
+all_null_and_empty_rows_round_trip_at_every_bitmap_width()
+    for n in 0..<70
+        val cols = buf[Type]()
+
+        for i in 0..<n
+            cols.push(nullable(pr_pick_fixed_or_variable(i)))
+
+        val vals = buf[Value]()
+        for _ in 0..<n
+            vals.push(Value.Null)
+
+        val h = RowHeader(1, 2, 0, 5)
+        val bytes = encode_row(h, cols.view(), vals.view()).unwrap()
+        val back = decode_row(cols.view(), bytes.view()).unwrap()
+
+        assert(back.header == h, s"$n columns: header")
+        assert(rf_same_values(back.values.view(), vals.view()), s"$n columns: all-null row came back changed")
+        assert_eq(bytes.len(), RowHeaderSize + (n + 7) / 8 + (n * 0) + pr_fixed_octets(cols.view()) + pr_variable_count(cols.view()) * RowOffsetSize, s"$n columns")
+
+private pr_pick_fixed_or_variable(i: usize) -> Type = [Type.Text, Int32, Type.Bytes, Int64, Float64, Type.Bool, Decimal(38, 5), Int8][i % 8]
+
+private pr_fixed_octets(cols: []const Type) -> usize
+    var n = 0
+
+    for t in cols
+        n = n + row_width(t.base())
+
+    n
+
+private pr_variable_count(cols: []const Type) -> usize
+    var n = 0
+
+    for t in cols
+        if row_width(t.base()) == 0 then n = n + 1
+
+    n
+
+/** A schema version made from `old` by dropping some columns and adding some at random places. */
+private pr_evolve(r: *Rng, old: []const Type) -> Buf[Type]
+    val out = buf[Type]()
+
+    for t in old
+        if r.below(3) != 0 then out.push(t)
+
+    for _ in 0..<usize(r.below(3))
+        val at = usize(r.below(u64(out.len() + 1)))
+        val t = rf_type(r, 1)
+        val nt = if r.boolean() then nullable(t) else t
+
+        out.push(nt)
+
+        var i = out.len() - 1
+        while i > at
+            out[i] = out[i - 1]
+            i = i - 1
+
+        out[at] = nt
+
+    out
+
+@test
+rows_of_every_schema_version_round_trip_under_their_own_column_list_over_many_seeds()
+    for seed in 0..<PropSeeds
+        var r = pr_rng(seed + 3000)
+
+        for _ in 0..<12
+            val versions = buf[Buf[Type]]()
+            versions.push(pr_columns(&r, pr_column_count(&r), false))
+
+            for _ in 0..<usize(1 + r.below(3))
+                versions.push(pr_evolve(&r, versions[versions.len() - 1].view()))
+
+            val rows = buf[Buf[u8]]()
+            val values = buf[Buf[Value]]()
+
+            for v in 0..<versions.len()
+                val vals = pr_row(&r, versions[v].view(), r.below(5) == 0)
+                val h = pr_header(&r, u16(v + 1))
+                val bytes = encode_row(h, versions[v].view(), vals.view()).unwrap()
+
+                rows.push(bytes)
+                values.push(vals)
+
+                val back = decode_row(versions[v].view(), bytes.view()).unwrap()
+
+                if back.header != h || !rf_same_values(back.values.view(), vals.view())
+                    assert(false, s"seed $seed: version ${v + 1} of ${pr_type_text(versions[v].view())} came back changed, row ${hex_string(bytes.view())}")
+
+                if encode_row(back.header, versions[v].view(), back.values.view()).unwrap().view() != bytes.view()
+                    assert(false, s"seed $seed: version ${v + 1} re-encodes differently, row ${hex_string(bytes.view())}")
+
+                // The header alone names the version, without the column list.
+                assert_eq(decode_row_header(bytes.view()).unwrap().schema_version, u16(v + 1), s"seed $seed: header version")
+
+            // Read through another version's column list, a row is refused or is some other value; it
+            // is never a crash.
+            for v in 0..<versions.len()
+                for w in 0..<versions.len()
+                    decode_row(versions[w].view(), rows[v].view()) match
+                        Ok(_) -> ()
+                        Err(e) -> if e.code != "D1001" then assert(false, s"seed $seed: row of version ${v + 1} under version ${w + 1} refused with ${e.code}")
+
+// -- the 4,000-octet inline limit -----------------------------------------------------------------
+
+private pr_encoded_len(t: Type, v: Value) -> usize = encode_value(t, v).unwrap().len()
+
+private pr_text_of(n: usize) -> Value
+    var s = ""
+
+    for _ in 0..<n
+        s = s + "x"
+
+    Value.Text(s)
+
+@test
+a_random_row_with_its_key_at_exactly_4000_octets_is_inline_and_one_more_octet_is_not_over_many_seeds()
+    for seed in 0..<PropSeeds
+        var r = pr_rng(seed + 4000)
+
+        for _ in 0..<12
+            // The random columns, then a text column that takes the entry to the limit.
+            val cols = pr_columns(&r, usize(r.below(8)), false)
+            val vals = pr_row(&r, cols.view(), false)
+
+            cols.push(Type.Text)
+            vals.push(pr_text_of(0))
+
+            val base = encode_row(RowHeader(0, 0, 0, 0), cols.view(), vals.view()).unwrap().len()
+
+            if base > 3000 then continue
+
+            val key_len = usize(r.below(u64(if 4000 - base < 1024 then 4000 - base else 1024) + 1))
+            val pad = 4000 - key_len - base
+
+            vals[vals.len() - 1] = pr_text_of(pad)
+
+            val total = encode_row(RowHeader(0, 0, 0, 0), cols.view(), vals.view()).unwrap().len()
+
+            assert_eq(key_len + total, 4000, s"seed $seed: the entry is not at the limit")
+
+            place_row(key_len, cols.view(), vals.view()) match
+                Ok(Inline) -> ()
+                other -> assert(false, s"seed $seed: ${pr_type_text(cols.view())} key $key_len pad $pad is not inline")
+
+            // One octet over: the padding column moves out of line when it is large enough to be
+            // allowed to, and the entry is refused with entry_too_large when nothing may move.
+            place_row(key_len + 1, cols.view(), vals.view()) match
+                Ok(Inline) -> assert(false, s"seed $seed: an entry of 4001 octets is inline")
+                Ok(OutOfLine(moved)) ->
+                    if moved.len() == 0 then assert(false, s"seed $seed: nothing moved from an entry of 4001 octets")
+
+                    for i in moved
+                        if pr_encoded_len(cols[i], vals[i]) < OutOfLineMinimum
+                            assert(false, s"seed $seed: column $i is under 256 octets and moved")
+                Err(e) ->
+                    if e.code != "D2002" then assert(false, s"seed $seed: entry 4001 refused with ${e.code}")
+
+                    for i in 0..<cols.len()
+                        if row_width(cols[i].base()) == 0 && pr_encoded_len(cols[i], vals[i]) >= OutOfLineMinimum
+                            assert(false, s"seed $seed: refused although column $i could move")
+
+@test
+an_entry_that_only_fixed_and_small_columns_fill_is_entry_too_large_one_octet_over_and_inline_at_the_limit()
+    // 245 int128 columns: 20 + 31 bitmap + 3920 = 3971, so a 29-octet key makes exactly 4000.
+    val cols = buf[Type]()
+    val vals = buf[Value]()
+
+    for _ in 0..<245
+        cols.push(Int128)
+        vals.push(Int(-1))
+
+    val size = encode_row(RowHeader(0, 0, 0, 0), cols.view(), vals.view()).unwrap().len()
+
+    assert_eq(size, 3971)
+    assert_eq(pr_code(place_row(4000 - size, cols.view(), vals.view())), "ok")
+    assert_eq(pr_code(place_row(4001 - size, cols.view(), vals.view())), "D2002")
+    assert_eq(pr_code(place_row(1024, cols.view(), vals.view())), "D2002")
+
+    // The same entry with variable columns that are all under 256 octets: nothing may move.
+    val mixed_cols = buf[Type]()
+    val mixed_vals = buf[Value]()
+
+    for _ in 0..<190
+        mixed_cols.push(Int128)
+        mixed_vals.push(Int(-1))
+
+    for _ in 0..<4
+        mixed_cols.push(Type.Text)
+        mixed_vals.push(pr_text_of(200))
+
+    val big = encode_row(RowHeader(0, 0, 0, 0), mixed_cols.view(), mixed_vals.view()).unwrap().len()
+
+    assert(big < 4000, s"the mixed row is $big octets")
+    assert_eq(pr_code(place_row(4000 - big, mixed_cols.view(), mixed_vals.view())), "ok")
+    assert_eq(pr_code(place_row(4001 - big, mixed_cols.view(), mixed_vals.view())), "D2002")
+
+// -- row corruption -------------------------------------------------------------------------------
+
+/** Whether `again`, a row's canonical encoding, equals `read`, the octets it was decoded from, except at
+ * octets the canonical form leaves zero. Those are the reserved octets of a relation value and of a stub,
+ * which a reader ignores (§1 rule 3), so a change to one of them cannot be detected.
+ */
+private pr_same_but_ignored(again: []const u8, read: []const u8) -> bool
+    if again.len != read.len then return false
+
+    for i in 0..<again.len
+        if again[i] != read[i] && again[i] != 0 then return false
+
+    true
+
+@test
+every_cut_and_single_octet_mutation_of_a_random_row_is_detected_or_canonical_over_many_seeds()
+    for seed in 0..<PropSeeds
+        var r = pr_rng(seed + 5000)
+
+        for _ in 0..<12
+            val cols = pr_columns(&r, pr_column_count(&r), false)
+            val vals = pr_row(&r, cols.view(), r.below(6) == 0)
+            val bytes = encode_row(RowHeader(1, 2, 0, 3), cols.view(), vals.view()).unwrap()
+
+            for n in 0..<bytes.len()
+                if pr_code(decode_row(cols.view(), bytes.view()[0..<n])) != "D1001"
+                    assert(false, s"seed $seed: ${pr_type_text(cols.view())} cut of ${hex_string(bytes.view())} to $n octets is not data_corrupted")
+
+            val longer = buf[u8]()
+            for o in bytes
+                longer.push(o)
+            longer.push(u8(r.below(256)))
+
+            if pr_code(decode_row(cols.view(), longer.view())) != "D1001"
+                assert(false, s"seed $seed: ${pr_type_text(cols.view())} row with an octet appended is not data_corrupted: ${hex_string(longer.view())}")
+
+            for i in 0..<bytes.len()
+                val m = buf[u8]()
+                for o in bytes
+                    m.push(o)
+
+                m[i] = m[i] ^ u8(1 + r.below(255))
+
+                decode_row(cols.view(), m.view()) match
+                    Err(e) -> if e.code != "D1001" then assert(false, s"seed $seed: mutation at $i refused with ${e.code}")
+                    Ok(back) ->
+                        if i >= RowHeaderSize
+                            // Past the header, what reads is what re-encodes to the same octets.
+                            encode_row_with_stubs(back.header, cols.view(), back.values.view(), back.stubs) match
+                                Ok(again) ->
+                                    if !pr_same_but_ignored(again.view()[RowHeaderSize..], m.view()[RowHeaderSize..])
+                                        assert(false, s"seed $seed: ${pr_type_text(cols.view())} ${hex_string(m.view())} read, and encodes to ${hex_string(again.view())}")
+                                Err(e) -> assert(false, s"seed $seed: ${pr_type_text(cols.view())} ${hex_string(m.view())} read as a row that does not encode: ${e.code}")
+
+// -- float32 NaN bits in a row ------------------------------------------------------------------------
+
+@test
+a_float32_nan_keeps_its_sign_quiet_bit_and_payload_through_a_row_value()
+    for b in [u32(0x7FC00000), 0xFFC00000, 0x7F800001, 0xFF800001, 0x7FBFFFFF, 0xFFBFFFFF, 0x7FFFFFFF, 0xFFFFFFFF,
+        0x7FC00001, 0x7F800035, 0x7FA00000]
+        val v = Float(float32_from_bits(b))
+        val bytes = encode_value(Float32, v).unwrap()
+
+        assert_eq(hex_string(bytes.view()), hex_string(encode_value(Float32, Float(float32_from_bits(b))).unwrap().view()))
+
+        decode_value(Float32, bytes.view()).unwrap() match
+            Float(x) -> assert_eq(float32_bits(x), b)
+            _ -> assert(false, "a float was expected")
+
+@test
+float32_infinities_and_ordinary_values_are_unchanged_by_the_nan_mapping()
+    for b in [u32(0x7F800000), 0xFF800000, 0x00000000, 0x80000000, 0x3F800000, 0x00000001, 0x7F7FFFFF, 0xFF7FFFFF]
+        assert_eq(float32_bits(float32_from_bits(b)), b)
