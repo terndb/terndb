@@ -1,0 +1,360 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The pieces of the shell that need no connection: meta-command words, settings, names, command
+// tags, error excerpts, the timing line, the catalog queries' trees, and `\d`'s text from catalog
+// rows built by hand as `ddl.md` §4.2 lays them out.
+
+@test
+meta_words_split_at_white_space()
+    val w = meta_words("  \\d  app.users\tother ")
+    assert_eq(w.len(), 3)
+    assert_eq(w[0], "d")
+    assert_eq(w[1], "app.users")
+    assert_eq(w[2], "other")
+
+@test
+meta_words_keep_a_quoted_argument_whole()
+    val w = meta_words("\\d \"my table\" x")
+    assert_eq(w.len(), 3)
+    assert_eq(w[1], "my table")
+    assert_eq(w[2], "x")
+
+@test
+meta_words_of_an_unclosed_quote_take_the_rest()
+    val w = meta_words("\\d \"my table")
+    assert_eq(w.len(), 2)
+    assert_eq(w[1], "my table")
+
+@test
+meta_words_of_a_bare_backslash_are_one_empty_command_or_none()
+    assert_eq(meta_words("\\").len(), 0)
+    assert_eq(meta_words("\\q").len(), 1)
+    assert_eq(meta_words("\\q\r")[0], "q")
+
+@test
+meta_rest_is_the_rest_of_the_line()
+    assert_eq(meta_rest("\\i /tmp/a b.sql "), "/tmp/a b.sql")
+    assert_eq(meta_rest("  \\i   'x y.sql'"), "x y.sql")
+    assert_eq(meta_rest("\\i \"x.sql\""), "x.sql")
+    assert_eq(meta_rest("\\i"), "")
+    assert_eq(meta_rest("\\i 'x.sql"), "'x.sql")
+
+@test
+settings_toggle_or_take_on_and_off()
+    assert_eq(setting_value(items_of(["x"]), false), Some(true))
+    assert_eq(setting_value(items_of(["x"]), true), Some(false))
+    assert_eq(setting_value(items_of(["x", "on"]), true), Some(true))
+    assert_eq(setting_value(items_of(["x", "ON"]), false), Some(true))
+    assert_eq(setting_value(items_of(["x", "off"]), true), Some(false))
+    assert_eq(setting_value(items_of(["x", "true"]), false), Some(true))
+    assert_eq(setting_value(items_of(["x", "0"]), true), Some(false))
+    assert_eq(setting_value(items_of(["x", "auto"]), true), None)
+
+@test
+names_split_at_the_first_dot()
+    val (ns, n) = split_name("app.users")
+    assert_eq(ns, Some("app"))
+    assert_eq(n, "users")
+    val (ns2, n2) = split_name("users")
+    assert_eq(ns2, None)
+    assert_eq(n2, "users")
+    val (ns3, n3) = split_name("a.b.c")
+    assert_eq(ns3, Some("a"))
+    assert_eq(n3, "b.c")
+
+// -- command tags ---------------------------------------------------------------------------------
+
+private mt_counts(xs: []const u64) -> Buf[u64] = items_of(xs)
+
+@test
+dml_tags_carry_their_counts()
+    val src = Values("v", buf(), buf())
+    assert_eq(command_tag(Insert(QualName("app", "t"), "t", None, buf(), src, None, buf()), mt_counts([3])), "INSERT 0 3")
+    assert_eq(command_tag(Insert(QualName("app", "t"), "t", None, buf(), src, None, buf()), mt_counts([])), "INSERT 0 0")
+    assert_eq(command_tag(Update(QualName("app", "t"), "t", None, None, None, buf(), buf()), mt_counts([2])), "UPDATE 2")
+    assert_eq(command_tag(Delete(QualName("app", "t"), "t", None, None, None, buf()), mt_counts([0])), "DELETE 0")
+
+@test
+a_tag_sums_the_counts_of_every_parameter_tuple()
+    assert_eq(command_tag(Delete(QualName("app", "t"), "t", None, None, None, buf()), mt_counts([1, 2, 3])), "DELETE 6")
+
+@test
+a_query_has_no_tag()
+    assert_eq(command_tag(Query(scan("app", "t", "t")), mt_counts([5])), "")
+
+@test
+ddl_tags_name_the_statement()
+    assert_eq(command_tag(CreateNamespace("a", false), buf()), "CREATE NAMESPACE")
+    assert_eq(command_tag(DropNamespace("a", false, false), buf()), "DROP NAMESPACE")
+    assert_eq(command_tag(DropTable(QualName("a", "t"), false, false), buf()), "DROP TABLE")
+    assert_eq(command_tag(AlterTable(QualName("a", "t"), buf()), buf()), "ALTER TABLE")
+    assert_eq(command_tag(DropIndex(QualName("a", "i"), false), buf()), "DROP INDEX")
+    assert_eq(command_tag(DropType(QualName("a", "t"), false), buf()), "DROP TYPE")
+    assert_eq(command_tag(DropSequence(QualName("a", "s"), false), buf()), "DROP SEQUENCE")
+    assert_eq(command_tag(CreateView(QualName("a", "v"), scan("a", "t", "t"), false), buf()), "CREATE VIEW")
+    assert_eq(command_tag(DropView(QualName("a", "v"), false, false), buf()), "DROP VIEW")
+    assert_eq(command_tag(DropRole("r", false), buf()), "DROP ROLE")
+    assert_eq(command_tag(AwaitJobs(1), buf()), "AWAIT JOBS")
+    assert_eq(command_tag(CancelJob(1), buf()), "CANCEL JOB")
+
+@test
+rows_show_for_queries_and_dml_that_returns()
+    val src = Values("v", buf(), buf())
+    assert(shows_rows(Query(scan("app", "t", "t"))), "a query")
+    assert(!shows_rows(Insert(QualName("app", "t"), "t", None, buf(), src, None, buf())), "an insert")
+    assert(shows_rows(Insert(QualName("app", "t"), "t", None, buf(), src, None, items_of([item("id", col("t", "id"))]))), "returning")
+    assert(shows_rows(Update(QualName("app", "t"), "t", None, None, None, buf(), items_of([item("id", col("t", "id"))]))), "returning")
+    assert(shows_rows(Delete(QualName("app", "t"), "t", None, None, None, items_of([item("id", col("t", "id"))]))), "returning")
+    assert(!shows_rows(CreateNamespace("a", false)), "DDL")
+
+// -- errors ---------------------------------------------------------------------------------------
+
+@test
+an_excerpt_points_at_the_offset()
+    assert_eq(line_excerpt("select x;", 7), "LINE 1: select x;\n" + " ".repeat(15) + "^\n")
+    assert_eq(line_excerpt("select x;", 0), "LINE 1: select x;\n" + " ".repeat(8) + "^\n")
+
+@test
+an_excerpt_names_the_line_of_the_offset()
+    assert_eq(line_excerpt("select\n  a,\n  b;", 14), "LINE 3:   b;\n" + " ".repeat(10) + "^\n")
+    assert_eq(line_excerpt("select\r\n  a;", 10), "LINE 2:   a;\n" + " ".repeat(10) + "^\n")
+
+@test
+an_excerpt_counts_wide_characters_before_the_caret()
+    assert_eq(line_excerpt("select '世界' x;", 16), "LINE 1: select '世界' x;\n" + " ".repeat(22) + "^\n")
+
+@test
+an_excerpt_at_the_end_points_past_the_text()
+    assert_eq(line_excerpt("select", 6), "LINE 1: select\n" + " ".repeat(14) + "^\n")
+    assert_eq(line_excerpt("select\n", 7), "LINE 2: \n" + " ".repeat(8) + "^\n")
+
+@test
+an_excerpt_past_the_end_is_nothing()
+    assert_eq(line_excerpt("select", 7), "")
+
+@test
+an_excerpt_of_a_two_digit_line_moves_the_caret()
+    var src = ""
+    for _ in 0..<9
+        src = src + "\n"
+    src = src + "oops"
+    assert_eq(line_excerpt(src, 9), "LINE 10: oops\n" + " ".repeat(9) + "^\n")
+
+@test
+a_front_end_error_without_a_code_or_position()
+    assert_eq(sql_error_text("x", SqlError("", "bad", None)), "ERROR:  bad\n")
+    assert_eq(sql_error_text("x", SqlError("Q1001", "bad", None)), "ERROR:  Q1001: bad\n")
+    assert_eq(sql_error_text("xy", SqlError("", "bad", Some(1))), "ERROR:  bad\nLINE 1: xy\n" + " ".repeat(9) + "^\n")
+
+@test
+a_server_error_shows_every_entry_and_its_range()
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry("Q2001", "relation app.t does not exist", "", buf(), Some(SourceRange(14, 19))))
+    entries.push(ErrorEntry("Q3001", "a second problem", "", buf(), None))
+    val w = WireError(entries, false, Unaffected, None, None)
+    assert_eq(wire_error_text("select * from app.t;", w),
+        "ERROR:  Q2001: relation app.t does not exist\nLINE 1: select * from app.t;\n" + " ".repeat(22) + "^\nERROR:  Q3001: a second problem\n")
+
+@test
+a_server_error_without_its_source_has_no_excerpt()
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry("T1001", "serialization failure", "", buf(), Some(SourceRange(0, 1))))
+    assert_eq(wire_error_text("", WireError(entries, true, Aborted, None, None)), "ERROR:  T1001: serialization failure\n")
+
+@test
+a_server_error_with_no_entries_still_says_something()
+    assert_eq(wire_error_text("", WireError(buf(), false, Unaffected, None, None)), "ERROR:  the server reported an error with no entries\n")
+
+@test
+timing_prints_milliseconds_to_three_places()
+    assert_eq(timing_text(0), "Time: 0.000 ms\n")
+    assert_eq(timing_text(5), "Time: 0.005 ms\n")
+    assert_eq(timing_text(50), "Time: 0.050 ms\n")
+    assert_eq(timing_text(1234), "Time: 1.234 ms\n")
+    assert_eq(timing_text(1000000), "Time: 1000.000 ms\n")
+    assert_eq(timing_text(-3), "Time: 0.000 ms\n")
+
+@test
+lines_of_splits_and_drops_carriage_returns()
+    assert_eq(lines_of("").len(), 0)
+    assert_eq(lines_of("a").len(), 1)
+    assert_eq(lines_of("a\n").len(), 1)
+    val ls = lines_of("a\r\n\nb")
+    assert_eq(ls.len(), 3)
+    assert_eq(ls[0], "a")
+    assert_eq(ls[1], "")
+    assert_eq(ls[2], "b")
+
+// -- the catalog queries --------------------------------------------------------------------------
+
+private mt_scans(env: Envelope) -> string = env.statement match
+    Query(rel) -> mt_rel(rel)
+    _ -> "?"
+
+private mt_rel(r: Rel) -> string = r match
+    Scan(q, _) -> q.schema + "." + q.name
+    Project(input, _, items) ->
+        var names = ""
+        for it in items
+            names = names + " " + it.name
+        mt_rel(*input) + " ->" + names
+    Filter(input, _) -> mt_rel(*input) + " filtered"
+    _ -> "?"
+
+@test
+the_catalog_queries_read_the_catalog_relations()
+    assert_eq(mt_scans(catalog_tables_query()), "catalog.tables -> oid namespace name owner primary_key")
+    assert_eq(mt_scans(catalog_views_query()), "catalog.views -> oid namespace name owner query")
+    assert_eq(mt_scans(catalog_columns_query(7)), "catalog.columns filtered -> ordinal name type_text nullable default generated identity")
+    assert_eq(mt_scans(catalog_indexes_query(7)), "catalog.indexes filtered -> name unique keys predicate state")
+    assert_eq(mt_scans(catalog_constraints_query(7)), "catalog.constraints filtered -> name validated kind")
+
+@test
+the_catalog_queries_encode()
+    for env in [catalog_tables_query(), catalog_views_query(), catalog_columns_query(1), catalog_indexes_query(1), catalog_constraints_query(1)]
+        assert(encode_envelope(env).is_ok(), "encodes")
+
+@test
+a_per_table_query_filters_on_its_oid()
+    catalog_columns_query(42).statement match
+        Query(Project(input, _, _)) -> (*input) match
+            Filter(_, pred) -> assert_eq(pred, call("eq", [col("c", "table_oid"), Literal(UInt64, UInt(42))]))
+            _ -> assert(false, "a filter")
+        _ -> assert(false, "a projected query")
+
+// -- \d from catalog rows -------------------------------------------------------------------------
+
+private mt_empty() -> Type = record([])
+
+private mt_identity() -> Type = nullable(union_of([Field("always", record([])), Field("by_default", record([]))]))
+
+private mt_columns_type() -> Type = Bag(record([Field("ordinal", UInt16), Field("name", Text), Field("type_text", Text), Field("nullable", Bool),
+    Field("default", nullable(Text)), Field("generated", nullable(Text)), Field("identity", mt_identity())]))
+
+private mt_col(ordinal: u64, name: string, ty: string, nullable: bool, default: Value, generated: Value, identity: Value) -> Value =
+    rec([UInt(ordinal), Text(name), Text(ty), Bool(nullable), default, generated, identity])
+
+private mt_key() -> Type = record([Field("column", nullable(Text)), Field("expr", Text), Field("descending", Bool)])
+
+private mt_index_state() -> Type = union_of([Field("building", record([Field("job", UInt64)])), Field("ready", record([])),
+    Field("failed", record([Field("job", UInt64)]))])
+
+private mt_indexes_type() -> Type = Bag(record([Field("name", Text), Field("unique", Bool), Field("keys", List(mt_key())),
+    Field("predicate", nullable(Text)), Field("state", mt_index_state())]))
+
+private mt_fk_action() -> Type = union_of([Field("no_action", record([])), Field("restrict", record([])), Field("cascade", record([])),
+    Field("set_null", record([])), Field("set_default", record([]))])
+
+private mt_kind() -> Type = union_of([
+    Field("primary_key", record([Field("columns", List(Text))])),
+    Field("unique", record([Field("columns", List(Text)), Field("index_oid", UInt64)])),
+    Field("not_null", record([Field("column", Text)])),
+    Field("check", record([Field("expr", Text)])),
+    Field("foreign_key", record([Field("columns", List(Text)), Field("ref_table_oid", UInt64), Field("ref_columns", List(Text)),
+        Field("on_delete", mt_fk_action()), Field("on_update", mt_fk_action()), Field("deferred", Bool)]))])
+
+private mt_constraints_type() -> Type = Bag(record([Field("name", Text), Field("validated", Bool), Field("kind", mt_kind())]))
+
+private mt_texts(xs: []const string) -> Value
+    val b = buf[Value]()
+    for x in xs
+        b.push(Text(x))
+    Relation(b)
+
+private mt_tables() -> Buf[RelEntry] = items_of([RelEntry(1, "app", "users", "table", "terndb"), RelEntry(2, "app", "posts", "table", "terndb")])
+
+@test
+d_shows_columns_in_ordinal_order_with_nullability_and_defaults()
+    val columns = cat_rows(mt_columns_type(), items_of([
+        mt_col(2, "name", "text", true, Text("'anon'"), Null, Null),
+        mt_col(1, "id", "int64", false, Null, Null, Null)]))
+    val got = describe_table_text("Table \"app.users\"", items_of(["id"]), columns, cat_rows(mt_indexes_type(), buf()),
+        cat_rows(mt_constraints_type(), buf()), mt_tables(), false)
+    assert_eq(got, " ".repeat(10) + "Table \"app.users\"\n Column | Type  | Nullable | Default\n--------+-------+----------+---------\n" +
+        " id     | int64 | not null |\n name   | text  |          | 'anon'\nPrimary key: (id)\n")
+
+@test
+d_shows_generated_and_identity_columns()
+    val ident = mt_identity()
+    val columns = cat_rows(mt_columns_type(), items_of([
+        mt_col(1, "a", "int64", false, Null, Null, variant(0, rec([]))),
+        mt_col(2, "b", "int64", false, Null, Null, variant(1, rec([]))),
+        mt_col(3, "c", "int64", true, Null, Text("a + 1"), Null)]))
+    val got = describe_table_text("T", buf(), columns, cat_rows(mt_indexes_type(), buf()), cat_rows(mt_constraints_type(), buf()), mt_tables(), false)
+    assert(got.contains(" a      | int64 | not null | generated always as identity\n"), got)
+    assert(got.contains(" b      | int64 | not null | generated by default as identity\n"), got)
+    assert(got.contains(" c      | int64 |          | generated always as (a + 1)\n"), got)
+    assert(!got.contains("Primary key"), "no key")
+    assert(ident.is_nullable(), "identity is nullable")
+
+@test
+d_shows_indexes_sorted_with_their_keys_and_state()
+    val indexes = cat_rows(mt_indexes_type(), items_of([
+        rec([Text("users_name"), Bool(true), rel([rec([Text("name"), Text("name"), Bool(false)])]), Null, variant(1, rec([]))]),
+        rec([Text("users_lower"), Bool(false), rel([rec([Null, Text("lower(name)"), Bool(true)]), rec([Text("id"), Text("id"), Bool(false)])]),
+            Text("id > 0"), variant(0, rec([UInt(9)]))]),
+        rec([Text("users_bad"), Bool(false), rel([rec([Text("id"), Text("id"), Bool(false)])]), Null, variant(2, rec([UInt(3)]))])]))
+    val got = describe_table_text("T", buf(), cat_rows(mt_columns_type(), buf()), indexes, cat_rows(mt_constraints_type(), buf()), mt_tables(), false)
+    assert(got.ends_with("Indexes:\n    \"users_bad\" (id) INVALID\n    \"users_lower\" (lower(name) DESC, id) WHERE id > 0 BUILDING\n    \"users_name\" UNIQUE (name)\n"), got)
+
+@test
+d_shows_check_unique_and_foreign_key_constraints_and_skips_the_rest()
+    val constraints = cat_rows(mt_constraints_type(), items_of([
+        rec([Text("posts_pkey"), Bool(true), variant(0, rec([mt_texts(["id"])]))]),
+        rec([Text("posts_title_nn"), Bool(true), variant(2, rec([Text("title")]))]),
+        rec([Text("posts_ck"), Bool(false), variant(3, rec([Text("id > 0")]))]),
+        rec([Text("posts_uq"), Bool(true), variant(1, rec([mt_texts(["title", "author_id"]), UInt(5)]))]),
+        rec([Text("posts_fk"), Bool(true), variant(4, rec([mt_texts(["author_id"]), UInt(1), mt_texts(["id"]), variant(2, rec([])), variant(0, rec([])), Bool(false)]))]),
+        rec([Text("posts_fk2"), Bool(true), variant(4, rec([mt_texts(["x"]), UInt(99), mt_texts(["y"]), variant(0, rec([])), variant(3, rec([])), Bool(true)]))])]))
+    val got = describe_table_text("T", buf(), cat_rows(mt_columns_type(), buf()), cat_rows(mt_indexes_type(), buf()), constraints, mt_tables(), false)
+    assert(got.ends_with("Unique constraints:\n    \"posts_uq\" UNIQUE (title, author_id)\nCheck constraints:\n    \"posts_ck\" CHECK (id > 0) NOT VALID\n" +
+        "Foreign-key constraints:\n    \"posts_fk\" FOREIGN KEY (author_id) REFERENCES app.users(id) ON DELETE CASCADE\n" +
+        "    \"posts_fk2\" FOREIGN KEY (x) REFERENCES oid 99(y) ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED\n"), got)
+    assert(!got.contains("posts_pkey") && !got.contains("posts_title_nn"), "keys and not-nulls show elsewhere")
+
+@test
+d_of_a_table_with_no_columns_still_has_its_heading()
+    val got = describe_table_text("T", buf(), cat_rows(mt_columns_type(), buf()), cat_rows(mt_indexes_type(), buf()),
+        cat_rows(mt_constraints_type(), buf()), mt_tables(), false)
+    assert_eq(got, " ".repeat(17) + "T\n Column | Type | Nullable | Default\n--------+------+----------+---------\n")
+
+@test
+d_in_expanded_mode_shows_a_block_per_column()
+    val columns = cat_rows(mt_columns_type(), items_of([mt_col(1, "id", "int64", false, Null, Null, Null)]))
+    val got = describe_table_text("Table \"app.t\"", items_of(["id"]), columns, cat_rows(mt_indexes_type(), buf()),
+        cat_rows(mt_constraints_type(), buf()), mt_tables(), true)
+    assert_eq(got, "Table \"app.t\"\n-[ RECORD 1 ]------\nColumn   | id\nType     | int64\nNullable | not null\nDefault  |\nPrimary key: (id)\n")
+
+@test
+d_describes_a_view_with_its_definition()
+    val columns = cat_rows(mt_columns_type(), items_of([mt_col(1, "n", "int64", true, Null, Null, Null)]))
+    assert_eq(describe_view_text("View \"app.v\"", columns, "project(...)", false),
+        "  View \"app.v\"\n Column | Type\n--------+-------\n n      | int64\nView definition:\n project(...)\n")
+
+@test
+listings_sort_by_namespace_then_name()
+    val entries = items_of([RelEntry(3, "b", "a", "table", "x"), RelEntry(1, "a", "z", "view", "y"), RelEntry(2, "a", "b", "table", "x")])
+    assert_eq(relations_text(entries, "List of relations", false),
+        " ".repeat(8) + "List of relations\n Namespace | Name | Type  | Owner\n-----------+------+-------+-------\n a         | b    | table | x\n a         | z    | view  | y\n b         | a    | table | x\n(3 rows)\n")
+
+@test
+catalog_rows_are_read_by_name_whatever_their_order()
+    val t = Bag(record([Field("b", Text), Field("a", Int64)]))
+    val r = cat_rows(t, items_of([rec([Text("x"), Int(5)])]))
+    assert_eq(cat_text(r.at(0, "b")), "x")
+    assert_eq(cat_u64(r.at(0, "a")), 5)
+    assert(r.at(0, "missing").is_null(), "a column the result lacks is null")
+
+@test
+catalog_values_read_leniently()
+    assert_eq(cat_text(Null), "")
+    assert_eq(cat_bool(Null), false)
+    assert_eq(cat_u64(Int(-1)), 0)
+    assert_eq(cat_u64(UInt(7)), 7)
+    assert_eq(cat_texts(Null).len(), 0)
+    assert_eq(variant_name(mt_fk_action(), Null), "")
+    assert_eq(variant_name(mt_fk_action(), variant(4, rec([]))), "set_default")
+    assert_eq(variant_name(mt_fk_action(), variant(9, rec([]))), "")

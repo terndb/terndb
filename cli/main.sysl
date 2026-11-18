@@ -1,0 +1,210 @@
+// `terndb` -- the TernDB command line (`docs/design/shell.md` § The program). `terndb serve` serves one
+// in-memory database over the native protocol until SIGINT or SIGTERM (`docs/design/engine.md` § The
+// server); `terndb`, or `terndb shell`, is the interactive shell, over a server's Unix socket or over
+// an in-memory database embedded in the shell itself.
+
+import sh.sysl.terndb.{BootstrapRole, Embedded, MonotonicClock, NoSqlFrontEnd, OverSocket, Shell, ShellConn, connect_shell, embedded_link,
+    engine, mem_catalog, random_octets, serve, server_settings, shell, shell_client_config, socket_link}
+import sysl.args.{cli, long_option, option, parse_or_exit}
+import sysl.encoding.hex_string
+import sysl.env
+import sysl.fs.read_text
+import sysl.io.{lines, read_all_text, stdin}
+import sysl.net.ipv4
+import sysl.posix.tty.{cooked, flush, hidden, is_tty, raw, tty_writer}
+import sysl.signal
+import sysl.term.edit.editor
+import sysl.text.parse_int
+import sysl.time.now
+
+const Version: string = "0.0.1"
+
+main(args: []string)
+    if args.len > 1 && args[1] == "serve" then serve_main(args[1..])
+    elif args.len > 1 && args[1] == "shell" then shell_main(args[1..])
+    else shell_main(args)
+
+// -- terndb serve ---------------------------------------------------------------------------------
+
+serve_main(args: []string)
+    val socket = option('s', "socket", "path", "the Unix-domain socket to make (default: terndb.sock)")
+    val port = option('p', "port", "port", "listen on TCP at 127.0.0.1 (TLS is not served yet: plaintext is refused)")
+    val database = option('d', "database", "name", "the database's name (default: terndb)")
+    val password_file = long_option("password-file", "path", "the bootstrap role's password (else $TERNDB_PASSWORD)")
+    val spec = cli("terndb serve", [socket, port, database, password_file], about = "A TernDB server over one in-memory database.",
+        version = Version)
+    val opts = parse_or_exit(spec, args)
+
+    val password = opts.value(password_file) match
+        Some(p) -> read_text(p).expect("a readable password file").trim_end()
+        None -> env.get("TERNDB_PASSWORD").unwrap_or("")
+    if password.len == 0
+        eprints("terndb: error: no password: give --password-file or set TERNDB_PASSWORD\n")
+        exit(2)
+
+    var settings = server_settings(password)
+    settings.database = opts.value_or(database, "terndb")
+    settings.unix_path = Some(opts.value_or(socket, "terndb.sock"))
+    opts.value(port) match
+        Some(p) -> settings.tcp = Some(ipv4(127, 0, 0, 1, u16(parse_int(p).expect("a port number"))))
+        None -> ()
+
+    var interrupt = signal.watch(signal.INT).expect("a SIGINT watch")
+    var terminate = signal.watch(signal.TERM).expect("a SIGTERM watch")
+    var srv = serve(engine(mem_catalog(), now().us, MonotonicClock()), settings).expect("listening")
+
+    print(s"terndb: serving database ${settings.database} on ${settings.unix_path.unwrap()} as role $BootstrapRole")
+    srv.tcp_address() match
+        Some(a) -> print(s"terndb: TCP on $a refuses plaintext; TLS is not served yet")
+        None -> ()
+
+    srv.run(() -> interrupt.take() || terminate.take()).expect("serving")
+    print("terndb: shut down")
+
+// -- terndb shell ---------------------------------------------------------------------------------
+
+shell_main(args: []string)
+    val socket = option('h', "socket", "path", "the server's Unix-domain socket (else $TERNDB_SOCKET; neither: an in-memory database)")
+    val database = option('d', "database", "name", "the database to connect to (default: terndb)")
+    val user = option('U', "user", "name", "the role to log in as (default: terndb)")
+    val command = option('c', "command", "sql", "run these statements and meta-commands, then exit")
+    val file = option('f', "file", "path", "run the statements and meta-commands in this file, then exit")
+    val spec = cli("terndb", [socket, database, user, command, file],
+        about = "The TernDB shell. `terndb serve --help` describes the server.", version = Version)
+    val opts = parse_or_exit(spec, args)
+
+    val db = opts.value_or(database, "terndb")
+    val role = opts.value_or(user, BootstrapRole)
+    val at: Option[string] = opts.value(socket) match
+        Some(p) -> Some(p)
+        None -> env.get("TERNDB_SOCKET")
+    val interactive = !opts.given(command) && !opts.given(file) && is_tty(0)
+
+    var sh = at match
+        Some(p) -> open_server(p, db, role)
+        None -> open_embedded(db, role)
+
+    if interactive then banner(at, db)
+
+    if opts.given(command)
+        sh.run_script(opts.value(command).unwrap())
+        finish(&sh)
+    if opts.given(file)
+        val path = opts.value(file).unwrap()
+        read_text(path) match
+            Ok(text) -> sh.run_script(text)
+            Err(e) ->
+                eprints(s"terndb: error: $path: ${e.message()}\n")
+                exit(1)
+        finish(&sh)
+    if !interactive
+        var input = stdin()
+        read_all_text(&input) match
+            Ok(text) -> sh.run_script(text)
+            Err(_) ->
+                eprints("terndb: error: standard input is not UTF-8\n")
+                exit(1)
+        finish(&sh)
+
+    var input = stdin()
+    var ed = editor(&input, tty_writer())
+    loop
+        prints(sh.prompt())
+        flush()
+        val _ = raw()
+        val got = ed.getline()
+        cooked()
+        got match
+            Some(line) -> sh.feed_line(line)
+            None ->
+                prints("\\q\n")
+                break
+        write_out(&sh)
+        if sh.quit then break
+    sh.end_input(false)
+    write_out(&sh)
+    sh.close()
+    exit(0)
+
+/** A shell over the server at socket `at`. */
+open_server(at: string, db: string, role: string) -> Shell
+    val password = env.get("TERNDB_PASSWORD") match
+        Some(p) -> p
+        None -> ask_password(role)
+    val link = socket_link(at) match
+        Ok(l) -> l
+        Err(e) ->
+            eprints(s"terndb: error: connection to server on socket \"$at\" failed: $e\n")
+            exit(2)
+    val conn = connect(link, db, role, password, s"to server on socket \"$at\"")
+    shell(conn, NoSqlFrontEnd(), OverSocket(at), db, role)
+
+/** A shell over an in-memory database of its own, logged in with a password made for it. */
+open_embedded(db: string, role: string) -> Shell
+    val password = random_octets(16) match
+        Ok(b) -> hex_string(b.view())
+        Err(e) ->
+            eprints(s"terndb: error: no random password for the embedded database: ${e.message()}\n")
+            exit(2)
+    val e = engine(mem_catalog(), now().us, MonotonicClock())
+    val link = embedded_link(e, db, password) match
+        Ok(l) -> l
+        Err(m) ->
+            eprints(s"terndb: error: the embedded database did not start: $m\n")
+            exit(2)
+    val conn = connect(link, db, role, password, "to the embedded database")
+    shell(conn, NoSqlFrontEnd(), Embedded, db, role)
+
+connect(link: &sh.sysl.terndb.Link, db: string, role: string, password: string, where: string) -> ShellConn
+    val config = shell_client_config(db, role, password) match
+        Ok(c) -> c
+        Err(m) ->
+            eprints(s"terndb: error: $m\n")
+            exit(2)
+    connect_shell(link, config) match
+        Ok(c) -> c
+        Err(m) ->
+            eprints(s"terndb: error: connection $where failed: $m\n")
+            exit(2)
+
+/** The password, typed at the terminal with echo off. Without a terminal there is nowhere to ask. */
+ask_password(role: string) -> string
+    if !is_tty(0)
+        eprints("terndb: error: no password: set TERNDB_PASSWORD\n")
+        exit(2)
+    prints(s"Password for user $role: ")
+    flush()
+    val _ = hidden()
+    var input = stdin()
+    var ls = lines(&input)
+    val got = ls.next()
+    cooked()
+    prints("\n")
+    got.unwrap_or("")
+
+banner(at: Option[string], db: string)
+    at match
+        Some(p) -> prints(s"terndb $Version, connected to database \"$db\" on socket \"$p\".\n")
+        None ->
+            prints(s"terndb $Version, with an in-memory database embedded in this shell.\n")
+            prints("Its data lives only for this session: it is gone when the shell exits.\n")
+    prints("This build has no SQL front end: only meta-commands run.\n")
+    prints("Type \\? for help, \\q to quit.\n\n")
+    flush()
+
+/** Writes what the shell printed, to standard output and standard error. */
+write_out(sh: *Shell)
+    for p in sh.take_printed()
+        if p.to_err
+            flush()
+            eprints(p.text)
+        else
+            prints(p.text)
+    flush()
+
+/** Ends a script run: 1 if anything in it failed, 0 otherwise. */
+finish(sh: *Shell)
+    sh.end_input(true)
+    write_out(sh)
+    sh.close()
+    exit(if sh.errors > 0 then 1 else 0)

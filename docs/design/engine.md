@@ -116,7 +116,7 @@ which `sysl.net` does not report yet, so `peer` fails (`W3001`).
 **Configuration** is the command line, since the specs name no configuration file:
 
 ```
-TERNDB_PASSWORD=… server/terndb [--socket <path>] [--port <n>] [--database <name>] [--password-file <path>]
+TERNDB_PASSWORD=… terndb serve [--socket <path>] [--port <n>] [--database <name>] [--password-file <path>]
 ```
 
 `--socket` defaults to `terndb.sock` in the working directory (a file left there by an earlier run is
@@ -126,8 +126,8 @@ opens the TCP listener described above. The connection limits it announces are `
 `max_in_flight` 64, `max_open_txns` 16 and `max_message_size` 16 MiB; wire 1.0 and the tree version of
 `qtree.sysl`; no compression; a 10-second handshake deadline and no idle limit.
 
-The program is `server/` (its own `sysl.hocon`, depending on the package by path), built with
-`sysl build server`. Tests: `server_tests.sysl`, which run wire clients over a real Unix socket and a real TCP
+The program is `terndb serve`, in `cli/` (its own `sysl.hocon`, depending on the package by path), built with
+`sysl build cli`; the same binary is the shell (`docs/design/shell.md`). Tests: `server_tests.sysl`, which run wire clients over a real Unix socket and a real TCP
 connection against a server in the same process, turning its loop by hand on a `ManualClock`.
 
 ## What it does not do yet

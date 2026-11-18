@@ -1,0 +1,297 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.text.columns
+
+// The shell's result display (`docs/design/shell.md` § Results): psql's aligned format, a heading
+// line, a rule and the rows, with a `(N rows)` footer; and its expanded format, a block of
+// `heading | value` lines per row. Widths are measured in terminal columns, so a wide character
+// counts two and a combining mark none. A cell may hold several lines — text with line breaks, or a
+// nested relation drawn as a table of its own — and its row is as tall as its tallest cell. Every
+// line is written without trailing blanks.
+//
+// A value becomes a cell's text by `cell_text`: null is an empty cell; a scalar is its canonical text
+// form (`text_form.sysl`); a relation of records is a nested table without a footer; any other
+// relation, a record and a union take the compact form, `[…]`, `{field: …}` and `variant {…}`, in
+// which text is quoted and null is `null`.
+
+/** What the shell prints as a table: headings, which columns are aligned right (the numeric ones,
+ * as psql does), and rows of cells, each as many cells as there are headings.
+ */
+struct Grid
+    headings: Buf[string]
+    right: Buf[bool]
+    rows: Buf[Buf[string]]
+
+grid(headings: []const string) -> Grid
+    val right = buf[bool]()
+    for _ in headings
+        right.push(false)
+    Grid(items_of(headings), right, buf())
+
+/** How many terminal columns `s` takes, as one line. */
+text_width(s: string) -> usize = columns(s.bytes)
+
+/** The lines of a cell: at least one, so an empty cell still has a line. */
+private cell_lines(s: string) -> Buf[string]
+    val out = buf[string]()
+    var start: usize = 0
+    var i: usize = 0
+    while i < s.len
+        if s.bytes[i] == u8('\n')
+            out.push(s[start..<i])
+            start = i + 1
+        i += 1
+    out.push(s[start..<s.len])
+    out
+
+private spaces(n: usize) -> string = " ".repeat(n)
+
+private pad_right(s: string, w: usize) -> string
+    val have = text_width(s)
+    if have >= w then s else s + spaces(w - have)
+
+private pad_left(s: string, w: usize) -> string
+    val have = text_width(s)
+    if have >= w then s else spaces(w - have) + s
+
+/** `s` centred in `w` columns, the odd column to its right, as psql centres a heading. */
+private centre(s: string, w: usize) -> string
+    val have = text_width(s)
+    if have >= w then return s
+    val left = (w - have) / 2
+    spaces(left) + s + spaces(w - have - left)
+
+/** `s` without the blanks at its end. */
+private trimmed(s: string) -> string
+    var n = s.len
+    while n > 0 && s.bytes[n - 1] == u8(' ')
+        n -= 1
+    s[0..<n]
+
+/** `(1 row)` or `(N rows)`. */
+row_footer(n: usize) -> string = if n == 1 then "(1 row)" else s"($n rows)"
+
+/** The width of each column: its heading's, or its widest line's. */
+private widths(g: Grid) -> Buf[usize]
+    val w = buf[usize]()
+    for h in g.headings
+        w.push(text_width(h))
+    for r in g.rows
+        for j in 0..<g.headings.len()
+            for l in cell_lines(r[j])
+                val lw = text_width(l)
+                if lw > w[j] then w[j] = lw
+    w
+
+/** `g` in the aligned format, every line ending in a line break: `title` centred above it when it is
+ * not empty, and the row-count footer when `footer` is set.
+ */
+render_aligned(g: Grid, title: string, footer: bool) -> string
+    var out = ""
+    val n = g.headings.len()
+    val w = widths(g)
+
+    var total: usize = 0
+    for j in 0..<n
+        total += w[j] + 2
+    if n > 0 then total += n - 1
+
+    if title.len > 0 then out = out + trimmed(centre(title, total)) + "\n"
+
+    if n == 0
+        out = out + "--\n"
+    else
+        var head = ""
+        var rule = ""
+        for j in 0..<n
+            if j > 0
+                head = head + "|"
+                rule = rule + "+"
+            head = head + " " + centre(g.headings[j], w[j]) + " "
+            rule = rule + "-".repeat(w[j] + 2)
+        out = out + trimmed(head) + "\n" + rule + "\n"
+
+        for r in g.rows
+            val cells = buf[Buf[string]]()
+            var height: usize = 1
+            for j in 0..<n
+                val ls = cell_lines(r[j])
+                if ls.len() > height then height = ls.len()
+                cells.push(ls)
+
+            for k in 0..<height
+                var line = ""
+                for j in 0..<n
+                    if j > 0 then line = line + "|"
+                    val text = if k < cells[j].len() then cells[j][k] else ""
+                    val padded = if g.right[j] then pad_left(text, w[j]) else pad_right(text, w[j])
+                    line = line + " " + padded + " "
+                out = out + trimmed(line) + "\n"
+
+    if footer then out = out + row_footer(g.rows.len()) + "\n"
+    out
+end render_aligned
+
+/** `g` in the expanded format: `title` above it when it is not empty, then for each row a
+ * `-[ RECORD n ]` line ruled to the block's width and one `heading | value` line per column, a value
+ * of several lines continuing under its first. A result of no rows is `(0 rows)`.
+ */
+render_expanded(g: Grid, title: string) -> string
+    var out = ""
+    if title.len > 0 then out = out + title + "\n"
+
+    if g.rows.len() == 0
+        return out + "(0 rows)\n"
+
+    val n = g.headings.len()
+    var label: usize = 0
+    for h in g.headings
+        if text_width(h) > label then label = text_width(h)
+
+    var value: usize = 0
+    for r in g.rows
+        for j in 0..<n
+            for l in cell_lines(r[j])
+                if text_width(l) > value then value = text_width(l)
+
+    val total = label + 3 + value
+
+    for i in 0..<g.rows.len()
+        var head = s"-[ RECORD ${i + 1} ]"
+        if text_width(head) < total then head = head + "-".repeat(total - text_width(head))
+        out = out + head + "\n"
+
+        for j in 0..<n
+            val ls = cell_lines(g.rows[i][j])
+            for k in 0..<ls.len()
+                val name = if k == 0 then g.headings[j] else ""
+                out = out + trimmed(pad_right(name, label) + " | " + ls[k]) + "\n"
+
+    out
+end render_expanded
+
+/** `g` in whichever format `expanded` picks, with the footer the aligned format takes. */
+render_grid(g: Grid, title: string, expanded: bool) -> string =
+    if expanded then render_expanded(g, title) else render_aligned(g, title, true)
+
+// -- values as cells ------------------------------------------------------------------------------
+
+/** Whether a column of type `t` is aligned right: the numbers. */
+is_numeric(t: Type) -> bool = t.base() match
+    Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64 | Decimal(_, _) -> true
+    _ -> false
+
+/** The element type of a relation type, if `t` is one. */
+private elem_of(t: Type) -> Option[Type] = t.base() match
+    Bag(e) -> Some(*e)
+    List(e) -> Some(*e)
+    _ -> None
+
+/** The fields of a record type, if `t` is one. */
+private fields_of(t: Type) -> Option[Buf[Field]] = t.base() match
+    Record(fs) -> Some(fs)
+    _ -> None
+
+/** The text of a scalar, which has a canonical text form; a value not of its type, which a decoded
+ * batch never holds, shows as `?`.
+ */
+private scalar_text(t: Type, v: Value) -> string = to_text(t, v) match
+    Ok(s) -> s
+    Err(_) -> "?"
+
+/** `s` quoted as a SQL string literal. */
+quoted_text(s: string) -> string = "'" + s.replace_all("'", "''") + "'"
+
+/** The cell that shows value `v` of type `t`. */
+cell_text(t: Type, v: Value) -> string
+    if v.is_null() then return ""
+
+    elem_of(t) match
+        Some(e) ->
+            fields_of(e) match
+                Some(fs) ->
+                    v match
+                        Relation(elems) -> return render_aligned(relation_grid(fs, elems), "", false).trim_end()
+                        _ -> ()
+                None -> ()
+        None -> ()
+
+    t.base() match
+        Record(_) | Union(_) | Bag(_) | List(_) -> compact_text(t, v)
+        _ -> scalar_text(t, v)
+end cell_text
+
+/** The compact form of `v`, which nests: `null`, a quoted text, `{name: value, …}`, `variant` or
+ * `variant {…}`, and `[value, …]`.
+ */
+compact_text(t: Type, v: Value) -> string
+    if v.is_null() then return "null"
+
+    (t.base(), v) match
+        (Text, Text(s)) -> quoted_text(s)
+        (Record(fs), Record(vs)) ->
+            var out = "{"
+            for i in 0..<fs.len()
+                if i > 0 then out = out + ", "
+                out = out + fs[i].name + ": " + compact_text(fs[i].ty, vs[i])
+            out + "}"
+        (Union(variants), Variant(tag, payload)) ->
+            val name = variants[tag].name
+            val inner = *payload
+            val empty = inner match
+                Record(vs) -> vs.len() == 0
+                _ -> false
+            if empty then name else name + " " + compact_text(variants[tag].ty, inner)
+        (Bag(e), Relation(elems)) -> compact_list(*e, elems)
+        (List(e), Relation(elems)) -> compact_list(*e, elems)
+        _ -> scalar_text(t, v)
+end compact_text
+
+private compact_list(e: Type, elems: Buf[Value]) -> string
+    var out = "["
+    for i in 0..<elems.len()
+        if i > 0 then out = out + ", "
+        out = out + compact_text(e, elems[i])
+    out + "]"
+
+/** The grid of a relation of records with fields `fs`. */
+relation_grid(fs: Buf[Field], elems: Buf[Value]) -> Grid
+    val headings = buf[string]()
+    val right = buf[bool]()
+    for f in fs
+        headings.push(f.name)
+        right.push(is_numeric(f.ty))
+
+    val rows = buf[Buf[string]]()
+    for v in elems
+        val cells = buf[string]()
+        v match
+            Record(vs) ->
+                for i in 0..<fs.len()
+                    cells.push(cell_text(fs[i].ty, vs[i]))
+            _ ->
+                for _ in fs
+                    cells.push("")
+        rows.push(cells)
+
+    Grid(headings, right, rows)
+
+/** The grid of a result of type `result` whose rows are `rows`: a relation of records shows a column
+ * per field; a relation of anything else shows one column, `?column?`.
+ */
+result_grid(result: Type, rows: Buf[Value]) -> Grid
+    val e = elem_of(result).unwrap_or(result)
+    fields_of(e) match
+        Some(fs) -> relation_grid(fs, rows)
+        None ->
+            val headings = buf[string]()
+            headings.push("?column?")
+            val right = buf[bool]()
+            right.push(is_numeric(e))
+            val out = buf[Buf[string]]()
+            for v in rows
+                val cells = buf[string]()
+                cells.push(cell_text(e, v))
+                out.push(cells)
+            Grid(headings, right, out)
