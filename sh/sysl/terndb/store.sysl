@@ -6,7 +6,9 @@ import sysl.buf.{Buf, buf}
 // §5): transactions begun at one of the three levels, reads at a snapshot through each row's chain of
 // versions, writes under first-updater-wins, and commit-time validation of a serializable
 // transaction's predicate log. StoredRows are `Value` records, each carrying the schema version it was
-// encoded in (`ddl.md` §5.2). The store is single-threaded: transactions interleave by the order
+// encoded in (`ddl.md` §5.2). Rows are kept as `on-disk-format.md` §8.1 has in-memory mode keep them:
+// one B+tree per table over 16 KB pages, each row in the row format (§4), every older version in the
+// undo log (§5), all through `UndoRows` (`undo.sysl`). The store is single-threaded: transactions interleave by the order
 // their operations are called in, and a write that would wait for another transaction's row lock
 // answers `Wait` instead of blocking (`docs/design/store.md`).
 

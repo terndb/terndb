@@ -3,8 +3,8 @@
 `sh/sysl/terndb/btree.sysl` is the B+tree of the in-memory mode, over pages laid out byte for byte as
 `on-disk-format.md` §3 specifies; `page.sysl` holds the frame, the page header, the node layout and the data space
 with its allocation bitmaps, and `btree_check.sysl` the structural check. Keys are already-encoded,
-order-preserving byte strings (§4.6 is a separate layer) compared bytewise; values are bytes. Nothing calls it yet:
-wiring it under the store (`store.sysl`) is a later item. Its tests are `btree_tests.sysl` (each edge case by name)
+order-preserving byte strings (§4.6 is a separate layer) compared bytewise; values are bytes. The store keeps each
+table's rows in one, through the undo log's leaf (`undo.md`, `store.md`). Its tests are `btree_tests.sysl` (each edge case by name)
 and `btree_model_tests.sysl` (a seeded model test).
 
 ## Structure
