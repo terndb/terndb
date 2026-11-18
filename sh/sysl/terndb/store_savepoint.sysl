@@ -25,7 +25,7 @@ impl Store
      */
     savepoint(*self, t: &Txn, name: string) -> Result[unit, CodecError]
         live(t)?
-        t.saves.push(Save(name, mark_of(t), self.ddl_steps(t), self.cat_locks_of(t)))
+        t.saves.push(Save(name, self.mark_of(t), self.ddl_steps(t), self.cat_locks_of(t)))
         Ok(())
 
     /** Undoes everything `t` did after savepoint `name` and keeps the savepoint (§5.5 rule 2): its
@@ -45,11 +45,11 @@ impl Store
             None -> return fail("W2012", s"no savepoint $name is set")
 
         val sp = t.saves[i]
-        undo_to(t, sp.mark)
+        self.undo_to(t, sp.mark)
         t.saves.truncate(i + 1)
         t.state = Live
         t.waits_for = 0
-        t.mark = mark_of(t)
+        t.mark = self.mark_of(t)
 
         self.rollback_catalog(t, sp.steps, sp.cat_locks) match
             Ok(_) -> ()

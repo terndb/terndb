@@ -1,0 +1,145 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// One test for each place a Phase-0 module raises a code that no other test of that module reaches:
+// the store's `data_corrupted` guards, the versioned catalog's `read_only_transaction` and its
+// `lock_timeout` at a commit, and the history driver's `unknown_transaction`. The names and the
+// retryability of the codes are held to `errors.md` by `error_registry_tests.sysl`.
+
+private ep_changes(c: RowChange) -> Buf[RowChange]
+    val out = buf[RowChange]()
+    out.push(c)
+    out
+
+private ep_ddl_code(s: &Store, t: &Txn, st: Statement) -> string = st_code(s.ddl(t, envelope([], st), BootstrapRole))
+
+private ep_x() -> Statement = cat_table("x", [cat_col("id", Int64)], ["id"])
+
+// -- store: data_corrupted (D1001) --------------------------------------------------------------
+
+@test
+a_replace_or_remove_of_a_row_that_is_not_there_is_data_corrupted()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+
+    // Each statement gets its own transaction: the refusal aborts the one that met it.
+    assert_eq(st_code(s.write_rows(s.begin(Snapshot), a, ep_changes(Replace(st_key(99), store_row(s, a, rec([Int(99), Int(0)])))))), "D1001")
+    assert_eq(st_code(s.write_rows(s.begin(Snapshot), a, ep_changes(Remove(st_key(99))))), "D1001")
+
+    // A row that is there is replaced and removed.
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.write_rows(t, a, ep_changes(Replace(st_key(1), store_row(s, a, rec([Int(1), Int(5)])))))), 1)
+    assert_eq(st_done(s.write_rows(t, a, ep_changes(Remove(st_key(2))))), 1)
+    st_commit(s, t)
+    assert_eq(st_read(s, s.begin(Snapshot), a, 1, 1), 5)
+    assert_eq(st_read(s, s.begin(Snapshot), a, 2, 1), -1)
+
+@test
+a_replace_of_a_row_a_transaction_removed_itself_is_data_corrupted()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.write_rows(t, a, ep_changes(Remove(st_key(1))))), 1)
+    assert_eq(st_code(s.write_rows(t, a, ep_changes(Replace(st_key(1), store_row(s, a, rec([Int(1), Int(5)])))))), "D1001")
+
+@test
+a_row_of_an_unknown_schema_version_or_not_a_record_does_not_translate()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    s.catalog = cat_ok(s.catalog, cat_alter("acct", [AddColumn(cat_col("note", nullable(Text)))]))
+
+    assert_eq(st_code(s.translated(a, StoredRow(77, rec([Int(1), Int(2)])))), "D1001")
+    assert_eq(st_code(s.translated(a, StoredRow(1, Int(5)))), "D1001")
+
+    // A row of an older version that is a record translates; one already of the current version is
+    // returned as it is, whatever it holds; a table the catalog does not know is not translated.
+    assert_eq(st_code(s.translated(a, StoredRow(1, rec([Int(1), Int(2)])))), "ok")
+    assert_eq(st_code(s.translated(a, StoredRow(2, Int(5)))), "ok")
+    assert_eq(st_code(s.translated(999999, StoredRow(77, Int(5)))), "ok")
+
+// -- catalog_mvcc: read_only_transaction (T4001) ------------------------------------------------
+
+@test
+a_ddl_statement_in_a_read_only_transaction_is_read_only_transaction()
+    for level in [ReadCommitted, Snapshot, Serializable]
+        val s = mem_store(cat_base())
+        assert_eq(ep_ddl_code(s, s.begin(level, true), ep_x()), "T4001")
+        assert_eq(ep_ddl_code(s, s.begin(level, true), DropTable(cat_q("t"), false, false)), "T4001")
+        assert_eq(ep_ddl_code(s, s.begin(level, true), cat_alter("t", [AddColumn(cat_col("note", nullable(Text)))])), "T4001")
+
+        assert(s.latest_catalog().table_at(cat_q("x")).is_none(), "nothing was created")
+        assert(s.latest_catalog().table_at(cat_q("t")).is_some(), "nothing was dropped")
+
+        // A transaction that may write runs the same statement.
+        val w = s.begin(level)
+        assert_eq(ep_ddl_code(s, w, ep_x()), "ok")
+        st_commit(s, w)
+        assert(s.latest_catalog().table_at(cat_q("x")).is_some(), "the writer's table is created")
+
+// -- store_index: lock_timeout (T1003) at a commit ----------------------------------------------
+
+@test
+a_unique_key_added_during_a_transaction_finds_its_value_held_by_a_live_writer_at_commit()
+    val s = mem_store(cat_base())
+    val t = st_oid(s, "t")
+    val writer = s.begin(Snapshot)
+    s.enter(writer).unwrap()
+    s.note_read(writer, query([], project(scan("app", "t", "r"), "o", [item("id", col("r", "id"))])))
+    st_insert(s, writer, t, [Int(1), Int(0), Text("dup")])
+    val holder = s.begin(Snapshot)
+    s.enter(holder).unwrap()
+    st_insert(s, holder, t, [Int(2), Int(0), Text("dup")])
+
+    // A DDL statement adds a unique key over the text column and commits while both are open.
+    val ddl = s.begin(Snapshot)
+    assert_eq(ep_ddl_code(s, ddl, cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), false)])), "ok")
+    st_commit(s, ddl)
+
+    // The writer's row now holds a value another live transaction's row holds; a commit does not wait.
+    assert_eq(st_code(s.commit(writer)), "T1003")
+
+@test
+a_unique_key_added_during_a_transaction_does_not_refuse_a_value_nobody_else_holds()
+    val s = mem_store(cat_base())
+    val t = st_oid(s, "t")
+    val writer = s.begin(Snapshot)
+    s.enter(writer).unwrap()
+    s.note_read(writer, query([], project(scan("app", "t", "r"), "o", [item("id", col("r", "id"))])))
+    st_insert(s, writer, t, [Int(1), Int(0), Text("mine")])
+    val holder = s.begin(Snapshot)
+    s.enter(holder).unwrap()
+    st_insert(s, holder, t, [Int(2), Int(0), Text("theirs")])
+
+    val ddl = s.begin(Snapshot)
+    assert_eq(ep_ddl_code(s, ddl, cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), false)])), "ok")
+    st_commit(s, ddl)
+
+    st_commit(s, writer)
+    st_commit(s, holder)
+    assert_eq(st_read(s, s.begin(Snapshot), t, 1, 0), 1)
+    assert_eq(st_read(s, s.begin(Snapshot), t, 2, 0), 2)
+
+// -- history: unknown_transaction (W2001) -------------------------------------------------------
+
+@test
+a_step_or_a_commit_on_a_transaction_the_bench_does_not_hold_is_unknown_transaction()
+    val b = bench(no_faults())
+    b.seed_rows(items_of(["r0"]), items_of(["r0"]), 0)
+
+    for txn in [0, 99, 1000000]
+        assert(b.run(u64(txn), SReadReg("r0")) == StepFailed("W2001", None))
+        b.commit(u64(txn)) match
+            Ok(_) -> assert(false, "a commit of a transaction the bench does not hold succeeded")
+            Err(code) -> assert_eq(code, "W2001")
+
+    // The transaction the bench does hold runs and commits.
+    val begun = b.begin(Serializable, false)
+    b.run(begun.0, SReadReg("r0")) match
+        StepFailed(code, _) -> assert(false, s"a held transaction's step failed with $code")
+        _ -> ()
+
+    b.commit(begun.0) match
+        Ok(_) -> ()
+        Err(code) -> assert(false, s"a held transaction's commit failed with $code")

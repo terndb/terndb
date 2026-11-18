@@ -1,0 +1,515 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The store over its pages (`store.sysl`, `docs/design/store.md`): each table's rows in a B+tree in
+// the row format, old versions in the undo log. Splits and merges under many rows, long version
+// chains read back through undo, rollback restoring the pages, purge and truncation once no snapshot
+// needs the old versions, unique keys with NULL components (Q48), the `LOCK_ONLY` chain of foreign-key
+// checks (Q49), rows at the 4,000-byte inline limit and past it, empty tables, and every key type the
+// key encoding supports. After each step the B+tree and undo checks run (`check_pages`).
+
+private sp_check(s: &Store, file: string = __FILE__, line: long = __LINE__) -> UndoStats = s.check_pages() match
+    Ok(st) -> st
+    Err(e) ->
+        assert(false, s"the page check fails: ${e.message}", file, line)
+        UndoStats(0, 0, 0, 0)
+
+private sp_scan(s: &Store, t: &Txn, oid: u64) -> Buf[Hit] = s.scan_rows(t, oid, all_rows()).unwrap()
+
+private sp_text(n: usize, c: string = "x") -> Value
+    var out = ""
+
+    for _ in 0..<n
+        out = out + c
+
+    Value.Text(out)
+
+/** `wide(id, body text)` keyed on `id`, and `acct` as `st_catalog` makes it. */
+private sp_store() -> &Store
+    var c = st_catalog()
+    c = cat_ok(c, cat_table("wide", [cat_col("id", Int64), cat_col("body", Text)], ["id"]))
+    mem_store(c)
+
+private sp_events(s: &Store, oid: u64) -> BtEvents = *s.rows.tree_of(oid).unwrap().events
+
+// -- empty tables --------------------------------------------------------------------------------------
+
+@test
+an_empty_table_has_no_tree_and_scans_no_rows()
+    val s = sp_store()
+    val a = st_oid(s, "acct")
+    val t = s.begin(Snapshot)
+    assert_eq(sp_scan(s, t, a).len(), 0)
+    assert_eq(s.get(t, a, st_key(1)).unwrap().is_none(), true)
+    assert_eq(s.rows.tree_of(a).is_none(), true)
+    st_commit(s, t)
+    assert_eq(sp_check(s), UndoStats(0, 0, 0, 0))
+    // A table whose only insert rolled back is empty again: one empty root leaf.
+    val w = s.begin(Snapshot)
+    st_insert(s, w, a, [Int(1), Int(10)])
+    assert_eq(s.abort(w), Ok(()))
+    val r = s.begin(Snapshot)
+    assert_eq(sp_scan(s, r, a).len(), 0)
+    assert_eq(s.rows.row_count(), 0)
+    sp_check(s)
+    st_commit(s, r)
+
+// -- splits, merges and many rows -----------------------------------------------------------------------
+
+@test
+many_rows_split_leaves_and_deleting_them_merges_the_tree_back()
+    val s = sp_store()
+    val wide = st_oid(s, "wide")
+    val w = s.begin(Snapshot)
+
+    // Inserted in an order that is neither ascending nor descending.
+    for i in 0..<1500
+        val k = (i * 7919) % 1500
+        st_insert(s, w, wide, [Int(i128(k)), sp_text(usize(200 + k % 50))])
+
+    st_commit(s, w)
+    val ev = sp_events(s, wide)
+    assert(ev.leaf_splits > 10, "the rows split many leaves")
+    assert(ev.root_splits >= 1, "the root split")
+    assert_eq(sp_check(s).rows, 1500)
+
+    // The scan reads the rows in key order, every one at its value.
+    val r = s.begin(Snapshot)
+    val hits = sp_scan(s, r, wide)
+    assert_eq(hits.len(), 1500)
+
+    for i in 0..<1500
+        assert(hits[i].key == st_key(i128(i)), s"row $i in key order")
+        assert(hits[i].row.at(1) == sp_text(usize(200 + i % 50)), s"row $i's body")
+
+    st_commit(s, r)
+
+    // Deleting every row but a few leaves ghosts until purge, which runs as the deleter ends.
+    val d = s.begin(Snapshot)
+    assert_eq(st_done(s.delete_where(d, wide, pred_all(x -> st_int(x.at(0)) % 100 != 0))), 1485)
+    sp_check(s)
+    st_commit(s, d)
+    val after = sp_events(s, wide)
+    assert(after.leaf_merges + after.leaf_shares > 0, "deleting merged or redistributed leaves")
+    assert_eq(s.rows.row_count(), 15)
+    assert_eq(sp_check(s).ghosts, 0)
+    val r2 = s.begin(Snapshot)
+    assert_eq(sp_scan(s, r2, wide).len(), 15)
+    st_commit(s, r2)
+
+// -- version chains through undo ------------------------------------------------------------------------
+
+@test
+a_long_version_chain_is_read_back_through_undo_by_every_snapshot()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val readers = buf[&Txn]()
+    readers.push(s.begin(Snapshot))
+
+    for i in 1..<300
+        val w = s.begin(Snapshot)
+        st_done(st_bump(s, w, 1, 1))
+        st_commit(s, w)
+        if i % 50 == 0 then readers.push(s.begin(Snapshot))
+
+    assert(s.rows.space.pages.len() >= 1, "the chain lives in undo pages")
+    sp_check(s)
+
+    for j in 0..<readers.len()
+        assert_eq(st_read(s, readers[j], a, 1, 1), i128(100 + 50 * j), s"reader $j")
+
+    val now = s.begin(Snapshot)
+    assert_eq(st_read(s, now, a, 1, 1), 399)
+    st_commit(s, now)
+
+    // Ending the readers lets purge truncate the chain: the old versions' pages go.
+    val low = s.rows.space.low
+
+    for r in readers
+        st_commit(s, r)
+
+    assert(s.rows.space.low > low, "undo_low advanced")
+    assert_eq(sp_check(s).records, 0)
+    val last = s.begin(Snapshot)
+    assert_eq(st_read(s, last, a, 1, 1), 399)
+    assert_eq(st_read(s, last, a, 2, 1), 100)
+    st_commit(s, last)
+
+@test
+a_transaction_writing_one_row_many_times_reads_its_newest_and_rolls_back_to_the_first()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val w = s.begin(Snapshot)
+
+    for _ in 0..<100
+        st_done(st_bump(s, w, 1, 2))
+
+    assert_eq(st_read(s, w, a, 1, 1), 300)
+    val other = s.begin(Snapshot)
+    assert_eq(st_read(s, other, a, 1, 1), 100)
+    sp_check(s)
+    assert_eq(s.abort(w), Ok(()))
+    assert_eq(st_read(s, other, a, 1, 1), 100)
+    st_commit(s, other)
+    sp_check(s)
+
+// -- rollback restores the pages -------------------------------------------------------------------------
+
+@test
+rolling_back_a_large_write_restores_every_page()
+    val s = sp_store()
+    val wide = st_oid(s, "wide")
+    val w = s.begin(Snapshot)
+
+    for i in 0..<200
+        st_insert(s, w, wide, [Int(i), sp_text(100)])
+
+    st_commit(s, w)
+    val pages = s.rows.data.allocated()
+    val before = s.rows.leaf_rows().unwrap()
+
+    // Inserts that split leaves, updates that grow rows, deletes: all rolled back.
+    val t = s.begin(Snapshot)
+
+    for i in 200..<800
+        st_insert(s, t, wide, [Int(i), sp_text(300)])
+
+    st_done(s.update_where(t, wide, pred_all(x -> st_int(x.at(0)) < 200), x -> rec([x.at(0), sp_text(900)])))
+    st_done(s.delete_where(t, wide, pred_all(x -> st_int(x.at(0)) % 3 == 0)))
+    assert(s.rows.data.allocated() > pages, "the write grew the tree")
+    sp_check(s)
+    assert_eq(s.abort(t), Ok(()))
+    val after = s.rows.leaf_rows().unwrap()
+    assert_eq(after.len(), before.len())
+
+    for i in 0..<after.len()
+        assert(after[i].key == before[i].key, s"row $i's key")
+        assert(after[i].row == before[i].row, s"row $i's image")
+
+    // Purge has passed the rolled-back records, and every page is accounted for.
+    assert_eq(sp_check(s).records, 0)
+
+@test
+a_statement_that_must_wait_part_way_leaves_its_pages_as_they_were()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val holder = s.begin(Snapshot)
+    st_done(st_bump(s, holder, 2, 5))
+    val t = s.begin(ReadCommitted)
+    s.statement(t)
+    val before = s.rows.leaf_rows().unwrap()
+    val batch = buf[RowChange]()
+    batch.push(Put(store_row(s, a, rec([Int(3), Int(1)]))))
+    batch.push(Replace(st_key(2), store_row(s, a, rec([Int(2), Int(0)]))))
+    assert_eq(st_waits(s.write_rows(t, a, batch)), holder.id)
+    val after = s.rows.leaf_rows().unwrap()
+    assert_eq(after.len(), before.len())
+    sp_check(s)
+    st_commit(s, holder)
+    st_commit(s, t)
+
+// -- purge and truncation --------------------------------------------------------------------------------
+
+@test
+ghosts_stay_while_a_snapshot_needs_them_and_purge_removes_them_after()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val old = s.begin(Snapshot)
+    val d = s.begin(Snapshot)
+    st_done(s.delete_where(d, a, all_rows()))
+    st_commit(s, d)
+    // The ghosts stay: the old snapshot still reads both rows.
+    assert_eq(s.rows.row_count(), 2)
+    assert_eq(sp_check(s).ghosts, 2)
+    assert_eq(st_read(s, old, a, 1, 1), 100)
+    assert_eq(sp_scan(s, old, a).len(), 2)
+    st_commit(s, old)
+    // Purge ran as the old snapshot ended: no ghost, no record, no undo page.
+    assert_eq(s.rows.row_count(), 0)
+    assert_eq(sp_check(s), UndoStats(0, 0, 0, 0))
+    // The key is free again, and a new row of it starts a new chain.
+    val w = s.begin(Snapshot)
+    st_insert(s, w, a, [Int(1), Int(7)])
+    st_commit(s, w)
+    assert_eq(sp_check(s).rows, 1)
+
+@test
+purge_waits_for_the_oldest_live_snapshot_of_any_level()
+    val s = st_bank()
+    val a = st_oid(s, "acct")
+    val rc = s.begin(ReadCommitted)
+    s.statement(rc)
+    val w = s.begin(Snapshot)
+    st_done(st_bump(s, w, 1, 1))
+    st_commit(s, w)
+    val other = s.begin(Snapshot)
+    st_commit(s, other)
+    // The read committed statement's snapshot still needs the version before `w`.
+    assert(sp_check(s).records > 0, "the record the statement needs is kept")
+    assert_eq(st_read(s, rc, a, 1, 1), 100)
+    // Its next statement takes a newer snapshot; the record may then go.
+    s.statement(rc)
+    st_commit(s, rc)
+    assert_eq(sp_check(s).records, 0)
+
+// -- unique keys with NULL components (Q48) ---------------------------------------------------------------
+
+/** `m(id, a text?, b int64?)` unique on `(a, b)`, and `e(id, email text?)` unique on `email`. */
+private sp_unique_store() -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("m", [cat_col("id", Int64), cat_col("a", nullable(Text)), cat_col("b", nullable(Int64))], ["id"], [cat_unique("m_ab", ["a", "b"])]))
+    c = cat_ok(c, cat_table("e", [cat_col("id", Int64), cat_col("email", nullable(Text))], ["id"], [cat_unique("e_email", ["email"])]))
+    mem_store(c)
+
+private sp_put(s: &Store, t: &Txn, table: string, fields: []const Value) -> string =
+    st_code(s.insert(t, st_oid(s, table), store_row(s, st_oid(s, table), rec(fields))))
+
+@test
+nulls_never_conflict_in_a_unique_key_whichever_components_are_null()
+    val s = sp_unique_store()
+    val t = s.begin(Snapshot)
+    // Wholly NULL, twice.
+    assert_eq(sp_put(s, t, "m", [Int(1), Null, Null]), "ok")
+    assert_eq(sp_put(s, t, "m", [Int(2), Null, Null]), "ok")
+    // NULL in the second component, with equal first components.
+    assert_eq(sp_put(s, t, "m", [Int(3), Value.Text("x"), Null]), "ok")
+    assert_eq(sp_put(s, t, "m", [Int(4), Value.Text("x"), Null]), "ok")
+    // NULL in the first component, with equal second components.
+    assert_eq(sp_put(s, t, "m", [Int(5), Null, Int(1)]), "ok")
+    assert_eq(sp_put(s, t, "m", [Int(6), Null, Int(1)]), "ok")
+    // No NULL: the second of two equal values conflicts.
+    assert_eq(sp_put(s, t, "m", [Int(7), Value.Text("x"), Int(1)]), "ok")
+    sp_check(s)
+    assert_eq(sp_put(s, t, "m", [Int(8), Value.Text("x"), Int(1)]), "T3001")
+
+    // A single-column key: NULLs never conflict, across transactions too.
+    val u = s.begin(Snapshot)
+    assert_eq(sp_put(s, u, "e", [Int(1), Null]), "ok")
+    assert_eq(sp_put(s, u, "e", [Int(2), Null]), "ok")
+    st_commit(s, u)
+    val v = s.begin(Snapshot)
+    assert_eq(sp_put(s, v, "e", [Int(3), Null]), "ok")
+    assert_eq(sp_put(s, v, "e", [Int(4), Value.Text("a")]), "ok")
+    // A row given a value then made NULL again frees the value.
+    st_done(s.update_where(v, st_oid(s, "e"), pred_all(x -> st_int(x.at(0)) == 4), x -> rec([x.at(0), Null])))
+    assert_eq(sp_put(s, v, "e", [Int(5), Value.Text("a")]), "ok")
+    st_commit(s, v)
+    val r = s.begin(Snapshot)
+    assert_eq(sp_scan(s, r, st_oid(s, "e")).len(), 5)
+    st_commit(s, r)
+    sp_check(s)
+
+@test
+partly_null_values_never_wait_for_a_live_writer_of_the_same_value()
+    val s = sp_unique_store()
+    val m = st_oid(s, "m")
+    val first = s.begin(Snapshot)
+    val second = s.begin(Snapshot)
+    assert_eq(sp_put(s, first, "m", [Int(1), Value.Text("x"), Null]), "ok")
+    assert_eq(sp_put(s, second, "m", [Int(2), Value.Text("x"), Null]), "ok")
+    // With no NULL the second writer waits for the first.
+    assert_eq(sp_put(s, first, "m", [Int(3), Value.Text("y"), Int(2)]), "ok")
+    assert_eq(st_waits(s.insert(second, m, store_row(s, m, rec([Int(4), Value.Text("y"), Int(2)])))), first.id)
+    st_commit(s, first)
+    st_commit(s, second)
+    sp_check(s)
+
+// -- the LOCK_ONLY chain (Q49) ------------------------------------------------------------------------------
+
+/** `p(id, n)` and `c(id, pid?)` referencing it. */
+private sp_fk_store() -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("p", [cat_col("id", Int64), cat_col("n", Int64)], ["id"]))
+    c = cat_ok(c, cat_table("c", [cat_col("id", Int64), cat_col("pid", nullable(Int64))], ["id"], [cat_fk("c_fk", ["pid"], "p", ["id"])]))
+    mem_store(c)
+
+@test
+foreign_key_locks_chain_as_lock_records_and_are_no_versions()
+    val s = sp_fk_store()
+    val p = st_oid(s, "p")
+    val fk = foreign_keys(s.catalog, st_oid(s, "c"), false)[0]
+    val w = s.begin(Snapshot)
+    st_insert(s, w, p, [Int(1), Int(10)])
+    st_commit(s, w)
+    val writer = s.begin(Snapshot)
+
+    // Two referencing transactions lock the parent one after the other.
+    val l1 = s.begin(Snapshot)
+    assert_eq(s.check_reference(l1, fk, st_key(1)), Ok(None))
+    val kb = s.key_bytes(s.table_data(p).unwrap(), st_key(1)).unwrap()
+    val row1 = s.rows.current(p, kb.view()).unwrap().unwrap()
+    assert_eq(row1.header.txn, l1.id)
+    assert_eq(row1.header.flags, RowLockOnly)
+    assert_eq(s.rows.space.read(row1.header.undo).unwrap().kind, UndoLock)
+    // A writer waits for the lock.
+    assert_eq(st_waits(s.update_where(writer, p, all_rows(), x -> rec([x.at(0), Int(11)]))), l1.id)
+    st_commit(s, l1)
+    val l2 = s.begin(Snapshot)
+    assert_eq(s.check_reference(l2, fk, st_key(1)), Ok(None))
+    val row2 = s.rows.current(p, kb.view()).unwrap().unwrap()
+    val rec2 = s.rows.space.read(row2.header.undo).unwrap()
+    assert_eq(rec2.kind, UndoLock)
+    assert_eq(rec2.flags, UndoOldLockOnly)
+    assert_eq(rec2.prev_txn, l1.id)
+    sp_check(s)
+    st_commit(s, l2)
+
+    // The writer, whose snapshot predates both lockers' commits, is not refused for them: a lock
+    // is not a version (first-updater-wins compares the version's writer).
+    assert_eq(st_done(s.update_where(writer, p, all_rows(), x -> rec([x.at(0), Int(11)]))), 1)
+    assert_eq(s.rows.space.read(s.rows.current(p, kb.view()).unwrap().unwrap().header.undo).unwrap().flags, UndoOldLockOnly)
+    sp_check(s)
+    st_commit(s, writer)
+    val r = s.begin(Snapshot)
+    assert_eq(st_read(s, r, p, 1, 1), 11)
+    st_commit(s, r)
+    assert_eq(sp_check(s).records, 0)
+
+@test
+a_lock_taken_in_a_statement_that_waits_is_undone_with_it()
+    val s = sp_fk_store()
+    val p = st_oid(s, "p")
+    val fk = foreign_keys(s.catalog, st_oid(s, "c"), false)[0]
+    val w = s.begin(Snapshot)
+    st_insert(s, w, p, [Int(1), Int(10)])
+    st_commit(s, w)
+    val kb = s.key_bytes(s.table_data(p).unwrap(), st_key(1)).unwrap()
+    val before = s.rows.current(p, kb.view()).unwrap().unwrap()
+    val t = s.begin(ReadCommitted)
+    s.statement(t)
+    assert_eq(s.check_reference(t, fk, st_key(1)), Ok(None))
+    assert_eq(s.rows.current(p, kb.view()).unwrap().unwrap().header.flags, RowLockOnly)
+    s.undo_statement(t)
+    assert_eq(s.rows.current(p, kb.view()).unwrap().unwrap(), before)
+    sp_check(s)
+    st_commit(s, t)
+    sp_check(s)
+
+// -- the inline limit ------------------------------------------------------------------------------------
+
+@test
+a_row_at_the_inline_limit_is_stored_and_one_byte_more_is_refused()
+    val s = sp_store()
+    val wide = st_oid(s, "wide")
+    val key_len = encode_key([KeyColumn(Int64, false)], [Int(1)]).unwrap().len()
+    // Key, header, one bitmap byte and one variable offset beside the text.
+    val most = 4000 - key_len - RowHeaderSize - 1 - 2
+    val w = s.begin(Snapshot)
+    st_insert(s, w, wide, [Int(1), sp_text(most)])
+    st_insert(s, w, wide, [Int(2), sp_text(most - 1)])
+    st_commit(s, w)
+    val r = s.begin(Snapshot)
+    assert(s.get(r, wide, st_key(1)).unwrap().unwrap().at(1) == sp_text(most), "the row at the limit reads back")
+    st_commit(s, r)
+    sp_check(s)
+    // One byte more needs an overflow chain, which is refused, and aborts the transaction.
+    val t = s.begin(Snapshot)
+    val e = s.insert(t, wide, store_row(s, wide, rec([Int(3), sp_text(most + 1)])))
+    assert_eq(st_code(e), "D2002")
+    assert_eq(st_code(s.insert(t, wide, store_row(s, wide, rec([Int(4), Int(0)])))), "W2003")
+    // So is an update that grows a row past it.
+    val u = s.begin(Snapshot)
+    assert_eq(st_code(s.update_where(u, wide, pred_all(x -> st_int(x.at(0)) == 2), x -> rec([x.at(0), sp_text(most + 1)]))), "D2002")
+    assert_eq(sp_check(s).rows, 2)
+
+@test
+a_row_far_past_the_limit_is_refused_and_writes_nothing()
+    val s = sp_store()
+    val wide = st_oid(s, "wide")
+    val t = s.begin(Snapshot)
+    st_insert(s, t, wide, [Int(1), sp_text(10)])
+    val records = sp_check(s).records
+    assert_eq(st_code(s.insert(t, wide, store_row(s, wide, rec([Int(2), sp_text(20000)])))), "D2002")
+    // The refused row wrote no undo record; the rollback that followed removed the first.
+    assert(sp_check(s).records <= records, "no record for the refused row")
+    assert_eq(s.rows.row_count(), 0)
+
+// -- every key type ----------------------------------------------------------------------------------------
+
+/** A table `k(k <ty>, v int64)` keyed on `k`, rows inserted with `keys` in reverse order: the scan
+ * answers them in `keys`' order (which must ascend), each readable by its key.
+ */
+private sp_key_type(ty: Type, keys: []const Value)
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, CreateType(cat_q("color"), Union(items_of([Field("red", record([])), Field("green", record([])), Field("blue", record([]))])), false))
+    c = cat_ok(c, cat_table("k", [cat_col("k", ty), cat_col("v", Int64)], ["k"]))
+    val s = mem_store(c)
+    val oid = st_oid(s, "k")
+    val w = s.begin(Snapshot)
+    var i = keys.len
+
+    while i > 0
+        i -= 1
+        st_insert(s, w, oid, [keys[i], Int(i128(i))])
+
+    st_commit(s, w)
+    val r = s.begin(Snapshot)
+    val hits = sp_scan(s, r, oid)
+    assert_eq(hits.len(), keys.len)
+
+    for j in 0..<keys.len
+        assert(hits[j].key == rec([keys[j]]), s"key $j in order")
+        assert(s.get(r, oid, rec([keys[j]])).unwrap().unwrap().at(1) == Int(i128(j)), s"key $j reads its row")
+
+    st_commit(s, r)
+    sp_check(s)
+
+@test
+every_key_type_orders_its_rows_in_the_tree()
+    sp_key_type(Type.Bool, [Value.Bool(false), Value.Bool(true)])
+    sp_key_type(Int8, [Int(-128), Int(-1), Int(0), Int(127)])
+    sp_key_type(Int16, [Int(-32768), Int(-1), Int(0), Int(256), Int(32767)])
+    sp_key_type(Int32, [Int(-2147483648), Int(-1), Int(0), Int(65536), Int(2147483647)])
+    sp_key_type(Int64, [Int(-9223372036854775808), Int(-1), Int(0), Int(9223372036854775807)])
+    sp_key_type(Int128, [Int(-170141183460469231731687303715884105728), Int(-1), Int(0), Int(170141183460469231731687303715884105727)])
+    sp_key_type(UInt8, [UInt(0), UInt(127), UInt(128), UInt(255)])
+    sp_key_type(UInt16, [UInt(0), UInt(256), UInt(65535)])
+    sp_key_type(UInt32, [UInt(0), UInt(0x80000000), UInt(0xffffffff)])
+    sp_key_type(UInt64, [UInt(0), UInt(0x8000000000000000), UInt(0xffffffffffffffff)])
+    sp_key_type(Float32, [Float(-1.0), Float(0.0), Float(0.5), Float(1.0)])
+    sp_key_type(Float64, [Float(-1000.25), Float(-1.0), Float(0.0), Float(1.0e300)])
+    sp_key_type(Decimal(10, 2), [Int(-9999999999), Int(-1), Int(0), Int(12345)])
+    sp_key_type(Decimal(30, 4), [Int(-999999999999999999999999), Int(0), Int(999999999999999999999999)])
+    sp_key_type(Type.Text, [Value.Text(""), Value.Text("\0"), Value.Text("a"), Value.Text("ab"), Value.Text("b")])
+    sp_key_type(Type.Bytes, [bytes_value([]), bytes_value([0]), bytes_value([0, 0]), bytes_value([1]), bytes_value([255])])
+    sp_key_type(Date, [Int(-2147483648), Int(0), Int(2147483647)])
+    sp_key_type(Time, [Int(0), Int(1), Int(86399999999)])
+    sp_key_type(DateTime, [Int(-9223372036854775808), Int(0), Int(9223372036854775807)])
+    sp_key_type(Timestamp, [Int(-1), Int(0), Int(1)])
+    sp_key_type(Type.Interval, [Value.Interval(-1, 0, 0), Value.Interval(0, -1, 0), Value.Interval(0, 0, 0), Value.Interval(0, 0, 1), Value.Interval(1, 0, 0)])
+    sp_key_type(Type.Uuid, [Value.Uuid(0), Value.Uuid(1), Value.Uuid(0x80000000000000000000000000000000), Value.Uuid(0xffffffffffffffffffffffffffffffff)])
+    sp_key_type(Named("app", "color"), [variant(0, rec([])), variant(1, rec([])), variant(2, rec([]))])
+
+@test
+a_composite_key_orders_component_by_component()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("ck", [cat_col("a", Text), cat_col("b", Int32), cat_col("v", Int64)], ["a", "b"]))
+    val s = mem_store(c)
+    val oid = st_oid(s, "ck")
+    val w = s.begin(Snapshot)
+
+    for k in [[Value.Text("b"), Int(1)], [Value.Text("a"), Int(2)], [Value.Text("a"), Int(-5)], [Value.Text(""), Int(9)]]
+        st_insert(s, w, oid, [k[0], k[1], Int(0)])
+
+    st_commit(s, w)
+    val r = s.begin(Snapshot)
+    val hits = sp_scan(s, r, oid)
+    assert(hits[0].key == rec([Value.Text(""), Int(9)]), "first")
+    assert(hits[1].key == rec([Value.Text("a"), Int(-5)]), "second")
+    assert(hits[2].key == rec([Value.Text("a"), Int(2)]), "third")
+    assert(hits[3].key == rec([Value.Text("b"), Int(1)]), "fourth")
+    st_commit(s, r)
+    sp_check(s)
+
+@test
+a_key_over_1024_bytes_is_refused()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("tk", [cat_col("k", Text), cat_col("v", Int64)], ["k"]))
+    val s = mem_store(c)
+    val oid = st_oid(s, "tk")
+    val t = s.begin(Snapshot)
+    assert_eq(st_code(s.insert(t, oid, store_row(s, oid, rec([sp_text(1020), Int(0)])))), "ok")
+    assert_eq(st_code(s.insert(t, oid, store_row(s, oid, rec([sp_text(1030), Int(0)])))), "D2001")
+    sp_check(s)
