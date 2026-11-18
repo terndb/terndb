@@ -1,0 +1,710 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The anomaly catalogue of `docs/design/history.md`: for each phenomenon of `isolation.md` §2.4 and
+// §3, the minimal hand-built history that shows it, judged at every level of §3 with all of its
+// transactions at that level, and its near miss, one edge away from the anomaly, accepted at every
+// level. Then the degenerate histories, each at every level. A verdict is `F` (found and forbidden,
+// under the spec's name), `P` (found and permitted, nothing forbidden) or `-` (not reported at all).
+
+private const Exists4 = "items.price > 4"
+
+private expect(r: HistoryReport, name: string, v: string, level: string, file: string, line: long)
+    if v == "F"
+        assert(r.found_forbidden(name), s"at $level expected a forbidden $name, found:\n${r.summary()}", file, line)
+        assert(!r.found("malformed"), s"at $level the history is malformed:\n${r.summary()}", file, line)
+    elif v == "P"
+        assert(r.found(name) && !r.found_forbidden(name), s"at $level expected a permitted $name, found:\n${r.summary()}", file, line)
+        assert(r.forbidden().len() == 0, s"at $level expected nothing forbidden, found:\n${r.summary()}", file, line)
+    else
+        assert(!r.found(name), s"at $level expected no $name, found:\n${r.summary()}", file, line)
+
+/** `build` at serializable, snapshot and read committed gives the verdicts `ser`, `si` and `rc` on
+ * the anomaly `name`.
+ */
+private verdicts(name: string, build: &Fn(string) -> HistoryReport, ser: string, si: string, rc: string, file: string = __FILE__, line: long = __LINE__)
+    expect(build(LevelSer), name, ser, LevelSer, file, line)
+    expect(build(LevelSi), name, si, LevelSi, file, line)
+    expect(build(LevelRc), name, rc, LevelRc, file, line)
+
+/** `build` reports nothing at any level. */
+private clean_everywhere(build: &Fn(string) -> HistoryReport, file: string = __FILE__, line: long = __LINE__)
+    for level in [LevelSer, LevelSi, LevelRc]
+        val r = build(level)
+        assert(r.anomalies.len() == 0, s"at $level expected no anomaly, found:\n${r.summary()}", file, line)
+
+// -- G0: dirty write -----------------------------------------------------------------------------
+
+// t0 and t1 each append to x and y; the final read orders them one way on x and the other on y.
+private g0(level: string, y: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_append("x", 1), m_append("y", 1)])
+    h.ok(2, [m_append("x", 2), m_append("y", 2)])
+    val _ = h.tx(9, level, [m_read_list("x", [1, 2]), m_read_list("y", y)])
+    h.check()
+
+@test
+catalogue_g0_dirty_write()
+    verdicts("G0", l -> g0(l, [2, 1]), "F", "F", "F")
+
+@test
+catalogue_g0_near_miss_one_order_on_both_keys()
+    clean_everywhere(l -> g0(l, [1, 2]))
+
+// -- G1a: aborted read ---------------------------------------------------------------------------
+
+// t1 reads x while t0's append is in flight, commits, and t0 then aborts.
+private g1a_list(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(2, [m_read_list("x", read)])
+    h.fail(1, [m_append("x", 1)], "deadlock_detected")
+    h.check()
+
+private g1a_register(level: string, read: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(2, [m_read_num("r", read)])
+    h.fail(1, [m_write("r", 5)], "deadlock_detected")
+    h.check()
+
+private g1a_predicate(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(2, [m_pred_rows("g = 1", rows)])
+    h.fail(1, [m_write("k1", 1)], "deadlock_detected")
+    h.check()
+
+@test
+catalogue_g1a_aborted_read_of_a_list()
+    verdicts("G1a", l -> g1a_list(l, [1]), "F", "F", "F")
+
+@test
+catalogue_g1a_aborted_read_of_a_register()
+    verdicts("G1a", l -> g1a_register(l, 5), "F", "F", "F")
+
+@test
+catalogue_g1a_aborted_insert_in_a_predicate_read()
+    verdicts("G1a", l -> g1a_predicate(l, ["k1"]), "F", "F", "F")
+
+@test
+catalogue_g1a_near_miss_the_aborted_write_unread()
+    clean_everywhere(l -> g1a_list(l, []))
+    clean_everywhere(l -> g1a_register(l, 0))
+    clean_everywhere(l -> g1a_predicate(l, []))
+
+// -- G1b: intermediate read ----------------------------------------------------------------------
+
+private g1b_list(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_append("x", 1), m_append("x", 2)])
+    h.ok(2, [m_read_list("x", read)])
+    h.check()
+
+private g1b_register(level: string, read: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_write("r", 1), m_write("r", 2)])
+    h.ok(2, [m_read_num("r", read)])
+    h.check()
+
+// t0 inserts k1 into group 1 and deletes it again: the row in group 1 is an intermediate version.
+private g1b_predicate(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_write("k1", 1), m_delete("k1")])
+    h.ok(2, [m_pred_rows("g = 1", rows)])
+    h.check()
+
+// t0 appends a matching element to k1.items and deletes the row: the matching row is intermediate.
+private g1b_nested_predicate(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_append("k1.items", 7), m_delete("k1")])
+    h.ok(2, [m_pred_rows(Exists4, rows)])
+    h.check()
+
+@test
+catalogue_g1b_intermediate_read_of_a_list()
+    verdicts("G1b", l -> g1b_list(l, [1]), "F", "F", "F")
+
+@test
+catalogue_g1b_intermediate_read_of_a_register()
+    verdicts("G1b", l -> g1b_register(l, 1), "F", "F", "F")
+
+@test
+catalogue_g1b_intermediate_row_in_a_predicate_read()
+    verdicts("G1b", l -> g1b_predicate(l, ["k1"]), "F", "F", "F")
+
+@test
+catalogue_g1b_intermediate_row_in_a_nested_predicate_read()
+    verdicts("G1b", l -> g1b_nested_predicate(l, ["k1"]), "F", "F", "F")
+
+@test
+catalogue_g1b_near_miss_the_final_version()
+    clean_everywhere(l -> g1b_list(l, [1, 2]))
+    clean_everywhere(l -> g1b_register(l, 2))
+    clean_everywhere(l -> g1b_predicate(l, []))
+    clean_everywhere(l -> g1b_nested_predicate(l, []))
+
+// -- G1c: circular information flow --------------------------------------------------------------
+
+private g1c(level: string, y: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_append("x", 1), m_read_list("y", y)])
+    h.ok(2, [m_append("y", 1), m_read_list("x", [1])])
+    h.check()
+
+@test
+catalogue_g1c_circular_information_flow()
+    verdicts("G1c", l -> g1c(l, [1]), "F", "F", "F")
+
+@test
+catalogue_g1c_near_miss_one_way_flow()
+    clean_everywhere(l -> g1c(l, []))
+
+// -- G-single: read skew and fractured read ------------------------------------------------------
+
+// t0 reads x before t1's append and y after it.
+private read_skew(level: string, y: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("x", []), m_read_list("y", y)])
+    h.ok(2, [m_append("x", 1), m_append("y", 1)])
+    val _ = h.tx(9, level, [m_read_list("x", [1]), m_read_list("y", [1])])
+    h.check()
+
+// t0 writes x and y together; t1 sees one of the writes and not the other.
+private fractured(level: string, y: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_write("x", 1), m_write("y", 1)])
+    h.ok(2, [m_read_num("x", 1), m_read_num("y", y)])
+    val _ = h.tx(9, level, [m_read_num("x", 1), m_read_num("y", 1)])
+    h.check()
+
+@test
+catalogue_g_single_read_skew()
+    verdicts("G-single", l -> read_skew(l, [1]), "F", "F", "P")
+
+@test
+catalogue_g_single_fractured_read()
+    verdicts("G-single", l -> fractured(l, 0), "F", "F", "P")
+
+@test
+catalogue_g_single_near_miss_a_consistent_read()
+    clean_everywhere(l -> read_skew(l, []))
+    clean_everywhere(l -> fractured(l, 1))
+
+// -- G-nonadjacent -------------------------------------------------------------------------------
+
+// t0 -rw(a)-> t1 -wr(b)-> t2 -rw(c)-> t3 -wr(d)-> t0: two rw edges, never adjacent.
+private nonadjacent(level: string, c: []const i64) -> HistoryReport
+    var h = hb()
+    for p in 1..4
+        val _ = h.inv(u64(p), level)
+    h.ok(1, [m_read_list("a", []), m_read_list("d", [1])])
+    h.ok(2, [m_append("a", 1), m_append("b", 1)])
+    h.ok(3, [m_read_list("b", [1]), m_read_list("c", c)])
+    h.ok(4, [m_append("c", 1), m_append("d", 1)])
+    val _ = h.tx(9, level, [m_read_list("a", [1]), m_read_list("c", [1])])
+    h.check()
+
+@test
+catalogue_g_nonadjacent()
+    verdicts("G-nonadjacent", l -> nonadjacent(l, []), "F", "F", "P")
+
+@test
+catalogue_g_nonadjacent_near_miss_t2_reads_t3s_append()
+    clean_everywhere(l -> nonadjacent(l, [1]))
+
+// -- P4: lost update -----------------------------------------------------------------------------
+
+private lost_append(level: string, base: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("x", []), m_append("x", 1)])
+    h.ok(2, [m_read_list("x", base), m_append("x", 2)])
+    val _ = h.tx(9, level, [m_read_list("x", [1, 2])])
+    h.check()
+
+private lost_write(level: string, base: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_num("r", 0), m_write("r", 1)])
+    h.ok(2, [m_read_num("r", base), m_write("r", 2)])
+    h.check()
+
+@test
+catalogue_p4_lost_update_of_a_list()
+    verdicts("P4", l -> lost_append(l, []), "F", "F", "P")
+
+@test
+catalogue_p4_lost_update_of_a_register()
+    verdicts("P4", l -> lost_write(l, 0), "F", "F", "P")
+
+@test
+catalogue_p4_near_miss_the_second_reads_the_first_write()
+    clean_everywhere(l -> lost_append(l, [1]))
+    clean_everywhere(l -> lost_write(l, 1))
+
+// -- G2-item: write skew, longer cycles, the read-only anomaly -----------------------------------
+
+private write_skew(level: string, x: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_read_list("x", []), m_read_list("y", []), m_append("x", 1)])
+    h.ok(2, [m_read_list("x", x), m_read_list("y", []), m_append("y", 1)])
+    val _ = h.tx(9, level, [m_read_list("x", [1]), m_read_list("y", [1])])
+    h.check()
+
+// t0 -rw(x)-> t1 -rw(y)-> t2 -rw(z)-> t0.
+private three_skew(level: string, x: i64) -> HistoryReport
+    var h = hb()
+    for p in 1..3
+        val _ = h.inv(u64(p), level)
+    h.ok(1, [m_read_num("x", x), m_write("z", 3)])
+    h.ok(2, [m_read_num("y", 0), m_write("x", 1)])
+    h.ok(3, [m_read_num("z", 0), m_write("y", 2)])
+    h.check()
+
+// [Fekete]: t1 deposits into savings y; read-only t2 then sees the deposit but not t0's withdrawal
+// from checking x, while t0, judging its overdraft on x + y, saw neither: t0 -rw(y)-> t1 -wr(y)->
+// t2 -rw(x)-> t0. `late` runs t2 after both commits instead, seeing both.
+private fekete(level: string, late: bool) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(2, [m_read_list("y", []), m_append("y", 1)])
+    if !late
+        val _ = h.tx(3, level, [m_read_list("x", []), m_read_list("y", [1])])
+    h.ok(1, [m_read_list("x", []), m_read_list("y", []), m_append("x", 1)])
+    if late
+        val _ = h.tx(3, level, [m_read_list("x", [1]), m_read_list("y", [1])])
+    val _ = h.tx(9, level, [m_read_list("x", [1]), m_read_list("y", [1])])
+    h.check()
+
+@test
+catalogue_a5b_write_skew()
+    verdicts("A5B", l -> write_skew(l, []), "F", "P", "P")
+
+@test
+catalogue_g2_item_three_transactions()
+    verdicts("G2-item", l -> three_skew(l, 0), "F", "P", "P")
+
+@test
+catalogue_g2_item_the_read_only_anomaly()
+    verdicts("G2-item", l -> fekete(l, false), "F", "P", "P")
+
+@test
+catalogue_g2_item_near_miss()
+    clean_everywhere(l -> write_skew(l, [1]))
+    clean_everywhere(l -> three_skew(l, 1))
+    clean_everywhere(l -> fekete(l, true))
+
+// -- G2 over predicates: phantoms, predicate write skew, nested predicates (I18) -----------------
+
+// Predicate write skew: each reads group 1 empty and inserts into it.
+private predicate_skew(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows("g = 1", []), m_write("k1", 1)])
+    h.ok(2, [m_pred_rows("g = 1", rows), m_write("k2", 1)])
+    h.check()
+
+// A phantom with one rw edge: t0's predicate misses t1's insert but sees t1's other write.
+private phantom_skew(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows("g = 1", rows), m_read_list("z", [1])])
+    h.ok(2, [m_write("k1", 1), m_append("z", 1)])
+    h.check()
+
+// The phantom through the nested level: each reads no row with an item priced over 4 and appends one.
+private nested_phantom(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows(Exists4, []), m_append("k1.items", 7)])
+    h.ok(2, [m_pred_rows(Exists4, rows), m_append("k2.items", 17)])
+    val _ = h.tx(9, level, [m_read_list("k1.items", [7]), m_read_list("k2.items", [17])])
+    h.check()
+
+// The nested phantom with one rw edge: t0's predicate misses t1's matching append to k1.items but
+// sees its append to z.
+private nested_phantom_skew(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.ok(1, [m_pred_rows(Exists4, rows), m_read_list("z", [1])])
+    h.ok(2, [m_append("k1.items", 7), m_append("z", 1)])
+    val _ = h.tx(9, level, [m_read_list("k1.items", [7])])
+    h.check()
+
+@test
+catalogue_g2_predicate_write_skew()
+    verdicts("G2", l -> predicate_skew(l, []), "F", "P", "P")
+
+@test
+catalogue_g_single_phantom()
+    verdicts("G-single", l -> phantom_skew(l, []), "F", "F", "P")
+
+@test
+catalogue_g2_nested_predicate_write_skew()
+    verdicts("G2", l -> nested_phantom(l, []), "F", "P", "P")
+
+@test
+catalogue_g_single_nested_phantom()
+    verdicts("G-single", l -> nested_phantom_skew(l, []), "F", "F", "P")
+
+@test
+catalogue_g2_near_miss_the_predicate_sees_the_insert()
+    clean_everywhere(l -> predicate_skew(l, ["k1"]))
+    clean_everywhere(l -> phantom_skew(l, ["k1"]))
+    clean_everywhere(l -> nested_phantom(l, ["k1"]))
+    clean_everywhere(l -> nested_phantom_skew(l, ["k1"]))
+
+// -- internal consistency ------------------------------------------------------------------------
+
+private internal_list(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1), m_read_list("x", read)])
+    h.check()
+
+private internal_register(level: string, read: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_write("r", 5), m_read_num("r", read)])
+    h.check()
+
+private internal_predicate(level: string, rows: []const string) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_write("k1", 1), m_pred_rows("g = 1", rows)])
+    h.check()
+
+@test
+catalogue_internal_a_read_missing_its_own_append()
+    verdicts("internal", l -> internal_list(l, []), "F", "F", "F")
+
+@test
+catalogue_internal_a_read_missing_its_own_write()
+    verdicts("internal", l -> internal_register(l, 0), "F", "F", "F")
+
+@test
+catalogue_internal_a_predicate_missing_its_own_insert()
+    verdicts("internal", l -> internal_predicate(l, []), "F", "F", "F")
+
+@test
+catalogue_internal_near_miss_reading_its_own_writes()
+    clean_everywhere(l -> internal_list(l, [1]))
+    clean_everywhere(l -> internal_register(l, 5))
+    clean_everywhere(l -> internal_predicate(l, ["k1"]))
+
+// -- real time and sessions (§3.1, §3.5) ---------------------------------------------------------
+
+// t1 begins after t0's append is acknowledged.
+private stale(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1)])
+    val _ = h.tx(2, level, [m_read_list("x", read)])
+    h.check()
+
+// Monotonic reads in one session: t1 sees t0's append, and t2, later on t1's session, does not;
+// t0's acknowledgement arrives only after t2 has begun, so no read is stale.
+private session_reads(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(3, level)
+    val _ = h.tx(1, level, [m_read_list("x", [1])])
+    val _ = h.tx(1, level, [m_read_list("x", read)])
+    h.ok(3, [m_append("x", 1)])
+    h.check()
+
+// Read-your-writes through a later version: t0 appends to x, t1 appends after it on another
+// session, and t2, on t1's session, reads x without either append.
+private session_writes(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(3, level)
+    val _ = h.inv(1, level)
+    h.ok(1, [m_read_list("x", [1]), m_append("x", 2)])
+    val _ = h.tx(1, level, [m_read_list("x", read)])
+    h.ok(3, [m_append("x", 1)])
+    val _ = h.tx(9, level, [m_read_list("x", [1, 2])])
+    h.check()
+
+// t1 begins after t0 is acknowledged and appends to x, yet the version order puts t1's append first;
+// the commit numbers the white box sees follow real time.
+private rt_writes(level: string, order: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    h.ok_wb(1, [m_append("x", 1)], 1, 1, 10)
+    val _ = h.inv(2, level)
+    h.ok_wb(2, [m_append("x", 2)], 2, 10, 20)
+    val _ = h.inv(9, level)
+    h.ok_wb(9, [m_read_list("x", order)], 3, 20, 0)
+    h.check()
+
+@test
+catalogue_g_stale_a_read_missing_an_acknowledged_write()
+    verdicts("G-stale", l -> stale(l, []), "F", "F", "F")
+
+@test
+catalogue_g_rt_a_read_missing_an_acknowledged_write()
+    verdicts("G-rt", l -> stale(l, []), "F", "-", "-")
+
+@test
+catalogue_g_session_monotonic_reads()
+    verdicts("G-session", l -> session_reads(l, []), "F", "F", "F")
+
+@test
+catalogue_g_session_read_your_writes_through_a_later_version()
+    verdicts("G-session", l -> session_writes(l, []), "F", "F", "F")
+
+@test
+catalogue_i5_version_order_against_real_time()
+    verdicts("I5", l -> rt_writes(l, [2, 1]), "F", "F", "F")
+    verdicts("G-rt", l -> rt_writes(l, [2, 1]), "F", "-", "-")
+
+@test
+catalogue_real_time_near_miss_reads_and_writes_in_order()
+    clean_everywhere(l -> stale(l, [1]))
+    clean_everywhere(l -> session_reads(l, [1]))
+    clean_everywhere(l -> session_writes(l, [1, 2]))
+    clean_everywhere(l -> rt_writes(l, [1, 2]))
+
+@test
+catalogue_g_session_near_miss_a_cycle_through_a_later_statement_at_read_committed()
+    // t0 and t1 run in turn on one session; t2, on another, reads x before t0's append in one
+    // statement and y after t1's in a later one. t0 -so-> t1 -wr-> t2 -rw-> t0 is a cycle in DSG+so
+    // whose rw edge does not follow its so edge: legal at read committed, where each statement
+    // takes a snapshot of its own (§3.3).
+    var h = hb()
+    val _ = h.inv(3, LevelRc)
+    val _ = h.tx(1, LevelRc, [m_append("x", 1)])
+    val _ = h.tx(1, LevelRc, [m_append("y", 1)])
+    h.ok(3, [m_read_list("x", []), m_read_list("y", [1])])
+    val r = h.check()
+    assert(r.forbidden().len() == 0, r.summary())
+
+// -- garbage reads -------------------------------------------------------------------------------
+
+private garbage_list(level: string, e: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1)])
+    val _ = h.tx(2, level, [m_read_list("x", [e])])
+    h.check()
+
+private garbage_register(level: string, v: i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_write("r", 1)])
+    val _ = h.tx(2, level, [m_read_num("r", v)])
+    h.check()
+
+private garbage_row(level: string, row: string) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_write("k1", 1)])
+    val _ = h.tx(2, level, [m_pred_rows("g = 1", [row])])
+    h.check()
+
+@test
+catalogue_garbage_an_element_nobody_appended()
+    verdicts("garbage", l -> garbage_list(l, 9), "F", "F", "F")
+
+@test
+catalogue_garbage_a_value_nobody_wrote()
+    verdicts("garbage", l -> garbage_register(l, 9), "F", "F", "F")
+
+@test
+catalogue_garbage_a_row_nobody_inserted()
+    verdicts("garbage", l -> garbage_row(l, "k9"), "F", "F", "F")
+
+@test
+catalogue_garbage_near_miss_the_value_written()
+    clean_everywhere(l -> garbage_list(l, 1))
+    clean_everywhere(l -> garbage_register(l, 1))
+    clean_everywhere(l -> garbage_row(l, "k1"))
+
+// -- list-append: duplicates, prefixes, the order of one transaction's appends -------------------
+
+private duplicates(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1)])
+    val _ = h.tx(2, level, [m_read_list("x", read)])
+    h.check()
+
+// Two reads of x no one order of appends explains.
+private not_a_prefix(level: string, second: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1)])
+    val _ = h.tx(2, level, [m_read_list("x", [1]), m_append("x", 2)])
+    val _ = h.tx(3, level, [m_read_list("x", second)])
+    h.check()
+
+// t0 appends 1, 2 and 3 to x in that order; a later read shows them otherwise.
+private append_order(level: string, read: []const i64) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1), m_append("x", 2), m_append("x", 3)])
+    val _ = h.tx(2, level, [m_read_list("x", read)])
+    h.check()
+
+@test
+catalogue_duplicate_elements()
+    verdicts("duplicate-elements", l -> duplicates(l, [1, 1]), "F", "F", "F")
+
+@test
+catalogue_incompatible_order_a_read_not_a_prefix_of_a_later_one()
+    verdicts("incompatible-order", l -> not_a_prefix(l, [2, 1]), "F", "F", "F")
+
+@test
+catalogue_incompatible_order_one_transactions_appends_reversed()
+    verdicts("incompatible-order", l -> append_order(l, [2, 1, 3]), "F", "F", "F")
+
+@test
+catalogue_incompatible_order_one_transactions_appends_with_a_gap()
+    verdicts("incompatible-order", l -> append_order(l, [1, 3]), "F", "F", "F")
+    verdicts("incompatible-order", l -> append_order(l, [3]), "F", "F", "F")
+
+@test
+catalogue_list_near_miss_reads_in_the_order_of_appends()
+    clean_everywhere(l -> duplicates(l, [1]))
+    clean_everywhere(l -> not_a_prefix(l, [1, 2]))
+    clean_everywhere(l -> append_order(l, [1, 2, 3]))
+
+// -- degenerate histories ------------------------------------------------------------------------
+
+private only_aborted(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    h.fail(1, [m_append("x", 1), m_write("r", 1), m_write("k1", 1)], "deadlock_detected")
+    h.fail(2, [m_read_list("x", []), m_read_num("r", 0), m_pred_rows("g = 1", [])], "deadlock_detected")
+    h.check()
+
+// Every outcome unknown (§5.4): one lost its answer with its operations recorded, one with only
+// its invoked plan, and a third read the first's writes, but its own outcome is unknown, so the
+// read resolves nothing.
+private only_unknown(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    val _ = h.inv(2, level)
+    val _ = h.inv(3, level)
+    h.info(1, [m_append("x", 1), m_write("r", 1), m_write("k1", 1)])
+    h.info(2, [])
+    h.info(3, [m_read_list("x", [1]), m_read_num("r", 1), m_pred_rows("g = 1", ["k1"])])
+    h.check()
+
+// An unknown write nobody read, and a later committed read without it: the write may have aborted.
+private unknown_unread(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.inv(1, level)
+    h.info(1, [m_append("x", 1), m_write("r", 1), m_write("k1", 1)])
+    val _ = h.tx(2, level, [m_read_list("x", []), m_read_num("r", 0), m_pred_rows("g = 1", [])])
+    h.check()
+
+private single(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_append("x", 1), m_read_list("x", [1]), m_write("r", 2), m_read_num("r", 2), m_write("k1", 1), m_pred_rows("g = 1", ["k1"])])
+    h.check()
+
+private initial_state(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_read_list("x", []), m_read_num("r", 0), m_read_unborn("s"), m_pred_rows("g = 1", []), m_read_list("n1.items", []), m_pred_rows(Exists4, [])])
+    val _ = h.tx(2, level, [m_read_list("x", []), m_read_num("r", 0)])
+    h.check()
+
+private no_ops(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [])
+    val _ = h.tx(1, level, [])
+    val _ = h.tx(2, level, [m_read_list("x", [])])
+    h.check()
+
+// A row inserted, then read and deleted, then found missing by a later reader: the reader saw the
+// delete, not the unborn row before the insert.
+private read_after_delete(level: string) -> HistoryReport
+    var h = hb()
+    val _ = h.tx(1, level, [m_write("k1", 5)])
+    val _ = h.tx(2, level, [m_read_num("k1", 5), m_delete("k1")])
+    val _ = h.tx(3, level, [m_read_unborn("k1")])
+    h.check()
+
+@test
+catalogue_an_empty_history()
+    val r = hb().check()
+    assert(r.anomalies.len() == 0 && r.txns.len() == 0 && r.edges.len() == 0, r.summary())
+
+@test
+catalogue_only_aborted_transactions()
+    clean_everywhere(l -> only_aborted(l))
+    val r = only_aborted(LevelSer)
+    assert(r.txns[0].outcome == TAborted && r.txns[1].outcome == TAborted)
+    assert_eq(r.edges.len(), 0)
+
+@test
+catalogue_only_unknown_transactions()
+    clean_everywhere(l -> only_unknown(l))
+    val r = only_unknown(LevelSer)
+    for t in r.txns
+        assert(t.outcome == TUnknown, s"T${t.id} should stay unknown")
+    assert_eq(r.edges.len(), 0)
+
+@test
+catalogue_an_unknown_write_nobody_read_may_have_aborted()
+    clean_everywhere(l -> unknown_unread(l))
+    assert(unknown_unread(LevelSer).txns[0].outcome == TUnknown)
+
+@test
+catalogue_a_single_transaction()
+    clean_everywhere(l -> single(l))
+
+@test
+catalogue_reads_of_the_initial_state()
+    clean_everywhere(l -> initial_state(l))
+
+@test
+catalogue_transactions_with_no_operations()
+    clean_everywhere(l -> no_ops(l))
+    assert_eq(no_ops(LevelSer).txns[0].ops.len(), 0)
+
+@test
+catalogue_a_read_after_a_delete()
+    clean_everywhere(l -> read_after_delete(l))
+
+@test
+catalogue_a_predicate_read_lacking_a_row_deleted_only_after_it_is_stale()
+    // t2 began after t0's insert was acknowledged and lacks it; t1's delete began only after t2
+    // ended, so it cannot explain the absence.
+    for level in [LevelSer, LevelSi, LevelRc]
+        var h = hb()
+        val _ = h.tx(1, level, [m_write("k1", 1)])
+        val _ = h.tx(2, level, [m_pred_rows("g = 1", [])])
+        val _ = h.tx(3, level, [m_pred_rows("g = 1", ["k1"]), m_delete("k1")])
+        expect(h.check(), "G-stale", "F", level, __FILE__, __LINE__)
+
+@test
+catalogue_a_nested_predicate_lacking_a_row_deleted_only_after_it_is_stale()
+    for level in [LevelSer, LevelSi, LevelRc]
+        var h = hb()
+        val _ = h.tx(1, level, [m_append("k1.items", 7)])
+        val _ = h.tx(2, level, [m_pred_rows(Exists4, [])])
+        val _ = h.tx(3, level, [m_read_list("k1.items", [7]), m_delete("k1")])
+        expect(h.check(), "G-stale", "F", level, __FILE__, __LINE__)

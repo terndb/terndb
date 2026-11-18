@@ -11,32 +11,53 @@ in a real store; the history checker of `history.md` is proven against each.
 
 ## Structure
 
-- **`Store`** holds the `MemCatalog` of the operation in progress and the catalog's committed versions (below), the transaction-id counter, the visible horizon `h`
-  (the last commit sequence number), one `TableData` per table that has been touched, the live transactions and
-  the retained committed write sets.
-- **`TableData`** keeps the table's rows as a `Buf[&Slot]` sorted by primary key (a record of the key columns,
-  compared with `cmp`), found by binary search. sysl has no fast hash map yet (`docs/phase0/sysl-survey/`), so
-  the ordered buffer stands in; an insert is O(n) in the number of keys. A slot is never removed: a delete is a
-  tombstone version and an aborted insert leaves an empty chain, both reclaimed by a purge that does not exist yet.
-- **`Slot`** is one row: its key, its row lock (the id of the live transaction owning the newest version, 0 for
-  none) and its versions, oldest first. The newest is the in-place version, the rest the undo chain (§4.1).
-- **`RowVersion`** carries its writer's id, its commit sequence number (0 while uncommitted) and its image, a
-  `StoredRow` (schema version plus the `Value` record of that version's columns) or `None` for a delete. Every
-  stored row carries its schema version (`ddl.md` §5.2).
+The rows live in pages exactly as `on-disk-format.md` §8.1 has in-memory mode keep them: one B+tree per table over
+16 KB pages (`btree.md`), each row in the row format (§4.1–§4.2, `row-format.md`), and every older version in the
+undo log (§5, `undo.md`). Checksums are not computed in memory (§8.1 rule 3). `check_pages` runs the B+tree check
+and the undo check over everything the store holds; `store_pages_tests.sysl` exercises the page-backed paths.
+
+- **`Store`** holds the `MemCatalog` of the operation in progress and the catalog's committed versions (below),
+  the transaction-id counter, the visible horizon `h` (the last commit sequence number), one `TableData` per
+  table that has been touched, **`rows`** (an `UndoRows`: the data space with every table's tree, the undo space,
+  and the transaction table), the live transactions and the retained committed write sets. A transaction's id is
+  its id in `rows`, and `h` is always `rows.last_commit`.
+- **`TableData`** is a table's place in the store: its primary key's columns, their record type and their §4.6
+  key encoding (each component ascending), the **`SchemaCodec`** of each schema version a row has been written in,
+  and its unique keys. A codec holds the version's columns, where the key columns sit among them, and each
+  non-key column's type with named types resolved as they stood at the version's first write; it is declared to
+  `rows` as the version's `RowLayout`, so the leaf can lay out a body. A codec is made again at a write when the
+  catalog's columns for its number differ, which happens only when a rolled-back `ALTER` gave the number out.
+- **A row** is the tree entry (encoded key, row). `Slot` is a row as read now: its key, the key's bytes and its
+  current image (`RowImage`: header and non-key column images). A `StoredRow` (schema version plus the `Value`
+  record of that version's columns, key included) becomes column images with `encode_value` and comes back with
+  `decode_value`, the key's values taken from the key. `RowVersion` (writer, commit number, image) is what the
+  checks below read from a row's version chain.
+- **Limits.** A key over 1,024 bytes is `key_too_long` (`D2001`). A row whose key and value exceed 4,000 bytes
+  would need columns out of line in overflow chains (§4.7–§4.8), which wait on sysl 0.12 (CRC32C), so it is
+  refused with `entry_too_large` (`D2002`) before any undo record is written; nothing is approximated.
 - **`UniqueIx`** (`store_index.sysl`) is one secondary unique key of a table — a `unique` constraint, or a ready
   unique index over columns with no predicate: a `Buf[IxEntry]` sorted by the key's value (then by primary key),
-  each entry a non-null value some version of a slot holds. An entry is added whenever a version is installed and
-  never removed; a lookup reads the slot's versions to decide whether the value is still there. `sync_uniques`
+  each entry a value with no null component that some version of a row holds, and the row's primary key. A value
+  with a null component never conflicts and has no entry (Q48; on disk such an entry takes the non-unique form,
+  §4.9 rule 1). An entry is added whenever a version is installed and never removed; a lookup fetches the row and
+  reads its versions to decide whether the value is still there, as §4.9 rule 2 has a reader do. `sync_uniques`
   brings a table's indexes in line with the catalog before each check, building a key added since from every
-  version of every row.
+  version of every row still reachable.
 
 ## Version chains and visibility
 
-A reader walks a slot's versions newest first and takes its own uncommitted version, else the first version
-committed at or before its snapshot (§4.1). Commit stamps the transaction's top version of every row it wrote
-with `c = h + 1`, releases the locks and publishes by setting `h = c`; publication is therefore in `c` order and
-precedes the return of `commit`, which is the acknowledgement. Abort pops each written row's top version, so an
-aborted version was never visible to anyone else.
+A row's current image names its writer in `txn`; its older versions are rebuilt by applying the undo records of
+its version chain backward (§5.4). A reader takes its own uncommitted version, else the newest committed at or
+before its snapshot. A write is one undo record and the row rewritten in its tree, through `UndoRows`: an INSERT
+where there is no row, an UPDATE over a live row or a ghost, a DELETE that leaves a ghost. A transaction writing a
+row again writes another record, so a statement or savepoint can take back just the later write. Commit changes
+no row: it takes `c = h + 1` in the transaction table and publishes by setting `h = c`, so publication is in `c`
+order and precedes the return of `commit`, which is the acknowledgement; the row locks, which are the rows' `txn`
+fields, lapse with it. A transaction with an empty write set is recorded as committed at its snapshot and
+publishes nothing. Abort walks the rollback chain and restores every row, so an aborted version was never visible
+to anyone else. **Purge** runs whenever a transaction ends, up to the oldest snapshot a live transaction holds or
+one beginning now would take: ghosts no snapshot can see leave their trees and undo pages below the horizon are
+dropped (§5.5, §5.6). A table no catalog can read any more gives its tree's pages back.
 
 A write (§4.2) to a row locked by another live transaction answers `Wait(holder)`. A write statement first
 collects the rows its predicate selects at its snapshot, and answers `Wait` before writing any of them if one is
@@ -57,11 +78,12 @@ version older than the newest committed image's aborts with `schema_changed` (`d
   removals first, so a key a row leaves is free for the row moving into it.
 - **`usable(t)`** refuses a statement in an ended transaction, and **`abort_with(t, e)`** aborts `t` with the
   code of an error raised outside the store (validation, a runtime error, a check constraint).
-- **`statement(t)`** begins a statement: a new snapshot at read committed, and a fresh **statement undo log**.
-  Every version `install` pushes or overwrites is recorded there, with every `LOCK_ONLY` lock and deferred check
-  the statement takes, so **`undo_statement(t)`** can take the statement back when it must wait part-way (a
-  cascade meeting a locked row, a foreign-key check meeting a locked referenced row). `write_rows` uses the same
-  log to undo its own batch.
+- **`statement(t)`** begins a statement: a new snapshot at read committed, and a **`Mark`**: where `t`'s statement
+  log (the rows it wrote, for the batch's unique checks and its write list), writes, `LOCK_ONLY` locks, deferred
+  checks and undo rollback chain stand. **`undo_statement(t)`** takes the statement back when it must wait
+  part-way (a cascade meeting a locked row, a foreign-key check meeting a locked referenced row): the undo records
+  after the mark are rolled back (`UndoRows.rollback_to`), which restores the rows and lets their locks go, and
+  the lists are cut back. `write_rows` uses the same mark to undo its own batch.
 - **`lookup_unique(t, table, ids, value)`** finds the visible row holding `value` in a unique or primary key, for
   an upsert's conflict check (logged as a read of every column).
 - **`check_reference(t, fk, value)`**, **`referencing(t, fk, values)`**, **`holds_key`** and **`defer_check`** are
@@ -72,16 +94,19 @@ version older than the newest committed image's aborts with `schema_changed` (`d
 
 A batch of writes (`write_rows`, `insert`, `update_where`) is checked against the table's secondary unique keys
 once every change is applied, so a statement may exchange values among its rows (`ddl.md` §2.6 rule 5). For each
-row the batch wrote, every other slot with an entry for its value is judged: a version another live transaction
+row the batch wrote, every other row with an entry for its value is judged: a version another live transaction
 is writing that holds it answers `Wait` (the batch is undone first); `t`'s own version or its snapshot's holding it
 is `unique_violation`; the newest committed one holding it is `serialization_failure` at snapshot and serializable,
 `unique_violation` at read committed. A row another transaction only holds `LOCK_ONLY` is judged by its committed
 version.
 
-A **`LOCK_ONLY` lock** is the slot's ordinary row lock held by a transaction whose version is not on top: it is
-listed in `Txn.locks`, released at commit and rollback, and anyone else writing the row waits for it as for any
-lock. `owns(s, t)` — the newest version is `t`'s uncommitted one — is what decides an in-place rewrite, since the
-lock alone no longer says so.
+A **`LOCK_ONLY` lock** is a LOCK undo record (§5.2, Q49): the row then carries the locker in `txn` with
+`LOCK_ONLY` set, its columns untouched, and is listed in `Txn.locks`. Anyone else writing the row waits for it as
+for any lock while the locker is live; at commit or rollback it lapses as every row lock does. It is never a
+version: first-updater-wins compares the version's writer, found past every LOCK record (`UndoRows.writer_of`),
+with the snapshot, so a lock committed after a writer's snapshot does not refuse it. A lock taken over a committed
+lock sets record flag bit 2, and so does a write over a locked row. `owns(s, t)` — the row carries `t` as its
+writer, not as a locker — is what decides a write over `t`'s own version.
 
 `check_reference` takes the referenced row `LOCK_ONLY` at every level and logs the read at serializable
 (`ddl.md` §2.6 rule 3); a referenced row another live transaction is writing answers its id to wait for.
@@ -201,7 +226,13 @@ per-row latches and a real wait) is the next slice of this work.
 ## Deferred
 
 - Disk, WAL, the buffer manager and recovery (waiting on sysl's CRC32C and io_uring gaps); `transaction_status`.
-- `max_predicate_log` coarsening, `max_snapshot_age` and undo purge.
+- `max_predicate_log` coarsening, `max_snapshot_age` and `undo_retention_limit`.
+- Overflow chains (§4.7–§4.8, waiting on sysl 0.12's CRC32C): until then a row over the inline limit is refused
+  with `entry_too_large`.
+- Secondary unique keys as B+trees of §4.9 entries, with SECONDARY undo records and delete marks: the unique keys
+  stay sorted buffers in memory, entries named by primary key, which the pages do not hold.
+- A retype of a primary-key column (its key encoding would change): keys are encoded with the key types the
+  table had when the store first touched it.
 - Translation of a value whose representation a lossless retype changes other than integer to float (to
   `decimal`, `json` to `text`); the commit latch of `ddl.md` §6.1 rule 3, which a single-threaded store does not
   need.

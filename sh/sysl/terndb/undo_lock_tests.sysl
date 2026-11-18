@@ -1,0 +1,265 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `LOCK_ONLY` rows and LOCK undo records (`undo.sysl`, Q49): a lock changes no version a reader sees,
+// holds the write lock until its transaction ends, rolls back to the row it found, and a lock taken
+// over a committed lock is flagged (record flag bit 2) and skipped when the version's writer is
+// looked for; updates and deletes over a lock-only row carry the same flag. Purge passes LOCK
+// records, and the structural check refuses a LOCK that does not sit under a lock-only version.
+
+private ul_cols(vs: []const string) -> Buf[ColumnImage]
+    val out = buf[ColumnImage]()
+
+    for v in vs
+        out.push(ColumnImage(false, undo_bytes(v.bytes)))
+
+    out
+
+private ul_done(r: Result[UndoWrite, CodecError]) -> u64 = r match
+    Ok(UndoDone(a)) -> a
+    Ok(_) -> panic("a write was refused")
+    Err(e) -> panic(s"a write failed: ${e.message}")
+
+private ul_put(u: &UndoRows, key: string, v: string) -> u64
+    val t = u.begin()
+    ul_done(u.insert(t, 1, key.bytes, 1, ul_cols([v]).view()))
+    u.commit(t).unwrap()
+
+private ul_set(u: &UndoRows, key: string, v: string) -> u64
+    val t = u.begin()
+    ul_done(u.update(t, 1, key.bytes, 1, ul_cols([v]).view()))
+    u.commit(t).unwrap()
+
+/** Locks `key` in a transaction of its own and commits it; answers the transaction. */
+private ul_lock(u: &UndoRows, key: string) -> u64
+    val t = u.begin()
+    ul_done(u.lock(t, 1, key.bytes))
+    u.commit(t).unwrap()
+    t
+
+private ul_get(u: &UndoRows, key: string, s: u64, own: u64) -> Option[Buf[ColumnImage]] = u.read(1, key.bytes, s, own) match
+    Ok(Some(r)) -> Some(r.cols)
+    Ok(None) -> None
+    Err(e) -> panic(s"a read failed: ${e.message}")
+
+private ul_row(u: &UndoRows, key: string) -> RowImage = u.current(1, key.bytes).unwrap().unwrap()
+
+private ul_check(u: &UndoRows) -> UndoStats = check_undo(u) match
+    Ok(s) -> s
+    Err(e) -> panic(s"the undo check failed: ${e.message}")
+
+private ul_record(u: &UndoRows, key: string) -> UndoRecord = u.space.read(ul_row(u, key).header.undo).unwrap()
+
+private ul_corrupt[T](r: Result[T, CodecError], what: string) = r match
+    Ok(_) -> assert(false, s"$what: accepted")
+    Err(e) -> assert_eq(e.code, "D1001", what)
+
+@test
+a_lock_changes_no_version_and_holds_the_write_lock()
+    val u = undo_rows()
+    val c1 = ul_put(u, "k", "a")
+    val c2 = ul_set(u, "k", "b")
+    val writer = ul_row(u, "k").header.txn
+    val l = u.begin()
+    val addr = ul_done(u.lock(l, 1, "k".bytes))
+    val row = ul_row(u, "k")
+    assert_eq(row.header.txn, l)
+    assert_eq(row.header.undo, addr)
+    assert_eq(row.header.flags, RowLockOnly)
+    assert_eq(row.cols, ul_cols(["b"]))
+    val rec = ul_record(u, "k")
+    assert_eq(rec.kind, UndoLock)
+    assert_eq(rec.flags, 0)
+    assert_eq(rec.prev_txn, writer)
+    assert_eq(u.writer_of(row), Ok(writer))
+    // Every snapshot, the locker's own included, sees what it saw before the lock.
+    assert_eq(ul_get(u, "k", c1, 0), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", c2, 0), Some(ul_cols(["b"])))
+    assert_eq(ul_get(u, "k", c1, l), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", c2, l), Some(ul_cols(["b"])))
+    // Every other writer, and every other locker, waits for it.
+    val w = u.begin()
+    assert_eq(u.update(w, 1, "k".bytes, 1, ul_cols(["c"]).view()), Ok(UndoLocked(l)))
+    assert_eq(u.delete(w, 1, "k".bytes), Ok(UndoLocked(l)))
+    assert_eq(u.lock(w, 1, "k".bytes), Ok(UndoLocked(l)))
+    assert_eq(ul_check(u).records, 3)
+    u.commit(l).unwrap()
+    // Committed, the lock is no lock: the row keeps LOCK_ONLY and the version is still the writer's.
+    assert_eq(ul_get(u, "k", u.last_commit, 0), Some(ul_cols(["b"])))
+    assert_eq(u.writer_of(ul_row(u, "k")), Ok(writer))
+    ul_done(u.update(w, 1, "k".bytes, 1, ul_cols(["c"]).view()))
+    assert_eq(ul_record(u, "k").flags, UndoOldLockOnly)
+    assert_eq(ul_row(u, "k").header.flags, 0)
+    val c4 = u.commit(w).unwrap()
+    assert_eq(ul_get(u, "k", c1, 0), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", c2, 0), Some(ul_cols(["b"])))
+    assert_eq(ul_get(u, "k", c4 - 1, 0), Some(ul_cols(["b"])))
+    assert_eq(ul_get(u, "k", c4, 0), Some(ul_cols(["c"])))
+    ul_check(u)
+
+@test
+a_lock_over_a_committed_lock_is_flagged_and_skipped()
+    val u = undo_rows()
+    val c1 = ul_put(u, "k", "a")
+    val writer = ul_row(u, "k").header.txn
+    val l1 = ul_lock(u, "k")
+    val l2 = u.begin()
+    ul_done(u.lock(l2, 1, "k".bytes))
+    val rec = ul_record(u, "k")
+    assert_eq(rec.kind, UndoLock)
+    assert_eq(rec.flags, UndoOldLockOnly)
+    assert_eq(rec.prev_txn, l1)
+    assert_eq(u.writer_of(ul_row(u, "k")), Ok(writer))
+    u.commit(l2).unwrap()
+    val l3 = ul_lock(u, "k")
+    assert_eq(ul_row(u, "k").header.txn, l3)
+    assert_eq(u.writer_of(ul_row(u, "k")), Ok(writer))
+    // A snapshot before the first lock, and one after every lock, see the one version.
+    assert_eq(ul_get(u, "k", c1, 0), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", u.last_commit, 0), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", 0, 0), None)
+    ul_check(u)
+    // A delete over the lock chain is flagged too, and rebuilds to the locked version.
+    val d = u.begin()
+    ul_done(u.delete(d, 1, "k".bytes))
+    assert_eq(ul_record(u, "k").kind, UndoDelete)
+    assert_eq(ul_record(u, "k").flags, UndoOldLockOnly)
+    assert_eq(ul_row(u, "k").header.flags, RowDeleted)
+    assert_eq(ul_get(u, "k", u.last_commit, 0), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", u.last_commit, d), None)
+    ul_check(u)
+    val cd = u.commit(d).unwrap()
+    assert_eq(ul_get(u, "k", cd, 0), None)
+    assert_eq(ul_get(u, "k", cd - 1, 0), Some(ul_cols(["a"])))
+    ul_check(u)
+
+@test
+a_lock_by_the_rows_own_writer_or_locker_writes_nothing()
+    val u = undo_rows()
+    ul_put(u, "k", "a")
+    val t = u.begin()
+    val a = ul_done(u.update(t, 1, "k".bytes, 1, ul_cols(["b"]).view()))
+    assert_eq(u.lock(t, 1, "k".bytes), Ok(UndoDone(a)))
+    assert_eq(ul_row(u, "k").header.flags, 0)
+    assert_eq(ul_check(u).records, 2)
+    u.commit(t).unwrap()
+    val l = u.begin()
+    val b = ul_done(u.lock(l, 1, "k".bytes))
+    assert_eq(u.lock(l, 1, "k".bytes), Ok(UndoDone(b)))
+    assert_eq(ul_check(u).records, 3)
+    // The locker may then write the row itself: an UPDATE over its own lock.
+    ul_done(u.update(l, 1, "k".bytes, 1, ul_cols(["c"]).view()))
+    assert_eq(ul_record(u, "k").flags, UndoOldLockOnly)
+    assert_eq(ul_record(u, "k").prev_txn, l)
+    assert_eq(ul_get(u, "k", u.last_commit, l), Some(ul_cols(["c"])))
+    assert_eq(ul_get(u, "k", u.last_commit, 0), Some(ul_cols(["b"])))
+    ul_check(u)
+
+@test
+a_lock_of_no_live_row_is_refused()
+    val u = undo_rows()
+    val t = u.begin()
+    assert_eq(u.lock(t, 1, "none".bytes), Ok(UndoMissing))
+    ul_put(u, "g", "x")
+    val d = u.begin()
+    ul_done(u.delete(d, 1, "g".bytes))
+    u.commit(d).unwrap()
+    assert_eq(u.lock(t, 1, "g".bytes), Ok(UndoMissing))
+    ul_put(u, "k", "a")
+    val w = u.begin()
+    ul_done(u.update(w, 1, "k".bytes, 1, ul_cols(["b"]).view()))
+    assert_eq(u.lock(t, 1, "k".bytes), Ok(UndoLocked(w)))
+    u.commit(t).unwrap()
+    assert_eq(u.lock(t, 1, "k".bytes), Ok(UndoNotActive))
+    ul_check(u)
+
+@test
+rolling_back_a_lock_restores_the_row_it_found()
+    val u = undo_rows()
+    ul_put(u, "k", "a")
+    val l1 = ul_lock(u, "k")
+    val before = copy_row_image(ul_row(u, "k"))
+    // A lock over the committed lock, then an update and a delete of the row by the same locker.
+    val l2 = u.begin()
+    ul_done(u.lock(l2, 1, "k".bytes))
+    ul_done(u.update(l2, 1, "k".bytes, 1, ul_cols(["b"]).view()))
+    ul_done(u.delete(l2, 1, "k".bytes))
+    ul_check(u)
+    assert_eq(u.abort(l2), Ok(true))
+    assert_eq(ul_row(u, "k"), before)
+    assert_eq(ul_row(u, "k").header.txn, l1)
+    ul_check(u)
+    // A lock rolled back alone.
+    val l3 = u.begin()
+    ul_done(u.lock(l3, 1, "k".bytes))
+    assert_eq(u.abort(l3), Ok(true))
+    assert_eq(ul_row(u, "k"), before)
+    ul_check(u)
+
+@test
+purge_passes_lock_records_and_the_row_stands_as_it_is()
+    val u = undo_rows()
+    ul_put(u, "k", "a")
+    ul_lock(u, "k")
+    ul_lock(u, "k")
+    val p = u.purge(0xffffffffffffffff).unwrap()
+    assert_eq(p.records, 3)
+    val row = ul_row(u, "k")
+    assert_eq(row.header.flags, RowLockOnly)
+    assert(row.header.undo < u.space.low, "the row's records are purged")
+    assert_eq(u.writer_of(row), Ok(0))
+    assert_eq(ul_get(u, "k", 0, 0), Some(ul_cols(["a"])))
+    ul_check(u)
+    // A lock and a write over the purged lock.
+    val l = u.begin()
+    ul_done(u.lock(l, 1, "k".bytes))
+    assert_eq(ul_record(u, "k").flags, UndoOldLockOnly)
+    assert_eq(u.writer_of(ul_row(u, "k")), Ok(0))
+    u.commit(l).unwrap()
+    val c = ul_set(u, "k", "b")
+    assert_eq(ul_get(u, "k", c - 1, 0), Some(ul_cols(["a"])))
+    assert_eq(ul_get(u, "k", c, 0), Some(ul_cols(["b"])))
+    ul_check(u)
+    u.purge(0xffffffffffffffff).unwrap()
+    assert_eq(ul_check(u).records, 0)
+
+@test
+lock_records_encode_and_their_flags_are_checked()
+    val r = UndoRecord(0, UndoLock, UndoOldLockOnly, 3, 9, 32, 0, 8, 1, undo_bytes("k".bytes), buf[UndoColumn](), 0, buf[u8]())
+    val b = encode_undo_record(r)
+    assert_eq(b.len(), 49)
+    assert_eq(b[3], UndoOldLockOnly)
+    val back = decode_undo_record(b.view()).unwrap()
+    assert_eq(back.kind, UndoLock)
+    assert_eq(back.flags, UndoOldLockOnly)
+    assert_eq(back.prev_txn, 8)
+    // A LOCK over a ghost, a version both a ghost and lock-only, and an INSERT over a lock.
+    b[3] = UndoOldDeleted
+    ul_corrupt(decode_undo_record(b.view()), "a LOCK over a ghost")
+    b[3] = UndoOldDeleted | UndoOldLockOnly
+    ul_corrupt(decode_undo_record(b.view()), "an old version both a ghost and lock-only")
+    val ins = encode_undo_record(UndoRecord(0, UndoInsert, UndoOldLockOnly, 0, 9, 0, 0, 0, 1, undo_bytes("k".bytes), buf[UndoColumn](), 0, buf[u8]()))
+    ul_corrupt(decode_undo_record(ins.view()), "an INSERT over a lock-only version")
+    val del = encode_undo_record(UndoRecord(0, UndoDelete, UndoOldDeleted | UndoOldLockOnly, 3, 9, 32, 0, 8, 1, undo_bytes("k".bytes), buf[UndoColumn](), 0, buf[u8]()))
+    ul_corrupt(decode_undo_record(del.view()), "a DELETE over a version both a ghost and lock-only")
+    // Bit 2 alone on an UPDATE and a DELETE is accepted.
+    del[3] = UndoOldLockOnly
+    assert_eq(decode_undo_record(del.view()).unwrap().flags, UndoOldLockOnly)
+
+@test
+the_check_and_reads_refuse_a_lock_record_out_of_place()
+    val u = undo_rows()
+    ul_put(u, "k", "a")
+    val l = u.begin()
+    ul_done(u.lock(l, 1, "k".bytes))
+    val row = copy_row_image(ul_row(u, "k"))
+    // The LOCK record under a version whose LOCK_ONLY flag is gone.
+    u.put_row(1, "k".bytes, RowImage(RowHeader(row.header.txn, row.header.undo, 0, row.header.schema_version), row.cols))
+    ul_corrupt(check_undo(u), "a LOCK record under a version that is not lock-only")
+    ul_corrupt(u.read(1, "k".bytes, 0, 0), "a read through that LOCK record")
+    u.put_row(1, "k".bytes, row)
+    ul_check(u)
+    u.commit(l).unwrap()
+    ul_check(u)

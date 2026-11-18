@@ -4,8 +4,8 @@
 body, the record that shares the body's layout, type descriptors, the scalar encodings, relation,
 record and union values, the in-place versus out-of-line decision and the 32-octet stub.
 `sh/sysl/terndb/key_encoding.sysl` implements §4.6, the order-preserving key encoding, and §4.9, the
-secondary-index entry. Neither is wired into the store or the B+tree yet; in-memory mode will use the
-same row format as on-disk mode (§8.1 rule 2).
+secondary-index entry. The store's rows are in this format, keyed by this encoding, in its B+trees
+(`store.md`); in-memory mode uses the same row format as on-disk mode (§8.1 rule 2).
 
 ## What the code offers
 
