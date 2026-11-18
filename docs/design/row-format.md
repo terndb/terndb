@@ -4,8 +4,8 @@
 body, the record that shares the body's layout, type descriptors, the scalar encodings, relation,
 record and union values, the in-place versus out-of-line decision and the 32-octet stub.
 `sh/sysl/terndb/key_encoding.sysl` implements §4.6, the order-preserving key encoding, and §4.9, the
-secondary-index entry. Neither is wired into the store or the B+tree yet; in-memory mode will use the
-same row format as on-disk mode (§8.1 rule 2).
+secondary-index entry. The store's rows are in this format, keyed by this encoding, in its B+trees
+(`store.md`); in-memory mode uses the same row format as on-disk mode (§8.1 rule 2).
 
 ## What the code offers
 
@@ -23,6 +23,28 @@ same row format as on-disk mode (§8.1 rule 2).
 Decoders raise `data_corrupted` (`D1001`) for anything that breaks the layout. Encoders raise
 `type_mismatch` (`Q3001`) for a value that does not belong to its type, and for a type with no stored
 form the code `ddl.md` refuses it with (`Q3014`, `Q3015`, `Q3016`, `Q6005`, `Q6011`).
+
+## Property tests
+
+`encoding_property_tests.sysl` runs 40 seeds (`PropSeeds`) of `sysl.rand.Rng` over edge-value pools for every
+type: each integer width, floats (NaN payloads, -0, subnormals, infinities), decimals at 1 and 38 digits at
+every scale, text and bytes holding 0x00 and 0xFF, interval, uuid and enums.
+
+- **Keys:** order equals `cmp` over every pair of edge values (nullable or not, ascending or descending) and
+  over random composite keys with mixed directions; no key is a prefix of another; a key decodes to the
+  canonical form (-0 as +0, any NaN as the quiet NaN).
+- **Key corruption:** every truncation, an appended octet and every single-octet mutation gives `D1001`, or a
+  value that re-encodes to exactly the mutated octets.
+- **Rows:** round trips across schema versions with dropped and added columns, all-NULL rows at every bitmap
+  width to 70 columns, decoding under another version's column list gives `D1001` or a value, and the
+  4,000-octet limit (exactly 4,000 inline; 4,001 moves a column of 256 octets or more, or is `D2002`).
+- **Row corruption:** every truncation and an appended octet are detected. A single-octet mutation is
+  detected, or reads as a row whose canonical encoding equals the mutated octets except at octets the
+  canonical form leaves zero. Those undetectable octets are the reserved ones, which a reader ignores
+  (§1 rule 3): the three reserved octets of a relation value and the reserved octets of a stub. Mutations
+  of the row header's reserved flag bits are ignored the same way and are not compared.
+- A float32 NaN keeps its sign, quiet bit and payload through a row (`float32_bits`, `float32_from_bits`),
+  as the Floats rule says a row keeps floats as given.
 
 ## Deferred
 

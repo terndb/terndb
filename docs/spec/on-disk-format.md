@@ -379,7 +379,7 @@ the value.
 | bit | name | meaning |
 |----:|------|---------|
 | 0 | `DELETED` | a ghost: the row is deleted as of `txn`, and stays until purge (§5.6) |
-| 1 | `LOCK_ONLY` | `txn` holds the write lock without having changed the row. The version's writer is the `prev_txn` of the LOCK undo record at `undo` |
+| 1 | `LOCK_ONLY` | `txn` holds the write lock without having changed the row. The version's writer is the `prev_txn` of the LOCK undo record at `undo`, or, where that record's flag bit 2 says the version under it was lock-only too, of the first LOCK record down the version chain without bit 2 (§5.2, §5.4) |
 | 2 | `HAS_EXTERNAL` | an external bitmap follows the null bitmap (§4.2) |
 | 3–15 | reserved | |
 
@@ -582,7 +582,10 @@ An overflow page:
 A secondary index is a B+tree (node `flags` bit 3) whose entries **point at the primary key**, never at a page.
 
 1. A non-unique index's key is (index columns ‖ primary key) and its value is empty. A unique index's key is the
-   index columns and its value is the encoded primary key.
+   index columns and its value is the encoded primary key. **An entry of a unique index with a NULL component is
+   stored in the non-unique form** (index columns ‖ primary key, empty value), so that NULLs never conflict with one
+   another (`ddl.md` §2.5 rule 2), as in the SQL standard and Postgres. A reader tells the two forms apart by
+   whether a decoded index component is NULL, and a uniqueness check looks only at entries of the unique form.
 2. Secondary entries carry no transaction fields. An update that changes an indexed column delete-marks the old
    entry (slot `flags` bit 0) and inserts the new one. A reader that finds an entry fetches the clustered row,
    rebuilds the version its snapshot sees, and keeps the entry only when that version's index columns equal the
@@ -631,7 +634,7 @@ An undo page:
 |----:|-----:|-------|---------|
 | 0  | 2 | `len` | the total length of the record |
 | 2  | 1 | `kind` | 0 PAD, 1 INSERT, 2 UPDATE, 3 DELETE, 4 LOCK, 5 SECONDARY (index-entry change); others reserved |
-| 3  | 1 | `flags` | bit 0 = the old version had `DELETED` set; bit 1 = an old value is out of line |
+| 3  | 1 | `flags` | bit 0 = the old version had `DELETED` set; bit 1 = an old value is out of line; bit 2 = the old version had `LOCK_ONLY` set; bits 3–7 reserved |
 | 4  | 2 | `old_schema_version` | |
 | 6  | 2 | `key_len` | |
 | 8  | 8 | `txn` | the transaction that made the change |
@@ -653,12 +656,23 @@ Payloads:
 - **SECONDARY**: `index_oid` u64, then the index entry's key. It records a secondary insert, so a rollback can
   remove the entry and purge can remove a delete-marked one.
 
+**Lock-only old versions** (flag bit 2). A LOCK, UPDATE or DELETE written over a row whose `LOCK_ONLY` is set (a
+lock taken over a committed lock, or a write over a locked row) sets bit 2, so that the old version it rebuilds
+is known to be lock-only: its `txn` (the record's `prev_txn`) is a locker, not the version's writer. Bit 2 is
+never set with bit 0 (a ghost is never locked) nor on an INSERT, and a LOCK never sets bit 0; any of these is
+`data_corrupted`. A LOCK record is written only by a transaction that does not already hold the row: one that
+wrote or locked it writes nothing more. A LOCK is a write lock like any other while its transaction is active
+(§4.1): a writer finding it waits, and the first-updater-wins rule (`isolation.md` §4.2) treats it as the row's
+lock. It is never a version: the version's writer, which the first-updater-wins rule compares with the snapshot,
+is found as §4.1 `LOCK_ONLY` says, skipping every LOCK record whose bit 2 is set.
+
 ### 5.3 Chaining
 
 Each record sits on two chains:
 
 1. The **version chain** runs from a row's `undo` field through each record's `prev_version`. Following it walks
-   the row's versions from newest to oldest. Along the chain, `txn` strictly decreases in commit order.
+   the row's versions from newest to oldest. Along the chain, `txn` strictly decreases in commit order, lock-only
+   versions (§5.2 flag bit 2) apart: a locker is not a writer, and its place in commit order says nothing.
 2. The **rollback chain** runs from a transaction's newest record through `txn_prev`. Following it undoes the
    transaction in reverse order.
 
@@ -667,12 +681,16 @@ Each record sits on two chains:
 A reader with snapshot S looks up the row in the leaf and copies it under the optimistic latch. Then, starting from
 that copy:
 
-1. If S sees `txn` (per `isolation.md`, with `LOCK_ONLY` reading `prev_txn` from the record at `undo`), the current
-   version is the answer: absent if `DELETED`, else the row.
+1. If S sees the version's writer — `txn`, or with `LOCK_ONLY` the `prev_txn` of the record at `undo`, skipping
+   down the version chain past each LOCK record whose flag bit 2 is set (§4.1, §5.2) — the current version is the
+   answer: absent if `DELETED`, else the row. A writer whose record lies below `undo_low` is seen by every
+   snapshot (§5.5 rule 2).
 2. Otherwise, if `undo < undo_low` (§5.5), the database is corrupt. Rule D17 forbids this.
 3. Otherwise, read the record at `undo` and apply it backward: INSERT gives "absent"; DELETE clears `DELETED`;
-   UPDATE restores the listed columns and `old_schema_version`; LOCK changes nothing in the row. Then set
-   `txn ← prev_txn` and `undo ← prev_version`, and repeat from step 1.
+   UPDATE restores the listed columns and `old_schema_version`; LOCK changes nothing in the row. `DELETED` and
+   `LOCK_ONLY` are then set as the record's flag bits 0 and 2 say. Then set `txn ← prev_txn` and
+   `undo ← prev_version`, and repeat from step 1. A LOCK record found under a version without `LOCK_ONLY`, or
+   any other kind under one with it, is `data_corrupted`.
 
 Reconstruction reads the undo log only. It never writes, and it never latches the leaf longer than the copy.
 
