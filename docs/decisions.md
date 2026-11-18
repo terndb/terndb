@@ -141,3 +141,19 @@ question in `replication.md` §16 open again.
 | P12 | Who may replicate? | Superusers and members of a predefined role `terndb_replication`; no new role attribute. | REPL §2.2; DDL §2.10 rule 6; ERR `S1006` |
 | P13 | Slots and their bound? | Persistent named slots on the primary (`slots/<name>.tslot`), invalidated past `max_slot_wal_keep` (default 64 GiB). | REPL §5.8; DISK §2 file set; ERR `S2001`–`S2003` |
 | P14 | Measuring `max_lag` across nodes? | Echoed probes timed on the replica's own monotonic clock; no clock comparison between nodes. | REPL §5.3, §5.4, §8.4 |
+
+## SQL
+
+Rows Q58 onward were decided while writing `sql.md` (SQL); to revert one, rewrite its sections.
+
+| Id | Question | Decision | Sections changed |
+|---|---|---|---|
+| Q58 | Does the SQL front end need a catalog? | No catalog, but a **resolver** of tables' column lists, optional: without it a table is opaque and only the constructs that need its columns (unqualified names over several tables, `*` beside other items, `INSERT` without columns, constants typed by a column) are refused, `Q8010`. A script's own `CREATE`/`ALTER`/`DROP TABLE` update what is known. | SQL §1 rules 4–5, §5.2, §5.4; ERR `Q8010` |
+| Q59 | How are unquoted identifiers folded? | To lower case, ASCII letters only (PostgreSQL's rule in UTF-8 databases); quoted identifiers are exact and never keywords. | SQL §2.2 |
+| Q60 | What type does a constant have? | Its own (integers `int32`/`int64`/`decimal(p,0)`, a point `decimal(p,s)`, an exponent `float64`, strings `text`) unless the column it is assigned to or compared with gives one, which it takes when it is exactly a value of it. `NULL` and parameters need such a context or a cast (`Q8007`). | SQL §2.6, §2.7, §5.3, §5.9; ERR `Q8004`, `Q8007` |
+| Q61 | Whose type names? | The tree's (`int8` is 8 bits, `timestamp` an instant, `datetime` the zoneless reading), with the standard and PostgreSQL spellings that cannot be misread (`integer`, `bigint`, `double precision`, `timestamptz`); `int2`/`int4`/`int8`-as-bigint, `float4`/`float8`, `varchar`, `char`, bare `decimal` are refused. `serial` types are identity columns. | SQL §4; ERR `Q8006` |
+| Q62 | Default null order, and `LIMIT` without `ORDER BY`? | Nulls sort last ascending and first descending (PostgreSQL); an unordered `LIMIT` sets `arbitrary`. | SQL §5.6, §5.7 |
+| Q63 | Output names that repeat? | An unaliased item's derived name that another item has is suffixed `_1`, `_2`, …; two equal aliases are left to validation (`Q2005`). | SQL §5.4 |
+| Q64 | `LIKE`'s default escape? | None, as in standard SQL (PostgreSQL's is `\`). | SQL §5.8 rule 3 |
+| Q65 | Isolation level names? | `SERIALIZABLE`; `SNAPSHOT` and `REPEATABLE READ` → snapshot; `READ COMMITTED` and `READ UNCOMMITTED` → read committed. | SQL §6 rule 1 |
+| Q66 | Default schema of unqualified names? | `public`, or what the caller gives. A new database has no `public` namespace (DDL §2.10 rule 7), so a script creates it first. | SQL §1 rule 3 |

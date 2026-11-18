@@ -40,6 +40,7 @@ A client logs in as the role `terndb` with that password (SCRAM-SHA-256) and spe
 | [Isolation](docs/spec/isolation.md) | What each isolation level guarantees, written as a checkable history model |
 | [C ABI](docs/spec/c-api.md) | `libterndb`'s header: handles, threads, sync and async execution, results as bytes or walked, errors, versioning |
 | [DDL and the catalog](docs/spec/ddl.md) | Catalog objects, DDL statement trees, the catalog as relations, schema versions and online schema change |
+| [SQL](docs/spec/sql.md) | TernDB's SQL dialect: lexical rules, the grammar of the statements it has, and the query or DDL tree each produces |
 | [Replication](docs/spec/replication.md) | One primary and streaming read replicas: base backup, the WAL stream, synchronous commit, replica reads, failover with fencing, rewind |
 | [Error codes](docs/spec/errors.md) | The one registry of every error code and its name, across all the specs |
 | [Decisions](docs/decisions.md) | The answers applied to the specs' open questions, each with what to revert |

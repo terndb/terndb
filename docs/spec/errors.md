@@ -14,7 +14,8 @@ from.*
 ## 1. Form
 
 1. A **code** is one letter naming the area, then four decimal digits: `Q` query tree (validation, `query-tree.md`;
-   the `Q6…` group is DDL validation, `ddl.md`),
+   the `Q6…` group is DDL validation, `ddl.md`; the `Q8…` group is the SQL front end, `sql.md`, raised in the
+   client before a tree exists),
    `R` runtime (evaluation, `query-tree.md`), `T` transactions and isolation (`isolation.md`), `W` wire
    (`wire-protocol.md`), `D` storage (`on-disk-format.md`; the `D4…` group is opening a database, `c-api.md` §4),
    `C` the C ABI (`c-api.md`), `S` replication, backup and failover (`replication.md`). The first digit groups
@@ -109,6 +110,19 @@ during the handshake.
 | `Q7002` | `substrait_type_unsupported` | Substrait type not supported. |
 | `Q7003` | `substrait_function_unmapped` | Substrait function not in the mapping. |
 | `Q7004` | `substrait_version_unsupported` | Substrait plan version is not the one this release pins. |
+| `Q8001` | `sql_syntax_error` | SQL text has a token the grammar does not allow there, or ends too early (`sql.md` §3–§6). |
+| `Q8002` | `sql_unterminated` | A string constant, quoted identifier or block comment is not terminated (`sql.md` §2). |
+| `Q8003` | `sql_invalid_token` | A character that starts no token, a malformed number, parameter or escape, or an empty quoted identifier (`sql.md` §2). |
+| `Q8004` | `sql_invalid_constant` | A constant that is not a value of its type: out of range, or a text that does not parse (`sql.md` §2.5, §2.6, §5.9). |
+| `Q8005` | `sql_unsupported` | A construct of SQL that TernDB's dialect does not have (`sql.md` §8). |
+| `Q8006` | `sql_invalid_type_name` | An unknown or refused type name, or a bad type modifier (`sql.md` §4). |
+| `Q8007` | `sql_undetermined_type` | The type of a `NULL`, a parameter or a `VALUES` column cannot be determined, or a parameter is given two types (`sql.md` §2.7, §5.3, §5.9). |
+| `Q8008` | `sql_ambiguous_column` | An unqualified column belongs to more than one source (`sql.md` §5.2). |
+| `Q8009` | `sql_ungrouped_column` | A grouped query reads a column of its input outside an aggregate and does not group by it (`sql.md` §5.5). |
+| `Q8010` | `sql_columns_unknown` | A construct needs a table's column list and the front end does not have it (`sql.md` §1 rule 4). |
+| `Q8011` | `sql_order_not_in_select` | An `ORDER BY` or `GROUP BY` position out of range, or an `ORDER BY` that must name an output column and does not (`sql.md` §5.5, §5.6). |
+| `Q8012` | `sql_column_count_mismatch` | A column list or `VALUES` row of the wrong length (`sql.md` §3.2, §5.3, §5.4). |
+| `Q8013` | `sql_invalid_table_definition` | Two primary keys, a column given twice, `NULL` with `NOT NULL`, or two defaults (`sql.md` §3.4). |
 
 ## 3. Query tree: runtime (`R`)
 
