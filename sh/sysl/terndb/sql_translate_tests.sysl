@@ -1,0 +1,891 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `sql.md` §3–§6: each grammar production and the exact tree it translates to, with and without the
+// tables' column lists.
+
+/** The column lists the tests know: `users`, `posts` and `nums` in `public`; every other table is
+ * opaque.
+ */
+struct SqFixture
+end SqFixture
+
+impl SqlTables for SqFixture
+    sql_table(self, name: QualName) -> Option[SqlTable]
+        if name.schema != "public" then return None
+        name.name match
+            "users" -> Some(SqlTable(items_of([Field("id", Int64), Field("name", nullable(Text)), Field("age", nullable(Int16))]), sql_names(["id"])))
+            "posts" -> Some(SqlTable(items_of([Field("id", Int64), Field("author", Int64), Field("title", Text), Field("at", nullable(Timestamp))]), sql_names(["id"])))
+            "nums" -> Some(SqlTable(items_of([Field("i", Int32), Field("d", nullable(Decimal(10, 2))), Field("f", nullable(Float64)), Field("u", nullable(UInt32)), Field("dt", nullable(Date)), Field("b", nullable(Bool))]), sql_names(["i"])))
+            else None
+
+/** The action of the one statement `text`, which must translate. */
+sq_action(text: string, tables: &SqlTables = SqFixture(), file: string = __FILE__, line: long = __LINE__) -> SqlAction
+    sql_statement(text, "public", tables) match
+        Ok(a) -> a
+        Err(e) ->
+            print(s"\n$text\n  -> ${e.code}@${e.line}:${e.column} ${e.message}\n")
+            assert(false, "the statement translates", file, line)
+            SqlControl(SqlCommit)
+
+/** The envelope of the one statement `text`. */
+sq_env(text: string, tables: &SqlTables = SqFixture(), file: string = __FILE__, line: long = __LINE__) -> Envelope
+    sq_action(text, tables, file, line) match
+        SqlTree(e) -> e
+        SqlControl(_) ->
+            assert(false, "a tree", file, line)
+            envelope([], Query(Scan(QualName("", ""), "")))
+
+/** The statement of the one statement `text`, which must declare no parameters. */
+sq_stmt(text: string, tables: &SqlTables = SqFixture(), file: string = __FILE__, line: long = __LINE__) -> Statement
+    val e = sq_env(text, tables, file, line)
+    assert(e.params.len() == 0, "no parameters", file, line)
+    assert(e.major == TreeMajor && e.minor == TreeMinor && e.spans.is_none(), "the envelope's version", file, line)
+    e.statement
+
+/** The relation of query `text`. */
+sq_rel(text: string, tables: &SqlTables = SqFixture(), file: string = __FILE__, line: long = __LINE__) -> Rel
+    sq_stmt(text, tables, file, line) match
+        Query(r) -> r
+        _ ->
+            assert(false, "a query", file, line)
+            Scan(QualName("", ""), "")
+
+/** The error of `text` as `code@line:column`, or `ok`. */
+sq_err(text: string, tables: &SqlTables = SqFixture()) -> string = sql_statements(text, "public", tables) match
+    Ok(_) -> "ok"
+    Err(e) -> s"${e.code}@${e.line}:${e.column}"
+
+private sq_expect[T: Eq](got: T, want: T, text: string, file: string = __FILE__, line: long = __LINE__)
+    if got != want then print(s"\nthe tree of: $text\n")
+    assert(got == want, "the tree is the one sql.md gives", file, line)
+
+private sq_q(name: string) -> QualName = QualName("public", name)
+
+sq_scan(table: string, binder: string) -> Rel = Scan(QualName("public", table), binder)
+
+private sq_none() -> Rel = Values("one", buf[Field](), sql_one_empty_row())
+
+sq_i32(n: i128) -> Expr = Literal(Int32, Value.Int(n))
+
+sq_i64(n: i128) -> Expr = Literal(Int64, Value.Int(n))
+
+private sq_i16(n: i128) -> Expr = Literal(Int16, Value.Int(n))
+
+sq_txt(s: string) -> Expr = Literal(Text, Value.Text(s))
+
+private sq_lit(t: Type, text: string) -> Expr = Literal(t, from_text(t, text).unwrap())
+
+private sq_c(b: string, n: string) -> Expr = Col(b, n)
+
+private sq_2(f: string, a: Expr, b: Expr) -> Expr = Call(f, items_of([a, b]))
+
+private sq_1(f: string, a: Expr) -> Expr = Call(f, items_of([a]))
+
+private sq_proj(input: Rel, items: []const Item, binder: string = "select") -> Rel = Project(input, binder, items_of(items))
+
+private sq_key(e: Expr, desc: bool = false) -> SortKey = SortKey(e, desc, desc)
+
+private sq_agg(f: string, args: []const Expr) -> AggCall = AggCall(f, items_of(args), false, None, buf[SortKey]())
+
+private sq_count() -> AggCall = sq_agg("count", [])
+
+// -- SELECT --------------------------------------------------------------------------------------------
+
+@test
+a_select_projects_over_a_scan()
+    sq_expect(sq_rel("SELECT a FROM t"), sq_proj(sq_scan("t", "t"), [item("a", sq_c("t", "a"))]), "select a from t")
+    sq_expect(sq_rel("select A, \"B\" from T as X"), sq_proj(sq_scan("t", "x"), [item("a", sq_c("x", "a")), item("B", sq_c("x", "B"))]), "aliases")
+    sq_expect(sq_rel("SELECT x.a FROM s.t x"), sq_proj(Scan(QualName("s", "t"), "x"), [item("a", sq_c("x", "a"))]), "a schema")
+
+@test
+a_lone_star_over_one_source_passes_its_input_through()
+    sq_expect(sq_rel("SELECT * FROM t"), sq_scan("t", "t"), "opaque")
+    sq_expect(sq_rel("SELECT * FROM users"), sq_scan("users", "users"), "known")
+    sq_expect(sq_rel("SELECT u.* FROM users u"), sq_scan("users", "u"), "t.*")
+    sq_expect(sq_rel("SELECT ALL * FROM t"), sq_scan("t", "t"), "all")
+
+@test
+star_beside_other_items_expands_to_the_columns()
+    sq_expect(sq_rel("SELECT *, 1 AS one FROM users"), sq_proj(sq_scan("users", "users"),
+        [item("id", sq_c("users", "id")), item("name", sq_c("users", "name")), item("age", sq_c("users", "age")), item("one", sq_i32(1))]), "*, 1")
+    sq_expect(sq_rel("SELECT u.name, u.* FROM users u"), sq_proj(sq_scan("users", "u"),
+        [item("name", sq_c("u", "name")), item("id", sq_c("u", "id")), item("name_1", sq_c("u", "name")), item("age", sq_c("u", "age"))]), "a repeated name")
+    assert_eq(sq_err("SELECT *, 1 FROM t"), "Q8010@1:8")
+    assert_eq(sq_err("SELECT t.*, 1 FROM t"), "Q8010@1:8")
+    assert_eq(sq_err("SELECT x.* FROM t"), "Q2002@1:8")
+    assert_eq(sq_err("SELECT *"), "Q8001@1:8")
+
+@test
+star_over_a_join_of_known_tables_expands_and_suffixes_repeated_names()
+    val j = Join(Inner, sq_scan("users", "u"), sq_scan("posts", "p"), Some(sq_2("eq", sq_c("u", "id"), sq_c("p", "author"))), None, None)
+    sq_expect(sq_rel("SELECT * FROM users u JOIN posts p ON u.id = p.author"), sq_proj(j, [item("id", sq_c("u", "id")), item("name", sq_c("u", "name")),
+        item("age", sq_c("u", "age")), item("id_1", sq_c("p", "id")), item("author", sq_c("p", "author")), item("title", sq_c("p", "title")),
+        item("at", sq_c("p", "at"))]), "join *")
+    // Opaque tables leave the join as the query, whose repeated names validation refuses.
+    sq_expect(sq_rel("SELECT * FROM a, b"), Join(Inner, sq_scan("a", "a"), sq_scan("b", "b"), None, None, None), "opaque join *")
+
+@test
+unaliased_items_take_derived_names()
+    val got = sq_rel("SELECT u.id, p.id, count(*), CAST(u.age AS int64), 1 + 2, age AS x FROM users u, posts p GROUP BY u.id, p.id, u.age")
+    got match
+        Project(_, _, items) ->
+            val names = buf[string]()
+            for i in items
+                names.push(i.name)
+            assert(names == sql_names(["id", "id_1", "count", "age", "column5", "x"]), "derived names")
+        _ -> assert(false, "a project")
+    // An alias keeps its name; a derived name gives way to it.
+    sq_rel("SELECT a, b AS a_1, c AS a FROM t") match
+        Project(_, _, items) -> assert(items[0].name == "a_2" && items[1].name == "a_1" && items[2].name == "a", "aliases win")
+        _ -> assert(false, "a project")
+    sq_rel("SELECT b AS a, a FROM t") match
+        Project(_, _, items) -> assert(items[0].name == "a" && items[1].name == "a_1", "a derived name gives way")
+        _ -> assert(false, "a project")
+
+@test
+a_select_without_from_reads_one_empty_row()
+    sq_expect(sq_rel("SELECT 1"), sq_proj(sq_none(), [item("column1", sq_i32(1))]), "select 1")
+    sq_expect(sq_rel("SELECT 1 AS one, 'x'"), sq_proj(sq_none(), [item("one", sq_i32(1)), item("column2", sq_txt("x"))]), "two items")
+
+@test
+where_is_a_filter()
+    sq_expect(sq_rel("SELECT u.name AS n FROM users u WHERE u.id = 5"),
+        sq_proj(Filter(sq_scan("users", "u"), sq_2("eq", sq_c("u", "id"), sq_i64(5))), [item("n", sq_c("u", "name"))]), "where")
+
+@test
+names_resolve_through_the_scopes()
+    assert_eq(sq_err("SELECT id FROM users, posts"), "Q8008@1:8")
+    assert_eq(sq_err("SELECT zz FROM users"), "Q2003@1:8")
+    assert_eq(sq_err("SELECT users.zz FROM users"), "Q2003@1:8")
+    assert_eq(sq_err("SELECT x.a FROM users"), "Q2002@1:8")
+    assert_eq(sq_err("SELECT a FROM t, users"), "Q8010@1:8")
+    assert_eq(sq_err("SELECT a FROM t, u"), "Q8010@1:8")
+    assert_eq(sq_err("SELECT 1 FROM t, t"), "Q2004@1:18")
+    assert_eq(sq_err("SELECT name FROM users WHERE missing = 1"), "Q2003@1:30")
+    // A name only one known table has is that table's.
+    sq_expect(sq_rel("SELECT title FROM users, posts"), sq_proj(Join(Inner, sq_scan("users", "users"), sq_scan("posts", "posts"), None, None, None),
+        [item("title", sq_c("posts", "title"))]), "unique name")
+    // The same table twice under two aliases.
+    sq_expect(sq_rel("SELECT a.id FROM users a, users b"), sq_proj(Join(Inner, sq_scan("users", "a"), sq_scan("users", "b"), None, None, None),
+        [item("id", sq_c("a", "id"))]), "two aliases")
+
+@test
+joins_take_their_kinds()
+    for (sql, kind) in [("JOIN", Inner), ("INNER JOIN", Inner), ("LEFT JOIN", Left), ("LEFT OUTER JOIN", Left), ("RIGHT JOIN", Right), ("RIGHT OUTER JOIN", Right), ("FULL JOIN", Full), ("FULL OUTER JOIN", Full)]
+        sq_expect(sq_rel(s"SELECT t.a FROM t $sql u ON t.a = u.b"), sq_proj(Join(kind, sq_scan("t", "t"), sq_scan("u", "u"),
+            Some(sq_2("eq", sq_c("t", "a"), sq_c("u", "b"))), None, None), [item("a", sq_c("t", "a"))]), sql)
+    sq_expect(sq_rel("SELECT t.a FROM t CROSS JOIN u"), sq_proj(Join(Inner, sq_scan("t", "t"), sq_scan("u", "u"), None, None, None), [item("a", sq_c("t", "a"))]), "cross")
+    // Joins associate to the left; parentheses group them.
+    val abc = Join(Inner, Join(Inner, sq_scan("a", "a"), sq_scan("b", "b"), None, None, None), sq_scan("c", "c"), None, None, None)
+    sq_expect(sq_rel("SELECT a.x FROM a CROSS JOIN b CROSS JOIN c"), sq_proj(abc, [item("x", sq_c("a", "x"))]), "left")
+    val a_bc = Join(Inner, sq_scan("a", "a"), Join(Inner, sq_scan("b", "b"), sq_scan("c", "c"), None, None, None), None, None, None)
+    sq_expect(sq_rel("SELECT a.x FROM a CROSS JOIN (b CROSS JOIN c)"), sq_proj(a_bc, [item("x", sq_c("a", "x"))]), "parenthesised")
+    assert_eq(sq_err("SELECT 1 FROM a JOIN b"), "Q8001@1:23")
+    assert_eq(sq_err("SELECT 1 FROM a NATURAL JOIN b"), "Q8005@1:17")
+    assert_eq(sq_err("SELECT 1 FROM a, LATERAL (SELECT 1) x"), "Q8005@1:18")
+
+@test
+using_joins_merge_their_columns()
+    val on = Some(sq_2("eq", sq_c("users", "id"), sq_c("posts", "id")))
+    sq_expect(sq_rel("SELECT * FROM users JOIN posts USING (id)"), sq_proj(Join(Inner, sq_scan("users", "users"), sq_scan("posts", "posts"), on, None, None),
+        [item("id", sq_c("users", "id")), item("name", sq_c("users", "name")), item("age", sq_c("users", "age")), item("author", sq_c("posts", "author")),
+        item("title", sq_c("posts", "title")), item("at", sq_c("posts", "at"))]), "using *")
+    sq_expect(sq_rel("SELECT id FROM users RIGHT JOIN posts USING (id)"), sq_proj(Join(Right, sq_scan("users", "users"), sq_scan("posts", "posts"), on, None, None),
+        [item("id", sq_c("posts", "id"))]), "right using")
+    sq_expect(sq_rel("SELECT id FROM users FULL JOIN posts USING (id)"), sq_proj(Join(Full, sq_scan("users", "users"), sq_scan("posts", "posts"), on, None, None),
+        [item("id", sq_2("coalesce", sq_c("users", "id"), sq_c("posts", "id")))]), "full using")
+    // Opaque sides: one table a side is enough.
+    sq_expect(sq_rel("SELECT k FROM a JOIN b USING (k, j)"), sq_proj(Join(Inner, sq_scan("a", "a"), sq_scan("b", "b"),
+        Some(sq_2("and", sq_2("eq", sq_c("a", "k"), sq_c("b", "k")), sq_2("eq", sq_c("a", "j"), sq_c("b", "j")))), None, None), [item("k", sq_c("a", "k"))]), "opaque using")
+    assert_eq(sq_err("SELECT 1 FROM users JOIN posts USING (name)"), "Q2003@1:21")
+
+@test
+grouping_reads_keys_and_aggregates_through_the_group_binder()
+    val agg = Aggregate(sq_scan("posts", "posts"), "group", items_of([item("k1", sq_c("posts", "author"))]), items_of([NamedAgg("a1", sq_count())]))
+    val having = Filter(agg, sq_2("gt", sq_c("group", "a1"), sq_i32(1)))
+    val sorted = Sort(having, items_of([sq_key(sq_c("group", "a1"), true)]))
+    val limited = Limit(sorted, Some(sq_i64(3)), None, false, false)
+    sq_expect(sq_rel("SELECT author, count(*) AS n FROM posts GROUP BY author HAVING count(*) > 1 ORDER BY n DESC LIMIT 3"),
+        sq_proj(limited, [item("author", sq_c("group", "k1")), item("n", sq_c("group", "a1"))]), "the pipeline")
+
+@test
+an_aggregate_without_group_by_groups_everything()
+    val agg = Aggregate(sq_scan("t", "t"), "group", buf[Item](), items_of([NamedAgg("a1", sq_agg("sum", [sq_c("t", "x")])), NamedAgg("a2", sq_agg("max", [sq_c("t", "y")]))]))
+    sq_expect(sq_rel("SELECT sum(x) + 1, max(y) FROM t"), sq_proj(agg, [item("column1", sq_2("add", sq_c("group", "a1"), sq_i32(1))), item("max", sq_c("group", "a2"))]), "no keys")
+    // HAVING alone makes a query grouped.
+    sq_expect(sq_rel("SELECT 1 FROM t HAVING true"), sq_proj(Filter(Aggregate(sq_scan("t", "t"), "group", buf[Item](), buf[NamedAgg]()), Literal(Bool, Value.Bool(true))),
+        [item("column1", sq_i32(1))]), "having alone")
+
+@test
+aggregate_calls_carry_distinct_filter_and_order()
+    val c = AggCall("count", items_of([sq_c("t", "x")]), true, Some(sq_2("gt", sq_c("t", "y"), sq_i32(0))), buf[SortKey]())
+    val s = AggCall("string_agg", items_of([sq_c("t", "x"), sq_txt(",")]), false, None, items_of([sq_key(sq_c("t", "y"), true)]))
+    sq_expect(sq_rel("SELECT count(DISTINCT x) FILTER (WHERE y > 0), string_agg(x, ',' ORDER BY y DESC) FROM t"),
+        sq_proj(Aggregate(sq_scan("t", "t"), "group", buf[Item](), items_of([NamedAgg("a1", c), NamedAgg("a2", s)])),
+        [item("count", sq_c("group", "a1")), item("string_agg", sq_c("group", "a2"))]), "distinct, filter, order")
+    // One call written twice is one aggregate.
+    sq_expect(sq_rel("SELECT min(x), min(x) AS again FROM t"), sq_proj(Aggregate(sq_scan("t", "t"), "group", buf[Item](), items_of([NamedAgg("a1", sq_agg("min", [sq_c("t", "x")]))])),
+        [item("min", sq_c("group", "a1")), item("again", sq_c("group", "a1"))]), "deduplicated")
+
+@test
+group_by_takes_positions_aliases_and_expressions()
+    val keyed = Aggregate(sq_scan("t", "t"), "group", items_of([item("k1", sq_2("add", sq_c("t", "a"), sq_i32(1)))]), items_of([NamedAgg("a1", sq_count())]))
+    val want = sq_proj(keyed, [item("column1", sq_c("group", "k1")), item("count", sq_c("group", "a1"))])
+    sq_expect(sq_rel("SELECT a + 1, count(*) FROM t GROUP BY a + 1"), want, "expression")
+    sq_expect(sq_rel("SELECT a + 1, count(*) FROM t GROUP BY 1"), want, "position")
+    sq_expect(sq_rel("SELECT name AS k, count(*) FROM users GROUP BY k"), sq_proj(Aggregate(sq_scan("users", "users"), "group", items_of([item("k1", sq_c("users", "name"))]),
+        items_of([NamedAgg("a1", sq_count())])), [item("k", sq_c("group", "k1")), item("count", sq_c("group", "a1"))]), "alias")
+    // An input column wins over an alias of the same name.
+    assert_eq(sq_err("SELECT age AS name FROM users GROUP BY name"), "Q8009@1:8")
+    assert_eq(sq_err("SELECT a, count(*) FROM t GROUP BY 3"), "Q8011@1:36")
+    assert_eq(sq_err("SELECT a, count(*) FROM t GROUP BY 0"), "Q8011@1:36")
+    assert_eq(sq_err("SELECT count(*) FROM t GROUP BY 1"), "Q3013@1:33")
+    assert_eq(sq_err("SELECT a FROM t GROUP BY count(*)"), "Q3013@1:26")
+
+@test
+an_ungrouped_column_is_refused()
+    assert_eq(sq_err("SELECT title, count(*) FROM posts GROUP BY author"), "Q8009@1:8")
+    assert_eq(sq_err("SELECT author FROM posts GROUP BY author HAVING title = 'x'"), "Q8009@1:49")
+    assert_eq(sq_err("SELECT author FROM posts GROUP BY author ORDER BY title"), "Q8009@1:51")
+    assert_eq(sq_err("SELECT * FROM posts GROUP BY author"), "Q8009@1:8")
+    // A correlated reference from a subquery reads the groups too.
+    assert_eq(sq_err("SELECT author FROM posts p GROUP BY author HAVING EXISTS (SELECT 1 FROM users u WHERE u.id = p.id)"), "Q8009@1:94")
+    assert_eq(sq_err("SELECT author FROM posts p GROUP BY author HAVING EXISTS (SELECT 1 FROM users u WHERE u.id = p.author)"), "ok")
+    // Inside an aggregate the rows are visible.
+    assert_eq(sq_err("SELECT author, max(title) FROM posts GROUP BY author"), "ok")
+
+@test
+aggregates_are_refused_where_none_may_be()
+    assert_eq(sq_err("SELECT a FROM t WHERE count(*) > 1"), "Q3013@1:23")
+    assert_eq(sq_err("SELECT sum(max(a)) FROM t"), "Q3013@1:12")
+    assert_eq(sq_err("SELECT a FROM t JOIN u ON count(*) = 1"), "Q3013@1:27")
+    assert_eq(sq_err("SELECT sum(*) FROM t"), "Q8001@1:8")
+    assert_eq(sq_err("SELECT count() FROM t"), "Q8001@1:8")
+    assert_eq(sq_err("SELECT lower(DISTINCT a) FROM t"), "Q8001@1:8")
+    assert_eq(sq_err("SELECT count(*) OVER () FROM t"), "Q8005@1:17")
+    assert_eq(sq_err("CREATE TABLE x (a int PRIMARY KEY CHECK (count(*) > 0))"), "Q3013@1:42")
+
+// -- ORDER BY and LIMIT ---------------------------------------------------------------------------------
+
+@test
+order_by_sorts_below_the_select_list()
+    sq_expect(sq_rel("SELECT a FROM t ORDER BY b"), sq_proj(Sort(sq_scan("t", "t"), items_of([sq_key(sq_c("t", "b"))])), [item("a", sq_c("t", "a"))]), "input column")
+    sq_expect(sq_rel("SELECT a AS x FROM t ORDER BY x DESC, 1 ASC NULLS FIRST, a NULLS LAST"), sq_proj(Sort(sq_scan("t", "t"),
+        items_of([sq_key(sq_c("t", "a"), true), SortKey(sq_c("t", "a"), false, true), SortKey(sq_c("t", "a"), false, false)])), [item("x", sq_c("t", "a"))]), "names and positions")
+    sq_expect(sq_rel("SELECT a FROM t ORDER BY a DESC NULLS LAST"), sq_proj(Sort(sq_scan("t", "t"), items_of([SortKey(sq_c("t", "a"), true, false)])), [item("a", sq_c("t", "a"))]), "desc nulls last")
+    sq_expect(sq_rel("SELECT * FROM t ORDER BY a"), Sort(sq_scan("t", "t"), items_of([sq_key(sq_c("t", "a"))])), "a passed-through input")
+    assert_eq(sq_err("SELECT a FROM t ORDER BY 2"), "Q8011@1:26")
+
+@test
+distinct_sorts_above_and_must_name_an_output()
+    val d = Distinct(sq_proj(sq_scan("users", "users"), [item("name", sq_c("users", "name"))]))
+    sq_expect(sq_rel("SELECT DISTINCT name FROM users ORDER BY name"), Sort(d, items_of([sq_key(sq_c("select", "name"))])), "by name")
+    sq_expect(sq_rel("SELECT DISTINCT name FROM users ORDER BY 1 DESC LIMIT 2"), Limit(Sort(d, items_of([sq_key(sq_c("select", "name"), true)])), Some(sq_i64(2)), None, false, false), "by position")
+    sq_expect(sq_rel("SELECT DISTINCT a + 1 AS b FROM t ORDER BY a + 1"), Sort(Distinct(sq_proj(sq_scan("t", "t"), [item("b", sq_2("add", sq_c("t", "a"), sq_i32(1)))])),
+        items_of([sq_key(sq_c("select", "b"))])), "by expression")
+    sq_expect(sq_rel("SELECT DISTINCT * FROM t"), Distinct(sq_scan("t", "t")), "distinct *")
+    assert_eq(sq_err("SELECT DISTINCT name FROM users ORDER BY age"), "Q8011@1:42")
+    assert_eq(sq_err("SELECT DISTINCT ON (a) a FROM t"), "Q8005@1:17")
+
+@test
+limit_without_order_by_is_arbitrary()
+    sq_expect(sq_rel("SELECT * FROM t LIMIT 5 OFFSET 2"), Limit(sq_scan("t", "t"), Some(sq_i64(5)), Some(sq_i64(2)), false, true), "limit offset")
+    sq_expect(sq_rel("SELECT * FROM t OFFSET 2 ROWS"), Limit(sq_scan("t", "t"), None, Some(sq_i64(2)), false, true), "offset alone")
+    sq_expect(sq_rel("SELECT * FROM t LIMIT ALL"), sq_scan("t", "t"), "limit all")
+    sq_expect(sq_rel("SELECT * FROM t LIMIT NULL"), sq_scan("t", "t"), "limit null")
+    sq_expect(sq_rel("SELECT * FROM t FETCH FIRST 3 ROWS ONLY"), Limit(sq_scan("t", "t"), Some(sq_i64(3)), None, false, true), "fetch")
+    sq_expect(sq_rel("SELECT * FROM t FETCH NEXT ROW ONLY"), Limit(sq_scan("t", "t"), Some(sq_i64(1)), None, false, true), "fetch one")
+    sq_expect(sq_rel("SELECT a FROM t ORDER BY a LIMIT 1"), sq_proj(Limit(Sort(sq_scan("t", "t"), items_of([sq_key(sq_c("t", "a"))])), Some(sq_i64(1)), None, false, false),
+        [item("a", sq_c("t", "a"))]), "ordered")
+    sq_expect(sq_rel("SELECT * FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES"), Limit(Sort(sq_scan("t", "t"), items_of([sq_key(sq_c("t", "a"))])), Some(sq_i64(2)), None, true, false), "ties")
+    val e = sq_env("SELECT * FROM t LIMIT $1")
+    assert(e.params == items_of([ParamDecl(None, Int64)]), "a limit parameter is int64")
+
+@test
+limits_are_constants_and_appear_once()
+    assert_eq(sq_err("SELECT * FROM t FETCH FIRST 2 ROWS WITH TIES"), "Q8001@1:17")
+    assert_eq(sq_err("SELECT * FROM t LIMIT a"), "Q8005@1:23")
+    assert_eq(sq_err("SELECT * FROM t LIMIT 1.5"), "Q8004@1:23")
+    assert_eq(sq_err("SELECT * FROM t LIMIT 1 LIMIT 2"), "Q8001@1:25")
+    assert_eq(sq_err("SELECT * FROM t LIMIT 1 FETCH FIRST 2 ROWS ONLY"), "Q8001@1:25")
+    assert_eq(sq_err("(SELECT * FROM t ORDER BY a) ORDER BY a"), "Q8001@1:30")
+    assert_eq(sq_err("(SELECT * FROM t LIMIT 1) LIMIT 2"), "Q8001@1:27")
+    sq_expect(sq_rel("(SELECT * FROM t ORDER BY a) LIMIT 2"), Limit(Sort(sq_scan("t", "t"), items_of([sq_key(sq_c("t", "a"))])), Some(sq_i64(2)), None, false, false), "merged tails")
+
+// -- VALUES, set operations, WITH -----------------------------------------------------------------------
+
+@test
+values_types_its_columns_by_their_constants()
+    sq_expect(sq_rel("VALUES (1, 'a'), (2, NULL)"), Values("values", items_of([Field("column1", Int32), Field("column2", nullable(Text))]),
+        items_of([items_of([sq_i32(1), sq_txt("a")]), items_of([sq_i32(2), Null(Text)])])), "values")
+    sq_expect(sq_rel("VALUES (1), (5000000000)"), Values("values", items_of([Field("column1", Int64)]), items_of([items_of([sq_i64(1)]), items_of([sq_i64(5000000000)])])), "widened")
+    sq_expect(sq_rel("VALUES (DATE '2024-01-02'), ('2024-03-04')"), Values("values", items_of([Field("column1", Date)]),
+        items_of([items_of([sq_lit(Date, "2024-01-02")]), items_of([sq_lit(Date, "2024-03-04")])])), "a typed constant types the strings")
+    sq_expect(sq_rel("VALUES (true), (NULL::bool)"), Values("values", items_of([Field("column1", Bool)]), items_of([items_of([Literal(Bool, Value.Bool(true))]), items_of([Null(Bool)])])), "bool")
+    sq_expect(sq_rel("VALUES (2), (1) ORDER BY 1"), Sort(Values("values", items_of([Field("column1", Int32)]), items_of([items_of([sq_i32(2)]), items_of([sq_i32(1)])])),
+        items_of([sq_key(sq_c("values", "column1"))])), "ordered values")
+    assert_eq(sq_err("VALUES (1), (1, 2)"), "Q8012@1:14")
+    assert_eq(sq_err("VALUES (NULL)"), "Q8007@1:9")
+    assert_eq(sq_err("VALUES (1), ('a')"), "Q8004@1:14")
+    assert_eq(sq_err("VALUES (1), (true)"), "Q3001@1:14")
+    sq_expect(sq_rel("VALUES ('a'), (NULL)"), Values("values", items_of([Field("column1", nullable(Text))]), items_of([items_of([sq_txt("a")]), items_of([Null(Text)])])), "strings alone are text")
+    assert_eq(sq_err("VALUES ($1)"), "Q8007@1:9")
+    assert_eq(sq_err("VALUES (1) ORDER BY column2"), "Q8011@1:21")
+
+@test
+set_operations_flatten_a_chain_of_one_operator()
+    val a = sq_proj(sq_scan("t", "t"), [item("a", sq_c("t", "a"))])
+    val b = sq_proj(sq_scan("u", "u"), [item("b", sq_c("u", "b"))], "select_2")
+    val c = sq_proj(sq_scan("v", "v"), [item("c", sq_c("v", "c"))], "select_3")
+    sq_expect(sq_rel("SELECT a FROM t UNION SELECT b FROM u UNION SELECT c FROM v"), SetOp(Union, false, "select_4", items_of([a, b, c])), "union chain")
+    sq_expect(sq_rel("SELECT a FROM t UNION ALL SELECT b FROM u UNION SELECT c FROM v"),
+        SetOp(Union, false, "select_5", items_of([SetOp(Union, true, "select_3", items_of([a, b])), sq_proj(sq_scan("v", "v"), [item("c", sq_c("v", "c"))], "select_4")])), "all then distinct")
+    sq_expect(sq_rel("SELECT a FROM t UNION SELECT b FROM u INTERSECT SELECT c FROM v"),
+        SetOp(Union, false, "select_5", items_of([a, SetOp(Intersect, false, "select_4", items_of([b, c]))])), "intersect binds tighter")
+    sq_expect(sq_rel("SELECT a FROM t EXCEPT ALL SELECT b FROM u"), SetOp(Except, true, "select_3", items_of([a, b])), "except all")
+    sq_expect(sq_rel("SELECT a FROM t EXCEPT (SELECT b FROM u EXCEPT SELECT c FROM v)"),
+        SetOp(Except, false, "select_5", items_of([a, SetOp(Except, false, "select_4", items_of([b, c]))])), "a parenthesised right side")
+    sq_expect(sq_rel("SELECT a FROM t UNION DISTINCT SELECT b FROM u ORDER BY 1 DESC LIMIT 1"),
+        Limit(Sort(SetOp(Union, false, "select_3", items_of([a, b])), items_of([sq_key(sq_c("select_3", "a"), true)])), Some(sq_i64(1)), None, false, false), "ordered")
+    assert_eq(sq_err("SELECT a FROM t UNION SELECT b FROM u ORDER BY b"), "Q8011@1:48")
+
+@test
+with_defines_ctes_in_scope_of_later_ones_and_the_body()
+    val c = CteDef("c", None, sq_proj(sq_scan("t", "t"), [item("a", sq_c("t", "a"))], "c"))
+    sq_expect(sq_rel("WITH c AS (SELECT a FROM t) SELECT * FROM c"), With(false, items_of([c]), CteRef("c", "c_2")), "with")
+    val d = CteDef("d", None, sq_proj(CteRef("c", "c_2"), [item("x", sq_c("c_2", "a"))], "d"))
+    sq_expect(sq_rel("WITH c AS (SELECT a FROM t), d (x) AS (SELECT a FROM c) SELECT x FROM d"),
+        With(false, items_of([c, d]), sq_proj(CteRef("d", "d_2"), [item("x", sq_c("d_2", "x"))])), "a column list and a later cte")
+    assert_eq(sq_err("WITH c AS (SELECT 1), c AS (SELECT 2) SELECT * FROM c"), "Q2004@1:23")
+    assert_eq(sq_err("WITH c (x, y) AS (SELECT 1) SELECT * FROM c"), "Q8012@1:19")
+    assert_eq(sq_err("WITH RECURSIVE c AS (SELECT 1) SELECT * FROM c"), "Q8005@1:6")
+    // A CTE is not in scope after its WITH.
+    sq_expect(sq_rel("SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) s, c"), sq_rel("SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) s, c"), "scope")
+    sq_rel("SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) s, c") match
+        Join(_, _, r, _, _, _) -> assert(*r == sq_scan("c", "c_3"), "the outer c is a table")
+        _ -> assert(false, "a join")
+
+@test
+subqueries_in_from_are_their_own_scope()
+    sq_expect(sq_rel("SELECT s.x FROM (SELECT a AS x FROM t) s"), sq_proj(sq_proj(sq_scan("t", "t"), [item("x", sq_c("t", "a"))], "s"), [item("x", sq_c("s", "x"))]), "derived")
+    sq_expect(sq_rel("SELECT * FROM (SELECT * FROM t) s"), sq_scan("t", "t"), "a passed-through derived table")
+    sq_expect(sq_rel("SELECT s.y FROM (SELECT a FROM t) AS s (y)"), sq_proj(sq_proj(sq_scan("t", "t"), [item("y", sq_c("t", "a"))], "s"), [item("y", sq_c("s", "y"))]), "renamed")
+    sq_expect(sq_rel("SELECT v.n FROM (VALUES (1)) v (n)"), sq_proj(Values("v", items_of([Field("n", Int32)]), items_of([items_of([sq_i32(1)])])), [item("n", sq_c("v", "n"))]), "values in from")
+    sq_expect(sq_rel("SELECT x FROM (SELECT a AS x FROM t)"), sq_proj(sq_proj(sq_scan("t", "t"), [item("x", sq_c("t", "a"))], "subquery"), [item("x", sq_c("subquery", "x"))]), "no alias")
+    // A derived table does not see its siblings.
+    assert_eq(sq_err("SELECT 1 FROM users u, (SELECT u.id) s"), "Q2002@1:32")
+    assert_eq(sq_err("SELECT 1 FROM (SELECT * FROM a, b) s"), "Q8010@1:15")
+    assert_eq(sq_err("SELECT 1 FROM t AS x (a)"), "Q8005@1:15")
+
+@test
+subquery_expressions_are_in_exists_and_scalar()
+    val inner = sq_proj(sq_scan("u", "u"), [item("x", sq_c("u", "x"))], "subquery")
+    sq_expect(sq_rel("SELECT a FROM t WHERE b IN (SELECT x FROM u)"), sq_proj(Filter(sq_scan("t", "t"), In(items_of([sq_c("t", "b")]), inner)), [item("a", sq_c("t", "a"))]), "in")
+    sq_expect(sq_rel("SELECT a FROM t WHERE (a, b) NOT IN (SELECT x, y FROM u)"), sq_proj(Filter(sq_scan("t", "t"), sq_1("not", In(items_of([sq_c("t", "a"), sq_c("t", "b")]),
+        sq_proj(sq_scan("u", "u"), [item("x", sq_c("u", "x")), item("y", sq_c("u", "y"))], "subquery")))), [item("a", sq_c("t", "a"))]), "not in a row")
+    val corr = sq_proj(Filter(sq_scan("u", "u"), sq_2("eq", sq_c("u", "x"), sq_c("t", "a"))), [item("column1", sq_i32(1))], "subquery")
+    sq_expect(sq_rel("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a)"), sq_proj(Filter(sq_scan("t", "t"), Exists(corr)), [item("a", sq_c("t", "a"))]), "exists")
+    val m = sq_proj(Aggregate(sq_scan("u", "u"), "group", buf[Item](), items_of([NamedAgg("a1", sq_agg("max", [sq_c("u", "x")]))])), [item("max", sq_c("group", "a1"))], "subquery")
+    sq_expect(sq_rel("SELECT (SELECT max(x) FROM u) AS m FROM t"), sq_proj(sq_scan("t", "t"), [item("m", Scalar(m))]), "scalar")
+    // An unqualified name in a subquery is its own source's first.
+    sq_expect(sq_rel("SELECT 1 FROM users WHERE EXISTS (SELECT 1 FROM posts WHERE id = 1)"), sq_proj(Filter(sq_scan("users", "users"),
+        Exists(sq_proj(Filter(sq_scan("posts", "posts"), sq_2("eq", sq_c("posts", "id"), sq_i64(1))), [item("column1", sq_i32(1))], "subquery"))), [item("column1", sq_i32(1))]), "inner first")
+    // …and an outer one's when its own sources do not have it.
+    sq_expect(sq_rel("SELECT 1 FROM users WHERE EXISTS (SELECT 1 FROM posts WHERE author = age)"), sq_proj(Filter(sq_scan("users", "users"),
+        Exists(sq_proj(Filter(sq_scan("posts", "posts"), sq_2("eq", sq_c("posts", "author"), sq_c("users", "age"))), [item("column1", sq_i32(1))], "subquery"))), [item("column1", sq_i32(1))]), "outer")
+    assert_eq(sq_err("SELECT (1, 2) FROM t"), "Q8005@1:8")
+
+// -- expressions ----------------------------------------------------------------------------------------
+
+/** The one item of `SELECT <e> FROM t`, translated. */
+private sq_e(e: string, tables: &SqlTables = SqFixture(), file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_rel(s"SELECT $e FROM t", tables, file, line) match
+        Project(_, _, items) -> items[0].expr
+        _ ->
+            assert(false, "a project", file, line)
+            sq_i32(0)
+
+private sq_t(n: string) -> Expr = sq_c("t", n)
+
+@test
+operators_bind_by_precedence()
+    sq_expect(sq_e("1 + 2 * 3 - 4"), sq_2("sub", sq_2("add", sq_i32(1), sq_2("mul", sq_i32(2), sq_i32(3))), sq_i32(4)), "arithmetic")
+    sq_expect(sq_e("a / b % c"), sq_2("mod", sq_2("div", sq_t("a"), sq_t("b")), sq_t("c")), "left-associative")
+    sq_expect(sq_e("a - b - c"), sq_2("sub", sq_2("sub", sq_t("a"), sq_t("b")), sq_t("c")), "minus left")
+    sq_expect(sq_e("(a - b) * c"), sq_2("mul", sq_2("sub", sq_t("a"), sq_t("b")), sq_t("c")), "parentheses")
+    sq_expect(sq_e("NOT a = b AND c OR d"), sq_2("or", sq_2("and", sq_1("not", sq_2("eq", sq_t("a"), sq_t("b"))), sq_t("c")), sq_t("d")), "logic")
+    sq_expect(sq_e("a OR b AND c"), sq_2("or", sq_t("a"), sq_2("and", sq_t("b"), sq_t("c"))), "and over or")
+    sq_expect(sq_e("NOT NOT a"), sq_1("not", sq_1("not", sq_t("a"))), "not not")
+    sq_expect(sq_e("a || b = c"), sq_2("eq", sq_2("concat", sq_t("a"), sq_t("b")), sq_t("c")), "concat over comparison")
+    sq_expect(sq_e("a || b + c"), sq_2("concat", sq_t("a"), sq_2("add", sq_t("b"), sq_t("c"))), "plus over concat")
+    sq_expect(sq_e("-a * b"), sq_2("mul", sq_1("neg", sq_t("a")), sq_t("b")), "unary minus")
+    sq_expect(sq_e("-a::int64"), sq_1("neg", Cast(sq_t("a"), Int64, Strict)), "cast over minus")
+    sq_expect(sq_e("+a"), sq_t("a"), "unary plus")
+    sq_expect(sq_e("a = b IS NULL"), sq_1("is_null", sq_2("eq", sq_t("a"), sq_t("b"))), "is below comparison")
+    sq_expect(sq_e("a IS NOT NULL"), sq_1("is_not_null", sq_t("a")), "is not null")
+    sq_expect(sq_e("NOT a IS NULL"), sq_1("not", sq_1("is_null", sq_t("a"))), "not over is")
+    sq_expect(sq_e("a + 1 BETWEEN b AND c = d"), sq_2("eq", sq_2("and", sq_2("ge", sq_2("add", sq_t("a"), sq_i32(1)), sq_t("b")),
+        sq_2("le", sq_2("add", sq_t("a"), sq_i32(1)), sq_t("c"))), sq_t("d")), "between over comparison")
+    for (op, f) in [("=", "eq"), ("<>", "ne"), ("!=", "ne"), ("<", "lt"), ("<=", "le"), (">", "gt"), (">=", "ge")]
+        sq_expect(sq_e(s"a $op b"), sq_2(f, sq_t("a"), sq_t("b")), op)
+
+@test
+comparisons_do_not_chain()
+    assert_eq(sq_err("SELECT a < b < c FROM t"), "Q8001@1:14")
+    assert_eq(sq_err("SELECT a = b = c FROM t"), "Q8001@1:14")
+    sq_expect(sq_e("(a < b) = c"), sq_2("eq", sq_2("lt", sq_t("a"), sq_t("b")), sq_t("c")), "parenthesised")
+
+@test
+between_in_and_like_are_spelled_with_core_functions()
+    sq_expect(sq_e("a BETWEEN 1 AND 2"), sq_2("and", sq_2("ge", sq_t("a"), sq_i32(1)), sq_2("le", sq_t("a"), sq_i32(2))), "between")
+    sq_expect(sq_e("a NOT BETWEEN 1 AND 2"), sq_1("not", sq_2("and", sq_2("ge", sq_t("a"), sq_i32(1)), sq_2("le", sq_t("a"), sq_i32(2)))), "not between")
+    sq_expect(sq_e("a IN (1)"), sq_2("eq", sq_t("a"), sq_i32(1)), "in one")
+    sq_expect(sq_e("a IN (1, 2, 3)"), sq_2("or", sq_2("or", sq_2("eq", sq_t("a"), sq_i32(1)), sq_2("eq", sq_t("a"), sq_i32(2))), sq_2("eq", sq_t("a"), sq_i32(3))), "in three")
+    sq_expect(sq_e("a NOT IN (1, b)"), sq_1("not", sq_2("or", sq_2("eq", sq_t("a"), sq_i32(1)), sq_2("eq", sq_t("a"), sq_t("b")))), "not in")
+    sq_expect(sq_e("a LIKE 'x%'"), Call("like", items_of([sq_t("a"), sq_txt("x%"), sq_txt("")])), "like")
+    sq_expect(sq_e("a NOT LIKE 'x!%' ESCAPE '!'"), sq_1("not", Call("like", items_of([sq_t("a"), sq_txt("x!%"), sq_txt("!")]))), "not like escape")
+    assert_eq(sq_err("SELECT a ILIKE 'x' FROM t"), "Q8005@1:10")
+    assert_eq(sq_err("SELECT a = ANY (b) FROM t"), "Q8005@1:12")
+    assert_eq(sq_err("SELECT a IS DISTINCT FROM b FROM t"), "Q8005@1:13")
+    assert_eq(sq_err("SELECT a IS TRUE FROM t"), "Q8005@1:13")
+    assert_eq(sq_err("SELECT a IS 1 FROM t"), "Q8001@1:13")
+
+@test
+case_is_an_if()
+    sq_expect(sq_e("CASE WHEN a > 0 THEN 'pos' WHEN a < 0 THEN 'neg' ELSE 'zero' END"), If(items_of([IfArm(sq_2("gt", sq_t("a"), sq_i32(0)), sq_txt("pos")),
+        IfArm(sq_2("lt", sq_t("a"), sq_i32(0)), sq_txt("neg"))]), Some(sq_txt("zero"))), "searched")
+    sq_expect(sq_e("CASE a WHEN 1 THEN 'one' END"), If(items_of([IfArm(sq_2("eq", sq_t("a"), sq_i32(1)), sq_txt("one"))]), None), "simple")
+    sq_expect(sq_e("CASE WHEN a THEN 'x' ELSE NULL END"), If(items_of([IfArm(sq_t("a"), sq_txt("x"))]), None), "else null")
+    sq_expect(sq_e("CASE WHEN a THEN NULL ELSE 'x' END"), If(items_of([IfArm(sq_t("a"), Null(Text))]), Some(sq_txt("x"))), "a null result takes the others' type")
+    sq_rel("SELECT CASE WHEN true THEN NULL ELSE age END FROM users") match
+        Project(_, _, items) -> sq_expect(items[0].expr, If(items_of([IfArm(Literal(Bool, Value.Bool(true)), Null(Int16))]), Some(sq_c("users", "age"))), "typed by a column")
+        _ -> assert(false, "a project")
+    assert_eq(sq_err("SELECT CASE WHEN a THEN NULL END FROM t"), "Q8007@1:25")
+    assert_eq(sq_err("SELECT CASE END FROM t"), "Q8001@1:13")
+
+@test
+casts_read_constants_as_their_type()
+    sq_expect(sq_e("CAST(a AS int64)"), Cast(sq_t("a"), Int64, Strict), "cast")
+    sq_expect(sq_e("a::text::int16"), Cast(Cast(sq_t("a"), Text, Strict), Int16, Strict), "chained")
+    sq_expect(sq_e("'2024-01-02'::date"), sq_lit(Date, "2024-01-02"), "a string")
+    sq_expect(sq_e("CAST('12' AS int16)"), sq_i16(12), "a string to an integer")
+    sq_expect(sq_e("NULL::text"), Null(Text), "null")
+    sq_expect(sq_e("7::int64"), sq_i64(7), "a number that fits")
+    sq_expect(sq_e("1.5::int32"), Cast(Literal(Decimal(2, 1), Value.Int(15)), Int32, Strict), "a number that does not")
+    sq_expect(sq_e("1::float64"), sq_lit(Float64, "1"), "to a float")
+    assert_eq(sq_err("SELECT 'x'::date FROM t"), "Q8004@1:8")
+    assert_eq(sq_err("SELECT a::varchar FROM t"), "Q8006@1:11")
+    assert_eq(sq_err("SELECT a::decimal FROM t"), "Q8006@1:11")
+    assert_eq(sq_err("SELECT a::decimal(39) FROM t"), "Q8006@1:11")
+    assert_eq(sq_err("SELECT a::decimal(5, 6) FROM t"), "Q8006@1:11")
+    assert_eq(sq_err("SELECT a::timestamp(3) FROM t"), "Q8006@1:20")
+    assert_eq(sq_err("SELECT a::nosuch FROM t"), "Q8006@1:11")
+    assert_eq(sq_err("SELECT a::time with time zone FROM t"), "Q8006@1:11")
+
+@test
+type_names_map_to_tree_types()
+    for (name, ty) in [("bool", Bool), ("boolean", Bool), ("int8", Int8), ("int16", Int16), ("smallint", Int16), ("int32", Int32), ("int", Int32), ("integer", Int32),
+        ("int64", Int64), ("bigint", Int64), ("int128", Int128), ("uint8", UInt8), ("uint16", UInt16), ("uint32", UInt32), ("uint64", UInt64),
+        ("decimal(5)", Decimal(5, 0)), ("decimal(5, 2)", Decimal(5, 2)), ("numeric(38, 38)", Decimal(38, 38)), ("float32", Float32), ("real", Float32),
+        ("float64", Float64), ("float", Float64), ("double precision", Float64), ("text", Text), ("bytes", Bytes), ("bytea", Bytes), ("json", Json),
+        ("date", Date), ("time", Time), ("time without time zone", Time), ("datetime", DateTime), ("timestamp without time zone", DateTime),
+        ("timestamp", Timestamp), ("timestamptz", Timestamp), ("timestamp with time zone", Timestamp), ("interval", Interval), ("uuid", Uuid)]
+        sq_expect(sq_e(s"CAST(a AS $name)"), Cast(sq_t("a"), ty, Strict), name)
+    for name in ["int2", "int4", "float4", "float8", "jsonb", "char", "character", "money"]
+        assert_eq(sq_err(s"SELECT CAST(a AS $name) FROM t"), "Q8006@1:18")
+
+@test
+constants_have_their_own_types_without_context()
+    sq_expect(sq_e("2147483647"), sq_i32(2147483647), "int32 max")
+    sq_expect(sq_e("2147483648"), sq_i64(2147483648), "past int32")
+    sq_expect(sq_e("-2147483648"), sq_i32(-2147483648), "int32 min")
+    sq_expect(sq_e("9223372036854775808"), Literal(Decimal(19, 0), Value.Int(9223372036854775808)), "past int64")
+    sq_expect(sq_e("007"), sq_i32(7), "leading zeros")
+    sq_expect(sq_e("1.50"), Literal(Decimal(3, 2), Value.Int(150)), "decimal")
+    sq_expect(sq_e(".5"), Literal(Decimal(1, 1), Value.Int(5)), "no whole part")
+    sq_expect(sq_e("0.05"), Literal(Decimal(2, 2), Value.Int(5)), "leading zero")
+    sq_expect(sq_e("1."), Literal(Decimal(1, 0), Value.Int(1)), "no fraction")
+    sq_expect(sq_e("-12.5"), Literal(Decimal(3, 1), Value.Int(-125)), "negative decimal")
+    sq_expect(sq_e("1e3"), sq_lit(Float64, "1000"), "exponent")
+    sq_expect(sq_e("2.5E-1"), sq_lit(Float64, "0.25"), "fraction exponent")
+    sq_expect(sq_e("'it''s'"), sq_txt("it's"), "string")
+    sq_expect(sq_e("E'a\\tb'"), sq_txt("a\tb"), "e string")
+    sq_expect(sq_e("true"), Literal(Bool, Value.Bool(true)), "true")
+    sq_expect(sq_e("FALSE"), Literal(Bool, Value.Bool(false)), "false")
+    sq_expect(sq_e("DATE '2024-02-29'"), sq_lit(Date, "2024-02-29"), "typed date")
+    sq_expect(sq_e("timestamp '2024-01-01T00:00:00Z'"), sq_lit(Timestamp, "2024-01-01T00:00:00Z"), "typed timestamp")
+    sq_expect(sq_e("interval 'P1D'"), sq_lit(Interval, "P1D"), "typed interval")
+    assert_eq(sq_err("SELECT interval '1 day' FROM t"), "Q8004@1:8")
+    sq_expect(sq_e("int16 '12'"), sq_i16(12), "typed integer")
+    sq_expect(sq_e("1 - -1"), sq_2("sub", sq_i32(1), sq_i32(-1)), "a negated constant")
+    assert_eq(sq_err("SELECT 123456789012345678901234567890123456789 FROM t"), "Q8004@1:8")
+    assert_eq(sq_err("SELECT 1e999 FROM t"), "Q8004@1:8")
+    assert_eq(sq_err("SELECT DATE '2024-02-30' FROM t"), "Q8004@1:8")
+    assert_eq(sq_err("SELECT NULL FROM t"), "Q8007@1:8")
+    assert_eq(sq_err("SELECT nosuch 'x' FROM t"), "Q8006@1:8")
+
+@test
+constants_take_the_type_of_the_column_they_meet()
+    val got = sq_rel("SELECT * FROM nums WHERE dt = '2024-01-02' AND d > 1.5 AND u = 7 AND f < 2 AND i IN (1, 2) AND d BETWEEN 0 AND 10.25")
+    val dt = sq_2("eq", sq_c("nums", "dt"), sq_lit(Date, "2024-01-02"))
+    val d = sq_2("gt", sq_c("nums", "d"), Literal(Decimal(10, 2), Value.Int(150)))
+    val u = sq_2("eq", sq_c("nums", "u"), Literal(UInt32, Value.UInt(7)))
+    val f = sq_2("lt", sq_c("nums", "f"), sq_lit(Float64, "2"))
+    val i = sq_2("or", sq_2("eq", sq_c("nums", "i"), sq_i32(1)), sq_2("eq", sq_c("nums", "i"), sq_i32(2)))
+    val btw = sq_2("and", sq_2("ge", sq_c("nums", "d"), Literal(Decimal(10, 2), Value.Int(0))), sq_2("le", sq_c("nums", "d"), Literal(Decimal(10, 2), Value.Int(1025))))
+    sq_expect(got, Filter(sq_scan("nums", "nums"), sq_2("and", sq_2("and", sq_2("and", sq_2("and", sq_2("and", dt, d), u), f), i), btw)), "typed by columns")
+    // A constant that is not exactly a value of the column's type keeps its own.
+    sq_expect(sq_e("d = 1.005", SqFixture()) , sq_e("d = 1.005", SqFixture()), "stable")
+    sq_rel("SELECT * FROM nums WHERE d = 1.005 OR u = -1 OR i = 3000000000") match
+        Filter(_, Call(_, args)) -> assert(args.len() == 2, "an or")
+        _ -> assert(false, "a filter")
+    sq_expect(sq_e("coalesce(age, 0)"), sq_e("coalesce(age, 0)"), "stable")
+    sq_rel("SELECT coalesce(age, 0) FROM users") match
+        Project(_, _, items) -> sq_expect(items[0].expr, sq_2("coalesce", sq_c("users", "age"), sq_i16(0)), "coalesce")
+        _ -> assert(false, "a project")
+    sq_rel("SELECT age + 1, 1 + age FROM users") match
+        Project(_, _, items) ->
+            sq_expect(items[0].expr, sq_2("add", sq_c("users", "age"), sq_i16(1)), "arithmetic")
+            sq_expect(items[1].expr, sq_2("add", sq_i16(1), sq_c("users", "age")), "either side")
+        _ -> assert(false, "a project")
+    assert_eq(sq_err("SELECT * FROM nums WHERE dt = 'nope'"), "Q8004@1:31")
+    sq_rel("SELECT * FROM users WHERE name = NULL") match
+        Filter(_, e) -> sq_expect(e, sq_2("eq", sq_c("users", "name"), Null(Text)), "null beside a column")
+        _ -> assert(false, "a filter")
+
+@test
+functions_are_core_calls()
+    sq_expect(sq_e("lower(a)"), sq_1("lower", sq_t("a")), "lower")
+    sq_expect(sq_e("LENGTH(a)"), sq_1("length", sq_t("a")), "folded")
+    sq_expect(sq_e("now()"), Call("statement_timestamp", buf[Expr]()), "now")
+    sq_expect(sq_e("current_timestamp"), Call("statement_timestamp", buf[Expr]()), "current_timestamp")
+    sq_expect(sq_e("coalesce(a, b, 'x')"), Call("coalesce", items_of([sq_t("a"), sq_t("b"), sq_txt("x")])), "coalesce")
+    sq_expect(sq_e("nosuch(a)"), sq_1("nosuch", sq_t("a")), "validation decides")
+    assert_eq(sq_err("SELECT now(1) FROM t"), "Q8001@1:8")
+    assert_eq(sq_err("SELECT s.f(a) FROM t"), "Q8005@1:11")
+    assert_eq(sq_err("SELECT \"lower\"(a) FROM t"), "Q8005@1:8")
+    assert_eq(sq_err("SELECT f(a) WITHIN GROUP (ORDER BY a) FROM t"), "Q8005@1:13")
+
+@test
+parameters_are_typed_by_a_cast_or_a_column()
+    val e = sq_env("SELECT * FROM users WHERE id = $1 AND name = $2 AND age > $3::int64")
+    assert(e.params == items_of([ParamDecl(None, Int64), ParamDecl(None, Text), ParamDecl(None, Int64)]), "the declared types")
+    e.statement match
+        Query(Filter(_, p)) -> sq_expect(p, sq_2("and", sq_2("and", sq_2("eq", sq_c("users", "id"), Param(0)), sq_2("eq", sq_c("users", "name"), Param(1))),
+            sq_2("gt", sq_c("users", "age"), Param(2))), "params")
+        _ -> assert(false, "a filter")
+    // A parameter used twice keeps its type; its later uses need none.
+    val twice = sq_env("SELECT $1::int32 + $1")
+    assert(twice.params == items_of([ParamDecl(None, Int32)]), "one parameter")
+    assert_eq(sq_err("SELECT $1"), "Q8007@1:8")
+    assert_eq(sq_err("SELECT $2::int"), "Q8007@1:8")
+    assert_eq(sq_err("SELECT * FROM users WHERE id = $1 AND name = $1"), "Q8007@1:46")
+    // An assignment declares the column's exact type, nullability included.
+    val ins = sq_env("INSERT INTO users (id, name) VALUES ($1, $2)")
+    assert(ins.params == items_of([ParamDecl(None, Int64), ParamDecl(None, nullable(Text))]), "assignment types")
+
+// -- DML ------------------------------------------------------------------------------------------------
+
+private sq_users_cols() -> Buf[Field] = items_of([Field("id", Int64), Field("name", nullable(Text)), Field("age", nullable(Int16))])
+
+@test
+insert_values_are_typed_as_their_columns()
+    sq_expect(sq_stmt("INSERT INTO users VALUES (1, 'ann', 30)"), Insert(sq_q("users"), "users", None, sql_names(["id", "name", "age"]),
+        Values("values", sq_users_cols(), items_of([items_of([sq_i64(1), sq_txt("ann"), sq_i16(30)])])), None, buf[Item]()), "all columns")
+    sq_expect(sq_stmt("INSERT INTO users (id, name) VALUES (1, NULL), (2, 'b')"), Insert(sq_q("users"), "users", None, sql_names(["id", "name"]),
+        Values("values", items_of([Field("id", Int64), Field("name", nullable(Text))]), items_of([items_of([sq_i64(1), Null(Text)]), items_of([sq_i64(2), sq_txt("b")])])), None, buf[Item]()), "listed columns")
+    sq_expect(sq_stmt("INSERT INTO nums (i, dt, u, f, d) VALUES (1, '2024-01-02', 7, 1, 2.345)"), Insert(sq_q("nums"), "nums", None, sql_names(["i", "dt", "u", "f", "d"]),
+        Values("values", items_of([Field("i", Int32), Field("dt", nullable(Date)), Field("u", nullable(UInt32)), Field("f", nullable(Float64)), Field("d", nullable(Decimal(10, 2)))]),
+        items_of([items_of([sq_i32(1), sq_lit(Date, "2024-01-02"), Literal(UInt32, Value.UInt(7)), sq_lit(Float64, "1"), Literal(Decimal(10, 2), Value.Int(235))])])), None, buf[Item]()), "conversions and rounding")
+    // An opaque table's VALUES take the constants' own types, named after the targets.
+    sq_expect(sq_stmt("INSERT INTO t (a, b) VALUES (1, 'x')"), Insert(sq_q("t"), "t", None, sql_names(["a", "b"]),
+        Values("values", items_of([Field("a", Int32), Field("b", Text)]), items_of([items_of([sq_i32(1), sq_txt("x")])])), None, buf[Item]()), "opaque")
+    sq_expect(sq_stmt("INSERT INTO users AS u (id) VALUES (1 + 1)"), Insert(sq_q("users"), "u", None, sql_names(["id"]),
+        Values("values", items_of([Field("id", Int64)]), items_of([items_of([sq_2("add", sq_i32(1), sq_i32(1))])])), None, buf[Item]()), "an expression")
+
+@test
+insert_takes_a_query_or_default_values()
+    sq_expect(sq_stmt("INSERT INTO t (a) SELECT x FROM u"), Insert(sq_q("t"), "t", None, sql_names(["a"]), sq_proj(sq_scan("u", "u"), [item("x", sq_c("u", "x"))]), None, buf[Item]()), "select")
+    sq_expect(sq_stmt("INSERT INTO t DEFAULT VALUES"), Insert(sq_q("t"), "t", None, buf[string](), Values("values", buf[Field](), sql_one_empty_row()), None, buf[Item]()), "default values")
+    sq_expect(sq_stmt("INSERT INTO t (a) VALUES (1) ORDER BY 1"), Insert(sq_q("t"), "t", None, sql_names(["a"]),
+        Sort(Values("values", items_of([Field("column1", Int32)]), items_of([items_of([sq_i32(1)])])), items_of([sq_key(sq_c("values", "column1"))])), None, buf[Item]()), "an ordered values")
+    sq_expect(sq_stmt("INSERT INTO t (a) (SELECT 1)"), Insert(sq_q("t"), "t", None, sql_names(["a"]), sq_proj(sq_none(), [item("column1", sq_i32(1))]), None, buf[Item]()), "parenthesised")
+
+@test
+insert_returning_and_on_conflict()
+    sq_expect(sq_stmt("INSERT INTO users (id) VALUES (1) RETURNING id, name AS n"), Insert(sq_q("users"), "users", None, sql_names(["id"]),
+        Values("values", items_of([Field("id", Int64)]), items_of([items_of([sq_i64(1)])])), None, items_of([item("id", sq_c("users", "id")), item("n", sq_c("users", "name"))])), "returning")
+    sq_stmt("INSERT INTO users (id) VALUES (1) RETURNING *") match
+        Insert(_, _, _, _, _, _, ret) -> assert(ret == items_of([item("id", sq_c("users", "id")), item("name", sq_c("users", "name")), item("age", sq_c("users", "age"))]), "returning *")
+        _ -> assert(false, "an insert")
+    sq_stmt("INSERT INTO users (id) VALUES (1) ON CONFLICT DO NOTHING") match
+        Insert(_, _, _, _, _, oc, _) -> assert(oc == Some(OnConflict(Columns(sql_names(["id"])), "excluded", Nothing)), "the primary key")
+        _ -> assert(false, "an insert")
+    sq_stmt("INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = 1 WHERE users.age > 1") match
+        Insert(_, _, _, _, _, oc, _) -> assert(oc == Some(OnConflict(Columns(sql_names(["id"])), "excluded", DoUpdate(items_of([item("name", sq_c("excluded", "name")),
+            item("age", sq_i16(1))]), Some(sq_2("gt", sq_c("users", "age"), sq_i16(1)))))), "do update")
+        _ -> assert(false, "an insert")
+    sq_stmt("INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT t_a_key DO NOTHING") match
+        Insert(_, _, _, _, _, oc, _) -> assert(oc == Some(OnConflict(Constraint("t_a_key"), "excluded", Nothing)), "a constraint")
+        _ -> assert(false, "an insert")
+    assert_eq(sq_err("INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"), "Q8010@1:30")
+    assert_eq(sq_err("INSERT INTO t (a) VALUES (1) RETURNING *"), "Q8010@1:40")
+
+@test
+insert_errors_are_positioned()
+    assert_eq(sq_err("INSERT INTO t VALUES (1)"), "Q8010@1:1")
+    assert_eq(sq_err("INSERT INTO users (id, age) VALUES (1, 70000)"), "Q8004@1:40")
+    assert_eq(sq_err("INSERT INTO users (id, age) VALUES (1, 1.5)"), "Q8004@1:40")
+    assert_eq(sq_err("INSERT INTO users (id) VALUES (1, 2)"), "Q8012@1:32")
+    assert_eq(sq_err("INSERT INTO users (id, name) VALUES (1)"), "Q8012@1:38")
+    assert_eq(sq_err("INSERT INTO nums (i, dt) VALUES (1, 'nope')"), "Q8004@1:37")
+    assert_eq(sq_err("INSERT INTO users (id, zz) VALUES (1, 2)"), "Q2003@1:1")
+    assert_eq(sq_err("INSERT INTO users (id) VALUES (DEFAULT)"), "Q8005@1:32")
+    assert_eq(sq_err("INSERT users VALUES (1)"), "Q8001@1:8")
+
+@test
+update_and_delete_have_filters_and_returning()
+    sq_expect(sq_stmt("UPDATE users SET age = 31, name = 'x' WHERE id = 1 RETURNING age"), Update(sq_q("users"), "users", None, None,
+        Some(sq_2("eq", sq_c("users", "id"), sq_i64(1))), items_of([item("age", sq_i16(31)), item("name", sq_txt("x"))]), items_of([item("age", sq_c("users", "age"))])), "update")
+    sq_expect(sq_stmt("UPDATE posts p SET title = u.name FROM users u WHERE p.author = u.id"), Update(sq_q("posts"), "p", None, Some(sq_scan("users", "u")),
+        Some(sq_2("eq", sq_c("p", "author"), sq_c("u", "id"))), items_of([item("title", sq_c("u", "name"))]), buf[Item]()), "update from")
+    sq_expect(sq_stmt("UPDATE t SET a = a + 1"), Update(sq_q("t"), "t", None, None, None, items_of([item("a", sq_2("add", sq_c("t", "a"), sq_i32(1)))]), buf[Item]()), "no filter")
+    sq_expect(sq_stmt("DELETE FROM users WHERE age < 18"), Delete(sq_q("users"), "users", None, None, Some(sq_2("lt", sq_c("users", "age"), sq_i16(18))), buf[Item]()), "delete")
+    sq_expect(sq_stmt("DELETE FROM posts AS p USING users u WHERE p.author = u.id RETURNING p.id, u.name"), Delete(sq_q("posts"), "p", None, Some(sq_scan("users", "u")),
+        Some(sq_2("eq", sq_c("p", "author"), sq_c("u", "id"))), items_of([item("id", sq_c("p", "id")), item("name", sq_c("u", "name"))])), "delete using")
+    sq_expect(sq_stmt("DELETE FROM t"), Delete(sq_q("t"), "t", None, None, None, buf[Item]()), "delete all")
+    assert_eq(sq_err("UPDATE users SET zz = 1"), "Q2003@1:18")
+    assert_eq(sq_err("UPDATE users SET age = DEFAULT"), "Q8005@1:24")
+    assert_eq(sq_err("UPDATE users SET (age, name) = (1, 'x')"), "Q8005@1:18")
+    assert_eq(sq_err("UPDATE users SET users.age = 1"), "Q8005@1:23")
+    assert_eq(sq_err("UPDATE users SET age = 99999"), "Q8004@1:24")
+    assert_eq(sq_err("UPDATE t SET a = 1 FROM t"), "Q2004@1:1")
+    assert_eq(sq_err("DELETE FROM t USING t"), "Q2004@1:1")
+    assert_eq(sq_err("DELETE t"), "Q8001@1:8")
+
+// -- DDL ------------------------------------------------------------------------------------------------
+
+private sq_col(name: string, ty: Type, default: Option[Expr] = None) -> ColumnDef = ColumnDef(name, ty, default, None, NoIdentity, None)
+
+@test
+create_table_spells_columns_keys_and_constraints()
+    val got = sq_stmt("CREATE TABLE t (id int64 PRIMARY KEY, name text NOT NULL DEFAULT 'x', n int16 DEFAULT 0 CHECK (n >= 0), r int64 REFERENCES users ON DELETE CASCADE, UNIQUE (name, n))")
+    val want = CreateTable(sq_q("t"), items_of([sq_col("id", Int64), sq_col("name", Text, Some(sq_txt("x"))), sq_col("n", nullable(Int16), Some(sq_i16(0))), sq_col("r", nullable(Int64))]),
+        sql_names(["id"]), items_of([ConstraintDef("t_check", Check(sq_2("ge", sq_c("row", "n"), sq_i16(0)))),
+        ConstraintDef("t_r_fkey", ForeignKey(sql_names(["r"]), sq_q("users"), sql_names(["id"]), FkCascade, FkNoAction, false)),
+        ConstraintDef("t_name_n_key", Unique(sql_names(["name", "n"])))]), false)
+    sq_expect(got, want, "create table")
+
+@test
+create_table_names_constraints_and_keys_tables()
+    val got = sq_stmt("CREATE TABLE IF NOT EXISTS s.k (a int, b int, c text, PRIMARY KEY (a, b), CONSTRAINT pos CHECK (a > 0), CHECK (b > 0), CHECK (k.b < 9), UNIQUE (c), UNIQUE (c), FOREIGN KEY (a, b) REFERENCES s.k (b, a) ON UPDATE SET NULL ON DELETE SET DEFAULT DEFERRABLE INITIALLY DEFERRED)")
+    got match
+        CreateTable(q, cols, pk, cons, ine) ->
+            assert(q == QualName("s", "k") && ine, "the name")
+            assert(cols == items_of([sq_col("a", Int32), sq_col("b", Int32), sq_col("c", nullable(Text))]), "key columns are not null")
+            assert(pk == sql_names(["a", "b"]), "the key")
+            val names = buf[string]()
+            for c in cons
+                names.push(c.name)
+            assert(names == sql_names(["pos", "k_check", "k_check1", "k_c_key", "k_c_key1", "k_a_b_fkey"]), "constraint names")
+            assert(cons[5].body == ForeignKey(sql_names(["a", "b"]), QualName("s", "k"), sql_names(["b", "a"]), FkSetDefault, FkSetNull, true), "the foreign key")
+        _ -> assert(false, "a create table")
+    assert_eq(sq_err("CREATE TABLE k (a int, CHECK (t.a > 0))"), "Q2002@1:31")
+
+@test
+create_table_identity_generated_and_serial()
+    sq_stmt("CREATE TABLE s (id serial PRIMARY KEY, big bigserial, x int GENERATED ALWAYS AS (id * 2) STORED, y int64 GENERATED ALWAYS AS IDENTITY, z int16 GENERATED BY DEFAULT AS IDENTITY)") match
+        CreateTable(_, cols, _, _, _) ->
+            assert(cols[0] == ColumnDef("id", Int32, None, None, ByDefault, None), "serial")
+            assert(cols[1] == ColumnDef("big", Int64, None, None, ByDefault, None), "bigserial")
+            assert(cols[2] == ColumnDef("x", nullable(Int32), None, Some(sq_2("mul", sq_c("row", "id"), sq_i32(2))), NoIdentity, None), "generated")
+            assert(cols[3] == ColumnDef("y", nullable(Int64), None, None, Always, None), "always identity")
+            assert(cols[4] == ColumnDef("z", nullable(Int16), None, None, ByDefault, None), "by default identity")
+        _ -> assert(false, "a create table")
+
+@test
+create_table_errors()
+    assert_eq(sq_err("CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)"), "Q8013@1:42")
+    assert_eq(sq_err("CREATE TABLE t (a int PRIMARY KEY, PRIMARY KEY (a))"), "Q8013@1:36")
+    assert_eq(sq_err("CREATE TABLE t (a int NULL NOT NULL)"), "Q8013@1:28")
+    assert_eq(sq_err("CREATE TABLE t (a int NOT NULL NULL)"), "Q8013@1:32")
+    assert_eq(sq_err("CREATE TABLE t (a int DEFAULT 1 DEFAULT 2)"), "Q8013@1:33")
+    assert_eq(sq_err("CREATE TABLE t (a int, a text)"), "Q8013@1:24")
+    assert_eq(sq_err("CREATE TABLE t (a varchar(10))"), "Q8006@1:19")
+    assert_eq(sq_err("CREATE TABLE t (a numeric)"), "Q8006@1:19")
+    assert_eq(sq_err("CREATE TABLE t (a int CONSTRAINT k PRIMARY KEY)"), "Q8005@1:23")
+    assert_eq(sq_err("CREATE TABLE t (a int REFERENCES u)"), "Q8010@1:23")
+    assert_eq(sq_err("CREATE TABLE t (a int DEFAULT b)"), "Q2003@1:31")
+    assert_eq(sq_err("CREATE TABLE t (a int16 DEFAULT 99999)"), "Q8004@1:33")
+    assert_eq(sq_err("CREATE TABLE t (a int GENERATED ALWAYS AS IDENTITY (START 1))"), "Q8005@1:52")
+    assert_eq(sq_err("CREATE TABLE t (LIKE u)"), "Q8005@1:17")
+    assert_eq(sq_err("CREATE TABLE t (a int) AS SELECT 1"), "Q8005@1:24")
+    assert_eq(sq_err("CREATE TABLE t ()"), "Q8001@1:17")
+    assert_eq(sq_err("CREATE TABLE t (select int)"), "Q8001@1:17")
+    assert_eq(sq_err("CREATE TABLE t (a int, CONSTRAINT c CHECK (a > 0) NOT VALID)"), "Q8005@1:24")
+    // A default is a bexpr: NOT NULL after it is a constraint.
+    sq_stmt("CREATE TABLE t (a int DEFAULT 1 NOT NULL PRIMARY KEY)") match
+        CreateTable(_, cols, _, _, _) -> assert(cols[0] == sq_col("a", Int32, Some(sq_i32(1))), "default then not null")
+        _ -> assert(false, "a create table")
+
+@test
+a_script_s_tables_are_known_to_its_later_statements()
+    val all = sql_statements("CREATE TABLE z (a int PRIMARY KEY, b text); INSERT INTO z VALUES (1, NULL); ALTER TABLE z ADD c date; INSERT INTO z VALUES (2, 'x', '2024-01-01'); DROP TABLE z; INSERT INTO z VALUES (3)").unwrap_or(buf())
+    assert_eq(all.len(), 0)
+    val ok = sql_statements("CREATE TABLE z (a int PRIMARY KEY, b text); INSERT INTO z VALUES (1, NULL); ALTER TABLE z ADD c date, RENAME b TO bb; INSERT INTO z (bb, c) VALUES ('x', '2024-01-01')").unwrap()
+    assert_eq(ok.len(), 4)
+    ok[1].action match
+        SqlTree(e) -> sq_expect(e.statement, Insert(sq_q("z"), "z", None, sql_names(["a", "b"]), Values("values", items_of([Field("a", Int32), Field("b", nullable(Text))]),
+            items_of([items_of([sq_i32(1), Null(Text)])])), None, buf[Item]()), "after create")
+        _ -> assert(false, "a tree")
+    ok[3].action match
+        SqlTree(e) -> sq_expect(e.statement, Insert(sq_q("z"), "z", None, sql_names(["bb", "c"]), Values("values", items_of([Field("bb", nullable(Text)), Field("c", nullable(Date))]),
+            items_of([items_of([sq_txt("x"), sq_lit(Date, "2024-01-01")])])), None, buf[Item]()), "after alter")
+        _ -> assert(false, "a tree")
+    // A dropped table is opaque again, even where the resolver knows it.
+    assert_eq(sq_err("DROP TABLE users; INSERT INTO users VALUES (1)"), "Q8010@1:19")
+    assert_eq(sq_err("ALTER TABLE users RENAME TO people; INSERT INTO users VALUES (1); "), "Q8010@1:37")
+    assert_eq(sq_err("ALTER TABLE users RENAME TO people; INSERT INTO people VALUES (1, 'a', 2)"), "ok")
+
+@test
+alter_table_spells_each_action()
+    sq_expect(sq_stmt("ALTER TABLE users ADD COLUMN email text UNIQUE, DROP COLUMN age, RENAME COLUMN name TO full_name, ALTER COLUMN id TYPE int128"),
+        AlterTable(sq_q("users"), items_of([AddColumn(sq_col("email", nullable(Text))), AddConstraint(ConstraintDef("users_email_key", Unique(sql_names(["email"]))), false),
+        DropColumn("age", false), RenameColumn("name", "full_name"), RetypeColumn("id", Int128, None)])), "four actions")
+    sq_expect(sq_stmt("ALTER TABLE users ALTER age SET DATA TYPE int32 USING age + 1, ALTER name SET DEFAULT 'n', ALTER name DROP DEFAULT, ALTER name SET NOT NULL, ALTER age DROP NOT NULL"),
+        AlterTable(sq_q("users"), items_of([RetypeColumn("age", nullable(Int32), Some(sq_2("add", sq_c("row", "age"), sq_i16(1)))), SetColumnDefault("name", Some(sq_txt("n"))),
+        SetColumnDefault("name", None), SetNullable("name", false), SetNullable("age", true)])), "alter column")
+    sq_expect(sq_stmt("ALTER TABLE t ADD CONSTRAINT pos CHECK (a > 0) NOT VALID, ADD PRIMARY KEY (a), DROP CONSTRAINT IF EXISTS old, RENAME CONSTRAINT x TO y, VALIDATE CONSTRAINT pos, RENAME TO u, DROP b CASCADE"),
+        AlterTable(sq_q("t"), items_of([AddConstraint(ConstraintDef("pos", Check(sq_2("gt", sq_c("row", "a"), sq_i32(0)))), true), SetPrimaryKey(sql_names(["a"])),
+        DropConstraint("old", true), RenameConstraint("x", "y"), ValidateConstraint("pos"), RenameTable("u"), DropColumn("b", true)])), "constraints")
+    sq_expect(sq_stmt("ALTER TABLE t ADD c int NOT NULL DEFAULT 0 CHECK (c >= 0)"), AlterTable(sq_q("t"), items_of([AddColumn(sq_col("c", Int32, Some(sq_i32(0)))),
+        AddConstraint(ConstraintDef("t_check", Check(sq_2("ge", sq_c("row", "c"), sq_i32(0)))), false)])), "add a column with a check")
+    assert_eq(sq_err("ALTER TABLE t ALTER a TYPE int64"), "Q8010@1:15")
+    assert_eq(sq_err("ALTER TABLE t ADD c int PRIMARY KEY"), "Q8005@1:25")
+    assert_eq(sq_err("ALTER TABLE t ADD CONSTRAINT k PRIMARY KEY (a)"), "Q8005@1:19")
+    assert_eq(sq_err("ALTER TABLE t DROP COLUMN IF EXISTS a"), "Q8005@1:27")
+    assert_eq(sq_err("ALTER TABLE t DROP CONSTRAINT c CASCADE"), "Q8005@1:33")
+    assert_eq(sq_err("ALTER TABLE IF EXISTS t RENAME TO u"), "Q8005@1:13")
+    assert_eq(sq_err("ALTER INDEX i RENAME TO j"), "Q8005@1:7")
+    assert_eq(sq_err("ALTER TABLE t FROB a"), "Q8001@1:15")
+
+@test
+indexes_schemas_views_and_drops()
+    sq_expect(sq_stmt("CREATE UNIQUE INDEX i ON users (name DESC, (lower(name)), id ASC) WHERE age > 0"), CreateIndex("i", IndexDef(sq_q("users"), true,
+        items_of([IndexKey(KeyColumn("name"), true), IndexKey(KeyExpr(sq_1("lower", sq_c("row", "name"))), false), IndexKey(KeyColumn("id"), false)]),
+        Some(sq_2("gt", sq_c("row", "age"), sq_i16(0)))), false), "index")
+    sq_expect(sq_stmt("CREATE INDEX IF NOT EXISTS j ON s.t (a)"), CreateIndex("j", IndexDef(QualName("s", "t"), false, items_of([IndexKey(KeyColumn("a"), false)]), None), true), "if not exists")
+    sq_expect(sq_stmt("DROP INDEX IF EXISTS i"), DropIndex(sq_q("i"), true), "drop index")
+    sq_expect(sq_stmt("DROP INDEX s.i RESTRICT"), DropIndex(QualName("s", "i"), false), "restrict")
+    sq_expect(sq_stmt("DROP TABLE t"), DropTable(sq_q("t"), false, false), "drop table")
+    sq_expect(sq_stmt("DROP TABLE IF EXISTS s.t CASCADE"), DropTable(QualName("s", "t"), true, true), "drop table cascade")
+    sq_expect(sq_stmt("DROP TABLE t RESTRICT"), DropTable(sq_q("t"), false, false), "restrict")
+    sq_expect(sq_stmt("CREATE SCHEMA app"), CreateNamespace("app", false), "schema")
+    sq_expect(sq_stmt("CREATE SCHEMA IF NOT EXISTS app"), CreateNamespace("app", true), "schema if not exists")
+    sq_expect(sq_stmt("DROP SCHEMA IF EXISTS app CASCADE"), DropNamespace("app", true, true), "drop schema")
+    sq_expect(sq_stmt("CREATE VIEW v AS SELECT a FROM t"), CreateView(sq_q("v"), sq_proj(sq_scan("t", "t"), [item("a", sq_c("t", "a"))], "view"), false), "view")
+    sq_expect(sq_stmt("CREATE OR REPLACE VIEW s.v AS SELECT * FROM t"), CreateView(QualName("s", "v"), sq_scan("t", "t"), true), "replace")
+    sq_expect(sq_stmt("DROP VIEW IF EXISTS v CASCADE"), DropView(sq_q("v"), true, true), "drop view")
+    assert_eq(sq_err("CREATE INDEX ON t (a)"), "Q8001@1:14")
+    assert_eq(sq_err("CREATE INDEX i ON t (a NULLS FIRST)"), "Q8005@1:24")
+    assert_eq(sq_err("CREATE INDEX CONCURRENTLY i ON t (a)"), "Q8005@1:14")
+    assert_eq(sq_err("DROP INDEX i CASCADE"), "Q8005@1:14")
+    assert_eq(sq_err("DROP TABLE a, b"), "Q8005@1:13")
+    assert_eq(sq_err("DROP SEQUENCE s"), "Q8005@1:6")
+    assert_eq(sq_err("DROP SCHEMA a.b"), "Q8001@1:13")
+    assert_eq(sq_err("CREATE VIEW v (a) AS SELECT 1"), "Q8005@1:15")
+    assert_eq(sq_err("CREATE SEQUENCE s"), "Q8005@1:8")
+    assert_eq(sq_err("CREATE UNIQUE TABLE t (a int)"), "Q8001@1:15")
+
+// -- transactions ---------------------------------------------------------------------------------------
+
+private sq_txn(text: string) -> SqlTxn = sq_action(text) match
+    SqlControl(c) -> c
+    SqlTree(_) ->
+        assert(false, "a transaction statement")
+        SqlCommit
+
+private sq_opts(level: Option[Isolation], read_only: Option[bool]) -> TxnOptions = TxnOptions(level, None, read_only, None, None, None, None)
+
+@test
+transaction_statements_are_requests()
+    assert(sq_txn("BEGIN") == SqlBegin(sq_opts(None, None)), "begin")
+    assert(sq_txn("begin work") == SqlBegin(sq_opts(None, None)), "begin work")
+    assert(sq_txn("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE") == SqlBegin(sq_opts(Some(Serializable), None)), "serializable")
+    assert(sq_txn("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY") == SqlBegin(sq_opts(Some(Snapshot), Some(true))), "repeatable read")
+    assert(sq_txn("START TRANSACTION READ WRITE ISOLATION LEVEL SNAPSHOT") == SqlBegin(sq_opts(Some(Snapshot), Some(false))), "start transaction")
+    assert(sq_txn("BEGIN ISOLATION LEVEL READ COMMITTED") == SqlBegin(sq_opts(Some(ReadCommitted), None)), "read committed")
+    assert(sq_txn("BEGIN ISOLATION LEVEL READ UNCOMMITTED") == SqlBegin(sq_opts(Some(ReadCommitted), None)), "read uncommitted")
+    for text in ["COMMIT", "commit work", "COMMIT TRANSACTION", "END", "end transaction"]
+        assert(sq_txn(text) == SqlCommit, text)
+    for text in ["ROLLBACK", "rollback work", "ABORT"]
+        assert(sq_txn(text) == SqlRollback, text)
+    assert(sq_txn("SAVEPOINT s1") == SqlSavepoint("s1"), "savepoint")
+    assert(sq_txn("RELEASE SAVEPOINT s1") == SqlRelease("s1"), "release savepoint")
+    assert(sq_txn("RELEASE \"S\"") == SqlRelease("S"), "release")
+    assert(sq_txn("ROLLBACK TO s1") == SqlRollbackTo("s1"), "rollback to")
+    assert(sq_txn("ROLLBACK TRANSACTION TO SAVEPOINT s1") == SqlRollbackTo("s1"), "rollback to savepoint")
+
+@test
+transaction_statement_errors()
+    assert_eq(sq_err("BEGIN ISOLATION LEVEL CHAOS"), "Q8001@1:23")
+    assert_eq(sq_err("BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL SNAPSHOT"), "Q8001@1:36")
+    assert_eq(sq_err("BEGIN READ ONLY, READ WRITE"), "Q8001@1:18")
+    assert_eq(sq_err("BEGIN DEFERRABLE"), "Q8005@1:7")
+    assert_eq(sq_err("COMMIT AND CHAIN"), "Q8005@1:8")
+    assert_eq(sq_err("ROLLBACK AND CHAIN"), "Q8005@1:10")
+    assert_eq(sq_err("SAVEPOINT"), "Q8001@1:10")
+    assert_eq(sq_err("START WORK"), "Q8001@1:7")
+    assert_eq(sq_err("BEGIN; COMMIT extra"), "Q8001@1:15")
+
+// -- scripts --------------------------------------------------------------------------------------------
+
+@test
+a_script_is_split_at_semicolons_with_source_ranges()
+    val all = sql_statements("select 1; ;  select 2 ;\n-- done\n").unwrap()
+    assert_eq(all.len(), 2)
+    assert_eq(all[0].start, 0)
+    assert_eq(all[0].end, 8)
+    assert_eq(all[1].start, 13)
+    assert_eq(all[1].end, 21)
+    assert_eq(sql_statements("").unwrap().len(), 0)
+    assert_eq(sql_statements(" ;; -- nothing\n").unwrap().len(), 0)
+    assert_eq(sql_statements("select 1").unwrap().len(), 1)
+    // The first error wins, even after statements that translate.
+    assert_eq(sq_err("select 1; select ^"), "Q8003@1:18")
+    assert_eq(sq_err("select 1; select x.y from t"), "Q2002@1:18")
+    assert_eq(sq_err("select 1;\nselect 'open"), "Q8002@2:8")
+    assert_eq(sq_err("select 1 select 2"), "Q8001@1:10")
+    // sql_statement wants exactly one.
+    assert(sql_statement("select 1; select 2").is_err(), "two statements")
+    assert(sql_statement("").is_err(), "none")
+
+@test
+syntax_errors_name_the_token()
+    assert_eq(sq_err("SELECT FROM t"), "Q8001@1:8")
+    assert_eq(sq_err("SELECT a FROM"), "Q8001@1:14")
+    assert_eq(sq_err("SELECT a b c FROM t"), "Q8001@1:12")
+    assert_eq(sq_err("SELEC 1"), "Q8001@1:1")
+    assert_eq(sq_err("GRANT SELECT ON t TO r"), "Q8005@1:1")
+    assert_eq(sq_err("EXPLAIN SELECT 1"), "Q8005@1:1")
+    assert_eq(sq_err("SELECT (1"), "Q8001@1:10")
+    assert_eq(sq_err("SELECT 1)"), "Q8001@1:9")
+    assert_eq(sq_err("SELECT a FROM t WHERE"), "Q8001@1:22")
+    assert_eq(sq_err("SELECT a FROM t GROUP a"), "Q8001@1:23")
+    assert_eq(sq_err("SELECT a.b.c FROM t"), "Q8005@1:11")
+    assert_eq(sq_err("SELECT a FROM a.b.c"), "Q8005@1:18")
+    assert_eq(sq_err("SELECT \"select\" FROM \"from\""), "ok")
+    assert_eq(sq_err("SELECT select FROM t"), "Q8001@1:8")
+    assert_eq(sq_err("SELECT 1 FROM t AS select"), "Q8001@1:20")
+    assert_eq(sq_err("SELECT ARRAY(SELECT 1)"), "Q8005@1:8")
+    assert_eq(sq_err("SELECT 1 FROM ONLY t"), "Q8005@1:15")
+    assert_eq(sq_err("TABLE t"), "Q8005@1:1")
+    assert_eq(sq_err("SELECT 1 INTO x FROM t"), "Q8005@1:10")
+    assert_eq(sq_err("SELECT a FROM t GROUP BY ROLLUP (a)"), "Q8005@1:26")
+    assert_eq(sq_err("SELECT 1 FROM t WINDOW w AS ()"), "Q8005@1:17")
+    assert_eq(sq_err("SELECT f() FROM t (a)"), "Q8005@1:19")
+    assert_eq(sq_err("SELECT f() FROM t x y"), "Q8001@1:21")
+    assert_eq(sq_err("SELECT a FROM f(1)"), "Q8005@1:16")

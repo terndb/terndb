@@ -1,0 +1,327 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `sql.md` end to end: SQL scripts translated by the front end, with the engine's catalog as the
+// resolver, and run over the wire against an in-memory engine (the engine tests' `Duo`): every tree
+// sent as an encoded envelope, every transaction statement as the wire's own request, every result
+// decoded from its batches. These are the tests that say the 0.0.1 subset works.
+
+/** A connection running SQL: its engine, its wire client, and the open transaction's handle (0 for
+ * none).
+ */
+struct SqSession
+    e: &Engine
+    d: Duo
+    txn: u64
+
+    /** Each statement of `script`, run in order: the replies to each. A statement that fails stops the
+     * script; its replies are the last.
+     */
+    run(*self, script: string, values: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Buf[Buf[Message]]
+        val out = buf[Buf[Message]]()
+        val statements = sql_statements(script, "public", self.e.store.latest_catalog()) match
+            Ok(s) -> s
+            Err(err) ->
+                print(s"\n$script\n  -> ${err.code}@${err.line}:${err.column} ${err.message}\n")
+                assert(false, "the script translates", file, line)
+                return out
+
+        for st in statements
+            val replies = st.action match
+                SqlTree(env) -> self.d.seen(self.d.send(ew_exec(self.txn, env, values)))
+                SqlControl(c) -> self.control(c)
+            out.push(replies)
+            if sq_failed(replies) then break
+
+        out
+
+    control(*self, c: SqlTxn) -> Buf[Message]
+        c match
+            SqlBegin(o) ->
+                self.txn = 1
+                self.d.seen(self.d.send(Begin(1, o)))
+            SqlCommit ->
+                val r = self.d.seen(self.d.send(Commit(self.txn)))
+                self.txn = 0
+                r
+            SqlRollback ->
+                val r = self.d.seen(self.d.send(Rollback(self.txn)))
+                self.txn = 0
+                r
+            SqlSavepoint(n) -> self.d.seen(self.d.send(Savepoint(self.txn, n)))
+            SqlRelease(n) -> self.d.seen(self.d.send(ReleaseSavepoint(self.txn, n)))
+            SqlRollbackTo(n) -> self.d.seen(self.d.send(RollbackToSavepoint(self.txn, n)))
+
+    /** Runs `script`, every statement of which must succeed. */
+    ok(*self, script: string, file: string = __FILE__, line: long = __LINE__)
+        for r in self.run(script, [], file, line)
+            if sq_failed(r) then print(s"\n$script\n  -> ${ew_kinds(r)}\n")
+            assert(!sq_failed(r), "every statement succeeds", file, line)
+
+    /** The rows of `script`'s last statement, every statement of which must succeed. */
+    rows(*self, script: string, values: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Buf[Value]
+        val all = self.run(script, values, file, line)
+        for r in all
+            if sq_failed(r) then print(s"\n$script\n  -> ${ew_kinds(r)}\n")
+            assert(!sq_failed(r), "every statement succeeds", file, line)
+        if all.len() == 0 then return buf()
+        ew_rows(all[all.len() - 1])
+
+    /** The row count of `script`'s last statement. */
+    count(*self, script: string, file: string = __FILE__, line: long = __LINE__) -> u64
+        val all = self.run(script, [], file, line)
+        val (counts, _) = ew_complete(all[all.len() - 1])
+        counts[0]
+
+    /** The code of the error that stopped `script`, or `ok`. */
+    code(*self, script: string, file: string = __FILE__, line: long = __LINE__) -> string
+        val all = self.run(script, [], file, line)
+        if all.len() == 0 then return "untranslated"
+        val last = all[all.len() - 1]
+        if !sq_failed(last) then return "ok"
+        ew_error(last).entries[0].code
+end SqSession
+
+private sq_failed(ms: Buf[Message]) -> bool
+    for m in ms
+        m match
+            ErrorReply(_) -> return true
+            _ -> ()
+    false
+
+/** A connection to a new engine holding the `public` schema and the tables `users` and `posts`. */
+private sq_db() -> SqSession
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    s.ok("CREATE SCHEMA public;
+        CREATE TABLE users (id int64 PRIMARY KEY, name text NOT NULL, age int16, city text);
+        INSERT INTO users VALUES (1, 'ann', 30, 'oslo'), (2, 'bob', NULL, 'rome'), (3, 'cy', 25, NULL);
+        CREATE TABLE posts (id int64 PRIMARY KEY, author int64 NOT NULL REFERENCES users, title text NOT NULL, score int32 DEFAULT 0);
+        INSERT INTO posts VALUES (10, 1, 'a', 5), (11, 1, 'b', 7), (12, 2, 'c', 1), (13, 3, 'd', NULL);")
+    s
+
+private sq_ints(rows: Buf[Value]) -> Buf[i128]
+    val out = buf[i128]()
+    for r in rows
+        r match
+            Record(fs) -> out.push(fs[0] match
+                Value.Int(n) -> n
+                Value.UInt(n) -> i128(n)
+                Value.Null -> -999
+                _ -> -998)
+            _ -> out.push(-997)
+    out
+
+private sq_is(xs: []const i128) -> Buf[i128]
+    val b = buf[i128]()
+    b.extend(xs)
+    b
+
+private sq_strs(rows: Buf[Value]) -> Buf[string]
+    val out = buf[string]()
+    for r in rows
+        r match
+            Record(fs) -> out.push(fs[0] match
+                Value.Text(s) -> s
+                Value.Null -> "<null>"
+                _ -> "<?>")
+            _ -> out.push("<?>")
+    out
+
+@test
+a_fresh_database_has_no_public_schema_until_one_is_created()
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    assert_eq(s.code("CREATE TABLE t (a int PRIMARY KEY)"), "Q6003")
+    s.ok("CREATE SCHEMA public; CREATE TABLE t (a int PRIMARY KEY)")
+    assert_eq(s.rows("SELECT * FROM t").len(), 0)
+
+@test
+select_filters_projects_orders_and_limits()
+    var s = sq_db()
+    assert(sq_strs(s.rows("SELECT name FROM users WHERE age > 26")) == sql_names(["ann"]), "where")
+    assert(sq_strs(s.rows("SELECT name, id FROM users ORDER BY name DESC LIMIT 2")) == sql_names(["cy", "bob"]), "order and limit")
+    assert(sq_strs(s.rows("SELECT name FROM users ORDER BY id OFFSET 1")) == sql_names(["bob", "cy"]), "offset")
+    assert(sq_strs(s.rows("SELECT name FROM users ORDER BY id FETCH FIRST 1 ROW ONLY")) == sql_names(["ann"]), "fetch")
+    assert_eq(s.rows("SELECT * FROM users LIMIT 2").len(), 2)
+    assert(s.rows("SELECT * FROM users WHERE id = 1")[0] == rec([Int(1), Text("ann"), Int(30), Text("oslo")]), "select *")
+    assert(s.rows("SELECT id * 10 AS x, upper(name) || '!', length(name) FROM users WHERE id = 2")[0] == rec([Int(20), Text("BOB!"), Int(3)]), "expressions")
+    assert(s.rows("SELECT 1 + 1, 'x' || 'y', 7 / 2, 7 % 2, -3")[0] == rec([Int(2), Text("xy"), Int(3), Int(1), Int(-3)]), "without from")
+
+@test
+nulls_follow_sql_s_three_valued_logic()
+    var s = sq_db()
+    assert_eq(s.rows("SELECT id FROM users WHERE age = NULL").len(), 0)
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE age IS NULL")) == sq_is([2]), "is null")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE age IS NOT NULL ORDER BY id")) == sq_is([1, 3]), "is not null")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE age <> 30")) == sq_is([3]), "a null comparison drops the row")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE NOT (age > 26)")) == sq_is([3]), "not of null is null")
+    assert_eq(s.rows("SELECT id FROM users WHERE age NOT IN (30, NULL)").len(), 0)
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE age IN (30, NULL)")) == sq_is([1]), "in with a null")
+    assert(sq_ints(s.rows("SELECT coalesce(age, -1) FROM users ORDER BY id")) == sq_is([30, -1, 25]), "coalesce")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE city IS NULL OR age IS NULL ORDER BY id")) == sq_is([2, 3]), "or")
+    // Nulls sort last ascending and first descending.
+    assert(sq_ints(s.rows("SELECT id FROM users ORDER BY age")) == sq_is([3, 1, 2]), "nulls last")
+    assert(sq_ints(s.rows("SELECT id FROM users ORDER BY age DESC")) == sq_is([2, 1, 3]), "nulls first descending")
+    assert(sq_ints(s.rows("SELECT id FROM users ORDER BY age NULLS FIRST")) == sq_is([2, 3, 1]), "nulls first")
+    assert(s.rows("SELECT CASE WHEN age > 26 THEN 'old' WHEN age IS NULL THEN NULL ELSE 'young' END FROM users ORDER BY id") ==
+        items_of([rec([Text("old")]), rec([Value.Null]), rec([Text("young")])]), "case")
+
+@test
+aggregates_ignore_nulls_and_count_rows()
+    var s = sq_db()
+    assert(s.rows("SELECT count(*), count(age), sum(age), min(age), max(age), avg(age) FROM users")[0] ==
+        rec([Int(3), Int(2), Int(55), Int(25), Int(30), Int(27500000)]), "aggregates")
+    assert(s.rows("SELECT count(*), sum(age) FROM users WHERE id > 99")[0] == rec([Int(0), Value.Null]), "over no rows")
+    assert(s.rows("SELECT count(DISTINCT author), count(*) FILTER (WHERE score > 4) FROM posts")[0] == rec([Int(3), Int(2)]), "distinct and filter")
+    assert(s.rows("SELECT string_agg(title, ',' ORDER BY title DESC) FROM posts")[0] == rec([Text("d,c,b,a")]), "string_agg")
+
+@test
+grouping_by_keys_with_having_and_order()
+    var s = sq_db()
+    assert(s.rows("SELECT author, count(*) AS n, sum(score) FROM posts GROUP BY author HAVING count(*) > 1") == items_of([rec([Int(1), Int(2), Int(12)])]), "having")
+    assert(sq_ints(s.rows("SELECT author FROM posts GROUP BY author ORDER BY sum(score) DESC")) == sq_is([3, 1, 2]), "order by an aggregate")
+    assert(s.rows("SELECT age IS NULL, count(*) FROM users GROUP BY 1 ORDER BY 1") == items_of([rec([Value.Bool(false), Int(2)]), rec([Value.Bool(true), Int(1)])]), "an expression key")
+    assert(s.rows("SELECT u.name, count(p.id) FROM users u LEFT JOIN posts p ON p.author = u.id GROUP BY u.name ORDER BY u.name") ==
+        items_of([rec([Text("ann"), Int(2)]), rec([Text("bob"), Int(1)]), rec([Text("cy"), Int(1)])]), "grouped join")
+
+@test
+joins_of_every_kind()
+    var s = sq_db()
+    s.ok("INSERT INTO users (id, name) VALUES (4, 'dee')")
+    assert(s.rows("SELECT u.name, p.title FROM users u JOIN posts p ON p.author = u.id ORDER BY p.id") ==
+        items_of([rec([Text("ann"), Text("a")]), rec([Text("ann"), Text("b")]), rec([Text("bob"), Text("c")]), rec([Text("cy"), Text("d")])]), "inner")
+    assert(s.rows("SELECT u.id, p.id FROM users u LEFT JOIN posts p ON p.author = u.id WHERE p.id IS NULL") == items_of([rec([Int(4), Value.Null])]), "left")
+    assert(sq_ints(s.rows("SELECT p.id FROM posts p RIGHT JOIN users u ON p.author = u.id ORDER BY u.id, p.id")) == sq_is([10, 11, 12, 13, -999]), "right")
+    assert_eq(s.rows("SELECT * FROM users u FULL JOIN posts p ON p.author = u.id AND p.score > 4").len(), 6)
+    assert_eq(s.rows("SELECT u.id FROM users u CROSS JOIN posts").len(), 16)
+    assert_eq(s.rows("SELECT u.id FROM users u, posts p WHERE u.id = p.author").len(), 4)
+    s.ok("CREATE TABLE likes (id int64 PRIMARY KEY, author int64)")
+    s.ok("INSERT INTO likes VALUES (1, 1), (2, 3)")
+    assert(sq_ints(s.rows("SELECT author FROM posts JOIN likes USING (author) ORDER BY 1")) == sq_is([1, 1, 3]), "using")
+
+@test
+subqueries_ctes_and_derived_tables()
+    var s = sq_db()
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE id IN (SELECT author FROM posts WHERE score > 4)")) == sq_is([1]), "in")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE id NOT IN (SELECT author FROM posts WHERE score > 4) ORDER BY id")) == sq_is([2, 3]), "not in")
+    assert(sq_ints(s.rows("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM posts p WHERE p.author = u.id AND p.score IS NULL)")) == sq_is([3]), "correlated exists")
+    assert(s.rows("SELECT name, (SELECT count(*) FROM posts p WHERE p.author = u.id) FROM users u ORDER BY id") ==
+        items_of([rec([Text("ann"), Int(2)]), rec([Text("bob"), Int(1)]), rec([Text("cy"), Int(1)])]), "scalar")
+    assert(sq_ints(s.rows("SELECT s.n FROM (SELECT author, count(*) AS n FROM posts GROUP BY author) s WHERE s.author = 1")) == sq_is([2]), "derived")
+    assert(sq_ints(s.rows("WITH top AS (SELECT author FROM posts WHERE score >= 5), names AS (SELECT u.id FROM users u JOIN top ON top.author = u.id) SELECT DISTINCT id FROM names")) == sq_is([1]), "ctes")
+    assert(s.rows("SELECT * FROM (VALUES (1, 'one'), (2, 'two')) v (n, word) WHERE n = 2") == items_of([rec([Int(2), Text("two")])]), "values in from")
+
+@test
+set_operations_and_values()
+    var s = sq_db()
+    assert(sq_ints(s.rows("SELECT author FROM posts UNION SELECT id FROM users ORDER BY 1")) == sq_is([1, 2, 3]), "union")
+    assert_eq(s.rows("SELECT author FROM posts UNION ALL SELECT id FROM users").len(), 7)
+    assert(sq_ints(s.rows("SELECT id FROM users INTERSECT SELECT author FROM posts WHERE score > 4")) == sq_is([1]), "intersect")
+    assert(sq_ints(s.rows("SELECT id FROM users EXCEPT SELECT author FROM posts WHERE score > 4 ORDER BY 1")) == sq_is([2, 3]), "except")
+    assert(s.rows("VALUES (2, 'b'), (1, 'a') ORDER BY 1") == items_of([rec([Int(1), Text("a")]), rec([Int(2), Text("b")])]), "values")
+
+@test
+expressions_evaluate()
+    var s = sq_db()
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE age BETWEEN 20 AND 29")) == sq_is([3]), "between")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE name LIKE 'b%' OR name LIKE '_y'")) == sq_is([2, 3]), "like")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE name NOT LIKE '%n%' ORDER BY id")) == sq_is([2, 3]), "not like")
+    assert(s.rows("SELECT CAST(age AS text), CAST('42' AS int64), '2024-02-29'::date FROM users WHERE id = 1")[0] ==
+        rec([Text("30"), Int(42), from_text(Date, "2024-02-29").unwrap()]), "casts")
+    assert(s.rows("SELECT CASE city WHEN 'oslo' THEN 1 WHEN 'rome' THEN 2 END FROM users ORDER BY id") == items_of([rec([Int(1)]), rec([Int(2)]), rec([Value.Null])]), "simple case")
+    assert(s.rows("SELECT 1.5 + 2.25, 2.5e0 * 2")[0] == rec([Int(375), Float(5.0)]), "decimal and float")
+    assert_eq(s.code("SELECT 1 / 0"), "R0002")
+    assert_eq(s.code("SELECT 2147483647 + 1"), "R0001")
+
+@test
+insert_update_delete_with_returning()
+    var s = sq_db()
+    assert(s.rows("INSERT INTO users (id, name) VALUES (5, 'eve') RETURNING id, name, age") == items_of([rec([Int(5), Text("eve"), Value.Null])]), "insert returning")
+    assert_eq(s.count("INSERT INTO users (id, name, age) SELECT id + 100, title, 1 FROM posts"), 4)
+    assert_eq(s.count("UPDATE users SET age = age + 1 WHERE id > 100"), 4)
+    assert(sq_ints(s.rows("UPDATE users SET city = 'x' WHERE id = 3 RETURNING age")) == sq_is([25]), "update returning")
+    assert(sq_strs(s.rows("SELECT city FROM users WHERE id = 3")) == sql_names(["x"]), "updated")
+    assert_eq(s.count("DELETE FROM users WHERE id > 100"), 4)
+    assert(sq_ints(s.rows("DELETE FROM posts WHERE score IS NULL RETURNING id")) == sq_is([13]), "delete returning")
+    assert_eq(s.count("UPDATE posts p SET score = p.score + 1 FROM users u WHERE p.author = u.id AND u.name = 'ann'"), 2)
+    assert(sq_ints(s.rows("SELECT score FROM posts WHERE author = 1 ORDER BY id")) == sq_is([6, 8]), "update from")
+    assert_eq(s.count("DELETE FROM posts p USING users u WHERE p.author = u.id AND u.name = 'bob'"), 1)
+    s.ok("INSERT INTO posts (id, author, title) VALUES (20, 1, 'defaulted')")
+    assert(sq_ints(s.rows("SELECT score FROM posts WHERE id = 20")) == sq_is([0]), "a default")
+
+@test
+upserts_and_constraints()
+    var s = sq_db()
+    s.ok("INSERT INTO users (id, name) VALUES (1, 'x') ON CONFLICT DO NOTHING")
+    assert(sq_strs(s.rows("SELECT name FROM users WHERE id = 1")) == sql_names(["ann"]), "do nothing")
+    s.ok("INSERT INTO users (id, name, age) VALUES (1, 'ann2', 5), (9, 'new', 5) ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = users.age + excluded.age")
+    assert(s.rows("SELECT name, age FROM users WHERE id IN (1, 9) ORDER BY id") == items_of([rec([Text("ann2"), Int(35)]), rec([Text("new"), Int(5)])]), "do update")
+    assert_eq(s.code("INSERT INTO users (id, name) VALUES (2, 'dup')"), "T3001")
+    assert_eq(s.code("INSERT INTO users (id, name) VALUES (7, NULL)"), "Q3005")
+    assert_eq(s.code("INSERT INTO users (id) VALUES (7)"), "Q3005")
+    assert_eq(s.code("INSERT INTO posts (id, author, title) VALUES (99, 42, 'orphan')"), "T3003")
+    s.ok("CREATE TABLE acct (id int64 PRIMARY KEY, bal int64 NOT NULL CHECK (bal >= 0), code text UNIQUE)")
+    assert_eq(s.code("INSERT INTO acct VALUES (1, -1, 'a')"), "T3002")
+    s.ok("INSERT INTO acct VALUES (1, 1, 'a')")
+    assert_eq(s.code("INSERT INTO acct VALUES (2, 1, 'a')"), "T3001")
+    assert_eq(s.code("UPDATE acct SET bal = bal - 5"), "T3002")
+    assert_eq(s.code("DELETE FROM users WHERE id = 3"), "T3003")
+
+@test
+ddl_creates_alters_and_drops()
+    var s = sq_db()
+    s.ok("ALTER TABLE users ADD COLUMN email text DEFAULT 'none', RENAME COLUMN city TO town")
+    assert(s.rows("SELECT email, town FROM users WHERE id = 1")[0] == rec([Text("none"), Text("oslo")]), "added and renamed")
+    s.ok("ALTER TABLE users DROP COLUMN email")
+    assert_eq(s.code("SELECT email FROM users"), "Q2003")
+    s.ok("CREATE INDEX users_by_name ON users (name); CREATE UNIQUE INDEX users_town ON users (town) WHERE town IS NOT NULL")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE name = 'bob'")) == sq_is([2]), "an indexed read")
+    assert_eq(s.code("UPDATE users SET town = 'oslo' WHERE id = 2"), "T3001")
+    s.ok("DROP INDEX users_town")
+    s.ok("UPDATE users SET town = 'oslo' WHERE id = 2")
+    s.ok("CREATE VIEW busy AS SELECT author, count(*) AS n FROM posts GROUP BY author")
+    assert(s.rows("SELECT n FROM busy WHERE author = 1") == items_of([rec([Int(2)])]), "a view")
+    s.ok("DROP VIEW busy")
+    s.ok("CREATE TABLE tmp (a int PRIMARY KEY, b text); DROP TABLE tmp; DROP TABLE IF EXISTS tmp")
+    assert_eq(s.code("SELECT * FROM tmp"), "Q2001")
+    s.ok("ALTER TABLE users ALTER COLUMN age TYPE int64")
+    assert(sq_ints(s.rows("SELECT age FROM users WHERE id = 1")) == sq_is([30]), "retyped")
+    s.ok("CREATE TABLE seq (id serial PRIMARY KEY, v text); INSERT INTO seq (v) VALUES ('a'), ('b')")
+    assert(sq_ints(s.rows("SELECT id FROM seq ORDER BY id")) == sq_is([1, 2]), "serial")
+
+@test
+transactions_commit_roll_back_and_keep_savepoints()
+    var s = sq_db()
+    s.ok("BEGIN; INSERT INTO users (id, name) VALUES (50, 'tx'); ROLLBACK")
+    assert_eq(s.rows("SELECT id FROM users WHERE id = 50").len(), 0)
+    s.ok("BEGIN ISOLATION LEVEL SNAPSHOT; INSERT INTO users (id, name) VALUES (51, 'tx'); COMMIT")
+    assert_eq(s.rows("SELECT id FROM users WHERE id = 51").len(), 1)
+    s.ok("START TRANSACTION; INSERT INTO users (id, name) VALUES (52, 'a'); SAVEPOINT sp; INSERT INTO users (id, name) VALUES (53, 'b'); ROLLBACK TO SAVEPOINT sp; RELEASE sp; COMMIT")
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE id >= 52 ORDER BY id")) == sq_is([52]), "rolled back to the savepoint")
+    // An error aborts the transaction; later statements fail until it is rolled back.
+    assert_eq(s.code("BEGIN; INSERT INTO users (id, name) VALUES (1, 'dup')"), "T3001")
+    assert_eq(s.code("SELECT 1"), "W2003")
+    s.ok("ROLLBACK")
+    // A savepoint before the error rescues the transaction.
+    s.ok("BEGIN; INSERT INTO users (id, name) VALUES (60, 'kept'); SAVEPOINT sp")
+    assert_eq(s.code("INSERT INTO users (id, name) VALUES (1, 'dup')"), "T3001")
+    s.ok("ROLLBACK TO sp; COMMIT")
+    assert_eq(s.rows("SELECT id FROM users WHERE id = 60").len(), 1)
+    // A read-only transaction refuses writes.
+    assert_eq(s.code("BEGIN READ ONLY; INSERT INTO users (id, name) VALUES (70, 'ro')"), "T4001")
+    s.ok("ROLLBACK")
+    // DDL is transactional.
+    s.ok("BEGIN; CREATE TABLE gone (a int PRIMARY KEY); INSERT INTO gone VALUES (1); ROLLBACK")
+    assert_eq(s.code("SELECT * FROM gone"), "Q2001")
+
+@test
+parameters_are_bound_by_the_client()
+    var s = sq_db()
+    assert(sq_strs(s.rows("SELECT name FROM users WHERE id = $1", [Int(2)])) == sql_names(["bob"]), "a parameter")
+    assert(sq_strs(s.rows("SELECT name FROM users WHERE id = $1::int64 OR name = $2", [Int(3), Text("ann")])) == sql_names(["ann", "cy"]) ||
+        sq_strs(s.rows("SELECT name FROM users WHERE id = $1::int64 OR name = $2", [Int(3), Text("ann")])) == sql_names(["cy", "ann"]), "two parameters")
+    s.run("INSERT INTO users (id, name, age) VALUES ($1, $2, $3)", [Int(80), Text("p"), Value.Null])
+    assert(s.rows("SELECT name, age FROM users WHERE id = 80") == items_of([rec([Text("p"), Value.Null])]), "inserted by parameters")

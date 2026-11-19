@@ -1,0 +1,1787 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The translator of TernDB's SQL dialect (`docs/spec/sql.md`): the parser's syntax tree made into
+// query trees (`query-tree.md`) and DDL trees (`ddl.md` §3), and transaction statements into the
+// requests a client sends for them. It is the SQL front end's public face: `sql_statements` turns
+// SQL text into one action per statement, and `sql_complete` (in `sql_lexer.sysl`) tells a shell
+// whether text is ready to send.
+//
+// A tree names tables by name and is typed at validation, so the translator needs no catalog to
+// produce a tree. It does use a table's column list, through `SqlTables`, wherever SQL leaves to
+// the database what a tree spells out (`sql.md` §1 rule 4): which table an unqualified column belongs
+// to when several are in scope, what `*` stands for beside other items, which columns an `INSERT`
+// without a column list fills, and the type a constant takes from the column it is written into or
+// compared with. A table it has no column list for is **opaque**: it is still translated, and only
+// the constructs that need its columns are refused (`Q8010`). Tables a script creates, alters or
+// drops before using them are tracked as the script goes, so a script needs no round trip between
+// its statements.
+
+/** A table's columns, in order, and its primary key's columns, as the translator knows them. */
+struct SqlTable derives Eq
+    columns: Buf[Field]
+    primary_key: Buf[string]
+
+/** Where the translator learns the columns of the tables a statement names (`sql.md` §1 rule 4). */
+trait SqlTables
+    /** Table or view `name`'s columns, or `None` when they are not known. */
+    sql_table(self, name: QualName) -> Option[SqlTable]
+
+/** The resolver that knows no table: every table is opaque. */
+struct SqlNoTables
+end SqlNoTables
+
+impl SqlTables for SqlNoTables
+    sql_table(self, name: QualName) -> Option[SqlTable] = None
+
+/** A catalog knows its tables' and views' ready columns and primary keys. */
+impl SqlTables for MemCatalog
+    sql_table(self, name: QualName) -> Option[SqlTable]
+        val info = self.table(name) match
+            Some(i) -> i
+            None -> return None
+
+        val columns = buf[Field]()
+        for c in info.columns
+            columns.push(Field(c.name, c.ty))
+
+        var key = buf[string]()
+        for u in info.unique
+            if u.name == name.name + "_pkey" then key = u.columns
+
+        Some(SqlTable(columns, key))
+
+/** What a statement asks of the database: a tree to execute, or a transaction request. */
+enum SqlAction derives Eq
+    SqlTree(envelope: Envelope)
+    SqlControl(txn: SqlTxn)
+
+/** One statement of SQL text: the bytes `start ..< end` it was read from (without its `;`) and what
+ * it asks for.
+ */
+struct SqlStatement derives Eq
+    start: u64
+    end: u64
+    action: SqlAction
+
+/** The default schema of unqualified names (`sql.md` §1 rule 3). */
+const SqlDefaultSchema: string = "public"
+
+/** The statements of `text`, translated in order: one per `;`-separated statement, empty statements
+ * skipped. Unqualified table names are in `schema`; `tables` gives the column lists the translator
+ * uses (`sql.md` §1 rule 4). The first error in the text, lexical, syntactic or of translation, is
+ * returned instead, with its position.
+ */
+sql_statements(text: string, schema: string = SqlDefaultSchema, tables: &SqlTables = SqlNoTables()) -> Result[Buf[SqlStatement], SqlError]
+    val parsed = sql_parse(text) match
+        Ok(p) -> p
+        Err(e) -> return Err(sql_located(text, e))
+
+    var tr = sql_translator(schema, tables)
+    val out = buf[SqlStatement]()
+
+    for p in parsed
+        tr.translate(p.stmt) match
+            Ok(a) -> out.push(SqlStatement(p.start, p.end, a))
+            Err(e) -> return Err(sql_located(text, e))
+
+    Ok(out)
+
+/** `sql_statements` of text that holds exactly one statement. */
+sql_statement(text: string, schema: string = SqlDefaultSchema, tables: &SqlTables = SqlNoTables()) -> Result[SqlAction, SqlError]
+    val all = sql_statements(text, schema, tables)?
+    if all.len() != 1 then return Err(sql_located(text, SqlError("Q8001", s"expected one statement, found ${all.len()}", 0, 0, 0)))
+    Ok(all[0].action)
+
+// -- the translator's state ------------------------------------------------------------------------
+
+/** A column of a source, its type known or not. */
+struct SqlCol derives Eq
+    name: string
+    ty: Option[Type]
+
+/** A source in scope: its SQL name (an alias or table name; empty for none), the binder its columns
+ * are read through, and its columns when known.
+ */
+struct SqlSource derives Eq
+    name: string
+    binder: string
+    columns: Option[Buf[SqlCol]]
+
+/** A column of a `USING` join: what an unqualified reference to it reads, and the two columns it
+ * merges, which `*` does not list again.
+ */
+struct SqlMerged derives Eq
+    name: string
+    expr: Expr
+    ty: Option[Type]
+    left: Expr
+    right: Expr
+
+/** One query level's scope (`sql.md` §5.2): its sources and `USING` columns; and when it is grouped,
+ * the `Aggregate` binder, its keys and the aggregate calls collected so far. `in_agg` is set while an
+ * aggregate's arguments are translated, which see the rows being grouped; `allow_aggs` says whether
+ * an aggregate may be written here at all.
+ */
+struct SqlLevel
+    sources: Buf[SqlSource]
+    merged: Buf[SqlMerged]
+    grouped: bool
+    group: string
+    keys: Buf[Item]
+    aggs: Buf[NamedAgg]
+    in_agg: bool
+    allow_aggs: bool
+
+private sql_level() -> &SqlLevel = SqlLevel(buf(), buf(), false, "", buf(), buf(), false, false)
+
+/** A CTE in scope and its output columns, when known. */
+struct SqlCteInfo
+    name: string
+    columns: Option[Buf[SqlCol]]
+
+/** A table a script made or changed before this statement: its columns now, or `None` once dropped. */
+struct SqlOverlay
+    name: QualName
+    table: Option[SqlTable]
+
+/** A translated query: its relation, the one binder its columns are read through (empty when it
+ * exposes several), and its output columns when known.
+ */
+struct SqlRel
+    rel: Rel
+    binder: string
+    columns: Option[Buf[SqlCol]]
+
+/** A translated select-list item. */
+struct SqlOut
+    name: string
+    expr: Expr
+    ty: Option[Type]
+    explicit: bool
+
+private sql_has(b: Buf[string], s: string) -> bool
+    for x in b
+        if x == s then return true
+    false
+
+private[terndb] sql_names(xs: []const string) -> Buf[string]
+    val b = buf[string]()
+    b.extend(xs)
+    b
+
+private sql_known(columns: Option[Buf[SqlCol]], name: string) -> Option[SqlCol]
+    columns match
+        Some(cs) ->
+            for c in cs
+                if c.name == name then return Some(c)
+            None
+        None -> None
+
+private sql_cols_of(fields: Buf[Field]) -> Buf[SqlCol]
+    val out = buf[SqlCol]()
+    for f in fields
+        out.push(SqlCol(f.name, Some(f.ty)))
+    out
+
+private sql_lit_text(s: string) -> Expr = Literal(Text, Text(s))
+
+private sql_call1(f: string, a: Expr) -> Expr = Call(f, items_of([a]))
+
+private sql_call2(f: string, a: Expr, b: Expr) -> Expr = Call(f, items_of([a, b]))
+
+/** The core aggregate functions a call may name (`query-tree.md` §6.7 rule 4). */
+private sql_is_aggregate(name: string) -> bool = name match
+    "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "string_agg" -> true
+    else false
+
+/** Whether `e` holds an aggregate call outside any subquery. */
+private sql_has_agg(e: SqlExpr) -> bool = e match
+    SqCall(name, args, _, _, filter, _, _) ->
+        if sql_is_aggregate(name) then return true
+        for a in args
+            if sql_has_agg(a) then return true
+        filter match
+            Some(f) -> sql_has_agg(*f)
+            None -> false
+    SqNeg(a, _) -> sql_has_agg(*a)
+    SqNot(a, _) -> sql_has_agg(*a)
+    SqBinary(_, l, r, _) -> sql_has_agg(*l) || sql_has_agg(*r)
+    SqIsNull(a, _, _) -> sql_has_agg(*a)
+    SqBetween(a, l, h, _, _) -> sql_has_agg(*a) || sql_has_agg(*l) || sql_has_agg(*h)
+    SqInList(a, items, _, _) ->
+        if sql_has_agg(*a) then return true
+        for i in items
+            if sql_has_agg(i) then return true
+        false
+    SqInQuery(args, _, _, _) ->
+        for a in args
+            if sql_has_agg(a) then return true
+        false
+    SqLike(a, p, esc, _, _) ->
+        if sql_has_agg(*a) || sql_has_agg(*p) then return true
+        esc match
+            Some(x) -> sql_has_agg(*x)
+            None -> false
+    SqCase(op, arms, other, _) ->
+        op match
+            Some(o) -> if sql_has_agg(*o) then return true
+            None -> ()
+        for w in arms
+            if sql_has_agg(w.cond) || sql_has_agg(w.value) then return true
+        other match
+            Some(o) -> sql_has_agg(*o)
+            None -> false
+    SqCast(a, _, _) -> sql_has_agg(*a)
+    SqRow(items, _) ->
+        for i in items
+            if sql_has_agg(i) then return true
+        false
+    _ -> false
+end sql_has_agg
+
+/** Whether `e` holds a subquery outside an aggregate's arguments. */
+private sql_has_query(e: SqlExpr) -> bool = e match
+    SqExists(_, _) | SqSubquery(_, _) | SqInQuery(_, _, _, _) -> true
+    SqCall(_, args, _, _, _, _, _) ->
+        for a in args
+            if sql_has_query(a) then return true
+        false
+    SqNeg(a, _) -> sql_has_query(*a)
+    SqNot(a, _) -> sql_has_query(*a)
+    SqBinary(_, l, r, _) -> sql_has_query(*l) || sql_has_query(*r)
+    SqIsNull(a, _, _) -> sql_has_query(*a)
+    SqBetween(a, l, h, _, _) -> sql_has_query(*a) || sql_has_query(*l) || sql_has_query(*h)
+    SqInList(a, items, _, _) ->
+        if sql_has_query(*a) then return true
+        for i in items
+            if sql_has_query(i) then return true
+        false
+    SqLike(a, p, _, _, _) -> sql_has_query(*a) || sql_has_query(*p)
+    SqCase(_, _, _, _) -> true
+    SqCast(a, _, _) -> sql_has_query(*a)
+    _ -> false
+
+/** Whether `e` is a constant that takes its type from its context (`sql.md` §5.9). */
+private sql_is_const(e: SqlExpr) -> bool = e match
+    SqNumber(_, _) | SqString(_, _) | SqNull(_) | SqParam(_, _) -> true
+    SqNeg(a, _) -> *a match
+        SqNumber(_, _) -> true
+        _ -> false
+    _ -> false
+
+/** The text of a number with a digit on each side of its point, as the text forms read it. */
+private sql_normal_number(text: string) -> string
+    var t = text
+    if t.starts_with(".") then t = "0" + t
+    val b = t.bytes
+    for i in 0..<b.len
+        if b[i] == u8('.') && (i + 1 == b.len || !(b[i + 1] >= u8('0') && b[i + 1] <= u8('9')))
+            return t[0..<i + 1] + "0" + t[i + 1..]
+    t
+
+/** Whether a number's text is an integer: digits only. */
+private sql_is_integer_text(text: string) -> bool
+    for c in text.bytes
+        if c < u8('0') || c > u8('9') then return false
+    true
+
+/** The digits after the point of a number without an exponent. */
+private sql_scale_of(text: string) -> u64
+    val b = text.bytes
+    for i in 0..<b.len
+        if b[i] == u8('.') then return u64(b.len - i - 1)
+    0
+
+private sql_has_point(text: string) -> bool
+    for c in text.bytes
+        if c == u8('.') then return true
+    false
+
+private sql_has_exponent(text: string) -> bool
+    for c in text.bytes
+        if c == u8('e') || c == u8('E') then return true
+    false
+
+/** A number constant's own type and value (`sql.md` §2.6): an integer is `int32`, else `int64`, else
+ * `decimal(p, 0)`; a number with a point and no exponent is `decimal(p, s)` with `s` its fraction's
+ * digits and `p` its significant digits (at least `s`, at least 1); one with an exponent is `float64`.
+ */
+private sql_number(text: string, negative: bool, at: u64) -> Result[Expr, SqlError]
+    val sign = if negative then "-" else ""
+
+    if sql_has_exponent(text)
+        return from_text(Float64, sign + sql_normal_number(text)) match
+            Ok(v) -> Ok(Literal(Float64, v))
+            Err(_) -> sql_fail("Q8004", s"$sign$text is out of range for float64", at)
+
+    // Leading zeros carry no digits.
+    var digits = text
+    while digits.len > 1 && digits.starts_with("0") && !digits.starts_with("0.")
+        digits = digits[1..]
+    val scale = sql_scale_of(digits)
+    val point = sql_has_point(digits)
+    var whole = digits.len - (if point then usize(scale) + 1 else 0)
+    if whole == 1 && digits.starts_with("0") then whole = 0
+    if digits.starts_with(".") then whole = 0
+    val precision = if u64(whole) + scale == 0 then 1 else u64(whole) + scale
+
+    if precision > 38 then return sql_fail("Q8004", s"$sign$text has more than 38 digits", at)
+    val n = from_text(Decimal(38, u8(scale)), sign + sql_normal_number(digits)).unwrap()
+
+    if point then return Ok(Literal(Decimal(u8(precision), u8(scale)), n))
+
+    val v = n match
+        Value.Int(i) -> i
+        _ -> 0
+    if v >= -2147483648 && v <= 2147483647 then return Ok(Literal(Int32, Value.Int(v)))
+    if v >= -9223372036854775808 && v <= 9223372036854775807 then return Ok(Literal(Int64, Value.Int(v)))
+    Ok(Literal(Decimal(u8(precision), 0), Value.Int(v)))
+end sql_number
+
+/** The translator, carried through one script. */
+struct SqlTr
+    schema: string
+    tables: &SqlTables
+    overlay: Buf[SqlOverlay]
+    used: Buf[string]
+    levels: Buf[&SqlLevel]
+    ctes: Buf[SqlCteInfo]
+    params: Buf[Option[Type]]
+    param_at: Buf[u64]
+
+    /** `name`'s columns: those a script statement left it with, else the resolver's. */
+    table_of(self, name: QualName) -> Option[SqlTable]
+        var k = self.overlay.len()
+        while k > 0
+            k -= 1
+            if self.overlay[k].name == name then return self.overlay[k].table
+        self.tables.sql_table(name)
+
+    qual(self, n: SqlName) -> QualName = QualName(n.schema.unwrap_or(self.schema), n.name)
+
+    /** A binder no other node of the statement has: `want`, or `want_2`, `want_3`, …. */
+    fresh(*self, want: string) -> string
+        var name = want
+        var k = 2
+        while sql_has(self.used, name)
+            name = s"${want}_$k"
+            k += 1
+        self.used.push(name)
+        name
+
+    level(self) -> &SqlLevel = self.levels[self.levels.len() - 1]
+
+    push_level(*self) -> &SqlLevel
+        val l = sql_level()
+        self.levels.push(l)
+        l
+
+    pop_level(*self)
+        val _ = self.levels.pop()
+
+    /** The type `$n` is declared with, set by its first typed use; a second, different one is `Q8007`. */
+    declare(*self, n: u64, ty: Type, at: u64) -> Result[Expr, SqlError]
+        while u64(self.params.len()) < n
+            self.params.push(None)
+            self.param_at.push(at)
+
+        val i = usize(n - 1)
+        self.params[i] match
+            Some(t) -> if t != ty then return sql_fail("Q8007", s"parameter $$$n is used as ${type_text(t)} and as ${type_text(ty)}", at)
+            None ->
+                self.params[i] = Some(ty)
+                self.param_at[i] = at
+        Ok(Param(n - 1))
+
+    /** The envelope of `s` with the parameters its text declared; one whose type nothing gave is
+     * `Q8007` (`sql.md` §2.7).
+     */
+    envelope_of(self, s: Statement) -> Result[SqlAction, SqlError]
+        val decls = buf[ParamDecl]()
+        for i in 0..<self.params.len()
+            self.params[i] match
+                Some(t) -> decls.push(ParamDecl(None, t))
+                None -> return sql_fail("Q8007", s"the type of parameter $$${i + 1} cannot be determined: write $$${i + 1}::type", self.param_at[i])
+        Ok(SqlTree(Envelope(TreeMajor, TreeMinor, decls, s, None)))
+
+    /** Translates one statement. */
+    translate(*self, s: SqlStmt) -> Result[SqlAction, SqlError]
+        self.used = buf()
+        self.levels = buf()
+        self.ctes = buf()
+        self.params = buf()
+        self.param_at = buf()
+
+        s match
+            StTxn(c, _) -> Ok(SqlControl(c))
+            StQuery(q) ->
+                val r = self.query(q, "select", buf())?
+                self.envelope_of(Query(r.rel))
+            StInsert(t, alias, cols, source, conflict, returning, at) -> self.envelope_of(self.insert(t, alias, cols, source, conflict, returning, at)?)
+            StUpdate(t, alias, sets, from, where, returning, at) -> self.envelope_of(self.update(t, alias, sets, from, where, returning, at)?)
+            StDelete(t, alias, using, where, returning, at) -> self.envelope_of(self.delete(t, alias, using, where, returning, at)?)
+            _ -> self.envelope_of(self.ddl(s)?)
+
+    // -- names ----------------------------------------------------------------------------------------
+
+    /** A column reference resolved through the scopes, innermost first (`sql.md` §5.2), with its type
+     * when known.
+     */
+    column(*self, qualifier: Option[string], name: string, at: u64) -> Result[(Expr, Option[Type]), SqlError]
+        var k = self.levels.len()
+
+        while k > 0
+            k -= 1
+            val lvl = self.levels[k]
+
+            qualifier match
+                Some(q) ->
+                    for src in lvl.sources
+                        if src.name == q
+                            if src.columns.is_some() && sql_known(src.columns, name).is_none()
+                                return sql_fail("Q2003", s"column $q.$name does not exist", at)
+                            val ty = sql_known(src.columns, name).map(c -> c.ty).unwrap_or(None)
+                            return self.grouped_ref(k, Col(src.binder, name), ty, name, at)
+                None ->
+                    for m in lvl.merged
+                        if m.name == name then return self.grouped_ref(k, m.expr, m.ty, name, at)
+
+                    var found: Option[(SqlSource, SqlCol)] = None
+                    var opaque = 0
+                    for src in lvl.sources
+                        if src.columns.is_none()
+                            opaque += 1
+                        else
+                            sql_known(src.columns, name) match
+                                Some(c) ->
+                                    if found.is_some() then return sql_fail("Q8008", s"column reference $name is ambiguous", at)
+                                    found = Some((src, c))
+                                None -> ()
+
+                    found match
+                        Some((src, c)) ->
+                            if opaque > 0 then return sql_fail("Q8010", s"column reference $name is ambiguous: the columns of some tables in scope are not known; qualify it", at)
+                            return self.grouped_ref(k, Col(src.binder, name), c.ty, name, at)
+                        None ->
+                            if opaque == 1 && lvl.sources.len() == 1 then return self.grouped_ref(k, Col(lvl.sources[0].binder, name), None, name, at)
+                            if opaque > 0 then return sql_fail("Q8010", s"cannot resolve column $name: the columns of some tables in scope are not known; qualify it", at)
+
+        qualifier match
+            Some(q) -> sql_fail("Q2002", s"there is no table or alias $q in scope", at)
+            None -> sql_fail("Q2003", s"column $name does not exist", at)
+    end column
+
+    /** A reference `e` to a column of level `k`, which a grouped level reads through its keys
+     * (`sql.md` §5.5): a column that is no key there is `Q8009`.
+     */
+    grouped_ref(self, k: usize, e: Expr, ty: Option[Type], name: string, at: u64) -> Result[(Expr, Option[Type]), SqlError]
+        val lvl = self.levels[k]
+        if !lvl.grouped || lvl.in_agg then return Ok((e, ty))
+
+        for key in lvl.keys
+            if key.expr == e then return Ok((Col(lvl.group, key.name), ty))
+
+        sql_fail("Q8009", s"column $name must appear in GROUP BY or be used in an aggregate", at)
+
+    /** The type a column reference would have, without reporting anything; for typing a constant
+     * beside it.
+     */
+    peek_type(self, e: SqlExpr) -> Option[Type] = e match
+        SqColumn(q, name, _) ->
+            var k = self.levels.len()
+            while k > 0
+                k -= 1
+                val lvl = self.levels[k]
+                q match
+                    Some(qn) ->
+                        for src in lvl.sources
+                            if src.name == qn then return sql_known(src.columns, name).map(c -> c.ty).unwrap_or(None).map(t -> t.base())
+                    None ->
+                        for m in lvl.merged
+                            if m.name == name then return m.ty.map(t -> t.base())
+                        for src in lvl.sources
+                            sql_known(src.columns, name) match
+                                Some(c) -> return c.ty.map(t -> t.base())
+                                None -> ()
+            None
+        SqCast(_, ty, _) -> Some(ty)
+        SqTyped(ty, _, _) -> Some(ty)
+        _ -> None
+
+    // -- expressions ------------------------------------------------------------------------------------
+
+    /** `e` as a tree expression. */
+    expr(*self, e: SqlExpr) -> Result[Expr, SqlError]
+        if self.levels.len() > 0
+            val lvl = self.level()
+            if lvl.grouped && !lvl.in_agg && !sql_has_agg(e) && !sql_has_query(e) && !sql_is_const(e)
+                // A grouped level reads an expression it groups by as that key.
+                lvl.in_agg = true
+                val plain = self.expr_inner(e)
+                lvl.in_agg = false
+                plain match
+                    Ok(x) ->
+                        for key in lvl.keys
+                            if key.expr == x then return Ok(Col(lvl.group, key.name))
+                    Err(_) -> ()
+        self.expr_inner(e)
+
+    /** `e` where a constant takes type `ty`, if given (`sql.md` §5.9). In an assignment (`strict`) a
+     * constant that is not a value of `ty` is `Q8004`; elsewhere it keeps its own type.
+     */
+    typed(*self, e: SqlExpr, ty: Option[Type], strict: bool) -> Result[Expr, SqlError]
+        ty match
+            Some(t) -> if sql_is_const(e) then return self.constant_as(e, t, strict)
+            None -> ()
+        self.expr(e)
+
+    /** Constant `e` as a value of `ty`. */
+    constant_as(*self, e: SqlExpr, ty: Type, strict: bool) -> Result[Expr, SqlError]
+        val base = ty.base()
+
+        e match
+            SqNull(_) -> return Ok(Null(base))
+            SqParam(n, at) -> return self.declare(n, if strict then ty else base, at)
+            SqString(s, at) ->
+                if base == Text then return Ok(sql_lit_text(s))
+                if !sql_has_text_form(base) then return self.expr(e)
+                return from_text(base, s) match
+                    Ok(v) -> Ok(Literal(base, v))
+                    Err(_) -> sql_fail("Q8004", s"'$s' is not a value of type ${type_text(base)}", at)
+            _ -> ()
+
+        val (text, negative, at) = e match
+            SqNumber(t, a) -> (t, false, a)
+            SqNeg(x, a) -> *x match
+                SqNumber(t, _) -> (t, true, a)
+                _ -> return self.expr(e)
+            _ -> return self.expr(e)
+
+        val sign = if negative then "-" else ""
+        val normal = sign + sql_normal_number(text)
+        val integer = sql_is_integer_text(text)
+
+        val fits = base match
+            Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 -> integer
+            Decimal(_, s) -> !sql_has_exponent(text) && (strict || sql_scale_of(text) <= u64(s))
+            Float32 | Float64 -> true
+            _ -> false
+
+        if !fits
+            if strict && base != Text && sql_has_text_form(base) && sql_is_numeric(base)
+                return sql_fail("Q8004", s"$sign$text is not a value of type ${type_text(base)}", at)
+            return self.expr(e)
+
+        from_text(base, normal) match
+            Ok(v) -> Ok(Literal(base, v))
+            Err(_) ->
+                if strict then return sql_fail("Q8004", s"$sign$text is out of range for ${type_text(base)}", at)
+                self.expr(e)
+    end constant_as
+
+    /** `l op r`, a constant on either side typed as the other side's column (`sql.md` §5.9). */
+    pair(*self, l: SqlExpr, r: SqlExpr) -> Result[(Expr, Expr), SqlError]
+        val lt = self.peek_type(l)
+        val rt = self.peek_type(r)
+        val a = self.typed(l, rt, false)?
+        val b = self.typed(r, lt, false)?
+        Ok((a, b))
+
+    /** The type a constant among `es` takes: the first one's whose type is known (`sql.md` §5.9). */
+    sibling(self, es: Buf[SqlExpr]) -> Option[Type]
+        for e in es
+            val t = self.peek_type(e)
+            if t.is_some() then return t
+        None
+
+    expr_inner(*self, e: SqlExpr) -> Result[Expr, SqlError]
+        e match
+            SqColumn(q, name, at) ->
+                val (x, _) = self.column(q, name, at)?
+                Ok(x)
+            SqStar(_, at) -> sql_fail("Q8001", "* is allowed only as a select-list item or in count(*)", at)
+            SqNumber(text, at) -> sql_number(text, false, at)
+            SqString(s, _) -> Ok(sql_lit_text(s))
+            SqTyped(ty, text, at) -> sql_typed_literal(ty, text, at)
+            SqBool(b, _) -> Ok(Literal(Bool, Value.Bool(b)))
+            SqNull(at) -> sql_fail("Q8007", "the type of NULL cannot be determined here: write CAST(NULL AS type)", at)
+            SqParam(n, at) ->
+                if usize(n) <= self.params.len()
+                    self.params[usize(n - 1)] match
+                        Some(_) -> return Ok(Param(n - 1))
+                        None -> ()
+                sql_fail("Q8007", s"the type of parameter $$$n cannot be determined here: write $$$n::type", at)
+            SqDefault(at) -> sql_fail("Q8005", "DEFAULT is allowed only as a column's whole value in an INSERT's VALUES list", at)
+            SqNeg(x, at) -> *x match
+                SqNumber(text, _) -> sql_number(text, true, at)
+                _ -> Ok(sql_call1("neg", self.expr(*x)?))
+            SqNot(x, _) -> Ok(sql_call1("not", self.expr(*x)?))
+            SqBinary(op, l, r, at) ->
+                if op == "and" || op == "or" then return Ok(sql_call2(op, self.expr(*l)?, self.expr(*r)?))
+                val (a, b) = self.pair(*l, *r)?
+                Ok(sql_call2(sql_operator_function(op), a, b))
+            SqIsNull(x, negated, _) -> Ok(sql_call1(if negated then "is_not_null" else "is_null", self.expr(*x)?))
+            SqBetween(x, lo, hi, negated, _) ->
+                val es = items_of([*x, *lo, *hi])
+                val t = self.sibling(es)
+                val v = self.typed(*x, t, false)?
+                val both = sql_call2("and", sql_call2("ge", v, self.typed(*lo, t, false)?), sql_call2("le", v, self.typed(*hi, t, false)?))
+                Ok(if negated then sql_call1("not", both) else both)
+            SqInList(x, items, negated, _) ->
+                val es = buf[SqlExpr]()
+                es.push(*x)
+                es.extend(items.view())
+                val t = self.sibling(es)
+                val v = self.typed(*x, t, false)?
+                var any: Option[Expr] = None
+                for i in items
+                    val test = sql_call2("eq", v, self.typed(i, t, false)?)
+                    any = Some(any match
+                        Some(a) -> sql_call2("or", a, test)
+                        None -> test)
+                val all = any.unwrap()
+                Ok(if negated then sql_call1("not", all) else all)
+            SqInQuery(args, q, negated, _) ->
+                val xs = buf[Expr]()
+                for a in args
+                    xs.push(self.expr(a)?)
+                val r = self.subquery(*q)?
+                val test = In(xs, r)
+                Ok(if negated then sql_call1("not", test) else test)
+            SqLike(x, pattern, escape, negated, _) ->
+                val (v, p) = self.pair(*x, *pattern)?
+                val esc = escape match
+                    Some(es) -> self.typed(*es, Some(Text), false)?
+                    None -> sql_lit_text("")
+                val test = Call("like", items_of([v, p, esc]))
+                Ok(if negated then sql_call1("not", test) else test)
+            SqCase(operand, arms, otherwise, at) -> self.case_of(operand, arms, otherwise, at)
+            SqCast(x, ty, at) ->
+                if sql_is_const(*x)
+                    val c = self.constant_as(*x, ty, false)?
+                    c match
+                        Literal(t, _) -> if t == ty then return Ok(c)
+                        Null(_) | Param(_) -> return Ok(c)
+                        _ -> ()
+                    return Ok(Cast(c, ty, Strict))
+                Ok(Cast(self.expr(*x)?, ty, Strict))
+            SqCall(name, args, distinct, star, filter, order, at) -> self.call_of(name, args, distinct, star, filter, order, at)
+            SqExists(q, _) -> Ok(Exists(self.subquery(*q)?))
+            SqSubquery(q, _) -> Ok(Scalar(self.subquery(*q)?))
+            SqRow(_, at) -> sql_fail("Q8005", "a row constructor is allowed only before IN", at)
+    end expr_inner
+
+    /** `CASE`: a searched case is an `If`; a simple one compares its operand with each `WHEN` value.
+     * A constant result takes the type of a result whose type is known; an `ELSE NULL` is no `else`.
+     */
+    case_of(*self, operand: Option[&SqlExpr], arms: Buf[SqlWhen], otherwise: Option[&SqlExpr], at: u64) -> Result[Expr, SqlError]
+        val results = buf[SqlExpr]()
+        for w in arms
+            results.push(w.value)
+        otherwise match
+            Some(o) -> results.push(*o)
+            None -> ()
+        var t = self.sibling(results)
+
+        if t.is_none()
+            // A constant result fixes the type of the others: the first one that has a type of its own.
+            for r in results
+                if sql_is_const(r)
+                    r match
+                        SqNull(_) | SqParam(_, _) -> ()
+                        _ ->
+                            t = Some(sql_type_of(self.expr(r)?))
+                            break
+
+        val out = buf[IfArm]()
+        for w in arms
+            val cond = operand match
+                Some(o) ->
+                    val (a, b) = self.pair(*o, w.cond)?
+                    sql_call2("eq", a, b)
+                None -> self.expr(w.cond)?
+            out.push(IfArm(cond, self.typed(w.value, t, false)?))
+
+        val other: Option[&Expr] = otherwise match
+            Some(o) -> *o match
+                SqNull(_) -> None
+                _ -> Some(self.typed(*o, t, false)?)
+            None -> None
+        Ok(If(out, other))
+
+    /** A function call: an aggregate where aggregates are allowed (`sql.md` §5.5), else a call of the
+     * core function the name maps to (`sql.md` §5.10).
+     */
+    call_of(*self, name: string, args: Buf[SqlExpr], distinct: bool, star: bool, filter: Option[&SqlExpr], order: Buf[SqlOrder], at: u64) -> Result[Expr, SqlError]
+        if sql_is_aggregate(name)
+            if self.levels.len() == 0 then return sql_fail("Q3013", s"the aggregate $name is not allowed here", at)
+            val lvl = self.level()
+            if !lvl.allow_aggs then return sql_fail("Q3013", s"the aggregate $name is not allowed here", at)
+            if lvl.in_agg then return sql_fail("Q3013", "an aggregate's arguments may not hold an aggregate", at)
+            if star && name != "count" then return sql_fail("Q8001", s"$name(*) is not a call: only count takes *", at)
+            if !star && args.len() == 0 then return sql_fail("Q8001", s"$name needs an argument (count(*) counts rows)", at)
+
+            lvl.in_agg = true
+            val xs = buf[Expr]()
+            var f: Option[Expr] = None
+            val keys = buf[SortKey]()
+            val r = self.agg_args(args, filter, order, xs, keys)
+            lvl.in_agg = false
+            f = r?
+
+            val c = AggCall(name, xs, distinct, f, keys)
+            for a in lvl.aggs
+                if a.call == c then return Ok(Col(lvl.group, a.name))
+            val n = s"a${lvl.aggs.len() + 1}"
+            lvl.aggs.push(NamedAgg(n, c))
+            return Ok(Col(lvl.group, n))
+
+        if star then return sql_fail("Q8001", s"$name(*) is not a call: only count takes *", at)
+        if distinct || filter.is_some() || order.len() > 0 then return sql_fail("Q8001", s"$name is not an aggregate: DISTINCT, ORDER BY and FILTER apply only to aggregates", at)
+
+        val f = name match
+            "now" | "current_timestamp" -> "statement_timestamp"
+            else name
+        if f == "statement_timestamp" && args.len() > 0 then return sql_fail("Q8001", s"$name takes no arguments", at)
+
+        val xs = buf[Expr]()
+        val t = if f == "coalesce" then self.sibling(args) else None
+        for a in args
+            xs.push(self.typed(a, t, false)?)
+        Ok(Call(f, xs))
+
+    agg_args(*self, args: Buf[SqlExpr], filter: Option[&SqlExpr], order: Buf[SqlOrder], xs: Buf[Expr], keys: Buf[SortKey]) -> Result[Option[Expr], SqlError]
+        for a in args
+            xs.push(self.expr(a)?)
+        for o in order
+            keys.push(SortKey(self.expr(o.expr)?, o.desc, o.nulls_first.unwrap_or(o.desc)))
+        filter match
+            Some(fe) -> Ok(Some(self.expr(*fe)?))
+            None -> Ok(None)
+
+    /** A subquery of an expression, translated as a level of its own above the current one. */
+    subquery(*self, q: SqlQuery) -> Result[Rel, SqlError] = Ok(self.query(q, "subquery", buf())?.rel)
+
+    // -- queries ----------------------------------------------------------------------------------------
+
+    /** Query `q`, its output binder named after `hint`, its columns renamed to `names` if given. */
+    query(*self, q: SqlQuery, hint: string, names: Buf[string]) -> Result[SqlRel, SqlError]
+        q match
+            QySelect(s, tail) -> self.select(s, tail, hint, names)
+            QyValues(rows, tail, at) ->
+                val v = self.values(rows, hint, names, at)?
+                self.tail_over(v, tail)
+            QySetOp(op, all, _, _, tail, at) ->
+                val inputs = buf[Rel]()
+                var first: Option[SqlRel] = None
+                for input in sql_setop_inputs(q, op, all)
+                    val r = self.query(input, "select", if first.is_none() then names else buf())?
+                    if first.is_none() then first = Some(r)
+                    inputs.push(r.rel)
+                val b = self.fresh(hint)
+                val s = SqlRel(SetOp(op, all, b, inputs), b, first.unwrap().columns)
+                self.tail_over(s, tail)
+            QyWith(ctes, body, at) ->
+                val defs = buf[CteDef]()
+                val mark = self.ctes.len()
+                val names_here = buf[string]()
+                for c in ctes
+                    if sql_has(names_here, c.name) then return sql_fail("Q2004", s"the WITH query name ${c.name} is given twice", c.at)
+                    names_here.push(c.name)
+                    val r = self.query(c.query, c.name, c.columns)?
+                    defs.push(CteDef(c.name, None, r.rel))
+                    self.ctes.push(SqlCteInfo(c.name, r.columns))
+                val b = self.query(*body, hint, names)
+                self.ctes.truncate(mark)
+                val inner = b?
+                Ok(SqlRel(With(false, defs, inner.rel), inner.binder, inner.columns))
+
+    /** The `ORDER BY` and `LIMIT` of a `VALUES` list or set operation, over its output columns. */
+    tail_over(*self, r: SqlRel, tail: SqlTail) -> Result[SqlRel, SqlError]
+        if tail.is_empty() then return Ok(r)
+        var rel = r.rel
+        val keys = buf[SortKey]()
+
+        for o in tail.order
+            val e = self.output_key(r, buf[SqlOut](), o.expr)?
+            keys.push(SortKey(e, o.desc, o.nulls_first.unwrap_or(o.desc)))
+
+        if keys.len() > 0 then rel = Sort(rel, keys)
+        rel = self.limit_over(rel, tail, keys.len() > 0)?
+        Ok(SqlRel(rel, r.binder, r.columns))
+
+    /** An `ORDER BY` key that must name an output column (`sql.md` §5.6): by position, by name, or as
+     * an expression equal to an item's.
+     */
+    output_key(*self, r: SqlRel, outs: Buf[SqlOut], e: SqlExpr) -> Result[Expr, SqlError]
+        val at = e.pos()
+        val cols = r.columns match
+            Some(cs) -> cs
+            None -> return sql_fail("Q8010", "ORDER BY here names an output column, and the output columns are not known", at)
+
+        e match
+            SqNumber(text, _) ->
+                if sql_is_integer_text(text) && text.len < 10
+                    val n = from_text(Int64, text).unwrap()
+                    val i = n match
+                        Value.Int(x) -> x
+                        _ -> 0
+                    if i < 1 || i > i128(cols.len()) then return sql_fail("Q8011", s"ORDER BY position $text is not in the select list", at)
+                    return Ok(Col(r.binder, cols[usize(i - 1)].name))
+            SqColumn(None, name, _) ->
+                for c in cols
+                    if c.name == name then return Ok(Col(r.binder, name))
+            _ -> ()
+
+        if outs.len() > 0 && !sql_has_agg(e)
+            val x = self.expr(e)?
+            for o in outs
+                if o.expr == x then return Ok(Col(r.binder, o.name))
+
+        sql_fail("Q8011", "ORDER BY of a DISTINCT, VALUES or set-operation query must name an output column", at)
+
+    /** `LIMIT`, `OFFSET` and `FETCH … WITH TIES` over `rel` (`sql.md` §5.7). */
+    limit_over(*self, rel: Rel, tail: SqlTail, sorted: bool) -> Result[Rel, SqlError]
+        if tail.ties && !sorted then return sql_fail("Q8001", "FETCH … WITH TIES needs ORDER BY", tail.at)
+        val count = self.limit_value(tail.count)?
+        val offset = self.limit_value(tail.offset)?
+        if count.is_none() && offset.is_none() then return Ok(rel)
+        Ok(Limit(rel, count, offset, tail.ties, !sorted))
+
+    limit_value(*self, e: Option[SqlExpr]) -> Result[Option[Expr], SqlError]
+        val x = e match
+            Some(v) -> v
+            None -> return Ok(None)
+        x match
+            SqNull(_) -> return Ok(None)
+            SqString(_, _) -> return sql_fail("Q8005", "LIMIT and OFFSET take an integer constant or a parameter", x.pos())
+            _ -> ()
+        if !sql_is_const(x) then return sql_fail("Q8005", "LIMIT and OFFSET take an integer constant or a parameter", x.pos())
+        Ok(Some(self.constant_as(x, Int64, true)?))
+
+    /** `VALUES` rows: each column's type is its constants' common type (`sql.md` §5.3). */
+    values(*self, rows: Buf[Buf[SqlExpr]], hint: string, names: Buf[string], at: u64) -> Result[SqlRel, SqlError]
+        val width = rows[0].len()
+        for r in rows
+            if r.len() != width then return sql_fail("Q8012", "every VALUES row must have the same number of values", r[0].pos())
+        if names.len() > 0 && names.len() != width then return sql_fail("Q8012", s"${names.len()} column names are given for $width VALUES columns", at)
+
+        val types = buf[Type]()
+        for j in 0..<width
+            val column = buf[SqlExpr]()
+            for r in rows
+                column.push(r[j])
+            types.push(self.column_type(column, j)?)
+
+        val fields = buf[Field]()
+        for j in 0..<width
+            fields.push(Field(if names.len() > 0 then names[j] else s"column${j + 1}", types[j]))
+
+        val vrows = self.value_rows(rows, types)?
+        val b = self.fresh(if hint == "select" || hint == "subquery" then "values" else hint)
+        Ok(SqlRel(Values(b, fields, vrows), b, Some(sql_cols_of(fields))))
+
+    /** The type of a `VALUES` column: the common type of its values' own types, nullable when one is
+     * `NULL`; `Q8007` when no value has a type of its own.
+     */
+    column_type(*self, column: Buf[SqlExpr], j: usize) -> Result[Type, SqlError]
+        var t: Option[Type] = None
+        var nulls = false
+        var strings = false
+
+        for e in column
+            val own = e match
+                SqNull(_) ->
+                    nulls = true
+                    None
+                SqString(_, _) ->
+                    // A string is read as the column's type when another value gives one.
+                    strings = true
+                    None
+                SqNumber(_, _) | SqNeg(_, _) | SqBool(_, _) ->
+                    if sql_is_const(e) || sql_is_bool(e) then Some(sql_type_of(self.expr(e)?)) else None
+                _ -> self.peek_type(e)
+            own match
+                Some(o) ->
+                    t = Some(t match
+                        Some(prev) -> common_type(prev, o) match
+                            Ok(c) -> c
+                            Err(_) -> return sql_fail("Q3001", s"VALUES column ${j + 1} has no common type: ${type_text(prev)} and ${type_text(o)}", e.pos())
+                        None -> o)
+                None -> ()
+
+        if t.is_none() && strings then t = Some(Text)
+
+        t match
+            Some(x) -> Ok(if nulls then nullable(x) else x)
+            None -> sql_fail("Q8007", s"the type of VALUES column ${j + 1} cannot be determined: CAST one of its values", column[0].pos())
+
+    /** `rows` with each constant typed as its column (`sql.md` §5.9). */
+    value_rows(*self, rows: Buf[Buf[SqlExpr]], types: Buf[Type]) -> Result[Buf[Buf[Expr]], SqlError]
+        val out = buf[Buf[Expr]]()
+        for r in rows
+            val row = buf[Expr]()
+            for j in 0..<r.len()
+                row.push(self.typed(r[j], Some(types[j]), true)?)
+            out.push(row)
+        Ok(out)
+
+    // -- SELECT -----------------------------------------------------------------------------------------
+
+    /** A `SELECT` (`sql.md` §5.1): `FROM`, then `WHERE`, `GROUP BY` and `HAVING`, then `ORDER BY` below
+     * the select list (or above it, for `DISTINCT`), then `LIMIT`.
+     */
+    select(*self, s: SqlSelect, tail: SqlTail, hint: string, names: Buf[string]) -> Result[SqlRel, SqlError]
+        val lvl = self.push_level()
+        val r = self.select_in(lvl, s, tail, hint, names)
+        self.pop_level()
+        r
+
+    select_in(*self, lvl: &SqlLevel, s: SqlSelect, tail: SqlTail, hint: string, names: Buf[string]) -> Result[SqlRel, SqlError]
+        var input = if s.from.len() == 0 then Values(self.fresh("one"), buf[Field](), sql_one_empty_row()) else self.from_list(s.from)?
+
+        s.where match
+            Some(w) -> input = Filter(input, self.expr(w)?)
+            None -> ()
+
+        var grouped = s.group.len() > 0 || s.having.is_some()
+        for i in s.items
+            if sql_has_agg(i.expr) then grouped = true
+        for o in tail.order
+            if sql_has_agg(o.expr) then grouped = true
+
+        if grouped
+            val keys = buf[Item]()
+            for g in s.group
+                val x = self.group_key(s, g)?
+                var seen = false
+                for k in keys
+                    if k.expr == x then seen = true
+                if !seen then keys.push(Item(s"k${keys.len() + 1}", x))
+            lvl.grouped = true
+            lvl.group = self.fresh("group")
+            lvl.keys = keys
+
+        lvl.allow_aggs = true
+        val outs = self.items(s.items, names, s.at, true)?
+
+        var having: Option[Expr] = None
+        s.having match
+            Some(h) -> having = Some(self.expr(h)?)
+            None -> ()
+
+        // ORDER BY below the select list reads the input, and an output name or position as its item.
+        val keys = buf[SortKey]()
+        if !s.distinct
+            for o in tail.order
+                keys.push(SortKey(self.order_key(outs, o.expr)?, o.desc, o.nulls_first.unwrap_or(o.desc)))
+        lvl.allow_aggs = false
+
+        if grouped
+            input = Aggregate(input, lvl.group, lvl.keys, lvl.aggs)
+            having match
+                Some(h) -> input = Filter(input, h)
+                None -> ()
+
+        val pass = outs.len() == 0
+        val b = if pass then "" else self.fresh(hint)
+
+        if keys.len() > 0
+            input = Sort(input, keys)
+
+        if !s.distinct
+            input = self.limit_over(input, tail, keys.len() > 0)?
+
+        var rel = if pass then input else Project(input, b, sql_items_of(outs))
+        var columns: Option[Buf[SqlCol]] = None
+        if !pass
+            val cs = buf[SqlCol]()
+            for o in outs
+                cs.push(SqlCol(o.name, o.ty))
+            columns = Some(cs)
+
+        var binder = b
+        if pass
+            // A lone `*` over one source: the source's binder and columns are the query's.
+            if lvl.sources.len() == 1
+                binder = lvl.sources[0].binder
+                columns = lvl.sources[0].columns
+
+        if s.distinct
+            rel = Distinct(rel)
+            val r = SqlRel(rel, binder, columns)
+            val dkeys = buf[SortKey]()
+            for o in tail.order
+                dkeys.push(SortKey(self.output_key(r, outs, o.expr)?, o.desc, o.nulls_first.unwrap_or(o.desc)))
+            if dkeys.len() > 0 then rel = Sort(rel, dkeys)
+            rel = self.limit_over(rel, tail, dkeys.len() > 0)?
+
+        Ok(SqlRel(rel, binder, columns))
+    end select_in
+
+    /** A `GROUP BY` entry: a select-list position, an output name no input column has, or an
+     * expression over the input (`sql.md` §5.5).
+     */
+    group_key(*self, s: SqlSelect, g: SqlExpr) -> Result[Expr, SqlError]
+        val lvl = self.level()
+        lvl.allow_aggs = false
+
+        g match
+            SqNumber(text, at) ->
+                if sql_is_integer_text(text)
+                    val i = if text.len < 10 then from_text(Int64, text).unwrap() else Value.Int(0)
+                    val n = i match
+                        Value.Int(x) -> x
+                        _ -> 0
+                    if n < 1 || n > i128(s.items.len()) then return sql_fail("Q8011", s"GROUP BY position $text is not in the select list", at)
+                    val item = s.items[usize(n - 1)]
+                    item.expr match
+                        SqStar(_, _) -> return sql_fail("Q8005", "GROUP BY position names a *", at)
+                        _ -> ()
+                    if sql_has_agg(item.expr) then return sql_fail("Q3013", s"GROUP BY position $text names an aggregate", at)
+                    return self.expr(item.expr)
+            SqColumn(None, name, at) ->
+                self.expr(g) match
+                    Ok(x) -> return Ok(x)
+                    Err(e) ->
+                        if e.code != "Q2003" then return Err(e)
+                        for item in s.items
+                            if item.alias == Some(name)
+                                if sql_has_agg(item.expr) then return sql_fail("Q3013", s"GROUP BY $name names an aggregate", at)
+                                return self.expr(item.expr)
+                        return Err(e)
+            _ -> ()
+
+        self.expr(g)
+
+    /** An `ORDER BY` key below the select list: a position or output name is that item's expression. */
+    order_key(*self, outs: Buf[SqlOut], e: SqlExpr) -> Result[Expr, SqlError]
+        e match
+            SqNumber(text, at) ->
+                if sql_is_integer_text(text)
+                    val i = if text.len < 10 then from_text(Int64, text).unwrap() else Value.Int(0)
+                    val n = i match
+                        Value.Int(x) -> x
+                        _ -> 0
+                    if n < 1 || n > i128(outs.len()) then return sql_fail("Q8011", s"ORDER BY position $text is not in the select list", at)
+                    return Ok(outs[usize(n - 1)].expr)
+            SqColumn(None, name, _) ->
+                for o in outs
+                    if o.name == name then return Ok(o.expr)
+            _ -> ()
+        self.expr(e)
+
+    /** The select list (`sql.md` §5.4): `*` and `t.*` expanded, and every item named. An empty
+     * result means a lone `*` that passes its input through.
+     */
+    items(*self, items: Buf[SqlItem], names: Buf[string], at: u64, pass: bool) -> Result[Buf[SqlOut], SqlError]
+        val lvl = self.level()
+        val outs = buf[SqlOut]()
+
+        // A lone `*` over one source, or over several whose columns are not all known, and a lone
+        // `t.*` of the only source, pass the input on.
+        if pass && items.len() == 1 && names.len() == 0 && !lvl.grouped && lvl.merged.len() == 0
+            val lone = items[0].expr match
+                SqStar(None, _) -> lvl.sources.len() == 1 || (lvl.sources.len() > 1 && !self.all_known())
+                SqStar(Some(q), _) -> lvl.sources.len() == 1 && lvl.sources[0].name == q
+                _ -> false
+            if lone then return Ok(outs)
+
+        var position = 0
+        for item in items
+            position += 1
+            item.expr match
+                SqStar(q, sat) -> self.star(q, sat, outs)?
+                _ ->
+                    val x = self.expr(item.expr)?
+                    val ty = self.peek_type(item.expr)
+                    item.alias match
+                        Some(a) -> outs.push(SqlOut(a, x, ty, true))
+                        None -> outs.push(SqlOut(sql_derived_name(item.expr, position), x, ty, false))
+
+        if names.len() > 0
+            if names.len() != outs.len() then return sql_fail("Q8012", s"${names.len()} column names are given for ${outs.len()} columns", at)
+            for i in 0..<outs.len()
+                outs[i] = SqlOut(names[i], outs[i].expr, outs[i].ty, true)
+
+        // A derived name that another item has already is suffixed, `name_1`, `name_2`, ….
+        val taken = buf[string]()
+        for o in outs
+            if o.explicit then taken.push(o.name)
+        for i in 0..<outs.len()
+            if outs[i].explicit then continue
+            var n = outs[i].name
+            var k = 1
+            while sql_has(taken, n)
+                n = s"${outs[i].name}_$k"
+                k += 1
+            taken.push(n)
+            outs[i] = SqlOut(n, outs[i].expr, outs[i].ty, false)
+
+        Ok(outs)
+    end items
+
+    all_known(self) -> bool
+        for s in self.level().sources
+            if s.columns.is_none() then return false
+        true
+
+    /** `*` or `q.*` as the columns it stands for. */
+    star(*self, q: Option[string], at: u64, outs: Buf[SqlOut]) -> Result[unit, SqlError]
+        val lvl = self.level()
+
+        q match
+            Some(name) ->
+                for src in lvl.sources
+                    if src.name == name
+                        val cs = src.columns match
+                            Some(c) -> c
+                            None -> return sql_fail("Q8010", s"the columns of $name are not known, so $name.* cannot be expanded here", at)
+                        for c in cs
+                            outs.push(SqlOut(c.name, self.grouped_col(Col(src.binder, c.name), c.ty, c.name, at)?, c.ty, false))
+                        return Ok(())
+                sql_fail("Q2002", s"there is no table or alias $name in scope", at)
+            None ->
+                if lvl.sources.len() == 0 then return sql_fail("Q8001", "SELECT * needs a FROM clause", at)
+                for m in lvl.merged
+                    outs.push(SqlOut(m.name, self.grouped_col(m.expr, m.ty, m.name, at)?, m.ty, false))
+                for src in lvl.sources
+                    val cs = src.columns match
+                        Some(c) -> c
+                        None -> return sql_fail("Q8010", s"the columns of ${src.name} are not known, so * cannot be expanded here", at)
+                    for c in cs
+                        val e = Col(src.binder, c.name)
+                        var merged = false
+                        for m in lvl.merged
+                            if m.left == e || m.right == e then merged = true
+                        if !merged then outs.push(SqlOut(c.name, self.grouped_col(e, c.ty, c.name, at)?, c.ty, false))
+                Ok(())
+
+    /** `e`, a column of the current level, as `grouped_ref` reads it. */
+    grouped_col(self, e: Expr, ty: Option[Type], name: string, at: u64) -> Result[Expr, SqlError]
+        val (x, _) = self.grouped_ref(self.levels.len() - 1, e, ty, name, at)?
+        Ok(x)
+
+    // -- FROM -------------------------------------------------------------------------------------------
+
+    /** The `FROM` items, comma-separated ones cross-joined, their sources put in the current level. */
+    from_list(*self, from: Buf[SqlFrom]) -> Result[Rel, SqlError]
+        var rel: Option[Rel] = None
+        for f in from
+            val r = self.from_item(f)?
+            rel = Some(rel match
+                Some(l) -> Join(Inner, l, r, None, None, None)
+                None -> r)
+        Ok(rel.unwrap())
+
+    add_source(*self, src: SqlSource, at: u64) -> Result[unit, SqlError]
+        val lvl = self.level()
+        if src.name.len > 0
+            for s in lvl.sources
+                if s.name == src.name then return sql_fail("Q2004", s"table name ${src.name} is given twice in FROM: alias one", at)
+        lvl.sources.push(src)
+        Ok(())
+
+    from_item(*self, f: SqlFrom) -> Result[Rel, SqlError]
+        f match
+            FrTable(name, alias, columns, at) ->
+                if columns.len() > 0 then return sql_fail("Q8005", "column aliases on a table are not supported", at)
+                val shown = alias.unwrap_or(name.name)
+                if name.schema.is_none()
+                    var k = self.ctes.len()
+                    while k > 0
+                        k -= 1
+                        if self.ctes[k].name == name.name
+                            val b = self.fresh(shown)
+                            self.add_source(SqlSource(shown, b, self.ctes[k].columns), at)?
+                            return Ok(CteRef(name.name, b))
+                val q = self.qual(name)
+                val b = self.fresh(shown)
+                val cols = self.table_of(q).map(t -> sql_cols_of(t.columns))
+                self.add_source(SqlSource(shown, b, cols), at)?
+                Ok(Scan(q, b))
+            FrQuery(query, alias, columns, at) ->
+                // A derived table sees the enclosing queries' sources, not its siblings'.
+                val here = self.levels.pop().unwrap()
+                val r = self.query(*query, alias.unwrap_or("subquery"), columns)
+                self.levels.push(here)
+                val inner = r?
+                if inner.binder.len == 0 then return sql_fail("Q8010", "the columns of this subquery are not known: list them", at)
+                self.add_source(SqlSource(alias.unwrap_or(""), inner.binder, inner.columns), at)?
+                Ok(inner.rel)
+            FrJoin(kind, left, right, on, using, at) ->
+                val lvl = self.level()
+                val before = lvl.sources.len()
+                val l = self.from_item(*left)?
+                val middle = lvl.sources.len()
+                val r = self.from_item(*right)?
+
+                val jk = kind match
+                    JnInner | JnCross -> Inner
+                    JnLeft -> Left
+                    JnRight -> Right
+                    JnFull -> Full
+
+                if using.len() > 0
+                    var cond: Option[Expr] = None
+                    for name in using
+                        val (le, lt) = self.side_column(before, middle, name, at)?
+                        val (re, rt) = self.side_column(middle, lvl.sources.len(), name, at)?
+                        val test = sql_call2("eq", le, re)
+                        cond = Some(cond match
+                            Some(c) -> sql_call2("and", c, test)
+                            None -> test)
+                        val merged = kind match
+                            JnRight -> re
+                            JnFull -> sql_call2("coalesce", le, re)
+                            _ -> le
+                        lvl.merged.push(SqlMerged(name, merged, if lt.is_some() then lt else rt, le, re))
+                    return Ok(Join(jk, l, r, cond, None, None))
+
+                on match
+                    Some(e) -> Ok(Join(jk, l, r, Some(self.expr(e)?), None, None))
+                    None -> Ok(Join(jk, l, r, None, None, None))
+
+    /** Column `name` of the one source in `[from, to)` of the current level that has it, for `USING`. */
+    side_column(self, from: usize, to: usize, name: string, at: u64) -> Result[(Expr, Option[Type]), SqlError]
+        val lvl = self.level()
+        for m in lvl.merged
+            if m.name == name then return Ok((m.expr, m.ty))
+
+        var found: Option[(Expr, Option[Type])] = None
+        var opaque = 0
+        for i in from..<to
+            val src = lvl.sources[i]
+            if src.columns.is_none()
+                opaque += 1
+            else
+                sql_known(src.columns, name) match
+                    Some(c) ->
+                        if found.is_some() then return sql_fail("Q8008", s"USING column $name is in more than one table of a side", at)
+                        found = Some((Col(src.binder, name), c.ty))
+                    None -> ()
+
+        found match
+            Some(x) -> if opaque == 0 then Ok(x) else sql_fail("Q8010", s"USING column $name: the columns of some tables are not known", at)
+            None ->
+                if opaque == 1 && to - from == 1 then return Ok((Col(lvl.sources[from].binder, name), None))
+                if opaque > 0 then return sql_fail("Q8010", s"USING column $name: the columns of some tables are not known", at)
+                sql_fail("Q2003", s"USING column $name is not a column of both sides", at)
+
+    // -- DML ---------------------------------------------------------------------------------------------
+
+    /** `INSERT` (`sql.md` §3.2). */
+    insert(*self, t: SqlName, alias: Option[string], cols: Buf[string], source: Option[SqlQuery], conflict: Option[SqlConflict], returning: Buf[SqlItem], at: u64) -> Result[Statement, SqlError]
+        val q = self.qual(t)
+        val info = self.table_of(q)
+        val shown = alias.unwrap_or(t.name)
+        val binder = self.fresh(shown)
+
+        var targets = cols
+        if targets.len() == 0 && source.is_some()
+            targets = info match
+                Some(i) ->
+                    val names = buf[string]()
+                    for c in i.columns
+                        names.push(c.name)
+                    names
+                None -> return sql_fail("Q8010", s"the columns of ${t.name} are not known: list the columns to insert", at)
+
+        // Each target's type, where the table is known.
+        val types = buf[Option[Type]]()
+        for c in targets
+            info match
+                Some(i) ->
+                    var ty: Option[Type] = None
+                    for f in i.columns
+                        if f.name == c then ty = Some(f.ty)
+                    if ty.is_none() then return sql_fail("Q2003", s"column $c of ${t.name} does not exist", at)
+                    types.push(ty)
+                None -> types.push(None)
+
+        val rel = source match
+            None -> Values(self.fresh("values"), buf[Field](), sql_one_empty_row())
+            Some(QyValues(rows, tail, vat)) ->
+                if !tail.is_empty() then self.query(source.unwrap(), "values", buf())?.rel else self.insert_values(rows, targets, types, vat)?
+            Some(sq) -> self.query(sq, "select", buf())?.rel
+
+        val target = SqlSource(shown, binder, info.map(i -> sql_cols_of(i.columns)))
+        val oc = conflict match
+            Some(c) -> Some(self.on_conflict(c, target, info)?)
+            None -> None
+
+        val ret = self.returning(target, buf[SqlSource](), returning)?
+        Ok(Insert(q, binder, None, targets, rel, oc, ret))
+
+    /** An `INSERT`'s `VALUES`: typed as the target columns where they are known (`sql.md` §5.9). */
+    insert_values(*self, rows: Buf[Buf[SqlExpr]], targets: Buf[string], types: Buf[Option[Type]], at: u64) -> Result[Rel, SqlError]
+        for r in rows
+            if r.len() != targets.len() then return sql_fail("Q8012", s"the VALUES row has ${r.len()} values for ${targets.len()} columns", r[0].pos())
+            for e in r
+                e match
+                    SqDefault(dat) -> return sql_fail("Q8005", "DEFAULT in VALUES is not supported: leave the column out of the column list", dat)
+                    _ -> ()
+
+        var known = true
+        for t in types
+            if t.is_none() then known = false
+
+        if !known then return Ok(self.values(rows, "values", targets, at)?.rel)
+
+        val fields = buf[Field]()
+        val tys = buf[Type]()
+        for i in 0..<targets.len()
+            fields.push(Field(targets[i], types[i].unwrap()))
+            tys.push(types[i].unwrap())
+        Ok(Values(self.fresh("values"), fields, self.value_rows(rows, tys)?))
+
+    on_conflict(*self, c: SqlConflict, target: SqlSource, info: Option[SqlTable]) -> Result[OnConflict, SqlError]
+        val ct = c.constraint match
+            Some(n) -> Constraint(n)
+            None ->
+                if c.columns.len() > 0
+                    Columns(c.columns)
+                else
+                    info match
+                        Some(i) ->
+                            if i.primary_key.len() == 0 then return sql_fail("Q8010", "ON CONFLICT needs a target: the table's primary key is not known", c.at)
+                            Columns(i.primary_key)
+                        None -> return sql_fail("Q8010", "ON CONFLICT needs a target: the table's primary key is not known", c.at)
+
+        val excluded = self.fresh("excluded")
+        val action = c.sets match
+            None -> Nothing
+            Some(sets) ->
+                val lvl = self.push_level()
+                lvl.sources.push(target)
+                lvl.sources.push(SqlSource("excluded", excluded, target.columns))
+                val r = self.assignments(sets, target, c.where)
+                self.pop_level()
+                val (set, where) = r?
+                DoUpdate(set, where)
+        Ok(OnConflict(ct, excluded, action))
+
+    /** `SET` assignments, each constant typed as its column, and an optional condition, in the current
+     * level.
+     */
+    assignments(*self, sets: Buf[SqlSet], target: SqlSource, where: Option[SqlExpr]) -> Result[(Buf[Item], Option[Expr]), SqlError]
+        val out = buf[Item]()
+        for s in sets
+            if target.columns.is_some() && sql_known(target.columns, s.column).is_none()
+                return sql_fail("Q2003", s"column ${s.column} of ${target.name} does not exist", s.at)
+            s.value match
+                SqDefault(dat) -> return sql_fail("Q8005", "SET column = DEFAULT is not supported", dat)
+                _ -> ()
+            val ty = sql_known(target.columns, s.column).map(c -> c.ty).unwrap_or(None)
+            out.push(Item(s.column, self.typed(s.value, ty, true)?))
+        val w = where match
+            Some(e) -> Some(self.expr(e)?)
+            None -> None
+        Ok((out, w))
+
+    /** `RETURNING` items, over the target and any `FROM`/`USING` sources. */
+    returning(*self, target: SqlSource, others: Buf[SqlSource], items: Buf[SqlItem]) -> Result[Buf[Item], SqlError]
+        if items.len() == 0 then return Ok(buf[Item]())
+        val lvl = self.push_level()
+        lvl.sources.push(target)
+        lvl.sources.extend(others.view())
+        val r = self.items(items, buf(), 0, false)
+        self.pop_level()
+        Ok(sql_items_of(r?))
+
+    /** `UPDATE` (`sql.md` §3.3). */
+    update(*self, t: SqlName, alias: Option[string], sets: Buf[SqlSet], from: Buf[SqlFrom], where: Option[SqlExpr], returning: Buf[SqlItem], at: u64) -> Result[Statement, SqlError]
+        val q = self.qual(t)
+        val info = self.table_of(q)
+        val shown = alias.unwrap_or(t.name)
+        val binder = self.fresh(shown)
+        val target = SqlSource(shown, binder, info.map(i -> sql_cols_of(i.columns)))
+
+        val lvl = self.push_level()
+        val r = self.update_in(lvl, target, sets, from, where, at)
+        self.pop_level()
+        val (rel, others, set, filter) = r?
+        val ret = self.returning(target, others, returning)?
+        Ok(Update(q, binder, None, rel, filter, set, ret))
+
+    /** The `FROM` or `USING` list of an `UPDATE` or `DELETE` in level `lvl`, with the target first. */
+    dml_sources(*self, lvl: &SqlLevel, target: SqlSource, from: Buf[SqlFrom], at: u64) -> Result[(Option[Rel], Buf[SqlSource]), SqlError]
+        var rel: Option[Rel] = None
+        if from.len() > 0 then rel = Some(self.from_list(from)?)
+        val others = buf[SqlSource]()
+        others.extend(lvl.sources.view())
+        for o in others
+            if o.name == target.name then return sql_fail("Q2004", s"table name ${target.name} is given twice: alias one", at)
+        lvl.sources.insert(0, target)
+        Ok((rel, others))
+
+    update_in(*self, lvl: &SqlLevel, target: SqlSource, sets: Buf[SqlSet], from: Buf[SqlFrom], where: Option[SqlExpr], at: u64) -> Result[(Option[Rel], Buf[SqlSource], Buf[Item], Option[Expr]), SqlError]
+        val (rel, others) = self.dml_sources(lvl, target, from, at)?
+        val (set, filter) = self.assignments(sets, target, where)?
+        Ok((rel, others, set, filter))
+
+    /** `DELETE` (`sql.md` §3.3). */
+    delete(*self, t: SqlName, alias: Option[string], using: Buf[SqlFrom], where: Option[SqlExpr], returning: Buf[SqlItem], at: u64) -> Result[Statement, SqlError]
+        val q = self.qual(t)
+        val info = self.table_of(q)
+        val shown = alias.unwrap_or(t.name)
+        val binder = self.fresh(shown)
+        val target = SqlSource(shown, binder, info.map(i -> sql_cols_of(i.columns)))
+
+        val lvl = self.push_level()
+        val r = self.delete_in(lvl, target, using, where, at)
+        self.pop_level()
+        val (rel, others, filter) = r?
+        val ret = self.returning(target, others, returning)?
+        Ok(Delete(q, binder, None, rel, filter, ret))
+
+    delete_in(*self, lvl: &SqlLevel, target: SqlSource, using: Buf[SqlFrom], where: Option[SqlExpr], at: u64) -> Result[(Option[Rel], Buf[SqlSource], Option[Expr]), SqlError]
+        val (rel, others) = self.dml_sources(lvl, target, using, at)?
+        val filter = where match
+            Some(e) -> Some(self.expr(e)?)
+            None -> None
+        Ok((rel, others, filter))
+
+    // -- DDL ---------------------------------------------------------------------------------------------
+
+    ddl(*self, s: SqlStmt) -> Result[Statement, SqlError]
+        s match
+            StCreateTable(t, elements, ine, at) -> self.create_table(t, elements, ine, at)
+            StDropTable(t, ie, cascade, _) ->
+                val q = self.qual(t)
+                self.overlay.push(SqlOverlay(q, None))
+                Ok(DropTable(q, ie, cascade))
+            StAlterTable(t, actions, _) -> self.alter_table(t, actions)
+            StCreateIndex(name, t, unique, keys, where, ine, _) ->
+                val q = self.qual(t)
+                val info = self.table_of(q)
+                val ks = buf[IndexKey]()
+                for k in keys
+                    k.column match
+                        Some(c) -> ks.push(IndexKey(KeyColumn(c), k.desc))
+                        None -> ks.push(IndexKey(KeyExpr(self.definition(t.name, info, k.expr.unwrap(), None)?), k.desc))
+                val pred = where match
+                    Some(w) -> Some(self.definition(t.name, info, w, None)?)
+                    None -> None
+                Ok(CreateIndex(name, IndexDef(q, unique, ks, pred), ine))
+            StDropIndex(n, ie, _) -> Ok(DropIndex(self.qual(n), ie))
+            StCreateSchema(n, ine, _) -> Ok(CreateNamespace(n, ine))
+            StDropSchema(n, ie, cascade, _) -> Ok(DropNamespace(n, ie, cascade))
+            StCreateView(v, query, replace, _) -> Ok(CreateView(self.qual(v), self.query(query, "view", buf())?.rel, replace))
+            StDropView(v, ie, cascade, _) -> Ok(DropView(self.qual(v), ie, cascade))
+            _ -> sql_fail("Q8005", "not a DDL statement", 0)
+
+    /** A definition expression over the row of table `table` (`ddl.md` §2.12): its columns are read
+     * through the binder `row`; a constant takes type `ty` if given.
+     */
+    definition(*self, table: string, info: Option[SqlTable], e: SqlExpr, ty: Option[Type]) -> Result[Expr, SqlError]
+        val lvl = self.push_level()
+        lvl.sources.push(SqlSource(table, "row", info.map(i -> sql_cols_of(i.columns))))
+        val r = self.typed(e, ty, true)
+        self.pop_level()
+        r
+
+    /** A default: a constant typed as its column, and no column visible (`ddl.md` §2.7 rule 1). */
+    default_of(*self, e: SqlExpr, ty: Type) -> Result[Expr, SqlError]
+        val lvl = self.push_level()
+        val r = self.typed(e, Some(ty), true)
+        self.pop_level()
+        r
+
+    /** A constraint's name: the one written, else `<table>_<columns>_<suffix>` (`sql.md` §3.5), made
+     * unique among `taken`.
+     */
+    constraint_name(self, written: Option[string], table: string, columns: Buf[string], suffix: string, taken: Buf[string]) -> string
+        val base = written match
+            Some(n) -> return n
+            None ->
+                var b = table
+                for c in columns
+                    b = b + "_" + c
+                b + "_" + suffix
+        var n = base
+        var k = 1
+        while sql_has(taken, n)
+            n = s"$base$k"
+            k += 1
+        taken.push(n)
+        n
+
+    /** `CREATE TABLE` (`sql.md` §3.5). */
+    create_table(*self, t: SqlName, elements: Buf[SqlElement], ine: bool, at: u64) -> Result[Statement, SqlError]
+        val q = self.qual(t)
+        val fields = buf[Field]()
+        var keyed = false
+        var pk = buf[string]()
+
+        // The primary key first: its columns are not null.
+        for el in elements
+            val cs = el match
+                ElColumn(c) -> c.constraints
+                ElConstraint(c) -> items_of([c])
+            for c in cs
+                c.body match
+                    CoPrimary(cols) ->
+                        if keyed then return sql_fail("Q8013", s"table ${t.name} has more than one primary key", c.at)
+                        if c.name.is_some() then return sql_fail("Q8005", s"a primary key is always named ${t.name}_pkey", c.at)
+                        keyed = true
+                        pk = cols
+                    _ -> ()
+                if c.not_valid then return sql_fail("Q8005", "NOT VALID applies only to ALTER TABLE ADD CONSTRAINT", c.at)
+
+        for el in elements
+            el match
+                ElColumn(c) ->
+                    for f in fields
+                        if f.name == c.name then return sql_fail("Q8013", s"column ${c.name} is given twice", c.at)
+                    fields.push(Field(c.name, if c.not_null || sql_has(pk, c.name) then c.ty else nullable(c.ty)))
+                _ -> ()
+
+        val info = SqlTable(fields, pk)
+        val columns = buf[ColumnDef]()
+        val constraints = buf[ConstraintDef]()
+        val taken = buf[string]()
+
+        for el in elements
+            el match
+                ElColumn(c) ->
+                    columns.push(self.column_def(c, fields, t.name, Some(info))?)
+                    for k in c.constraints
+                        val d = self.constraint_def(k, t.name, q, Some(info), taken)?
+                        d match
+                            Some(x) -> constraints.push(x)
+                            None -> ()
+                ElConstraint(k) ->
+                    val d = self.constraint_def(k, t.name, q, Some(info), taken)?
+                    d match
+                        Some(x) -> constraints.push(x)
+                        None -> ()
+
+        self.overlay.push(SqlOverlay(q, Some(info)))
+        Ok(CreateTable(q, columns, pk, constraints, ine))
+    end create_table
+
+    /** A column definition, its type `T` or `T?` as `fields` has it. */
+    column_def(*self, c: SqlColumn, fields: Buf[Field], table: string, info: Option[SqlTable]) -> Result[ColumnDef, SqlError]
+        var ty = c.ty
+        for f in fields
+            if f.name == c.name then ty = f.ty
+        val d = c.default match
+            Some(e) -> Some(self.default_of(e, ty)?)
+            None -> None
+        val g = c.generated match
+            Some(e) -> Some(self.definition(table, info, e, Some(ty))?)
+            None -> None
+        Ok(ColumnDef(c.name, ty, d, g, c.identity, None))
+
+    /** A unique, check or foreign-key constraint; `None` for a primary key, which the table holds. */
+    constraint_def(*self, k: SqlConstraint, table: string, q: QualName, info: Option[SqlTable], taken: Buf[string]) -> Result[Option[ConstraintDef], SqlError]
+        k.body match
+            CoPrimary(_) -> Ok(None)
+            CoUnique(cols) -> Ok(Some(ConstraintDef(self.constraint_name(k.name, table, cols, "key", taken), Unique(cols))))
+            CoCheck(e) ->
+                val cols = buf[string]()
+                Ok(Some(ConstraintDef(self.constraint_name(k.name, table, cols, "check", taken), Check(self.definition(table, info, e, None)?))))
+            CoForeign(cols, rt, refs, on_delete, on_update, deferred) ->
+                val rq = self.qual(rt)
+                var targets = refs
+                if targets.len() == 0
+                    val rinfo = if rq == q then info else self.table_of(rq)
+                    targets = rinfo.map(i -> i.primary_key).unwrap_or(buf[string]())
+                    if targets.len() == 0 then return sql_fail("Q8010", s"REFERENCES ${rt.name} needs its columns: the table's primary key is not known", k.at)
+                Ok(Some(ConstraintDef(self.constraint_name(k.name, table, cols, "fkey", taken), ForeignKey(cols, rq, targets, on_delete, on_update, deferred))))
+
+    /** `ALTER TABLE` (`sql.md` §3.6): each action as its `AlterAction`, in order. */
+    alter_table(*self, t: SqlName, actions: Buf[SqlAlter]) -> Result[Statement, SqlError]
+        val q = self.qual(t)
+        val before = self.table_of(q)
+        var fields: Option[Buf[Field]] = before.map(i -> i.columns.copy())
+        val pk = before.map(i -> i.primary_key).unwrap_or(buf[string]())
+        val out = buf[AlterAction]()
+        val taken = buf[string]()
+        var name = q
+
+        for a in actions
+            val info = fields.map(f -> SqlTable(f, pk))
+            a match
+                AlAddColumn(c) ->
+                    val ty = if c.not_null then c.ty else nullable(c.ty)
+                    val here = buf[Field]()
+                    here.push(Field(c.name, ty))
+                    out.push(AddColumn(self.column_def(c, here, t.name, info)?))
+                    for k in c.constraints
+                        k.body match
+                            CoPrimary(_) -> return sql_fail("Q8005", "ADD COLUMN … PRIMARY KEY is not supported: add the column, then the key", k.at)
+                            _ -> ()
+                    fields match
+                        Some(f) -> f.push(Field(c.name, ty))
+                        None -> ()
+                    val now = fields.map(f -> SqlTable(f, pk))
+                    for k in c.constraints
+                        val d = self.constraint_def(k, t.name, q, now, taken)?
+                        d match
+                            Some(x) -> out.push(AddConstraint(x, false))
+                            None -> ()
+                AlAddConstraint(k) ->
+                    k.body match
+                        CoPrimary(cols) ->
+                            if k.name.is_some() then return sql_fail("Q8005", s"a primary key is always named ${t.name}_pkey", k.at)
+                            out.push(SetPrimaryKey(cols))
+                        _ ->
+                            val d = self.constraint_def(k, t.name, q, info, taken)?
+                            d match
+                                Some(x) -> out.push(AddConstraint(x, k.not_valid))
+                                None -> ()
+                AlDropColumn(n, cascade, _) ->
+                    out.push(DropColumn(n, cascade))
+                    fields = fields.map(f -> sql_without(f, n))
+                AlDropConstraint(n, ie, _) -> out.push(DropConstraint(n, ie))
+                AlRenameColumn(n, to, _) ->
+                    out.push(RenameColumn(n, to))
+                    fields = fields.map(f -> sql_renamed(f, n, to))
+                AlRenameConstraint(n, to, _) -> out.push(RenameConstraint(n, to))
+                AlRenameTable(to, _) ->
+                    out.push(RenameTable(to))
+                    name = QualName(q.schema, to)
+                AlType(n, ty, using, at) ->
+                    val old = sql_field_type(fields, n) match
+                        Some(o) -> o
+                        None -> return sql_fail("Q8010", s"the type of column $n is not known, so its nullability cannot be kept: write the change as a tree", at)
+                    val to = if old.is_nullable() then nullable(ty) else ty
+                    val u = using match
+                        Some(e) -> Some(self.definition(t.name, info, e, Some(to))?)
+                        None -> None
+                    out.push(RetypeColumn(n, to, u))
+                    fields = fields.map(f -> sql_retyped(f, n, to))
+                AlSetDefault(n, d, _) ->
+                    val dv = d match
+                        Some(e) ->
+                            val ty = sql_field_type(fields, n)
+                            val lvl = self.push_level()
+                            val r = self.typed(e, ty, true)
+                            self.pop_level()
+                            Some(r?)
+                        None -> None
+                    out.push(SetColumnDefault(n, dv))
+                AlNullable(n, nullable_now, _) ->
+                    out.push(SetNullable(n, nullable_now))
+                    fields = fields.map(f -> sql_with_nullability(f, n, nullable_now))
+                AlValidate(n, _) -> out.push(ValidateConstraint(n))
+
+        if name != q then self.overlay.push(SqlOverlay(q, None))
+        self.overlay.push(SqlOverlay(name, fields.map(f -> SqlTable(f, pk))))
+        Ok(AlterTable(q, out))
+    end alter_table
+end SqlTr
+
+private sql_translator(schema: string, tables: &SqlTables) -> SqlTr =
+    SqlTr(schema, tables, buf(), buf(), buf(), buf(), buf(), buf())
+
+/** One row of no values: the input of a `SELECT` without `FROM`. */
+private[terndb] sql_one_empty_row() -> Buf[Buf[Expr]]
+    val rows = buf[Buf[Expr]]()
+    rows.push(buf[Expr]())
+    rows
+
+private sql_items_of(outs: Buf[SqlOut]) -> Buf[Item]
+    val items = buf[Item]()
+    for o in outs
+        items.push(Item(o.name, o.expr))
+    items
+
+/** The core function an operator is (`query-tree.md` §7.12). */
+private sql_operator_function(op: string) -> string = op match
+    "=" -> "eq"
+    "<>" -> "ne"
+    "<" -> "lt"
+    "<=" -> "le"
+    ">" -> "gt"
+    ">=" -> "ge"
+    "+" -> "add"
+    "-" -> "sub"
+    "*" -> "mul"
+    "/" -> "div"
+    "%" -> "mod"
+    "||" -> "concat"
+    else op
+
+/** The name an unaliased select item gets (`sql.md` §5.4). */
+private sql_derived_name(e: SqlExpr, position: int) -> string = e match
+    SqColumn(_, name, _) -> name
+    SqCall(name, _, _, _, _, _, _) -> name
+    SqCast(x, _, _) -> *x match
+        SqColumn(_, _, _) | SqCall(_, _, _, _, _, _, _) | SqCast(_, _, _) -> sql_derived_name(*x, position)
+        _ -> s"column$position"
+    _ -> s"column$position"
+
+private sql_is_bool(e: SqlExpr) -> bool = e match
+    SqBool(_, _) -> true
+    _ -> false
+
+/** The type of a translated constant. */
+private sql_type_of(e: Expr) -> Type = e match
+    Literal(t, _) -> t
+    Null(t) -> nullable(t)
+    Cast(_, t, _) -> t
+    _ -> Text
+
+private sql_typed_literal(ty: Type, text: string, at: u64) -> Result[Expr, SqlError]
+    if !sql_has_text_form(ty) then return sql_fail("Q8004", s"${type_text(ty)} has no text form", at)
+    from_text(ty, text) match
+        Ok(v) -> Ok(Literal(ty, v))
+        Err(_) -> sql_fail("Q8004", s"'$text' is not a value of type ${type_text(ty)}", at)
+
+private sql_has_text_form(t: Type) -> bool = t match
+    Record(_) | Union(_) | Bag(_) | List(_) | Named(_, _) | Nullable(_) -> false
+    _ -> true
+
+private sql_is_numeric(t: Type) -> bool = t match
+    Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | Decimal(_, _) | Float32 | Float64 -> true
+    _ -> false
+
+/** The inputs of a chain of one set operation, flattened on the left (`query-tree.md` §6.12). */
+private sql_setop_inputs(q: SqlQuery, op: SetOpKind, all: bool) -> Buf[SqlQuery]
+    val out = buf[SqlQuery]()
+    q match
+        QySetOp(_, _, l, r, _, _) ->
+            *l match
+                QySetOp(lo, la, _, _, lt, _) ->
+                    if lo == op && la == all && lt.is_empty() then out.extend(sql_setop_inputs(*l, op, all).view()) else out.push(*l)
+                _ -> out.push(*l)
+            out.push(*r)
+        _ -> out.push(q)
+    out
+
+private sql_field_type(fields: Option[Buf[Field]], name: string) -> Option[Type]
+    fields match
+        Some(fs) ->
+            for f in fs
+                if f.name == name then return Some(f.ty)
+            None
+        None -> None
+
+private sql_without(fields: Buf[Field], name: string) -> Buf[Field]
+    val out = buf[Field]()
+    for f in fields
+        if f.name != name then out.push(f)
+    out
+
+private sql_renamed(fields: Buf[Field], name: string, to: string) -> Buf[Field]
+    val out = buf[Field]()
+    for f in fields
+        out.push(if f.name == name then Field(to, f.ty) else f)
+    out
+
+private sql_retyped(fields: Buf[Field], name: string, ty: Type) -> Buf[Field]
+    val out = buf[Field]()
+    for f in fields
+        out.push(if f.name == name then Field(name, ty) else f)
+    out
+
+private sql_with_nullability(fields: Buf[Field], name: string, allow: bool) -> Buf[Field]
+    val out = buf[Field]()
+    for f in fields
+        out.push(if f.name == name then Field(name, if allow then nullable(f.ty) else f.ty.base()) else f)
+    out
