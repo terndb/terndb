@@ -44,3 +44,15 @@ same rule. Nothing in the map's structure stands in the way of that.
 - Reference counts read by a writer to decide copy-on-write (§8.4), and clones themselves.
 - Latching: the map is single-threaded, like the store. Readers of an old root need no latch, since nothing they
   reach is ever written.
+
+## Differential tests
+
+`page_map_fuzz_tests.sysl` runs seeded random operation sequences (`sysl.rand`) against a model, a sorted list
+searched linearly. Six modes: dense low PIDs, sparse PIDs over 63 bits, PIDs at level boundaries, the extremes of
+every space, a single-element map, and growth to a deep tree followed by removal down to empty. After every
+operation the map and model agree on `get`, `len`, `seek`, `iter_from`, `iter` and `last`, and `check_page_map`
+holds. Sampled older versions are re-verified throughout, so persistence is checked against the model as it stood
+then. Node sharing is measured by node address: a set that does not grow the tree builds exactly one node per level;
+a set that grows it from height `h` to `H` builds `2H - 1 - h` (the wrapper chain over the old root, the new root,
+and the new path); a remove builds at most one per level and none when the PID is absent. A failure names the seed,
+mode and operation index, so a run replays exactly.

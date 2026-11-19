@@ -1,0 +1,211 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The shell's statement buffer (`docs/design/shell.md` § Statements and lines): the lines typed or
+// read are gathered until they hold a `;` that ends a statement, and only then are the complete
+// statements taken out to run. The split is lexical, never a parse: a `;` ends a statement only where
+// it stands in code, outside a string literal ('…', with '' for a quote), a quoted identifier ("…",
+// with "" for a quote), a line comment (-- to the end of the line) and a block comment (/* … */,
+// which nests). What follows the last such `;` stays in the buffer, so one line may finish a
+// statement and begin the next.
+
+/** What the end of some SQL text is inside. */
+enum SqlLexState
+    InCode
+    InString
+    InQuotedIdent
+    InLineComment
+    InBlockComment
+
+/** What a lexical scan of SQL text found: where each statement ends (the offset just past its `;`),
+ * what the text's end is inside, how deeply block comments are nested there, and how many
+ * parentheses are open there since the last `;`.
+ */
+struct SqlScan
+    ends: Buf[usize]
+    state: SqlLexState
+    depth: usize
+    parens: usize
+
+/** Scans `text` from the start, in code. */
+scan_sql(text: string) -> SqlScan
+    val b = text.bytes
+    val n = b.len
+    val ends = buf[usize]()
+    var state = InCode
+    var depth: usize = 0
+    var parens: usize = 0
+    var i: usize = 0
+
+    while i < n
+        val c = b[i]
+        val next: u8 = if i + 1 < n then b[i + 1] else 0
+
+        state match
+            InCode ->
+                if c == u8('\'')
+                    state = InString
+                elif c == u8('"')
+                    state = InQuotedIdent
+                elif c == u8('-') && next == u8('-')
+                    state = InLineComment
+                    i += 1
+                elif c == u8('/') && next == u8('*')
+                    state = InBlockComment
+                    depth = 1
+                    i += 1
+                elif c == u8('(')
+                    parens += 1
+                elif c == u8(')')
+                    if parens > 0 then parens -= 1
+                elif c == u8(';')
+                    ends.push(i + 1)
+                    parens = 0
+            InString ->
+                if c == u8('\'')
+                    if next == u8('\'')
+                        i += 1
+                    else
+                        state = InCode
+            InQuotedIdent ->
+                if c == u8('"')
+                    if next == u8('"')
+                        i += 1
+                    else
+                        state = InCode
+            InLineComment ->
+                if c == u8('\n') then state = InCode
+            InBlockComment ->
+                if c == u8('/') && next == u8('*')
+                    depth += 1
+                    i += 1
+                elif c == u8('*') && next == u8('/')
+                    depth -= 1
+                    i += 1
+                    if depth == 0 then state = InCode
+
+        i += 1
+
+    SqlScan(ends, state, depth, parens)
+end scan_sql
+
+/** Whether `text` holds anything to run: a character in code that is not white space or a `;`.
+ * Comments alone, blank lines and empty statements hold nothing.
+ */
+has_sql(text: string) -> bool
+    val b = text.bytes
+    val n = b.len
+    var state = InCode
+    var depth: usize = 0
+    var i: usize = 0
+
+    while i < n
+        val c = b[i]
+        val next: u8 = if i + 1 < n then b[i + 1] else 0
+
+        state match
+            InCode ->
+                if c == u8('-') && next == u8('-')
+                    state = InLineComment
+                    i += 1
+                elif c == u8('/') && next == u8('*')
+                    state = InBlockComment
+                    depth = 1
+                    i += 1
+                elif !is_blank(c) && c != u8(';')
+                    return true
+            InLineComment ->
+                if c == u8('\n') then state = InCode
+            InBlockComment ->
+                if c == u8('/') && next == u8('*')
+                    depth += 1
+                    i += 1
+                elif c == u8('*') && next == u8('/')
+                    depth -= 1
+                    i += 1
+                    if depth == 0 then state = InCode
+            _ -> return true
+
+        i += 1
+
+    false
+end has_sql
+
+private is_blank(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\n') || c == u8('\r') || c == u8('\f')
+
+/** `text` with its leading white space taken off. */
+private trim_leading(text: string) -> string
+    var i: usize = 0
+    while i < text.len && is_blank(text.bytes[i])
+        i += 1
+    text[i..<text.len]
+
+/** The text of the statement being typed, gathered line by line. */
+struct StatementBuffer
+    text: string
+
+    /** Nothing is buffered. */
+    is_empty(self) -> bool = self.text.len == 0
+
+    /** Appends one line of input, which ends with a line break in the buffer. A buffer holding no
+     * statement yet takes no leading blank lines.
+     */
+    add(*self, line: string)
+        if self.text.len == 0 && trim_leading(line).len == 0 then return
+        self.text = self.text + line + "\n"
+
+    /** Takes every complete statement out, in order, each from its first non-blank character through
+     * its `;`. An empty statement (`;` alone, or comments and a `;`) is dropped. What follows the last
+     * `;` stays, unless it holds nothing to run and is inside no string, identifier or comment.
+     */
+    take(*self) -> Buf[string]
+        val out = buf[string]()
+        val s = scan_sql(self.text)
+        var start: usize = 0
+
+        for e in s.ends
+            val chunk = self.text[start..<e]
+            if has_sql(chunk) then out.push(trim_leading(chunk))
+            start = e
+
+        val rest = self.text[start..<self.text.len]
+        val open = s.state == InString || s.state == InQuotedIdent || s.state == InBlockComment
+        self.text = if open || has_sql(rest) then trim_leading(rest) else ""
+        out
+
+    /** At the end of the input: what is left, if it holds anything to run, and the buffer emptied. */
+    finish(*self) -> Option[string]
+        val rest = self.text
+        self.text = ""
+        if has_sql(rest) then Some(trim_leading(rest).trim_end()) else None
+
+    /** Forgets what is buffered (`\r`). */
+    reset(*self)
+        self.text = ""
+
+    /** The character the prompt shows for the buffer (`docs/design/shell.md` § Prompts): `=` when it is
+     * empty, `'` inside a string literal, `"` inside a quoted identifier, `*` inside a block comment, `(`
+     * inside parentheses, and `-` otherwise.
+     */
+    prompt_mark(self) -> string
+        if self.text.len == 0 then return "="
+        val s = scan_sql(self.text)
+        s.state match
+            InString -> "'"
+            InQuotedIdent -> "\""
+            InBlockComment -> "*"
+            _ -> if s.parens > 0 then "(" else "-"
+
+    /** Whether a line read now would be in code, where a `\` meta-command is recognised, rather than
+     * inside a string, identifier or comment that an earlier line opened.
+     */
+    in_code(self) -> bool = scan_sql(self.text).state == InCode
+end StatementBuffer
+
+statement_buffer() -> StatementBuffer = StatementBuffer("")
+
+/** Whether `line` is a meta-command: its first non-blank character is `\`. */
+is_meta_line(line: string) -> bool
+    val t = trim_leading(line)
+    t.len > 0 && t.bytes[0] == u8('\\')

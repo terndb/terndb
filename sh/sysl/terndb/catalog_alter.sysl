@@ -189,6 +189,10 @@ impl MemCatalog
                 Some(d) ->
                     if c.generated.is_some() || c.identity != NoIdentity then return fail("Q6006", s"column '$name' is generated or an identity and takes no default")
                     check_default(*self, c.ty, d)?
+                    c.target match
+                        Some(to) -> check_default(*self, to, d)?
+                        None -> ()
+
                     self.usable_sequences(d, who)?
                 None -> ()
 
@@ -341,12 +345,13 @@ impl MemCatalog
      * encoding as it was, else the column becomes `converting` toward the new type. A conversion
      * `query-tree.md` §7.6 does not permit and no `using` provides is `Q6008`; a column a view reads is
      * `Q6007` (§2.9 rule 2); a column whose earlier retype is still `converting` is `Q6023`, raised
-     * before any conversion is looked at.
+     * before any conversion is looked at, and one still `filling` is `Q6024`, raised at the same point.
      */
     retype_column(*self, ti: usize, name: string, ty: Type, using: Option[Expr], who: u64) -> Result[bool, CodecError]
         val ci = self.column_of(ti, name)?
         val c = self.tables[ti].columns[ci]
         if c.state == ColumnConverting then return fail("Q6023", s"column '$name' is being retyped; wait for the conversion to finish")
+        if c.state == ColumnFilling then return fail("Q6024", s"column '$name' is being filled; wait for the fill to finish")
         val to = self.usable_type(ty, who)?
         val from = resolve_type(*self, c.ty)?
         val columns = self.tables[ti].columns

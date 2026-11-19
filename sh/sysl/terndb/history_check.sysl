@@ -499,6 +499,13 @@ private struct HChecker
                     if full[i] == full[j]
                         self.anomaly("duplicate-elements", true, [t.id], buf(), s"T${t.id} read ${k.key} as ${list_text(full)}, holding ${full[i]} twice")
 
+            // One transaction's appends sit in the list in the order it made them, each after all
+            // of its earlier ones: anything else is a version no order of appends produces.
+            val disordered = self.out_of_append_order(k.key, ext)
+            if disordered != NoTxn
+                self.anomaly("incompatible-order", true, [disordered, t.id], buf(),
+                    s"T${t.id} read ${k.key} as ${list_text(ext)}, which does not hold T${disordered}'s appends as it made them")
+
             for i in 0..<ext.len()
                 val r = self.writer(k.key, ext[i], false)
 
@@ -511,7 +518,7 @@ private struct HChecker
 
                 if self.txns[w.txn].outcome == TAborted
                     self.anomaly("G1a", true, [w.txn, t.id], buf(), s"T${t.id} read ${ext[i]} in ${k.key}, appended by T${w.txn}, which aborted")
-                elif !w.last && !self.later_of_same(ext, i, w)
+                elif !w.last && w.txn != disordered && !self.later_of_same(ext, i, w)
                     self.anomaly("G1b", true, [w.txn, t.id], buf(), s"T${t.id} read ${k.key} as ${list_text(ext)}, an intermediate version of T${w.txn}")
 
             if full.len() > longest.len()
@@ -612,6 +619,24 @@ private struct HChecker
         self.lost_updates(k.key, lost_base, lost_txn)
         longest
 
+    // A transaction whose appends to `key` the list holds out of the order it made them, or without
+    // one it made before another the list holds; NoTxn where there is none. A repeated element is
+    // a duplicate, reported as such, and counts once.
+    out_of_append_order(self, key: string, list: Buf[i64]) -> usize
+        for i in 0..<list.len()
+            val r = self.writer(key, list[i], false)
+            if r == NoTxn || self.recs[r].ambiguous then continue
+            val w = self.recs[r].txn
+            var before: usize = 0
+            for j in 0..<i
+                if list[j] == list[i] then continue
+                val q = self.writer(key, list[j], false)
+                if q != NoTxn && !self.recs[q].ambiguous && self.recs[q].txn == w then before += 1
+            val wt = self.txns[w]
+            val made = self.own_appends(wt, key, wt.ops.len())
+            if before >= made.len() || made[before] != list[i] then return w
+        NoTxn
+
     later_of_same(self, list: Buf[i64], i: usize, w: WriteRec) -> bool
         for j in (i + 1)..<list.len()
             val r = self.writer(w.key, list[j], false)
@@ -667,7 +692,7 @@ private struct HChecker
             return (NoTxn, false)
 
         m.seen match
-            ObsUnborn -> (InitVersion, true)
+            ObsUnborn -> self.unborn_version(t, k)
             ObsNum(v) ->
                 if v == 0 then return (InitVersion, true)
                 val r = self.writer(k.key, v, false)
@@ -689,6 +714,19 @@ private struct HChecker
 
                 (r, true)
             _ -> (NoTxn, false)
+
+    // A read that found no row saw the initial version or the row's delete, which look alike. It
+    // saw the delete where that was acknowledged before the read began, and the initial version
+    // where there is no delete that may have committed or it began only after the read ended;
+    // otherwise it names neither, and adds no edge.
+    unborn_version(self, t: HTxn, k: KeyInfo) -> (usize, bool)
+        val d = self.writer(k.key, 0, true)
+        if d == NoTxn || self.recs[d].ambiguous then return (InitVersion, true)
+        val dt = self.txns[self.recs[d].txn]
+        if dt.outcome == TAborted || dt.id == t.id then return (InitVersion, true)
+        if t.end != 0 && dt.invoked > t.end then return (InitVersion, true)
+        if dt.outcome == TCommitted && dt.end != 0 && dt.end < t.invoked then return (d, true)
+        (NoTxn, false)
 
     register_key(*self, k: KeyInfo)
         // Versions: the key's committed last writes. `after[i]` lists the versions known to follow
@@ -845,8 +883,13 @@ private struct HChecker
             if self.own_write_before(t, key, op, true)
                 self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${key}, which it had deleted")
 
-            self.edge(w.txn, t.id, EWr, true, m.key)
             val d = self.writer(key, 0, true)
+
+            // A row its inserter deleted again was in the group only inside that transaction.
+            if d != NoTxn && !self.recs[d].ambiguous && self.recs[d].txn == w.txn && w.txn != t.id
+                self.anomaly("G1b", true, [w.txn, t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${key}, which T${w.txn} inserted and deleted again")
+
+            self.edge(w.txn, t.id, EWr, true, m.key)
 
             if d != NoTxn && self.committed(self.recs[d].txn)
                 val dt = self.txns[self.recs[d].txn]
@@ -865,9 +908,10 @@ private struct HChecker
                     self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' lacks ${w.key}, which it had inserted")
                 continue
 
-            // A delete that committed, or may have (§5.4), explains the absence.
+            // A delete that committed, or may have (§5.4), explains the absence, unless it began
+            // only after the read ended.
             val d = self.writer(w.key, 0, true)
-            if d != NoTxn && self.txns[self.recs[d].txn].outcome != TAborted then continue
+            if d != NoTxn && self.may_precede(self.recs[d].txn, t) then continue
 
             self.edge(t.id, w.txn, ERw, true, m.key)
             val it = self.txns[w.txn]
@@ -905,6 +949,12 @@ private struct HChecker
 
         if !same
             self.anomaly("wb-read", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' is not the rows committed at its snapshot ${t.snapshot}")
+
+    // Whether transaction `d`'s writes may be visible to `t`: it did not abort, and it was invoked
+    // before `t` ended (§5.4: an unknown one may have committed).
+    may_precede(self, d: usize, t: HTxn) -> bool
+        val dt = self.txns[d]
+        dt.outcome != TAborted && (t.end == 0 || dt.invoked < t.end)
 
     // Whether `key` is a row a predicate may select: written, but neither a list nor a counter.
     row_key(self, key: string) -> bool = self.by_key.get(key) match
@@ -1133,6 +1183,18 @@ private struct HChecker
                     elif !unknown
                         self.anomaly("garbage", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${row}, which no append made match")
 
+                // A row matching only through appends of the transaction that deleted it matched
+                // only inside that transaction.
+                if deleted && dt != t.id && self.committed(dt)
+                    var by_dt = false
+                    var by_other = false
+                    for wr in k.writes
+                        val w = self.recs[wr]
+                        if w.ambiguous || nest_price(w.value) <= np.bound || !self.committed(w.txn) then continue
+                        if w.txn == dt then by_dt = true else by_other = true
+                    if by_dt && !by_other
+                        self.anomaly("G1b", true, [dt, t.id], buf(), s"T${t.id}'s read of '${m.key}' returned ${row}, which matched only through T${dt}'s appends, and T${dt} deleted it")
+
                 if deleted && dt != t.id && self.committed(dt)
                     self.edge(t.id, dt, ERw, true, m.key)
                     val dx = self.txns[dt]
@@ -1146,8 +1208,9 @@ private struct HChecker
                 if own_match
                     self.anomaly("internal", true, [t.id], buf(), s"T${t.id}'s read of '${m.key}' lacks ${row}, which its own append made match")
                     continue
-                // A delete that committed, or may have (§5.4), explains the absence.
-                if deleted then continue
+                // A delete that committed, or may have (§5.4), explains the absence, unless it
+                // began only after the read ended.
+                if deleted && self.may_precede(dt, t) then continue
 
                 val targets = buf[usize]()
                 if first != NoTxn then targets.push(first)
@@ -1391,6 +1454,12 @@ private struct HChecker
         self.search("G-session", f0, MaskWw | MaskWr | MaskSo, MaxRw0, SeedSo, 0, covered)
         self.search("G-session", f1, MaskDsg | MaskSo, MaxRw1, SeedSo, 1, covered)
         self.search("G-session", f2, MaskDsg | MaskSo, AnyRw, SeedSo, 2, covered)
+        // At every level, a session cycle whose each rw edge directly follows an so edge: a
+        // transaction missing a version its session's earlier transaction saw, wrote after, or
+        // followed (read-your-writes and monotonic reads, §3.5). A transaction begun after its
+        // predecessor ended reads, in every statement, past every version that predecessor
+        // depends on; an rw edge elsewhere is a later statement's concern at read committed.
+        self.search("G-session", f0, MaskDsg | MaskSo, SoThenRw, SeedSo, 0, covered)
         self.search("G-rt", f2, MaskDsg | MaskSo | MaskRt, AnyRw, SeedRt, 2, covered)
 
         // Permitted: the same classes over every committed transaction, where some transaction's
@@ -1501,7 +1570,8 @@ private struct HChecker
             prev_state.push(NoTxn)
 
         val rw0: usize = if first.kind == ERw then 1 else 0
-        val start = state_of(first.to, rw0, rw0 == 1)
+        // The state's flag is whether the last edge was rw; under SoThenRw, whether it was so.
+        val start = state_of(first.to, rw0, if mode == SoThenRw then first.kind == ESo else rw0 == 1)
         if first.to == u then return buf()
         prev_edge[start] = e0
         val queue = buf[usize]()
@@ -1520,6 +1590,7 @@ private struct HChecker
                 if !in_mask(mask, e) || !f[e.to] || comp[e.to] != region then continue
                 val is_rw = e.kind == ERw
                 if mode == NonAdjacent && last_rw && is_rw then continue
+                if mode == SoThenRw && is_rw && !last_rw then continue
                 var nrc = rc + (if is_rw then 1 else 0)
                 if mode == MaxRw0 && nrc > 0 then continue
                 if mode == MaxRw1 && nrc > 1 then continue
@@ -1541,7 +1612,7 @@ private struct HChecker
                         cyc.push(path[j])
                     return cyc
 
-                val ns = state_of(e.to, nrc, is_rw)
+                val ns = state_of(e.to, nrc, if mode == SoThenRw then e.kind == ESo else is_rw)
                 if prev_edge[ns] != NoTxn then continue
                 prev_edge[ns] = i
                 prev_state[ns] = s
@@ -1571,6 +1642,7 @@ private const MaxRw0: u32 = 0
 private const MaxRw1: u32 = 1
 private const AnyRw: u32 = 2
 private const NonAdjacent: u32 = 3
+private const SoThenRw: u32 = 4
 
 private const SeedWw: u32 = 0
 private const SeedWr: u32 = 1

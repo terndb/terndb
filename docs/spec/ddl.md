@@ -82,7 +82,8 @@ in the same statement, in dependency order (§2.11).
 3. A column is in one of three **states**: `ready`, `filling` (being backfilled, §8.2) or `converting` (being
    retyped, §8.5). Only a `ready` column is visible to statements: a `Scan` does not output a column in another
    state, and naming one is `Q2003`. A writer still writes every column of its schema version, whatever its state
-   (§5.4).
+   (§5.4). That rule is for queries and definition expressions; what an `AlterTable` action may do to a column
+   that is not `ready` is §2.13 rule 11.
 
 ### 2.4 The primary key
 
@@ -172,7 +173,9 @@ Every constraint has a name unique in the table's namespace, and is one of:
    holding it only through a commit after the snapshot is `serialization_failure` at snapshot and serializable and
    `unique_violation` at read committed. The check runs once every write of a statement to the table has been
    applied (and again after each cascade's writes to it), so a statement may exchange or shift values among its
-   rows, and a value a statement or an earlier statement of the transaction freed is free.
+   rows, and a value a statement or an earlier statement of the transaction freed is free. A value with a NULL
+   component is never checked (§2.5 rule 2), whichever of its components are NULL; its index entry takes the
+   non-unique form ([DISK] §4.9 rule 1).
 
 ### 2.7 Defaults, generated columns, identity and sequences
 
@@ -403,6 +406,18 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
     a table with no room is refused here, before anything is recorded; a retype that does not enlarge it (a text to
     an int8, an int64 to an int8) never is, because the table already fitted.
     `Q6011` (rule 2) is checked first. The statement has no effect when refused.
+11. **Actions on a column that is not `ready`.** An `AlterTable` action naming a column in state `converting` or
+    `filling` finds it by name (it is the statement, not a query, so `Q2003` of §2.3 rule 3 does not apply to it), and
+    the actions of one statement apply in order. A statement never sees a column its own earlier action made
+    `converting` or `filling`, because a name touched by two actions is `Q6016` (§3.3 rule 3): the state is the one
+    the column had before the statement.
+    - `retype_column` of a `converting` column is `Q6023` (§8.5 rule 4); of a `filling` column `Q6024` (§8.5 rule 5).
+    - `drop_column` of a `converting` column is allowed and abandons its conversion (§8.3).
+    - `rename_column` of a `converting` column is allowed and the conversion continues under the new name (§8.4).
+    - `set_default` of a `converting` column is allowed only for a default valid at both its current type and its
+      target type; a default that is not is `Q3001` as for any column (§8.6).
+    A refused action leaves the catalog unchanged and the statement's other actions unapplied. A column that is
+    `filling` takes `drop_column`, `rename_column` and `set_default` as a `ready` one does.
 
 ## 3. DDL statement trees
 
@@ -550,7 +565,7 @@ changes in one statement.
   :columns [(column :name id :type int64 :identity always)
             (column :name email :type text)
             (column :name status :type app.status
-                    :default (variant :type app.status :tag active :value (record)))
+                    :default (variant :type app.status :tag active :expr (record)))
             (column :name addresses :type list<{city: text, zip: text?}>)]
   :primary_key [id]
   :constraints [(constraint :name users_email_key :unique [email])])
@@ -675,15 +690,17 @@ each phase in pre-order. They need nothing but the tree, so a client library MAY
 
 1. The relations below are system views in the reserved namespace `catalog`. They are read with an ordinary `Scan`
    ([QT] §6.1), at the statement's snapshot, like any relation, and every role may read them (§2.10 rule 5). They
-   are read-only (`Q5003`).
+   are read-only (`Q5003`). A read of them is neither part of the statement's catalog read (§6.2) nor logged as a
+   read of rows ([ISO] §4.4): a DDL committed while the reader runs does not abort it.
 2. They are the **stable** interface to the catalog. The stored system trees (`sys.*`, [DISK] §3.9) are an internal
    format, may change with the on-disk format, and MUST NOT be scanned by name (`Q2001`).
 3. Their column lists are versioned with the tree schema ([QT] §13): a minor version MAY append columns and MAY add
    relations, a variant to a union column, or a field to a record column at its end; anything else is a major
    change. A generator SHOULD name the columns it reads rather than read whole rows.
 4. A type is reported twice: `type` is its canonical [QT] §12.3 encoding (structural, with the nullable wrapper,
-   never a named reference), which a client decodes with the decoder it already has; `type_text` is its [QT] §15
-   text form. An expression is reported as its [QT] §15 text form.
+   never a named reference), which a client decodes with the decoder it already has; `type_text` is the [QT] §15
+   text form of the same structural type, so it names no named type either (`type_name` does, where there is one).
+   An expression is reported as its [QT] §15 text form, its row binder `row` (§2.12).
 5. Objects not yet visible to the reader's snapshot are absent; objects in a non-`ready` state are present with
    their state, so a tool can watch a change in progress. A generator SHOULD use only `ready` columns.
 
@@ -703,7 +720,8 @@ uint32}`.
 `type_text: text`, `type_name: QualName?`, `nullable: bool`, `in_primary_key: bool`, `default: text?`,
 `generated: text?`, `identity: union<always: {}, by_default: {}>?`, `state: union<ready: {}, filling: {job:
 uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`. One row per column of the table's current
-schema version, including the columns of views (`table_oid` the view's oid, no key, no default).
+schema version, in every state, including the columns of views (`table_oid` the view's oid, no key, no default,
+`ready`). `ordinal` counts from 0 in the current schema version; a view's column has `column_id` its ordinal plus 1.
 
 **`catalog.indexes`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `unique: bool`, `keys:
 list<{column: text?, expr: text, descending: bool}>` (`column` set when the component is a plain column),
@@ -713,7 +731,8 @@ list<{column: text?, expr: text, descending: bool}>` (`column` set when the comp
 union<primary_key: {columns: list<text>}, unique: {columns: list<text>, index_oid: uint64}, not_null: {column:
 text}, check: {expr: text}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
 on_delete: FkAction, on_update: FkAction, deferred: bool}>`, where `FkAction` is `union<no_action: {}, restrict:
-{}, cascade: {}, set_null: {}, set_default: {}>`.
+{}, cascade: {}, set_null: {}, set_default: {}>`. A `not_null` row is listed for each column whose type is not
+nullable; it is no object (§2.6), so its `oid` is 0, its name `<table>_<column>_not_null`, and it is validated.
 
 **`catalog.types`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `kind: union<record: {}, union: {},
 enum: {}>` (`enum` for a union whose payloads are all `{}`), `type: bytes`, `type_text: text`, `members:
@@ -726,7 +745,7 @@ int64`, `min: int64`, `max: int64`, `cycle: bool`, `cache: uint32`, `owned_by: {
 uint32}?`. The current value is not reported, since it is not transactional.
 
 **`catalog.views`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `query: text` (its [QT] §15 form),
-`query_tree: bytes` (the canonical encoding of its `Query` node).
+`query_tree: bytes` (the canonical encoding of its `Query` node). `query` is that node's text form, `(query :rel …)`.
 
 **`catalog.roles`** — `name: text`, `login: bool`, `superuser: bool`, `member_of: list<text>`.
 
@@ -988,6 +1007,12 @@ that record rolls it back like any write.
 
 - **Kind:** metadata-only. A new schema version without the column. A primary-key column cannot be dropped
   (`Q6007`); nor can a column an index, constraint, generated column or view uses, unless `cascade` drops those.
+- **A `converting` column** may be dropped (§2.13 rule 11). The drop abandons the conversion: the column's entry,
+  its target type, its `using`, its guard and its replacement indexes (§8.5 rule 2) leave with it in the same
+  transaction, and the `convert_column` job is cancelled in that transaction (§7 rule 6), so it finds nothing left
+  to do: no converted value survives and its final transaction never runs. The `cascade` rule above applies to the
+  column's own indexes and constraints as to any column's. Re-adding a column under the dropped name adds a new
+  column with a new column id (§2.3 rule 1), which is `ready` or `filling` by §8.1 and §8.2 and never `converting`.
 - **Running transactions:** a transaction that resolved the column, or read the whole column list, conflicts. One
   that never named it commits; its writes at the old version still carry the column's bytes, which no later
   version reads.
@@ -1002,6 +1027,10 @@ that record rolls it back like any write.
   unchanged, so no row is touched. Every stored definition that names the column (checks, index expressions,
   generated columns, defaults, views) is rewritten to the new name in the same transaction. Renaming a table also
   rewrites the views that scan it.
+- **A `converting` column** may be renamed (§2.13 rule 11). The column keeps its id, its state and its target, the
+  `using` expression and the guard (§8.5 rule 2) are rewritten to the new name with every other definition, and the
+  `convert_column` job, which finds its column by id, continues; its final transaction makes the column `ready` in
+  its target type under the new name. A `retype_column` of it under the new name is `Q6023`.
 - **Running transactions:** a transaction that resolved the old name conflicts; others do not notice.
 - **Crash:** the catalog rows only.
 - **Old rows:** unchanged; they are matched by column id.
@@ -1046,10 +1075,21 @@ its old type and at its new one (`Q6022`, nothing recorded), whether the retype 
    transaction has made it `ready`, including after a failed job, which returns it to `ready` in its old type. A
    metadata-only retype (rule 1) completes within its statement, so a later retype of the column is never refused
    for it, and a retype of another column of the same table is unaffected by one that converts.
+5. **A column that is still `filling` is not retyped.** A `retype_column` naming a column in state `filling` (§8.2)
+   is refused with `Q6024` ("the column is being filled; wait for the fill to finish"), whatever the new type or
+   `using`, with the effects of rule 4: checked at the same point, before rule 2's conversion and §2.13 rule 10's
+   limits, nothing recorded, the statement's other actions unapplied. It is a code of its own, not `Q6023`, because
+   `Q6023` says the column is being *retyped* and a fill is not a retype, and a client's remedy differs (wait for
+   the `fill_column` job). The column can be retyped once the job has made it `ready`. A column added by the same
+   `AlterTable` is not retyped in it either, but that is `Q6016` (§3.3 rule 3), not this code.
 
 ### 8.6 Set or drop a default; drop or set not null
 
 - **Set or drop a default:** metadata-only, a new schema version. The fill of existing columns does not change.
+  Setting the default of a `converting` column (§2.13 rule 11) checks it twice, against the column's current type
+  and against its target type (§8.5 rule 2); it is accepted only if both accept it, and otherwise `Q3001`, the code
+  of a default that does not fit its column. A default that is null is valid at both when both types are nullable.
+  Dropping the default is always allowed, and the default stays when the conversion finishes or fails.
   Transactions that inserted without naming the column conflict (§6.3).
 - **Drop not null** (`set_nullable` true): metadata-only, a new schema version, lossless (`T → T?`). Transactions
   that resolved the column conflict, since its type changed.

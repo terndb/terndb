@@ -531,8 +531,9 @@ impl Store
 
         val tables = buf[&TableData]()
 
+        // A table nobody can read any more gives its tree's pages back (`on-disk-format.md` §5.6).
         for d in self.tables
-            if self.holds_table(d.oid) then tables.push(d)
+            if self.holds_table(d.oid) then tables.push(d) else self.rows.drop_table(d.oid)
 
         self.tables = tables
     end prune_catalogs

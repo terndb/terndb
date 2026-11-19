@@ -1,0 +1,19 @@
+// The `terndb` program: `terndb serve`, the command line over `sh.sysl.terndb`'s `Server`
+// (`docs/design/engine.md` § The server), and `terndb`, the interactive shell over the library's
+// `Shell` (`docs/design/shell.md`). The library beside it is its one dependency.
+package {
+  name    = "terndb"
+  version = "0.0.1"
+  sysl    = "0.11.0"
+}
+
+requires {
+  os    = true
+  heap  = true
+  posix = true
+  libc  = true
+}
+
+dependencies {
+  terndb { path = ".." }
+}

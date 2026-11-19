@@ -1,0 +1,272 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The text form of a query tree (`query-tree.md` §15), as the catalog relations report definition
+// expressions and views' queries (`ddl.md` §2.12 rule 4, §4.1 rule 4). A node prints as
+// `(kind :field value …)`, its kind in snake case and its fields named and ordered as the tables of
+// §6 and §7 list them; a field holding its empty value (an absent option, `false`, an empty list, an
+// enumeration's first value) is omitted. `Col` prints as `b.c`, `Param` as `$i`, a `Literal` as its
+// §3.5 text quoted with `'` doubled, then `::` and its type, a `Call` as `(call f arg …)`, an
+// aggregate or window call as `(f arg … :field value …)`, a `SortKey` as `(asc|desc e
+// nulls_first|nulls_last)`, and the other auxiliary records (`IfArm`, `MatchArm`, `CteDef`, `Frame`,
+// `Bound`) as nodes named after them (decision Q67).
+
+/** The statement `Query(r)`, as a view's `query` is reported. */
+query_text(r: Rel) -> string = nd("query", [fv("rel", rel_text(r))])
+
+rel_text(r: Rel) -> string = r match
+    Scan(table, binder) -> nd("scan", [fv("table", qual_text(table)), fv("as", binder)])
+    Values(binder, columns, rows) ->
+        val rs = buf[string]()
+
+        for row in rows
+            rs.push(list_text(exprs_of(row)))
+
+        nd("values", [fv("as", binder), fl("columns", fields_text(columns)), fl("rows", rs)])
+    ParamScan(binder, param) -> nd("param_scan", [fv("as", binder), fv("param", "$" + param.to_string())])
+    Filter(input, predicate) -> nd("filter", [fv("input", rel_text(*input)), fv("predicate", expr_text(predicate))])
+    Project(input, binder, items) -> nd("project", [fv("input", rel_text(*input)), fv("as", binder), fl("items", items_text(items))])
+    Join(kind, left, right, on, mark, binder) -> nd("join", [fe("kind", join_kind_text(kind)), fv("left", rel_text(*left)),
+        fv("right", rel_text(*right)), fo("on", on), fopt("mark", mark), fopt("as", binder)])
+    Apply(kind, left, right, on, mark, binder) -> nd("apply", [fe("kind", apply_kind_text(kind)), fv("left", rel_text(*left)),
+        fv("right", rel_text(*right)), fo("on", on), fopt("mark", mark), fopt("as", binder)])
+    Aggregate(input, binder, keys, aggs) ->
+        val parts = buf[string]()
+
+        for a in aggs
+            parts.push(s"${a.name}: ${agg_text(a.call)}")
+
+        nd("aggregate", [fv("input", rel_text(*input)), fv("as", binder), fl("keys", items_text(keys)), fl("aggs", parts)])
+    Window(input, binder, items) ->
+        val ws = buf[string]()
+
+        for w in items
+            ws.push(s"${w.name}: ${win_text(w.call)}")
+
+        nd("window", [fv("input", rel_text(*input)), fv("as", binder), fl("items", ws)])
+    Sort(input, keys) -> nd("sort", [fv("input", rel_text(*input)), fl("keys", sort_keys_text(keys))])
+    Limit(input, count, offset, ties, arbitrary) -> nd("limit", [fv("input", rel_text(*input)), fo("count", count),
+        fo("offset", offset), fb("ties", ties), fb("arbitrary", arbitrary)])
+    Distinct(input) -> nd("distinct", [fv("input", rel_text(*input))])
+    SetOp(op, all, binder, inputs) ->
+        val parts = buf[string]()
+
+        for x in inputs
+            parts.push(rel_text(x))
+
+        nd("set_op", [fe("op", set_op_text(op)), fb("all", all), fv("as", binder), fl("inputs", parts)])
+    With(recursive, ctes, body) ->
+        val cs = buf[string]()
+
+        for c in ctes
+            val columns = c.columns match
+                Some(fs) -> fv("columns", list_text(fields_text(fs)))
+                None -> ""
+
+            cs.push(nd("cte_def", [fv("name", c.name), columns, fv("rel", rel_text(c.rel))]))
+
+        nd("with", [fb("recursive", recursive), fl("ctes", cs), fv("body", rel_text(*body))])
+    CteRef(name, binder) -> nd("cte_ref", [fv("name", name), fv("as", binder)])
+    Nest(input, binder, keys, name, items, order) -> nd("nest", [fv("input", rel_text(*input)), fv("as", binder),
+        fl("keys", items_text(keys)), fv("name", name), fl("items", items_text(items)), fl("order", sort_keys_text(order))])
+    Unnest(input, binder, value, outer, ordinality) -> nd("unnest", [fv("input", rel_text(*input)), fv("as", binder),
+        fv("value", expr_text(value)), fb("outer", outer), fopt("ordinality", ordinality)])
+    Tag(input, binder, ty, tag) -> nd("tag", [fv("input", rel_text(*input)), fv("as", binder), fv("type", type_text(ty)), fv("tag", tag)])
+end rel_text
+
+expr_text(e: Expr) -> string = e match
+    Col(binder, name) -> s"$binder.$name"
+    Row(binder) -> nd("row", [fv("binder", binder)])
+    Param(index) -> "$" + index.to_string()
+    Null(ty) -> nd("null", [fv("type", type_text(ty))])
+    Call(function, args) ->
+        var out = "(call " + function
+
+        for a in args
+            out = out + " " + expr_text(a)
+
+        out + ")"
+    Cast(x, ty, mode) -> nd("cast", [fv("expr", expr_text(*x)), fv("type", type_text(ty)), fe("mode", if mode == Try then "try" else "")])
+    If(arms, otherwise) ->
+        val parts = buf[string]()
+
+        for a in arms
+            parts.push(nd("if_arm", [fv("cond", expr_text(a.cond)), fv("value", expr_text(a.value))]))
+
+        nd("if", [fl("arms", parts), fob("else", otherwise)])
+    Match(x, arms, otherwise) ->
+        val parts = buf[string]()
+
+        for a in arms
+            parts.push(nd("match_arm", [fv("tag", a.tag), fv("binder", a.binder), fv("expr", expr_text(a.expr))]))
+
+        nd("match", [fv("expr", expr_text(*x)), fl("arms", parts), fob("else", otherwise)])
+    Record(fields) -> nd("record", [fl("fields", items_text(fields))])
+    Field(x, name) -> nd("field", [fv("expr", expr_text(*x)), fv("name", name)])
+    Variant(ty, tag, x) -> nd("variant", [fv("type", type_text(ty)), fv("tag", tag), fv("expr", expr_text(*x))])
+    Relation(r) -> nd("relation", [fv("rel", rel_text(*r))])
+    Scalar(r) -> nd("scalar", [fv("rel", rel_text(*r))])
+    Exists(r) -> nd("exists", [fv("rel", rel_text(*r))])
+    In(xs, r) -> nd("in", [fl("exprs", exprs_of(xs)), fv("rel", rel_text(*r))])
+    Action -> "(action)"
+    Literal(ty, v) -> literal_text(ty, v)
+end expr_text
+
+/** A `Literal`: its §3.5 text form in quotes, each `'` in it doubled, then `::` and its type. */
+literal_text(ty: Type, v: Value) -> string
+    val text = to_text(ty, v) match
+        Ok(t) -> t
+        Err(_) -> ""
+
+    var out = "'"
+    var from: usize = 0
+
+    for i in 0..<text.len
+        if text.bytes[i] == u8('\'')
+            out = out + text[from..<i + 1] + "'"
+            from = i + 1
+
+    out + text[from..<text.len] + "'::" + type_text(ty)
+
+qual_text(q: QualName) -> string = s"${q.schema}.${q.name}"
+
+private agg_text(a: AggCall) -> string
+    var out = "(" + a.function
+
+    for x in a.args
+        out = out + " " + expr_text(x)
+
+    out + fb("distinct", a.distinct) + fo("filter", a.filter) + fl("order", sort_keys_text(a.order)) + ")"
+
+private win_text(w: WinCall) -> string
+    var out = "(" + w.function
+
+    for x in w.args
+        out = out + " " + expr_text(x)
+
+    val frame = w.frame match
+        Some(f) -> fv("frame", nd("frame", [fe("unit", frame_unit_text(f.unit)), fv("start", bound_text(f.start)),
+            fv("end", bound_text(f.end)), fe("exclude", exclude_text(f.exclude))]))
+        None -> ""
+
+    out + fl("partition", exprs_of(w.partition)) + fl("order", sort_keys_text(w.order)) + frame + ")"
+
+private bound_text(b: Bound) -> string = nd("bound", [fe("kind", bound_kind_text(b.kind)), fo("offset", b.offset)])
+
+// -- the pieces of a node -------------------------------------------------------------------------
+
+private nd(kind: string, fields: []const string) -> string
+    var out = "(" + kind
+
+    for f in fields
+        out = out + f
+
+    out + ")"
+
+/** A field that is always printed. */
+private fv(name: string, value: string) -> string = s" :$name $value"
+
+/** An enumeration field, empty at its first value, which is the empty string here. */
+private fe(name: string, value: string) -> string = if value.len == 0 then "" else fv(name, value)
+
+private fb(name: string, b: bool) -> string = if b then fv(name, "true") else ""
+
+private fopt(name: string, s: Option[string]) -> string = s match
+    Some(x) -> fv(name, x)
+    None -> ""
+
+private fo(name: string, e: Option[Expr]) -> string = e match
+    Some(x) -> fv(name, expr_text(x))
+    None -> ""
+
+private fob(name: string, e: Option[&Expr]) -> string = e match
+    Some(x) -> fv(name, expr_text(*x))
+    None -> ""
+
+/** A list field, absent when empty. */
+private fl(name: string, values: Buf[string]) -> string = if values.len() == 0 then "" else fv(name, list_text(values))
+
+private list_text(values: Buf[string]) -> string
+    var out = "["
+
+    for i in 0..<values.len()
+        if i > 0 then out = out + " "
+        out = out + values[i]
+
+    out + "]"
+
+private exprs_of(es: Buf[Expr]) -> Buf[string]
+    val out = buf[string]()
+
+    for e in es
+        out.push(expr_text(e))
+
+    out
+
+private items_text(items: Buf[Item]) -> Buf[string]
+    val out = buf[string]()
+
+    for it in items
+        out.push(s"${it.name}: ${expr_text(it.expr)}")
+
+    out
+
+private fields_text(fs: Buf[Field]) -> Buf[string]
+    val out = buf[string]()
+
+    for f in fs
+        out.push(s"${f.name}: ${type_text(f.ty)}")
+
+    out
+
+private sort_keys_text(keys: Buf[SortKey]) -> Buf[string]
+    val out = buf[string]()
+
+    for k in keys
+        out.push(s"(${if k.desc then "desc" else "asc"} ${expr_text(k.expr)} ${if k.nulls_first then "nulls_first" else "nulls_last"})")
+
+    out
+
+// -- the enumerations, each empty at its first value -----------------------------------------------
+
+private join_kind_text(k: JoinKind) -> string = k match
+    Inner -> ""
+    Left -> "left"
+    Right -> "right"
+    Full -> "full"
+    Semi -> "semi"
+    Anti -> "anti"
+    MarkJoin -> "mark"
+    SingleJoin -> "single"
+
+private apply_kind_text(k: ApplyKind) -> string = k match
+    Cross -> ""
+    Outer -> "outer"
+    SemiApply -> "semi"
+    AntiApply -> "anti"
+    MarkApply -> "mark"
+    SingleApply -> "single"
+
+private set_op_text(k: SetOpKind) -> string = k match
+    Union -> ""
+    Intersect -> "intersect"
+    Except -> "except"
+
+private frame_unit_text(u: FrameUnit) -> string = u match
+    Rows -> ""
+    Range -> "range"
+    Groups -> "groups"
+
+private bound_kind_text(k: BoundKind) -> string = k match
+    UnboundedPreceding -> ""
+    Preceding -> "preceding"
+    CurrentRow -> "current"
+    Following -> "following"
+    UnboundedFollowing -> "unbounded_following"
+
+private exclude_text(x: FrameExclude) -> string = x match
+    ExcludeNone -> ""
+    ExcludeCurrent -> "current"
+    ExcludeGroup -> "group"
+    ExcludeTies -> "ties"

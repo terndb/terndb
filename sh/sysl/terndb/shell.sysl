@@ -1,0 +1,509 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.time.monotonic
+
+// The interactive shell (`docs/design/shell.md`): lines in, statements gathered by the statement
+// buffer, each statement turned into requests by the SQL front end and run over the shell's
+// connection, results and errors written out. The shell holds no terminal and no file: what it prints
+// is kept as `Printed` pieces for its driver to write, standard output and standard error apart, so
+// a test reads exactly what a user would see.
+
+/** One statement as the shell runs it: what the SQL front end makes of one statement's text. */
+enum ShellRequest
+    /** A query, DML or DDL statement, as its tree. */
+    RunTree(env: Envelope)
+    BeginTxn(options: TxnOptions)
+    CommitTxn
+    RollbackTxn
+    SavepointTxn(name: string)
+    RollbackToTxn(name: string)
+    ReleaseTxn(name: string)
+
+/** Why a statement's text could not be turned into requests: an error code from `errors.md`, its
+ * message, and the byte offset in the text it concerns, when it concerns one.
+ */
+struct SqlError
+    code: string
+    message: string
+    at: Option[usize]
+
+/** The SQL front end, as the shell uses it. */
+trait SqlFrontEnd
+    /** The requests of one complete statement's text, `;` included. */
+    translate(*self, text: string) -> Result[Buf[ShellRequest], SqlError]
+
+/** A front end that has no SQL: every statement is refused. It stands where none is built in. */
+struct NoSqlFrontEnd
+end NoSqlFrontEnd
+
+impl SqlFrontEnd for NoSqlFrontEnd
+    translate(*self, text: string) -> Result[Buf[ShellRequest], SqlError] =
+        Err(SqlError("", "this build of terndb has no SQL front end; only meta-commands run", None))
+
+/** Where the shell's database is. */
+enum ShellPlace
+    /** A database in this process, gone when it exits. */
+    Embedded
+    /** A server, through the Unix socket at `path`. */
+    OverSocket(socket: string)
+
+/** The state of the shell's transaction, which the prompt shows. */
+enum TxnMode
+    /** No transaction is open: each statement runs in a transaction of its own. */
+    TxnIdle
+    /** A transaction is open. */
+    TxnOpen
+    /** A transaction is open and has failed: only `ROLLBACK`, `ROLLBACK TO SAVEPOINT` and `COMMIT`
+     * (which rolls back) are useful.
+     */
+    TxnFailed
+
+/** A piece of what the shell printed, and whether it goes to standard error. */
+struct Printed
+    text: string
+    to_err: bool
+
+/** How deep `\i` may nest files. */
+const MaxIncludeDepth: usize = 16
+
+/** The shell over one connection. */
+struct Shell
+    conn: ShellConn
+    sql: &SqlFrontEnd
+    place: ShellPlace
+    database: string
+    user: string
+    buffer: StatementBuffer
+    /** The transaction handle open, 0 for none. */
+    txn: u64
+    mode: TxnMode
+    next_handle: u64
+    expanded: bool
+    timing: bool
+    /** Statements and meta-commands that failed. */
+    errors: usize
+    /** `\q` was given, or the connection was lost. */
+    quit: bool
+    /** How many `\i` files are being read. */
+    depth: usize
+    printed: Buf[Printed]
+
+    // -- output ----------------------------------------------------------------------------------
+
+    /** Writes `text` to standard output. */
+    say(*self, text: string) = self.printed.push(Printed(text, false))
+
+    /** Writes `text` to standard error. */
+    complain(*self, text: string) = self.printed.push(Printed(text, true))
+
+    /** An error the user caused, written to standard error and counted. */
+    fail(*self, text: string)
+        self.errors += 1
+        self.complain(text)
+
+    /** What was printed since the last call, in order. */
+    take_printed(*self) -> Buf[Printed]
+        val out = self.printed
+        self.printed = buf()
+        out
+
+    // -- prompts ---------------------------------------------------------------------------------
+
+    /** The prompt for the next line (`docs/design/shell.md` § Prompts): the database, the buffer's mark,
+     * the transaction's mark and `> `.
+     */
+    prompt(self) -> string
+        val txn = self.mode match
+            TxnIdle -> ""
+            TxnOpen -> "*"
+            TxnFailed -> "!"
+        self.database + self.buffer.prompt_mark() + txn + "> "
+
+    // -- input -----------------------------------------------------------------------------------
+
+    /** One line of input. A meta-command line in code runs at once and leaves the buffer as it was;
+     * any other line is added to the buffer, and every statement it completes is run.
+     */
+    feed_line(*self, line: string)
+        if self.quit then return
+
+        if self.buffer.in_code() && is_meta_line(line)
+            self.meta(line)
+            return
+
+        self.buffer.add(line)
+        for stmt in self.buffer.take()
+            if self.quit then return
+            self.run_statement(stmt)
+
+    /** The input has ended. A script's unterminated last statement is run, as psql runs it; an
+     * interactive session's is dropped.
+     */
+    end_input(*self, run_rest: bool)
+        val rest = self.buffer.finish()
+        if !run_rest || self.quit then return
+        rest match
+            Some(s) -> self.run_statement(s)
+            None -> ()
+
+    /** Every line of `text`, then its end, as a script. */
+    run_script(*self, text: string)
+        for line in lines_of(text)
+            if self.quit then return
+            self.feed_line(line)
+        self.end_input(true)
+
+    // -- statements ------------------------------------------------------------------------------
+
+    /** One complete statement's text: through the front end, then each of its requests, stopping at
+     * the first that fails. With `\timing` on, the time it took follows.
+     */
+    run_statement(*self, text: string)
+        val started = monotonic().us
+        self.sql.translate(text) match
+            Ok(reqs) ->
+                for r in reqs
+                    if !self.run_request(text, r) then break
+            Err(e) -> self.fail(sql_error_text(text, e))
+        if self.timing then self.say(timing_text(monotonic().us - started))
+
+    /** Runs one request; whether it succeeded. */
+    run_request(*self, source: string, r: ShellRequest) -> bool = r match
+        RunTree(env) -> self.run_tree(source, env)
+        BeginTxn(options) -> self.begin(options)
+        CommitTxn -> self.commit()
+        RollbackTxn -> self.rollback()
+        SavepointTxn(name) -> self.txn_call(Savepoint(self.txn, name), "SAVEPOINT", "SAVEPOINT")
+        RollbackToTxn(name) -> self.txn_call(RollbackToSavepoint(self.txn, name), "ROLLBACK", "ROLLBACK TO SAVEPOINT")
+        ReleaseTxn(name) -> self.txn_call(ReleaseSavepoint(self.txn, name), "RELEASE", "RELEASE SAVEPOINT")
+
+    /** Sends `m` and answers its responses; a lost connection ends the shell. */
+    private call(*self, m: Message) -> Option[Buf[Message]]
+        self.conn.call(m) match
+            Ok(ms) -> Some(ms)
+            Err(e) ->
+                self.fail(s"terndb: error: $e\n")
+                if self.conn.gone || self.conn.c.phase == Shut || self.conn.c.phase == Leaving
+                    self.quit = true
+                    self.fail("terndb: error: the connection to the server was lost\n")
+                None
+
+    /** A failure the server reported, and what it did to the transaction. */
+    private failed(*self, source: string, w: WireError)
+        self.fail(wire_error_text(source, w))
+        if self.txn != 0
+            w.txn_state match
+                Aborted -> self.mode = TxnFailed
+                Closed ->
+                    self.txn = 0
+                    self.mode = TxnIdle
+                Unaffected -> ()
+
+    /** Runs a tree: its rows, if it has any to show, then its command tag. */
+    run_tree(*self, source: string, env: Envelope) -> bool
+        val bytes = encode_envelope(env) match
+            Ok(b) -> b
+            Err(e) ->
+                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                return false
+        val types = buf[Type]()
+        for p in env.params
+            types.push(p.ty)
+        val params = encode_params(types.view(), no_params()) match
+            Ok(b) -> b
+            Err(e) ->
+                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                return false
+
+        val replies = self.call(ExecuteMsg(Execute(self.txn, None, no_exec_options(), bytes, params, None))) match
+            Some(ms) -> ms
+            None -> return false
+
+        var result: Option[Type] = None
+        val rows = buf[Value]()
+        var counts = buf[u64]()
+
+        for m in replies
+            m match
+                ResultHeaderMsg(h) -> result = h.result_type
+                BatchReply(payload) ->
+                    result match
+                        Some(t) ->
+                            val decoded = column_tree(t) match
+                                Ok(tree) -> decode_batch(tree, payload.view())
+                                Err(e) -> Err(e)
+                            decoded match
+                                Ok(b) -> rows.extend(b.rows().view())
+                                Err(e) ->
+                                    self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                                    return false
+                        None -> ()
+                Complete(cs, _) -> counts = cs
+                ErrorReply(w) ->
+                    self.failed(source, w)
+                    return false
+                _ -> ()
+
+        if shows_rows(env.statement)
+            result match
+                Some(t) -> self.say(render_grid(result_grid(t, rows), "", self.expanded))
+                None -> ()
+
+        val tag = command_tag(env.statement, counts)
+        if tag.len > 0 then self.say(tag + "\n")
+        true
+    end run_tree
+
+    private begin(*self, options: TxnOptions) -> bool
+        if self.txn != 0
+            self.complain("WARNING:  there is already a transaction in progress\n")
+            self.say("BEGIN\n")
+            return true
+        val h = self.next_handle
+        self.next_handle += 1
+        val replies = self.call(Begin(h, options)) match
+            Some(ms) -> ms
+            None -> return false
+        for m in replies
+            m match
+                TxnBegun(_, _, _) ->
+                    self.txn = h
+                    self.mode = TxnOpen
+                    self.say("BEGIN\n")
+                    return true
+                ErrorReply(w) ->
+                    self.failed("", w)
+                    return false
+                _ -> ()
+        false
+
+    private commit(*self) -> bool
+        if self.txn == 0
+            self.complain("WARNING:  there is no transaction in progress\n")
+            self.say("COMMIT\n")
+            return true
+        if self.mode == TxnFailed then return self.end_with_rollback()
+
+        val replies = self.call(Commit(self.txn)) match
+            Some(ms) -> ms
+            None -> return false
+        self.txn = 0
+        self.mode = TxnIdle
+        for m in replies
+            m match
+                TxnCommitted(_, _) ->
+                    self.say("COMMIT\n")
+                    return true
+                ErrorReply(w) ->
+                    self.fail(wire_error_text("", w))
+                    return false
+                _ -> ()
+        false
+
+    private rollback(*self) -> bool
+        if self.txn == 0
+            self.complain("WARNING:  there is no transaction in progress\n")
+            self.say("ROLLBACK\n")
+            return true
+        self.end_with_rollback()
+
+    /** Rolls the open transaction back, as `ROLLBACK` does and as `COMMIT` of a failed one does. */
+    private end_with_rollback(*self) -> bool
+        val replies = self.call(Rollback(self.txn)) match
+            Some(ms) -> ms
+            None -> return false
+        self.txn = 0
+        self.mode = TxnIdle
+        for m in replies
+            m match
+                ErrorReply(w) ->
+                    self.fail(wire_error_text("", w))
+                    return false
+                _ -> ()
+        self.say("ROLLBACK\n")
+        true
+
+    /** A savepoint request, which needs an open transaction; `tag` is printed on success. A rollback
+     * to a savepoint ends a failed transaction's failure.
+     */
+    private txn_call(*self, m: Message, tag: string, what: string) -> bool
+        if self.txn == 0
+            self.fail(s"ERROR:  $what can only be used in transaction blocks\n")
+            return false
+        val replies = self.call(m) match
+            Some(ms) -> ms
+            None -> return false
+        for r in replies
+            r match
+                OkReply ->
+                    m match
+                        RollbackToSavepoint(_, _) -> self.mode = TxnOpen
+                        _ -> ()
+                    self.say(tag + "\n")
+                    return true
+                ErrorReply(w) ->
+                    self.failed("", w)
+                    return false
+                _ -> ()
+        false
+
+    /** Runs a query tree for a meta-command, answering its result type and rows, or `None` after
+     * printing why it failed.
+     */
+    query_rows(*self, env: Envelope) -> Option[(Type, Buf[Value])]
+        val bytes = encode_envelope(env) match
+            Ok(b) -> b
+            Err(e) ->
+                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                return None
+        val params = encode_params([], no_params()) match
+            Ok(b) -> b
+            Err(e) ->
+                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                return None
+        val replies = self.call(ExecuteMsg(Execute(self.txn, None, no_exec_options(), bytes, params, None)))?
+        var result: Option[Type] = None
+        val rows = buf[Value]()
+        for m in replies
+            m match
+                ResultHeaderMsg(h) -> result = h.result_type
+                BatchReply(payload) ->
+                    if result.is_some()
+                        val decoded = column_tree(result.unwrap()) match
+                            Ok(tree) -> decode_batch(tree, payload.view())
+                            Err(e) -> Err(e)
+                        decoded match
+                            Ok(b) -> rows.extend(b.rows().view())
+                            Err(e) ->
+                                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                                return None
+                ErrorReply(w) ->
+                    self.failed("", w)
+                    return None
+                _ -> ()
+        result match
+            Some(t) -> Some((t, rows))
+            None -> Some((Bag(record([])), rows))
+    end query_rows
+
+    /** Ends the session. */
+    close(*self) = self.conn.close()
+end Shell
+
+/** A shell over `conn`, in database `database` as `user`, its statements translated by `sql`. */
+shell(conn: ShellConn, sql: &SqlFrontEnd, place: ShellPlace, database: string, user: string) -> Shell =
+    Shell(conn, sql, place, database, user, statement_buffer(), 0, TxnIdle, 1, false, false, 0, false, 0, buf())
+
+/** The lines of `text`, a last line without a line break included, a `\r` before a line break
+ * dropped.
+ */
+lines_of(text: string) -> Buf[string]
+    val out = buf[string]()
+    var start: usize = 0
+    var i: usize = 0
+    while i < text.len
+        if text.bytes[i] == u8('\n')
+            var end = i
+            if end > start && text.bytes[end - 1] == u8('\r') then end -= 1
+            out.push(text[start..<end])
+            start = i + 1
+        i += 1
+    if start < text.len then out.push(text[start..<text.len])
+    out
+
+/** `Time: 1.234 ms`, for `micros` microseconds. */
+timing_text(micros: long) -> string
+    val us = if micros < 0 then 0 else micros
+    val frac = us % 1000
+    val pad = if frac < 10 then "00" elif frac < 100 then "0" else ""
+    s"Time: ${us / 1000}.$pad$frac ms\n"
+
+// -- what statements print ------------------------------------------------------------------------
+
+/** Whether a statement's result rows are shown: a query's always, and DML's when it returns rows. */
+shows_rows(s: Statement) -> bool = s match
+    Query(_) -> true
+    Insert(_, _, _, _, _, _, returning) -> returning.len() > 0
+    Update(_, _, _, _, _, _, returning) -> returning.len() > 0
+    Delete(_, _, _, _, _, returning) -> returning.len() > 0
+    _ -> false
+
+/** The command tag printed after a statement, psql's for the same statement: `INSERT 0 n`,
+ * `UPDATE n`, `DELETE n`, or the DDL statement's name; a query has none, its row count being the
+ * footer.
+ */
+command_tag(s: Statement, counts: Buf[u64]) -> string
+    var n: u64 = 0
+    for c in counts
+        n += c
+    s match
+        Query(_) -> ""
+        Insert(_, _, _, _, _, _, _) -> s"INSERT 0 $n"
+        Update(_, _, _, _, _, _, _) -> s"UPDATE $n"
+        Delete(_, _, _, _, _, _) -> s"DELETE $n"
+        CreateNamespace(_, _) -> "CREATE NAMESPACE"
+        DropNamespace(_, _, _) -> "DROP NAMESPACE"
+        CreateTable(_, _, _, _, _) -> "CREATE TABLE"
+        DropTable(_, _, _) -> "DROP TABLE"
+        AlterTable(_, _) -> "ALTER TABLE"
+        CreateIndex(_, _, _) -> "CREATE INDEX"
+        DropIndex(_, _) -> "DROP INDEX"
+        CreateType(_, _, _) -> "CREATE TYPE"
+        AlterType(_, _) -> "ALTER TYPE"
+        DropType(_, _) -> "DROP TYPE"
+        CreateSequence(_, _, _) -> "CREATE SEQUENCE"
+        AlterSequence(_, _, _) -> "ALTER SEQUENCE"
+        DropSequence(_, _) -> "DROP SEQUENCE"
+        CreateView(_, _, _) -> "CREATE VIEW"
+        DropView(_, _, _) -> "DROP VIEW"
+        CreateRole(_, _) -> "CREATE ROLE"
+        AlterRole(_, _, _) -> "ALTER ROLE"
+        DropRole(_, _) -> "DROP ROLE"
+        Grant(_, _, _, _) -> "GRANT"
+        Revoke(_, _, _) -> "REVOKE"
+        AwaitJobs(_) -> "AWAIT JOBS"
+        CancelJob(_) -> "CANCEL JOB"
+end command_tag
+
+// -- errors ---------------------------------------------------------------------------------------
+
+/** The `LINE n:` excerpt of `source` at byte offset `at`, with a caret under that character, or
+ * nothing when the offset is past the text.
+ */
+line_excerpt(source: string, at: usize) -> string
+    if at > source.len then return ""
+    var line_no: usize = 1
+    var start: usize = 0
+    for i in 0..<at
+        if source.bytes[i] == u8('\n')
+            line_no += 1
+            start = i + 1
+    var end = start
+    while end < source.len && source.bytes[end] != u8('\n')
+        end += 1
+    var text_end = end
+    if text_end > start && source.bytes[text_end - 1] == u8('\r') then text_end -= 1
+    val head = s"LINE $line_no: "
+    val before = source[start..<at]
+    head + source[start..<text_end] + "\n" + " ".repeat(text_width(head) + text_width(before)) + "^\n"
+
+/** One entry's lines: `ERROR:  code: message`, then the excerpt at its position, when it has one. */
+private entry_text(source: string, code: string, message: string, at: Option[u64]) -> string
+    val head = if code.len > 0 then s"ERROR:  $code: $message\n" else s"ERROR:  $message\n"
+    at match
+        Some(p) -> if source.len > 0 then head + line_excerpt(source, usize(p)) else head
+        None -> head
+
+/** What the shell prints for a front-end error in statement `source`. */
+sql_error_text(source: string, e: SqlError) -> string = entry_text(source, e.code, e.message, e.at.map(p -> u64(p)))
+
+/** What the shell prints for a server's `Error` about statement `source`: each entry, with an excerpt
+ * where it carries a source range.
+ */
+wire_error_text(source: string, w: WireError) -> string
+    var out = ""
+    for e in w.entries
+        out = out + entry_text(source, e.code, e.message, e.span.map(r -> r.start))
+    if w.entries.len() == 0 then out = "ERROR:  the server reported an error with no entries\n"
+    out

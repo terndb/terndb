@@ -1,0 +1,265 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.hex_string
+import sysl.net.{Socket, unix, unix_connect}
+import sysl.time.{millis, monotonic, sleep}
+
+// The shell's connection (`docs/design/shell.md` § Connections): a native-protocol client session
+// over a `Link`, the byte stream to a server. Both ways the shell reaches a database go through it, so
+// both see one protocol and one set of transaction rules. Over a Unix socket the link is the socket;
+// embedded, it is a server session over an engine in this process, fed the same frames a socket
+// would carry. The shell waits for each answer before it sends the next request.
+
+/** The byte stream between the shell and a server. */
+trait Link
+    /** Sends all of `bytes`; a failure ends the connection. An embedded link runs the statement it
+     * carries here, and the engine keeps what it reads through `self`, so implementations may keep it.
+     */
+    @keeps(self)
+    send(*self, bytes: []const u8) -> Result[unit, string]
+
+    /** Waits until the server has sent something and puts it at the start of `into`, answering how
+     * much; 0 is the end of the stream. A link that turns a server or ticks a session while it waits
+     * may keep `self`, as `send` may.
+     */
+    @keeps(self)
+    receive(*self, into: []u8) -> Result[usize, string]
+
+/** A link over a connected socket. */
+struct SocketLink
+    sock: Socket
+
+impl Link for SocketLink
+    send(*self, bytes: []const u8) -> Result[unit, string] = self.sock.send_all(bytes) match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(e.message())
+
+    receive(*self, into: []u8) -> Result[usize, string] = self.sock.recv(into) match
+        Ok(n) -> Ok(n)
+        Err(e) -> Err(e.message())
+
+/** A link to the server listening on the Unix socket at `at`. */
+socket_link(at: string) -> Result[&SocketLink, string]
+    val addr = unix(at) match
+        Ok(a) -> a
+        Err(e) -> return Err(e.message())
+    unix_connect(addr) match
+        Ok(s) -> Ok(SocketLink(s))
+        Err(e) -> Err(e.message())
+
+/** A link to a server session in this process over `engine`: what the shell sends is reassembled and
+ * handed to the session as a socket's server would hand it, and what the session answers is framed and
+ * waits to be received. A statement that answers `NotYet` is resumed by ticking the session while the
+ * shell waits, as the server's loop does.
+ */
+struct EmbeddedLink
+    engine: &Engine
+    session: ServerSession
+    reasm: Reassembler
+    minor: u64
+    frame: u64
+    pending: Buf[u8]
+    at: usize
+    closed: bool
+
+    private take(*self, st: Step)
+        st.negotiated match
+            Some(n) ->
+                self.minor = n.minor
+                self.reasm.minor = n.minor
+                self.reasm.limits = n.receive
+                self.frame = n.send_frame_size
+            None -> ()
+
+        for o in st.out
+            encode_frames(o.m, o.stream, self.minor, usize(self.frame)) match
+                Ok(b) -> self.pending.extend(b.view())
+                Err(_) -> self.closed = true
+            if o.stream != 0 && is_terminal(o.m) then self.reasm.answered(o.stream)
+
+        if st.close then self.closed = true
+
+    private now_ms(self) -> u64 = self.engine.clock.now_ms()
+end EmbeddedLink
+
+impl Link for EmbeddedLink
+    send(*self, bytes: []const u8) -> Result[unit, string]
+        if self.closed then return Err("the embedded database is closed")
+        self.engine.now = sysl.time.now().us
+        val now = self.now_ms()
+        self.reasm.push(bytes) match
+            Ok(arrivals) ->
+                for a in arrivals
+                    if !self.closed then self.take(self.session.receive(a, now))
+            Err(e) -> self.take(self.session.refuse(e))
+        Ok(())
+
+    receive(*self, into: []u8) -> Result[usize, string]
+        loop
+            if self.at < self.pending.len()
+                var n = self.pending.len() - self.at
+                if n > into.len then n = into.len
+                for i in 0..<n
+                    into[i] = self.pending[self.at + i]
+                self.at += n
+                if self.at == self.pending.len()
+                    self.pending.clear()
+                    self.at = 0
+                return Ok(n)
+
+            if self.closed then return Ok(0)
+
+            self.take(self.session.tick(self.now_ms()))
+            if self.pending.len() == 0 && !self.closed then sleep(millis(1))
+
+/** A link to a new server session over `engine`, which serves database `database` and logs the
+ * bootstrap role in with `password`.
+ */
+embedded_link(engine: &Engine, database: string, password: string) -> Result[&EmbeddedLink, string]
+    val salt = random_octets(16) match
+        Ok(b) -> b
+        Err(e) -> return Err(e.message())
+    val nonce = random_octets(18) match
+        Ok(b) -> hex_string(b.view())
+        Err(e) -> return Err(e.message())
+    val verifier = scram_verifier(password, salt.view(), 4096) match
+        Ok(v) -> v
+        Err(e) -> return Err(e.message)
+    val credentials: &ServerCredentials = ServerCredentials(verifier, database)
+    val config = ServerConfig(server_wire_versions(), server_tree_versions(), "terndb 0.0.1", 1048576, 64, 16,
+        MinMessageSize, 1, Primary, OverUnix, nonce, buf(), None, buf(), 10000, None)
+    val now = engine.clock.now_ms()
+    val session = server_session(config, engine.connect(""), catalog_authority(engine, credentials), now)
+    Ok(EmbeddedLink(engine, session, reassembler(Server), 0, DefaultFrameSize, buf(), 0, false))
+
+/** What the shell logs in with. */
+shell_client_config(database: string, user: string, password: string) -> Result[ClientConfig, string]
+    val nonce = random_octets(18) match
+        Ok(b) -> hex_string(b.view())
+        Err(e) -> return Err(e.message())
+    val methods = buf[string]()
+    methods.push(ScramPlain)
+    Ok(ClientConfig(server_wire_versions(), server_tree_versions(), user, database, "terndb shell", methods, password, buf(),
+        nonce, buf(), OverUnix, false, 1048576, no_session_defaults(), buf(), 60000, 10000))
+
+private client_now() -> u64 = u64(monotonic().us / 1000)
+
+/** A logged-in client session over a link. */
+struct ShellConn
+    link: &Link
+    c: ClientSession
+    cr: Reassembler
+    minor: u64
+    frame: u64
+    events: Buf[Event]
+    /** The connection has ended. */
+    gone: bool
+
+    /** Puts what the client session produced on the link, and keeps its events. */
+    private take(*self, st: ClientStep) -> Result[unit, string]
+        st.negotiated match
+            Some(n) ->
+                self.minor = n.minor
+                self.cr.minor = n.minor
+                self.cr.limits = n.receive
+                self.frame = n.send_frame_size
+            None -> ()
+
+        for o in st.out
+            val bytes = encode_frames(o.m, o.stream, self.minor, usize(self.frame)) match
+                Ok(b) -> b
+                Err(e) -> return Err(s"${e.code}: ${e.message}")
+            self.link.send(bytes.view())?
+            if o.stream != 0 && is_request(o.m) then self.cr.sent(o.stream)
+
+        for e in st.events
+            self.events.push(e)
+
+        st.fatal match
+            Some(e) ->
+                self.gone = true
+                Err(s"${e.code}: ${e.message}")
+            None -> Ok(())
+
+    /** Waits for what the server sends next and hands it to the client session. */
+    private pump(*self) -> Result[unit, string]
+        if self.gone then return Err("the connection to the server was lost")
+        var into = [0u8; 65536]
+        val n = self.link.receive(into[..])?
+        if n == 0
+            self.gone = true
+            val _ = self.take(self.c.lost())
+            return Err("the server closed the connection")
+
+        self.cr.push(into[0..<n]) match
+            Ok(arrivals) ->
+                for a in arrivals
+                    self.take(self.c.receive(a, client_now()))?
+            Err(e) ->
+                self.gone = true
+                val _ = self.take(self.c.refuse(e))
+                return Err(s"${e.code}: ${e.message}")
+        Ok(())
+
+    /** The error a server sent on stream 0 or a handshake stream, if it sent one. */
+    private refusal(self) -> Option[string]
+        for e in self.events
+            e match
+                Response(_, m) -> m match
+                    ErrorReply(w) ->
+                        if w.entries.len() > 0 then return Some(s"${w.entries[0].code}: ${w.entries[0].message}")
+                    _ -> ()
+                Departing(code, message, _) -> return Some(s"$code: $message")
+                _ -> ()
+        None
+
+    /** Sends request `m` and answers every response to it, through the one that ends its stream. */
+    call(*self, m: Message) -> Result[Buf[Message], string]
+        val st = self.c.request(m, client_now()) match
+            Ok(s) -> s
+            Err(e) -> return Err(s"${e.code}: ${e.message}")
+        val stream = st.stream
+        self.take(st)?
+
+        val out = buf[Message]()
+        loop
+            val kept = buf[Event]()
+            var done = false
+            for e in self.events
+                e match
+                    Response(s, r) ->
+                        if s == stream && !done
+                            out.push(r)
+                            if is_terminal(r) then done = true
+                        else
+                            kept.push(e)
+                    _ -> kept.push(e)
+            self.events = kept
+            if done then return Ok(out)
+            self.pump()?
+
+    /** Ends the session with `Terminate`. */
+    close(*self)
+        if self.gone then return
+        val _ = self.take(self.c.terminate(client_now()))
+        self.gone = true
+end ShellConn
+
+/** A client session over `link`, through the handshake to `Ready`. */
+connect_shell(link: &Link, config: ClientConfig) -> Result[ShellConn, string]
+    val pre = buf[u8]()
+    push_preface(pre)
+    link.send(pre.view())?
+
+    var conn = ShellConn(link, client_session(config, client_now()), reassembler(Client), 0, DefaultFrameSize, buf(), false)
+    conn.take(conn.c.hello(client_now()))?
+
+    while conn.c.phase != Open
+        if conn.c.phase == Shut || conn.gone
+            return Err(conn.refusal().unwrap_or("the server refused the connection"))
+        conn.pump() match
+            Ok(_) -> ()
+            Err(e) -> return Err(conn.refusal().unwrap_or(e))
+    conn.events.clear()
+    Ok(conn)

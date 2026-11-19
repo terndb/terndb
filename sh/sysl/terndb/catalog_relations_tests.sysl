@@ -1,0 +1,861 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The catalog as relations (`ddl.md` §4): every relation §4.2 lists that is served, each of its
+// columns, an empty catalog, each kind of DDL, the catalog a transaction sees (its own DDL, a
+// rollback, a savepoint rolled back, another's uncommitted DDL), filters, projections, joins and
+// aggregates over them, writes refused with `Q5003`, and `catalog.x` beside a user table of the same
+// name; and the text form (`query-tree.md` §15) they report definitions in.
+
+// -- fixtures -------------------------------------------------------------------------------------
+
+/** Every row of `catalog.<name>` as `t` sees it. */
+private cr_rows(s: &Store, t: &Txn, name: string, file: string = __FILE__, line: long = __LINE__) -> Buf[Value] =
+    cr_run(s, t, scan("catalog", name, "c"), file, line)
+
+/** The rows of query `r` in `t`, run against the catalog `t` sees, as the engine runs a statement. */
+private cr_run(s: &Store, t: &Txn, r: Rel, file: string = __FILE__, line: long = __LINE__) -> Buf[Value]
+    s.statement(t)
+    s.enter(t).unwrap()
+    xd_rows(xd_ran(s, t, query([], r), [], file, line))
+
+/** The code statement `st` fails with in `t`, or "ok". */
+private cr_code(s: &Store, t: &Txn, st: Statement) -> string
+    s.enter(t).unwrap()
+    xd_code(s, t, envelope([], st))
+
+/** The rows of `catalog.<name>` in a fresh snapshot transaction of a store over `c`. */
+private cr_now(c: MemCatalog, name: string, file: string = __FILE__, line: long = __LINE__) -> Buf[Value]
+    val s = mem_store(c)
+    cr_rows(s, s.begin(Snapshot), name, file, line)
+
+/** The rows of query `r` in a fresh snapshot transaction of a store over `c`. */
+private cr_on(c: MemCatalog, r: Rel, file: string = __FILE__, line: long = __LINE__) -> Buf[Value]
+    val s = mem_store(c)
+    cr_run(s, s.begin(Snapshot), r, file, line)
+
+private cr_ddl(s: &Store, t: &Txn, st: Statement, file: string = __FILE__, line: long = __LINE__)
+    s.ddl(t, envelope([], st), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+/** `catalog.<name>` filtered to the rows whose `column` is `value`, projected to `columns`. */
+private cr_where(name: string, column: string, value: Expr, columns: []const string) -> Rel
+    val items = buf[Item]()
+
+    for c in columns
+        items.push(item(c, col("c", c)))
+
+    Project(Filter(scan("catalog", name, "c"), call("eq", [col("c", column), value])), "r", items)
+
+/** `catalog.<name>` projected to `columns`. */
+private cr_pick(name: string, columns: []const string) -> Rel
+    val items = buf[Item]()
+
+    for c in columns
+        items.push(item(c, col("c", c)))
+
+    Project(scan("catalog", name, "c"), "r", items)
+
+/** The first column of each of `rows`, a text, joined by `,`. */
+private cr_names(rows: Buf[Value]) -> string
+    var out = ""
+
+    for r in rows
+        if out.len > 0 then out = out + ","
+
+        r match
+            Record(fs) -> fs[0] match
+                Text(x) -> out = out + x
+                _ -> out = out + "?"
+            _ -> out = out + "?"
+
+    out
+
+private cr_has(rows: Buf[Value], v: Value) -> bool
+    for r in rows
+        if r == v then return true
+
+    false
+
+private cr_field(v: Value, i: usize) -> Value = v match
+    Record(fs) -> fs[i]
+    _ -> Null
+
+private cr_type(t: Type) -> Value
+    val out = buf[u8]()
+    encode_type(t, out)
+    Bytes(out)
+
+private cr_texts(names: []const string) -> Value
+    val out = buf[Value]()
+
+    for n in names
+        out.push(Text(n))
+
+    Relation(out)
+
+private cr_ready() -> Value = variant(0, rec([]))
+
+private cr_oid(c: MemCatalog, name: string) -> u64 = cat_table_of(c, name).oid
+
+private cr_qual(ns: string, name: string) -> Value = rec([Text(ns), Text(name)])
+
+private cr_grant(oid: u64, kind: usize, privilege: string, grantable: bool) -> Value =
+    rec([UInt(oid), variant(kind, rec([])), Text("bob"), Text(privilege), Bool(grantable)])
+
+/** `cat_base` with a second table `u(k int64, t_id int64?)` referencing `t`. */
+private cr_two() -> MemCatalog =
+    cat_ok(cat_base(), cat_table("u", [cat_col("k", Int64), cat_col("t_id", nullable(Int64))], ["k"], [cat_fk("u_t", ["t_id"], "t", ["id"])]))
+
+// -- an empty catalog -------------------------------------------------------------------------------
+
+@test
+the_namespaces_of_an_empty_catalog_are_the_reserved_ones()
+    val rows = cr_now(mem_catalog(), "namespaces")
+    assert_eq(rows.len(), 2)
+    assert(rows[0] == rec([UInt(3), Text("sys"), Text("terndb")]))
+    assert(rows[1] == rec([UInt(4), Text("catalog"), Text("terndb")]))
+
+@test
+an_empty_catalog_has_no_tables_columns_indexes_constraints_types_sequences_views_grants_or_dependencies()
+    for name in ["tables", "columns", "indexes", "constraints", "types", "sequences", "views", "grants", "depends"]
+        assert_eq(cr_now(mem_catalog(), name).len(), 0, name)
+
+@test
+an_empty_catalog_has_its_two_predefined_roles()
+    val rows = cr_now(mem_catalog(), "roles")
+    assert_eq(rows.len(), 2)
+    assert(rows[0] == rec([Text("terndb"), Bool(true), Bool(true), cr_texts([])]))
+    assert(rows[1] == rec([Text("terndb_replication"), Bool(false), Bool(false), cr_texts([])]))
+
+@test
+the_version_relation_is_one_row_of_the_catalog_version_and_tree_schema()
+    val rows = cr_now(mem_catalog(), "version")
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([UInt(0), rec([UInt(TreeMajor), UInt(TreeMinor)])]))
+
+    // Every DDL statement moves the catalog version.
+    val c = cat_base()
+    assert(c.version > 0)
+    assert(cr_now(c, "version")[0] == rec([UInt(c.version), rec([UInt(TreeMajor), UInt(TreeMinor)])]))
+
+// -- each relation and each of its columns ----------------------------------------------------------
+
+@test
+a_table_row_reports_every_column_of_catalog_tables()
+    val c = cat_base()
+    val t = cat_table_of(c, "t")
+    val rows = cr_now(c, "tables")
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([UInt(t.oid), Text("app"), Text("t"), Text("terndb"), UInt(t.schema_version()), cr_texts(["id"]), cr_ready()]))
+
+@test
+a_composite_primary_key_is_listed_in_key_order()
+    val c = cat_ok(cat_base(), cat_table("pair", [cat_col("a", Int64), cat_col("b", Int64)], ["b", "a"]))
+    assert(cr_on(c, cr_where("tables", "name", cat_text("pair"), ["primary_key"]))[0] == rec([cr_texts(["b", "a"])]))
+
+@test
+a_plain_column_row_reports_every_column_of_catalog_columns()
+    val c = cat_base()
+    val oid = cr_oid(c, "t")
+    val rows = cr_now(c, "columns")
+    assert_eq(rows.len(), 3)
+    assert(rows[0] == rec([UInt(oid), UInt(1), UInt(0), Text("id"), cr_type(Int64), Text("int64"), Null, Bool(false), Bool(true),
+        Null, Null, Null, cr_ready()]))
+    assert(rows[1] == rec([UInt(oid), UInt(2), UInt(1), Text("a"), cr_type(nullable(Int32)), Text("int32?"), Null, Bool(true), Bool(false),
+        Null, Null, Null, cr_ready()]))
+    assert(rows[2] == rec([UInt(oid), UInt(3), UInt(2), Text("b"), cr_type(Text), Text("text"), Null, Bool(false), Bool(false),
+        Null, Null, Null, cr_ready()]))
+
+@test
+a_column_reports_its_default_generation_expression_and_identity_in_text_form()
+    val d = ColumnDef("d", Text, Some(cat_text("it's")), None, NoIdentity, None)
+    val g = ColumnDef("g", Int64, None, Some(call("add", [cat_row("id"), cat_int(1)])), NoIdentity, None)
+    val always = ColumnDef("x", Int64, None, None, Always, None)
+    val by_default = ColumnDef("y", Int64, None, None, ByDefault, None)
+    val c = cat_ok(cat_ok(mem_catalog(), CreateNamespace("app", false)), cat_table("w", [cat_col("id", Int64), d, g, always, by_default], ["id"]))
+    val rows = cr_on(c, cr_pick("columns", ["name", "default", "generated", "identity"]))
+    assert_eq(rows.len(), 5)
+    assert(rows[0] == rec([Text("id"), Null, Null, Null]))
+    assert(rows[1] == rec([Text("d"), Text("'it''s'::text"), Null, Null]))
+    assert(rows[2] == rec([Text("g"), Null, Text("(call add row.id '1'::int64)"), Null]))
+    assert(rows[3] == rec([Text("x"), Null, Null, variant(0, rec([]))]))
+    assert(rows[4] == rec([Text("y"), Null, Null, variant(1, rec([]))]))
+
+@test
+a_column_of_a_named_type_reports_the_structure_and_the_name()
+    val status = union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))])
+    var c = cat_ok(cat_base(), CreateType(cat_q("status"), status, false))
+    c = cat_ok(c, cat_alter("t", [AddColumn(cat_col("st", nullable(Named("app", "status"))))]))
+    val rows = cr_on(c, cr_where("columns", "name", cat_text("st"), ["type", "type_text", "type_name", "nullable"]))
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([cr_type(nullable(status)), Text("union<active: {}, banned: {reason: text}>?"), cr_qual("app", "status"), Bool(true)]))
+
+@test
+a_filling_column_is_present_with_its_state()
+    // A volatile default is a background fill: the column is not ready, but catalog.columns lists it.
+    val volatile = ColumnDef("at", Timestamp, Some(call("statement_timestamp", [])), None, NoIdentity, None)
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(volatile)]))
+    val rows = cr_on(c, cr_where("columns", "name", cat_text("at"), ["ordinal", "state", "default"]))
+    assert(rows[0] == rec([UInt(3), variant(1, rec([UInt(0)])), Text("(call statement_timestamp)")]))
+
+    // The table as a statement sees it has no such column.
+    assert_eq(cat_info(c, "t").columns.len(), 3)
+
+@test
+a_column_being_retyped_reports_its_type_and_the_type_it_becomes()
+    val c = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]))
+    val rows = cr_on(c, cr_where("columns", "name", cat_text("a"), ["type_text", "state"]))
+    assert(rows[0] == rec([Text("int32?"), variant(2, rec([UInt(0), cr_type(nullable(Int16)), Text("int16?")]))]))
+
+    // A lossless retype is metadata only, and the column is ready at its new type at once.
+    val d = cat_ok(cat_base(), cat_alter("t", [RetypeColumn("a", nullable(Int64), None)]))
+    assert(cr_on(d, cr_where("columns", "name", cat_text("a"), ["type_text", "state"]))[0] == rec([Text("int64?"), cr_ready()]))
+
+@test
+a_view_s_columns_are_listed_with_no_key_and_no_default()
+    val c = cat_ok(cat_base(), cat_view("vt", cat_pick("t", "x", "o", ["b", "a"])))
+    val v = c.views[c.view_at(cat_q("vt")).unwrap()]
+    val rows = cr_on(c, Filter(scan("catalog", "columns", "c"), call("eq", [col("c", "table_oid"), Literal(UInt64, UInt(v.oid))])))
+    assert_eq(rows.len(), 2)
+    assert(rows[0] == rec([UInt(v.oid), UInt(1), UInt(0), Text("b"), cr_type(Text), Text("text"), Null, Bool(false), Bool(false), Null, Null, Null, cr_ready()]))
+    assert(rows[1] == rec([UInt(v.oid), UInt(2), UInt(1), Text("a"), cr_type(nullable(Int32)), Text("int32?"), Null, Bool(true), Bool(false), Null, Null, Null, cr_ready()]))
+
+@test
+an_index_row_reports_every_column_of_catalog_indexes()
+    val keys = items_of([IndexKey(KeyExpr(call("lower", [cat_row("b")])), true), IndexKey(KeyColumn("id"), false)])
+    val c = cat_ok(cat_base(), CreateIndex("t_lower", IndexDef(cat_q("t"), true, keys, Some(call("is_not_null", [cat_row("a")]))), false))
+    val x = c.indexes[c.index_at(cat_q("t_lower")).unwrap()]
+    val rows = cr_now(c, "indexes")
+    assert_eq(rows.len(), 1)
+    val ks = rel([rec([Null, Text("(call lower row.b)"), Bool(true)]), rec([Text("id"), Text("row.id"), Bool(false)])])
+    // A new index is building until its job finishes; no job runs here, so it stays so.
+    assert(rows[0] == rec([UInt(x.oid), UInt(cr_oid(c, "t")), Text("app"), Text("t_lower"), Bool(true), ks, Text("(call is_not_null row.a)"),
+        variant(0, rec([UInt(0)]))]))
+
+@test
+a_unique_constraint_s_index_is_ready_and_named_for_it()
+    val c = cat_ok(cat_base(), cat_table("e", [cat_col("id", Int64), cat_col("mail", Text)], ["id"], [cat_unique("e_mail", ["mail"])]))
+    val rows = cr_on(c, cr_where("indexes", "name", cat_text("e_mail"), ["unique", "keys", "predicate", "state"]))
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([Bool(true), rel([rec([Text("mail"), Text("row.mail"), Bool(false)])]), Null, variant(1, rec([]))]))
+
+@test
+every_kind_of_constraint_is_listed_with_its_definition()
+    val check = cat_check("u_k_pos", call("gt", [cat_row("k"), cat_int(0)]))
+    val fk = ConstraintDef("u_t", ForeignKey(items_of(["t_id"]), cat_q("t"), items_of(["id"]), FkCascade, FkSetNull, true))
+    val c = cat_ok(cat_base(), cat_table("u", [cat_col("k", Int64), cat_col("t_id", nullable(Int64)), cat_col("m", Text)], ["k"],
+        [check, fk, cat_unique("u_m", ["m"])]))
+    val u = cr_oid(c, "u")
+    val rows = cr_on(c, Filter(scan("catalog", "constraints", "c"), call("eq", [col("c", "table_oid"), Literal(UInt64, UInt(u))])))
+
+    var pk: Option[CatConstraint] = None
+    var un: Option[CatConstraint] = None
+    var ck: Option[CatConstraint] = None
+    var fo: Option[CatConstraint] = None
+
+    for k in c.constraints_of(u)
+        k.kind match
+            ConPrimaryKey(_) -> pk = Some(k)
+            ConUnique(_) -> un = Some(k)
+            ConCheck(_) -> ck = Some(k)
+            ConForeignKey(_, _, _, _, _, _) -> fo = Some(k)
+
+    assert_eq(rows.len(), 6)
+    assert(cr_has(rows, rec([UInt(pk.unwrap().oid), UInt(u), Text("app"), Text(pk.unwrap().name), Bool(true), variant(0, rec([cr_texts(["k"])]))])))
+    assert(cr_has(rows, rec([UInt(ck.unwrap().oid), UInt(u), Text("app"), Text("u_k_pos"), Bool(true), variant(3, rec([Text("(call gt row.k '0'::int64)")]))])))
+    assert(cr_has(rows, rec([UInt(fo.unwrap().oid), UInt(u), Text("app"), Text("u_t"), Bool(true), variant(4, rec([cr_texts(["t_id"]),
+        UInt(cr_oid(c, "t")), cr_texts(["id"]), variant(2, rec([])), variant(3, rec([])), Bool(true)]))])))
+    assert(cr_has(rows, rec([UInt(un.unwrap().oid), UInt(u), Text("app"), Text("u_m"), Bool(true), variant(1, rec([cr_texts(["m"]), UInt(un.unwrap().index)]))])))
+    assert(un.unwrap().index != 0)
+
+    // A not-null column is listed as a constraint though it is no object: oid 0.
+    assert(cr_has(rows, rec([UInt(0), UInt(u), Text("app"), Text("u_k_not_null"), Bool(true), variant(2, rec([Text("k")]))])))
+    assert(cr_has(rows, rec([UInt(0), UInt(u), Text("app"), Text("u_m_not_null"), Bool(true), variant(2, rec([Text("m")]))])))
+
+@test
+every_foreign_key_action_has_its_variant()
+    val actions = [FkNoAction, FkRestrict, FkCascade, FkSetNull, FkSetDefault]
+
+    for i in 0..<actions.len
+        val fk = ConstraintDef("u_t", ForeignKey(items_of(["t_id"]), cat_q("t"), items_of(["id"]), actions[i], actions[4 - i], false))
+        val c = cat_ok(cat_base(), cat_table("u", [cat_col("k", Int64), cat_col("t_id", nullable(Int64))], ["k"], [fk]))
+        val rows = cr_on(c, cr_where("constraints", "name", cat_text("u_t"), ["kind"]))
+        assert(rows[0] == rec([variant(4, rec([cr_texts(["t_id"]), UInt(cr_oid(c, "t")), cr_texts(["id"]), variant(i, rec([])),
+            variant(4 - i, rec([])), Bool(false)]))]))
+
+@test
+a_constraint_added_by_alter_is_not_validated_until_its_job_runs()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(cat_check("t_b", call("ne", [cat_row("b"), cat_text("")])), false)]))
+    assert(cr_on(c, cr_where("constraints", "name", cat_text("t_b"), ["validated"]))[0] == rec([Bool(false)]))
+
+@test
+setting_not_null_lists_its_pending_check_and_no_not_null_yet()
+    val c = cat_ok(cat_base(), cat_alter("t", [SetNullable("a", false)]))
+    assert_eq(cr_names(cr_on(c, cr_pick("constraints", ["name"]))), "t_pkey,a_not_null,t_id_not_null,t_b_not_null")
+
+@test
+a_named_type_row_reports_its_kind_structure_and_members()
+    val point = record([Field("x", Int32), Field("y", Int32)])
+    val color = union_of([Field("red", record([])), Field("blue", record([]))])
+    var c = cat_ok(cat_base(), CreateType(cat_q("point"), point, false))
+    c = cat_ok(c, CreateType(cat_q("color"), color, false))
+    val shape = union_of([Field("dot", record([Field("at", Named("app", "point"))])), Field("none", record([]))])
+    c = cat_ok(c, CreateType(cat_q("shape"), shape, false))
+    val pin = record([Field("at", Named("app", "point")), Field("c", nullable(Named("app", "color")))])
+    c = cat_ok(c, CreateType(cat_q("pin"), pin, false))
+
+    val rows = cr_now(c, "types")
+    assert_eq(rows.len(), 4)
+    val p = c.types[c.type_at(cat_q("point")).unwrap()]
+    assert(rows[0] == rec([UInt(p.oid), Text("app"), Text("point"), Text("terndb"), variant(0, rec([])), cr_type(point), Text("{x: int32, y: int32}"),
+        rel([rec([Text("x"), cr_type(Int32), Text("int32"), Null]), rec([Text("y"), cr_type(Int32), Text("int32"), Null])])]))
+
+    // An enum: every payload empty.
+    val k = c.types[c.type_at(cat_q("color")).unwrap()]
+    assert(rows[1] == rec([UInt(k.oid), Text("app"), Text("color"), Text("terndb"), variant(2, rec([])), cr_type(color), Text("union<red: {}, blue: {}>"),
+        rel([rec([Text("red"), cr_type(record([])), Text("{}"), Null]), rec([Text("blue"), cr_type(record([])), Text("{}"), Null])])]))
+
+    // A union with a payload, reported structurally: the named type inside it is resolved.
+    val flat_shape = union_of([Field("dot", record([Field("at", point)])), Field("none", record([]))])
+    assert(cr_field(rows[2], 4) == variant(1, rec([])))
+    assert(cr_field(rows[2], 5) == cr_type(flat_shape))
+    assert(cr_field(rows[2], 6) == Text("union<dot: {at: {x: int32, y: int32}}, none: {}>"))
+
+    // A record whose fields were declared with named types: each member keeps its name.
+    assert(cr_field(rows[3], 7) == rel([rec([Text("at"), cr_type(point), Text("{x: int32, y: int32}"), cr_qual("app", "point")]),
+        rec([Text("c"), cr_type(nullable(color)), Text("union<red: {}, blue: {}>?"), cr_qual("app", "color")])]))
+
+@test
+a_sequence_row_reports_its_options_and_owner()
+    val c = cat_ok(cat_base(), CreateSequence(cat_q("seq"), SequenceDef(Int32, Some(5), Some(-2), Some(-100), Some(10), true, Some(7)), false))
+    val q = c.sequences[c.sequence_at(cat_q("seq")).unwrap()]
+    val rows = cr_now(c, "sequences")
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([UInt(q.oid), Text("app"), Text("seq"), cr_type(Int32), Int(5), Int(-2), Int(-100), Int(10), Bool(true), UInt(7), Null]))
+
+@test
+an_identity_column_s_sequence_is_owned_by_its_column()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(ColumnDef("n", Int64, None, None, ByDefault, None))]))
+    val t = cat_table_of(c, "t")
+    val rows = cr_now(c, "sequences")
+    assert_eq(rows.len(), 1)
+    assert(cr_field(rows[0], 10) == rec([UInt(t.oid), UInt(u64(t.column_named("n").unwrap().id))]))
+
+@test
+a_view_row_reports_its_query_in_text_form_and_encoded()
+    val q = Filter(scan("app", "t", "x"), call("gt", [col("x", "id"), cat_int(3)]))
+    val c = cat_ok(cat_base(), cat_view("big", q))
+    val v = c.views[c.view_at(cat_q("big")).unwrap()]
+    val rows = cr_now(c, "views")
+    assert_eq(rows.len(), 1)
+    val tree = encode_statement(Query(q)).unwrap()
+    assert(rows[0] == rec([UInt(v.oid), Text("app"), Text("big"), Text("terndb"),
+        Text("(query :rel (filter :input (scan :table app.t :as x) :predicate (call gt x.id '3'::int64)))"), Bytes(tree)]))
+
+    // The encoding is the `Query` node an envelope carries after its version and parameters.
+    val env = encode_envelope(envelope([], Query(q))).unwrap()
+    for i in 0..<tree.len()
+        assert_eq(env[3 + i], tree[i])
+
+@test
+roles_report_their_memberships_by_name()
+    var c = cat_ok(mem_catalog(), cat_role("staff", false))
+    c = cat_ok(c, CreateRole("ann", RoleDef(true, false, items_of(["staff", "terndb_replication"]))))
+    val rows = cr_now(c, "roles")
+    assert_eq(rows.len(), 4)
+    assert(rows[2] == rec([Text("staff"), Bool(false), Bool(false), cr_texts([])]))
+    assert(rows[3] == rec([Text("ann"), Bool(true), Bool(false), cr_texts(["staff", "terndb_replication"])]))
+
+@test
+grants_report_object_kind_grantee_privilege_and_grantability()
+    var c = cat_ok(cat_ok(cat_base(), cat_role("bob")), cat_view("vt", cat_pick("t", "x", "o", ["b"])))
+    c = cat_ok(c, CreateSequence(cat_q("seq"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    c = cat_ok(c, CreateType(cat_q("pt"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, Grant(items_of([PrivSelect, PrivInsert]), OnTable(cat_q("t")), "bob", true))
+    c = cat_ok(c, Grant(items_of([PrivSelect]), OnTable(cat_q("vt")), "bob", false))
+    c = cat_ok(c, Grant(items_of([PrivUsage, PrivCreate]), OnNamespace("app"), "bob", false))
+    c = cat_ok(c, Grant(items_of([PrivUsage]), OnSequence(cat_q("seq")), "bob", false))
+    c = cat_ok(c, Grant(items_of([PrivUsage]), OnType(cat_q("pt")), "bob", false))
+    c = cat_ok(c, Grant(items_of([PrivUpdate, PrivDelete, PrivReferences]), OnTable(cat_q("t")), "bob", false))
+
+    val t = cr_oid(c, "t")
+    val v = c.views[c.view_at(cat_q("vt")).unwrap()].oid
+    val n = c.namespaces[c.namespace_at("app").unwrap()].oid
+    val q = c.sequences[c.sequence_at(cat_q("seq")).unwrap()].oid
+    val p = c.types[c.type_at(cat_q("pt")).unwrap()].oid
+    val rows = cr_on(c, Filter(scan("catalog", "grants", "c"), call("eq", [col("c", "grantee"), cat_text("bob")])))
+    assert_eq(rows.len(), 10)
+    assert(cr_has(rows, cr_grant(t, 0, "select", true)))
+    assert(cr_has(rows, cr_grant(t, 0, "insert", true)))
+    assert(cr_has(rows, cr_grant(t, 0, "update", false)))
+    assert(cr_has(rows, cr_grant(t, 0, "delete", false)))
+    assert(cr_has(rows, cr_grant(t, 0, "references", false)))
+    assert(cr_has(rows, cr_grant(v, 1, "select", false)))
+    assert(cr_has(rows, cr_grant(n, 2, "usage", false)))
+    assert(cr_has(rows, cr_grant(n, 2, "create", false)))
+    assert(cr_has(rows, cr_grant(q, 3, "usage", false)))
+    assert(cr_has(rows, cr_grant(p, 4, "usage", false)))
+
+@test
+dependencies_are_listed_once_each()
+    var c = cr_two()
+    c = cat_ok(c, cat_index("t_b", "t", ["b"]))
+    // A view scanning `t` twice depends on it once.
+    val twice = Join(Inner, scan("app", "t", "p"), scan("app", "t", "q"), None, None, None)
+    c = cat_ok(c, cat_view("vv", Project(twice, "o", items_of([item("a", col("p", "id"))]))))
+    val t = cr_oid(c, "t")
+    val u = cr_oid(c, "u")
+    val v = c.views[c.view_at(cat_q("vv")).unwrap()].oid
+    val x = c.indexes[c.index_at(cat_q("t_b")).unwrap()].oid
+    val rows = cr_now(c, "depends")
+
+    var n = 0
+    for r in rows
+        if r == rec([UInt(v), UInt(t)]) then n += 1
+    assert_eq(n, 1)
+    assert(cr_has(rows, rec([UInt(x), UInt(t)])), "the index depends on its table")
+
+    // The foreign key depends on both its tables.
+    var fk: u64 = 0
+    for k in c.constraints
+        if k.name == "u_t" then fk = k.oid
+    assert(cr_has(rows, rec([UInt(fk), UInt(t)])))
+    assert(cr_has(rows, rec([UInt(fk), UInt(u)])))
+
+// -- each kind of DDL ----------------------------------------------------------------------------------
+
+@test
+a_dropped_table_leaves_no_row_in_any_relation()
+    val u = cr_oid(cr_two(), "u")
+    val c = cat_ok(cr_two(), DropTable(cat_q("u"), false, false))
+
+    for name in ["tables", "columns", "constraints", "indexes", "depends"]
+        for r in cr_now(c, name)
+            assert(cr_field(r, 0) != UInt(u) && cr_field(r, 1) != UInt(u), name)
+
+    assert_eq(cr_names(cr_on(c, cr_pick("tables", ["name"]))), "t")
+
+@test
+a_renamed_table_and_column_are_reported_under_their_new_names()
+    val c = cat_ok(cat_ok(cat_base(), cat_alter("t", [RenameColumn("b", "label")])), cat_alter("t", [RenameTable("things")]))
+    assert_eq(cr_names(cr_on(c, cr_pick("tables", ["name"]))), "things")
+    assert_eq(cr_names(cr_on(c, cr_pick("columns", ["name"]))), "id,a,label")
+    assert(cr_on(c, cr_pick("tables", ["oid"]))[0] == rec([UInt(cr_oid(cat_base(), "t"))]))
+
+@test
+a_renamed_column_is_followed_by_the_definitions_that_name_it()
+    val k = cat_check("t_b_set", call("ne", [cat_row("b"), cat_text("")]))
+    var c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(k, false)]))
+    c = cat_ok(c, cat_index("t_b", "t", ["b"]))
+    c = cat_ok(c, cat_alter("t", [RenameColumn("b", "label")]))
+    assert(cr_on(c, cr_where("constraints", "name", cat_text("t_b_set"), ["kind"]))[0] == rec([variant(3, rec([Text("(call ne row.label ''::text)")]))]))
+    assert(cr_on(c, cr_where("indexes", "name", cat_text("t_b"), ["keys"]))[0] == rec([rel([rec([Text("label"), Text("row.label"), Bool(false)])])]))
+
+@test
+an_altered_column_reports_its_new_default_and_nullability()
+    var c = cat_ok(cat_base(), cat_alter("t", [SetColumnDefault("b", Some(cat_text("x")))]))
+    c = cat_ok(c, cat_alter("t", [SetNullable("b", true)]))
+    assert(cr_on(c, cr_where("columns", "name", cat_text("b"), ["default", "nullable", "type_text"]))[0] == rec([Text("'x'::text"), Bool(true), Text("text?")]))
+
+    // The column is no longer listed as not null.
+    assert_eq(cr_on(c, cr_where("constraints", "name", cat_text("t_b_not_null"), ["oid"])).len(), 0)
+
+    // Dropping the default again.
+    val d = cat_ok(c, cat_alter("t", [SetColumnDefault("b", None)]))
+    assert(cr_on(d, cr_where("columns", "name", cat_text("b"), ["default"]))[0] == rec([Null]))
+
+@test
+an_added_column_appears_with_the_next_id_and_ordinal_and_a_dropped_one_goes()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(cat_col("z", nullable(Int64)))]))
+    assert(cr_on(c, cr_where("columns", "name", cat_text("z"), ["column_id", "ordinal"]))[0] == rec([UInt(4), UInt(3)]))
+
+    // After dropping `a`, `b` and `z` keep their ids and move up an ordinal.
+    val d = cat_ok(c, cat_alter("t", [DropColumn("a", false)]))
+    val rows = cr_on(d, cr_pick("columns", ["name", "column_id", "ordinal"]))
+    assert_eq(rows.len(), 3)
+    assert(rows[1] == rec([Text("b"), UInt(3), UInt(1)]))
+    assert(rows[2] == rec([Text("z"), UInt(4), UInt(2)]))
+
+@test
+a_new_schema_version_shows_in_the_table_row()
+    val c = cat_ok(cat_base(), cat_alter("t", [AddColumn(cat_col("z", nullable(Int64)))]))
+    val before = cat_table_of(cat_base(), "t").schema_version()
+    val after = cat_table_of(c, "t").schema_version()
+    assert(after > before)
+    assert(cr_on(c, cr_where("tables", "name", cat_text("t"), ["schema_version"]))[0] == rec([UInt(after)]))
+
+@test
+dropped_indexes_constraints_views_types_sequences_and_namespaces_leave()
+    var c = cat_ok(cat_base(), cat_index("t_b", "t", ["b"]))
+    c = cat_ok(c, cat_alter("t", [AddConstraint(cat_check("t_ck", call("gt", [cat_row("id"), cat_int(0)])), false)]))
+    c = cat_ok(c, cat_view("vt", cat_pick("t", "x", "o", ["b"])))
+    c = cat_ok(c, CreateType(cat_q("pt"), record([Field("x", Int32)]), false))
+    c = cat_ok(c, CreateSequence(cat_q("seq"), SequenceDef(Int64, None, None, None, None, false, None), false))
+    c = cat_ok(c, CreateNamespace("other", false))
+    assert_eq(cr_now(c, "namespaces").len(), 4)
+
+    c = cat_ok(c, DropIndex(cat_q("t_b"), false))
+    c = cat_ok(c, cat_alter("t", [DropConstraint("t_ck", false)]))
+    c = cat_ok(c, DropView(cat_q("vt"), false, false))
+    c = cat_ok(c, DropType(cat_q("pt"), false))
+    c = cat_ok(c, DropSequence(cat_q("seq"), false))
+    c = cat_ok(c, DropNamespace("other", false, false))
+
+    assert_eq(cr_now(c, "indexes").len(), 0)
+    assert_eq(cr_now(c, "views").len(), 0)
+    assert_eq(cr_now(c, "types").len(), 0)
+    assert_eq(cr_now(c, "sequences").len(), 0)
+    assert_eq(cr_now(c, "namespaces").len(), 3)
+    assert_eq(cr_now(c, "columns").len(), 3)
+    assert_eq(cr_on(c, cr_where("constraints", "name", cat_text("t_ck"), ["oid"])).len(), 0)
+
+// -- the catalog a transaction sees, §4.1 rule 5, §6.2 --------------------------------------------------
+
+@test
+ddl_is_visible_to_its_own_transaction_and_to_no_other_until_it_commits()
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    val other = s.begin(Snapshot)
+    cr_ddl(s, t, cat_table("x", [cat_col("id", Int64), cat_col("v", Text)], ["id"]))
+    cr_ddl(s, t, cat_alter("t", [AddColumn(cat_col("z", nullable(Int64)))]))
+
+    assert_eq(cr_names(cr_run(s, t, cr_pick("tables", ["name"]))), "t,x")
+    assert_eq(cr_rows(s, t, "columns").len(), 6)
+    assert_eq(cr_names(cr_run(s, other, cr_pick("tables", ["name"]))), "t")
+    assert_eq(cr_rows(s, other, "columns").len(), 3)
+
+    st_commit(s, t)
+    // A snapshot older than the commit still does not see it; a newer one does.
+    assert_eq(cr_names(cr_run(s, other, cr_pick("tables", ["name"]))), "t")
+    assert_eq(cr_names(cr_run(s, s.begin(Snapshot), cr_pick("tables", ["name"]))), "t,x")
+    assert_eq(cr_rows(s, s.begin(Snapshot), "columns").len(), 6)
+
+@test
+a_read_committed_transaction_sees_ddl_once_committed_at_its_next_statement()
+    val s = mem_store(cat_base())
+    val reader = s.begin(ReadCommitted)
+    assert_eq(cr_names(cr_run(s, reader, cr_pick("tables", ["name"]))), "t")
+    val w = s.begin(Snapshot)
+    cr_ddl(s, w, cat_table("x", [cat_col("id", Int64)], ["id"]))
+    assert_eq(cr_names(cr_run(s, reader, cr_pick("tables", ["name"]))), "t")
+    st_commit(s, w)
+    assert_eq(cr_names(cr_run(s, reader, cr_pick("tables", ["name"]))), "t,x")
+
+@test
+a_rolled_back_transaction_s_ddl_is_absent()
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    cr_ddl(s, t, cat_table("x", [cat_col("id", Int64)], ["id"]))
+    cr_ddl(s, t, cat_index("t_b", "t", ["b"]))
+    assert_eq(cr_rows(s, t, "indexes").len(), 1)
+    s.abort(t).unwrap()
+
+    val after = s.begin(Snapshot)
+    assert_eq(cr_names(cr_run(s, after, cr_pick("tables", ["name"]))), "t")
+    assert_eq(cr_rows(s, after, "indexes").len(), 0)
+    assert_eq(cr_rows(s, after, "columns").len(), 3)
+
+@test
+ddl_after_a_savepoint_rolled_back_to_is_absent_and_ddl_before_it_stays()
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    cr_ddl(s, t, cat_table("x", [cat_col("id", Int64)], ["id"]))
+    s.savepoint(t, "a").unwrap()
+    cr_ddl(s, t, cat_table("y", [cat_col("id", Int64)], ["id"]))
+    cr_ddl(s, t, cat_alter("x", [RenameTable("x2")]))
+    assert_eq(cr_names(cr_run(s, t, cr_pick("tables", ["name"]))), "t,x2,y")
+
+    s.rollback_to(t, "a").unwrap()
+    assert_eq(cr_names(cr_run(s, t, cr_pick("tables", ["name"]))), "t,x")
+
+    st_commit(s, t)
+    assert_eq(cr_names(cr_run(s, s.begin(Snapshot), cr_pick("tables", ["name"]))), "t,x")
+
+@test
+a_ddl_committed_after_a_writer_read_the_catalog_does_not_abort_it()
+    // A read of a catalog relation is not logged (§4.1 rule 1): the writer commits.
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    assert_eq(cr_names(cr_run(s, t, cr_pick("tables", ["name"]))), "t")
+    val ins = Insert(cat_q("t"), "i", None, items_of(["id", "b"]),
+        Values("v", items_of([Field("id", Int64), Field("b", Text)]), items_of([items_of([cat_int(1), cat_text("x")])])), None, buf[Item]())
+    assert_eq(cr_code(s, t, ins), "ok")
+
+    val d = s.begin(Snapshot)
+    cr_ddl(s, d, cat_table("x", [cat_col("id", Int64)], ["id"]))
+    st_commit(s, d)
+    st_commit(s, t)
+
+@test
+the_version_relation_follows_the_transaction_s_own_catalog()
+    val s = mem_store(cat_base())
+    val t = s.begin(Serializable)
+    val other = s.begin(Snapshot)
+    val before = cr_rows(s, other, "version")[0]
+    cr_ddl(s, t, cat_table("x", [cat_col("id", Int64)], ["id"]))
+    assert(cr_rows(s, t, "version")[0] != before)
+    assert(cr_rows(s, other, "version")[0] == before)
+
+// -- relational operators over them ---------------------------------------------------------------------
+
+@test
+a_filter_and_a_projection_over_catalog_tables_work_like_any_relation()
+    var c = cr_two()
+    c = cat_ok(c, CreateNamespace("other", false))
+    c = cat_ok(c, CreateTable(QualName("other", "t"), items_of([cat_col("id", Int64)]), items_of(["id"]), buf(), false))
+    val s = mem_store(c)
+    val t = s.begin(Snapshot)
+    assert_eq(cr_names(cr_run(s, t, cr_where("tables", "namespace", cat_text("app"), ["name"]))), "t,u")
+    assert_eq(cr_names(cr_run(s, t, cr_where("tables", "name", cat_text("t"), ["namespace"]))), "app,other")
+
+    // Sorted, and limited.
+    val sorted = Sort(Project(scan("catalog", "tables", "c"), "r", items_of([item("n", col("c", "name")), item("ns", col("c", "namespace"))])),
+        items_of([SortKey(col("r", "ns"), true, false), SortKey(col("r", "n"), false, false)]))
+    assert_eq(cr_names(cr_run(s, t, sorted)), "t,t,u")
+    assert_eq(cr_names(cr_run(s, t, Limit(sorted, Some(cat_int(1)), None, false, false))), "t")
+
+@test
+a_join_of_tables_and_columns_lists_each_table_s_columns()
+    val j = Join(Inner, scan("catalog", "tables", "t"), scan("catalog", "columns", "c"), Some(call("eq", [col("t", "oid"), col("c", "table_oid")])), None, None)
+    val q = Sort(Project(j, "r", items_of([item("col", col("c", "name")), item("tab", col("t", "name"))])),
+        items_of([SortKey(col("r", "tab"), false, false), SortKey(col("r", "col"), false, false)]))
+    val rows = cr_on(cr_two(), q)
+    assert_eq(cr_names(rows), "a,b,id,k,t_id")
+    assert(rows[3] == rec([Text("k"), Text("u")]))
+
+@test
+a_join_of_a_catalog_relation_with_a_user_table_works()
+    var c = cat_ok(cat_base(), cat_table("notes", [cat_col("tab", Text), cat_col("note", Text)], ["tab"]))
+    val s = mem_store(c)
+    val w = s.begin(Snapshot)
+    xd_ran(s, w, envelope([], Insert(cat_q("notes"), "i", None, items_of(["tab", "note"]),
+        Values("v", items_of([Field("tab", Text), Field("note", Text)]), items_of([items_of([cat_text("t"), cat_text("the t")])])), None, buf[Item]())))
+    st_commit(s, w)
+    val j = Join(Inner, scan("catalog", "tables", "t"), scan("app", "notes", "n"), Some(call("eq", [col("t", "name"), col("n", "tab")])), None, None)
+    val rows = cr_run(s, s.begin(Snapshot), Project(j, "r", items_of([item("note", col("n", "note")), item("oid", col("t", "oid"))])))
+    assert_eq(rows.len(), 1)
+    assert(rows[0] == rec([Text("the t"), UInt(cr_oid(c, "t"))]))
+
+@test
+an_aggregate_counts_columns_per_table()
+    val agg = Aggregate(scan("catalog", "columns", "c"), "g", items_of([item("table", col("c", "table_oid"))]),
+        items_of([NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))]))
+    val rows = cr_on(cr_two(), Sort(agg, items_of([SortKey(col("g", "table"), false, false)])))
+    assert_eq(rows.len(), 2)
+    assert(rows[0] == rec([UInt(cr_oid(cr_two(), "t")), Int(3)]))
+    assert(rows[1] == rec([UInt(cr_oid(cr_two(), "u")), Int(2)]))
+
+@test
+a_union_typed_column_is_matched_on_its_tag()
+    val c = cat_ok(cat_base(), cat_index("t_b", "t", ["b"]))
+    val state = Match(col("c", "state"), items_of([MatchArm("building", "p1", cat_text("building")), MatchArm("ready", "p2", cat_text("ready")),
+        MatchArm("failed", "p3", cat_text("failed"))]), None)
+    assert(cr_on(c, Project(scan("catalog", "indexes", "c"), "r", items_of([item("s", state)])))[0] == rec([Text("building")]))
+
+@test
+a_user_view_over_a_catalog_relation_reads_it()
+    val q = Project(scan("catalog", "tables", "c"), "o", items_of([item("name", col("c", "name"))]))
+    val c = cat_ok(cat_base(), cat_view("my_tables", q))
+    assert_eq(cr_names(cr_on(c, scan("app", "my_tables", "m"))), "t")
+
+    // A table created later is seen through the view.
+    val d = cat_ok(c, cat_table("x", [cat_col("id", Int64)], ["id"]))
+    assert_eq(cr_names(cr_on(d, scan("app", "my_tables", "m"))), "t,x")
+
+// -- read-only, §4.1 rule 1 -----------------------------------------------------------------------------
+
+@test
+writes_to_a_catalog_relation_are_refused_with_q5003()
+    val s = mem_store(cat_base())
+    val cols = items_of([Field("name", Text)])
+    val ins = Insert(QualName("catalog", "tables"), "i", None, items_of(["name"]), Values("v", cols, items_of([items_of([cat_text("x")])])), None, buf[Item]())
+    assert_eq(cr_code(s, s.begin(Snapshot), ins), "Q5003")
+
+    val upd = Update(QualName("catalog", "columns"), "u", None, None, None, items_of([item("name", cat_text("z"))]), buf[Item]())
+    assert_eq(cr_code(s, s.begin(Snapshot), upd), "Q5003")
+    assert_eq(cr_code(s, s.begin(Snapshot), Delete(QualName("catalog", "namespaces"), "d", None, None, None, buf[Item]())), "Q5003")
+    assert_eq(cr_code(s, s.begin(Snapshot), Delete(QualName("catalog", "version"), "d", None, None, Some(Literal(Bool, Bool(true))), buf[Item]())), "Q5003")
+
+    // Nothing changed.
+    assert_eq(cr_names(cr_run(s, s.begin(Snapshot), cr_pick("tables", ["name"]))), "t")
+    assert_eq(cr_now(cat_base(), "namespaces").len(), 3)
+
+@test
+every_served_relation_is_read_only_to_the_type_checker()
+    for name in ["version", "namespaces", "tables", "columns", "indexes", "constraints", "types", "sequences", "views", "roles", "grants", "depends"]
+        val info = cat_base().table(QualName("catalog", name)).unwrap()
+        assert(info.is_view, name)
+        assert_eq(info.unique.len(), 0, name)
+
+        for c in info.columns
+            assert(!c.writable, name)
+
+@test
+a_relation_section_4_2_does_not_serve_and_the_stored_trees_are_unknown_tables()
+    val s = mem_store(cat_base())
+
+    for name in ["jobs", "schema_versions", "nothing", "Tables"]
+        assert_eq(cr_code(s, s.begin(Snapshot), Query(scan("catalog", name, "c"))), "Q2001", name)
+
+    assert_eq(cr_code(s, s.begin(Snapshot), Query(scan("sys", "objects", "c"))), "Q2001")
+    assert_eq(cr_code(s, s.begin(Snapshot), Query(scan("sys", "tables", "c"))), "Q2001")
+
+@test
+a_column_a_relation_does_not_have_is_q2003()
+    val s = mem_store(cat_base())
+    val q = Project(scan("catalog", "tables", "c"), "r", items_of([item("x", col("c", "kind"))]))
+    assert_eq(cr_code(s, s.begin(Snapshot), Query(q)), "Q2003")
+
+@test
+no_object_can_be_created_in_the_catalog_namespace()
+    assert_eq(cat_code(cat_base(), CreateTable(QualName("catalog", "tables"), items_of([cat_col("id", Int64)]), items_of(["id"]), buf(), false)), "Q6014")
+    assert_eq(cat_code(cat_base(), CreateView(QualName("catalog", "mine"), scan("app", "t", "x"), false)), "Q6014")
+
+@test
+every_role_may_read_the_catalog_relations()
+    val c = cat_ok(cat_base(), cat_role("nobody"))
+    val q = Join(Inner, scan("catalog", "tables", "t"), scan("catalog", "columns", "c"), None, None, None)
+    assert(statement_privileges(c, Query(q), "nobody").is_ok())
+    // A user table needs a grant.
+    assert_eq(st_code(statement_privileges(c, Query(scan("app", "t", "x")), "nobody")), "Q6015")
+
+// -- names, §8.1 -------------------------------------------------------------------------------------
+
+@test
+catalog_tables_and_a_user_table_named_tables_are_different_relations()
+    var c = cat_ok(cat_base(), cat_table("tables", [cat_col("id", Int64), cat_col("note", Text)], ["id"]))
+    val s = mem_store(c)
+    val t = s.begin(Snapshot)
+    xd_ran(s, t, envelope([], Insert(cat_q("tables"), "i", None, items_of(["id", "note"]),
+        Values("v", items_of([Field("id", Int64), Field("note", Text)]), items_of([items_of([cat_int(1), cat_text("mine")])])), None, buf[Item]())))
+
+    // The user's table has its own columns and rows.
+    assert(cr_run(s, t, scan("app", "tables", "x"))[0] == rec([Int(1), Text("mine")]))
+    // `catalog.tables` lists both tables, the user's `tables` among them.
+    assert_eq(cr_names(cr_run(s, t, cr_where("tables", "namespace", cat_text("app"), ["name"]))), "t,tables")
+
+    // A user table named `columns` in `app` does not hide `catalog.columns`.
+    c = cat_ok(c, cat_table("columns", [cat_col("id", Int64)], ["id"]))
+    assert_eq(cr_now(c, "columns").len(), 6)
+    assert_eq(cr_on(c, scan("app", "columns", "x")).len(), 0)
+
+// -- through the engine ---------------------------------------------------------------------------------
+
+/** `select name from catalog.tables where namespace = 'app'`. */
+private cr_app_tables() -> Envelope = query([], cr_where("tables", "namespace", cat_text("app"), ["name"]))
+
+@test
+a_session_sees_its_transaction_s_ddl_in_the_catalog_and_another_session_does_not()
+    val e = ew_engine()
+    ew_setup(e, [ew_app()])
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+
+    a.send(Begin(1, no_txn_options()))
+    assert_eq(a.kinds_of(1, ew_table("x", [Field("id", Int64)], "id")), "header complete")
+    assert_eq(cr_names(ew_rows(a.seen(a.send(ew_exec(1, cr_app_tables()))))), "x")
+    assert_eq(ew_rows(b.seen(b.send(ew_exec(0, cr_app_tables())))).len(), 0)
+
+    assert_eq(ew_kinds(a.seen(a.send(Rollback(1)))), "ok")
+    assert_eq(ew_rows(a.seen(a.send(ew_exec(0, cr_app_tables())))).len(), 0)
+
+    assert_eq(a.kinds_of(0, ew_table("y", [Field("id", Int64)], "id")), "header complete")
+    assert_eq(cr_names(ew_rows(b.seen(b.send(ew_exec(0, cr_app_tables()))))), "y")
+
+@test
+a_write_to_a_catalog_relation_through_the_engine_is_q5003()
+    val e = ew_engine()
+    var a = ew_duo(e)
+    assert_eq(a.kinds_of(0, envelope([], Delete(QualName("catalog", "tables"), "d", None, None, None, buf[Item]()))), "Q5003")
+
+// -- the text form, `query-tree.md` §15 ----------------------------------------------------------------
+
+@test
+expressions_print_in_the_text_form()
+    assert_eq(expr_text(col("row", "a")), "row.a")
+    assert_eq(expr_text(Param(2)), "$2")
+    assert_eq(expr_text(Literal(Int64, Int(-3))), "'-3'::int64")
+    assert_eq(expr_text(Literal(Text, Text("a'b''"))), "'a''b'''''::text")
+    assert_eq(expr_text(Literal(Text, Text("'"))), "''''::text")
+    assert_eq(expr_text(Literal(Text, Text(""))), "''::text")
+    assert_eq(expr_text(Literal(Bool, Bool(true))), "'true'::bool")
+    assert_eq(expr_text(Null(nullable(Int32))), "(null :type int32?)")
+    assert_eq(expr_text(call("now", [])), "(call now)")
+    assert_eq(expr_text(call("add", [col("r", "a"), Literal(Int32, Int(1))])), "(call add r.a '1'::int32)")
+    assert_eq(expr_text(Cast(col("r", "a"), Text, Strict)), "(cast :expr r.a :type text)")
+    assert_eq(expr_text(Cast(col("r", "a"), Text, Try)), "(cast :expr r.a :type text :mode try)")
+    assert_eq(expr_text(Row("r")), "(row :binder r)")
+    assert_eq(expr_text(Action), "(action)")
+    assert_eq(expr_text(Record(buf[Item]())), "(record)")
+    assert_eq(expr_text(Record(items_of([item("x", col("r", "a")), item("y", Param(0))]))), "(record :fields [x: r.a y: $0])")
+    assert_eq(expr_text(Field(col("r", "p"), "x")), "(field :expr r.p :name x)")
+    assert_eq(expr_text(Variant(Named("app", "status"), "active", Record(buf[Item]()))), "(variant :type app.status :tag active :expr (record))")
+
+@test
+conditional_and_subquery_expressions_print_in_the_text_form()
+    val arms = items_of([IfArm(col("r", "c"), Literal(Int64, Int(1)))])
+    assert_eq(expr_text(If(arms, None)), "(if :arms [(if_arm :cond r.c :value '1'::int64)])")
+    assert_eq(expr_text(If(arms, Some(Literal(Int64, Int(2))))), "(if :arms [(if_arm :cond r.c :value '1'::int64)] :else '2'::int64)")
+    val m = Match(col("r", "s"), items_of([MatchArm("a", "p", col("p", "x"))]), Some(Literal(Int64, Int(0))))
+    assert_eq(expr_text(m), "(match :expr r.s :arms [(match_arm :tag a :binder p :expr p.x)] :else '0'::int64)")
+    val sc = scan("app", "t", "x")
+    assert_eq(expr_text(Relation(sc)), "(relation :rel (scan :table app.t :as x))")
+    assert_eq(expr_text(Scalar(sc)), "(scalar :rel (scan :table app.t :as x))")
+    assert_eq(expr_text(Exists(sc)), "(exists :rel (scan :table app.t :as x))")
+    assert_eq(expr_text(In(items_of([col("r", "a")]), sc)), "(in :exprs [r.a] :rel (scan :table app.t :as x))")
+
+@test
+relations_print_in_the_text_form()
+    val sc = scan("app", "t", "x")
+    assert_eq(rel_text(Values("v", items_of([Field("a", Int64)]), items_of([items_of([Literal(Int64, Int(1))])]))),
+        "(values :as v :columns [a: int64] :rows [['1'::int64]])")
+    assert_eq(rel_text(Values("v", items_of([Field("a", Int64)]), buf[Buf[Expr]]())), "(values :as v :columns [a: int64])")
+    assert_eq(rel_text(ParamScan("p", 1)), "(param_scan :as p :param $1)")
+    assert_eq(rel_text(Project(sc, "o", items_of([item("a", col("x", "a"))]))), "(project :input (scan :table app.t :as x) :as o :items [a: x.a])")
+    assert_eq(rel_text(Join(Inner, sc, scan("app", "u", "y"), None, None, None)),
+        "(join :left (scan :table app.t :as x) :right (scan :table app.u :as y))")
+    assert_eq(rel_text(Join(MarkJoin, sc, scan("app", "u", "y"), Some(col("x", "b")), Some("m"), Some("j"))),
+        "(join :kind mark :left (scan :table app.t :as x) :right (scan :table app.u :as y) :on x.b :mark m :as j)")
+    assert_eq(rel_text(Apply(Outer, sc, sc, None, None, None)), "(apply :kind outer :left (scan :table app.t :as x) :right (scan :table app.t :as x))")
+    assert_eq(rel_text(Sort(sc, items_of([SortKey(col("x", "a"), true, true), SortKey(col("x", "b"), false, false)]))),
+        "(sort :input (scan :table app.t :as x) :keys [(desc x.a nulls_first) (asc x.b nulls_last)])")
+    assert_eq(rel_text(Limit(sc, Some(Param(0)), Some(Literal(Int64, Int(5))), true, true)),
+        "(limit :input (scan :table app.t :as x) :count $0 :offset '5'::int64 :ties true :arbitrary true)")
+    assert_eq(rel_text(Distinct(sc)), "(distinct :input (scan :table app.t :as x))")
+    assert_eq(rel_text(SetOp(Union, false, "s", items_of([sc, sc]))), "(set_op :as s :inputs [(scan :table app.t :as x) (scan :table app.t :as x)])")
+    assert_eq(rel_text(SetOp(Except, true, "s", items_of([sc, sc]))),
+        "(set_op :op except :all true :as s :inputs [(scan :table app.t :as x) (scan :table app.t :as x)])")
+    assert_eq(rel_text(CteRef("c", "z")), "(cte_ref :name c :as z)")
+    val w = With(true, items_of([CteDef("c", Some(items_of([Field("n", Int64)])), sc), CteDef("d", None, sc)]), CteRef("c", "z"))
+    assert_eq(rel_text(w), "(with :recursive true :ctes [(cte_def :name c :columns [n: int64] :rel (scan :table app.t :as x)) (cte_def :name d :rel (scan :table app.t :as x))] :body (cte_ref :name c :as z))")
+    assert_eq(rel_text(Unnest(sc, "e", col("x", "l"), true, Some("i"))), "(unnest :input (scan :table app.t :as x) :as e :value x.l :outer true :ordinality i)")
+    assert_eq(rel_text(Tag(sc, "g", record([Field("a", Int64)]), "k")), "(tag :input (scan :table app.t :as x) :as g :type {a: int64} :tag k)")
+    assert_eq(rel_text(Nest(sc, "n", items_of([item("k", col("x", "k"))]), "items", items_of([item("v", col("x", "v"))]), items_of([SortKey(col("x", "v"), false, false)]))),
+        "(nest :input (scan :table app.t :as x) :as n :keys [k: x.k] :name items :items [v: x.v] :order [(asc x.v nulls_last)])")
+
+@test
+aggregate_and_window_calls_print_as_their_function()
+    val sc = scan("app", "t", "x")
+    val count = NamedAgg("n", AggCall("count", buf[Expr](), false, None, buf[SortKey]()))
+    val sum = NamedAgg("s", AggCall("sum", items_of([col("x", "a")]), true, Some(col("x", "ok")), items_of([SortKey(col("x", "a"), false, false)])))
+    assert_eq(rel_text(Aggregate(sc, "g", items_of([item("k", col("x", "k"))]), items_of([count, sum]))),
+        "(aggregate :input (scan :table app.t :as x) :as g :keys [k: x.k] :aggs [n: (count) s: (sum x.a :distinct true :filter x.ok :order [(asc x.a nulls_last)])])")
+
+    val rn = NamedWin("r", WinCall("row_number", buf[Expr](), items_of([col("x", "k")]), items_of([SortKey(col("x", "a"), true, false)]), None))
+    val frame = Frame(Rows, Bound(Preceding, Some(Literal(Int64, Int(2)))), Bound(CurrentRow, None), ExcludeTies)
+    val sm = NamedWin("s", WinCall("sum", items_of([col("x", "a")]), buf[Expr](), buf[SortKey](), Some(frame)))
+    val whole = Frame(Range, Bound(UnboundedPreceding, None), Bound(UnboundedFollowing, None), ExcludeNone)
+    val dflt = NamedWin("d", WinCall("sum", items_of([col("x", "a")]), buf[Expr](), buf[SortKey](), Some(whole)))
+    assert_eq(rel_text(Window(sc, "w", items_of([rn, sm, dflt]))),
+        "(window :input (scan :table app.t :as x) :as w :items [r: (row_number :partition [x.k] :order [(desc x.a nulls_last)]) s: (sum x.a :frame (frame :start (bound :kind preceding :offset '2'::int64) :end (bound :kind current) :exclude ties)) d: (sum x.a :frame (frame :unit range :start (bound) :end (bound :kind unbounded_following)))])")
+
+@test
+the_text_form_of_the_spec_s_worked_encoding()
+    // `query-tree.md` §12.7's tree, written there in the text form.
+    val q = Filter(scan("app", "t", "t"), call("eq", [col("t", "id"), Param(0)]))
+    assert_eq(query_text(q), "(query :rel (filter :input (scan :table app.t :as t) :predicate (call eq t.id $0)))")

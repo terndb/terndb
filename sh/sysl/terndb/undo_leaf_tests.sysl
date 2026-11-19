@@ -1,0 +1,223 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The clustered leaf under the undo log (`undo.sysl`): each table's rows in a B+tree of their own,
+// every value a §4.1 header and §4.2 body laid out by its schema version's column widths, which give
+// exactly the bytes `encode_row` gives for those types; a row too large for the leaf refused before
+// any record is written; rollback to a savepoint's record; and a dropped table's pages freed.
+
+private ul2_cols(vs: []const string) -> Buf[ColumnImage]
+    val out = buf[ColumnImage]()
+
+    for v in vs
+        out.push(if v == "~" then ColumnImage(true, buf[u8]()) else ColumnImage(false, undo_bytes(v.bytes)))
+
+    out
+
+private ul2_done(r: Result[UndoWrite, CodecError]) -> u64 = r match
+    Ok(UndoDone(a)) -> a
+    Ok(_) -> panic("a write was refused")
+    Err(e) -> panic(s"a write failed: ${e.message}")
+
+private ul2_check(u: &UndoRows) -> UndoStats = check_undo(u) match
+    Ok(s) -> s
+    Err(e) -> panic(s"the undo check failed: ${e.message}")
+
+private ul2_get(u: &UndoRows, oid: u64, key: string, s: u64, own: u64) -> Option[Buf[ColumnImage]] = u.read(oid, key.bytes, s, own) match
+    Ok(Some(r)) -> Some(r.cols)
+    Ok(None) -> None
+    Err(e) -> panic(s"a read failed: ${e.message}")
+
+private ul2_w(xs: []const usize) -> Buf[usize]
+    val out = buf[usize]()
+    out.extend(xs)
+    out
+
+private ul2_fill(c: u8, n: usize) -> ColumnImage
+    val b = buf[u8]()
+
+    for _ in 0..<n
+        b.push(c)
+
+    ColumnImage(false, b)
+
+@test
+a_leaf_row_is_the_row_format_of_its_types()
+    // int32, text (nullable), int64 (nullable), bytes: fixed, variable, fixed, variable.
+    val tys = buf[Type]()
+    tys.extend([Int32, nullable(Text), nullable(Int64), Bytes])
+    val vals = buf[Value]()
+    vals.extend([Value.Int(7), Value.Text("hello"), Value.Null, Value.Bytes(undo_bytes([1, 2, 3]))])
+    val hd = RowHeader(9, 4096 + 32, RowLockOnly, 3)
+    val want = encode_row(hd, tys.view(), vals.view()).unwrap()
+    val cols = buf[ColumnImage]()
+
+    for i in 0..<4
+        cols.push(if vals[i].is_null() then ColumnImage(true, buf[u8]()) else ColumnImage(false, encode_value(tys[i], vals[i]).unwrap()))
+
+    val widths = buf[usize]()
+
+    for t in tys
+        widths.push(row_width(t.base()))
+
+    val got = encode_leaf_row(RowImage(hd, cols), widths.view()).unwrap()
+    assert_eq(got, want)
+    assert_eq(decode_leaf_row(got.view(), widths.view()).unwrap(), RowImage(hd, cols))
+    assert_eq(decode_row(tys.view(), got.view()).unwrap().values, vals)
+
+@test
+a_leaf_row_of_no_columns_or_only_nulls_round_trips()
+    val none = RowImage(RowHeader(1, 32, 0, 1), buf[ColumnImage]())
+    val b = encode_leaf_row(none, buf[usize]().view()).unwrap()
+    assert_eq(b.len(), RowHeaderSize)
+    assert_eq(decode_leaf_row(b.view(), buf[usize]().view()).unwrap(), none)
+    val nulls = RowImage(RowHeader(1, 32, RowDeleted, 1), ul2_cols(["~", "~", "~", "~", "~", "~", "~", "~", "~"]))
+    val w = ul2_w([8, 0, 4, 0, 0, 16, 1, 2, 0])
+    val nb = encode_leaf_row(nulls, w.view()).unwrap()
+    assert_eq(nb.len(), RowHeaderSize + 2 + 8 + 4 + 16 + 1 + 2 + 2 * 4)
+    assert_eq(decode_leaf_row(nb.view(), w.view()).unwrap(), nulls)
+
+@test
+a_leaf_row_that_breaks_its_layout_is_refused()
+    val w = ul2_w([4, 0])
+    assert_eq(encode_leaf_row(RowImage(RowHeader(1, 32, 0, 1), ul2_cols(["abc", "x"])), w.view()).unwrap_err().code, "Q3001")
+    assert_eq(encode_leaf_row(RowImage(RowHeader(1, 32, 0, 1), ul2_cols(["abcd"])), w.view()).unwrap_err().code, "Q3001")
+    val big = buf[ColumnImage]()
+    big.push(ul2_fill(0x41, 40000))
+    big.push(ul2_fill(0x42, 40000))
+    assert_eq(encode_leaf_row(RowImage(RowHeader(1, 32, 0, 1), big), ul2_w([0, 0]).view()).unwrap_err().code, "D2002")
+    val good = encode_leaf_row(RowImage(RowHeader(1, 32, 0, 1), ul2_cols(["abcd", "xy"])), w.view()).unwrap()
+    assert_eq(decode_leaf_row(good.view(), w.view()).unwrap().cols, ul2_cols(["abcd", "xy"]))
+    // Short bodies, a stray bitmap bit, a null with bytes, bytes past the end, an external column.
+    for n in 0..<good.len()
+        assert_eq(decode_leaf_row(good.view()[0..<n], w.view()).is_err(), true, s"a row cut to $n bytes")
+
+    val stray = undo_bytes(good.view())
+    stray[RowHeaderSize] = 4
+    assert_eq(decode_leaf_row(stray.view(), w.view()).unwrap_err().code, "D1001")
+    val null_fixed = undo_bytes(good.view())
+    null_fixed[RowHeaderSize] = 1
+    assert_eq(decode_leaf_row(null_fixed.view(), w.view()).unwrap_err().code, "D1001")
+    val null_var = undo_bytes(good.view())
+    null_var[RowHeaderSize] = 2
+    assert_eq(decode_leaf_row(null_var.view(), w.view()).unwrap_err().code, "D1001")
+    val longer = undo_bytes(good.view())
+    longer.push(0)
+    assert_eq(decode_leaf_row(longer.view(), w.view()).unwrap_err().code, "D1001")
+    val ext = undo_bytes(good.view())
+    ext[16] = u8(RowHasExternal)
+    assert_eq(decode_leaf_row(ext.view(), w.view()).unwrap_err().code, "D1001")
+
+@test
+a_row_the_leaf_cannot_hold_is_refused_before_any_record()
+    val u = undo_rows()
+    u.layout(1, 1, ul2_w([8, 0]).view())
+    val t = u.begin()
+    // A fixed column of the wrong width.
+    assert_eq(u.insert(t, 1, "k".bytes, 1, ul2_cols(["abc", "x"]).view()).unwrap_err().code, "Q3001")
+    // A key over 1,024 bytes.
+    val long_key = buf[u8]()
+
+    for _ in 0..<1025
+        long_key.push(0x6b)
+
+    assert_eq(u.insert(t, 1, long_key.view(), 1, ul2_cols(["abcdefgh", "x"]).view()).unwrap_err().code, "D2001")
+    // Exactly at the in-place limit, and one byte past it.
+    val at_limit = 4000 - 1 - (RowHeaderSize + 1 + 8 + 2)
+    val cols = buf[ColumnImage]()
+    cols.push(ColumnImage(false, undo_bytes("abcdefgh".bytes)))
+    cols.push(ul2_fill(0x61, at_limit))
+    ul2_done(u.insert(t, 1, "k".bytes, 1, cols.view()))
+    cols[1] = ul2_fill(0x61, at_limit + 1)
+    assert_eq(u.insert(t, 1, "j".bytes, 1, cols.view()).unwrap_err().code, "D2002")
+    assert_eq(u.update(t, 1, "k".bytes, 1, cols.view()).unwrap_err().code, "D2002")
+    assert_eq(ul2_check(u).records, 1)
+    u.commit(t).unwrap()
+    assert_eq(u.row_count(), 1)
+    ul2_check(u)
+
+@test
+rows_of_many_tables_live_in_trees_of_their_own()
+    val u = undo_rows()
+    val t = u.begin()
+
+    for o in [30, 10, 20]
+        for i in 0..<300
+            ul2_done(u.insert(t, u64(o), s"key$i".bytes, 1, [ul2_fill(u8(o), 200)]))
+
+    u.commit(t).unwrap()
+    val trees = u.all_trees()
+    assert_eq(trees.len(), 3)
+    assert_eq(trees[0].owner, 10)
+    assert_eq(trees[2].owner, 30)
+    assert(u.tree_of(20).unwrap().events.leaf_splits > 0, "the rows split leaves")
+    assert_eq(u.row_count(), 900)
+    assert_eq(u.table_rows(20, KeyAny, KeyAny).unwrap().len(), 300)
+    assert_eq(ul2_get(u, 20, "key7", 1, 0).unwrap()[0], ul2_fill(20, 200))
+    assert_eq(ul2_check(u).rows, 900)
+    // Dropping a table frees its pages, and the check finds no page left over.
+    val before = u.data.allocated()
+    u.drop_table(20)
+    assert(u.data.allocated() < before, "the dropped table's pages are freed")
+    assert_eq(u.tree_of(20).is_none(), true)
+    assert_eq(u.row_count(), 600)
+    ul2_check(u)
+
+@test
+rollback_to_a_record_undoes_only_what_came_after()
+    val u = undo_rows()
+    val c0 = u.begin()
+    ul2_done(u.insert(c0, 1, "a".bytes, 1, ul2_cols(["a0"]).view()))
+    ul2_done(u.insert(c0, 1, "b".bytes, 1, ul2_cols(["b0"]).view()))
+    u.commit(c0).unwrap()
+    val t = u.begin()
+    ul2_done(u.update(t, 1, "a".bytes, 1, ul2_cols(["a1"]).view()))
+    val mark = u.last_record(t)
+    ul2_done(u.update(t, 1, "a".bytes, 1, ul2_cols(["a2"]).view()))
+    ul2_done(u.delete(t, 1, "b".bytes))
+    ul2_done(u.insert(t, 1, "c".bytes, 1, ul2_cols(["c2"]).view()))
+    assert_eq(u.lock(t, 1, "b".bytes), Ok(UndoMissing))
+    ul2_check(u)
+    assert_eq(u.rollback_to(t, mark), Ok(true))
+    assert_eq(u.last_record(t), mark)
+    assert_eq(ul2_get(u, 1, "a", 1, t), Some(ul2_cols(["a1"])))
+    assert_eq(ul2_get(u, 1, "b", 1, t), Some(ul2_cols(["b0"])))
+    assert_eq(ul2_get(u, 1, "c", 1, t), None)
+    assert_eq(u.undone.len(), 3)
+    ul2_check(u)
+    // Writing again after the rollback, then rolling back to nothing, then committing.
+    ul2_done(u.update(t, 1, "b".bytes, 1, ul2_cols(["b3"]).view()))
+    ul2_check(u)
+    assert_eq(u.rollback_to(t, 0), Ok(true))
+    assert_eq(ul2_get(u, 1, "a", 1, t), Some(ul2_cols(["a0"])))
+    assert_eq(ul2_get(u, 1, "b", 1, t), Some(ul2_cols(["b0"])))
+    ul2_check(u)
+    ul2_done(u.update(t, 1, "a".bytes, 1, ul2_cols(["a4"]).view()))
+    val c = u.commit(t).unwrap()
+    assert_eq(ul2_get(u, 1, "a", c, 0), Some(ul2_cols(["a4"])))
+    assert_eq(ul2_get(u, 1, "a", c - 1, 0), Some(ul2_cols(["a0"])))
+    ul2_check(u)
+    // Purge passes the rolled-back records with the rest, and forgets them.
+    u.purge(0xffffffffffffffff).unwrap()
+    assert_eq(u.undone.len(), 0)
+    assert_eq(ul2_check(u).records, 0)
+    // A stop that is not on the chain, and a transaction that is not active.
+    val t2 = u.begin()
+    ul2_done(u.update(t2, 1, "a".bytes, 1, ul2_cols(["a5"]).view()))
+    assert_eq(u.rollback_to(t2, u.last_record(t2) + 1).unwrap_err().code, "D1001")
+    assert_eq(u.rollback_to(t, 0), Ok(false))
+
+@test
+the_check_refuses_a_rolled_back_record_a_row_still_names()
+    val u = undo_rows()
+    val t = u.begin()
+    ul2_done(u.insert(t, 1, "a".bytes, 1, ul2_cols(["1"]).view()))
+    val mark = u.last_record(t)
+    ul2_done(u.update(t, 1, "a".bytes, 1, ul2_cols(["2"]).view()))
+    val row = u.current(1, "a".bytes).unwrap().unwrap()
+    u.rollback_to(t, mark).unwrap()
+    ul2_check(u)
+    u.put_row(1, "a".bytes, row)
+    assert_eq(check_undo(u).unwrap_err().code, "D1001")

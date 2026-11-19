@@ -1,0 +1,271 @@
+module sh.sysl.terndb
+@tests
+
+// The statement buffer (`shell_split.sysl`): statements typed across lines, `;` inside strings,
+// identifiers and comments, several statements to a line, and what the prompt shows meanwhile.
+
+/** The buffer after `lines` are added one by one, and every statement taken after each line, joined
+ * by ` | `.
+ */
+private sp_feed(lines: []const string) -> (StatementBuffer, string)
+    var b = statement_buffer()
+    var taken = ""
+    for l in lines
+        b.add(l)
+        for s in b.take()
+            taken = if taken.len == 0 then s else taken + " | " + s
+    (b, taken)
+
+@test
+a_statement_on_one_line_is_taken_whole()
+    val (b, taken) = sp_feed(["select 1;"])
+    assert_eq(taken, "select 1;")
+    assert(b.is_empty(), "nothing left")
+
+@test
+a_statement_split_over_many_lines_waits_for_its_semicolon()
+    var b = statement_buffer()
+    b.add("select")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "-")
+    b.add("  a,")
+    assert_eq(b.take().len(), 0)
+    b.add("  b")
+    assert_eq(b.take().len(), 0)
+    b.add("from t")
+    assert_eq(b.take().len(), 0)
+    b.add(";")
+    val got = b.take()
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], "select\n  a,\n  b\nfrom t\n;")
+    assert(b.is_empty(), "nothing left")
+    assert_eq(b.prompt_mark(), "=")
+
+@test
+blank_lines_inside_a_statement_are_kept()
+    val (b, taken) = sp_feed(["select", "", "   ", "1;"])
+    assert_eq(taken, "select\n\n   \n1;")
+    assert(b.is_empty(), "nothing left")
+
+@test
+blank_lines_before_a_statement_are_not_buffered()
+    var b = statement_buffer()
+    b.add("")
+    b.add("   ")
+    assert(b.is_empty(), "blank lines alone buffer nothing")
+    assert_eq(b.prompt_mark(), "=")
+
+@test
+a_semicolon_in_a_string_does_not_end_the_statement()
+    val (b, taken) = sp_feed(["select 'a;b';"])
+    assert_eq(taken, "select 'a;b';")
+    assert(b.is_empty(), "nothing left")
+
+@test
+a_string_spanning_lines_with_a_semicolon_inside_waits_for_its_close()
+    var b = statement_buffer()
+    b.add("insert into t values ('one;")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "'")
+    b.add("two;")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "'")
+    b.add("three')")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "-")
+    b.add(";")
+    val got = b.take()
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], "insert into t values ('one;\ntwo;\nthree')\n;")
+
+@test
+a_doubled_quote_does_not_close_a_string()
+    var b = statement_buffer()
+    b.add("select 'it''s;")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "'")
+    b.add("';")
+    assert_eq(b.take()[0], "select 'it''s;\n';")
+
+@test
+a_semicolon_in_a_quoted_identifier_does_not_end_the_statement()
+    var b = statement_buffer()
+    b.add("select 1 as \"a;")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "\"")
+    b.add("b\"\"c\";")
+    assert_eq(b.take()[0], "select 1 as \"a;\nb\"\"c\";")
+
+@test
+a_semicolon_in_a_line_comment_does_not_end_the_statement()
+    var b = statement_buffer()
+    b.add("select 1 -- not yet;")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "-")
+    b.add(";")
+    assert_eq(b.take()[0], "select 1 -- not yet;\n;")
+
+@test
+a_block_comment_spanning_lines_hides_its_semicolons()
+    var b = statement_buffer()
+    b.add("select /* one;")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "*")
+    b.add("two; */ 1;")
+    assert_eq(b.take()[0], "select /* one;\ntwo; */ 1;")
+    assert(b.is_empty(), "nothing left")
+
+@test
+block_comments_nest()
+    var b = statement_buffer()
+    b.add("select /* a /* b */ still; */ 1;")
+    assert_eq(b.take()[0], "select /* a /* b */ still; */ 1;")
+
+@test
+a_comment_opener_inside_a_string_is_text()
+    val (_, taken) = sp_feed(["select '/*', '--';"])
+    assert_eq(taken, "select '/*', '--';")
+
+@test
+a_quote_inside_a_comment_opens_no_string()
+    val (b, taken) = sp_feed(["select 1 -- don't", ";"])
+    assert_eq(taken, "select 1 -- don't\n;")
+    assert(b.is_empty(), "nothing left")
+
+@test
+several_statements_on_one_line_are_taken_in_order()
+    val (b, taken) = sp_feed(["select 1; select 2;select 3;"])
+    assert_eq(taken, "select 1; | select 2; | select 3;")
+    assert(b.is_empty(), "nothing left")
+
+@test
+a_statement_ending_mid_line_leaves_the_next_one_buffered()
+    var b = statement_buffer()
+    b.add("select 1; select")
+    val got = b.take()
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], "select 1;")
+    assert(!b.is_empty(), "the second statement is buffered")
+    assert_eq(b.prompt_mark(), "-")
+    b.add("2;")
+    assert_eq(b.take()[0], "select\n2;")
+
+@test
+an_empty_statement_is_dropped()
+    val (b, taken) = sp_feed([";", " ; ;", "-- c", ";", "/* x */;"])
+    assert_eq(taken, "")
+    assert(b.is_empty(), "nothing left")
+
+@test
+a_comment_alone_buffers_nothing()
+    var b = statement_buffer()
+    b.add("-- a note")
+    assert_eq(b.take().len(), 0)
+    assert(b.is_empty(), "a line comment alone is dropped")
+    assert_eq(b.prompt_mark(), "=")
+    b.add("/* closed */")
+    assert_eq(b.take().len(), 0)
+    assert(b.is_empty(), "a closed block comment alone is dropped")
+
+@test
+an_open_block_comment_alone_stays_buffered()
+    var b = statement_buffer()
+    b.add("/* open")
+    assert_eq(b.take().len(), 0)
+    assert(!b.is_empty(), "the comment is still open")
+    assert_eq(b.prompt_mark(), "*")
+    b.add("*/")
+    assert_eq(b.take().len(), 0)
+    assert(b.is_empty(), "closed, and nothing to run")
+
+@test
+open_parentheses_show_in_the_prompt()
+    var b = statement_buffer()
+    b.add("select (1 +")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "(")
+    b.add("2)")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "-")
+
+@test
+a_parenthesis_in_a_string_does_not_count()
+    var b = statement_buffer()
+    b.add("select '('")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.prompt_mark(), "-")
+
+@test
+finish_returns_an_unterminated_statement_and_empties_the_buffer()
+    var b = statement_buffer()
+    b.add("select 1")
+    b.add("")
+    assert_eq(b.take().len(), 0)
+    assert_eq(b.finish(), Some("select 1"))
+    assert(b.is_empty(), "emptied")
+    assert_eq(b.finish(), None)
+
+@test
+finish_returns_nothing_for_comments_alone()
+    var b = statement_buffer()
+    b.add("/* open")
+    assert_eq(b.finish(), None)
+    assert(b.is_empty(), "emptied")
+
+@test
+finish_returns_an_unterminated_string_for_the_front_end_to_refuse()
+    var b = statement_buffer()
+    b.add("select 'abc")
+    assert_eq(b.finish(), Some("select 'abc"))
+
+@test
+reset_forgets_the_buffer()
+    var b = statement_buffer()
+    b.add("select 'abc")
+    b.reset()
+    assert(b.is_empty(), "emptied")
+    assert_eq(b.prompt_mark(), "=")
+    assert(b.in_code(), "back in code")
+
+@test
+a_meta_command_line_starts_with_a_backslash()
+    assert(is_meta_line("\\q"), "\\q")
+    assert(is_meta_line("   \\dt"), "indented")
+    assert(!is_meta_line("select '\\q'"), "inside a statement")
+    assert(!is_meta_line(""), "empty")
+    assert(!is_meta_line("   "), "blank")
+
+@test
+a_backslash_line_inside_a_string_is_not_in_code()
+    var b = statement_buffer()
+    b.add("select 'abc")
+    assert(!b.in_code(), "inside the string")
+    b.add("'")
+    assert(b.in_code(), "the string closed")
+
+@test
+leading_blanks_of_a_statement_are_trimmed()
+    val (_, taken) = sp_feed(["   select 1;   ", "\tselect 2;"])
+    assert_eq(taken, "select 1; | select 2;")
+
+@test
+unicode_text_in_strings_splits_correctly()
+    val (_, taken) = sp_feed(["select 'héllo; 世界'; select 2;"])
+    assert_eq(taken, "select 'héllo; 世界'; | select 2;")
+
+@test
+scan_sql_reports_every_end_offset()
+    val s = scan_sql("a;b;'c;';")
+    assert_eq(s.ends.len(), 3)
+    assert_eq(s.ends[0], 2)
+    assert_eq(s.ends[1], 4)
+    assert_eq(s.ends[2], 9)
+    assert(s.state == InCode, "in code at the end")
+
+@test
+scan_sql_reports_an_unclosed_quote_at_the_very_end()
+    assert(scan_sql("select '").state == InString, "a lone quote at the end opens a string")
+    assert(scan_sql("select \"").state == InQuotedIdent, "a lone double quote opens an identifier")
+    assert(scan_sql("select 1 -").state == InCode, "one dash is code")
+    assert(scan_sql("select 1 /").state == InCode, "one slash is code")
+    assert(scan_sql("select 1 --").state == InLineComment, "a line comment to the end")

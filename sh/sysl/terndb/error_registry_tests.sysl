@@ -1,0 +1,404 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.fs.{entries, exists}
+import sysl.path.join
+import sysl.text.from_utf8
+
+// `docs/spec/errors.md` is the one registry of error codes. These tests embed it, parse its rows, and
+// hold the implementation to it: every code the sources name in a string literal is a registered,
+// live code, and the names and retryability the implementation carries are the registry's.
+
+/** One registry row: the code, its snake_case name, the area letter of the section it sits in, whether
+ * it is withdrawn, and (for a `T`, `W` or `S` row) whether its R column says the request may be re-run.
+ */
+struct RegistryRow
+    code: string
+    name: string
+    area: string
+    withdrawn: bool
+    retryable: bool
+
+/** One source file of the package, by name, as embedded. */
+struct SourceText
+    file: string
+    text: []const u8
+
+/** A code a source names, and the first file that does. */
+struct Raised
+    code: string
+    file: string
+
+private src(out: Buf[SourceText], file: string, text: []const u8) = out.push(SourceText(file, text))
+
+/** Every non-test source file of the package. `embed` takes only a literal path, so a new source file
+ * is added here, and `every_source_file_of_the_package_is_listed_in_sources` fails until it is.
+ */
+sources() -> Buf[SourceText]
+    val out = buf[SourceText]()
+    src(out, "btree_check.sysl", embed("btree_check.sysl"))
+    src(out, "btree.sysl", embed("btree.sysl"))
+    src(out, "catalog_alter.sysl", embed("catalog_alter.sysl"))
+    src(out, "catalog_apply.sysl", embed("catalog_apply.sysl"))
+    src(out, "catalog_drop.sysl", embed("catalog_drop.sysl"))
+    src(out, "catalog_mvcc.sysl", embed("catalog_mvcc.sysl"))
+    src(out, "catalog_objects.sysl", embed("catalog_objects.sysl"))
+    src(out, "catalog_privileges.sysl", embed("catalog_privileges.sysl"))
+    src(out, "catalog_relations.sysl", embed("catalog_relations.sysl"))
+    src(out, "catalog_typing.sysl", embed("catalog_typing.sysl"))
+    src(out, "catalog_walk.sysl", embed("catalog_walk.sysl"))
+    src(out, "catalog.sysl", embed("catalog.sysl"))
+    src(out, "clock.sysl", embed("clock.sysl"))
+    src(out, "columns.sysl", embed("columns.sysl"))
+    src(out, "compare.sysl", embed("compare.sysl"))
+    src(out, "decode.sysl", embed("decode.sysl"))
+    src(out, "encode.sysl", embed("encode.sysl"))
+    src(out, "engine_authority.sysl", embed("engine_authority.sysl"))
+    src(out, "engine.sysl", embed("engine.sysl"))
+    src(out, "error.sysl", embed("error.sysl"))
+    src(out, "exec_agg.sysl", embed("exec_agg.sysl"))
+    src(out, "exec_dml.sysl", embed("exec_dml.sysl"))
+    src(out, "exec_eval.sysl", embed("exec_eval.sysl"))
+    src(out, "exec_functions.sysl", embed("exec_functions.sysl"))
+    src(out, "exec_join.sysl", embed("exec_join.sysl"))
+    src(out, "exec_kernels.sysl", embed("exec_kernels.sysl"))
+    src(out, "exec_nest.sysl", embed("exec_nest.sysl"))
+    src(out, "exec_ops.sysl", embed("exec_ops.sysl"))
+    src(out, "exec_plan.sysl", embed("exec_plan.sysl"))
+    src(out, "exec_scan.sysl", embed("exec_scan.sysl"))
+    src(out, "exec_sequence.sysl", embed("exec_sequence.sysl"))
+    src(out, "exec_setop.sysl", embed("exec_setop.sysl"))
+    src(out, "exec_vector.sysl", embed("exec_vector.sysl"))
+    src(out, "exec_view.sysl", embed("exec_view.sysl"))
+    src(out, "exec_window_slide.sysl", embed("exec_window_slide.sysl"))
+    src(out, "exec_window.sysl", embed("exec_window.sysl"))
+    src(out, "exec_zone.sysl", embed("exec_zone.sysl"))
+    src(out, "history_check.sysl", embed("history_check.sysl"))
+    src(out, "history_workloads.sysl", embed("history_workloads.sysl"))
+    src(out, "history.sysl", embed("history.sysl"))
+    src(out, "iso_lockstep.sysl", embed("iso_lockstep.sysl"))
+    src(out, "iso_model.sysl", embed("iso_model.sysl"))
+    src(out, "json.sysl", embed("json.sysl"))
+    src(out, "key_encoding.sysl", embed("key_encoding.sysl"))
+    src(out, "page_map.sysl", embed("page_map.sysl"))
+    src(out, "page.sysl", embed("page.sysl"))
+    src(out, "plan_unnest.sysl", embed("plan_unnest.sysl"))
+    src(out, "primitives.sysl", embed("primitives.sysl"))
+    src(out, "qtree_check.sysl", embed("qtree_check.sysl"))
+    src(out, "qtree_decode.sysl", embed("qtree_decode.sysl"))
+    src(out, "qtree_encode.sysl", embed("qtree_encode.sysl"))
+    src(out, "qtree_recursion.sysl", embed("qtree_recursion.sysl"))
+    src(out, "qtree_types.sysl", embed("qtree_types.sysl"))
+    src(out, "qtree.sysl", embed("qtree.sysl"))
+    src(out, "row_format.sysl", embed("row_format.sysl"))
+    src(out, "server.sysl", embed("server.sysl"))
+    src(out, "session_auth.sysl", embed("session_auth.sysl"))
+    src(out, "session_client.sysl", embed("session_client.sysl"))
+    src(out, "session_common.sysl", embed("session_common.sysl"))
+    src(out, "session_executor.sysl", embed("session_executor.sysl"))
+    src(out, "session_server.sysl", embed("session_server.sysl"))
+    src(out, "shell_conn.sysl", embed("shell_conn.sysl"))
+    src(out, "shell_meta.sysl", embed("shell_meta.sysl"))
+    src(out, "shell_render.sysl", embed("shell_render.sysl"))
+    src(out, "shell_split.sysl", embed("shell_split.sysl"))
+    src(out, "shell.sysl", embed("shell.sysl"))
+    src(out, "store_index.sysl", embed("store_index.sysl"))
+    src(out, "store_savepoint.sysl", embed("store_savepoint.sysl"))
+    src(out, "store.sysl", embed("store.sysl"))
+    src(out, "text_form.sysl", embed("text_form.sysl"))
+    src(out, "text_tree.sysl", embed("text_tree.sysl"))
+    src(out, "translate.sysl", embed("translate.sysl"))
+    src(out, "types.sysl", embed("types.sysl"))
+    src(out, "undo_check.sysl", embed("undo_check.sysl"))
+    src(out, "undo.sysl", embed("undo.sysl"))
+    src(out, "value.sysl", embed("value.sysl"))
+    src(out, "wire_codec.sysl", embed("wire_codec.sysl"))
+    src(out, "wire_decode.sysl", embed("wire_decode.sysl"))
+    src(out, "wire_encode.sysl", embed("wire_encode.sysl"))
+    src(out, "wire_frame.sysl", embed("wire_frame.sysl"))
+    src(out, "wire_messages.sysl", embed("wire_messages.sysl"))
+    src(out, "wire_params.sysl", embed("wire_params.sysl"))
+    src(out, "wire_reassembler.sysl", embed("wire_reassembler.sysl"))
+    out
+end sources
+
+private utf8(b: []const u8) -> string = from_utf8(b).unwrap()
+
+private is_area_letter(c: u8) -> bool =
+    c == u8('Q') || c == u8('R') || c == u8('T') || c == u8('W') || c == u8('D') || c == u8('C') || c == u8('S')
+
+private is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+/** Whether `code` is one area letter then four decimal digits (`errors.md` §1 rule 1). */
+well_formed_code(code: string) -> bool
+    val b = code.bytes
+    if b.len != 5 then return false
+    if !is_area_letter(b[0]) then return false
+
+    for i in 1..<5
+        if !is_digit(b[i]) then return false
+
+    true
+
+/** Whether `name` is `snake_case`: lower-case letters, digits and underscores, starting with a letter. */
+snake_case(name: string) -> bool
+    val b = name.bytes
+    if b.len == 0 || b[0] < u8('a') || b[0] > u8('z') then return false
+
+    for c in b
+        if !(c >= u8('a') && c <= u8('z')) && !is_digit(c) && c != u8('_') then return false
+
+    true
+
+/** The index of the next `c` in `line` at or after `from`, or `line.len` when there is none. */
+private find_byte(line: []const u8, c: u8, from: usize) -> usize
+    var i = from
+    while i < line.len && line[i] != c
+        i += 1
+
+    i
+
+/** Whether the last cell of table row `line` begins "yes": the R column of a `T`, `W` or `S` table. */
+private last_cell_is_yes(line: []const u8) -> bool
+    var i = line.len
+    var bars = 0
+
+    while i > 0 && bars < 2
+        i -= 1
+        if line[i] == u8('|') then bars += 1
+
+    val at = i + 2
+    at + 3 <= line.len && utf8(line[at..<at + 3]) == "yes"
+
+/** The registry rows of `errors.md`: every table row whose first cell is a backticked code, with the
+ * area letter its section heading names (`## 2. Query tree: validation (`Q`)`).
+ */
+parse_registry(file: []const u8) -> Buf[RegistryRow]
+    val rows = buf[RegistryRow]()
+    var area = ""
+    var at: usize = 0
+
+    while at < file.len
+        val end = find_byte(file, u8('\n'), at)
+        val line = file[at..<end]
+        at = end + 1
+
+        if line.len > 3 && line[0] == u8('#') && line[1] == u8('#') && line[2] == u8(' ')
+            // A heading ending "(`X`)" names its area; any other heading names none.
+            area = ""
+            if line.len > 5 && line[line.len - 1] == u8(')') && line[line.len - 2] == u8('`') && line[line.len - 4] == u8('`') && line[line.len - 5] == u8('(')
+                area = utf8(line[line.len - 3..<line.len - 2])
+
+        elif line.len > 3 && line[0] == u8('|') && line[1] == u8(' ') && line[2] == u8('`')
+            val code_end = find_byte(line, u8('`'), 3)
+            val code = utf8(line[3..<code_end])
+            // Cell two: "| `code` | `name` |".
+            val name_start = code_end + 5
+            val name = if name_start < line.len && line[code_end + 1] == u8(' ') then utf8(line[name_start..<find_byte(line, u8('`'), name_start)]) else ""
+            val retryable = (area == "T" || area == "W" || area == "S") && last_cell_is_yes(line)
+            rows.push(RegistryRow(code, name, area, utf8(line).contains("*Withdrawn*"), retryable))
+
+    rows
+end parse_registry
+
+/** The registry as embedded. */
+registry() -> Buf[RegistryRow] = parse_registry(embed("../../../docs/spec/errors.md"))
+
+private find_row(rows: Buf[RegistryRow], code: string) -> Option[RegistryRow]
+    for r in rows
+        if r.code == code then return Some(r)
+
+    None
+
+/** The codes a source text names in a string literal, `"Q3001"`, in order of appearance, with repeats. */
+literal_codes(text: []const u8) -> Buf[string]
+    val out = buf[string]()
+    if text.len < 7 then return out
+
+    for i in 0..<text.len - 6
+        if text[i] == u8('"') && text[i + 6] == u8('"') && is_area_letter(text[i + 1])
+            var digits = true
+            for j in 2..<6
+                if !is_digit(text[i + j]) then digits = false
+
+            if digits then out.push(utf8(text[i + 1..<i + 6]))
+
+    out
+
+/** Every code the package's sources name, once each, with the first file that does. */
+raised_codes() -> Buf[Raised]
+    val seen = set[string]()
+    val out = buf[Raised]()
+
+    for s in sources()
+        for c in literal_codes(s.text)
+            if seen.add(c) then out.push(Raised(c, s.file))
+
+    out
+
+/** The directory holding the package's sources, relative to where the tests run, or "" if neither
+ * the package root nor the directory itself holds `error.sysl`.
+ */
+private source_dir() -> string
+    for dir in ["sh/sysl/terndb", "."]
+        if exists(join(dir, "error.sysl")) then return dir
+
+    ""
+
+@test
+the_registry_parses_to_every_area()
+    val rows = registry()
+    assert(rows.len() > 150, s"only ${rows.len()} rows parsed")
+
+    for area in ["Q", "R", "T", "W", "D", "C", "S"]
+        var n = 0
+        for r in rows
+            if r.area == area then n += 1
+
+        assert(n > 0, s"no rows in area $area")
+
+@test
+the_parser_reads_a_row_a_heading_and_a_withdrawn_mark()
+    val text = "## 4. Things (`T`)\n\n| Code | Name |\n|---|---|\n| `T1001` | `one_thing` | when | all | yes |\n| `T1002` | `two_thing` | when | all | **no**: x |\n## Form\n| `Q1001` | `no_area` | *Withdrawn*: gone |\n"
+    val rows = parse_registry(text.bytes)
+    assert_eq(rows.len(), 3)
+    assert_eq(rows[0].code, "T1001")
+    assert_eq(rows[0].name, "one_thing")
+    assert_eq(rows[0].area, "T")
+    assert(rows[0].retryable)
+    assert(!rows[0].withdrawn)
+    assert(!rows[1].retryable)
+    assert_eq(rows[2].area, "")
+    assert(rows[2].withdrawn)
+
+@test
+every_registered_code_is_well_formed()
+    for r in registry()
+        assert(well_formed_code(r.code), s"malformed code '${r.code}'")
+
+@test
+the_form_check_refuses_a_malformed_code_or_name()
+    assert(well_formed_code("Q3001"))
+    assert(!well_formed_code("Q301"))
+    assert(!well_formed_code("Q30011"))
+    assert(!well_formed_code("X3001"))
+    assert(!well_formed_code("q3001"))
+    assert(!well_formed_code("Q30a1"))
+    assert(snake_case("unique_violation"))
+    assert(snake_case("a1"))
+    assert(!snake_case(""))
+    assert(!snake_case("Unique"))
+    assert(!snake_case("1a"))
+    assert(!snake_case("a-b"))
+    assert(!snake_case("a b"))
+
+@test
+every_registered_code_is_unique()
+    val seen = set[string]()
+    for r in registry()
+        assert(seen.add(r.code), s"duplicate code ${r.code}")
+
+@test
+every_registered_name_is_unique_snake_case()
+    val seen = set[string]()
+    for r in registry()
+        assert(snake_case(r.name), s"${r.code}: name '${r.name}' is not snake_case")
+        assert(seen.add(r.name), s"${r.code}: duplicate name ${r.name}")
+
+@test
+every_code_sits_in_the_section_of_its_letter()
+    for r in registry()
+        assert(r.area == utf8(r.code.bytes[0..<1]), s"${r.code} is in the section for area '${r.area}'")
+
+private group_digit_ok(a: u8, d: u8) -> bool =
+    if a == u8('Q') then d >= u8('1') && d <= u8('7')
+    elif a == u8('R') then d == u8('0')
+    elif a == u8('T') || a == u8('W') || a == u8('D') then d >= u8('1') && d <= u8('4')
+    elif a == u8('C') then d == u8('1') || d == u8('2')
+    else d >= u8('1') && d <= u8('3')
+
+@test
+every_code_is_in_a_first_digit_group_its_area_uses()
+    // `errors.md` §1 rule 1: the first digit groups related codes within an area. The groups are those the
+    // registry's tables use today (`Q1`–`Q7`, `R0`, `T1`–`T4`, `W1`–`W4`, `D1`–`D4`, `C1`–`C2`, `S1`–`S3`);
+    // a code in a group of no table is a typo or a new group, and a new group is added to the table above.
+    for r in registry()
+        val a = r.code.bytes[0]
+        val d = r.code.bytes[1]
+        assert(group_digit_ok(a, d), s"${r.code} has a first digit no group of its area has")
+
+@test
+the_scanner_reads_a_literal_code_and_ignores_other_text()
+    val got = literal_codes("fail(\"Q3001\", \"x\") \"Q30011\" \"q3001\" \"Q301\" \"X1001\" \"W2003\"".bytes)
+    assert_eq(got.len(), 2)
+    assert_eq(got[0], "Q3001")
+    assert_eq(got[1], "W2003")
+    assert_eq(literal_codes("".bytes).len(), 0)
+    assert_eq(literal_codes("\"Q3001\"".bytes).len(), 1)
+    assert_eq(literal_codes("\"Q3001".bytes).len(), 0)
+
+@test
+every_source_file_of_the_package_is_listed_in_sources()
+    val dir = source_dir()
+    assert(dir.len > 0, "the package's sources are not under the working directory of the tests")
+
+    val listed = set[string]()
+    for s in sources()
+        listed.add(s.file)
+
+    var seen = 0
+    for name in entries(dir).unwrap()
+        if name.ends_with(".sysl") && !name.ends_with("_tests.sysl")
+            seen += 1
+            assert(listed.has(name), s"$name is a source file of the package and is not in sources()")
+
+    assert_eq(seen, sources().len())
+
+@test
+every_code_the_sources_name_is_registered_and_live()
+    val rows = registry()
+    val raised = raised_codes()
+    assert(raised.len() > 100, s"only ${raised.len()} codes found in the sources")
+
+    for r in raised
+        val row = find_row(rows, r.code)
+        assert(row.is_some(), s"${r.code} is named in ${r.file} and not in errors.md")
+        assert(!row.unwrap().withdrawn, s"${r.code} is named in ${r.file} and withdrawn in errors.md")
+
+@test
+the_withdrawn_code_is_in_the_registry_and_in_no_source()
+    val rows = registry()
+    assert(find_row(rows, "W2017").unwrap().withdrawn)
+
+    for r in raised_codes()
+        assert(r.code != "W2017", s"W2017 is withdrawn and ${r.file} names it")
+
+@test
+the_history_checker_names_codes_as_the_registry_does()
+    val rows = registry()
+    var named_codes = 0
+
+    for r in rows
+        val named = error_name(r.code)
+        if named != r.code
+            named_codes += 1
+            assert_eq(named, r.name, r.code)
+
+    assert_eq(named_codes, 6)
+
+@test
+the_history_checker_retries_what_the_registry_does()
+    val rows = registry()
+    for r in rows
+        if retryable_code(r.code) then assert(r.retryable, s"${r.code} is retried and not retryable in errors.md")
+
+    // T1001 to T1004 are the retryable codes a history carries.
+    for code in ["T1001", "T1002", "T1003", "T1004"]
+        assert(find_row(rows, code).unwrap().retryable, code)
+        assert(retryable_code(code), code)
+
+    // A code the registry marks no-retry is not retried by the checker.
+    for code in ["T2001", "T3001", "T4001", "W2003", "Q3001"]
+        assert(!retryable_code(code), code)
