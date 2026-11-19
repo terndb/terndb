@@ -1,0 +1,1103 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `sql.md`'s edge cases, one per test: empty and one-token input, keywords quoted and folded, the
+// limits of every constant, deep nesting, each `Q8` code, `NULL` in every position, and every type
+// name with its aliases. Trees are compared with the tree of an equivalent text where that is
+// clearer than spelling the tree.
+
+/** The code alone of `text`'s error, or `ok`. */
+private se_code(text: string) -> string = sql_statements(text, "public", SqFixture()) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** The number of statements `text` translates to; -1 for an error. */
+private se_count(text: string) -> int = sql_statements(text, "public", SqFixture()) match
+    Ok(s) -> int(s.len())
+    Err(_) -> -1
+
+/** Asserts `a` and `b` translate to the same statement. */
+private se_same(a: string, b: string, file: string = __FILE__, line: long = __LINE__)
+    val x = sq_stmt(a, SqFixture(), file, line)
+    val y = sq_stmt(b, SqFixture(), file, line)
+    if x != y then print(s"\nnot the same tree:\n  $a\n  $b\n")
+    assert(x == y, "the two texts translate to one tree", file, line)
+
+/** The first select item of `SELECT e FROM src`. */
+private se_e(e: string, src: string = "t", file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_rel(s"SELECT $e FROM $src", SqFixture(), file, line) match
+        Project(_, _, items) -> items[0].expr
+        _ ->
+            assert(false, "a project", file, line)
+            sq_i32(0)
+
+/** The first select item of `SELECT e`, with no `FROM`. */
+private se_bare(e: string, file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_rel(s"SELECT $e", SqFixture(), file, line) match
+        Project(_, _, items) -> items[0].expr
+        _ ->
+            assert(false, "a project", file, line)
+            sq_i32(0)
+
+private se_eq[T: Eq](got: T, want: T, what: string, file: string = __FILE__, line: long = __LINE__)
+    if got != want then print(s"\nthe tree of: $what\n")
+    assert(got == want, "the tree is the one sql.md gives", file, line)
+
+/** The column types of the `VALUES` an `INSERT` reads. */
+private se_insert_types(text: string, file: string = __FILE__, line: long = __LINE__) -> Buf[Type]
+    val out = buf[Type]()
+    sq_stmt(text, SqFixture(), file, line) match
+        Insert(_, _, _, _, rel, _, _) -> rel match
+            Values(_, fields, _) ->
+                for f in fields
+                    out.push(f.ty)
+            _ -> assert(false, "a VALUES source", file, line)
+        _ -> assert(false, "an insert", file, line)
+    out
+
+private se_types(ts: []const Type) -> Buf[Type]
+    val b = buf[Type]()
+    b.extend(ts)
+    b
+
+/** `n` copies of `s`. */
+private se_rep(s: string, n: int) -> string
+    var out = ""
+    for _ in 0..<n
+        out = out + s
+    out
+
+private se_dec(p: u8, s: u8, v: i128) -> Expr = Literal(Decimal(p, s), Value.Int(v))
+
+private sq_call(f: string, args: []const Expr) -> Expr = Call(f, items_of(args))
+
+private sq_lit_of(t: Type, text: string) -> Expr = Literal(t, from_text(t, text).unwrap())
+
+// -- empty input and a lone token -------------------------------------------------------------------
+
+@test
+an_empty_script_has_no_statements()
+    assert_eq(se_count(""), 0)
+
+@test
+a_script_of_whitespace_has_no_statements()
+    assert_eq(se_count("  \n\t\r "), 0)
+
+@test
+a_script_of_a_line_comment_has_no_statements()
+    assert_eq(se_count("-- nothing"), 0)
+
+@test
+a_script_of_a_block_comment_has_no_statements()
+    assert_eq(se_count("/* nothing */"), 0)
+
+@test
+a_script_of_semicolons_has_no_statements()
+    assert_eq(se_count(";"), 0)
+    assert_eq(se_count(" ; ;; "), 0)
+
+@test
+empty_statements_between_others_are_skipped()
+    assert_eq(se_count(";SELECT 1;;SELECT 2;"), 2)
+
+@test
+one_statement_of_empty_text_is_refused()
+    sql_statement("", "public", SqFixture()) match
+        Ok(_) -> assert(false, "refused")
+        Err(e) -> assert_eq(e.code, "Q8001")
+
+@test
+one_statement_of_two_is_refused()
+    sql_statement("SELECT 1; SELECT 2", "public", SqFixture()) match
+        Ok(_) -> assert(false, "refused")
+        Err(e) -> assert_eq(e.code, "Q8001")
+
+@test
+a_lone_keyword_ends_too_early()
+    assert_eq(sq_err("SELECT"), "Q8001@1:7")
+
+@test
+a_lone_name_is_no_statement()
+    assert_eq(sq_err("users"), "Q8001@1:1")
+
+@test
+a_lone_number_is_no_statement()
+    assert_eq(sq_err("1"), "Q8001@1:1")
+
+@test
+a_lone_string_is_no_statement()
+    assert_eq(sq_err("'a'"), "Q8001@1:1")
+
+@test
+a_lone_parameter_is_no_statement()
+    assert_eq(sq_err("$1"), "Q8001@1:1")
+
+@test
+a_lone_open_parenthesis_ends_too_early()
+    assert_eq(sq_err("("), "Q8001@1:2")
+
+@test
+a_lone_close_parenthesis_is_no_statement()
+    assert_eq(sq_err(")"), "Q8001@1:1")
+
+@test
+a_lone_operator_is_no_statement()
+    assert_eq(sq_err("*"), "Q8001@1:1")
+
+@test
+a_lone_dot_is_no_statement()
+    assert_eq(sq_err("."), "Q8001@1:1")
+
+@test
+select_with_an_empty_list_is_refused()
+    assert_eq(sq_err("SELECT;"), "Q8001@1:7")
+
+@test
+select_from_with_no_table_ends_too_early()
+    assert_eq(sq_err("SELECT a FROM"), "Q8001@1:14")
+
+@test
+where_with_no_condition_ends_too_early()
+    assert_eq(sq_err("SELECT a FROM t WHERE"), "Q8001@1:22")
+
+@test
+a_trailing_comma_in_the_select_list_is_refused()
+    assert_eq(sq_err("SELECT a, FROM t"), "Q8001@1:11")
+
+@test
+an_error_after_an_empty_statement_is_positioned_in_the_script()
+    assert_eq(sq_err(";\n;\n  SELECT"), "Q8001@3:9")
+
+@test
+an_empty_string_is_an_empty_text()
+    se_eq(se_bare("''"), sq_txt(""), "''")
+
+@test
+an_empty_e_string_is_an_empty_text()
+    se_eq(se_bare("E''"), sq_txt(""), "E''")
+
+@test
+a_string_of_one_quote_is_a_quote()
+    se_eq(se_bare("''''"), sq_txt("'"), "''''")
+
+@test
+a_semicolon_inside_a_string_does_not_split()
+    assert_eq(se_count("SELECT ';'; SELECT 2"), 2)
+
+@test
+a_semicolon_inside_a_quoted_identifier_does_not_split()
+    assert_eq(se_count("SELECT \"a;b\" FROM t"), 1)
+
+@test
+a_semicolon_inside_a_comment_does_not_split()
+    assert_eq(se_count("SELECT 1 /* ; */; -- ;\nSELECT 2"), 2)
+
+// -- keywords, quoted and unquoted, and case folding -------------------------------------------------
+
+private se_reserved() -> []const string = ["all", "and", "any", "as", "asc", "between", "both", "case", "cast", "check", "collate",
+    "constraint", "create", "cross", "current_timestamp", "default", "desc", "distinct", "do", "else", "end", "except", "exists",
+    "false", "fetch", "for", "foreign", "from", "full", "group", "having", "ilike", "in", "inner", "intersect", "into", "is", "join",
+    "lateral", "left", "like", "limit", "natural", "not", "null", "offset", "on", "only", "or", "order", "outer", "over", "primary",
+    "references", "returning", "right", "select", "similar", "some", "table", "then", "true", "union", "unique", "using", "values",
+    "when", "where", "window", "with"]
+
+@test
+every_reserved_word_unquoted_is_refused_as_an_alias()
+    for w in se_reserved()
+        if sq_err(s"SELECT a AS $w FROM t") != "Q8001@1:13" then print(s"\nreserved: $w\n")
+        assert_eq(sq_err(s"SELECT a AS $w FROM t"), "Q8001@1:13")
+
+@test
+every_reserved_word_upper_case_is_refused_as_an_alias()
+    for w in se_reserved()
+        val up = w.to_upper()
+        if sq_err(s"SELECT a AS $up FROM t") != "Q8001@1:13" then print(s"\nreserved: $up\n")
+        assert_eq(sq_err(s"SELECT a AS $up FROM t"), "Q8001@1:13")
+
+@test
+every_reserved_word_quoted_is_a_name()
+    for w in se_reserved()
+        se_eq(sq_rel(s"SELECT a AS \"$w\" FROM t"), Project(sq_scan("t", "t"), "select", items_of([item(w, Col("t", "a"))])), w)
+
+@test
+every_reserved_word_quoted_is_a_column()
+    for w in se_reserved()
+        se_eq(se_e(s"\"$w\""), Col("t", w), w)
+
+@test
+every_reserved_word_quoted_is_a_table()
+    for w in se_reserved()
+        se_eq(sq_rel(s"SELECT * FROM \"$w\""), sq_scan(w, w), w)
+
+@test
+a_reserved_word_as_a_column_definition_is_refused()
+    assert_eq(se_code("CREATE TABLE x (from int32)"), "Q8001")
+
+@test
+a_reserved_word_quoted_as_a_column_definition_is_a_name()
+    assert_eq(se_code("CREATE TABLE x (\"from\" int32)"), "ok")
+
+private se_unreserved() -> []const string = ["key", "set", "index", "first", "last", "date", "time", "timestamp", "interval", "uuid",
+    "text", "zone", "level", "work", "transaction", "nulls", "rows", "ties", "schema", "view", "filter", "escape", "column", "add",
+    "rename", "type", "serial", "insert", "update", "delete", "drop", "alter", "begin", "commit", "rollback", "savepoint", "release",
+    "conflict", "nothing", "isolation", "read", "write", "generated", "always", "identity", "precision", "without", "if", "to"]
+
+@test
+every_unreserved_keyword_is_a_column()
+    for w in se_unreserved()
+        se_eq(se_e(w), Col("t", w), w)
+
+@test
+every_unreserved_keyword_is_an_alias()
+    for w in se_unreserved()
+        se_eq(sq_rel(s"SELECT a AS $w FROM t"), Project(sq_scan("t", "t"), "select", items_of([item(w, Col("t", "a"))])), w)
+
+@test
+every_unreserved_keyword_is_a_table()
+    for w in se_unreserved()
+        se_eq(sq_rel(s"SELECT * FROM $w"), sq_scan(w, w), w)
+
+@test
+keywords_are_read_in_any_case()
+    se_same("sElEcT a FrOm t WhErE a = 1 OrDeR bY a", "SELECT a FROM t WHERE a = 1 ORDER BY a")
+
+@test
+unquoted_names_fold_to_lower_case()
+    se_same("SELECT A, Bb FROM T", "SELECT a, bb FROM t")
+
+@test
+quoted_names_keep_their_case()
+    se_eq(se_e("\"A\""), Col("t", "A"), "\"A\"")
+    assert(se_e("\"A\"") != se_e("A"), "a quoted upper-case name is another name")
+
+@test
+a_quoted_lower_case_name_is_the_unquoted_name()
+    se_same("SELECT \"a\" FROM \"t\"", "SELECT a FROM t")
+
+@test
+a_quoted_keyword_in_another_case_keeps_it()
+    se_eq(se_e("\"Select\""), Col("t", "Select"), "\"Select\"")
+
+@test
+a_quoted_name_may_hold_a_dot()
+    se_eq(se_e("\"a.b\""), Col("t", "a.b"), "\"a.b\"")
+
+@test
+a_quoted_name_may_hold_a_doubled_quote()
+    se_eq(se_e("\"a\"\"b\""), Col("t", "a\"b"), "\"a\"\"b\"")
+
+@test
+a_quoted_schema_and_table_keep_their_case()
+    se_eq(sq_rel("SELECT * FROM \"S\".\"T\""), Scan(QualName("S", "T"), "T"), "\"S\".\"T\"")
+
+@test
+only_ascii_letters_fold()
+    se_eq(se_e("ÉA"), Col("t", "Éa"), "ÉA")
+
+@test
+function_names_fold()
+    se_same("SELECT LOWER(a) FROM t", "SELECT lower(a) FROM t")
+
+@test
+aggregate_names_fold()
+    se_same("SELECT COUNT(*), Sum(a) FROM t", "SELECT count(*), sum(a) FROM t")
+
+@test
+type_names_fold()
+    se_same("SELECT CAST(a AS INT64), a::Double Precision, a::TIMESTAMP WITH TIME ZONE FROM t", "SELECT CAST(a AS int64), a::double precision, a::timestamp with time zone FROM t")
+
+@test
+transaction_keywords_fold()
+    assert(sq_action("begin") == sq_action("BEGIN"), "begin")
+    assert(sq_action("CoMmIt") == sq_action("commit"), "commit")
+    assert(sq_action("ROLLBACK") == sq_action("rollback"), "rollback")
+
+@test
+true_and_false_in_any_case_are_booleans()
+    se_eq(se_bare("TRUE"), Literal(Bool, Value.Bool(true)), "TRUE")
+    se_eq(se_bare("False"), Literal(Bool, Value.Bool(false)), "False")
+
+@test
+quoted_true_is_a_column()
+    se_eq(se_e("\"true\""), Col("t", "true"), "\"true\"")
+
+// -- the limits of every constant -------------------------------------------------------------------
+
+@test
+int32_max_is_an_int32()
+    se_eq(se_bare("2147483647"), sq_i32(2147483647), "int32 max")
+
+@test
+int32_min_is_an_int32()
+    se_eq(se_bare("-2147483648"), sq_i32(-2147483648), "int32 min")
+
+@test
+past_int32_min_is_an_int64()
+    se_eq(se_bare("-2147483649"), sq_i64(-2147483649), "past int32 min")
+
+@test
+int64_max_is_an_int64()
+    se_eq(se_bare("9223372036854775807"), sq_i64(9223372036854775807), "int64 max")
+
+@test
+int64_min_is_an_int64()
+    se_eq(se_bare("-9223372036854775808"), sq_i64(-9223372036854775808), "int64 min")
+
+@test
+past_int64_min_is_a_decimal()
+    se_eq(se_bare("-9223372036854775809"), se_dec(19, 0, -9223372036854775809), "past int64 min")
+
+@test
+thirty_eight_digits_are_a_decimal()
+    se_eq(se_bare("99999999999999999999999999999999999999"), se_dec(38, 0, 99999999999999999999999999999999999999), "38 digits")
+
+@test
+thirty_nine_digits_are_refused()
+    assert_eq(sq_err("SELECT 999999999999999999999999999999999999999"), "Q8004@1:8")
+
+@test
+thirty_nine_negative_digits_are_refused()
+    assert_eq(se_code("SELECT -999999999999999999999999999999999999999"), "Q8004")
+
+@test
+leading_zeros_are_not_significant()
+    se_eq(se_bare("00000000000000000000000000000000000000001"), sq_i32(1), "zero-padded 1")
+
+@test
+zero_is_an_int32()
+    se_eq(se_bare("0"), sq_i32(0), "0")
+
+@test
+negative_zero_is_an_int32_zero()
+    se_eq(se_bare("-0"), sq_i32(0), "-0")
+
+@test
+a_scale_of_thirty_eight_is_a_decimal()
+    se_eq(se_bare("0.12345678901234567890123456789012345678"), se_dec(38, 38, 12345678901234567890123456789012345678), "scale 38")
+
+@test
+a_scale_of_thirty_nine_is_refused()
+    assert_eq(sq_err("SELECT 0.123456789012345678901234567890123456789"), "Q8004@1:8")
+
+@test
+trailing_zeros_after_the_point_count()
+    se_eq(se_bare("1.000"), se_dec(4, 3, 1000), "1.000")
+
+@test
+zero_point_zero_is_a_decimal()
+    se_eq(se_bare("0.0"), se_dec(1, 1, 0), "0.0")
+
+@test
+float_max_is_a_float()
+    se_eq(se_bare("1.7976931348623157e308"), Literal(Float64, Value.Float(1.7976931348623157e308)), "float max")
+
+@test
+past_float_max_is_refused()
+    assert_eq(sq_err("SELECT 1e309"), "Q8004@1:8")
+
+@test
+a_float_below_the_smallest_is_zero()
+    se_eq(se_bare("1e-400"), Literal(Float64, Value.Float(0.0)), "underflow")
+
+@test
+an_exponent_of_zero_is_a_float()
+    se_eq(se_bare("5e0"), Literal(Float64, Value.Float(5.0)), "5e0")
+
+@test
+an_exponent_without_digits_is_refused()
+    assert_eq(sq_err("SELECT 1e"), "Q8003@1:8")
+
+@test
+a_letter_after_a_number_is_refused()
+    assert_eq(sq_err("SELECT 1x"), "Q8003@1:9")
+
+@test
+a_dollar_after_a_number_is_refused()
+    assert_eq(sq_err("SELECT 1$"), "Q8003@1:9")
+
+@test
+an_int16_column_takes_its_max()
+    assert_eq(se_code("INSERT INTO users (id, name, age) VALUES (1, 'a', 32767)"), "ok")
+
+@test
+an_int16_column_takes_its_min()
+    assert_eq(se_code("INSERT INTO users (id, name, age) VALUES (1, 'a', -32768)"), "ok")
+
+@test
+past_an_int16_column_s_max_is_refused()
+    assert_eq(se_code("INSERT INTO users (id, name, age) VALUES (1, 'a', 32768)"), "Q8004")
+
+@test
+past_an_int16_column_s_min_is_refused()
+    assert_eq(se_code("INSERT INTO users (id, name, age) VALUES (1, 'a', -32769)"), "Q8004")
+
+@test
+a_fraction_into_an_integer_column_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i) VALUES (1.5)"), "Q8004")
+
+@test
+a_whole_decimal_into_an_integer_column_is_refused()
+    assert_eq(sq_err("INSERT INTO nums (i) VALUES (2.0)"), "Q8004@1:30")
+
+@test
+a_float_into_an_integer_column_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i) VALUES (2e0)"), "Q8004")
+
+@test
+an_unsigned_column_takes_its_max()
+    assert_eq(se_code("INSERT INTO nums (i, u) VALUES (1, 4294967295)"), "ok")
+
+@test
+past_an_unsigned_column_s_max_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i, u) VALUES (1, 4294967296)"), "Q8004")
+
+@test
+a_negative_into_an_unsigned_column_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i, u) VALUES (1, -1)"), "Q8004")
+
+@test
+a_decimal_column_rounds_half_up()
+    se_same("INSERT INTO nums (i, d) VALUES (1, 1.005)", "INSERT INTO nums (i, d) VALUES (1, 1.01)")
+
+@test
+a_decimal_column_rounds_half_away_from_zero_below_zero()
+    se_same("INSERT INTO nums (i, d) VALUES (1, -1.005)", "INSERT INTO nums (i, d) VALUES (1, -1.01)")
+
+@test
+a_decimal_column_rounds_down_below_half()
+    se_same("INSERT INTO nums (i, d) VALUES (1, 1.004)", "INSERT INTO nums (i, d) VALUES (1, 1.00)")
+
+@test
+a_decimal_column_takes_its_widest_value()
+    assert_eq(se_code("INSERT INTO nums (i, d) VALUES (1, 99999999.99)"), "ok")
+
+@test
+past_a_decimal_column_s_precision_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i, d) VALUES (1, 999999999.99)"), "Q8004")
+
+@test
+rounding_up_past_a_decimal_column_s_precision_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i, d) VALUES (1, 99999999.995)"), "Q8004")
+
+@test
+past_float_max_into_a_float_column_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i, f) VALUES (1, 1e309)"), "Q8004")
+
+@test
+a_string_into_an_integer_column_is_read_as_one()
+    se_same("INSERT INTO nums (i) VALUES ('12')", "INSERT INTO nums (i) VALUES (12)")
+
+@test
+a_string_that_is_no_integer_into_an_integer_column_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i) VALUES ('x')"), "Q8004")
+
+@test
+a_leap_day_is_a_date()
+    assert_eq(se_code("INSERT INTO nums (i, dt) VALUES (1, '2024-02-29')"), "ok")
+
+@test
+a_day_past_the_month_s_end_is_refused()
+    assert_eq(se_code("INSERT INTO nums (i, dt) VALUES (1, '2023-02-29')"), "Q8004")
+
+@test
+a_typed_date_that_is_no_date_is_refused_at_the_type_name()
+    assert_eq(sq_err("SELECT DATE '2024-02-30'"), "Q8004@1:8")
+
+@test
+an_interval_in_postgres_form_is_refused()
+    assert_eq(sq_err("SELECT INTERVAL '1 day'"), "Q8004@1:8")
+
+@test
+an_interval_in_the_tree_s_form_is_one()
+    se_eq(se_bare("INTERVAL 'P1D'"), sq_lit_of(Interval, "P1D"), "INTERVAL 'P1D'")
+
+@test
+a_malformed_uuid_is_refused()
+    assert_eq(sq_err("SELECT UUID 'nope'"), "Q8004@1:8")
+
+@test
+a_string_with_a_doubled_quote_at_each_end()
+    se_eq(se_bare("'''a'''"), sq_txt("'a'"), "'''a'''")
+
+@test
+a_backslash_ends_no_plain_string()
+    se_eq(se_bare("'a\\'"), sq_txt("a\\"), "'a\\'")
+
+@test
+an_e_string_s_escaped_quote_does_not_end_it()
+    se_eq(se_bare("E'a\\'b'"), sq_txt("a'b"), "E'a\\'b'")
+
+@test
+an_e_string_s_highest_scalar_is_read()
+    se_eq(se_bare("E'\\U0010FFFF'"), sq_txt(string(char(0x10FFFF))), "U+10FFFF")
+
+@test
+an_e_string_s_last_surrogate_is_refused()
+    assert_eq(sq_err("SELECT E'\\uDFFF'"), "Q8003@1:10")
+
+@test
+an_e_string_s_short_long_escape_is_refused()
+    assert_eq(sq_err("SELECT E'\\U0001F6'"), "Q8003@1:10")
+
+@test
+an_unterminated_string_after_a_statement_is_positioned()
+    assert_eq(sq_err("SELECT 1; SELECT 'x"), "Q8002@1:18")
+
+@test
+an_unterminated_e_string_is_refused_at_the_e()
+    assert_eq(sq_err("SELECT e'x"), "Q8002@1:8")
+
+@test
+an_unterminated_quoted_identifier_is_refused()
+    assert_eq(sq_err("SELECT \"x"), "Q8002@1:8")
+
+@test
+an_unterminated_line_comment_is_whitespace()
+    assert_eq(se_count("SELECT 1 --"), 1)
+
+@test
+an_unterminated_block_comment_is_refused()
+    assert_eq(sq_err("SELECT 1 /*"), "Q8002@1:10")
+
+@test
+a_block_comment_closed_once_of_two_is_refused()
+    assert_eq(sq_err("SELECT 1 /* /* */"), "Q8002@1:10")
+
+@test
+a_stray_comment_close_is_an_operator_pair()
+    assert_eq(sq_err("SELECT 1 */"), "Q8001@1:11")
+
+@test
+the_highest_parameter_number_is_read()
+    assert(sql_tokens("$100000000").unwrap()[0].tok == TkParam(100000000), "$100000000")
+
+@test
+a_parameter_past_the_highest_is_refused()
+    assert_eq(sq_err("SELECT $100000001"), "Q8003@1:8")
+
+@test
+a_nine_digit_parameter_past_the_highest_is_refused()
+    assert_eq(sq_err("SELECT $999999999"), "Q8003@1:8")
+
+// -- deep nesting -----------------------------------------------------------------------------------
+
+@test
+two_hundred_parentheses_around_a_constant()
+    se_eq(se_bare(se_rep("(", 200) + "1" + se_rep(")", 200)), sq_i32(1), "200 parentheses")
+
+@test
+two_hundred_parentheses_around_a_column()
+    se_eq(se_e(se_rep("(", 200) + "a" + se_rep(")", 200)), Col("t", "a"), "200 parentheses")
+
+@test
+an_unclosed_parenthesis_two_hundred_deep_is_refused()
+    assert_eq(se_code("SELECT " + se_rep("(", 200) + "1"), "Q8001")
+
+@test
+an_extra_close_parenthesis_is_refused()
+    assert_eq(sq_err("SELECT (1))"), "Q8001@1:11")
+
+@test
+two_hundred_nots()
+    var want = Col("t", "a")
+    for _ in 0..<200
+        want = sq_call("not", [want])
+    se_eq(se_e(se_rep("NOT ", 200) + "a"), want, "200 nots")
+
+@test
+two_hundred_unary_minuses()
+    var want = Col("t", "a")
+    for _ in 0..<200
+        want = sq_call("neg", [want])
+    se_eq(se_e(se_rep("- ", 200) + "a"), want, "200 minuses")
+
+@test
+the_deepest_chain_of_additions_associates_left()
+    var want = Col("t", "a")
+    // The statement's query is level 1 and the select item level 2, so 254 operators reach 256.
+    for _ in 0..<254
+        want = sq_call("add", [want, Col("t", "a")])
+    se_eq(se_e("a" + se_rep(" + a", 254)), want, "254 additions")
+
+@test
+one_addition_past_the_deepest_is_refused()
+    assert_eq(se_code("SELECT a" + se_rep(" + a", 255) + " FROM t"), "Q1006")
+
+@test
+the_refusal_names_the_token_past_the_limit()
+    // "SELECT a" is 8 bytes and each " + a" 4: the 255th `+` is at byte 8 + 254 × 4 + 1 = 1025, and
+    // the limit is passed reading the operand after it, at byte 1027, column 1028.
+    assert_eq(sq_err("SELECT a" + se_rep(" + a", 255) + " FROM t"), "Q1006@1:1028")
+
+@test
+a_thousand_additions_are_refused_not_a_crash()
+    assert_eq(se_code("SELECT a" + se_rep(" + a", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_ands_are_refused_not_a_crash()
+    assert_eq(se_code("SELECT a FROM t WHERE a" + se_rep(" AND a", 1000)), "Q1006")
+
+@test
+a_thousand_concatenations_are_refused()
+    assert_eq(se_code("SELECT a" + se_rep(" || a", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_multiplications_are_refused()
+    assert_eq(se_code("SELECT a" + se_rep(" * a", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_ors_are_refused()
+    assert_eq(se_code("SELECT a" + se_rep(" OR a", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_is_nulls_are_refused()
+    assert_eq(se_code("SELECT a" + se_rep(" IS NULL", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_casts_are_refused()
+    assert_eq(se_code("SELECT a" + se_rep("::int64", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_unions_are_refused()
+    assert_eq(se_code("SELECT a FROM t" + se_rep(" UNION SELECT a FROM t", 1000)), "Q1006")
+
+@test
+a_thousand_intersects_are_refused()
+    assert_eq(se_code("SELECT a FROM t" + se_rep(" INTERSECT SELECT a FROM t", 1000)), "Q1006")
+
+@test
+a_thousand_joins_are_refused()
+    assert_eq(se_code("SELECT * FROM t" + se_rep(" CROSS JOIN t", 1000)), "Q1006")
+
+@test
+the_deepest_nots_are_read()
+    assert_eq(se_code("SELECT " + se_rep("NOT ", 254) + "a FROM t"), "ok")
+
+@test
+one_not_past_the_deepest_is_refused()
+    assert_eq(se_code("SELECT " + se_rep("NOT ", 255) + "a FROM t"), "Q1006")
+
+@test
+the_deepest_minuses_are_read()
+    assert_eq(se_code("SELECT " + se_rep("- ", 254) + "a FROM t"), "ok")
+
+@test
+one_minus_past_the_deepest_is_refused()
+    assert_eq(se_code("SELECT " + se_rep("- ", 255) + "a FROM t"), "Q1006")
+
+@test
+the_deepest_parentheses_are_read()
+    assert_eq(se_code("SELECT " + se_rep("(", 254) + "a" + se_rep(")", 254) + " FROM t"), "ok")
+
+@test
+one_parenthesis_past_the_deepest_is_refused()
+    assert_eq(se_code("SELECT " + se_rep("(", 255) + "a" + se_rep(")", 255) + " FROM t"), "Q1006")
+
+@test
+a_thousand_parentheses_are_refused_not_a_crash()
+    assert_eq(se_code("SELECT " + se_rep("(", 1000) + "a" + se_rep(")", 1000) + " FROM t"), "Q1006")
+
+@test
+a_thousand_nested_subqueries_are_refused_not_a_crash()
+    assert_eq(se_code(se_rep("SELECT (", 1000) + "SELECT 1" + se_rep(")", 1000)), "Q1006")
+
+@test
+a_thousand_nested_derived_tables_are_refused_not_a_crash()
+    assert_eq(se_code(se_rep("SELECT * FROM (", 1000) + "SELECT 1" + se_rep(") s", 1000)), "Q1006")
+
+@test
+the_depth_is_counted_again_in_each_statement()
+    val one = "SELECT " + se_rep("NOT ", 254) + "a FROM t"
+    assert_eq(se_count(one + ";" + one + ";" + one), 3)
+
+@test
+the_depth_comes_back_after_a_nested_expression()
+    val one = "(" + se_rep("NOT ", 250) + "a)"
+    assert_eq(se_code("SELECT " + one + " AND " + one + " AND " + one + " FROM t"), "ok")
+
+@test
+a_hundred_nested_function_calls()
+    assert_eq(se_code("SELECT " + se_rep("lower(", 100) + "a" + se_rep(")", 100) + " FROM t"), "ok")
+
+@test
+fifty_nested_cases()
+    assert_eq(se_code("SELECT " + se_rep("CASE WHEN a THEN ", 50) + "1" + se_rep(" ELSE 2 END", 50) + " FROM t"), "ok")
+
+@test
+a_hundred_nested_derived_tables()
+    var q = "SELECT a FROM t"
+    for i in 0..<100
+        q = s"SELECT a FROM ($q) d$i"
+    assert_eq(se_code(q), "ok")
+
+@test
+a_hundred_nested_scalar_subqueries()
+    assert_eq(se_code(se_rep("SELECT (", 100) + "SELECT 1" + se_rep(")", 100)), "ok")
+
+@test
+a_hundred_nested_exists()
+    assert_eq(se_code("SELECT a FROM t WHERE " + se_rep("EXISTS (SELECT 1 FROM t WHERE ", 100) + "true" + se_rep(")", 100)), "ok")
+
+@test
+a_hundred_ctes_each_reading_the_last()
+    var q = "WITH c0 AS (SELECT a FROM t)"
+    for i in 1..<100
+        q = q + s", c$i AS (SELECT a FROM c${i - 1})"
+    assert_eq(se_code(q + " SELECT a FROM c99"), "ok")
+
+@test
+a_hundred_unions()
+    assert_eq(se_code("SELECT a FROM t" + se_rep(" UNION SELECT a FROM t", 100)), "ok")
+
+@test
+a_hundred_joins()
+    var q = "SELECT t0.a FROM t t0"
+    for i in 1..<100
+        q = q + s" JOIN t t$i ON t$i.a = t0.a"
+    assert_eq(se_code(q), "ok")
+
+@test
+a_hundred_nested_block_comments()
+    assert_eq(se_count(se_rep("/* ", 100) + se_rep(" */", 100) + " SELECT 1"), 1)
+
+@test
+a_hundred_values_rows()
+    assert_eq(se_code("VALUES (1)" + se_rep(", (1)", 100)), "ok")
+
+@test
+a_thousand_select_items()
+    assert_eq(se_code("SELECT a" + se_rep(", a", 1000) + " FROM t"), "ok")
+
+@test
+a_thousand_statements()
+    assert_eq(se_count(se_rep("SELECT 1;", 1000)), 1000)
+
+// -- every Q8 code ----------------------------------------------------------------------------------
+
+@test
+q8001_a_token_the_grammar_does_not_allow()
+    assert_eq(sq_err("SELECT a FROM t t2 t3"), "Q8001@1:20")
+
+@test
+q8002_an_unterminated_string()
+    assert_eq(sq_err("SELECT 'a"), "Q8002@1:8")
+
+@test
+q8003_a_character_that_starts_no_token()
+    assert_eq(sq_err("SELECT a ~ b FROM t"), "Q8003@1:10")
+
+@test
+q8004_a_constant_that_is_not_a_value_of_its_type()
+    assert_eq(sq_err("SELECT TIMESTAMP 'yesterday'"), "Q8004@1:8")
+
+@test
+q8005_a_construct_the_dialect_does_not_have()
+    assert_eq(sq_err("SELECT DISTINCT ON (a) a FROM t"), "Q8005@1:17")
+
+@test
+q8006_a_refused_type_name()
+    assert_eq(sq_err("SELECT CAST(a AS varchar) FROM t"), "Q8006@1:18")
+
+@test
+q8007_a_null_without_a_type()
+    assert_eq(sq_err("SELECT NULL"), "Q8007@1:8")
+
+@test
+q8008_a_column_of_two_sources()
+    assert_eq(sq_err("SELECT id FROM users, posts"), "Q8008@1:8")
+
+@test
+q8009_an_ungrouped_column()
+    assert_eq(sq_err("SELECT name FROM users GROUP BY age"), "Q8009@1:8")
+
+@test
+q8010_a_construct_that_needs_unknown_columns()
+    assert_eq(se_code("SELECT *, 1 FROM t, u"), "Q8010")
+
+@test
+q8010_an_unqualified_column_of_two_opaque_sources()
+    assert_eq(se_code("SELECT a FROM t, u"), "Q8010")
+
+@test
+a_lone_star_over_two_opaque_sources_passes_the_join_through()
+    assert_eq(se_code("SELECT * FROM t, u"), "ok")
+
+@test
+q8011_an_order_by_position_out_of_range()
+    assert_eq(sq_err("SELECT a FROM t ORDER BY 2"), "Q8011@1:26")
+
+@test
+q8011_an_order_by_position_of_zero()
+    assert_eq(sq_err("SELECT a FROM t ORDER BY 0"), "Q8011@1:26")
+
+@test
+q8011_a_group_by_position_out_of_range()
+    assert_eq(sq_err("SELECT a FROM t GROUP BY 2"), "Q8011@1:26")
+
+@test
+q8012_a_values_row_of_the_wrong_length()
+    assert_eq(se_code("INSERT INTO users (id, name) VALUES (1)"), "Q8012")
+
+@test
+q8012_values_rows_of_different_lengths()
+    assert_eq(se_code("VALUES (1, 2), (3)"), "Q8012")
+
+@test
+q8013_a_column_defined_twice()
+    assert_eq(se_code("CREATE TABLE x (a int32, a int32)"), "Q8013")
+
+@test
+q8013_two_primary_keys()
+    assert_eq(se_code("CREATE TABLE x (a int32 PRIMARY KEY, b int32 PRIMARY KEY)"), "Q8013")
+
+@test
+q8013_null_and_not_null()
+    assert_eq(se_code("CREATE TABLE x (a int32 NULL NOT NULL)"), "Q8013")
+
+@test
+q8013_two_defaults()
+    assert_eq(se_code("CREATE TABLE x (a int32 DEFAULT 1 DEFAULT 2)"), "Q8013")
+
+@test
+the_first_error_of_a_script_wins()
+    assert_eq(sq_err("SELECT 1; SELECT NULL; SELECT 'x"), "Q8002@1:31")
+
+@test
+a_translation_error_after_a_good_statement_is_positioned()
+    assert_eq(sq_err("SELECT 1;\nSELECT NULL"), "Q8007@2:8")
+
+// -- NULL in every position -------------------------------------------------------------------------
+
+@test
+null_alone_has_no_type()
+    assert_eq(sq_err("SELECT NULL FROM t"), "Q8007@1:8")
+
+@test
+null_cast_takes_the_type()
+    se_eq(se_bare("CAST(NULL AS int64)"), Null(Int64), "CAST(NULL AS int64)")
+
+@test
+null_compared_with_a_known_column_takes_its_type()
+    se_eq(se_e("age = NULL", "users"), sq_call("eq", [Col("users", "age"), Null(Int16)]), "age = NULL")
+
+@test
+null_on_the_left_of_a_comparison_takes_the_column_s_type()
+    se_eq(se_e("NULL = age", "users"), sq_call("eq", [Null(Int16), Col("users", "age")]), "NULL = age")
+
+@test
+null_compared_with_an_opaque_column_has_no_type()
+    assert_eq(se_code("SELECT a = NULL FROM t"), "Q8007")
+
+@test
+null_is_null_has_no_type()
+    assert_eq(se_code("SELECT NULL IS NULL"), "Q8007")
+
+@test
+null_as_a_where_condition_has_no_type()
+    assert_eq(se_code("SELECT a FROM t WHERE NULL"), "Q8007")
+
+@test
+null_in_between_takes_the_column_s_type()
+    se_eq(se_e("age BETWEEN NULL AND 3", "users"), sq_call("and", [sq_call("ge", [Col("users", "age"), Null(Int16)]),
+        sq_call("le", [Col("users", "age"), Literal(Int16, Value.Int(3))])]), "BETWEEN NULL")
+
+@test
+null_in_an_in_list_takes_the_column_s_type()
+    se_eq(se_e("age IN (1, NULL)", "users"), sq_call("or", [sq_call("eq", [Col("users", "age"), Literal(Int16, Value.Int(1))]),
+        sq_call("eq", [Col("users", "age"), Null(Int16)])]), "IN (1, NULL)")
+
+@test
+null_as_a_like_pattern_is_text()
+    se_eq(se_e("name LIKE NULL", "users"), Call("like", items_of([Col("users", "name"), Null(Text), sq_txt("")])), "LIKE NULL")
+
+@test
+null_concatenated_with_a_string_constant_has_no_type()
+    assert_eq(se_code("SELECT NULL || 'a'"), "Q8007")
+
+@test
+null_concatenated_with_a_text_column_is_text()
+    se_eq(se_e("name || NULL", "users"), sq_call("concat", [Col("users", "name"), Null(Text)]), "name || NULL")
+
+@test
+null_added_to_a_column_takes_its_type()
+    se_eq(se_e("age + NULL", "users"), sq_call("add", [Col("users", "age"), Null(Int16)]), "age + NULL")
+
+@test
+null_as_a_function_argument_has_no_type()
+    assert_eq(se_code("SELECT lower(NULL)"), "Q8007")
+
+@test
+coalesce_of_nulls_has_no_type()
+    assert_eq(se_code("SELECT coalesce(NULL, NULL)"), "Q8007")
+
+@test
+coalesce_types_a_null_by_a_column()
+    se_eq(se_e("coalesce(age, NULL)", "users"), sq_call("coalesce", [Col("users", "age"), Null(Int16)]), "coalesce(age, NULL)")
+
+@test
+count_of_null_has_no_type()
+    assert_eq(se_code("SELECT count(NULL) FROM t"), "Q8007")
+
+@test
+a_case_of_only_nulls_has_no_type()
+    assert_eq(se_code("SELECT CASE WHEN a THEN NULL ELSE NULL END FROM t"), "Q8007")
+
+@test
+values_of_one_null_has_no_type()
+    assert_eq(se_code("VALUES (NULL)"), "Q8007")
+
+@test
+values_with_a_null_is_nullable()
+    sq_rel("VALUES (1), (NULL)") match
+        Values(_, fields, _) -> assert(fields[0].ty == Nullable(Int32), "nullable int32")
+        _ -> assert(false, "a VALUES")
+
+@test
+insert_null_into_an_opaque_table_s_column_has_no_type()
+    assert_eq(se_code("INSERT INTO t (a) VALUES (NULL)"), "Q8007")
+
+@test
+insert_null_makes_its_values_column_nullable()
+    assert(se_insert_types("INSERT INTO users (id, name, age) VALUES (1, NULL, NULL)") == se_types([Int64, Nullable(Text), Nullable(Int16)]), "nullable")
+
+@test
+insert_null_into_a_not_null_column_makes_it_nullable()
+    assert(se_insert_types("INSERT INTO posts (id, author, title) VALUES (1, 2, NULL)") == se_types([Int64, Int64, Nullable(Text)]), "validation refuses it")
+
+@test
+insert_null_in_one_row_of_several_makes_the_column_nullable()
+    assert(se_insert_types("INSERT INTO posts (id, author, title) VALUES (1, 2, 'a'), (2, 2, NULL)") == se_types([Int64, Int64, Nullable(Text)]), "nullable")
+
+@test
+insert_without_null_keeps_the_column_s_type()
+    assert(se_insert_types("INSERT INTO posts (id, author, title) VALUES (1, 2, 'a')") == se_types([Int64, Int64, Text]), "not null")
+
+@test
+update_set_null_takes_the_column_s_type()
+    sq_stmt("UPDATE users SET age = NULL") match
+        Update(_, _, _, _, _, set, _) -> assert(set[0].expr == Null(Int16), "Null(int16)")
+        _ -> assert(false, "an update")
+
+@test
+limit_null_is_no_limit()
+    se_same("SELECT a FROM t LIMIT NULL", "SELECT a FROM t LIMIT ALL")
+
+@test
+offset_null_is_no_offset()
+    se_same("SELECT a FROM t OFFSET NULL", "SELECT a FROM t")
+
+@test
+limit_and_offset_null_are_neither()
+    se_same("SELECT a FROM t LIMIT NULL OFFSET NULL", "SELECT a FROM t")
+
+@test
+order_by_null_has_no_type()
+    assert_eq(se_code("SELECT a FROM t ORDER BY NULL"), "Q8007")
+
+@test
+a_null_default_is_allowed()
+    assert_eq(se_code("CREATE TABLE x (a int32 DEFAULT NULL)"), "ok")
+
+@test
+a_typed_null_parameter_cast()
+    assert_eq(se_code("SELECT NULL::int64 + $1::int64"), "ok")
+
+// -- every type name and its aliases ----------------------------------------------------------------
+
+private se_type_pairs() -> []const (string, string) = [("bool", "boolean"), ("int16", "smallint"), ("int32", "int"), ("int32", "integer"),
+    ("int64", "bigint"), ("decimal(5, 0)", "decimal(5)"), ("decimal(5, 2)", "numeric(5, 2)"), ("decimal(7, 0)", "numeric(7)"),
+    ("float32", "real"), ("float64", "float"), ("float64", "double precision"), ("bytes", "bytea"), ("datetime", "timestamp without time zone"),
+    ("timestamp", "timestamptz"), ("timestamp", "timestamp with time zone"), ("time", "time without time zone")]
+
+@test
+every_type_alias_is_its_type_in_a_column_definition()
+    for (name, alias) in se_type_pairs()
+        se_same(s"CREATE TABLE x (a $alias)", s"CREATE TABLE x (a $name)")
+
+@test
+every_type_alias_is_its_type_in_a_cast()
+    for (name, alias) in se_type_pairs()
+        se_same(s"SELECT CAST(a AS $alias) FROM t", s"SELECT CAST(a AS $name) FROM t")
+
+@test
+every_type_name_defines_a_column()
+    for name in ["bool", "int8", "int16", "int32", "int64", "int128", "uint8", "uint16", "uint32", "uint64", "decimal(38, 10)", "float32",
+        "float64", "text", "bytes", "json", "date", "time", "datetime", "timestamp", "interval", "uuid"]
+        if se_code(s"CREATE TABLE x (a $name)") != "ok" then print(s"\ntype: $name\n")
+        assert_eq(se_code(s"CREATE TABLE x (a $name)"), "ok")
+
+@test
+every_refused_type_name_is_refused_in_a_column_definition()
+    for name in ["int2", "int4", "float4", "float8", "jsonb", "varchar", "char", "character", "money", "decimal", "numeric",
+        "varchar(10)", "timestamp(3)", "time with time zone", "nosuch"]
+        if se_code(s"CREATE TABLE x (a $name)") != "Q8006" then print(s"\ntype: $name\n")
+        assert_eq(se_code(s"CREATE TABLE x (a $name)"), "Q8006")
+
+@test
+double_without_precision_ends_too_early()
+    assert_eq(sq_err("CREATE TABLE x (a double)"), "Q8001@1:25")
+
+@test
+an_array_type_is_out_of_scope()
+    assert_eq(se_code("CREATE TABLE x (a int32[])"), "Q8003")
+
+@test
+int8_is_eight_bits()
+    se_eq(se_e("CAST(a AS int8)"), Cast(Col("t", "a"), Nullable(Int8), Strict), "int8")
+
+@test
+a_decimal_of_precision_one()
+    se_eq(se_e("CAST(a AS decimal(1))"), Cast(Col("t", "a"), Nullable(Decimal(1, 0)), Strict), "decimal(1)")
+
+@test
+a_decimal_of_precision_thirty_eight()
+    se_eq(se_e("CAST(a AS decimal(38))"), Cast(Col("t", "a"), Nullable(Decimal(38, 0)), Strict), "decimal(38)")
+
+@test
+a_decimal_whose_scale_is_its_precision()
+    se_eq(se_e("CAST(a AS decimal(1, 1))"), Cast(Col("t", "a"), Nullable(Decimal(1, 1)), Strict), "decimal(1, 1)")
+
+@test
+a_decimal_of_precision_zero_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(0)) FROM t"), "Q8006")
+
+@test
+a_decimal_of_precision_thirty_nine_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(39)) FROM t"), "Q8006")
+
+@test
+a_decimal_of_a_huge_precision_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(99999999999999999999)) FROM t"), "Q8006")
+
+@test
+a_decimal_scale_past_its_precision_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(2, 3)) FROM t"), "Q8006")
+
+@test
+a_decimal_of_negative_scale_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(5, -1)) FROM t"), "Q8001")
+
+@test
+a_decimal_with_a_missing_scale_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(5, )) FROM t"), "Q8001")
+
+@test
+a_decimal_with_three_modifiers_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(5, 2, 1)) FROM t"), "Q8001")
+
+@test
+a_decimal_of_a_fractional_precision_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS decimal(5.5)) FROM t"), "Q8006")
+
+@test
+a_modifier_on_text_is_refused()
+    assert_eq(se_code("SELECT CAST(a AS text(5)) FROM t"), "Q8006")
+
+@test
+every_typed_constant_type()
+    se_eq(se_bare("DATE '2024-02-29'"), sq_lit_of(Date, "2024-02-29"), "date")
+    se_eq(se_bare("TIME '12:30:00'"), sq_lit_of(Time, "12:30:00"), "time")
+    se_eq(se_bare("UUID '00000000-0000-0000-0000-000000000000'"), sq_lit_of(Uuid, "00000000-0000-0000-0000-000000000000"), "uuid")
+    se_eq(se_bare("TIMESTAMP '2024-01-01T00:00:00Z'"), sq_lit_of(Timestamp, "2024-01-01T00:00:00Z"), "timestamp")

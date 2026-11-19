@@ -43,6 +43,12 @@ says so.
    `_2`, `_3`, …. Nodes the translation adds take the binders `select`, `group`, `values`, `one`, `excluded` and
    `subquery`, suffixed the same way. Binders are invisible in results ([QT] §10.2 renames them for the shape).
 7. **Spans.** The envelope's `spans` is absent in this version; errors from validation name tree paths.
+8. **Depth.** A statement's expressions and queries nest at most 256 levels, the tree's own limit ([QT] §12,
+   `Q1006`): each expression, query, `NOT` and unary minus is a level, and each operator of a chain of one
+   left-associative operator (`a + b + c`, `a AND b AND c`, `x::T::U`, `UNION`, `JOIN`) one more. Deeper text is
+   refused with `Q1006`, at the token that passes the limit, before it is translated.
+   *Rationale: the server refuses a deeper tree anyway, and refusing it while reading keeps the front end's own
+   recursion bounded, so no input can exhaust its stack.*
 
 ## 2. Lexical structure
 
@@ -110,8 +116,8 @@ PostgreSQL's: an interval is written `P1D`, not `1 day`. It is
 
 ### 2.7 Parameters
 
-`$n`, `n` ≥ 1, is parameter `n − 1` of the envelope ([QT] §7.3, §10.1). `$0`, a `$` without digits (dollar quoting
-is not supported) and digits followed by a letter are `Q8003`. A parameter's type is never inferred by the server
+`$n`, `1 ≤ n ≤ 100000000`, is parameter `n − 1` of the envelope ([QT] §7.3, §10.1). `$0`, a larger `n`, a `$`
+without digits (dollar quoting is not supported) and digits followed by a letter are `Q8003`. A parameter's type is never inferred by the server
 ([QT] §4), so the front end decides it: from a cast written on it (`$1::int64`, which is the parameter itself, not
 a `Cast`), from the column it is assigned to (its exact type, nullability included), or from the column it is
 compared with (that column's type without nullability) (§5.9). A parameter whose type nothing gives, and one given
@@ -290,7 +296,8 @@ and `ALTER TABLE IF EXISTS` are `Q8005`.
 | `text` | `text` |
 | `bytes`, `bytea` | `bytes` |
 | `json` | `json` |
-| `date`, `time` | `date`, `time` |
+| `date` | `date` |
+| `time`, `time without time zone` | `time` |
 | `datetime`, `timestamp without time zone` | `datetime` |
 | `timestamp`, `timestamptz`, `timestamp with time zone` | `timestamp` |
 | `interval` | `interval` |
@@ -414,7 +421,7 @@ columns (§5.6).
 
 1. `LIMIT n`, `FETCH FIRST n ROWS ONLY` and `OFFSET m` are `Limit(input, count, offset, ties, arbitrary)`; `count` and
    `offset` are `int64` literals or `int64` parameters ([QT] §6.10 rule 1). `LIMIT ALL` and `LIMIT NULL` are no
-   count; `FETCH FIRST ROWS` is a count of 1. Any other expression is `Q8005`.
+   count, and `OFFSET NULL` no offset (with neither, no `Limit`); `FETCH FIRST ROWS` is a count of 1. Any other expression is `Q8005`.
 2. **`arbitrary` is set exactly when the query has no `ORDER BY`**: SQL's unordered `LIMIT` takes any rows, which the
    tree requires to be said ([QT] §6.10 rule 2).
 3. `WITH TIES` sets `ties` and requires `ORDER BY` (`Q8001`); the `Limit` is then directly above the `Sort`.
@@ -462,8 +469,8 @@ A **constant** is a number, a negated number, a string, `NULL` or a parameter. W
 it is written as a value of `T` rather than of its own type (§2.6):
 
 1. **Assignment**: an `INSERT` value, an `UPDATE`/`ON CONFLICT` `SET` value, a `DEFAULT`, a `VALUES` value (its
-   column's type), a cast. A number that is not a value of a numeric `T` (out of range, a fraction into an integer)
-   is `Q8004`; a decimal with more digits after the point than `T`'s scale is rounded half away from zero, as a
+   column's type), a cast. A number that is not a value of a numeric `T` (out of range, or written with a point or
+   an exponent into an integer type, so `2.0` too) is `Q8004`; a decimal with more digits after the point than `T`'s scale is rounded half away from zero, as a
    cast is ([QT] §7.6). A string is read from `T`'s text form, `Q8004` when it is not one.
 2. **Comparison**: a constant compared with, `BETWEEN`, `IN` or `LIKE` beside, `||`-joined to, or combined
    arithmetically with a column reference (or a cast or typed constant) takes that operand's type without
@@ -518,7 +525,7 @@ aggregate are `Q8001`. A schema-qualified function name, `OVER` (window function
 The front end's own codes are the `Q8…` group of `errors.md` §2. It also reports, before validation would, the
 validation codes `Q2002` (no such table or alias in scope), `Q2003` (a known table has no such column), `Q2004`
 (a name twice in one `FROM` or `WITH`), `Q3001` (a `VALUES` column without a common type) and `Q3013` (an aggregate
-where none may be). Everything else is found by validation, with [QT] §11's codes.
+where none may be), and the tree's `Q1006` (nesting past the limit, §1 rule 8). Everything else is found by validation, with [QT] §11's codes.
 
 | Code | When |
 |---|---|
@@ -527,7 +534,7 @@ where none may be). Everything else is found by validation, with [QT] §11's cod
 | `Q8003` | A character starts no token; a malformed number, parameter or escape; an empty quoted identifier. |
 | `Q8004` | A constant that is not a value of its type: out of range, or a text that does not parse. |
 | `Q8005` | A construct of SQL that the dialect does not have (§8). |
-| `Q8006` | An unknown or refused type name, or a bad modifier. |
+| `Q8006` | An unknown or refused type name, or a bad modifier (out of range, too large, or not an integer). |
 | `Q8007` | The type of a `NULL`, parameter or `VALUES` column cannot be determined. |
 | `Q8008` | An unqualified column belongs to more than one source. |
 | `Q8009` | A column of a grouped query's input is read outside an aggregate and is not grouped by. |

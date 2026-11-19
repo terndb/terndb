@@ -96,6 +96,9 @@ private sql_folded(word: string) -> string
 
     sb.finish()
 
+/** The highest parameter number, `$100000000` (`sql.md` §2.7). */
+const SqlMaxParam: u64 = 100000000
+
 /** The tokens of `text`, ending with `TkEnd`, or the first lexical error (`docs/spec/sql.md` §2). */
 sql_tokens(text: string) -> Result[Buf[SqlToken], SqlError]
     val b = text.bytes
@@ -133,8 +136,8 @@ sql_tokens(text: string) -> Result[Buf[SqlToken], SqlError]
             var n: u64 = 0
             var digits = 0
             while i < b.len && sql_is_digit(b[i])
-                if n > 100000000 then return sql_fail("Q8003", "a parameter number is too large", u64(start))
                 n = n * 10 + u64(b[i] - u8('0'))
+                if n > SqlMaxParam then return sql_fail("Q8003", s"a parameter number is at most $SqlMaxParam", u64(start))
                 digits += 1
                 i += 1
             if digits == 0 then return sql_fail("Q8003", "'$' must be followed by a parameter number (dollar quoting is not supported)", u64(start))

@@ -284,10 +284,27 @@ private sql_token_text(t: SqlTok) -> string = t match
     TkOp(o) -> o
     TkEnd -> "the end of the input"
 
+/** How deep a statement's expressions and queries may nest: the query tree's own limit
+ * (`MaxTreeDepth`, `errors.md` `Q1006`), which also bounds the parser's and translator's recursion.
+ */
+const SqlMaxDepth: usize = 256
+
 /** A recursive-descent parser over a token list that ends with `TkEnd`. */
 struct SqlParser
     toks: Buf[SqlToken]
     pos: usize
+    // How deep the expression or query being read nests: each expression, query and NOT or unary
+    // minus a level, and each operator of a left-associative chain one more.
+    depth: usize
+
+    /** One level deeper; past `SqlMaxDepth` the text is refused with `Q1006` (`sql.md` §1 rule 8). */
+    deeper(*self) -> Result[unit, SqlError]
+        self.depth += 1
+        if self.depth > SqlMaxDepth then return sql_fail("Q1006", s"the statement nests more than $SqlMaxDepth levels deep", self.at())
+        Ok(())
+
+    /** `n` levels back up. */
+    shallower(*self, n: usize) = self.depth -= n
 
     tok(self) -> SqlTok = self.toks[self.pos].tok
 
@@ -443,15 +460,17 @@ struct SqlParser
         Ok(ty)
     end type_name
 
-    /** A non-negative integer constant of at most nine digits. */
+    /** A type modifier: a non-negative integer constant of at most nine digits, any other number
+     * being a bad modifier (`Q8006`).
+     */
     small_int(*self) -> Result[u64, SqlError]
         val at = self.at()
         self.tok() match
             TkNumber(text) ->
-                if text.len > 9 then return sql_fail("Q8004", s"$text is too large here", at)
+                if text.len > 9 then return sql_fail("Q8006", s"the modifier $text is too large", at)
                 var n: u64 = 0
                 for c in text.bytes
-                    if c < u8('0') || c > u8('9') then return sql_fail("Q8001", s"syntax error at $text: expected an integer", at)
+                    if c < u8('0') || c > u8('9') then return sql_fail("Q8006", s"the modifier $text is not an integer", at)
                     n = n * 10 + u64(c - u8('0'))
                 self.advance()
                 Ok(n)
@@ -462,7 +481,7 @@ end SqlParser
  * nothing before it) are skipped.
  */
 sql_parse(text: string) -> Result[Buf[SqlParsed], SqlError]
-    var p = SqlParser(sql_tokens(text)?, 0)
+    var p = SqlParser(sql_tokens(text)?, 0, 0)
     val out = buf[SqlParsed]()
 
     loop
@@ -1001,6 +1020,12 @@ private sql_empty_tail(at: u64) -> SqlTail = SqlTail(buf[SqlOrder](), None, None
 
 /** `[WITH …] body [ORDER BY …] [LIMIT …] [OFFSET …] [FETCH …]` (`sql.md` §5). */
 private[terndb] sql_query(p: *SqlParser) -> Result[SqlQuery, SqlError]
+    p.deeper()?
+    val q = sql_query_at(p)?
+    p.shallower(1)
+    Ok(q)
+
+private sql_query_at(p: *SqlParser) -> Result[SqlQuery, SqlError]
     val at = p.at()
 
     if p.eat_kw("with")
@@ -1033,7 +1058,7 @@ private[terndb] sql_query(p: *SqlParser) -> Result[SqlQuery, SqlError]
     val count = if tail.count.is_some() then tail.count else old.count
     val offset = if tail.offset.is_some() then tail.offset else old.offset
     Ok(body.with_tail(SqlTail(order, count, offset, tail.ties || old.ties, if old.is_empty() then tail.at else old.at)))
-end sql_query
+end sql_query_at
 
 /** `ORDER BY …`, `LIMIT n | LIMIT ALL`, `OFFSET n [ROW | ROWS]`, `FETCH {FIRST | NEXT} [n] {ROW | ROWS}
  * {ONLY | WITH TIES}`, in any order a query may have them.
@@ -1096,26 +1121,34 @@ private sql_order_list(p: *SqlParser) -> Result[Buf[SqlOrder], SqlError]
 /** `term {UNION | EXCEPT} [ALL | DISTINCT] term …`, left-associative; `INTERSECT` binds tighter. */
 private sql_set_expr(p: *SqlParser) -> Result[SqlQuery, SqlError]
     var left = sql_set_term(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         val op = if p.eat_kw("union") then Union else if p.eat_kw("except") then Except else break
+        p.deeper()?
+        chain += 1
         val all = sql_set_all(p)
         val right = sql_set_term(p)?
         left = QySetOp(op, all, left, right, sql_empty_tail(at), at)
 
+    p.shallower(chain)
     Ok(left)
 
 private sql_set_term(p: *SqlParser) -> Result[SqlQuery, SqlError]
     var left = sql_set_primary(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         if !p.eat_kw("intersect") then break
+        p.deeper()?
+        chain += 1
         val all = sql_set_all(p)
         val right = sql_set_primary(p)?
         left = QySetOp(Intersect, all, left, right, sql_empty_tail(at), at)
 
+    p.shallower(chain)
     Ok(left)
 
 private sql_set_all(p: *SqlParser) -> bool
@@ -1218,6 +1251,7 @@ private sql_from_list(p: *SqlParser) -> Result[Buf[SqlFrom], SqlError]
 /** A `FROM` item and the joins that follow it, left-associative. */
 private sql_from_item(p: *SqlParser) -> Result[SqlFrom, SqlError]
     var left = sql_from_primary(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
@@ -1242,6 +1276,8 @@ private sql_from_item(p: *SqlParser) -> Result[SqlFrom, SqlError]
             break
 
         p.expect_kw("join")?
+        p.deeper()?
+        chain += 1
         val right = sql_from_primary(p)?
 
         if kind == JnCross
@@ -1253,6 +1289,7 @@ private sql_from_item(p: *SqlParser) -> Result[SqlFrom, SqlError]
         else
             return p.unexpected("ON or USING")
 
+    p.shallower(chain)
     Ok(left)
 end sql_from_item
 
@@ -1299,13 +1336,18 @@ private sql_parens_query(p: *SqlParser) -> bool
 
 /** An expression. */
 private[terndb] sql_expr(p: *SqlParser) -> Result[SqlExpr, SqlError]
+    p.deeper()?
     var left = sql_and(p)?
+    var chain: usize = 1
 
     loop
         val at = p.at()
         if !p.eat_kw("or") then break
+        p.deeper()?
+        chain += 1
         left = SqBinary("or", left, sql_and(p)?, at)
 
+    p.shallower(chain)
     Ok(left)
 
 /** An expression that stops before `NOT NULL`, `NULL` and the column constraints after a `DEFAULT`:
@@ -1315,26 +1357,37 @@ private sql_bexpr(p: *SqlParser) -> Result[SqlExpr, SqlError] = sql_comparison(p
 
 private sql_and(p: *SqlParser) -> Result[SqlExpr, SqlError]
     var left = sql_not(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         if !p.eat_kw("and") then break
+        p.deeper()?
+        chain += 1
         left = SqBinary("and", left, sql_not(p)?, at)
 
+    p.shallower(chain)
     Ok(left)
 
 private sql_not(p: *SqlParser) -> Result[SqlExpr, SqlError]
     val at = p.at()
-    if p.eat_kw("not") then return Ok(SqNot(sql_not(p)?, at))
+    if p.eat_kw("not")
+        p.deeper()?
+        val e = SqNot(sql_not(p)?, at)
+        p.shallower(1)
+        return Ok(e)
     sql_is(p)
 
 /** `x IS [NOT] NULL`, repeatable. */
 private sql_is(p: *SqlParser) -> Result[SqlExpr, SqlError]
     var left = sql_comparison(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         if !p.eat_kw("is") then break
+        p.deeper()?
+        chain += 1
         val negated = p.eat_kw("not")
         if p.eat_kw("null")
             left = SqIsNull(left, negated, at)
@@ -1345,6 +1398,7 @@ private sql_is(p: *SqlParser) -> Result[SqlExpr, SqlError]
                 _ -> ()
             return p.unexpected("NULL")
 
+    p.shallower(chain)
     Ok(left)
 
 private sql_cmp_op(p: *SqlParser) -> Option[string]
@@ -1418,50 +1472,70 @@ private sql_exprs_of(e: SqlExpr) -> Buf[SqlExpr]
 /** `a || b`, left-associative. */
 private sql_concat(p: *SqlParser) -> Result[SqlExpr, SqlError]
     var left = sql_additive(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         if !p.eat_op("||") then break
+        p.deeper()?
+        chain += 1
         left = SqBinary("||", left, sql_additive(p)?, at)
 
+    p.shallower(chain)
     Ok(left)
 
 private sql_additive(p: *SqlParser) -> Result[SqlExpr, SqlError]
     var left = sql_multiplicative(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         val op = if p.eat_op("+") then "+" else if p.eat_op("-") then "-" else break
+        p.deeper()?
+        chain += 1
         left = SqBinary(op, left, sql_multiplicative(p)?, at)
 
+    p.shallower(chain)
     Ok(left)
 
 private sql_multiplicative(p: *SqlParser) -> Result[SqlExpr, SqlError]
     var left = sql_unary(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         val op = if p.eat_op("*") then "*" else if p.eat_op("/") then "/" else if p.eat_op("%") then "%" else break
+        p.deeper()?
+        chain += 1
         left = SqBinary(op, left, sql_unary(p)?, at)
 
+    p.shallower(chain)
     Ok(left)
 
 /** Unary `-` and `+`, which bind tighter than every binary operator and looser than `::`. */
 private sql_unary(p: *SqlParser) -> Result[SqlExpr, SqlError]
     val at = p.at()
-    if p.eat_op("-") then return Ok(SqNeg(sql_unary(p)?, at))
+    if p.eat_op("-")
+        p.deeper()?
+        val e = SqNeg(sql_unary(p)?, at)
+        p.shallower(1)
+        return Ok(e)
     if p.eat_op("+") then return sql_unary(p)
     sql_postfix(p)
 
 /** A primary followed by any number of `:: type`. */
 private sql_postfix(p: *SqlParser) -> Result[SqlExpr, SqlError]
     var e = sql_primary(p)?
+    var chain: usize = 0
 
     loop
         val at = p.at()
         if !p.eat_op("::") then break
+        p.deeper()?
+        chain += 1
         e = SqCast(e, p.type_name()?, at)
 
+    p.shallower(chain)
     Ok(e)
 
 /** A constant, parameter, column reference, function call, parenthesised expression or subquery,
