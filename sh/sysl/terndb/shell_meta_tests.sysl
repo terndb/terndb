@@ -145,9 +145,9 @@ an_excerpt_of_a_two_digit_line_moves_the_caret()
 
 @test
 a_front_end_error_without_a_code_or_position()
-    assert_eq(sql_error_text("x", SqlError("", "bad", None)), "ERROR:  bad\n")
-    assert_eq(sql_error_text("x", SqlError("Q1001", "bad", None)), "ERROR:  Q1001: bad\n")
-    assert_eq(sql_error_text("xy", SqlError("", "bad", Some(1))), "ERROR:  bad\nLINE 1: xy\n" + " ".repeat(9) + "^\n")
+    assert_eq(sql_error_text("x", ShellSqlError("", "bad", None)), "ERROR:  bad\n")
+    assert_eq(sql_error_text("x", ShellSqlError("Q1001", "bad", None)), "ERROR:  Q1001: bad\n")
+    assert_eq(sql_error_text("xy", ShellSqlError("", "bad", Some(1))), "ERROR:  bad\nLINE 1: xy\n" + " ".repeat(9) + "^\n")
 
 @test
 a_server_error_shows_every_entry_and_its_range()

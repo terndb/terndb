@@ -26,13 +26,13 @@ struct TableFrontEnd
         self.reqs.push(items_of(reqs))
 
 impl SqlFrontEnd for TableFrontEnd
-    translate(*self, text: string) -> Result[Buf[ShellRequest], SqlError]
+    translate(*self, text: string) -> Result[Buf[ShellRequest], ShellSqlError]
         self.seen.push(text)
         for i in 0..<self.texts.len()
             if self.texts[i] == text then return Ok(self.reqs[i])
         text.index_of("oops") match
-            Some(at) -> Err(SqlError("", "syntax error at or near \"oops\"", Some(at)))
-            None -> Err(SqlError("", "syntax error", Some(0)))
+            Some(at) -> Err(ShellSqlError("", "syntax error at or near \"oops\"", Some(at)))
+            None -> Err(ShellSqlError("", "syntax error", Some(0)))
 
 private sh_tree(s: Statement) -> ShellRequest = RunTree(envelope([], s))
 

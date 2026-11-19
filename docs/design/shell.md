@@ -138,6 +138,6 @@ sessions, and a line wider than the terminal redraws incorrectly.
 ## The SQL front end
 
 The shell takes SQL through the `SqlFrontEnd` trait: the text of one complete statement goes in, and either a
-list of `ShellRequest`s (a tree to run, or a transaction-control request) or a `SqlError` with a byte offset
+list of `ShellRequest`s (a tree to run, or a transaction-control request) or a `ShellSqlError` with a byte offset
 comes out. Error offsets are relative to the statement text that was passed in, which starts at its first
 non-blank character.

@@ -23,7 +23,7 @@ enum ShellRequest
 /** Why a statement's text could not be turned into requests: an error code from `errors.md`, its
  * message, and the byte offset in the text it concerns, when it concerns one.
  */
-struct SqlError
+struct ShellSqlError
     code: string
     message: string
     at: Option[usize]
@@ -31,15 +31,15 @@ struct SqlError
 /** The SQL front end, as the shell uses it. */
 trait SqlFrontEnd
     /** The requests of one complete statement's text, `;` included. */
-    translate(*self, text: string) -> Result[Buf[ShellRequest], SqlError]
+    translate(*self, text: string) -> Result[Buf[ShellRequest], ShellSqlError]
 
 /** A front end that has no SQL: every statement is refused. It stands where none is built in. */
 struct NoSqlFrontEnd
 end NoSqlFrontEnd
 
 impl SqlFrontEnd for NoSqlFrontEnd
-    translate(*self, text: string) -> Result[Buf[ShellRequest], SqlError] =
-        Err(SqlError("", "this build of terndb has no SQL front end; only meta-commands run", None))
+    translate(*self, text: string) -> Result[Buf[ShellRequest], ShellSqlError] =
+        Err(ShellSqlError("", "this build of terndb has no SQL front end; only meta-commands run", None))
 
 /** Where the shell's database is. */
 enum ShellPlace
@@ -496,7 +496,7 @@ private entry_text(source: string, code: string, message: string, at: Option[u64
         None -> head
 
 /** What the shell prints for a front-end error in statement `source`. */
-sql_error_text(source: string, e: SqlError) -> string = entry_text(source, e.code, e.message, e.at.map(p -> u64(p)))
+sql_error_text(source: string, e: ShellSqlError) -> string = entry_text(source, e.code, e.message, e.at.map(p -> u64(p)))
 
 /** What the shell prints for a server's `Error` about statement `source`: each entry, with an excerpt
  * where it carries a source range.

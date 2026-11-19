@@ -316,7 +316,7 @@ every_code_sits_in_the_section_of_its_letter()
         assert(r.area == utf8(r.code.bytes[0..<1]), s"${r.code} is in the section for area '${r.area}'")
 
 private group_digit_ok(a: u8, d: u8) -> bool =
-    if a == u8('Q') then d >= u8('1') && d <= u8('7')
+    if a == u8('Q') then d >= u8('1') && d <= u8('8')
     elif a == u8('R') then d == u8('0')
     elif a == u8('T') || a == u8('W') || a == u8('D') then d >= u8('1') && d <= u8('4')
     elif a == u8('C') then d == u8('1') || d == u8('2')
@@ -325,12 +325,19 @@ private group_digit_ok(a: u8, d: u8) -> bool =
 @test
 every_code_is_in_a_first_digit_group_its_area_uses()
     // `errors.md` §1 rule 1: the first digit groups related codes within an area. The groups are those the
-    // registry's tables use today (`Q1`–`Q7`, `R0`, `T1`–`T4`, `W1`–`W4`, `D1`–`D4`, `C1`–`C2`, `S1`–`S3`);
+    // registry's tables use today (`Q1`–`Q8`, `R0`, `T1`–`T4`, `W1`–`W4`, `D1`–`D4`, `C1`–`C2`, `S1`–`S3`);
     // a code in a group of no table is a typo or a new group, and a new group is added to the table above.
     for r in registry()
         val a = r.code.bytes[0]
         val d = r.code.bytes[1]
         assert(group_digit_ok(a, d), s"${r.code} has a first digit no group of its area has")
+
+@test
+the_query_area_s_groups_run_from_one_to_eight()
+    assert(!group_digit_ok(u8('Q'), u8('0')))
+    assert(group_digit_ok(u8('Q'), u8('1')))
+    assert(group_digit_ok(u8('Q'), u8('8')))
+    assert(!group_digit_ok(u8('Q'), u8('9')))
 
 @test
 the_scanner_reads_a_literal_code_and_ignores_other_text()
