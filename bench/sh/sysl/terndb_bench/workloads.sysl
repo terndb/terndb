@@ -70,6 +70,7 @@ private const MutateCheck: string = "select count(*) as n, sum(amount) as total,
 /** Every workload, in the order a run takes them: reads, then writes to tables of their own. */
 workloads() -> Buf[Workload]
     val out = buf[Workload]()
+    out.push(w("round_trip", "statement round trip", Read, "select 1 as one", NoArgs, 20))
     out.push(w("point_pk", "point lookup", Read, "select id, user_id, amount, status from orders where id = $1", Key("orders"), 20))
     out.push(w("range_pk", "range scan", Read, "select count(*) as n, sum(amount) as total from orders where id between $1 and $2",
         KeyRange("orders", 10), 5))
