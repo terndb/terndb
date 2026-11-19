@@ -144,10 +144,26 @@ an_excerpt_of_a_two_digit_line_moves_the_caret()
     assert_eq(line_excerpt(src, 9), "LINE 10: oops\n" + " ".repeat(9) + "^\n")
 
 @test
-a_front_end_error_without_a_code_or_position()
-    assert_eq(sql_error_text("x", ShellSqlError("", "bad", None)), "ERROR:  bad\n")
-    assert_eq(sql_error_text("x", ShellSqlError("Q1001", "bad", None)), "ERROR:  Q1001: bad\n")
-    assert_eq(sql_error_text("xy", ShellSqlError("", "bad", Some(1))), "ERROR:  bad\nLINE 1: xy\n" + " ".repeat(9) + "^\n")
+a_front_end_error_shows_its_code_line_and_caret()
+    assert_eq(sql_error_text("xy", SqlError("Q8001", "bad", 1, 1, 2)), "ERROR:  Q8001: bad\nLINE 1: xy\n" + " ".repeat(9) + "^\n")
+    assert_eq(sql_error_text("xy", SqlError("Q8001", "bad", 0, 1, 1)), "ERROR:  Q8001: bad\nLINE 1: xy\n" + " ".repeat(8) + "^\n")
+
+@test
+a_front_end_error_at_the_end_points_past_the_text()
+    assert_eq(sql_error_text("xy", SqlError("Q8001", "bad", 2, 1, 3)), "ERROR:  Q8001: bad\nLINE 1: xy\n" + " ".repeat(10) + "^\n")
+
+@test
+a_front_end_error_without_a_code_omits_it()
+    assert_eq(sql_error_text("xy", SqlError("", "bad", 1, 1, 2)), "ERROR:  bad\nLINE 1: xy\n" + " ".repeat(9) + "^\n")
+
+@test
+a_front_end_error_past_the_text_has_no_excerpt()
+    assert_eq(sql_error_text("x", SqlError("Q8001", "bad", 5, 1, 6)), "ERROR:  Q8001: bad\n")
+    assert_eq(sql_error_text("", SqlError("Q8001", "bad", 0, 1, 1)), "ERROR:  Q8001: bad\n")
+
+@test
+a_front_end_error_on_a_later_line_counts_wide_characters_twice()
+    assert_eq(sql_error_text("a\n漢x", SqlError("Q8003", "bad", 5, 2, 2)), "ERROR:  Q8003: bad\nLINE 2: 漢x\n" + " ".repeat(10) + "^\n")
 
 @test
 a_server_error_shows_every_entry_and_its_range()

@@ -244,6 +244,13 @@ catalog_columns_query(oid: u64) -> Envelope =
     envelope([], Query(Project(Filter(scan("catalog", "columns", "c"), of_table("c", oid)), "r",
         cat_items("c", ["ordinal", "name", "type_text", "nullable", "default", "generated", "identity"]))))
 
+/** `catalog.columns` of the table or view `oid` as the SQL front end needs them: each column's
+ * structural type and its state.
+ */
+column_types_query(oid: u64) -> Envelope =
+    envelope([], Query(Project(Filter(scan("catalog", "columns", "c"), of_table("c", oid)), "r",
+        cat_items("c", ["ordinal", "name", "type", "state"]))))
+
 /** `catalog.indexes` of table `oid`. */
 catalog_indexes_query(oid: u64) -> Envelope =
     envelope([], Query(Project(Filter(scan("catalog", "indexes", "i"), of_table("i", oid)), "r",

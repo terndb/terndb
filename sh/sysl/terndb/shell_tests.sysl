@@ -10,11 +10,13 @@ import sysl.time.millis
 
 // The shell end to end (`shell.sysl`, `shell_meta.sysl`): sessions typed line by line and scripts
 // read whole, against an embedded engine and against a server over a real Unix socket, compared
-// with the text a user would see. Statements are translated by `TableFrontEnd`, which knows a fixed
-// set of statement texts and the trees they stand for, so these tests need no SQL parser.
+// with the text a user would see. Statements go through the SQL front end, as they do in `terndb`.
+// A few tests use `TableFrontEnd` instead, a stand-in that knows a fixed set of statement texts: to
+// see exactly the text the shell hands over, to make one statement into several requests, or to
+// create a table SQL cannot write.
 
-/** A front end that knows a fixed table of statement texts. A text containing `oops` is a syntax
- * error there; any other unknown text is a syntax error at its start.
+/** A front end that knows a fixed table of statement texts, and keeps every text it was given. Any
+ * other text is a syntax error at its start.
  */
 struct TableFrontEnd
     texts: Buf[string]
@@ -26,63 +28,28 @@ struct TableFrontEnd
         self.reqs.push(items_of(reqs))
 
 impl SqlFrontEnd for TableFrontEnd
-    translate(*self, text: string) -> Result[Buf[ShellRequest], ShellSqlError]
+    translate(*self, text: string, tables: &SqlTables) -> Result[Buf[ShellRequest], SqlError]
         self.seen.push(text)
         for i in 0..<self.texts.len()
             if self.texts[i] == text then return Ok(self.reqs[i])
-        text.index_of("oops") match
-            Some(at) -> Err(ShellSqlError("", "syntax error at or near \"oops\"", Some(at)))
-            None -> Err(ShellSqlError("", "syntax error", Some(0)))
-
-private sh_tree(s: Statement) -> ShellRequest = RunTree(envelope([], s))
+        Err(SqlError("", "unknown statement", 0, 1, 1))
 
 private sh_one(n: i128) -> Envelope =
     envelope([], Query(Values("v", items_of([Field("n", Int64)]), items_of([items_of([Literal(Int64, Int(n))])]))))
 
-/** The users table's columns as `create table users (id int64 primary key, name text)` makes them: `name` is
- * nullable (sql.md §4 rule 2).
- */
-private sh_users_columns() -> [2]Field = [Field("id", Int64), Field("name", nullable(Text))]
-
-/** The types of the literals inserted into users, which are never nullable. */
-private sh_users() -> [2]Field = [Field("id", Int64), Field("name", Text)]
-
-private sh_select_users() -> ShellRequest =
-    RunTree(envelope([], Query(Project(scan("app", "users", "u"), "r", items_of([item("id", col("u", "id")), item("name", col("u", "name"))])))))
-
-private sh_insert(rows: []const Value) -> ShellRequest = RunTree(ew_insert("users", sh_users(), rows))
-
-/** The front end every session test uses. */
-private sh_front_end() -> &TableFrontEnd
+/** The stand-in front end, knowing `select 1;` and `select 2;`. */
+private sh_stand_in() -> &TableFrontEnd
     val fe: &TableFrontEnd = TableFrontEnd(buf(), buf(), buf())
     fe.know("select 1;", [RunTree(sh_one(1))])
     fe.know("select 2;", [RunTree(sh_one(2))])
-    fe.know("select\n1;", [RunTree(sh_one(1))])
-    fe.know("create namespace app;", [sh_tree(CreateNamespace("app", false))])
-    fe.know("create table users (id int64 primary key, name text);", [RunTree(ew_table("users", sh_users_columns(), "id"))])
-    fe.know("create table users (\n  id int64 primary key,\n  name text\n);", [RunTree(ew_table("users", sh_users_columns(), "id"))])
-    fe.know("insert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');",
-        [sh_insert([rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")]), rec([Int(3), Text("cy")])])])
-    fe.know("insert into users values (4, 'di');", [sh_insert([rec([Int(4), Text("di")])])])
-    fe.know("insert into users values (1, 'again');", [sh_insert([rec([Int(1), Text("again")])])])
-    fe.know("insert into users values (5, 'semi;colon');", [sh_insert([rec([Int(5), Text("semi;colon")])])])
-    fe.know("insert into users values (5, 'semi;\ncolon');", [sh_insert([rec([Int(5), Text("semi;\ncolon")])])])
-    fe.know("select * from users;", [sh_select_users()])
-    fe.know("select * from missing;", [RunTree(envelope([], Query(scan("app", "missing", "m"))))])
-    fe.know("begin;", [BeginTxn(no_txn_options())])
-    fe.know("commit;", [CommitTxn])
-    fe.know("rollback;", [RollbackTxn])
-    fe.know("savepoint a;", [SavepointTxn("a")])
-    fe.know("rollback to savepoint a;", [RollbackToTxn("a")])
-    fe.know("release savepoint a;", [ReleaseTxn("a")])
     fe
 
-/** A shell over an embedded engine, its statements translated by `fe`. */
-private sh_embedded(fe: &SqlFrontEnd) -> Shell
-    val e = engine(mem_catalog(), 1700000000000000, MonotonicClock())
+/** A shell over a new embedded engine holding schema `public`, its statements translated by `fe`. */
+private sh_embedded(fe: &SqlFrontEnd = dialect_front_end()) -> Shell
+    val e = engine(sql_catalog(), 1700000000000000, MonotonicClock())
     val link = embedded_link(e, "terndb", "pencil").unwrap()
     val conn = connect_shell(link, shell_client_config("terndb", BootstrapRole, "pencil").unwrap()).unwrap()
-    shell(conn, fe, Embedded, "terndb", BootstrapRole)
+    shell(conn, Embedded, "terndb", BootstrapRole, fe)
 
 /** What `s` printed since last asked, standard output and standard error together, in order. */
 private sh_printed(s: *Shell) -> string
@@ -107,97 +74,95 @@ private sh_session(s: *Shell, lines: []const string) -> string
         out = out + sh_printed(s)
     out
 
-/** A shell holding namespace `app`, table `users` and its three rows, with nothing printed. */
-private sh_with_users(fe: &SqlFrontEnd) -> Shell
+/** A shell holding table `users` and its three rows, with nothing printed. */
+private sh_with_users(fe: &SqlFrontEnd = dialect_front_end()) -> Shell
     var s = sh_embedded(fe)
-    s.run_script("create namespace app;\ncreate table users (id int64 primary key, name text);\ninsert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');\n")
-    assert_eq(sh_printed(&s), "CREATE NAMESPACE\nCREATE TABLE\nINSERT 0 3\n")
+    s.run_script("create table users (id int64 primary key, name text);\ninsert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');\n")
+    assert_eq(sh_printed(&s), "CREATE TABLE\nINSERT 0 3\n")
     s
 
 private sh_users_table() -> string = " id | name\n----+------\n  1 | ann\n  2 | bo\n  3 | cy\n(3 rows)\n"
+
+/** What `select n as n;` prints. */
+private sh_n(n: int) -> string = s" n\n---\n $n\n(1 row)\n"
 
 // -- sessions -------------------------------------------------------------------------------------
 
 @test
 a_session_creates_a_table_inserts_and_selects()
-    var s = sh_embedded(sh_front_end())
-    val got = sh_session(&s, ["create namespace app;", "create table users (", "  id int64 primary key,", "  name text", ");",
-        "insert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');", "select * from users;"])
-    assert_eq(got, "terndb=> create namespace app;\nCREATE NAMESPACE\n" +
-        "terndb=> create table users (\nterndb(> " + "  id int64 primary key,\nterndb(>   name text\nterndb(> );\nCREATE TABLE\n" +
-        "terndb=> insert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');\nINSERT 0 3\n" +
-        "terndb=> select * from users;\n" + sh_users_table())
+    var s = sh_embedded()
+    val got = sh_session(&s, ["create schema app;", "create table app.users (", "  id int64 primary key,", "  name text", ");",
+        "insert into app.users values (1, 'ann'), (2, 'bo'), (3, 'cy');", "select * from app.users;"])
+    assert_eq(got, "terndb=> create schema app;\nCREATE NAMESPACE\n" +
+        "terndb=> create table app.users (\nterndb(> " + "  id int64 primary key,\nterndb(>   name text\nterndb(> );\nCREATE TABLE\n" +
+        "terndb=> insert into app.users values (1, 'ann'), (2, 'bo'), (3, 'cy');\nINSERT 0 3\n" +
+        "terndb=> select * from app.users;\n" + sh_users_table())
     assert_eq(s.errors, 0)
 
 @test
 a_statement_split_over_lines_shows_the_continuation_prompt()
-    var s = sh_embedded(sh_front_end())
-    assert_eq(sh_session(&s, ["select", "1;"]), "terndb=> select\nterndb-> 1;\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select", "1 as n;"]), "terndb=> select\nterndb-> 1 as n;\n" + sh_n(1))
 
 @test
 blank_lines_inside_a_statement_are_part_of_it()
-    val fe = sh_front_end()
-    fe.know("select\n\n1;", [RunTree(sh_one(1))])
-    var s = sh_embedded(fe)
-    assert_eq(sh_session(&s, ["select", "", "1;"]), "terndb=> select\nterndb-> \nterndb-> 1;\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select", "", "1 as n;"]), "terndb=> select\nterndb-> \nterndb-> 1 as n;\n" + sh_n(1))
 
 @test
 blank_lines_between_statements_change_nothing()
-    var s = sh_embedded(sh_front_end())
-    assert_eq(sh_session(&s, ["", "  ", "select 1;"]), "terndb=> \nterndb=>   \nterndb=> select 1;\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["", "  ", "select 1 as n;"]), "terndb=> \nterndb=>   \nterndb=> select 1 as n;\n" + sh_n(1))
 
 @test
 several_statements_on_one_line_run_in_order()
-    var s = sh_embedded(sh_front_end())
-    assert_eq(sh_session(&s, ["select 1; select 2;"]), "terndb=> select 1; select 2;\n n\n---\n 1\n(1 row)\n n\n---\n 2\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select 1 as n; select 2 as n;"]), "terndb=> select 1 as n; select 2 as n;\n" + sh_n(1) + sh_n(2))
 
 @test
 a_statement_ending_mid_line_runs_and_the_next_one_waits()
-    var s = sh_embedded(sh_front_end())
-    assert_eq(sh_session(&s, ["select 1; select", "1;"]),
-        "terndb=> select 1; select\n n\n---\n 1\n(1 row)\nterndb-> 1;\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select 1 as n; select", "1 as n;"]),
+        "terndb=> select 1 as n; select\n" + sh_n(1) + "terndb-> 1 as n;\n" + sh_n(1))
 
 @test
 a_semicolon_in_a_string_spanning_lines_does_not_end_the_statement()
-    var s = sh_with_users(sh_front_end())
-    assert_eq(sh_session(&s, ["insert into users values (5, 'semi;", "colon');"]),
-        "terndb=> insert into users values (5, 'semi;\nterndb'> colon');\nINSERT 0 1\n")
+    var s = sh_with_users()
+    assert_eq(sh_session(&s, ["insert into users values (5, 'semi;", "colon');", "select name from users where id = 5;"]),
+        "terndb=> insert into users values (5, 'semi;\nterndb'> colon');\nINSERT 0 1\n" +
+        "terndb=> select name from users where id = 5;\n name\n-------\n semi;\n colon\n(1 row)\n")
 
 @test
 a_semicolon_in_a_comment_does_not_end_the_statement()
-    val fe = sh_front_end()
-    fe.know("select /* a;\nb; */ 1;", [RunTree(sh_one(1))])
-    var s = sh_embedded(fe)
-    assert_eq(sh_session(&s, ["select /* a;", "b; */ 1;"]), "terndb=> select /* a;\nterndb*> b; */ 1;\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select /* a;", "b; */ 1 as n;"]), "terndb=> select /* a;\nterndb*> b; */ 1 as n;\n" + sh_n(1))
 
 @test
 a_meta_command_alone_runs_at_once()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     assert_eq(sh_session(&s, ["\\x", "\\x"]), "terndb=> \\x\nExpanded display is on.\nterndb=> \\x\nExpanded display is off.\n")
 
 @test
 a_meta_command_inside_a_statement_runs_and_keeps_the_statement()
-    var s = sh_embedded(sh_front_end())
-    assert_eq(sh_session(&s, ["select", "\\x", "1;"]),
-        "terndb=> select\nterndb-> \\x\nExpanded display is on.\nterndb-> 1;\n-[ RECORD 1 ]\nn | 1\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select", "\\x", "1 as n;"]),
+        "terndb=> select\nterndb-> \\x\nExpanded display is on.\nterndb-> 1 as n;\n-[ RECORD 1 ]\nn | 1\n")
 
 @test
 a_backslash_line_inside_a_string_is_part_of_the_string()
-    val fe = sh_front_end()
-    fe.know("select 'a\n\\x\n';", [RunTree(sh_one(1))])
-    var s = sh_embedded(fe)
-    assert_eq(sh_session(&s, ["select 'a", "\\x", "';"]), "terndb=> select 'a\nterndb'> \\x\nterndb'> ';\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select 'a", "\\x", "' as t;"]), "terndb=> select 'a\nterndb'> \\x\nterndb'> ' as t;\n t\n----\n a\n \\x\n\n(1 row)\n")
     assert(!s.expanded, "\\x was text, not a command")
 
 @test
 reset_forgets_the_statement_being_typed()
-    var s = sh_embedded(sh_front_end())
-    assert_eq(sh_session(&s, ["select", "\\r", "select 2;"]),
-        "terndb=> select\nterndb-> \\r\nQuery buffer reset (cleared).\nterndb=> select 2;\n n\n---\n 2\n(1 row)\n")
+    var s = sh_embedded()
+    assert_eq(sh_session(&s, ["select", "\\r", "select 2 as n;"]),
+        "terndb=> select\nterndb-> \\r\nQuery buffer reset (cleared).\nterndb=> select 2 as n;\n" + sh_n(2))
 
 @test
 quit_stops_reading()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.feed_line("\\q")
     assert(s.quit, "quit")
     s.feed_line("select 1;")
@@ -205,21 +170,21 @@ quit_stops_reading()
 
 @test
 quit_in_a_script_skips_the_rest()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("select 1;\n\\q\nselect 2;\n")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    s.run_script("select 1 as n;\n\\q\nselect 2 as n;\n")
+    assert_eq(sh_printed(&s), sh_n(1))
 
 @test
 a_statement_the_front_end_makes_two_requests_of_runs_both()
-    val fe = sh_front_end()
+    val fe = sh_stand_in()
     fe.know("twice;", [RunTree(sh_one(1)), RunTree(sh_one(2))])
     var s = sh_embedded(fe)
     s.run_script("twice;\n")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n n\n---\n 2\n(1 row)\n")
+    assert_eq(sh_printed(&s), sh_n(1) + sh_n(2))
 
 @test
 a_failing_request_stops_the_rest_of_its_statement()
-    val fe = sh_front_end()
+    val fe = sh_stand_in()
     fe.know("bad then good;", [RunTree(envelope([], Query(scan("app", "missing", "m")))), RunTree(sh_one(2))])
     var s = sh_embedded(fe)
     s.run_script("bad then good;\n")
@@ -229,35 +194,55 @@ a_failing_request_stops_the_rest_of_its_statement()
 
 @test
 a_comment_after_a_statement_on_its_line_is_dropped()
-    val fe = sh_front_end()
+    val fe = sh_stand_in()
     var s = sh_embedded(fe)
     s.run_script("select 1; -- a note\n")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n")
+    assert_eq(sh_printed(&s), sh_n(1))
     assert_eq(fe.seen.len(), 1)
     assert_eq(fe.seen[0], "select 1;")
+
+@test
+a_comment_after_a_statement_runs_through_the_sql_front_end()
+    var s = sh_embedded()
+    s.run_script("select 1 as n; -- a note\n-- a line of its own\nselect 2 as n; /* and a block */\n")
+    assert_eq(sh_printed(&s), sh_n(1) + sh_n(2))
+    assert_eq(s.errors, 0)
+
+@test
+a_front_end_error_without_a_code_prints_none()
+    val fe = sh_stand_in()
+    var s = sh_embedded(fe)
+    s.run_script("what;\n")
+    assert_eq(sh_printed(&s), "ERROR:  unknown statement\nLINE 1: what;\n        ^\n")
+    assert_eq(s.errors, 1)
 
 // -- end of input ---------------------------------------------------------------------------------
 
 @test
 a_script_runs_its_unterminated_last_statement()
-    var s = sh_embedded(sh_front_end())
-    val fe_text = "select 2"
-    s.run_script("select 1;\n" + fe_text)
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\nERROR:  syntax error\nLINE 1: select 2\n        ^\n")
-    assert_eq(s.errors, 1)
+    var s = sh_embedded()
+    s.run_script("select 1 as n;\nselect 2 as n")
+    assert_eq(sh_printed(&s), sh_n(1) + sh_n(2))
+    assert_eq(s.errors, 0)
 
 @test
 an_unterminated_last_statement_is_sent_as_typed()
-    val fe = sh_front_end()
-    fe.know("select 2", [RunTree(sh_one(2))])
+    val fe = sh_stand_in()
     var s = sh_embedded(fe)
     s.run_script("select\n2\n\n")
     assert_eq(fe.seen[fe.seen.len() - 1], "select\n2")
-    assert_eq(sh_printed(&s), "ERROR:  syntax error\nLINE 1: select\n        ^\n")
+    assert_eq(sh_printed(&s), "ERROR:  unknown statement\nLINE 1: select\n        ^\n")
+
+@test
+an_unfinished_last_statement_is_a_syntax_error_at_the_end()
+    var s = sh_embedded()
+    s.run_script("select 1 as n;\nselect\n")
+    assert_eq(sh_printed(&s), sh_n(1) + "ERROR:  Q8001: syntax error at the end of the input: expected an expression\nLINE 1: select\n              ^\n")
+    assert_eq(s.errors, 1)
 
 @test
 an_interactive_session_drops_an_unterminated_statement_at_its_end()
-    val fe = sh_front_end()
+    val fe = sh_stand_in()
     var s = sh_embedded(fe)
     s.feed_line("select")
     s.end_input(false)
@@ -267,27 +252,27 @@ an_interactive_session_drops_an_unterminated_statement_at_its_end()
 
 @test
 comments_alone_at_the_end_of_a_script_run_nothing()
-    val fe = sh_front_end()
+    val fe = sh_stand_in()
     var s = sh_embedded(fe)
     s.run_script("select 1;\n-- the end\n/* really */\n")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n")
+    assert_eq(sh_printed(&s), sh_n(1))
     assert_eq(fe.seen.len(), 1)
 
 @test
 a_script_without_a_final_line_break_reads_its_last_line()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("select 1;\nselect 2;")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n n\n---\n 2\n(1 row)\n")
+    var s = sh_embedded()
+    s.run_script("select 1 as n;\nselect 2 as n;")
+    assert_eq(sh_printed(&s), sh_n(1) + sh_n(2))
 
 @test
 crlf_scripts_read_as_lf_scripts()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("select\r\n1;\r\n")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    s.run_script("select\r\n1 as n;\r\n")
+    assert_eq(sh_printed(&s), sh_n(1))
 
 @test
 an_empty_script_does_nothing()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.run_script("")
     assert_eq(sh_printed(&s), "")
     assert_eq(s.errors, 0)
@@ -296,61 +281,52 @@ an_empty_script_does_nothing()
 
 @test
 a_syntax_error_shows_its_line_and_a_caret()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("select 1 oops;\n")
-    assert_eq(sh_errors(&s), "ERROR:  syntax error at or near \"oops\"\nLINE 1: select 1 oops;\n" + " ".repeat(17) + "^\n")
+    var s = sh_embedded()
+    s.run_script("select 1 from;\n")
+    assert_eq(sh_errors(&s), "ERROR:  Q8001: syntax error at ;: expected a name\nLINE 1: select 1 from;\n" + " ".repeat(21) + "^\n")
     assert_eq(s.errors, 1)
 
 @test
 a_syntax_error_on_a_later_line_names_that_line()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("select\n  1,\n  oops;\n")
-    assert_eq(sh_errors(&s), "ERROR:  syntax error at or near \"oops\"\nLINE 3:   oops;\n          ^\n")
+    var s = sh_embedded()
+    s.run_script("select\n  1,\n  from;\n")
+    assert_eq(sh_errors(&s), "ERROR:  Q8001: syntax error at from: expected an expression\nLINE 3:   from;\n          ^\n")
 
 @test
 the_script_goes_on_after_an_error()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("oops;\nselect 1;\n")
-    assert_eq(sh_printed(&s), "ERROR:  syntax error at or near \"oops\"\nLINE 1: oops;\n        ^\n n\n---\n 1\n(1 row)\n")
+    var s = sh_embedded()
+    s.run_script("oops;\nselect 1 as n;\n")
+    assert_eq(sh_printed(&s), "ERROR:  Q8001: syntax error at oops: expected a statement\nLINE 1: oops;\n        ^\n" + sh_n(1))
     assert_eq(s.errors, 1)
 
 @test
 a_server_error_prints_its_code()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.run_script("select * from missing;\n")
-    val got = sh_errors(&s)
-    assert(got.starts_with("ERROR:  Q"), got)
+    assert_eq(sh_errors(&s), "ERROR:  Q2001: no table or view 'public.missing'\n")
     assert_eq(s.errors, 1)
 
 @test
 a_constraint_error_prints_its_code_and_leaves_the_rows()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.run_script("insert into users values (1, 'again');\nselect * from users;\n")
     val printed = s.take_printed()
     assert(printed[0].to_err, "the error goes to standard error")
     assert(printed[0].text.starts_with("ERROR:  "), printed[0].text)
     assert_eq(printed[1].text, sh_users_table())
 
-@test
-the_no_sql_front_end_refuses_statements_and_runs_meta_commands()
-    val fe: &NoSqlFrontEnd = NoSqlFrontEnd()
-    var s = sh_embedded(fe)
-    s.run_script("select 1;\n\\timing on\n")
-    assert_eq(sh_printed(&s), "ERROR:  this build of terndb has no SQL front end; only meta-commands run\nTiming is on.\n")
-    assert_eq(s.errors, 1)
-
 // -- transactions and prompts ---------------------------------------------------------------------
 
 @test
 the_prompt_shows_an_open_transaction()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     assert_eq(sh_session(&s, ["begin;", "insert into users values (4, 'di');", "commit;", "select * from users;"]),
         "terndb=> begin;\nBEGIN\nterndb=*> insert into users values (4, 'di');\nINSERT 0 1\nterndb=*> commit;\nCOMMIT\n" +
         "terndb=> select * from users;\n id | name\n----+------\n  1 | ann\n  2 | bo\n  3 | cy\n  4 | di\n(4 rows)\n")
 
 @test
 rollback_undoes_the_transaction()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     assert_eq(sh_session(&s, ["begin;", "insert into users values (4, 'di');", "rollback;"]),
         "terndb=> begin;\nBEGIN\nterndb=*> insert into users values (4, 'di');\nINSERT 0 1\nterndb=*> rollback;\nROLLBACK\n")
     s.run_script("select * from users;")
@@ -358,7 +334,7 @@ rollback_undoes_the_transaction()
 
 @test
 a_failed_statement_in_a_transaction_shows_in_the_prompt_until_rollback()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.feed_line("begin;")
     s.feed_line("insert into users values (1, 'again');")
     assert(s.mode == TxnFailed, "failed")
@@ -373,7 +349,7 @@ a_failed_statement_in_a_transaction_shows_in_the_prompt_until_rollback()
 
 @test
 commit_of_a_failed_transaction_rolls_back()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.run_script("begin;\ninsert into users values (4, 'di');\ninsert into users values (1, 'again');\n")
     val _ = sh_printed(&s)
     s.feed_line("commit;")
@@ -384,7 +360,7 @@ commit_of_a_failed_transaction_rolls_back()
 
 @test
 a_rollback_to_a_savepoint_ends_the_failure()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.run_script("begin;\ninsert into users values (4, 'di');\nsavepoint a;\n")
     assert_eq(sh_printed(&s), "BEGIN\nINSERT 0 1\nSAVEPOINT\n")
     s.feed_line("insert into users values (1, 'again');")
@@ -398,7 +374,7 @@ a_rollback_to_a_savepoint_ends_the_failure()
 
 @test
 begin_inside_a_transaction_warns_and_keeps_it()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.run_script("begin;\nbegin;\n")
     assert_eq(sh_printed(&s), "BEGIN\nWARNING:  there is already a transaction in progress\nBEGIN\n")
     assert_eq(s.prompt(), "terndb=*> ")
@@ -406,21 +382,21 @@ begin_inside_a_transaction_warns_and_keeps_it()
 
 @test
 commit_and_rollback_outside_a_transaction_warn()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.run_script("commit;\nrollback;\n")
     assert_eq(sh_printed(&s), "WARNING:  there is no transaction in progress\nCOMMIT\nWARNING:  there is no transaction in progress\nROLLBACK\n")
     assert_eq(s.errors, 0)
 
 @test
 savepoints_outside_a_transaction_are_errors()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.run_script("savepoint a;\nrollback to savepoint a;\nrelease savepoint a;\n")
     assert_eq(sh_printed(&s), "ERROR:  SAVEPOINT can only be used in transaction blocks\nERROR:  ROLLBACK TO SAVEPOINT can only be used in transaction blocks\nERROR:  RELEASE SAVEPOINT can only be used in transaction blocks\n")
     assert_eq(s.errors, 3)
 
 @test
 prompts_combine_the_buffer_and_the_transaction()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     assert_eq(s.prompt(), "terndb=> ")
     s.feed_line("select '")
     assert_eq(s.prompt(), "terndb'> ")
@@ -445,7 +421,7 @@ prompts_combine_the_buffer_and_the_transaction()
 
 @test
 the_prompt_names_the_database()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.database = "app"
     assert_eq(s.prompt(), "app=> ")
 
@@ -453,14 +429,14 @@ the_prompt_names_the_database()
 
 @test
 expanded_display_applies_to_results()
-    var s = sh_with_users(sh_front_end())
-    s.run_script("\\x on\nselect * from users;\n\\x off\nselect 1;\n")
+    var s = sh_with_users()
+    s.run_script("\\x on\nselect * from users;\n\\x off\nselect 1 as n;\n")
     assert_eq(sh_printed(&s), "Expanded display is on.\n-[ RECORD 1 ]\nid   | 1\nname | ann\n-[ RECORD 2 ]\nid   | 2\nname | bo\n" +
-        "-[ RECORD 3 ]\nid   | 3\nname | cy\nExpanded display is off.\n n\n---\n 1\n(1 row)\n")
+        "-[ RECORD 3 ]\nid   | 3\nname | cy\nExpanded display is off.\n" + sh_n(1))
 
 @test
 a_bad_setting_value_is_an_error()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.run_script("\\x maybe\n\\timing sometimes\n")
     assert_eq(sh_printed(&s), "\\x: unrecognized value \"maybe\": on or off expected\n\\timing: unrecognized value \"sometimes\": on or off expected\n")
     assert_eq(s.errors, 2)
@@ -468,21 +444,21 @@ a_bad_setting_value_is_an_error()
 
 @test
 timing_follows_each_statement()
-    var s = sh_embedded(sh_front_end())
-    s.run_script("\\timing\nselect 1;\noops;\n\\timing off\nselect 1;\n")
+    var s = sh_embedded()
+    s.run_script("\\timing\nselect 1 as n;\noops;\n\\timing off\nselect 1 as n;\n")
     val printed = s.take_printed()
     assert_eq(printed[0].text, "Timing is on.\n")
-    assert_eq(printed[1].text, " n\n---\n 1\n(1 row)\n")
+    assert_eq(printed[1].text, sh_n(1))
     assert(printed[2].text.starts_with("Time: ") && printed[2].text.ends_with(" ms\n"), printed[2].text)
     assert(printed[3].to_err, "the error")
     assert(printed[4].text.starts_with("Time: "), "an error is timed too")
     assert_eq(printed[5].text, "Timing is off.\n")
-    assert_eq(printed[6].text, " n\n---\n 1\n(1 row)\n")
+    assert_eq(printed[6].text, sh_n(1))
     assert_eq(printed.len(), 7)
 
 @test
 conninfo_says_the_database_is_embedded()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.feed_line("\\conninfo")
     assert_eq(sh_printed(&s), "You are connected to the in-memory database \"terndb\" as user \"terndb\", embedded in this process.\n")
 
@@ -492,7 +468,7 @@ conninfo_over_a_socket_names_it()
 
 @test
 help_lists_the_meta_commands()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.feed_line("\\?")
     val got = sh_printed(&s)
     for c in ["\\q", "\\?", "\\conninfo", "\\i FILE", "\\r", "\\x", "\\timing", "\\d", "\\d NAME", "\\dt"]
@@ -500,7 +476,7 @@ help_lists_the_meta_commands()
 
 @test
 an_unknown_meta_command_is_an_error()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.feed_line("\\frob x")
     assert_eq(sh_errors(&s), "invalid command \\frob\nTry \\? for help.\n")
     assert_eq(s.errors, 1)
@@ -511,14 +487,14 @@ an_unknown_meta_command_is_an_error()
 include_runs_a_file_with_its_own_buffer()
     val dir = make_temp_dir(f"terndb-sh-${pid()}-inc-").unwrap()
     val file = join(dir, "a.sql")
-    write_text(file, "select 1;\nselect\n").unwrap()
-    var s = sh_embedded(sh_front_end())
+    write_text(file, "select 1 as n;\nselect\n").unwrap()
+    var s = sh_embedded()
     s.feed_line("select")
     s.feed_line(s"\\i $file")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\nERROR:  syntax error\nLINE 1: select\n        ^\n")
+    assert_eq(sh_printed(&s), sh_n(1) + "ERROR:  Q8001: syntax error at the end of the input: expected an expression\nLINE 1: select\n              ^\n")
     assert_eq(s.prompt(), "terndb-> ")
-    s.feed_line("1;")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n")
+    s.feed_line("1 as n;")
+    assert_eq(sh_printed(&s), sh_n(1))
     val _ = remove_dir_all(dir)
 
 @test
@@ -526,11 +502,11 @@ include_nests_and_a_file_may_quit()
     val dir = make_temp_dir(f"terndb-sh-${pid()}-nest-").unwrap()
     val inner = join(dir, "inner.sql")
     val outer = join(dir, "outer.sql")
-    write_text(inner, "select 2;\n").unwrap()
-    write_text(outer, s"select 1;\n\\i $inner\n\\q\nselect 1;\n").unwrap()
-    var s = sh_embedded(sh_front_end())
-    s.run_script(s"\\i $outer\nselect 2;\n")
-    assert_eq(sh_printed(&s), " n\n---\n 1\n(1 row)\n n\n---\n 2\n(1 row)\n")
+    write_text(inner, "select 2 as n;\n").unwrap()
+    write_text(outer, s"select 1 as n;\n\\i $inner\n\\q\nselect 1 as n;\n").unwrap()
+    var s = sh_embedded()
+    s.run_script(s"\\i $outer\nselect 2 as n;\n")
+    assert_eq(sh_printed(&s), sh_n(1) + sh_n(2))
     assert(s.quit, "\\q in a file quits the shell, as in psql")
     val _ = remove_dir_all(dir)
 
@@ -538,17 +514,17 @@ include_nests_and_a_file_may_quit()
 include_of_a_quoted_name_with_spaces()
     val dir = make_temp_dir(f"terndb-sh-${pid()}-sp-").unwrap()
     val file = join(dir, "a b.sql")
-    write_text(file, "select 2;").unwrap()
-    var s = sh_embedded(sh_front_end())
+    write_text(file, "select 2 as n;").unwrap()
+    var s = sh_embedded()
     s.feed_line(s"\\i '$file'")
-    assert_eq(sh_printed(&s), " n\n---\n 2\n(1 row)\n")
+    assert_eq(sh_printed(&s), sh_n(2))
     s.feed_line(s"\\i $file")
-    assert_eq(sh_printed(&s), " n\n---\n 2\n(1 row)\n")
+    assert_eq(sh_printed(&s), sh_n(2))
     val _ = remove_dir_all(dir)
 
 @test
 include_of_a_missing_file_is_an_error()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.feed_line("\\i /nonexistent/terndb-no-such-file.sql")
     val got = sh_errors(&s)
     assert(got.starts_with("\\i: /nonexistent/terndb-no-such-file.sql: "), got)
@@ -560,8 +536,8 @@ include_of_a_missing_file_is_an_error()
 include_of_itself_stops_at_the_depth_limit()
     val dir = make_temp_dir(f"terndb-sh-${pid()}-self-").unwrap()
     val file = join(dir, "self.sql")
-    write_text(file, s"select 1;\n\\i $file\n").unwrap()
-    var s = sh_embedded(sh_front_end())
+    write_text(file, s"select 1 as n;\n\\i $file\n").unwrap()
+    var s = sh_embedded()
     s.feed_line(s"\\i $file")
     val printed = s.take_printed()
     var ones = 0
@@ -577,13 +553,13 @@ include_of_itself_stops_at_the_depth_limit()
 
 @test
 dt_lists_the_tables()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.feed_line("\\dt")
-    assert_eq(sh_printed(&s), " ".repeat(11) + "List of tables\n Namespace | Name  | Type  | Owner\n-----------+-------+-------+--------\n app       | users | table | terndb\n(1 row)\n")
+    assert_eq(sh_printed(&s), " ".repeat(11) + "List of tables\n Namespace | Name  | Type  | Owner\n-----------+-------+-------+--------\n public    | users | table | terndb\n(1 row)\n")
 
 @test
 dt_with_no_tables_says_so()
-    var s = sh_embedded(sh_front_end())
+    var s = sh_embedded()
     s.feed_line("\\dt")
     assert_eq(sh_printed(&s), "Did not find any tables.\n")
     s.feed_line("\\d")
@@ -591,21 +567,20 @@ dt_with_no_tables_says_so()
 
 @test
 d_describes_a_table()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.feed_line("\\d users")
-    assert_eq(sh_printed(&s), " ".repeat(10) + "Table \"app.users\"\n Column | Type  | Nullable | Default\n--------+-------+----------+---------\n id     | int64 | not null |\n name   | text  |          |\nPrimary key: (id)\n")
-    s.feed_line("\\d app.users")
-    assert(sh_printed(&s).contains("Table \"app.users\""), "a qualified name")
+    assert_eq(sh_printed(&s), " ".repeat(8) + "Table \"public.users\"\n Column | Type  | Nullable | Default\n--------+-------+----------+---------\n id     | int64 | not null |\n name   | text  |          |\nPrimary key: (id)\n")
+    s.feed_line("\\d public.users")
+    assert(sh_printed(&s).contains("Table \"public.users\""), "a qualified name")
 
 @test
 d_says_a_columns_own_nullability_once_and_keeps_nested_ones()
-    val create = "create table kinds (k int64 primary key, a text, b list<text?> not null, c list<text?>);"
-    val fe = sh_front_end()
-    fe.know(create, [RunTree(ew_table("kinds", [Field("k", Int64), Field("a", nullable(Text)), Field("b", list(nullable(Text))),
-        Field("c", nullable(list(nullable(Text))))], "k"))])
-    var s = sh_with_users(fe)
-    s.feed_line(create)
-    assert_eq(sh_printed(&s), "CREATE TABLE\n")
+    val fe = sh_stand_in()
+    fe.know("make kinds;", [RunTree(ew_app()), RunTree(ew_table("kinds", [Field("k", Int64), Field("a", nullable(Text)),
+        Field("b", list(nullable(Text))), Field("c", nullable(list(nullable(Text))))], "k"))])
+    var s = sh_embedded(fe)
+    s.feed_line("make kinds;")
+    assert_eq(sh_printed(&s), "CREATE NAMESPACE\nCREATE TABLE\n")
     s.feed_line("\\d kinds")
     val got = sh_printed(&s)
     assert(got.contains(" k      | int64       | not null |\n"), got)
@@ -615,16 +590,16 @@ d_says_a_columns_own_nullability_once_and_keeps_nested_ones()
 
 @test
 d_of_a_missing_relation_is_an_error()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.feed_line("\\d nothing")
     assert_eq(sh_errors(&s), "Did not find any relation named \"nothing\".\n")
     assert_eq(s.errors, 1)
 
 @test
 d_lists_relations()
-    var s = sh_with_users(sh_front_end())
+    var s = sh_with_users()
     s.feed_line("\\d")
-    assert(sh_printed(&s).contains(" app       | users | table | terndb"), "the table")
+    assert(sh_printed(&s).contains(" public    | users | table | terndb"), "the table")
 
 // -- server mode, over a real socket --------------------------------------------------------------
 
@@ -647,31 +622,38 @@ impl Link for TurnedLink
                 Ok(n) -> return Ok(n)
                 Err(e) -> if !would_block(e) then return Err(e.message())
 
-private sh_server(name: string) -> (&TurnedLink, string)
+/** A server in this process over a new engine holding schema `public`, serving database `app`, and
+ * a link to it; the directory holding its socket.
+ */
+sh_server(name: string) -> (&TurnedLink, string)
     val dir = make_temp_dir(f"terndb-sh-${pid()}-$name-").unwrap()
     var settings = server_settings("pencil")
     settings.database = "app"
     settings.unix_path = Some(join(dir, "s.sock"))
-    val srv = serve(engine(mem_catalog(), 1700000000000000, MonotonicClock()), settings).unwrap()
+    val srv = serve(engine(sql_catalog(), 1700000000000000, MonotonicClock()), settings).unwrap()
     var sock = sysl.net.unix_connect(sysl.net.unix(join(dir, "s.sock")).unwrap()).unwrap()
     sock.non_blocking().unwrap()
     val link: &TurnedLink = TurnedLink(sock, srv)
     (link, dir)
 
+/** A shell logged in to `link`'s server, its statements translated by `fe`. */
+sh_over_socket(link: &TurnedLink, dir: string, fe: &SqlFrontEnd = dialect_front_end()) -> Shell
+    val conn = connect_shell(link, shell_client_config("app", BootstrapRole, "pencil").unwrap()).unwrap()
+    shell(conn, OverSocket(join(dir, "s.sock")), "app", BootstrapRole, fe)
+
 @test
 a_script_over_a_socket_prints_what_it_prints_embedded()
-    val script = "create namespace app;\ncreate table users (\n  id int64 primary key,\n  name text\n);\n" +
-        "insert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');\nbegin;\ninsert into users values (4, 'di');\nrollback;\nselect * from users;\n\\x\nselect 1;\n"
-    var e = sh_embedded(sh_front_end())
+    val script = "create table users (\n  id int64 primary key,\n  name text\n);\n" +
+        "insert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');\nbegin;\ninsert into users values (4, 'di');\nrollback;\nselect * from users;\n\\x\nselect 1 as n;\n"
+    var e = sh_embedded()
     e.run_script(script)
     val embedded = sh_printed(&e)
 
     val (link, dir) = sh_server("same")
-    val conn = connect_shell(link, shell_client_config("app", BootstrapRole, "pencil").unwrap()).unwrap()
-    var s = shell(conn, sh_front_end(), OverSocket(join(dir, "s.sock")), "app", BootstrapRole)
+    var s = sh_over_socket(link, dir)
     s.run_script(script)
     assert_eq(sh_printed(&s), embedded)
-    assert_eq(embedded, "CREATE NAMESPACE\nCREATE TABLE\nINSERT 0 3\nBEGIN\nINSERT 0 1\nROLLBACK\n" + sh_users_table() +
+    assert_eq(embedded, "CREATE TABLE\nINSERT 0 3\nBEGIN\nINSERT 0 1\nROLLBACK\n" + sh_users_table() +
         "Expanded display is on.\n-[ RECORD 1 ]\nn | 1\n")
     assert_eq(s.prompt(), "app=> ")
     s.feed_line("\\conninfo")
@@ -701,8 +683,7 @@ a_wrong_database_over_a_socket_is_refused()
 @test
 a_lost_server_ends_the_shell()
     val (link, dir) = sh_server("lost")
-    val conn = connect_shell(link, shell_client_config("app", BootstrapRole, "pencil").unwrap()).unwrap()
-    var s = shell(conn, sh_front_end(), OverSocket("x"), "app", BootstrapRole)
+    var s = sh_over_socket(link, dir)
     link.srv.shutdown(0)
     s.run_script("select 1;\nselect 2;\n")
     assert(s.quit, "the shell stops")
@@ -711,8 +692,20 @@ a_lost_server_ends_the_shell()
     val _ = remove_dir_all(dir)
 
 @test
+a_server_lost_while_the_shell_looks_up_a_table_ends_the_shell()
+    val (link, dir) = sh_server("lostlookup")
+    var s = sh_over_socket(link, dir)
+    link.srv.shutdown(0)
+    s.run_script("insert into users values (1, 'ann');\nselect 2;\n")
+    assert(s.quit, "the shell stops")
+    val got = sh_errors(&s)
+    assert(got.contains("terndb: error: "), got)
+    assert(!got.contains("Q8010") && !got.contains("Q2001"), "no translation error follows the loss")
+    val _ = remove_dir_all(dir)
+
+@test
 a_wrong_password_embedded_is_refused()
-    val e = engine(mem_catalog(), 1700000000000000, MonotonicClock())
+    val e = engine(sql_catalog(), 1700000000000000, MonotonicClock())
     val link = embedded_link(e, "terndb", "pencil").unwrap()
     connect_shell(link, shell_client_config("terndb", BootstrapRole, "wrong").unwrap()) match
         Ok(_) -> assert(false, "connected with a wrong password")

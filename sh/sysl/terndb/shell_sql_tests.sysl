@@ -1,0 +1,536 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.net.{Socket, would_block}
+import sysl.path.join
+import sysl.time.millis
+
+// Real SQL through the shell, end to end: TernDB's SQL front end translating each statement, the
+// tables it names looked up in the catalog as it asks, the trees run over the shell's connection,
+// embedded and over a Unix socket, and the text a user would see compared whole. Each error path has
+// its own test: syntax errors at every kind of position, translation errors, engine errors, and
+// errors inside a transaction.
+
+/** A shell over a new embedded database holding `users` and `posts`, with nothing printed. */
+private sq_shell() -> Shell
+    var s = sh_embedded_sql()
+    s.run_script(sq_setup())
+    assert_eq(sq_out(&s), "CREATE TABLE\nINSERT 0 3\nCREATE TABLE\nINSERT 0 3\nINSERT 0 1\n")
+    s
+
+private sh_embedded_sql() -> Shell
+    val e = engine(sql_catalog(), 1700000000000000, MonotonicClock())
+    val link = embedded_link(e, "terndb", "pencil").unwrap()
+    val conn = connect_shell(link, shell_client_config("terndb", BootstrapRole, "pencil").unwrap()).unwrap()
+    shell(conn, Embedded, "terndb", BootstrapRole)
+
+private sq_setup() -> string =
+    "create table users (id int64 primary key, name text not null, city text);\n" +
+    "insert into users values (1, 'ann', 'oslo'), (2, 'bob', 'rome'), (3, 'cy', null);\n" +
+    "create table posts (\n  id int64 primary key,\n  author int64 not null references users,\n  title text not null,\n  score int32 default 0\n);\n" +
+    "insert into posts values (10, 1, 'a', 5), (11, 1, 'b', 7), (12, 2, 'c', 1);\n" +
+    "insert into posts (id, author, title) values (13, 3, 'd');\n"
+
+/** Everything `s` printed since last asked, in order. */
+private sq_out(s: *Shell) -> string
+    var out = ""
+    for p in s.take_printed()
+        out = out + p.text
+    out
+
+/** Standard error alone since last asked. */
+private sq_err(s: *Shell) -> string
+    var out = ""
+    for p in s.take_printed()
+        if p.to_err then out = out + p.text
+    out
+
+/** What running `script` on a fresh database with `users` and `posts` prints. */
+private sq_run(script: string) -> string
+    var s = sq_shell()
+    s.run_script(script)
+    sq_out(&s)
+
+// -- DDL and the catalog meta-commands ------------------------------------------------------------
+
+@test
+dt_lists_the_tables_sql_made()
+    var s = sq_shell()
+    s.feed_line("\\dt")
+    assert_eq(sq_out(&s), " ".repeat(11) + "List of tables\n Namespace | Name  | Type  | Owner\n-----------+-------+-------+--------\n" +
+        " public    | posts | table | terndb\n public    | users | table | terndb\n(2 rows)\n")
+
+@test
+d_describes_a_table_sql_made()
+    var s = sq_shell()
+    s.feed_line("create index posts_by_author on posts (author);")
+    assert_eq(sq_out(&s), "CREATE INDEX\n")
+    s.feed_line("\\d posts")
+    val got = sq_out(&s)
+    assert(got.starts_with(" ".repeat(10) + "Table \"public.posts\"\n Column | Type  | Nullable |  Default\n" +
+        "--------+-------+----------+------------\n id     | int64 | not null |\n author | int64 | not null |\n" +
+        " title  | text  | not null |\n score  | int32 |          | '0'::int32\nPrimary key: (id)\nIndexes:\n    \"posts_by_author\" (row.author)"), got)
+    assert(got.ends_with("Foreign-key constraints:\n    \"posts_author_fkey\" FOREIGN KEY (author) REFERENCES public.users(id)\n"), got)
+
+@test
+a_view_sql_made_lists_and_reads()
+    var s = sq_shell()
+    s.run_script("create view busy as select author, count(*) as n from posts group by author;\nselect * from busy where n > 1;\n\\d\n")
+    val got = sq_out(&s)
+    assert(got.starts_with("CREATE VIEW\n author | n\n--------+---\n      1 | 2\n(1 row)\n"), got)
+    assert(got.contains(" public    | busy  | view  | terndb\n"), got)
+
+@test
+drop_table_removes_it_from_dt()
+    var s = sq_shell()
+    s.run_script("drop table posts;\n\\dt\n")
+    assert_eq(sq_out(&s), "DROP TABLE\n" + " ".repeat(11) + "List of tables\n Namespace | Name  | Type  | Owner\n-----------+-------+-------+--------\n" +
+        " public    | users | table | terndb\n(1 row)\n")
+
+@test
+alter_table_add_column_is_seen_by_the_next_insert()
+    assert_eq(sq_run("alter table users add column age int16;\ninsert into users values (4, 'di', 'oslo', 40);\nselect name, age from users where id = 4;\n"),
+        "ALTER TABLE\nINSERT 0 1\n name | age\n------+-----\n di   |  40\n(1 row)\n")
+
+@test
+a_schema_and_a_table_in_it()
+    assert_eq(sq_run("create schema app;\ncreate table app.t (a int64 primary key);\ninsert into app.t values (1), (2);\nselect count(*) from app.t;\n"),
+        "CREATE NAMESPACE\nCREATE TABLE\nINSERT 0 2\n count\n-------\n     2\n(1 row)\n")
+
+// -- queries ---------------------------------------------------------------------------------------
+
+@test
+a_join_with_aliases()
+    assert_eq(sq_run("select u.name, p.title from users u join posts p on p.author = u.id order by p.id;\n"),
+        " name | title\n------+-------\n ann  | a\n ann  | b\n bob  | c\n cy   | d\n(4 rows)\n")
+
+@test
+a_join_with_unqualified_columns_uses_both_tables_columns()
+    assert_eq(sq_run("select name, title from users join posts on author = users.id where score > 4 order by title;\n"),
+        " name | title\n------+-------\n ann  | a\n ann  | b\n(2 rows)\n")
+
+@test
+a_left_join_shows_nulls_as_empty_cells()
+    assert_eq(sq_run("select u.name, p.title from users u left join posts p on p.author = u.id and p.score > 4 order by u.id, p.id;\n"),
+        " name | title\n------+-------\n ann  | a\n ann  | b\n bob  |\n cy   |\n(4 rows)\n")
+
+@test
+star_over_a_join_is_every_column_of_both()
+    assert_eq(sq_run("select * from users u join posts p on p.author = u.id where p.id = 12;\n"),
+        " id | name | city | id_1 | author | title | score\n----+------+------+------+--------+-------+-------\n  2 | bob  | rome |   12 |      2 | c     |     1\n(1 row)\n")
+
+@test
+aggregates_group_by_and_having()
+    assert_eq(sq_run("select author, count(*) as n, sum(score) as total from posts group by author order by author;\n" +
+        "select author from posts group by author having count(*) > 1;\nselect count(*) from users;\n"),
+        " author | n | total\n--------+---+-------\n      1 | 2 |    12\n      2 | 1 |     1\n      3 | 1 |     0\n(3 rows)\n" +
+        " author\n--------\n      1\n(1 row)\n count\n-------\n     3\n(1 row)\n")
+
+@test
+order_by_limit_and_offset()
+    assert_eq(sq_run("select title from posts order by score desc limit 2 offset 1;\nselect title from posts order by id limit 0;\n"),
+        " title\n-------\n a\n c\n(2 rows)\n title\n-------\n(0 rows)\n")
+
+@test
+a_query_of_the_catalog_namespace_knows_its_columns()
+    assert_eq(sq_run("select t.name, c.name from catalog.tables t join catalog.columns c on c.table_oid = t.oid where t.name = 'users' order by c.ordinal;\n"),
+        " name  | name_1\n-------+--------\n users | id\n users | name\n users | city\n(3 rows)\n")
+
+@test
+a_multi_line_statement_with_comments_inside()
+    var s = sq_shell()
+    for l in ["select u.name,  -- who", "       count(*) as posts", "from users u", "  /* every post", "     they wrote */",
+        "  join posts p on p.author = u.id", "group by u.name", "order by u.name;"]
+        s.feed_line(l)
+    assert_eq(sq_out(&s), " name | posts\n------+-------\n ann  |     2\n bob  |     1\n cy   |     1\n(3 rows)\n")
+
+// -- DML -------------------------------------------------------------------------------------------
+
+@test
+update_and_delete_count_their_rows()
+    assert_eq(sq_run("update posts set score = score + 1 where author = 1;\ndelete from posts where score < 1;\nupdate posts set score = 0 where id = 99;\n" +
+        "select id, score from posts order by id;\n"),
+        "UPDATE 2\nDELETE 1\nUPDATE 0\n id | score\n----+-------\n 10 |     6\n 11 |     8\n 12 |     1\n(3 rows)\n")
+
+@test
+returning_prints_rows_then_the_tag()
+    assert_eq(sq_run("insert into users values (4, 'di', 'oslo') returning name;\nupdate users set city = 'bergen' where id = 3 returning id, city;\n" +
+        "delete from users where id = 4 returning id;\n"),
+        " name\n------\n di\n(1 row)\nINSERT 0 1\n id |  city\n----+--------\n  3 | bergen\n(1 row)\nUPDATE 1\n id\n----\n  4\n(1 row)\nDELETE 1\n")
+
+@test
+insert_with_a_column_list_takes_the_defaults()
+    assert_eq(sq_run("select score from posts where id = 13;\n"), " score\n-------\n     0\n(1 row)\n")
+
+// -- transactions ----------------------------------------------------------------------------------
+
+@test
+a_committed_transaction_keeps_its_work()
+    var s = sq_shell()
+    assert_eq(sh_session_sql(&s, ["begin;", "insert into users values (4, 'di', null);", "update users set city = 'oslo' where id = 4;", "commit;",
+        "select count(*) from users where city = 'oslo';"]),
+        "terndb=> begin;\nBEGIN\nterndb=*> insert into users values (4, 'di', null);\nINSERT 0 1\n" +
+        "terndb=*> update users set city = 'oslo' where id = 4;\nUPDATE 1\nterndb=*> commit;\nCOMMIT\n" +
+        "terndb=> select count(*) from users where city = 'oslo';\n count\n-------\n     2\n(1 row)\n")
+
+@test
+a_rolled_back_transaction_leaves_nothing()
+    assert_eq(sq_run("begin;\ndelete from posts;\nselect count(*) from posts;\nrollback;\nselect count(*) from posts;\n"),
+        "BEGIN\nDELETE 4\n count\n-------\n     0\n(1 row)\nROLLBACK\n count\n-------\n     4\n(1 row)\n")
+
+@test
+start_transaction_and_its_modes()
+    assert_eq(sq_run("start transaction isolation level serializable, read only;\nselect count(*) from users;\nend;\n" +
+        "begin isolation level read committed;\nabort;\n"),
+        "BEGIN\n count\n-------\n     3\n(1 row)\nCOMMIT\nBEGIN\nROLLBACK\n")
+
+@test
+a_table_created_in_a_transaction_is_known_to_its_next_statement()
+    assert_eq(sq_run("begin;\ncreate table t (a int64 primary key, b text);\ninsert into t values (1, 'x');\nselect * from t;\ncommit;\n"),
+        "BEGIN\nCREATE TABLE\nINSERT 0 1\n a | b\n---+---\n 1 | x\n(1 row)\nCOMMIT\n")
+
+@test
+ddl_in_a_transaction_makes_the_shell_look_the_table_up_again()
+    assert_eq(sq_run("begin;\ninsert into users values (4, 'di', null);\nalter table users add column age int16;\n" +
+        "insert into users values (5, 'ed', null, 50);\nselect id, age from users where id >= 4 order by id;\ncommit;\n"),
+        "BEGIN\nINSERT 0 1\nALTER TABLE\nINSERT 0 1\n id | age\n----+-----\n  4 |\n  5 |  50\n(2 rows)\nCOMMIT\n")
+
+@test
+rollback_to_a_savepoint_makes_the_shell_look_the_table_up_again()
+    assert_eq(sq_run("begin;\ncreate table t (a int64 primary key);\nsavepoint s;\nalter table t add column b text;\ninsert into t values (1, 'x');\n" +
+        "rollback to savepoint s;\ninsert into t values (2);\nselect * from t;\ncommit;\n"),
+        "BEGIN\nCREATE TABLE\nSAVEPOINT\nALTER TABLE\nINSERT 0 1\nROLLBACK\nINSERT 0 1\n a\n---\n 2\n(1 row)\nCOMMIT\n")
+
+@test
+a_table_dropped_by_a_rollback_is_gone_for_the_next_statement()
+    var s = sq_shell()
+    s.run_script("begin;\ncreate table t (a int64 primary key);\ninsert into t values (1);\nrollback;\n")
+    assert_eq(sq_out(&s), "BEGIN\nCREATE TABLE\nINSERT 0 1\nROLLBACK\n")
+    s.run_script("insert into t values (2);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.t'\nLINE 1: insert into t values (2);\n" + " ".repeat(20) + "^\n")
+
+// -- syntax errors, at each kind of position --------------------------------------------------------
+
+@test
+a_syntax_error_at_the_first_token()
+    var s = sq_shell()
+    s.run_script("selec 1;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q8001: syntax error at selec: expected a statement\nLINE 1: selec 1;\n        ^\n")
+    assert_eq(s.errors, 1)
+
+@test
+a_syntax_error_in_the_middle_of_a_line()
+    var s = sq_shell()
+    s.run_script("select name from users where;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q8001: syntax error at ;: expected an expression\nLINE 1: select name from users where;\n" + " ".repeat(36) + "^\n")
+
+@test
+a_syntax_error_on_a_later_line_of_the_statement()
+    var s = sq_shell()
+    s.run_script("select name\nfrom users\nwhere id = = 1;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q8001: syntax error at =: expected an expression\nLINE 3: where id = = 1;\n" + " ".repeat(19) + "^\n")
+
+@test
+a_syntax_error_at_the_end_of_the_input()
+    var s = sq_shell()
+    s.run_script("select (1")
+    assert_eq(sq_err(&s), "ERROR:  Q8001: syntax error at the end of the input: expected ')'\nLINE 1: select (1\n" + " ".repeat(17) + "^\n")
+
+@test
+an_unterminated_string_is_reported_where_it_opens()
+    var s = sq_shell()
+    s.run_script("select 'abc\ndef")
+    assert_eq(sq_err(&s), "ERROR:  Q8002: unterminated string constant\nLINE 1: select 'abc\n" + " ".repeat(15) + "^\n")
+
+@test
+a_character_that_starts_no_token()
+    var s = sq_shell()
+    s.run_script("select 1 ` 2;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q8003: a character that starts no token\nLINE 1: select 1 ` 2;\n" + " ".repeat(17) + "^\n")
+
+@test
+the_caret_counts_wide_characters_as_two_columns()
+    var s = sq_shell()
+    s.run_script("select '漢字' as k from;\nselect 'héllo' as h from;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q8001: syntax error at ;: expected a name\nLINE 1: select '漢字' as k from;\n" + " ".repeat(31) + "^\n" +
+        "ERROR:  Q8001: syntax error at ;: expected a name\nLINE 1: select 'héllo' as h from;\n" + " ".repeat(32) + "^\n")
+
+@test
+the_position_is_within_its_own_statement()
+    var s = sq_shell()
+    s.run_script("select 1 as n; select 1 from;\n\n\nselect\n  2 from;\n")
+    assert_eq(sq_out(&s), " n\n---\n 1\n(1 row)\n" +
+        "ERROR:  Q8001: syntax error at ;: expected a name\nLINE 1: select 1 from;\n" + " ".repeat(21) + "^\n" +
+        "ERROR:  Q8001: syntax error at ;: expected a name\nLINE 2:   2 from;\n" + " ".repeat(16) + "^\n")
+    assert_eq(s.errors, 2)
+
+// -- translation errors ------------------------------------------------------------------------------
+
+@test
+an_ambiguous_column_is_a_translation_error()
+    var s = sq_shell()
+    s.run_script("select id from users join posts on author = users.id;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q8008: column reference id is ambiguous\nLINE 1: select id from users join posts on author = users.id;\n" +
+        " ".repeat(15) + "^\n")
+
+@test
+an_unknown_column_of_a_known_table_is_found_before_the_server()
+    var s = sq_shell()
+    s.run_script("select nope from users;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2003: column nope does not exist\nLINE 1: select nope from users;\n" + " ".repeat(15) + "^\n")
+
+@test
+a_values_row_of_the_wrong_length()
+    var s = sq_shell()
+    s.run_script("insert into users values (9, 'x');\n")
+    val got = sq_err(&s)
+    assert(got.starts_with("ERROR:  Q8012: "), got)
+    assert(got.contains("\nLINE 1: insert into users values (9, 'x');\n"), got)
+
+@test
+an_insert_into_a_missing_table_names_the_table()
+    var s = sq_shell()
+    s.run_script("insert into nosuch values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.nosuch'\nLINE 1: insert into nosuch values (1);\n" + " ".repeat(20) + "^\n")
+    assert_eq(s.errors, 1)
+
+@test
+a_construct_outside_the_dialect()
+    var s = sq_shell()
+    s.run_script("select * from users natural join posts;\n")
+    val got = sq_err(&s)
+    assert(got.starts_with("ERROR:  Q8005: "), got)
+
+@test
+an_unknown_type_name()
+    var s = sq_shell()
+    s.run_script("create table t (a nosuchtype);\n")
+    val got = sq_err(&s)
+    assert(got.starts_with("ERROR:  Q8006: "), got)
+    assert(got.contains("LINE 1: create table t (a nosuchtype);\n" + " ".repeat(26) + "^\n"), got)
+
+@test
+a_statement_with_a_parameter_is_refused()
+    var s = sq_shell()
+    s.run_script("select $1 as n;\n")
+    val got = sq_err(&s)
+    assert(got.starts_with("ERROR:  "), got)
+    assert_eq(s.errors, 1)
+
+@test
+a_missing_table_in_a_named_schema_points_at_its_name()
+    var s = sq_shell()
+    s.run_script("insert into app.nosuch values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'app.nosuch'\nLINE 1: insert into app.nosuch values (1);\n" + " ".repeat(24) + "^\n")
+
+@test
+a_missing_quoted_table_keeps_its_case()
+    var s = sq_shell()
+    s.run_script("insert into \"NoSuch\" values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.NoSuch'\nLINE 1: insert into \"NoSuch\" values (1);\n" + " ".repeat(20) + "^\n")
+
+@test
+a_missing_relation_of_the_catalog_namespace()
+    var s = sq_shell()
+    s.run_script("insert into catalog.nosuch values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'catalog.nosuch'\nLINE 1: insert into catalog.nosuch values (1);\n" + " ".repeat(28) + "^\n")
+
+@test
+a_missing_table_beside_a_known_one_is_the_one_named()
+    var s = sq_shell()
+    s.run_script("select name, title from users join nosuch on author = users.id;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.nosuch'\nLINE 1: select name, title from users join nosuch on author = users.id;\n" +
+        " ".repeat(43) + "^\n")
+
+@test
+nesting_past_the_limit_is_refused_before_it_is_sent()
+    var s = sq_shell()
+    s.run_script("select " + "(".repeat(300) + "1" + ")".repeat(300) + ";\n")
+    assert(sq_err(&s).starts_with("ERROR:  Q1006: "), "too deep")
+    assert_eq(s.errors, 1)
+
+// -- edges -----------------------------------------------------------------------------------------
+
+@test
+empty_statements_run_nothing()
+    var s = sq_shell()
+    s.run_script(";\n;;\n  ;  -- nothing\n")
+    assert_eq(sq_out(&s), "")
+    assert_eq(s.errors, 0)
+
+@test
+on_conflict_without_a_target_uses_the_primary_key_from_the_catalog()
+    assert_eq(sq_run("insert into users values (1, 'again', null), (4, 'di', null) on conflict do nothing;\nselect count(*) from users;\n"),
+        "INSERT 0 1\n count\n-------\n     4\n(1 row)\n")
+
+@test
+a_view_s_columns_resolve_beside_a_table()
+    assert_eq(sq_run("create view busy as select author, count(*) as n from posts group by author;\n" +
+        "select name, n from busy join users on author = id order by name;\n"),
+        "CREATE VIEW\n name | n\n------+---\n ann  | 2\n bob  | 1\n cy   | 1\n(3 rows)\n")
+
+@test
+an_empty_table_shows_its_headings()
+    assert_eq(sq_run("create table e (a int64 primary key, b text);\nselect * from e;\nselect count(*) from e;\n"),
+        "CREATE TABLE\n a | b\n---+---\n(0 rows)\n count\n-------\n     0\n(1 row)\n")
+
+@test
+a_table_without_a_primary_key_is_refused_by_the_server_and_stays_missing()
+    assert_eq(sq_run("create table k (a int64, b text);\ninsert into k values (1, 'x');\n"),
+        "ERROR:  Q6009: a table has no primary key\nERROR:  Q2001: no table or view 'public.k'\nLINE 1: insert into k values (1, 'x');\n" +
+        " ".repeat(20) + "^\n")
+
+// -- engine errors -----------------------------------------------------------------------------------
+
+@test
+a_duplicate_key_is_an_engine_error()
+    var s = sq_shell()
+    s.run_script("insert into users values (1, 'again', null);\nselect count(*) from users;\n")
+    val got = sq_out(&s)
+    assert(got.starts_with("ERROR:  T3001: "), got)
+    assert(got.ends_with(" count\n-------\n     3\n(1 row)\n"), got)
+    assert_eq(s.errors, 1)
+
+@test
+a_null_in_a_not_null_column_is_an_engine_error()
+    var s = sq_shell()
+    s.run_script("insert into users (id) values (9);\n")
+    assert(sq_err(&s).starts_with("ERROR:  Q"), "refused")
+    assert_eq(s.errors, 1)
+
+@test
+a_missing_referenced_row_is_an_engine_error()
+    var s = sq_shell()
+    s.run_script("insert into posts values (20, 99, 'z', 1);\n")
+    val got = sq_err(&s)
+    assert(got.starts_with("ERROR:  T3003: "), got)
+    assert_eq(s.errors, 1)
+
+@test
+a_type_error_is_found_by_the_server()
+    var s = sq_shell()
+    s.run_script("select name + 1 from users;\n")
+    assert(sq_err(&s).starts_with("ERROR:  Q"), "refused")
+    assert_eq(s.errors, 1)
+
+@test
+a_query_of_a_missing_table_is_refused_by_the_server()
+    var s = sq_shell()
+    s.run_script("select * from nosuch;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.nosuch'\n")
+
+// -- errors inside a transaction ------------------------------------------------------------------
+
+@test
+a_syntax_error_in_a_transaction_sends_nothing_and_keeps_it_open()
+    var s = sq_shell()
+    assert_eq(sh_session_sql(&s, ["begin;", "selec 1;", "insert into users values (4, 'di', null);", "commit;"]),
+        "terndb=> begin;\nBEGIN\nterndb=*> selec 1;\nERROR:  Q8001: syntax error at selec: expected a statement\nLINE 1: selec 1;\n        ^\n" +
+        "terndb=*> insert into users values (4, 'di', null);\nINSERT 0 1\nterndb=*> commit;\nCOMMIT\n")
+
+@test
+an_engine_error_in_a_transaction_fails_it_and_later_statements_are_refused()
+    var s = sq_shell()
+    s.run_script("begin;\ninsert into users values (1, 'again', null);\n")
+    val _ = sq_out(&s)
+    assert_eq(s.prompt(), "terndb=!> ")
+    s.feed_line("insert into posts values (20, 1, 'z', 1);")
+    val got = sq_err(&s)
+    assert(got.starts_with("ERROR:  W2003: "), got)
+    s.feed_line("select * from users;")
+    assert(sq_err(&s).starts_with("ERROR:  W2003: "), "refused too")
+    s.feed_line("commit;")
+    assert_eq(sq_out(&s), "ROLLBACK\n")
+    assert_eq(s.prompt(), "terndb=> ")
+    s.run_script("select count(*) from posts;\n")
+    assert_eq(sq_out(&s), " count\n-------\n     4\n(1 row)\n")
+
+@test
+a_translation_error_in_a_failed_transaction_is_still_reported()
+    var s = sq_shell()
+    s.run_script("begin;\ninsert into users values (1, 'again', null);\n")
+    val _ = sq_out(&s)
+    s.feed_line("select (;")
+    assert(sq_err(&s).starts_with("ERROR:  Q8001: "), "the syntax error")
+    assert_eq(s.prompt(), "terndb=!> ")
+    s.feed_line("rollback;")
+    assert_eq(sq_out(&s), "ROLLBACK\n")
+
+@test
+an_error_after_a_savepoint_is_undone_by_rolling_back_to_it()
+    assert(sq_run("begin;\ninsert into users values (4, 'di', null);\nsavepoint a;\ninsert into users values (4, 'twice', null);\n" +
+        "rollback to savepoint a;\ninsert into users values (5, 'ed', null);\ncommit;\nselect id from users where id > 3 order by id;\n").contains(
+        "ROLLBACK\nINSERT 0 1\nCOMMIT\n id\n----\n  4\n  5\n(2 rows)\n"), "the work before the savepoint and after the rollback stays")
+
+// -- over a socket ----------------------------------------------------------------------------------
+
+/** A session typed at `s`: each line after its prompt, then what it printed. */
+private sh_session_sql(s: *Shell, lines: []const string) -> string
+    var out = ""
+    for l in lines
+        out = out + s.prompt() + l + "\n"
+        s.feed_line(l)
+        out = out + sq_out(s)
+    out
+
+@test
+real_sql_over_a_socket_prints_what_it_prints_embedded()
+    val script = sq_setup() + "select u.name, count(*) as posts from users u join posts p on p.author = u.id group by u.name order by u.name;\n" +
+        "begin;\nupdate posts set score = 0;\nselec;\ndelete from posts where id = 10;\nrollback;\nselect title from posts order by score desc limit 1;\n" +
+        "insert into nosuch values (1);\n\\dt\n"
+    var e = sh_embedded_sql()
+    e.run_script(script)
+    val embedded = sq_out(&e)
+    assert(embedded.contains("BEGIN\nUPDATE 4\nERROR:  Q8001: "), embedded)
+    assert(embedded.contains("DELETE 1\nROLLBACK\n title\n-------\n b\n(1 row)\nERROR:  Q2001: no table or view 'public.nosuch'\n"), embedded)
+    assert(embedded.ends_with(" public    | posts | table | terndb\n public    | users | table | terndb\n(2 rows)\n"), embedded)
+
+    val (link, dir) = sh_server("sql")
+    var s = sh_over_socket(link, dir)
+    s.run_script(script)
+    assert_eq(sq_out(&s), embedded)
+    assert_eq(s.errors, e.errors)
+    s.close()
+    link.srv.shutdown(0)
+    val _ = remove_dir_all(dir)
+
+/** A second connection to the server `first` turns, which turns it while it waits. */
+struct BesideLink
+    sock: Socket
+    first: &TurnedLink
+
+impl Link for BesideLink
+    send(*self, bytes: []const u8) -> Result[unit, string] = self.sock.send_all(bytes) match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(e.message())
+
+    receive(*self, into: []u8) -> Result[usize, string]
+        loop
+            self.first.srv.turn(Some(millis(1))).unwrap()
+            self.sock.recv(into) match
+                Ok(n) -> return Ok(n)
+                Err(e) -> if !would_block(e) then return Err(e.message())
+
+@test
+a_second_session_sees_the_tables_the_first_one_changed()
+    val (link, dir) = sh_server("two")
+    var a = sh_over_socket(link, dir)
+    a.run_script("create table t (a int64 primary key);\n")
+    assert_eq(sq_out(&a), "CREATE TABLE\n")
+    var sock = sysl.net.unix_connect(sysl.net.unix(join(dir, "s.sock")).unwrap()).unwrap()
+    sock.non_blocking().unwrap()
+    val second: &BesideLink = BesideLink(sock, link)
+    val conn = connect_shell(second, shell_client_config("app", BootstrapRole, "pencil").unwrap()).unwrap()
+    var b = shell(conn, OverSocket(join(dir, "s.sock")), "app", BootstrapRole)
+    b.run_script("insert into t values (1);\n")
+    assert_eq(sq_out(&b), "INSERT 0 1\n")
+    a.run_script("alter table t add column b text;\n")
+    assert_eq(sq_out(&a), "ALTER TABLE\n")
+    b.run_script("insert into t values (2, 'x');\nselect * from t order by a;\n")
+    assert_eq(sq_out(&b), "INSERT 0 1\n a | b\n---+---\n 1 |\n 2 | x\n(2 rows)\n")
+    a.close()
+    b.close()
+    link.srv.shutdown(0)
+    val _ = remove_dir_all(dir)

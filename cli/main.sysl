@@ -3,8 +3,8 @@
 // server); `terndb`, or `terndb shell`, is the interactive shell, over a server's Unix socket or over
 // an in-memory database embedded in the shell itself.
 
-import sh.sysl.terndb.{BootstrapRole, Embedded, MonotonicClock, NoSqlFrontEnd, OverSocket, Shell, ShellConn, connect_shell, embedded_link,
-    engine, mem_catalog, random_octets, serve, server_settings, shell, shell_client_config, socket_link}
+import sh.sysl.terndb.{BootstrapRole, Embedded, MonotonicClock, OverSocket, Shell, ShellConn, connect_shell, embedded_link,
+    engine, random_octets, serve, server_settings, shell, shell_client_config, socket_link, sql_catalog}
 import sysl.args.{cli, long_option, option, parse_or_exit}
 import sysl.encoding.hex_string
 import sysl.env
@@ -51,7 +51,7 @@ serve_main(args: []string)
 
     var interrupt = signal.watch(signal.INT).expect("a SIGINT watch")
     var terminate = signal.watch(signal.TERM).expect("a SIGTERM watch")
-    var srv = serve(engine(mem_catalog(), now().us, MonotonicClock()), settings).expect("listening")
+    var srv = serve(engine(sql_catalog(), now().us, MonotonicClock()), settings).expect("listening")
 
     print(s"terndb: serving database ${settings.database} on ${settings.unix_path.unwrap()} as role $BootstrapRole")
     srv.tcp_address() match
@@ -137,7 +137,7 @@ open_server(at: string, db: string, role: string) -> Shell
             eprints(s"terndb: error: connection to server on socket \"$at\" failed: $e\n")
             exit(2)
     val conn = connect(link, db, role, password, s"to server on socket \"$at\"")
-    shell(conn, NoSqlFrontEnd(), OverSocket(at), db, role)
+    shell(conn, OverSocket(at), db, role)
 
 /** A shell over an in-memory database of its own, logged in with a password made for it. */
 open_embedded(db: string, role: string) -> Shell
@@ -146,14 +146,14 @@ open_embedded(db: string, role: string) -> Shell
         Err(e) ->
             eprints(s"terndb: error: no random password for the embedded database: ${e.message()}\n")
             exit(2)
-    val e = engine(mem_catalog(), now().us, MonotonicClock())
+    val e = engine(sql_catalog(), now().us, MonotonicClock())
     val link = embedded_link(e, db, password) match
         Ok(l) -> l
         Err(m) ->
             eprints(s"terndb: error: the embedded database did not start: $m\n")
             exit(2)
     val conn = connect(link, db, role, password, "to the embedded database")
-    shell(conn, NoSqlFrontEnd(), Embedded, db, role)
+    shell(conn, Embedded, db, role)
 
 connect(link: &sh.sysl.terndb.Link, db: string, role: string, password: string, where: string) -> ShellConn
     val config = shell_client_config(db, role, password) match
@@ -188,7 +188,6 @@ banner(at: Option[string], db: string)
         None ->
             prints(s"terndb $Version, with an in-memory database embedded in this shell.\n")
             prints("Its data lives only for this session: it is gone when the shell exits.\n")
-    prints("This build has no SQL front end: only meta-commands run.\n")
     prints("Type \\? for help, \\q to quit.\n\n")
     flush()
 
