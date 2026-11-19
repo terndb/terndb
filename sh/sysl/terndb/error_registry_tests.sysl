@@ -58,6 +58,7 @@ sources() -> Buf[SourceText]
     src(out, "engine_authority.sysl", embed("engine_authority.sysl"))
     src(out, "engine.sysl", embed("engine.sysl"))
     src(out, "error.sysl", embed("error.sysl"))
+    src(out, "exec_access.sysl", embed("exec_access.sysl"))
     src(out, "exec_agg.sysl", embed("exec_agg.sysl"))
     src(out, "exec_dml.sysl", embed("exec_dml.sysl"))
     src(out, "exec_eval.sysl", embed("exec_eval.sysl"))

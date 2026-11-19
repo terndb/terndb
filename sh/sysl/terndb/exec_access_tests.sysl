@@ -1,0 +1,683 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// Access-path selection (`exec_access.sysl`, `docs/design/executor.md` §4.6): a filter's comparisons
+// of the primary key with fixed values narrow a scan to a range of the table's tree. Each case checks
+// the rows against what a full scan returns and counts the leaf entries the scan visited
+// (`Store.slots_read`), so a lookup that quietly fell back to a full scan fails. The differential
+// test at the end compares random predicates with the same predicate made unusable for narrowing.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+/** `t(id int64, v int64, note text?)` keyed by `id`; `c(a int64, b text, n int32, v int64)` keyed by
+ * `(a, b, n)`; `u(k uint32, v int64)` keyed by `k`; `d(a int64, b int64, v int64?)` keyed by `(a, b)`.
+ */
+private pk_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("v", Int64), cat_col("note", nullable(Text))], ["id"]))
+    c = cat_ok(c, cat_table("c", [cat_col("a", Int64), cat_col("b", Text), cat_col("n", Int32), cat_col("v", Int64)], ["a", "b", "n"]))
+    c = cat_ok(c, cat_table("u", [cat_col("k", UInt32), cat_col("v", Int64)], ["k"]))
+    cat_ok(c, cat_table("d", [cat_col("a", Int64), cat_col("b", Int64), cat_col("v", nullable(Int64))], ["a", "b"]))
+
+private pk_store() -> &Store = mem_store(pk_catalog())
+
+/** The tree of SQL statement `text`, over the store's catalog with `app` as the default schema. */
+private pk_env(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope
+    sql_statements(text, "app", s.latest_catalog()) match
+        Ok(sts) -> sts[0].action match
+            SqlTree(env) -> return env
+            SqlControl(_) -> ()
+        Err(e) -> print(s"\n$text\n  -> ${e.code} ${e.message}\n")
+
+    assert(false, "the statement translates", file, line)
+    panic("untranslated")
+
+/** Runs `text` in a transaction of its own, which commits. */
+private pk_ok(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    val _ = xd_ran(s, t, pk_env(s, text, file, line), [], file, line)
+    assert(s.commit(t).is_ok(), "the transaction commits", file, line)
+
+/** `t` holding ids `1..=n`, each with `v = id * 10`. */
+private pk_seed(s: &Store, n: i128)
+    var text = "INSERT INTO t (id, v) VALUES "
+
+    for i in 1..<n + 1
+        if i > 1 then text = text + ", "
+        text = text + s"($i, ${i * 10})"
+
+    pk_ok(s, text)
+
+/** The first column of each row of the result of `text` in `t`, in order. */
+private pk_read(s: &Store, t: &Txn, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Buf[i128] =
+    pk_first(xd_ran(s, t, pk_env(s, text, file, line), params, file, line))
+
+/** `pk_read` in a snapshot transaction of its own. */
+private pk_sel(s: &Store, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Buf[i128] =
+    pk_read(s, s.begin(Snapshot), text, params, file, line)
+
+/** How many leaf entries `text` visits, run in a snapshot transaction of its own. */
+private pk_visits(s: &Store, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> u64
+    val before = s.slots_read
+    val _ = xd_ran(s, s.begin(Snapshot), pk_env(s, text, file, line), params, file, line)
+    s.slots_read - before
+
+private pk_first(o: Executed) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in xd_rows(o)
+        r match
+            Record(fs) -> out.push(pk_int(fs[0]))
+            _ -> out.push(-997)
+
+    out
+
+private pk_int(v: Value) -> i128 = v match
+    Int(n) -> n
+    UInt(n) -> i128(n)
+    Null -> -999
+    _ -> -998
+
+/** `text`'s rows and visits: the rows must be `want` and the visits `visits`. */
+private pk_check(s: &Store, text: string, want: []const i128, visits: u64, params: []const Value = [], file: string = __FILE__, line: long = __LINE__)
+    xd_ids_are(pk_sel(s, text, params, file, line), want, file, line)
+    assert_eq(pk_visits(s, text, params, file, line), visits, s"leaf entries visited by: $text", file, line)
+
+// -- the plan chosen ---------------------------------------------------------------------------------
+
+private pk_col(b: string, name: string, ty: Type) -> TExpr = TExpr(Col(b, name), ty, buf[TExpr](), None, 0)
+
+private pk_lit(n: i128) -> TExpr = TExpr(Literal(Int64, Int(n)), Int64, buf[TExpr](), None, 0)
+
+private pk_param(i: u64, ty: Type) -> TExpr = TExpr(Param(i), ty, buf[TExpr](), None, 0)
+
+private pk_call(f: string, args: []const TExpr) -> TExpr = TExpr(Call(f, buf[Expr]()), nullable(Bool), items_of(args), None, 0)
+
+/** The access path a scan of `table` through `b` filtered by `p` takes, with parameters `params`. */
+private pk_access(s: &Store, table: string, b: string, p: Option[TExpr], params: []const Value = []) -> Access
+    val ct = s.catalog.tables[s.catalog.table_at(cat_q(table)).unwrap()]
+    access_of(no_uses().db(s, s.begin(Snapshot)), ct, b, p, xe_ctx(params))
+
+private pk_eq_param() -> TExpr = pk_call("eq", [pk_col("x", "id", Int64), pk_param(0, Int64)])
+
+@test
+a_primary_key_equal_to_a_parameter_is_a_key_lookup()
+    val s = pk_store()
+    pk_seed(s, 3)
+    val a = pk_access(s, "t", "x", Some(pk_eq_param()), [Int(2)])
+    assert(a.path == KeyLookup, "where id = $1 is a key lookup")
+    // The same lookup from the far side of the comparison.
+    val turned = pk_call("eq", [pk_param(0, Int64), pk_col("x", "id", Int64)])
+    assert(pk_access(s, "t", "x", Some(turned), [Int(2)]).path == KeyLookup, "where $1 = id is a key lookup")
+
+@test
+a_parameterised_lookup_visits_one_entry_of_a_large_table()
+    val s = pk_store()
+    pk_seed(s, 300)
+    pk_check(s, "SELECT id FROM t WHERE id = $1::int64", [150], 1, [Int(150)])
+
+@test
+no_filter_and_a_filter_on_other_columns_are_full_scans()
+    val s = pk_store()
+    pk_seed(s, 3)
+    assert(pk_access(s, "t", "x", None).path == FullScan, "no filter")
+    assert(pk_access(s, "t", "x", Some(pk_call("eq", [pk_col("x", "v", Int64), pk_lit(10)]))).path == FullScan, "a non-key column")
+    // Another binder's column is not this scan's key.
+    assert(pk_access(s, "t", "x", Some(pk_call("eq", [pk_col("y", "id", Int64), pk_lit(1)]))).path == FullScan, "another binder")
+    // A key compared with a column is not fixed for the statement.
+    assert(pk_access(s, "t", "x", Some(pk_call("eq", [pk_col("x", "id", Int64), pk_col("x", "v", Int64)]))).path == FullScan, "a column")
+    assert(pk_access(s, "t", "x", Some(pk_call("ne", [pk_col("x", "id", Int64), pk_lit(1)]))).path == FullScan, "ne")
+
+@test
+a_bound_on_the_key_is_a_range_and_a_null_comparand_reads_nothing()
+    val s = pk_store()
+    pk_seed(s, 3)
+    assert(pk_access(s, "t", "x", Some(pk_call("gt", [pk_col("x", "id", Int64), pk_lit(1)]))).path == KeyRange, "gt")
+    assert(pk_access(s, "t", "x", Some(pk_eq_param()), [Null]).path == NoRows, "a null parameter")
+    // A conjunct's key comparison is used inside an `and`, not inside an `or`.
+    val both = pk_call("and", [pk_call("eq", [pk_col("x", "v", Int64), pk_lit(1)]), pk_eq_param()])
+    assert(pk_access(s, "t", "x", Some(both), [Int(1)]).path == KeyLookup, "and")
+    val either = pk_call("or", [pk_call("eq", [pk_col("x", "v", Int64), pk_lit(1)]), pk_eq_param()])
+    assert(pk_access(s, "t", "x", Some(either), [Int(1)]).path == FullScan, "or")
+
+@test
+successor_drops_trailing_ff_octets_and_increments()
+    assert(successor(items_of([u8(1), 2])).unwrap() == items_of([u8(1), 3]), "plain")
+    assert(successor(items_of([u8(1), 0xFF, 0xFF])).unwrap() == items_of([u8(2)]), "trailing 0xff")
+    assert(successor(items_of([u8(0xFF), 0xFF])).is_none(), "all 0xff")
+    assert(successor(buf[u8]()).is_none(), "empty")
+
+// -- lookups -----------------------------------------------------------------------------------------
+
+@test
+a_key_lookup_hit_returns_the_row()
+    val s = pk_store()
+    pk_seed(s, 20)
+    pk_check(s, "SELECT v FROM t WHERE id = 7", [70], 1)
+
+@test
+a_key_lookup_miss_returns_nothing_and_visits_nothing()
+    val s = pk_store()
+    pk_seed(s, 20)
+    pk_check(s, "SELECT v FROM t WHERE id = 1000", [], 0)
+    pk_check(s, "SELECT v FROM t WHERE id = 0", [], 0)
+    pk_check(s, "SELECT v FROM t WHERE id = -5", [], 0)
+
+@test
+a_lookup_and_a_range_over_an_empty_table_return_nothing()
+    val s = pk_store()
+    pk_check(s, "SELECT v FROM t WHERE id = 1", [], 0)
+    pk_check(s, "SELECT v FROM t WHERE id > 1", [], 0)
+    pk_check(s, "SELECT v FROM t WHERE id BETWEEN 1 AND 9", [], 0)
+
+@test
+the_first_and_the_last_key_are_found()
+    val s = pk_store()
+    pk_seed(s, 20)
+    pk_check(s, "SELECT id FROM t WHERE id = 1", [1], 1)
+    pk_check(s, "SELECT id FROM t WHERE id = 20", [20], 1)
+    pk_check(s, "SELECT id FROM t WHERE id <= 1", [1], 1)
+    pk_check(s, "SELECT id FROM t WHERE id >= 20", [20], 1)
+    pk_check(s, "SELECT id FROM t WHERE id < 1", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id > 20", [], 0)
+
+@test
+a_lookup_keeps_the_rest_of_the_filter()
+    val s = pk_store()
+    pk_seed(s, 20)
+    pk_check(s, "SELECT id FROM t WHERE id = 7 AND v = 70", [7], 1)
+    pk_check(s, "SELECT id FROM t WHERE id = 7 AND v = 71", [], 1)
+    pk_check(s, "SELECT id FROM t WHERE v > 0 AND id = 7 AND note IS NULL", [7], 1)
+
+@test
+two_different_equalities_on_the_key_match_nothing()
+    val s = pk_store()
+    pk_seed(s, 20)
+    xd_ids_are(pk_sel(s, "SELECT id FROM t WHERE id = 3 AND id = 4"), [])
+    xd_ids_are(pk_sel(s, "SELECT id FROM t WHERE id = 3 AND id = 3"), [3])
+
+// -- ranges --------------------------------------------------------------------------------------------
+
+@test
+each_range_operator_reads_only_its_range()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id < 4", [1, 2, 3], 3)
+    pk_check(s, "SELECT id FROM t WHERE id <= 4", [1, 2, 3, 4], 4)
+    pk_check(s, "SELECT id FROM t WHERE id > 7", [8, 9, 10], 3)
+    pk_check(s, "SELECT id FROM t WHERE id >= 7", [7, 8, 9, 10], 4)
+    // The comparand on the left turns the operator round.
+    pk_check(s, "SELECT id FROM t WHERE 4 > id", [1, 2, 3], 3)
+    pk_check(s, "SELECT id FROM t WHERE 7 <= id", [7, 8, 9, 10], 4)
+
+@test
+open_and_closed_bounds_combine()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id > 3 AND id < 7", [4, 5, 6], 3)
+    pk_check(s, "SELECT id FROM t WHERE id >= 3 AND id < 7", [3, 4, 5, 6], 4)
+    pk_check(s, "SELECT id FROM t WHERE id > 3 AND id <= 7", [4, 5, 6, 7], 4)
+    pk_check(s, "SELECT id FROM t WHERE id >= 3 AND id <= 7", [3, 4, 5, 6, 7], 5)
+    pk_check(s, "SELECT id FROM t WHERE id BETWEEN 3 AND 7", [3, 4, 5, 6, 7], 5)
+    pk_check(s, "SELECT id FROM t WHERE id NOT BETWEEN 3 AND 7", [1, 2, 8, 9, 10], 10)
+
+@test
+the_tighter_of_two_bounds_on_one_side_wins()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id > 2 AND id > 5", [6, 7, 8, 9, 10], 5)
+    pk_check(s, "SELECT id FROM t WHERE id > 5 AND id >= 5", [6, 7, 8, 9, 10], 5)
+    pk_check(s, "SELECT id FROM t WHERE id < 8 AND id < 3", [1, 2], 2)
+    pk_check(s, "SELECT id FROM t WHERE id <= 3 AND id < 3", [1, 2], 2)
+
+@test
+an_empty_range_and_inverted_bounds_read_nothing()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id > 5 AND id < 6", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id > 5 AND id < 5", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id >= 5 AND id < 5", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id BETWEEN 7 AND 3", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id BETWEEN 5 AND 5", [5], 1)
+
+@test
+a_range_holding_no_stored_key_reads_nothing()
+    val s = pk_store()
+    pk_ok(s, "INSERT INTO t (id, v) VALUES (10, 1), (20, 2), (30, 3)")
+    pk_check(s, "SELECT id FROM t WHERE id > 10 AND id < 20", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id BETWEEN 11 AND 29", [20], 1)
+
+@test
+extreme_bounds_are_ranges_too()
+    val s = pk_store()
+    pk_ok(s, "INSERT INTO t (id, v) VALUES (-9223372036854775808, 1), (0, 2), (9223372036854775807, 3)")
+    pk_check(s, "SELECT v FROM t WHERE id = -9223372036854775808", [1], 1)
+    pk_check(s, "SELECT v FROM t WHERE id = 9223372036854775807", [3], 1)
+    pk_check(s, "SELECT v FROM t WHERE id >= 9223372036854775807", [3], 1)
+    pk_check(s, "SELECT v FROM t WHERE id > 9223372036854775807", [], 0)
+    pk_check(s, "SELECT v FROM t WHERE id < -9223372036854775808", [], 0)
+
+// -- composite keys --------------------------------------------------------------------------------------
+
+/** `c` holding `(a, b, n, v)` rows in which `b` takes values that are prefixes of one another. */
+private pk_composite() -> &Store
+    val s = pk_store()
+    pk_ok(s, """
+        INSERT INTO c (a, b, n, v) VALUES
+        (1, 'w', 1, 1), (1, 'x', 1, 2), (1, 'x', 2, 3), (1, 'xa', 1, 4), (1, 'y', 5, 5),
+        (2, 'x', 1, 6), (2, 'x', 3, 7), (3, '', 0, 8)
+        """)
+    s
+
+@test
+a_full_composite_key_is_a_lookup()
+    val s = pk_composite()
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b = 'x' AND n = 2", [3], 1)
+    pk_check(s, "SELECT v FROM c WHERE n = 1 AND b = 'x' AND a = 2", [6], 1)
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b = 'x' AND n = 9", [], 0)
+    pk_check(s, "SELECT v FROM c WHERE a = 3 AND b = '' AND n = 0", [8], 1)
+
+@test
+a_composite_key_prefix_is_a_range()
+    val s = pk_composite()
+    pk_check(s, "SELECT v FROM c WHERE a = 1", [1, 2, 3, 4, 5], 5)
+    pk_check(s, "SELECT v FROM c WHERE a = 2", [6, 7], 2)
+    // `'x'` is a prefix of `'xa'` as text, but not as a key component.
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b = 'x'", [2, 3], 2)
+    pk_check(s, "SELECT v FROM c WHERE a = 3 AND b = ''", [8], 1)
+    pk_check(s, "SELECT v FROM c WHERE a = 9", [], 0)
+
+@test
+a_bound_after_a_composite_prefix_narrows_the_range()
+    val s = pk_composite()
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b > 'x'", [4, 5], 2)
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b >= 'x'", [2, 3, 4, 5], 4)
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b < 'x'", [1], 1)
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b <= 'x'", [1, 2, 3], 3)
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND b = 'x' AND n > 1", [3], 1)
+    pk_check(s, "SELECT v FROM c WHERE a >= 2", [6, 7, 8], 3)
+    pk_check(s, "SELECT v FROM c WHERE a > 1 AND a < 3", [6, 7], 2)
+
+@test
+a_condition_on_a_later_key_column_alone_is_a_full_scan()
+    val s = pk_composite()
+    pk_check(s, "SELECT v FROM c WHERE b = 'x'", [2, 3, 6, 7], 8)
+    pk_check(s, "SELECT v FROM c WHERE n = 1", [1, 2, 4, 6], 8)
+    // A gap in the prefix: only `a` narrows, and `n` is filtered.
+    pk_check(s, "SELECT v FROM c WHERE a = 1 AND n = 1", [1, 2, 4], 5)
+    // A bound on `a` stops the prefix: `b` is filtered.
+    pk_check(s, "SELECT v FROM c WHERE a > 1 AND b = 'x'", [6, 7], 3)
+
+// -- what falls back -----------------------------------------------------------------------------------
+
+@test
+an_or_falls_back_to_a_full_scan()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id = 1 OR id = 3", [1, 3], 10)
+    pk_check(s, "SELECT id FROM t WHERE id IN (2, 4)", [2, 4], 10)
+    // An `or` beside a key equality: the equality still narrows.
+    pk_check(s, "SELECT id FROM t WHERE id = 5 AND (v = 50 OR v = 1)", [5], 1)
+
+@test
+a_comparison_with_null_matches_nothing()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id = CAST(NULL AS int64)", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id > CAST(NULL AS int64)", [], 0)
+    pk_check(s, "SELECT id FROM t WHERE id = $1::int64", [], 0, [Null])
+    pk_check(s, "SELECT id FROM t WHERE id BETWEEN 2 AND $1::int64", [], 0, [Null])
+    // `IS NULL` of a key column holds for no row; it reads every row to find that.
+    pk_check(s, "SELECT id FROM t WHERE id IS NULL", [], 10)
+    pk_check(s, "SELECT id FROM t WHERE id IS NOT NULL AND id = 4", [4], 1)
+
+@test
+parameters_bound_a_range()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id >= $1::int64 AND id < $2::int64", [3, 4], 2, [Int(3), Int(5)])
+    pk_check(s, "SELECT id FROM t WHERE id BETWEEN $1::int64 AND $2::int64", [], 0, [Int(5), Int(3)])
+
+@test
+a_narrower_integer_comparand_is_converted_to_the_key_s_type()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_check(s, "SELECT id FROM t WHERE id = CAST(7 AS int32)", [7], 1)
+    pk_check(s, "SELECT id FROM t WHERE id > CAST(8 AS int16)", [9, 10], 2)
+    pk_check(s, "SELECT id FROM t WHERE id = $1::int32", [4], 1, [Int(4)])
+
+@test
+an_unsigned_key_takes_signed_comparands_it_can_hold()
+    val s = pk_store()
+    pk_ok(s, "INSERT INTO u (k, v) VALUES (0, 1), (3, 2), (4294967295, 3)")
+    pk_check(s, "SELECT v FROM u WHERE k = 3", [2], 1)
+    pk_check(s, "SELECT v FROM u WHERE k = CAST(3 AS int64)", [2], 1)
+    // Values the key cannot hold leave the comparison to the filter.
+    pk_check(s, "SELECT v FROM u WHERE k = CAST(-1 AS int64)", [], 3)
+    pk_check(s, "SELECT v FROM u WHERE k > CAST(-1 AS int64)", [1, 2, 3], 3)
+    pk_check(s, "SELECT v FROM u WHERE k < CAST(5000000000 AS int64)", [1, 2, 3], 3)
+    pk_check(s, "SELECT v FROM u WHERE k = 4294967295", [3], 1)
+
+@test
+a_comparand_that_fails_to_evaluate_is_left_to_the_filter()
+    val s = pk_store()
+    // Over an empty table the filter never runs, so nothing fails.
+    assert_eq(xd_code(s, s.begin(Snapshot), pk_env(s, "SELECT id FROM t WHERE id = CAST($1::text AS int64)"), [Text("abc")]), "ok")
+    pk_seed(s, 3)
+    assert(xd_code(s, s.begin(Snapshot), pk_env(s, "SELECT id FROM t WHERE id = CAST($1::text AS int64)"), [Text("abc")]) != "ok", "the filter fails")
+    pk_check(s, "SELECT id FROM t WHERE id = CAST($1::text AS int64)", [2], 1, [Text("2")])
+
+@test
+a_runtime_error_on_a_row_outside_the_key_range_does_not_occur()
+    val s = pk_store()
+    pk_seed(s, 10)
+    // Row 5 divides by zero; the lookup of row 3 never evaluates the filter on it (`query-tree.md`
+    // §6.4 rule 3), while the full scan does.
+    xd_ids_are(pk_sel(s, "SELECT id FROM t WHERE id = 3 AND 100 / (v - 50) < 0"), [3])
+    assert(xd_code(s, s.begin(Snapshot), pk_env(s, "SELECT id FROM t WHERE id = 3 OR 100 / (v - 50) < 0")) != "ok", "the full scan raises")
+
+// -- subqueries ------------------------------------------------------------------------------------------
+
+@test
+a_key_inside_a_correlated_subquery_is_looked_up_per_outer_row()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_ok(s, "INSERT INTO u (k, v) VALUES (2, 0), (5, 0), (9, 0)")
+    xd_ids_are(pk_sel(s, "SELECT (SELECT x.v FROM t x WHERE x.id = u.k) FROM u"), [20, 50, 90])
+    xd_ids_are(pk_sel(s, "SELECT u.k FROM u WHERE EXISTS (SELECT 1 FROM t x WHERE x.id = u.k + 1)"), [2, 5, 9])
+    xd_ids_are(pk_sel(s, "SELECT u.k FROM u WHERE NOT EXISTS (SELECT 1 FROM t x WHERE x.id = u.k * 2)"), [9])
+    xd_ids_are(pk_sel(s, "SELECT (SELECT count(*) FROM t x WHERE x.id > u.k) FROM u"), [8, 5, 1])
+
+@test
+an_uncorrelated_subquery_s_lookup_is_narrowed_too()
+    val s = pk_store()
+    pk_seed(s, 10)
+    xd_ids_are(pk_sel(s, "SELECT id FROM t WHERE v = (SELECT y.v FROM t y WHERE y.id = 4)"), [4])
+
+// -- writes by key --------------------------------------------------------------------------------------
+
+@test
+an_update_by_key_writes_only_that_row()
+    val s = pk_store()
+    pk_seed(s, 10)
+    val before = s.slots_read
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "UPDATE t SET v = 0 WHERE id = 4"))), 1)
+    assert_eq(s.slots_read - before, 1)
+    assert(s.commit(t).is_ok())
+    xd_ids_are(pk_sel(s, "SELECT v FROM t WHERE id >= 3 AND id <= 5"), [30, 0, 50])
+
+@test
+an_update_of_a_missing_key_writes_nothing()
+    val s = pk_store()
+    pk_seed(s, 10)
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "UPDATE t SET v = 0 WHERE id = 40"))), 0)
+    assert(s.commit(t).is_ok())
+    xd_ids_are(pk_sel(s, "SELECT count(*) FROM t WHERE v = 0"), [0])
+
+@test
+an_update_of_the_key_itself_moves_the_row()
+    val s = pk_store()
+    pk_seed(s, 5)
+    pk_ok(s, "UPDATE t SET id = 50 WHERE id = 2")
+    pk_check(s, "SELECT v FROM t WHERE id = 50", [20], 1)
+    pk_check(s, "SELECT v FROM t WHERE id = 2", [], 0)
+
+@test
+a_delete_by_key_and_by_range_removes_only_those_rows()
+    val s = pk_store()
+    pk_seed(s, 10)
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "DELETE FROM t WHERE id = 3"))), 1)
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "DELETE FROM t WHERE id > 8"))), 2)
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "DELETE FROM t WHERE id = 3"))), 0)
+    assert(s.commit(t).is_ok())
+    xd_ids_are(pk_sel(s, "SELECT id FROM t"), [1, 2, 4, 5, 6, 7, 8])
+
+@test
+a_returning_update_by_key_returns_the_row()
+    val s = pk_store()
+    pk_seed(s, 10)
+    val t = s.begin(Snapshot)
+    xd_ids_are(pk_first(xd_ran(s, t, pk_env(s, "UPDATE t SET v = v + 1 WHERE id = $1::int64 RETURNING v"), [Int(6)])), [61])
+
+@test
+an_update_from_another_table_narrows_its_target_by_key()
+    val s = pk_store()
+    pk_seed(s, 10)
+    pk_ok(s, "INSERT INTO u (k, v) VALUES (1, 7), (2, 8)")
+    pk_ok(s, "UPDATE t SET v = u.v FROM u WHERE t.id = 4 AND u.k = 2")
+    xd_ids_are(pk_sel(s, "SELECT v FROM t WHERE id BETWEEN 3 AND 5"), [30, 8, 50])
+
+@test
+a_write_by_key_waits_for_the_row_s_lock()
+    val s = pk_store()
+    pk_seed(s, 10)
+    val a = s.begin(Snapshot)
+    val b = s.begin(Snapshot)
+    assert_eq(xd_count(xd_ran(s, a, pk_env(s, "UPDATE t SET v = 1 WHERE id = 4"))), 1)
+    assert_eq(xd_code(s, b, pk_env(s, "UPDATE t SET v = 2 WHERE id = 4")), "wait")
+    assert_eq(xd_code(s, b, pk_env(s, "DELETE FROM t WHERE id = 4")), "wait")
+    // Another key is not locked.
+    assert_eq(xd_code(s, b, pk_env(s, "UPDATE t SET v = 2 WHERE id = 5")), "ok")
+    assert(s.commit(a).is_ok())
+    // First-updater-wins: the row changed after b's snapshot.
+    assert_eq(xd_code(s, b, pk_env(s, "UPDATE t SET v = 2 WHERE id = 4")), "T1001")
+
+// -- concurrent writers, at each isolation level --------------------------------------------------------
+
+private pk_levels() -> []const Isolation = [ReadCommitted, Snapshot, Serializable]
+
+/** `committed` at read committed, whose statements see what committed before them, else `snapshot`. */
+private pk_seen(level: Isolation, committed: []const i128, snapshot: []const i128) -> Buf[i128] =
+    items_of(if level == ReadCommitted then committed else snapshot)
+
+@test
+a_concurrent_insert_is_seen_by_a_lookup_as_by_a_scan()
+    for level in pk_levels()
+        val s = pk_store()
+        pk_seed(s, 5)
+        val r = s.begin(level)
+        val w = s.begin(Snapshot)
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 1"), [1])
+        assert_eq(xd_count(xd_ran(s, w, pk_env(s, "INSERT INTO t (id, v) VALUES (9, 90)"))), 1)
+        // Uncommitted: seen by its writer only.
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 9"), [])
+        xd_ids_are(pk_read(s, w, "SELECT id FROM t WHERE id = 9"), [9])
+        xd_ids_are(pk_read(s, w, "SELECT id FROM t WHERE id > 4"), [5, 9])
+        assert(s.commit(w).is_ok())
+        // Committed after the reader's snapshot: seen at read committed only, as a scan sees it.
+        val want = pk_seen(level, [9], [])
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 9"), want.view())
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id >= 9"), want.view())
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 9 OR false"), want.view())
+
+@test
+a_concurrent_update_is_seen_by_a_lookup_as_by_a_scan()
+    for level in pk_levels()
+        val s = pk_store()
+        pk_seed(s, 5)
+        val r = s.begin(level)
+        val w = s.begin(Snapshot)
+        xd_ids_are(pk_read(s, r, "SELECT v FROM t WHERE id = 3"), [30])
+        assert_eq(xd_count(xd_ran(s, w, pk_env(s, "UPDATE t SET v = 999 WHERE id = 3"))), 1)
+        xd_ids_are(pk_read(s, r, "SELECT v FROM t WHERE id = 3"), [30])
+        xd_ids_are(pk_read(s, w, "SELECT v FROM t WHERE id = 3"), [999])
+        assert(s.commit(w).is_ok())
+        val want = pk_seen(level, [999], [30])
+        xd_ids_are(pk_read(s, r, "SELECT v FROM t WHERE id = 3"), want.view())
+        xd_ids_are(pk_read(s, r, "SELECT v FROM t WHERE id BETWEEN 3 AND 3"), want.view())
+        xd_ids_are(pk_read(s, r, "SELECT v FROM t WHERE id = 3 OR false"), want.view())
+
+@test
+a_concurrent_delete_is_seen_by_a_lookup_as_by_a_scan()
+    for level in pk_levels()
+        val s = pk_store()
+        pk_seed(s, 5)
+        val r = s.begin(level)
+        val w = s.begin(Snapshot)
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 2"), [2])
+        assert_eq(xd_count(xd_ran(s, w, pk_env(s, "DELETE FROM t WHERE id = 2"))), 1)
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 2"), [2])
+        xd_ids_are(pk_read(s, w, "SELECT id FROM t WHERE id = 2"), [])
+        assert(s.commit(w).is_ok())
+        val want = pk_seen(level, [], [2])
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 2"), want.view())
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id < 3 AND id > 1"), want.view())
+        xd_ids_are(pk_read(s, r, "SELECT id FROM t WHERE id = 2 OR false"), want.view())
+
+@test
+a_write_by_key_after_a_concurrent_commit_follows_each_level_s_rule()
+    for level in pk_levels()
+        val s = pk_store()
+        pk_seed(s, 5)
+        val r = s.begin(level)
+        // Each level's snapshot is taken.
+        xd_ids_are(pk_read(s, r, "SELECT v FROM t WHERE id = 1"), [10])
+        pk_ok(s, "UPDATE t SET v = 7 WHERE id = 4")
+        val got = xd_code(s, r, pk_env(s, "UPDATE t SET v = v + 1 WHERE id = 4"))
+
+        if level == ReadCommitted
+            assert_eq(got, "ok")
+            assert(s.commit(r).is_ok())
+            xd_ids_are(pk_sel(s, "SELECT v FROM t WHERE id = 4"), [8])
+        else
+            assert_eq(got, "T1001")
+
+// -- serializable: the predicate log ---------------------------------------------------------------------
+
+@test
+a_phantom_inserted_into_a_read_key_range_fails_the_serializable_commit()
+    val s = pk_store()
+    pk_seed(s, 5)
+    val t = s.begin(Serializable)
+    xd_ids_are(pk_read(s, t, "SELECT id FROM t WHERE id BETWEEN 100 AND 200"), [])
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "INSERT INTO t (id, v) VALUES (1000, 0)"))), 1)
+    pk_ok(s, "INSERT INTO t (id, v) VALUES (150, 0)")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+an_insert_outside_a_read_key_range_lets_the_serializable_commit_through()
+    val s = pk_store()
+    pk_seed(s, 5)
+    val t = s.begin(Serializable)
+    xd_ids_are(pk_read(s, t, "SELECT id FROM t WHERE id BETWEEN 100 AND 200"), [])
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "INSERT INTO t (id, v) VALUES (1000, 0)"))), 1)
+    pk_ok(s, "INSERT INTO t (id, v) VALUES (300, 0)")
+    pk_ok(s, "INSERT INTO t (id, v) VALUES (99, 0)")
+    assert(s.commit(t).is_ok())
+
+@test
+a_phantom_of_a_missed_key_lookup_fails_the_serializable_commit()
+    val s = pk_store()
+    pk_seed(s, 5)
+    val t = s.begin(Serializable)
+    xd_ids_are(pk_read(s, t, "SELECT id FROM t WHERE id = $1::int64", [Int(77)]), [])
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "INSERT INTO t (id, v) VALUES (1000, 0)"))), 1)
+    pk_ok(s, "INSERT INTO t (id, v) VALUES (77, 0)")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+a_concurrent_change_to_a_looked_up_row_fails_the_serializable_commit()
+    val s = pk_store()
+    pk_seed(s, 5)
+    val t = s.begin(Serializable)
+    xd_ids_are(pk_read(s, t, "SELECT v FROM t WHERE id = 3"), [30])
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "INSERT INTO t (id, v) VALUES (1000, 0)"))), 1)
+    pk_ok(s, "DELETE FROM t WHERE id = 3")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+a_null_lookup_still_logs_its_read()
+    val s = pk_store()
+    pk_seed(s, 5)
+    val t = s.begin(Serializable)
+    xd_ids_are(pk_read(s, t, "SELECT id FROM t WHERE id = $1::int64", [Null]), [])
+    assert_eq(s.logged(t), 1)
+
+@test
+a_phantom_in_a_composite_prefix_fails_the_serializable_commit()
+    val s = pk_composite()
+    val t = s.begin(Serializable)
+    xd_ids_are(pk_read(s, t, "SELECT v FROM c WHERE a = 2 AND b = 'x'"), [6, 7])
+    assert_eq(xd_count(xd_ran(s, t, pk_env(s, "INSERT INTO t (id, v) VALUES (1, 0)"))), 1)
+    pk_ok(s, "INSERT INTO c (a, b, n, v) VALUES (2, 'x', 2, 9)")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+// -- differential: the narrowed plan against the full scan -----------------------------------------------
+
+/** A random comparand: a small integer, a parameter of one, or now and then a null. */
+private pk_operand(g: *Rng, params: Buf[Value]) -> string
+    val n = i128(g.below(12)) - 2
+
+    g.below(10) match
+        0 -> "CAST(NULL AS int64)"
+        1 | 2 ->
+            params.push(Int(n))
+            s"$$${params.len()}::int64"
+        _ -> s"$n"
+
+private pk_conjunct(g: *Rng, params: Buf[Value]) -> string
+    val cols = ["a", "b", "v"]
+    val ops = ["=", "<", "<=", ">", ">="]
+    val c = cols[usize(g.below(3))]
+
+    g.below(8) match
+        0 -> s"$c BETWEEN ${pk_operand(g, params)} AND ${pk_operand(g, params)}"
+        1 -> s"($c = ${pk_operand(g, params)} OR $c = ${pk_operand(g, params)})"
+        _ -> s"$c ${ops[usize(g.below(5))]} ${pk_operand(g, params)}"
+
+private pk_predicate(g: *Rng, params: Buf[Value]) -> string
+    var p = pk_conjunct(g, params)
+
+    for _ in 0..<g.below(4)
+        p = p + " AND " + pk_conjunct(g, params)
+
+    p
+
+/** `d` filled with random rows: `a` and `b` from small ranges so that prefixes repeat, `v` now and
+ * then null.
+ */
+private pk_random_table(g: *Rng) -> &Store
+    val s = pk_store()
+    var text = "INSERT INTO d (a, b, v) VALUES "
+    var first = true
+    val rows = g.below(40)
+
+    for a in 0..<10
+        for b in 0..<10
+            if g.below(100) < rows
+                val v = if g.below(6) == 0 then "NULL" else s"${i128(g.below(12)) - 2}"
+                if !first then text = text + ", "
+                text = text + s"(${i128(a) - 1}, ${i128(b) - 1}, $v)"
+                first = false
+
+    if !first then pk_ok(s, text)
+    s
+
+private pk_rows(s: &Store, t: &Txn, text: string, params: Buf[Value]) -> Buf[Value] =
+    xd_rows(xd_ran(s, t, pk_env(s, text), params.view()))
+
+@test
+random_predicates_agree_with_the_full_scan_row_for_row()
+    for seed in 0..<12
+        var g = rng(u64(seed), 4242)
+        val s = pk_random_table(&g)
+
+        for q in 0..<40
+            val params = buf[Value]()
+            val p = pk_predicate(&g, params)
+            val t = s.begin(Snapshot)
+            val before = s.slots_read
+            val narrowed = pk_rows(s, t, s"SELECT a, b, v FROM d WHERE $p", params)
+            val mid = s.slots_read
+            // An `or` of the whole predicate cannot be narrowed: this is the full scan.
+            val full = pk_rows(s, t, s"SELECT a, b, v FROM d WHERE ($p) OR false", params)
+            val after = s.slots_read
+
+            assert(narrowed == full, s"seed $seed query $q: $p")
+            assert(mid - before <= after - mid, s"seed $seed query $q visits no more than the full scan: $p")

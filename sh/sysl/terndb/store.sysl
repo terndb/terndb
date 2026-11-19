@@ -218,6 +218,10 @@ struct Store
     released: u64
     /** Every job a commit started, oldest first, with how it ended (`store_jobs.sysl`). */
     jobs: Buf[JobRecord]
+    /** How many leaf entries the executor's scans have visited (`scan_range`): what a test reads to
+     * know a scan read only the key range its filter allows.
+     */
+    slots_read: u64
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
@@ -285,9 +289,21 @@ struct Store
      * the executor's `Scan` reads, its filter then applied to the rows by the executor. `logged` must
      * hold for every row the statement's result depends on.
      */
-    scan_rows(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError]
-        val r = self.scan_rows_in(t, table, logged)
+    scan_rows(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError] = self.scan_range(t, table, KeyAny, KeyAny, logged)
+
+    /** The rows of `table` visible to `t` whose encoded keys (§4.6) lie between `lo` and `hi`, in key
+     * order, the read logged as `logged` under serializable (§4.4) whatever the range: a scan
+     * narrowed to the keys its filter allows (`exec_access.sysl`). `logged` must hold for every row
+     * the statement's result depends on, and the range must hold every such row.
+     */
+    scan_range(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred) -> Result[Buf[Hit], CodecError]
+        val r = self.scan_range_in(t, table, lo, hi, logged)
         self.guard(t, r)
+
+    /** The primary key `table`'s tree is keyed by: its columns' ids and their §4.6 encodings. */
+    key_of_table(*self, table: u64) -> Result[(Buf[u32], Buf[KeyColumn]), CodecError]
+        val d = self.table_data(table)?
+        Ok((d.key_columns, d.key_spec))
 
     /** One write statement's changes to `table`, which the executor computed from rows it read at
      * `t`'s snapshot: each a new row, a row replaced or a row removed, by key, applied in order under
@@ -416,12 +432,15 @@ struct Store
             Some(r) -> Ok(Some(self.translated(table, r)?))
             None -> Ok(None)
 
-    private scan_rows_in(*self, t: &Txn, table: u64, logged: Pred) -> Result[Buf[Hit], CodecError]
+    private scan_range_in(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred) -> Result[Buf[Hit], CodecError]
         live(t)?
         val d = self.table_data(table)?
         val out = buf[Hit]()
 
-        for s in self.slots_of(d)?
+        for r in self.rows.table_rows(d.oid, lo, hi)?
+            self.slots_read += 1
+            val s = Slot(self.key_value(d, r.key.view())?, r.key, r.row)
+
             self.visible(d, s, t.snapshot, t.id)? match
                 Some(r) -> out.push(Hit(s.key, self.translated(table, r)?))
                 None -> ()
@@ -1046,7 +1065,7 @@ private fill_of(fill: Option[Expr]) -> Value = fill match
 
 /** A store over `catalog`'s tables, empty. */
 mem_store(catalog: MemCatalog) -> &Store =
-    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf())
+    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf(), 0)
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow

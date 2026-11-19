@@ -26,6 +26,7 @@ question in `replication.md` §16 open again.
 | Q10 | Substrait outbound, version range? | Import-only, pinned to one Substrait version per release. | QT §14 intro; ERR `Q7004` |
 | Q11 | `arbitrary: true` for `Limit` over a bag? | Kept. The GraphQL front end orders by primary key instead of setting it. | QT §6.10 rule 2 |
 | Q12 | Canonical text forms of values? | A short "values" section in QT. | QT §3.5 (new), §7.6 |
+| Q72 | May a scan read only the primary-key range its filter allows, when §7.12 rule 1 has `and` evaluate both operands on every row? | Yes: a `Filter`'s predicate, like a join's `on`, MAY leave the other conjuncts unevaluated on a row where one is not `true`, so a runtime error raised only on rows outside the key range does not occur. Without it no key lookup is possible. | QT §6.4 rule 3 (new) |
 
 ## Isolation
 

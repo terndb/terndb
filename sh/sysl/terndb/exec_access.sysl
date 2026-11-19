@@ -1,0 +1,303 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Access-path selection for a scan of the store (`docs/design/executor.md` §4.6). The conjuncts of a
+// scan's filter that compare a primary-key column with a value fixed for the whole statement — a
+// literal, a parameter, an outer row's value bound as one, or a cast of these — narrow the scan to
+// a range of the table's B+tree: equalities on a leading run of the key's columns fix a prefix of
+// its encoding (§4.6 rule 3), and one bound on the column after them limits the range further. The
+// filter itself still runs over every row the range holds, so the range only has to hold every row
+// the filter keeps; a conjunct that cannot narrow the range exactly is left out of it.
+
+/** How a scan reads its table: every row, the one row of a key, a range of keys, or no row at all
+ * because a conjunct compares a key column with null.
+ */
+enum AccessPath
+    FullScan
+    KeyLookup
+    KeyRange
+    NoRows
+
+/** A scan's access path and the encoded keys it reads between. */
+struct Access
+    path: AccessPath
+    lo: KeyBound
+    hi: KeyBound
+
+/** Every row of the table. */
+full_access() -> Access = Access(FullScan, KeyAny, KeyAny)
+
+/** No row: every key is at or above the empty key, so none is below it. */
+private no_rows() -> Access = Access(NoRows, KeyAny, KeyExcl(buf[u8]()))
+
+/** One end of a key column's range: the column's encoding of the value, and whether it is included. */
+private struct ColBound
+    enc: Buf[u8]
+    inclusive: bool
+
+/** What the conjuncts say of one key column: the encoding it equals, and its bounds. */
+private struct ColLimits
+    eq: Option[Buf[u8]]
+    lo: Option[ColBound]
+    hi: Option[ColBound]
+
+/** The access path of a scan of `table` through `binder` whose rows are filtered by `filter`. */
+private[terndb] access_of(d: Db, ct: CatTable, binder: string, filter: Option[TExpr], ctx: Ctx) -> Access
+    val p = filter match
+        Some(p) -> p
+        None -> return full_access()
+
+    val (ids, spec) = d.store.key_of_table(ct.oid) match
+        Ok(k) -> k
+        Err(_) -> return full_access()
+
+    val names = buf[string]()
+    val types = buf[Type]()
+
+    for id in ids
+        ct.column_by_id(id) match
+            Some(c) ->
+                names.push(c.name)
+                types.push(c.ty)
+            None -> return full_access()
+
+    val limits = buf[ColLimits]()
+
+    for _ in ids
+        limits.push(ColLimits(None, None, None))
+
+    val conjuncts = buf[TExpr]()
+    conjuncts_of(p, conjuncts)
+
+    for c in conjuncts
+        val (f, col, other) = key_comparison(c, binder) match
+            Some(k) -> k
+            None -> continue
+
+        val i = index_of(names, col.e) match
+            Some(i) -> i
+            None -> continue
+
+        if spec[i].descending then continue
+
+        val v = constant_value(other, ctx) match
+            Some(v) -> v
+            None -> continue
+
+        // A comparison with null is never true, so neither is the filter.
+        if v.is_null() then return no_rows()
+
+        val enc = key_component(d.store.catalog, spec[i], types[i], other.ty, v) match
+            Some(e) -> e
+            None -> continue
+
+        val l = limits[i]
+
+        f match
+            "eq" -> if l.eq.is_none() then limits[i] = ColLimits(Some(enc), l.lo, l.hi)
+            "gt" | "ge" -> limits[i] = ColLimits(l.eq, Some(higher_lo(l.lo, ColBound(enc, f == "ge"))), l.hi)
+            _ -> limits[i] = ColLimits(l.eq, l.lo, Some(lower_hi(l.hi, ColBound(enc, f == "le"))))
+
+    bounds_of(limits)
+end access_of
+
+/** The access path `limits` allow: equalities on the leading columns fix a prefix of the key, and
+ * the bounds of the column after them narrow the range below and above it.
+ */
+private bounds_of(limits: Buf[ColLimits]) -> Access
+    val prefix = buf[u8]()
+    var k: usize = 0
+
+    while k < limits.len()
+        limits[k].eq match
+            Some(e) -> prefix.extend(e.view())
+            None -> break
+
+        k += 1
+
+    if k == limits.len() then return Access(KeyLookup, KeyIncl(prefix), above_all(prefix))
+
+    val l = limits[k]
+    if k == 0 && l.lo.is_none() && l.hi.is_none() then return full_access()
+
+    // `> v` starts after every key holding `v` there; `>= v` at the first of them.
+    val lo = l.lo match
+        Some(b) -> lower_bound(joined(prefix, b.enc), b.inclusive)
+        None -> if prefix.len() == 0 then KeyAny else KeyIncl(prefix.copy())
+
+    // `< v` ends before the first key holding `v` there; `<= v` after the last of them.
+    val hi = l.hi match
+        Some(b) -> upper_bound(joined(prefix, b.enc), b.inclusive, prefix)
+        None -> above_all(prefix)
+
+    Access(KeyRange, lo, hi)
+end bounds_of
+
+/** The lower bound of the keys that begin with `at` (inclusive) or follow all of them. When nothing
+ * follows them (`at` is all 0xFF), the keys above `at` itself, of which only those that begin with
+ * it can exist.
+ */
+private lower_bound(at: Buf[u8], inclusive: bool) -> KeyBound
+    if inclusive then return KeyIncl(at)
+
+    successor(at) match
+        Some(s) -> KeyIncl(s)
+        None -> KeyExcl(at)
+
+/** The upper bound below the keys that begin with `at` (exclusive), or above all of them; past the
+ * keys that begin with `prefix` when nothing follows `at`.
+ */
+private upper_bound(at: Buf[u8], inclusive: bool, prefix: Buf[u8]) -> KeyBound
+    if !inclusive then return KeyExcl(at)
+
+    successor(at) match
+        Some(s) -> KeyExcl(s)
+        None -> above_all(prefix)
+
+/** The upper bound above every key that begins with `prefix`. */
+private above_all(prefix: Buf[u8]) -> KeyBound = successor(prefix) match
+    Some(s) -> KeyExcl(s)
+    None -> KeyAny
+
+/** The least octet string above every string that begins with `x`: `x` with its trailing 0xFF
+ * octets dropped and its last octet then incremented; none when `x` is empty or all 0xFF.
+ */
+private[terndb] successor(x: Buf[u8]) -> Option[Buf[u8]]
+    var n = x.len()
+
+    while n > 0 && x[n - 1] == 0xFF
+        n -= 1
+
+    if n == 0 then return None
+
+    val out = buf[u8]()
+    out.extend(x.view()[0..<n])
+    out[n - 1] = out[n - 1] + 1
+    Some(out)
+
+private joined(a: Buf[u8], b: Buf[u8]) -> Buf[u8]
+    val out = a.copy()
+    out.extend(b.view())
+    out
+
+/** The tighter of two lower bounds: the higher, and at an equal encoding the exclusive one. */
+private higher_lo(a: Option[ColBound], b: ColBound) -> ColBound = a match
+    Some(x) -> if x.enc.view() > b.enc.view() || (x.enc.view() == b.enc.view() && !x.inclusive) then x else b
+    None -> b
+
+/** The tighter of two upper bounds: the lower, and at an equal encoding the exclusive one. */
+private lower_hi(a: Option[ColBound], b: ColBound) -> ColBound = a match
+    Some(x) -> if x.enc.view() < b.enc.view() || (x.enc.view() == b.enc.view() && !x.inclusive) then x else b
+    None -> b
+
+/** The conjuncts of `p`: the operands of its `and`s at any nesting, and `p` itself otherwise. */
+private conjuncts_of(p: TExpr, out: Buf[TExpr])
+    p.e match
+        Call(f, _) -> if f == "and" && p.kids.len() == 2
+            conjuncts_of(p.kids[0], out)
+            conjuncts_of(p.kids[1], out)
+            return
+        _ -> ()
+
+    out.push(p)
+
+/** A comparison of a column of `binder` with another operand, as `col f other`: the comparison
+ * turned round when the column is on the right.
+ */
+private key_comparison(c: TExpr, binder: string) -> Option[(string, TExpr, TExpr)]
+    val f = c.e match
+        Call(f, _) -> f
+        _ -> return None
+
+    if c.kids.len() != 2 then return None
+    if f != "eq" && f != "lt" && f != "le" && f != "gt" && f != "ge" then return None
+
+    if is_col_of(c.kids[0], binder) then return Some((f, c.kids[0], c.kids[1]))
+    if is_col_of(c.kids[1], binder) then return Some((turned(f), c.kids[1], c.kids[0]))
+
+    None
+
+private is_col_of(x: TExpr, binder: string) -> bool = x.e match
+    Col(b, _) -> b == binder
+    _ -> false
+
+/** `f` with its operands swapped: `a < b` is `b > a`. */
+private turned(f: string) -> string = f match
+    "lt" -> "gt"
+    "le" -> "ge"
+    "gt" -> "lt"
+    "ge" -> "le"
+    _ -> f
+
+private index_of(names: Buf[string], col: Expr) -> Option[usize]
+    val name = col match
+        Col(_, n) -> n
+        _ -> return None
+
+    for i in 0..<names.len()
+        if names[i] == name then return Some(i)
+
+    None
+
+/** The value of `x` when it is the same for every row of the statement — a literal, a null, a
+ * parameter (an outer row's value is bound as one) or a cast of these — and evaluates without error.
+ * An error is left for the filter to raise, on the rows it reads.
+ */
+private constant_value(x: TExpr, ctx: Ctx) -> Option[Value]
+    if !is_constant(x) then return None
+
+    eval(x, rows_env(ctx, 1)) match
+        Ok(v) -> Some(value_at(v, 0))
+        Err(_) -> None
+
+private is_constant(x: TExpr) -> bool
+    if x.sub.is_some() then return false
+
+    x.e match
+        Literal(_, _) | Null(_) | Param(_) -> true
+        Cast(_, _, _) -> x.kids.len() == 1 && is_constant(x.kids[0])
+        _ -> false
+
+/** The encoding, under `key`, of the key column of type `col` holding a value that compares with
+ * it as `v`, of type `ty`, does: `v` itself when the two types are one, and `v` as the column's own
+ * integer when both are integers (§4.2: integers compare by value). None for any other pair, and
+ * for a value the column cannot hold.
+ */
+private key_component(c: MemCatalog, key: KeyColumn, col: Type, ty: Type, v: Value) -> Option[Buf[u8]]
+    val ct = resolve_type(c, col) match
+        Ok(t) -> t.base()
+        Err(_) -> return None
+
+    val vt = resolve_type(c, ty) match
+        Ok(t) -> t.base()
+        Err(_) -> return None
+
+    // The column's type in the tree must be the catalog's, or its encoding is not this value's.
+    if ct != key.ty then return None
+    if vt != ct && !(is_integer(vt) && is_integer(ct)) then return None
+
+    val kv = if vt == ct then Some(v) else as_integer(v, ct)
+    if kv.is_none() then return None
+
+    val out = buf[u8]()
+
+    push_key_component(out, KeyColumn(ct, false), kv.unwrap()) match
+        Ok(_) -> Some(out)
+        Err(_) -> None
+
+private is_integer(t: Type) -> bool = t match
+    Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 -> true
+    _ -> false
+
+/** Integer `v` as a value of integer type `t`, when `t` can hold it. */
+private as_integer(v: Value, t: Type) -> Option[Value]
+    val n: i128 = v match
+        Int(x) -> x
+        UInt(x) -> i128(x)
+        _ -> return None
+
+    t match
+        Int8 | Int16 | Int32 | Int64 | Int128 -> Some(Int(n))
+        UInt8 | UInt16 | UInt32 | UInt64 -> if n < 0 || n >= i128(1) << 64 then None else Some(UInt(u64(n)))
+        _ -> None
