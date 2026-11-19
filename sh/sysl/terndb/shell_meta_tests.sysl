@@ -293,6 +293,17 @@ d_shows_columns_in_ordinal_order_with_nullability_and_defaults()
         " id     | int64 | not null |\n name   | text  |          | 'anon'\nPrimary key: (id)\n")
 
 @test
+d_names_a_column_key_by_its_column_not_its_tree_text()
+    val indexes = cat_rows(mt_indexes_type(), items_of([
+        rec([Text("t_a"), Bool(false), rel([rec([Text("a"), Text("row.a"), Bool(false)])]), Null, variant(1, rec([]))]),
+        rec([Text("t_mixed"), Bool(true), rel([rec([Null, Text("(call lower row.b)"), Bool(false)]), rec([Text("c"), Text("row.c"), Bool(true)])]),
+            Null, variant(1, rec([]))])]))
+    val got = describe_table_text("T", buf(), cat_rows(mt_columns_type(), buf()), indexes, cat_rows(mt_constraints_type(), buf()), mt_tables(), false)
+    assert(got.contains("    \"t_a\" (a)\n"), got)
+    assert(got.contains("    \"t_mixed\" UNIQUE ("), got)
+    assert(got.contains(", c DESC)\n"), got)
+
+@test
 d_shows_generated_and_identity_columns()
     val ident = mt_identity()
     val columns = cat_rows(mt_columns_type(), items_of([

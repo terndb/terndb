@@ -419,8 +419,10 @@ describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, i
                 Relation(elems) ->
                     for k in elems
                         val kr = cat_rows(Bag(et), items_of([k]))
-                        var text = cat_text(kr.at(0, "expr"))
-                        if text.len == 0 then text = cat_text(kr.at(0, "column"))
+                        // A plain column key names its column; `expr` is its tree text (`row.c`), shown only for an
+                        // expression key, whose `column` is null (ddl.md §4.2).
+                        val column = kr.at(0, "column")
+                        var text = if column.is_null() then cat_text(kr.at(0, "expr")) else cat_text(column)
                         if cat_bool(kr.at(0, "descending")) then text = text + " DESC"
                         keys.push(text)
                 _ -> ()
