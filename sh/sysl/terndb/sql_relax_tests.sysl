@@ -1,0 +1,461 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// `sql.md`'s PostgreSQL-like readings, each translated to the exact tree: an integer beside a float widens
+// (§5.8 rule 7), an `INSERT`'s query assigns its constants to the target columns (§3.2 rule 4), a `NULL`
+// in a boolean context is `Null(bool)` (§5.9 rule 3), and `double` alone names `float64` (§4.1). The
+// end-to-end results are in `sql_end_to_end_tests.sysl`.
+
+/** A table `every` with one column of each scalar type, beside the tables `SqFixture` knows. */
+struct RxFixture
+end RxFixture
+
+impl SqlTables for RxFixture
+    sql_table(self, name: QualName) -> Option[SqlTable]
+        if name == QualName("public", "every") then return Some(SqlTable(rx_fields(), sql_names(["id"])))
+        SqFixture().sql_table(name)
+
+private rx_fields() -> Buf[Field] = items_of([Field("id", Int64), Field("c_bool", Bool), Field("c_i8", Int8), Field("c_i16", Int16),
+    Field("c_i32", Int32), Field("c_i64", Int64), Field("c_i128", Int128), Field("c_u8", UInt8), Field("c_u16", UInt16),
+    Field("c_u32", UInt32), Field("c_u64", UInt64), Field("c_f32", Float32), Field("c_f64", Float64), Field("c_dec", Decimal(5, 2)),
+    Field("c_text", Text), Field("c_bytes", Bytes), Field("c_json", Json), Field("c_date", Date), Field("c_time", Time),
+    Field("c_dt", DateTime), Field("c_ts", Timestamp), Field("c_iv", Interval), Field("c_uuid", Uuid), Field("c_null", nullable(Int16))])
+
+/** Each column of `every`, a constant written for it, and the text form of the value it must be. */
+private rx_cases() -> []const (string, string, string) = [("c_bool", "'true'", "true"), ("c_i8", "-7", "-7"), ("c_i16", "300", "300"),
+    ("c_i32", "70000", "70000"), ("c_i64", "1", "1"), ("c_i128", "1", "1"), ("c_u8", "255", "255"), ("c_u16", "65535", "65535"),
+    ("c_u32", "7", "7"), ("c_u64", "18446744073709551615", "18446744073709551615"), ("c_f32", "1.5", "1.5"), ("c_f64", "1", "1"),
+    ("c_dec", "1.5", "1.5"), ("c_text", "'hi'", "hi"), ("c_bytes", "'\\x0102'", "\\x0102"), ("c_json", "'[1, 2]'", "[1, 2]"),
+    ("c_date", "'2024-02-29'", "2024-02-29"), ("c_time", "'12:30:00'", "12:30:00"), ("c_dt", "'2024-01-01T10:00:00'", "2024-01-01T10:00:00"),
+    ("c_ts", "'2024-01-01T00:00:00Z'", "2024-01-01T00:00:00Z"), ("c_iv", "'P1D'", "P1D"),
+    ("c_uuid", "'0e5f3c9a-1b2c-4d5e-8f90-123456789abc'", "0e5f3c9a-1b2c-4d5e-8f90-123456789abc"), ("c_null", "5", "5")]
+
+private rx_type_of(column: string) -> Type
+    for f in rx_fields()
+        if f.name == column then return f.ty
+    Bool
+
+private rx_fail(what: string, file: string, line: long) -> Expr
+    assert(false, what, file, line)
+    Null(Bool)
+
+/** The error code of `text`, or `ok`. */
+private rx_code(text: string) -> string = sql_statements(text, "public", RxFixture()) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** The first select item of `SELECT e FROM src`. */
+private rx_e(e: string, src: string = "nums", file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_rel(s"SELECT $e FROM $src", RxFixture(), file, line) match
+        Project(_, _, items) -> items[0].expr
+        _ -> rx_fail("a project", file, line)
+
+/** The first select item of `SELECT e`, with no `FROM`. */
+private rx_bare(e: string, file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_rel(s"SELECT $e", RxFixture(), file, line) match
+        Project(_, _, items) -> items[0].expr
+        _ -> rx_fail("a project", file, line)
+
+/** The predicate of `SELECT * FROM t WHERE w`. */
+private rx_where(w: string, file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_rel(s"SELECT * FROM t WHERE $w", RxFixture(), file, line) match
+        Filter(_, p) -> p
+        _ -> rx_fail("a filter", file, line)
+
+/** The first select item of the query an `INSERT` reads. */
+private rx_insert_item(text: string, file: string = __FILE__, line: long = __LINE__) -> Expr
+    sq_stmt(text, RxFixture(), file, line) match
+        Insert(_, _, _, _, rel, _, _) -> rel match
+            Project(_, _, items) -> items[0].expr
+            _ -> rx_fail("a project", file, line)
+        _ -> rx_fail("an insert", file, line)
+
+/** The first item of projection `r`. */
+private rx_first_item(r: Rel, file: string = __FILE__, line: long = __LINE__) -> Expr = r match
+    Project(_, _, items) -> items[0].expr
+    _ -> rx_fail("a project", file, line)
+
+/** The source an `INSERT` reads. */
+private rx_insert_source(text: string, file: string = __FILE__, line: long = __LINE__) -> Rel
+    sq_stmt(text, RxFixture(), file, line) match
+        Insert(_, _, _, _, rel, _, _) -> rel
+        _ ->
+            assert(false, "an insert", file, line)
+            Scan(QualName("", ""), "")
+
+private rx_same(a: string, b: string, file: string = __FILE__, line: long = __LINE__)
+    val x = sq_stmt(a, RxFixture(), file, line)
+    val y = sq_stmt(b, RxFixture(), file, line)
+    if x != y then print(s"\nnot the same tree:\n  $a\n  $b\n")
+    assert(x == y, "the two texts translate to one tree", file, line)
+
+private rx_eq(got: Expr, want: Expr, what: string, file: string = __FILE__, line: long = __LINE__)
+    if got != want then print(s"\nthe tree of: $what\n")
+    assert(got == want, "the tree is the one sql.md gives", file, line)
+
+private rx_2(f: string, a: Expr, b: Expr) -> Expr = Call(f, items_of([a, b]))
+
+private rx_1(f: string, a: Expr) -> Expr = Call(f, items_of([a]))
+
+private rx_f(x: real) -> Expr = Literal(Float64, Value.Float(x))
+
+/** `x` widened to a `float64` whose nullability the front end does not know. */
+private rx_wide(x: Expr) -> Expr = Cast(x, nullable(Float64), Strict)
+
+/** Constant `x` widened to a non-null `float64`. */
+private rx_wide_const(x: Expr) -> Expr = Cast(x, Float64, Strict)
+
+private rx_nums(c: string) -> Expr = Col("nums", c)
+
+private rx_arith_ops() -> []const (string, string) = [("+", "add"), ("-", "sub"), ("*", "mul"), ("/", "div"), ("%", "mod")]
+
+private rx_cmp_ops() -> []const (string, string) = [("=", "eq"), ("<>", "ne"), ("<", "lt"), ("<=", "le"), (">", "gt"), (">=", "ge")]
+
+// -- an integer beside a float widens (§5.8 rule 7) ------------------------------------------------------
+
+@test
+an_integer_column_times_a_double_column_widens_the_integer()
+    rx_eq(rx_e("i * f"), rx_2("mul", rx_wide(rx_nums("i")), rx_nums("f")), "i * f")
+
+@test
+a_double_column_times_an_integer_column_widens_the_integer()
+    rx_eq(rx_e("f * i"), rx_2("mul", rx_nums("f"), rx_wide(rx_nums("i"))), "f * i")
+
+@test
+every_arithmetic_operator_widens()
+    for (op, f) in rx_arith_ops()
+        rx_eq(rx_e(s"i $op f"), rx_2(f, rx_wide(rx_nums("i")), rx_nums("f")), op)
+        rx_eq(rx_e(s"f $op i"), rx_2(f, rx_nums("f"), rx_wide(rx_nums("i"))), op)
+
+@test
+every_comparison_widens_both_ways()
+    for (op, f) in rx_cmp_ops()
+        rx_eq(rx_e(s"i $op f"), rx_2(f, rx_wide(rx_nums("i")), rx_nums("f")), op)
+        rx_eq(rx_e(s"f $op i"), rx_2(f, rx_nums("f"), rx_wide(rx_nums("i"))), op)
+
+@test
+an_integer_constant_beside_a_float_constant_widens_as_a_non_null_value()
+    rx_eq(rx_bare("2.5e0 * 2"), rx_2("mul", rx_f(2.5), rx_wide_const(sq_i32(2))), "2.5e0 * 2")
+    rx_eq(rx_bare("2 * 2.5e0"), rx_2("mul", rx_wide_const(sq_i32(2)), rx_f(2.5)), "2 * 2.5e0")
+
+@test
+an_integer_constant_beside_a_float_column_is_typed_as_the_column_not_widened()
+    rx_eq(rx_e("f * 2"), rx_2("mul", rx_nums("f"), rx_f(2.0)), "f * 2")
+    rx_eq(rx_e("2 < f"), rx_2("lt", rx_f(2.0), rx_nums("f")), "2 < f")
+
+@test
+a_float_constant_beside_an_integer_column_widens_the_column()
+    rx_eq(rx_e("i = 2e0"), rx_2("eq", rx_wide(rx_nums("i")), rx_f(2.0)), "i = 2e0")
+    rx_eq(rx_e("2.5e0 > i"), rx_2("gt", rx_f(2.5), rx_wide(rx_nums("i"))), "2.5e0 > i")
+
+@test
+int64_and_int16_widen_as_int32_does()
+    rx_eq(rx_e("id * 1e0", "users"), rx_2("mul", rx_wide(Col("users", "id")), rx_f(1.0)), "int64")
+    rx_eq(rx_e("age * 1e0", "users"), rx_2("mul", rx_wide(Col("users", "age")), rx_f(1.0)), "int16")
+    rx_eq(rx_bare("CAST(1 AS int64) * 1e0"), rx_2("mul", rx_wide_const(sq_i64(1)), rx_f(1.0)), "int64 constant")
+    rx_eq(rx_bare("9007199254740993 * 1e0"), rx_2("mul", rx_wide_const(sq_i64(9007199254740993)), rx_f(1.0)), "an int64 constant")
+
+@test
+an_unsigned_integer_widens()
+    rx_eq(rx_e("u * f"), rx_2("mul", rx_wide(rx_nums("u")), rx_nums("f")), "uint32")
+
+@test
+a_float32_beside_an_integer_widens_the_integer_to_float64()
+    val single = Literal(Float32, from_text(Float32, "1.5").unwrap())
+    rx_eq(rx_e("CAST(1.5 AS float32) * i"), rx_2("mul", single, rx_wide(rx_nums("i"))), "float32 and int32")
+    rx_eq(rx_bare("CAST(1.5 AS float32) * 2"), rx_2("mul", single, Literal(Float32, from_text(Float32, "2").unwrap())), "a constant takes the cast's type")
+
+@test
+integer_arithmetic_inside_an_operand_stays_integer_and_widens_whole()
+    rx_eq(rx_e("i + 1 > f"), rx_2("gt", rx_wide(rx_2("add", rx_nums("i"), sq_i32(1))), rx_nums("f")), "i + 1 > f")
+    rx_eq(rx_bare("(2147483647 + 1) * 2.5e0"), rx_2("mul", rx_wide(rx_2("add", sq_i32(2147483647), sq_i32(1))), rx_f(2.5)), "overflow first")
+    rx_eq(rx_e("-i * f"), rx_2("mul", rx_wide(rx_1("neg", rx_nums("i"))), rx_nums("f")), "neg")
+
+@test
+a_widened_product_widens_again_beside_an_integer()
+    rx_eq(rx_e("i + i * f"), rx_2("add", rx_wide(rx_nums("i")), rx_2("mul", rx_wide(rx_nums("i")), rx_nums("f"))), "nested")
+
+@test
+a_null_operand_takes_the_float_type_or_widens()
+    rx_eq(rx_e("f * NULL"), rx_2("mul", rx_nums("f"), Null(Float64)), "f * NULL")
+    rx_eq(rx_e("CAST(NULL AS int32) * f"), rx_2("mul", Null(Float64), rx_nums("f")), "a typed null")
+    rx_eq(rx_e("i * CAST(NULL AS float64)"), rx_2("mul", rx_wide(rx_nums("i")), Null(Float64)), "a float null")
+
+@test
+a_declared_parameter_widens_by_its_declared_nullability()
+    val e = sq_env("SELECT $1::int64 * 2e0", RxFixture())
+    e.statement match
+        Query(Project(_, _, items)) -> rx_eq(items[0].expr, rx_2("mul", rx_wide_const(Param(0)), rx_f(2.0)), "$1::int64")
+        _ -> assert(false, "a project")
+
+@test
+between_in_and_a_simple_case_widen_each_comparison()
+    rx_eq(rx_e("f BETWEEN i AND 10"), rx_2("and", rx_2("ge", rx_nums("f"), rx_wide(rx_nums("i"))), rx_2("le", rx_nums("f"), rx_f(10.0))), "between")
+    rx_eq(rx_e("i BETWEEN 1 AND f"), rx_2("and", rx_2("ge", rx_nums("i"), sq_i32(1)), rx_2("le", rx_wide(rx_nums("i")), rx_nums("f"))), "between")
+    rx_eq(rx_e("i IN (1, 2e0)"), rx_2("or", rx_2("eq", rx_nums("i"), sq_i32(1)), rx_2("eq", rx_wide(rx_nums("i")), rx_f(2.0))), "in")
+    rx_eq(rx_e("CASE i WHEN 2e0 THEN 1 END"), If(items_of([IfArm(rx_2("eq", rx_wide(rx_nums("i")), rx_f(2.0)), sq_i32(1))]), None), "case")
+
+@test
+aggregates_over_mixed_types_widen_by_their_result_types()
+    rx_eq(rx_e("sum(i) * 1.5e0"), rx_2("mul", rx_wide(Col("group", "a1")), rx_f(1.5)), "sum of int32 is int128")
+    rx_eq(rx_e("count(*) * 2e0"), rx_2("mul", rx_wide(Col("group", "a1")), rx_f(2.0)), "count is int64")
+    rx_eq(rx_e("max(f) > min(i)"), rx_2("gt", Col("group", "a1"), rx_wide(Col("group", "a2"))), "min of int32")
+    rx_eq(rx_e("sum(f) + sum(i)"), rx_2("add", Col("group", "a1"), rx_wide(Col("group", "a2"))), "sum of float64")
+    rx_eq(rx_e("avg(f) * count(*)"), rx_2("mul", Col("group", "a1"), rx_wide(Col("group", "a2"))), "avg of float64")
+
+@test
+a_group_key_widens_by_its_expression_s_type()
+    sq_rel("SELECT i * 2e0 FROM nums GROUP BY i", RxFixture()) match
+        Project(_, _, items) -> rx_eq(items[0].expr, rx_2("mul", rx_wide(Col("group", "k1")), rx_f(2.0)), "a key")
+        _ -> assert(false, "a project")
+
+@test
+mixes_other_than_integer_and_float_are_left_to_validation()
+    rx_eq(rx_e("d * f"), rx_2("mul", rx_nums("d"), rx_nums("f")), "decimal and float")
+    rx_eq(rx_e("i * d"), rx_2("mul", rx_nums("i"), rx_nums("d")), "integer and decimal")
+    rx_eq(rx_e("avg(i) * 2e0"), rx_2("mul", Col("group", "a1"), rx_f(2.0)), "avg of an integer is a decimal")
+    rx_eq(rx_e("i * 2"), rx_2("mul", rx_nums("i"), sq_i32(2)), "integers")
+    rx_eq(rx_bare("1.5 * 2e0"), rx_2("mul", Literal(Decimal(2, 1), Value.Int(15)), rx_f(2.0)), "decimal constant")
+
+@test
+an_operand_of_unknown_type_is_not_widened()
+    rx_eq(rx_e("a * 2e0", "t"), rx_2("mul", Col("t", "a"), rx_f(2.0)), "an opaque column")
+    rx_eq(rx_e("lower(a) = 2e0", "t"), rx_2("eq", Call("lower", items_of([Col("t", "a")])), rx_f(2.0)), "a call")
+
+@test
+concatenation_is_not_widened()
+    rx_eq(rx_e("i || f"), rx_2("concat", rx_nums("i"), rx_nums("f")), "||")
+
+// -- an INSERT's query assigns its constants (§3.2 rule 4) -------------------------------------------------
+
+@test
+an_insert_select_constant_takes_each_column_type()
+    for (column, written, text) in rx_cases()
+        val ty = rx_type_of(column).base()
+        val got = rx_insert_item(s"INSERT INTO every ($column) SELECT $written")
+        val want = Literal(ty, from_text(ty, text).unwrap())
+        if got != want then print(s"\ncolumn: $column\n")
+        assert(got == want, "the constant is a value of its column's type")
+
+@test
+an_insert_select_null_takes_the_column_type()
+    rx_eq(rx_insert_item("INSERT INTO every (c_null) SELECT NULL"), Null(Int16), "a nullable target")
+    rx_eq(rx_insert_item("INSERT INTO every (c_i16) SELECT NULL"), Null(Int16), "a NOT NULL target: validation refuses it")
+
+@test
+an_insert_select_parameter_takes_the_column_type_exactly()
+    val e = sq_env("INSERT INTO every (c_i16, c_null) SELECT $1, $2", RxFixture())
+    assert(e.params.len() == 2, "two parameters")
+    assert(e.params[0] == ParamDecl(None, Int16), "the column's type")
+    assert(e.params[1] == ParamDecl(None, nullable(Int16)), "its nullability too")
+
+@test
+an_insert_select_mixes_constants_and_columns()
+    sq_stmt("INSERT INTO users (id, name, age) SELECT id, 'x', 3 FROM posts", RxFixture()) match
+        Insert(_, _, _, _, Project(_, _, items), _, _) ->
+            rx_eq(items[0].expr, Col("posts", "id"), "a column")
+            rx_eq(items[1].expr, sq_txt("x"), "text")
+            rx_eq(items[2].expr, Literal(Int16, Value.Int(3)), "int16")
+        _ -> assert(false, "an insert of a project")
+
+@test
+a_constant_after_a_star_is_assigned_to_the_target_past_the_star_s_columns()
+    sq_stmt("INSERT INTO every (c_i32, c_i64, c_u8) SELECT *, 3 FROM (SELECT 1 AS a, 2 AS b) x", RxFixture()) match
+        Insert(_, _, _, _, Project(_, _, items), _, _) ->
+            assert(items.len() == 3, "the star's two columns and the constant")
+            rx_eq(items[2].expr, Literal(UInt8, from_text(UInt8, "3").unwrap()), "the third target's type")
+        _ -> assert(false, "an insert of a project")
+
+@test
+each_input_of_an_insert_s_set_operation_is_assigned()
+    rx_insert_source("INSERT INTO every (c_i16) SELECT 1 UNION SELECT 2") match
+        SetOp(_, _, _, inputs) ->
+            assert(inputs.len() == 2, "two inputs")
+            rx_eq(rx_first_item(inputs[0]), Literal(Int16, Value.Int(1)), "the first input")
+            rx_eq(rx_first_item(inputs[1]), Literal(Int16, Value.Int(2)), "the second input")
+        _ -> assert(false, "a set operation")
+    rx_insert_source("INSERT INTO every (c_i16) SELECT 1 EXCEPT SELECT 2 INTERSECT SELECT 3") match
+        SetOp(_, _, _, inputs) -> rx_eq(rx_first_item(inputs[0]), Literal(Int16, Value.Int(1)), "EXCEPT's left input")
+        _ -> assert(false, "a set operation")
+
+@test
+an_insert_s_values_with_a_tail_is_assigned()
+    rx_insert_source("INSERT INTO every (c_i16) VALUES (1), (NULL) ORDER BY 1") match
+        Sort(input, _) -> *input match
+            Values(_, fields, rows) ->
+                assert(fields[0].ty == nullable(Int16), "the column is the target's type, nullable for its NULL")
+                rx_eq(rows[0][0], Literal(Int16, Value.Int(1)), "int16")
+                rx_eq(rows[1][0], Null(Int16), "null")
+            _ -> assert(false, "a VALUES")
+        _ -> assert(false, "a sort")
+
+@test
+an_insert_s_values_column_with_a_non_constant_keeps_its_common_type()
+    rx_insert_source("INSERT INTO every (c_i16) VALUES (1), ((SELECT 2)) ORDER BY 1") match
+        Sort(input, _) -> *input match
+            Values(_, fields, _) -> assert(fields[0].ty == Int32, "not every value is a constant")
+            _ -> assert(false, "a VALUES")
+        _ -> assert(false, "a sort")
+
+@test
+an_insert_s_with_body_is_assigned_and_its_ctes_are_not()
+    rx_insert_source("INSERT INTO every (c_i16) WITH k AS (SELECT 1 AS v) SELECT 2") match
+        With(_, defs, body) ->
+            rx_eq(rx_first_item(*body), Literal(Int16, Value.Int(2)), "the body")
+            rx_eq(rx_first_item(defs[0].rel), sq_i32(1), "the CTE keeps its own type")
+        _ -> assert(false, "a WITH")
+
+@test
+a_query_nested_in_an_insert_s_query_is_not_assigned()
+    rx_insert_source("INSERT INTO every (c_i16) SELECT v FROM (SELECT 1 AS v) x") match
+        Project(input, _, _) -> rx_eq(rx_first_item(*input), sq_i32(1), "a derived table")
+        _ -> assert(false, "a project over a derived table")
+    rx_insert_item("INSERT INTO every (c_i16) SELECT (SELECT 1)") match
+        Scalar(r) -> rx_eq(rx_first_item(*r), sq_i32(1), "a scalar subquery")
+        _ -> assert(false, "a scalar subquery")
+    sq_stmt("INSERT INTO every (c_i16, c_i32) SELECT 1, 2 FROM t WHERE a IN (SELECT 3)", RxFixture()) match
+        Insert(_, _, _, _, Project(_, _, items), _, _) -> rx_eq(items[0].expr, Literal(Int16, Value.Int(1)), "the outer item still is")
+        _ -> assert(false, "an insert of a project")
+
+@test
+an_insert_select_constant_that_is_not_a_value_of_its_column_is_refused()
+    assert_eq(rx_code("INSERT INTO every (c_i16) SELECT 70000"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_i32) SELECT 1.5"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_i32) SELECT 2e0"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_u8) SELECT -1"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_u8) SELECT 256"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_dec) SELECT 12345.6"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_date) SELECT 'nope'"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_i16) SELECT 'x'"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_uuid) SELECT 'x'"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_i16) SELECT 1 UNION SELECT 70000"), "Q8004")
+    assert_eq(rx_code("INSERT INTO every (c_i16) VALUES (1), (70000) ORDER BY 1"), "Q8004")
+
+@test
+a_number_into_a_text_column_keeps_its_own_type()
+    rx_eq(rx_insert_item("INSERT INTO every (c_text) SELECT 5"), sq_i32(5), "validation refuses it (Q3001)")
+
+@test
+an_item_past_the_targets_keeps_its_own_type()
+    sq_stmt("INSERT INTO every (c_i16) SELECT 1, 2", RxFixture()) match
+        Insert(_, _, _, _, Project(_, _, items), _, _) ->
+            rx_eq(items[0].expr, Literal(Int16, Value.Int(1)), "assigned")
+            rx_eq(items[1].expr, sq_i32(2), "no target")
+        _ -> assert(false, "an insert of a project")
+
+@test
+an_opaque_target_leaves_its_query_s_constants_alone()
+    rx_eq(rx_insert_item("INSERT INTO t (a) SELECT 1"), sq_i32(1), "opaque")
+
+@test
+returning_and_on_conflict_are_not_assigned()
+    assert_eq(rx_code("INSERT INTO every (id, c_i16) SELECT 1, 2 ON CONFLICT (id) DO UPDATE SET c_i16 = 3 RETURNING 70000"), "ok")
+
+@test
+a_select_outside_an_insert_is_not_assigned()
+    rx_eq(rx_bare("1"), sq_i32(1), "a plain select")
+    assert_eq(rx_code("INSERT INTO every (c_i16) SELECT 1; SELECT NULL"), "Q8007")
+
+// -- NULL in a boolean context (§5.9 rule 3) ------------------------------------------------------------
+
+@test
+null_in_where_is_a_null_bool()
+    rx_eq(rx_where("NULL"), Null(Bool), "WHERE NULL")
+    rx_eq(rx_where("(NULL)"), Null(Bool), "WHERE (NULL)")
+
+@test
+not_null_as_an_expression_is_not_of_a_null_bool()
+    rx_eq(rx_where("NOT NULL"), rx_1("not", Null(Bool)), "WHERE NOT NULL")
+    rx_eq(rx_bare("NOT NULL"), rx_1("not", Null(Bool)), "SELECT NOT NULL")
+    rx_eq(rx_bare("NOT NOT NULL"), rx_1("not", rx_1("not", Null(Bool))), "NOT NOT NULL")
+
+@test
+null_beside_and_or_or_is_a_null_bool()
+    rx_eq(rx_where("a AND NULL"), rx_2("and", Col("t", "a"), Null(Bool)), "AND")
+    rx_eq(rx_where("NULL OR a"), rx_2("or", Null(Bool), Col("t", "a")), "OR")
+    rx_eq(rx_bare("NULL AND NULL"), rx_2("and", Null(Bool), Null(Bool)), "both")
+
+@test
+null_in_having_is_a_null_bool()
+    sq_rel("SELECT count(*) FROM t HAVING NULL", RxFixture()) match
+        Project(input, _, _) -> *input match
+            Filter(_, p) -> rx_eq(p, Null(Bool), "HAVING NULL")
+            _ -> assert(false, "a filter over the aggregate")
+        _ -> assert(false, "a project")
+
+@test
+null_in_join_on_is_a_null_bool()
+    assert(sq_rel("SELECT * FROM t JOIN u ON NULL", RxFixture()) == Join(Inner, sq_scan("t", "t"), sq_scan("u", "u"), Some(Null(Bool)), None, None), "inner")
+    assert(sq_rel("SELECT * FROM t LEFT JOIN u ON NULL", RxFixture()) == Join(Left, sq_scan("t", "t"), sq_scan("u", "u"), Some(Null(Bool)), None, None), "left")
+
+@test
+null_in_case_when_is_a_null_bool()
+    rx_eq(rx_bare("CASE WHEN NULL THEN 1 ELSE 2 END"), If(items_of([IfArm(Null(Bool), sq_i32(1))]), Some(sq_i32(2))), "CASE WHEN NULL")
+
+@test
+null_in_an_aggregate_filter_is_a_null_bool()
+    assert_eq(rx_code("SELECT count(*) FILTER (WHERE NULL) FROM t"), "ok")
+
+@test
+null_in_update_delete_and_on_conflict_where_is_a_null_bool()
+    sq_stmt("UPDATE t SET a = 1 WHERE NULL", RxFixture()) match
+        Update(_, _, _, _, w, _, _) -> assert(w == Some(Null(Bool)), "UPDATE")
+        _ -> assert(false, "an update")
+    sq_stmt("DELETE FROM t WHERE NULL", RxFixture()) match
+        Delete(_, _, _, _, w, _) -> assert(w == Some(Null(Bool)), "DELETE")
+        _ -> assert(false, "a delete")
+    assert_eq(rx_code("INSERT INTO users (id, name) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET name = 'y' WHERE NULL"), "ok")
+
+@test
+null_outside_a_boolean_context_still_has_no_type()
+    assert_eq(rx_code("SELECT NULL"), "Q8007")
+    assert_eq(rx_code("SELECT NULL = NULL"), "Q8007")
+    assert_eq(rx_code("SELECT -NULL"), "Q8007")
+    assert_eq(rx_code("SELECT * FROM t WHERE NULL = 1"), "Q8007")
+    assert_eq(rx_code("SELECT * FROM t WHERE NULL IS NULL"), "Q8007")
+    assert_eq(rx_code("SELECT * FROM t WHERE NULL + 1 > 0"), "Q8007")
+    assert_eq(rx_code("SELECT CASE WHEN true THEN NULL END"), "Q8007")
+    assert_eq(rx_code("SELECT a FROM t ORDER BY NULL"), "Q8007")
+    assert_eq(rx_code("SELECT a FROM t GROUP BY NULL"), "Q8007")
+    assert_eq(rx_code("SELECT CASE NULL WHEN NULL THEN 1 END"), "Q8007")
+
+// -- double alone is float64 (§4.1) ----------------------------------------------------------------------
+
+@test
+double_names_float64_in_create_table()
+    rx_same("CREATE TABLE x (a double, b double precision, c DOUBLE, d int32)", "CREATE TABLE x (a float64, b float64, c float64, d int32)")
+    rx_same("CREATE TABLE x (a double NOT NULL DEFAULT 1.5)", "CREATE TABLE x (a float64 NOT NULL DEFAULT 1.5)")
+
+@test
+a_column_named_double_may_have_type_double()
+    rx_same("CREATE TABLE x (double double)", "CREATE TABLE x (double float64)")
+    rx_same("CREATE TABLE x (precision double)", "CREATE TABLE x (precision float64)")
+
+@test
+double_names_float64_in_a_cast()
+    rx_same("SELECT CAST(a AS double) FROM t", "SELECT CAST(a AS float64) FROM t")
+    rx_same("SELECT a::double FROM t", "SELECT a::float64 FROM t")
+    rx_same("SELECT a::double precision FROM t", "SELECT a::float64 FROM t")
+    rx_same("SELECT a::double p FROM t", "SELECT a::float64 AS p FROM t")
+
+@test
+double_names_float64_in_a_typed_constant()
+    rx_same("SELECT double '1.5'", "SELECT float64 '1.5'")
+    rx_same("SELECT double precision '1.5'", "SELECT float64 '1.5'")
+
+@test
+double_names_float64_in_alter_table()
+    rx_same("ALTER TABLE users ADD COLUMN e double", "ALTER TABLE users ADD COLUMN e float64")
+    rx_same("ALTER TABLE users ALTER age SET DATA TYPE double", "ALTER TABLE users ALTER age SET DATA TYPE float64")
+
+@test
+double_and_double_precision_take_no_modifier_and_float8_stays_refused()
+    assert_eq(rx_code("CREATE TABLE x (a double(5))"), "Q8006")
+    assert_eq(rx_code("CREATE TABLE x (a double precision(5))"), "Q8006")
+    assert_eq(rx_code("SELECT CAST(a AS float8) FROM t"), "Q8006")
+    assert_eq(rx_code("CREATE TABLE x (a float8)"), "Q8006")
+    assert_eq(rx_code("CREATE TABLE x (a precision)"), "Q8006")
+    assert_eq(rx_code("CREATE TABLE x (a double array)"), "Q8005")
+    assert_eq(rx_code("SELECT double 'x'"), "Q8004")

@@ -241,7 +241,7 @@ expressions_evaluate()
         rec([Text("30"), Int(42), from_text(Date, "2024-02-29").unwrap()]), "casts")
     assert(s.rows("SELECT CASE city WHEN 'oslo' THEN 1 WHEN 'rome' THEN 2 END FROM users ORDER BY id") == items_of([rec([Int(1)]), rec([Int(2)]), rec([Value.Null])]), "simple case")
     assert(s.rows("SELECT 1.5 + 2.25, 2.5e0 * 2.0e0")[0] == rec([Int(375), Float(5.0)]), "decimal and float")
-    assert_eq(s.code("SELECT 2.5e0 * 2"), "Q3002")
+    assert(s.rows("SELECT 2.5e0 * 2")[0] == rec([Float(5.0)]), "an integer beside a float widens")
     assert(s.rows("SELECT age * 1.5 FROM users WHERE id = 1")[0] == rec([Int(450)]), "a constant beside a column")
     assert_eq(s.code("SELECT 1 / 0"), "R0002")
     assert_eq(s.code("SELECT 2147483647 + 1"), "R0001")
@@ -250,8 +250,7 @@ expressions_evaluate()
 insert_update_delete_with_returning()
     var s = sq_db()
     assert(s.rows("INSERT INTO users (id, name) VALUES (5, 'eve') RETURNING id, name, age") == items_of([rec([Int(5), Text("eve"), Value.Null])]), "insert returning")
-    assert_eq(s.code("INSERT INTO users (id, name, age) SELECT id + 100, title, 1 FROM posts"), "Q3001")
-    assert_eq(s.count("INSERT INTO users (id, name, age) SELECT id + 100, title, CAST(1 AS int16) FROM posts"), 4)
+    assert_eq(s.count("INSERT INTO users (id, name, age) SELECT id + 100, title, 1 FROM posts"), 4)
     assert_eq(s.count("UPDATE users SET age = age + 1 WHERE id > 100"), 4)
     assert(sq_ints(s.rows("UPDATE users SET city = 'x' WHERE id = 3 RETURNING age")) == sq_is([25]), "update returning")
     assert(sq_strs(s.rows("SELECT city FROM users WHERE id = 3")) == sql_names(["x"]), "updated")
@@ -349,3 +348,190 @@ parameters_are_bound_by_the_client()
         sq_strs(s.rows("SELECT name FROM users WHERE id = $1::int64 OR name = $2", [Int(3), Text("ann")])) == sql_names(["cy", "ann"]), "two parameters")
     s.run("INSERT INTO users (id, name, age) VALUES ($1, $2, $3)", [Int(80), Text("p"), Value.Null])
     assert(s.rows("SELECT name, age FROM users WHERE id = 80") == items_of([rec([Text("p"), Value.Null])]), "inserted by parameters")
+
+// -- the PostgreSQL-like readings: `sql.md` §5.8 rule 7, §3.2 rule 4, §5.9 rule 3, §4.1 -------------------
+
+/** `sq_db` and a table `m` of integer, float and decimal columns, `f` declared with bare `double`. */
+private sq_mixed() -> SqSession
+    var s = sq_db()
+    s.ok("""
+        CREATE TABLE m (id int64 PRIMARY KEY, i int32 NOT NULL, b int64 NOT NULL, f double NOT NULL, r real NOT NULL, n int32, d decimal(5, 2) NOT NULL);
+        INSERT INTO m VALUES (1, 2, 3, 0.5, 0.25, NULL, 1.5), (2, 4, 9007199254740993, 1.5, 2, 7, 2.25);
+        """)
+    s
+
+/** The first column of each row, a float; -999 for null. */
+private sq_floats(rows: Buf[Value]) -> Buf[real]
+    val out = buf[real]()
+    for r in rows
+        r match
+            Record(fs) -> out.push(fs[0] match
+                Value.Float(x) -> x
+                Value.Null -> -999.0
+                _ -> -998.0)
+            _ -> out.push(-997.0)
+    out
+
+private sq_fs(xs: []const real) -> Buf[real]
+    val b = buf[real]()
+    b.extend(xs)
+    b
+
+@test
+an_integer_beside_a_float_widens_in_arithmetic()
+    var s = sq_mixed()
+    assert(sq_floats(s.rows("SELECT i * f FROM m ORDER BY id")) == sq_fs([1.0, 6.0]), "int * double")
+    assert(sq_floats(s.rows("SELECT f * i FROM m ORDER BY id")) == sq_fs([1.0, 6.0]), "double * int")
+    assert(s.rows("SELECT i + f, i - f, f - i, i / f FROM m WHERE id = 1")[0] == rec([Float(2.5), Float(1.5), Float(-1.5), Float(4.0)]), "each operator")
+    assert(s.rows("SELECT 2.5e0 * 2, 2 * 2.5e0, 2147483647 * 2e0")[0] == rec([Float(5.0), Float(5.0), Float(4294967294.0)]), "constants")
+    assert(sq_floats(s.rows("SELECT -i * f FROM m ORDER BY id")) == sq_fs([-1.0, -6.0]), "a negated integer")
+    assert(sq_floats(s.rows("SELECT i + i * f FROM m ORDER BY id")) == sq_fs([3.0, 10.0]), "a widened product beside an integer")
+    assert(sq_floats(s.rows("SELECT r * i FROM m ORDER BY id")) == sq_fs([0.5, 8.0]), "real beside an integer")
+
+@test
+an_integer_beside_a_float_widens_in_comparisons()
+    var s = sq_mixed()
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE f < i ORDER BY id")) == sq_is([1, 2]), "double < int")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE f * 4 > i ORDER BY id")) == sq_is([2]), "double > int")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i < f * 4 ORDER BY id")) == sq_is([2]), "int < double")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i = 2e0")) == sq_is([1]), "int = float constant")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE 4e0 = i")) == sq_is([2]), "float constant = int")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i <> 2e0")) == sq_is([2]), "<>")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE 2e0 >= i")) == sq_is([1]), ">=")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE f BETWEEN 1 AND i")) == sq_is([2]), "between")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i NOT BETWEEN 0.5e0 AND 3e0")) == sq_is([2]), "not between")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i IN (2e0, 5e0)")) == sq_is([1]), "in")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i NOT IN (2e0)")) == sq_is([2]), "not in")
+    assert(sq_strs(s.rows("SELECT CASE i WHEN 4e0 THEN 'four' ELSE 'other' END FROM m ORDER BY id")) == sql_names(["other", "four"]), "simple case")
+
+@test
+int32_and_int64_both_widen_and_a_large_int64_rounds()
+    var s = sq_mixed()
+    assert(s.rows("SELECT i * 1e0, b * 1e0 FROM m WHERE id = 1")[0] == rec([Float(2.0), Float(3.0)]), "int32 and int64")
+    assert(s.rows("SELECT b * 1e0 FROM m WHERE id = 2")[0] == rec([Float(9007199254740992.0)]), "an int64 past 2^53 rounds, as in PostgreSQL")
+    assert(s.rows("SELECT b = 9007199254740992e0 FROM m WHERE id = 2")[0] == rec([Value.Bool(true)]), "and compares as its rounded value")
+    assert(s.rows("SELECT 9007199254740993 * 1e0")[0] == rec([Float(9007199254740992.0)]), "an int64 constant")
+    assert(s.rows("SELECT CAST(3 AS int16) * 0.5e0, CAST(3 AS uint8) * 0.5e0, CAST(1 AS int64) * 0.5e0")[0] == rec([Float(1.5), Float(1.5), Float(0.5)]), "int16, uint8, int64")
+
+@test
+integer_arithmetic_overflows_before_it_widens()
+    var s = sq_mixed()
+    assert_eq(s.code("SELECT (2147483647 + 1) * 2.5e0"), "R0001")
+    assert_eq(s.code("SELECT (i + 2147483647) * 1e0 FROM m"), "R0001")
+    assert(s.rows("SELECT 2147483647 + 1 * 2.5e0")[0] == rec([Float(2147483649.5)]), "the product widens first, so the sum does not overflow")
+
+@test
+a_null_operand_of_a_widened_operator_is_null()
+    var s = sq_mixed()
+    assert(sq_floats(s.rows("SELECT n * f FROM m ORDER BY id")) == sq_fs([-999.0, 10.5]), "a nullable integer column")
+    assert(sq_floats(s.rows("SELECT f * NULL FROM m ORDER BY id")) == sq_fs([-999.0, -999.0]), "a null beside a float")
+    assert(s.rows("SELECT CAST(NULL AS int32) * 2e0")[0] == rec([Value.Null]), "a typed null")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE n > 6.5e0")) == sq_is([2]), "the null row is not kept")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE n * 1e0 IS NULL")) == sq_is([1]), "is null")
+
+@test
+aggregates_over_mixed_types_widen()
+    var s = sq_mixed()
+    assert(s.rows("SELECT sum(i) * 1.5e0 FROM m")[0] == rec([Float(9.0)]), "sum of int32")
+    assert(s.rows("SELECT sum(f) + sum(i) FROM m")[0] == rec([Float(8.0)]), "sum of double and sum of int32")
+    assert(s.rows("SELECT sum(i * f) FROM m")[0] == rec([Float(7.0)]), "sum of a widened product")
+    assert(s.rows("SELECT avg(f) * count(*) FROM m")[0] == rec([Float(2.0)]), "avg of double and count")
+    assert(s.rows("SELECT max(i) > max(f), min(i) < min(f) FROM m")[0] == rec([Value.Bool(true), Value.Bool(false)]), "min and max")
+    assert(sq_ints(s.rows("SELECT id FROM m GROUP BY id HAVING sum(i) > 3.5e0")) == sq_is([2]), "having")
+    assert(sq_floats(s.rows("SELECT i * 2e0 FROM m GROUP BY i ORDER BY 1")) == sq_fs([4.0, 8.0]), "a group key")
+    assert(sq_ints(s.rows("SELECT count(*) FROM m WHERE i > 1.5e0")) == sq_is([2]), "count")
+
+@test
+widening_leaves_other_mixes_refused()
+    var s = sq_mixed()
+    assert_eq(s.code("SELECT d * f FROM m"), "Q3002")
+    assert_eq(s.code("SELECT f + d FROM m"), "Q3002")
+    assert_eq(s.code("SELECT 1.5 * 2e0"), "Q3002")
+    assert_eq(s.code("SELECT avg(i) * 2e0 FROM m"), "Q3002")
+    assert_eq(s.code("SELECT 'a' * 2e0"), "Q3002")
+
+@test
+a_widened_value_is_nullable_so_a_not_null_target_needs_assert_not_null()
+    var s = sq_mixed()
+    s.ok("CREATE TABLE g (id int64 PRIMARY KEY, v double NOT NULL)")
+    assert_eq(s.code("INSERT INTO g SELECT id, i * f FROM m"), "Q3005")
+    assert_eq(s.count("INSERT INTO g SELECT id, assert_not_null(i * f) FROM m"), 2)
+    assert_eq(s.count("INSERT INTO g SELECT 3, 2.5e0 * 2"), 1)
+    assert(sq_floats(s.rows("SELECT v FROM g ORDER BY id")) == sq_fs([1.0, 6.0, 5.0]), "inserted")
+
+@test
+an_insert_select_constant_takes_its_target_column_s_type()
+    var s = sq_db()
+    s.ok("CREATE TABLE every (id int64 PRIMARY KEY, s int16 NOT NULL, t text, dt date, d decimal(5, 2), f double, r real, u uint8, ts timestamp, iv interval, bo bool, n int16)")
+    assert_eq(s.count("INSERT INTO every (id, s, t, dt, d, f, r, u, ts, iv, bo, n) SELECT 1, 7, 'x', '2024-02-29', 1.5, 2, 0.5, 255, '2024-01-01T00:00:00Z', 'P1D', 'true', NULL"), 1)
+    assert(s.rows("SELECT s, t, dt, d, f, r, u, bo, n FROM every WHERE id = 1")[0] ==
+        rec([Int(7), Text("x"), from_text(Date, "2024-02-29").unwrap(), Int(150), Float(2.0), Float(0.5), from_text(UInt8, "255").unwrap(), Value.Bool(true), Value.Null]), "each type")
+    assert(s.rows("SELECT ts, iv FROM every WHERE id = 1")[0] == rec([from_text(Timestamp, "2024-01-01T00:00:00Z").unwrap(), from_text(Interval, "P1D").unwrap()]), "timestamp and interval")
+
+@test
+an_insert_select_assigns_to_a_nullable_target_and_refuses_null_into_a_not_null_one()
+    var s = sq_db()
+    s.ok("CREATE TABLE every (id int64 PRIMARY KEY, s int16 NOT NULL, n int16)")
+    assert_eq(s.count("INSERT INTO every (id, s, n) SELECT 2, 1, NULL"), 1)
+    assert(s.rows("SELECT n FROM every WHERE id = 2")[0] == rec([Value.Null]), "null kept")
+    assert_eq(s.code("INSERT INTO every (id, s) SELECT 3, NULL"), "Q3005")
+    assert_eq(s.code("INSERT INTO users (id, name) SELECT 9, NULL"), "Q3005")
+
+@test
+an_insert_select_constant_that_does_not_fit_is_refused()
+    var s = sq_db()
+    s.ok("CREATE TABLE every (id int64 PRIMARY KEY, s int16 NOT NULL, t text, dt date, d decimal(5, 2), u uint8)")
+    assert_eq(s.code("INSERT INTO every (id, s) SELECT 4, 70000"), "Q8004")
+    assert_eq(s.code("INSERT INTO every (id, s) SELECT 4, 1.5"), "Q8004")
+    assert_eq(s.code("INSERT INTO every (id, s, u) SELECT 4, 1, -1"), "Q8004")
+    assert_eq(s.code("INSERT INTO every (id, s, dt) SELECT 4, 1, 'nope'"), "Q8004")
+    assert_eq(s.code("INSERT INTO every (id, s, d) SELECT 4, 1, 12345.6"), "Q8004")
+    assert_eq(s.code("INSERT INTO every (id, s, t) SELECT 4, 1, 5"), "Q3001")
+    assert_eq(s.code("INSERT INTO every (id, s) SELECT 41, v FROM (SELECT 1 AS v) x"), "Q3001")
+    assert_eq(s.rows("SELECT id FROM every").len(), 0)
+
+@test
+an_insert_select_mixes_columns_constants_set_operations_values_and_with()
+    var s = sq_db()
+    s.ok("CREATE TABLE every (id int64 PRIMARY KEY, s int16 NOT NULL)")
+    assert_eq(s.count("INSERT INTO users (id, name, age) SELECT id + 200, 'p', 4 FROM posts"), 4)
+    assert(sq_ints(s.rows("SELECT age FROM users WHERE id > 200")) == sq_is([4, 4, 4, 4]), "a constant beside columns")
+    assert_eq(s.count("INSERT INTO every (id, s) SELECT 10, 1 UNION ALL SELECT 11, 2"), 2)
+    assert_eq(s.count("INSERT INTO every (id, s) SELECT 12, 1 EXCEPT SELECT 13, 1"), 1)
+    assert_eq(s.count("INSERT INTO every (id, s) VALUES (14, 1), (15, 2) ORDER BY 1 LIMIT 1"), 1)
+    assert_eq(s.count("INSERT INTO every (id, s) WITH k AS (SELECT 1 AS v) SELECT 16, 3 FROM k"), 1)
+    s.run("INSERT INTO every (id, s) SELECT $1, $2", [Int(17), Int(5)])
+    assert(sq_ints(s.rows("SELECT s FROM every ORDER BY id")) == sq_is([1, 2, 1, 1, 3, 5]), "every row")
+
+@test
+null_in_a_boolean_context_keeps_no_row()
+    var s = sq_db()
+    assert_eq(s.rows("SELECT id FROM users WHERE NULL").len(), 0)
+    assert_eq(s.rows("SELECT id FROM users WHERE NOT NULL").len(), 0)
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE id > 1 OR NULL ORDER BY id")) == sq_is([2, 3]), "or")
+    assert_eq(s.rows("SELECT id FROM users WHERE id > 1 AND NULL").len(), 0)
+    assert(sq_ints(s.rows("SELECT id FROM users WHERE NOT (id > 1 AND NULL) ORDER BY id")) == sq_is([1]), "not of and")
+    assert_eq(s.rows("SELECT count(*) FROM users HAVING NULL").len(), 0)
+    assert_eq(s.rows("SELECT city, count(*) FROM users GROUP BY city HAVING NULL").len(), 0)
+    assert_eq(s.rows("SELECT u.id FROM users u JOIN posts p ON NULL").len(), 0)
+    assert(s.rows("SELECT u.id, p.id FROM users u LEFT JOIN posts p ON NULL ORDER BY u.id") ==
+        items_of([rec([Int(1), Value.Null]), rec([Int(2), Value.Null]), rec([Int(3), Value.Null])]), "left join")
+    assert(s.rows("SELECT CASE WHEN NULL THEN 1 ELSE 2 END")[0] == rec([Int(2)]), "case")
+    assert(s.rows("SELECT CASE WHEN NULL THEN 1 END")[0] == rec([Value.Null]), "case without else")
+    assert(s.rows("SELECT NOT NULL, NULL AND false, NULL OR true, NULL AND true")[0] == rec([Value.Null, Value.Bool(false), Value.Bool(true), Value.Null]), "three-valued")
+    assert(s.rows("SELECT count(*) FILTER (WHERE NULL) FROM users")[0] == rec([Int(0)]), "filter")
+    assert_eq(s.count("UPDATE users SET city = 'z' WHERE NULL"), 0)
+    assert_eq(s.count("DELETE FROM users WHERE NULL"), 0)
+    s.ok("INSERT INTO users (id, name) VALUES (1, 'q') ON CONFLICT (id) DO UPDATE SET name = 'q' WHERE NULL")
+    assert(sq_strs(s.rows("SELECT name FROM users WHERE id = 1")) == sql_names(["ann"]), "the conflict's update is skipped")
+
+@test
+double_names_float64_end_to_end()
+    var s = sq_db()
+    s.ok("CREATE TABLE dd (id int64 PRIMARY KEY, a double, b double precision, c double NOT NULL DEFAULT 1.5)")
+    s.ok("INSERT INTO dd (id, a, b) VALUES (1, 0.5, 2)")
+    assert(s.rows("SELECT a, b, c, CAST(id AS double), id::double, double '2.5' FROM dd")[0] ==
+        rec([Float(0.5), Float(2.0), Float(1.5), Float(1.0), Float(1.0), Float(2.5)]), "every spelling")
+    s.ok("ALTER TABLE dd ADD COLUMN e double")
+    s.ok("INSERT INTO dd (id, e) VALUES (2, 0.25)")
+    assert(sq_floats(s.rows("SELECT e FROM dd WHERE id = 2")) == sq_fs([0.25]), "an added double column")
