@@ -138,7 +138,10 @@ connection against a server in the same process, turning its loop by hand on a `
 - **Reconciliation** (`ddl.md` §6.4) covers added unique keys only. A writer that commits after a DDL it did not
   see which added a check, not-null or referencing foreign-key constraint, a column whose default is not its fill
   (or a generated or filling column), or a foreign key referencing a table it removed or changed rows of, aborts
-  with `schema_changed` instead of being reconciled, since the store cannot evaluate expressions.
+  with `schema_changed` instead of being reconciled. An added unique key is reconciled whatever its kind: over
+  columns, partial, or over expressions, which the store evaluates as definition expressions (`store.md`).
+- **Jobs other than `build_index`** do not run (`store.md` § Jobs): a check or foreign-key constraint stays not
+  validated, and `AwaitJobs` returns no relation yet, although the store records how each build ended.
 - **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
   column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
   expression applied on read. Translation (`store.md`) applies the lossless conversions only.

@@ -35,14 +35,23 @@ and the undo check over everything the store holds; `store_pages_tests.sysl` exe
 - **Limits.** A key over 1,024 bytes is `key_too_long` (`D2001`). A row whose key and value exceed 4,000 bytes
   would need columns out of line in overflow chains (§4.7–§4.8), which wait on sysl 0.12 (CRC32C), so it is
   refused with `entry_too_large` (`D2002`) before any undo record is written; nothing is approximated.
-- **`UniqueIx`** (`store_index.sysl`) is one secondary unique key of a table — a `unique` constraint, or a ready
-  unique index over columns with no predicate: a `Buf[IxEntry]` sorted by the key's value (then by primary key),
-  each entry a value with no null component that some version of a row holds, and the row's primary key. A value
-  with a null component never conflicts and has no entry (Q48; on disk such an entry takes the non-unique form,
-  §4.9 rule 1). An entry is added whenever a version is installed and never removed; a lookup fetches the row and
-  reads its versions to decide whether the value is still there, as §4.9 rule 2 has a reader do. `sync_uniques`
+- **`UniqueIx`** (`store_index.sysl`) is one secondary unique key of a table — a `unique` constraint, or a unique
+  index `building` or `ready`, partial or over expressions (`enforced_keys`): a `Buf[IxEntry]` sorted by the key's
+  value (then by primary key), each entry a value with no null component that some version of a row holds, and the
+  row's primary key. A value with a null component, or a version the predicate is not true of, never conflicts and
+  has no entry (Q48; on disk such an entry takes the non-unique form, §4.9 rule 1). An entry is added whenever a
+  version is installed and never removed; a lookup fetches the row and reads its versions to decide whether the
+  value is still there, as §4.9 rule 2 has a reader do. A plain key (columns only, no predicate) reads a version's
+  entry from its image; any other evaluates its predicate and expression components over the version as a row of
+  the current schema version (`ix_values`), the versions installed since the last check together. `sync_uniques`
   brings a table's indexes in line with the catalog before each check, building a key added since from every
-  version of every row still reachable.
+  version of every row still reachable, so a `building` index holds every row's entry from its creation (Q71).
+- **Jobs** (`store_jobs.sysl`, `ddl.md` §7): the commit of a transaction that ran DDL runs the `build_index` jobs it
+  started before it returns — one per index left `building` that backs no constraint, and one per `unique`
+  constraint whose validation is due — each in an internal read committed transaction at the newest snapshot that
+  checks no two visible rows share a value and commits the index `ready` (and the constraint validated), or
+  `failed`: a failed index is dropped, a failed constraint's index kept with the constraint not validated. Each
+  job's `JobRecord` (`Store.jobs_of`) holds how it ended.
 
 ## Version chains and visibility
 

@@ -1,0 +1,523 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The `build_index` job and the unique indexes a store enforces (`ddl.md` §2.5, §7, §8.7, §8.9):
+// a build over empty, one-row and many-row tables and over existing duplicates, which fails it;
+// NULL components (Q48); partial indexes and the rows moving into and out of their coverage;
+// multi-column and expression keys; a writer the build did not see; the creating transaction's
+// own writes; a rollback of the create; a drop; and a `unique` constraint's validation.
+
+/** `u(id, a text?, b int64?)`, with no secondary key. */
+private ib_store() -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("u", [cat_col("id", Int64), cat_col("a", nullable(Text)), cat_col("b", nullable(Int64))], ["id"]))
+    mem_store(c)
+
+private ib_u(s: &Store) -> u64 = st_oid(s, "u")
+
+/** The row `(id, a, b)` of `u`; `a` empty and `b` negative stand for null. */
+private ib_row(s: &Store, id: i128, a: string, b: i128 = -1) -> StoredRow =
+    store_row(s, ib_u(s), rec([Int(id), if a.len == 0 then Null else Value.Text(a), if b < 0 then Null else Int(b)]))
+
+/** `create [unique] index <name> on app.u (<keys>) [where <p>]`. */
+private ib_index(name: string, keys: []const IndexKey, unique: bool = true, p: Option[Expr] = None) -> Statement =
+    CreateIndex(name, IndexDef(cat_q("u"), unique, items_of(keys), p), false)
+
+private ib_on(c: string) -> IndexKey = IndexKey(KeyColumn(c), false)
+
+private ib_over(e: Expr) -> IndexKey = IndexKey(KeyExpr(e), false)
+
+/** Runs `st` in a transaction of its own, which must commit; the transaction's id. */
+private ib_ddl(s: &Store, st: Statement, file: string = __FILE__, line: long = __LINE__) -> u64
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+
+    s.ddl(t, envelope([], st), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+    st_commit(s, t, file, line)
+    t.id
+
+/** Inserts `row` into `u` in a transaction of its own: "ok", or the code that refused it. */
+private ib_put(s: &Store, row: StoredRow) -> string
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val r = st_code(s.insert(t, ib_u(s), row))
+    if r != "ok" then return r
+    st_code(s.commit(t))
+
+/** Replaces the row of `u` keyed `id` by `row` in a transaction of its own: "ok", or the code. */
+private ib_set(s: &Store, id: i128, row: StoredRow) -> string
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val changes = buf[RowChange]()
+    changes.push(Replace(st_key(id), row))
+    val r = st_code(s.write_rows(t, ib_u(s), changes))
+    if r != "ok" then return r
+    st_code(s.commit(t))
+
+/** The state of index `name` in the newest committed catalog, "absent" when there is none. */
+private ib_state(s: &Store, name: string) -> string
+    val c = s.latest_catalog()
+
+    for x in c.indexes
+        if x.name == name
+            return x.state match
+                IndexBuilding -> "building"
+                IndexReady -> "ready"
+                IndexFailed -> "failed"
+
+    "absent"
+
+/** How the one job transaction `txid` started ended: "succeeded", or its code. */
+private ib_job(s: &Store, txid: u64, file: string = __FILE__, line: long = __LINE__) -> string
+    val js = s.jobs_of(txid)
+    assert(js.len() == 1, s"one job, not ${js.len()}", file, line)
+    assert(js[0].kind == "build_index", "a build_index job", file, line)
+
+    js[0].end match
+        JobSucceeded -> "succeeded"
+        JobFailed(code, _) -> code
+
+private ib_fill(s: &Store, rows: []const StoredRow)
+    for r in rows
+        assert_eq(ib_put(s, r), "ok")
+
+// -- the build ---------------------------------------------------------------------------------
+
+@test
+a_build_over_an_empty_table_makes_the_index_ready()
+    val s = ib_store()
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a"), "ready")
+    assert_eq(ib_put(s, ib_row(s, 1, "x")), "ok")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+
+@test
+a_build_over_one_row_makes_the_index_ready_and_covers_the_row()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a"), "ready")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 3, "y")), "ok")
+
+@test
+a_build_over_many_distinct_rows_makes_the_index_ready()
+    val s = ib_store()
+
+    for i in 0..<200
+        assert_eq(ib_put(s, ib_row(s, i, s"v$i")), "ok")
+
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a"), "ready")
+    assert_eq(ib_put(s, ib_row(s, 500, "v199")), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 501, "v0")), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 502, "v200")), "ok")
+
+@test
+a_build_over_existing_duplicates_fails_and_drops_the_index()
+    val s = ib_store()
+
+    for i in 0..<50
+        assert_eq(ib_put(s, ib_row(s, i, s"v$i")), "ok")
+
+    assert_eq(ib_put(s, ib_row(s, 50, "v17")), "ok")
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_job(s, txid), "T3001")
+    assert_eq(ib_state(s, "u_a"), "absent")
+
+    // Nothing enforces the dropped index, and its name is free again.
+    assert_eq(ib_put(s, ib_row(s, 51, "v17")), "ok")
+    assert_eq(ib_ddl(s, ib_index("u_a", [ib_on("b")])) > txid, true)
+    assert_eq(ib_state(s, "u_a"), "ready")
+
+@test
+a_build_over_duplicates_that_were_deleted_succeeds()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x"), ib_row(s, 2, "x")])
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.delete_where(t, ib_u(s), st_key_is(2, [st_col(s, "u", "id")]))), 1)
+    st_commit(s, t)
+
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 3, "x")), "T3001")
+
+@test
+a_non_unique_index_is_built_ready_over_duplicates()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x"), ib_row(s, 2, "x")])
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")], false))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a"), "ready")
+    assert_eq(ib_put(s, ib_row(s, 3, "x")), "ok")
+
+@test
+each_index_a_statement_creates_gets_its_own_job()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "x", 2)])
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_b", [ib_on("b")])), BootstrapRole)), 0)
+    st_commit(s, t)
+
+    val js = s.jobs_of(t.id)
+    assert_eq(js.len(), 2)
+    assert(js[0].end != JobSucceeded, "u_a meets the duplicate")
+    assert(js[1].end == JobSucceeded, "u_b does not")
+    assert_eq(ib_state(s, "u_a"), "absent")
+    assert_eq(ib_state(s, "u_b"), "ready")
+
+@test
+a_transaction_with_no_ddl_starts_no_job()
+    val s = ib_store()
+    val t = s.begin(Snapshot)
+    assert_eq(st_done(s.insert(t, ib_u(s), ib_row(s, 1, "x"))), 1)
+    st_commit(s, t)
+    assert_eq(s.jobs_of(t.id).len(), 0)
+    assert_eq(s.jobs_of(999).len(), 0)
+
+// -- NULLs (Q48) --------------------------------------------------------------------------------
+
+@test
+rows_whose_key_is_null_never_conflict_in_the_build()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, ""), ib_row(s, 2, ""), ib_row(s, 3, "x")])
+    val txid = ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 4, "")), "ok")
+    assert_eq(ib_put(s, ib_row(s, 5, "x")), "T3001")
+
+@test
+multi_column_keys_differing_only_in_a_null_never_conflict()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x"), ib_row(s, 2, "x"), ib_row(s, 3, "", 5), ib_row(s, 4, "", 5)])
+    val txid = ib_ddl(s, ib_index("u_ab", [ib_on("a"), ib_on("b")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 5, "x")), "ok")
+    assert_eq(ib_put(s, ib_row(s, 6, "", 5)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 7, "x", 5)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 8, "x", 5)), "T3001")
+
+@test
+an_update_to_a_null_key_frees_the_value()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_set(s, 1, ib_row(s, 1, "")), "ok")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "ok")
+
+// -- multi-column and expression keys ------------------------------------------------------------
+
+@test
+a_multi_column_key_conflicts_only_when_every_component_is_equal()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "x", 2), ib_row(s, 3, "y", 1)])
+    val txid = ib_ddl(s, ib_index("u_ab", [ib_on("a"), ib_on("b")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 4, "x", 3)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 5, "x", 1)), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 6, "y", 2)), "ok")
+
+@test
+a_multi_column_build_over_a_duplicate_pair_fails()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "x", 1)])
+    val txid = ib_ddl(s, ib_index("u_ab", [ib_on("b"), ib_on("a")]))
+    assert_eq(ib_job(s, txid), "T3001")
+    assert_eq(ib_state(s, "u_ab"), "absent")
+
+@test
+an_expression_key_conflicts_on_the_expression_s_value()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "Ann")])
+    val txid = ib_ddl(s, ib_index("u_lower", [ib_over(call("lower", [cat_row("a")]))]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_lower"), "ready")
+    assert_eq(ib_put(s, ib_row(s, 2, "ANN")), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 3, "bob")), "ok")
+    assert_eq(ib_put(s, ib_row(s, 4, "")), "ok")
+
+@test
+an_expression_key_build_over_rows_equal_under_it_fails()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "Ann"), ib_row(s, 2, "aNN")])
+    val txid = ib_ddl(s, ib_index("u_lower", [ib_over(call("lower", [cat_row("a")]))]))
+    assert_eq(ib_job(s, txid), "T3001")
+    assert_eq(ib_state(s, "u_lower"), "absent")
+
+@test
+an_expression_and_a_column_make_one_key()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "Ann", 1)])
+    ib_ddl(s, ib_index("u_mix", [ib_on("b"), ib_over(call("lower", [cat_row("a")]))]))
+    assert_eq(ib_put(s, ib_row(s, 2, "ANN", 2)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 3, "ANN", 1)), "T3001")
+
+@test
+an_expression_that_fails_on_an_existing_row_fails_the_build()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 0)])
+    val txid = ib_ddl(s, ib_index("u_inv", [ib_over(call("div", [cat_int(10), cat_row("b")]))]))
+    assert(ib_job(s, txid).starts_with("R"), "the evaluation's error fails the job")
+    assert_eq(ib_state(s, "u_inv"), "absent")
+    assert_eq(ib_put(s, ib_row(s, 2, "y", 0)), "ok")
+
+@test
+an_expression_that_fails_on_a_written_row_refuses_the_write()
+    val s = ib_store()
+    ib_ddl(s, ib_index("u_inv", [ib_over(call("div", [cat_int(10), cat_row("b")]))]))
+    assert(ib_put(s, ib_row(s, 1, "x", 0)).starts_with("R"), "the write fails with the evaluation's error")
+    assert_eq(ib_put(s, ib_row(s, 2, "x", 5)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 3, "x", 5)), "T3001")
+
+// -- partial indexes -----------------------------------------------------------------------------
+
+private ib_positive() -> Option[Expr] = Some(call("gt", [cat_row("b"), cat_int(0)]))
+
+@test
+a_partial_index_builds_over_duplicates_it_does_not_cover()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 0), ib_row(s, 2, "x", 0), ib_row(s, 3, "x", 1), ib_row(s, 4, "x")])
+    val txid = ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a_pos"), "ready")
+
+@test
+a_partial_index_build_over_duplicates_it_covers_fails()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "x", 2)])
+    val txid = ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_job(s, txid), "T3001")
+    assert_eq(ib_state(s, "u_a_pos"), "absent")
+
+@test
+a_partial_index_enforces_only_among_the_rows_it_covers()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1)])
+    ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_put(s, ib_row(s, 2, "x", 0)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 3, "x")), "ok")
+    assert_eq(ib_put(s, ib_row(s, 4, "x", 7)), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 5, "y", 7)), "ok")
+
+@test
+an_update_moving_a_row_into_coverage_conflicts()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "x", 0)])
+    ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_set(s, 2, ib_row(s, 2, "x", 3)), "T3001")
+    assert_eq(ib_set(s, 2, ib_row(s, 2, "y", 3)), "ok")
+
+@test
+an_update_moving_a_row_out_of_coverage_frees_its_value()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "x", 0)])
+    ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_set(s, 1, ib_row(s, 1, "x", 0)), "ok")
+    assert_eq(ib_set(s, 2, ib_row(s, 2, "x", 9)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 3, "x", 4)), "T3001")
+
+@test
+an_insert_into_coverage_meets_a_covered_row_only()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 0)])
+    ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_put(s, ib_row(s, 2, "x", 5)), "ok")
+    assert_eq(ib_put(s, ib_row(s, 3, "x", 6)), "T3001")
+
+@test
+a_null_predicate_does_not_cover_the_row()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x"), ib_row(s, 2, "x")])
+    val txid = ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 3, "x")), "ok")
+
+@test
+a_partial_expression_index_combines_both()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "Ann", 1), ib_row(s, 2, "ANN", 0)])
+    val txid = ib_ddl(s, ib_index("u_l_pos", [ib_over(call("lower", [cat_row("a")]))], true, ib_positive()))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 3, "aNn", 2)), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 4, "aNn", 0)), "ok")
+
+@test
+a_batch_that_swaps_covered_values_is_checked_once_applied()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1), ib_row(s, 2, "y", 1)])
+    ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val swap = buf[RowChange]()
+    swap.push(Replace(st_key(1), ib_row(s, 1, "y", 1)))
+    swap.push(Replace(st_key(2), ib_row(s, 2, "x", 1)))
+    assert_eq(st_done(s.write_rows(t, ib_u(s), swap)), 2)
+    st_commit(s, t)
+
+// -- writers around the build ------------------------------------------------------------------
+
+@test
+the_creating_transaction_s_own_duplicate_is_refused_while_building()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+    assert_eq(ib_state(s, "u_a"), "absent")
+    assert_eq(st_code(s.insert(t, ib_u(s), ib_row(s, 2, "x"))), "T3001")
+
+@test
+the_creating_transaction_s_rows_are_built_at_its_commit()
+    val s = ib_store()
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+    assert_eq(st_done(s.insert(t, ib_u(s), ib_row(s, 1, "x"))), 1)
+    st_commit(s, t)
+    assert_eq(ib_job(s, t.id), "succeeded")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+
+@test
+a_duplicate_committed_before_the_ddl_commits_fails_the_build()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+
+    // Another writer, which does not see the uncommitted index, commits a duplicate first.
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "ok")
+    st_commit(s, t)
+    assert_eq(ib_job(s, t.id), "T3001")
+    assert_eq(ib_state(s, "u_a"), "absent")
+
+@test
+the_build_commits_under_a_number_of_its_own()
+    val s = ib_store()
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+    val c = st_commit(s, t)
+    assert_eq(s.horizon, c + 1)
+    assert_eq(ib_state(s, "u_a"), "ready")
+
+// -- rollback and drop ----------------------------------------------------------------------------
+
+@test
+a_rolled_back_create_index_starts_no_job_and_enforces_nothing()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+    assert(s.abort(t).is_ok())
+    assert_eq(s.jobs_of(t.id).len(), 0)
+    assert_eq(ib_state(s, "u_a"), "absent")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "ok")
+
+@test
+a_create_index_rolled_back_to_a_savepoint_enforces_nothing()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert(s.savepoint(t, "sp").is_ok())
+    assert_eq(st_done(s.ddl(t, envelope([], ib_index("u_a", [ib_on("a")])), BootstrapRole)), 0)
+    assert(s.rollback_to(t, "sp").is_ok())
+    s.enter(t).unwrap()
+    assert_eq(st_done(s.insert(t, ib_u(s), ib_row(s, 2, "x"))), 1)
+    st_commit(s, t)
+    assert_eq(s.jobs_of(t.id).len(), 0)
+    assert_eq(ib_state(s, "u_a"), "absent")
+
+@test
+a_dropped_unique_index_allows_duplicates_again()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    ib_ddl(s, ib_index("u_a", [ib_on("a")]))
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+    ib_ddl(s, DropIndex(cat_q("u_a"), false))
+    assert_eq(ib_state(s, "u_a"), "absent")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "ok")
+
+@test
+a_dropped_partial_index_allows_duplicates_again()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x", 1)])
+    ib_ddl(s, ib_index("u_a_pos", [ib_on("a")], true, ib_positive()))
+    assert_eq(ib_put(s, ib_row(s, 2, "x", 1)), "T3001")
+    ib_ddl(s, DropIndex(cat_q("u_a_pos"), false))
+    assert_eq(ib_put(s, ib_row(s, 2, "x", 1)), "ok")
+
+@test
+a_renamed_unique_constraint_keeps_enforcing()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    ib_ddl(s, cat_alter("u", [AddConstraint(cat_unique("u_a_key", ["a"]), false)]))
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+    ib_ddl(s, cat_alter("u", [RenameConstraint("u_a_key", "u_a2")]))
+    assert_eq(ib_state(s, "u_a2"), "ready")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+
+// -- a unique constraint's index (§8.7) --------------------------------------------------------
+
+private ib_constraint(s: &Store, name: string) -> CatConstraint
+    for k in s.latest_catalog().constraints
+        if k.name == name then return k
+
+    assert(false, s"no constraint $name")
+    s.latest_catalog().constraints[0]
+
+@test
+an_added_unique_constraint_is_validated_by_its_build()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val txid = ib_ddl(s, cat_alter("u", [AddConstraint(cat_unique("u_a_key", ["a"]), false)]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a_key"), "ready")
+    val k = ib_constraint(s, "u_a_key")
+    assert(k.validated && !k.job, "validated, and no job due")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")
+
+@test
+a_unique_constraint_over_duplicates_stays_not_validated_and_enforced()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x"), ib_row(s, 2, "x")])
+    val txid = ib_ddl(s, cat_alter("u", [AddConstraint(cat_unique("u_a_key", ["a"]), false)]))
+    assert_eq(ib_job(s, txid), "T3001")
+    assert_eq(ib_state(s, "u_a_key"), "failed")
+    val k = ib_constraint(s, "u_a_key")
+    assert(!k.validated && !k.job, "not validated, and no job due")
+    assert_eq(ib_put(s, ib_row(s, 3, "x")), "T3001")
+    assert_eq(ib_put(s, ib_row(s, 4, "y")), "ok")
+
+@test
+validating_a_failed_unique_constraint_after_fixing_the_data_builds_its_index()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x"), ib_row(s, 2, "x")])
+    ib_ddl(s, cat_alter("u", [AddConstraint(cat_unique("u_a_key", ["a"]), false)]))
+    assert_eq(ib_set(s, 2, ib_row(s, 2, "y")), "ok")
+    val txid = ib_ddl(s, cat_alter("u", [ValidateConstraint("u_a_key")]))
+    assert_eq(ib_job(s, txid), "succeeded")
+    assert_eq(ib_state(s, "u_a_key"), "ready")
+    assert(ib_constraint(s, "u_a_key").validated, "validated")
+
+@test
+a_deferred_unique_constraint_starts_no_job_and_its_index_stays_building()
+    val s = ib_store()
+    ib_fill(s, [ib_row(s, 1, "x")])
+    val txid = ib_ddl(s, cat_alter("u", [AddConstraint(cat_unique("u_a_key", ["a"]), true)]))
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert_eq(ib_state(s, "u_a_key"), "building")
+    assert_eq(ib_put(s, ib_row(s, 2, "x")), "T3001")

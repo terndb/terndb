@@ -216,6 +216,8 @@ struct Store
      * statement waiting for one of them runs again although its holder is still live.
      */
     released: u64
+    /** Every job a commit started, oldest first, with how it ended (`store_jobs.sysl`). */
+    jobs: Buf[JobRecord]
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
@@ -355,12 +357,16 @@ struct Store
 
         // Commit changes no row: whether a snapshot sees `t`'s versions is read from its commit
         // number, and its row locks, which are its id in the rows' `txn`, lapse with it (§4.1).
+        val ddl = self.has_ddl(t)
         val c = self.rows.commit(t.id).unwrap()
         self.publish_catalog(t, c)
         self.horizon = c
         t.state = CommittedAt(c)
         self.history.push(CommittedWrites(c, t.writes))
         self.retire(t)
+
+        // The jobs its DDL started run now, after its commit (`ddl.md` §7 rule 1).
+        if ddl then self.run_jobs(t.id)
         Ok(c)
     end commit
 
@@ -1005,7 +1011,7 @@ struct Store
         t.state = AbortedWith(code)
         self.retire(t)
 
-    private retire(*self, t: &Txn)
+    private[terndb] retire(*self, t: &Txn)
         t.waits_for = 0
 
         for i in 0..<self.active.len()
@@ -1040,7 +1046,7 @@ private fill_of(fill: Option[Expr]) -> Value = fill match
 
 /** A store over `catalog`'s tables, empty. */
 mem_store(catalog: MemCatalog) -> &Store =
-    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0)
+    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf())
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow
