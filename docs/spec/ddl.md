@@ -961,7 +961,10 @@ updates with `UPDATE` undo records), so a crash before `T`'s commit record undoe
    its operation as for a failure, with state `cancelled`. A DDL on the job's table that conflicts with the job's
    operation (dropping the column being filled) cancels it in the same transaction.
 7. **Priority.** Jobs run at a priority below user work, and a server SHOULD bound their I/O (`job_io_limit`).
-   Several jobs may run at once, on different tables or on one.
+   Several jobs may run at once, on different tables or on one. An engine MAY instead run each job to its end, in
+   one batch, after the commit that started it is published and before that commit returns; its final transaction
+   then commits under a number of its own, and no statement of another transaction runs while it does. The
+   interleavings of §8 then reduce to writers that did not see the DDL, which reconcile at their commit (§6.4).
 8. On a replica, jobs do not run: their effects arrive by WAL replay, like all writes.
 
 ## 8. Online operations
@@ -1136,7 +1139,9 @@ constraint is cancelled.
   in its final transaction.
 - **Unique indexes:** while `building`, aware writers check uniqueness against the entries present and the job
   checks each entry it inserts against them, waiting for the writer of an entry whose row is uncommitted, so two committed rows with equal keys are found by whichever of the
-  two arrives second, which fails: a writer with `unique_violation`, or the job, which then fails. Each candidate
+  two arrives second, which fails: a writer with `unique_violation`, or the job, which then fails with
+  `unique_violation` (`T3001`) recorded in its row. A row the index's predicate or an expression component cannot be
+  evaluated over fails the job with that evaluation's error, and a write of such a row fails with it. Each candidate
   conflict is confirmed against the clustered row's version visible at the newest snapshot ([DISK] §4.9 rule 2), so
   a stale or delete-marked entry is never a conflict.
 - **Running transactions:** none conflicts. The planner uses only `ready` indexes, so no query reads a partial

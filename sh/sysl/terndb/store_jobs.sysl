@@ -1,0 +1,156 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort_by
+
+// The jobs a DDL statement starts (`ddl.md` §7), as the in-memory store runs them. A job runs to its
+// end right after the commit that started it, before that commit returns, as one batch whose
+// internal transaction commits under a number of its own: the store is single-threaded, so no
+// statement of another transaction runs while a job does (Q71). The kind it runs is `build_index`
+// (§8.9), for a created index and for the index of a `unique` constraint being validated (§8.7);
+// the other kinds do not run yet (`docs/design/engine.md`).
+
+/** How a job ended (`ddl.md` §3.2 rule 4): it succeeded, or failed with an error code and message. */
+enum JobEnd derives Eq
+    JobSucceeded
+    JobFailed(code: string, message: string)
+
+/** A job (`ddl.md` §7; a row of `sys.jobs`): its id, the transaction whose commit started it, its
+ * kind, the object it works on, and how it ended.
+ */
+struct JobRecord
+    id: u64
+    txid: u64
+    kind: string
+    object: u64
+    end: JobEnd
+
+impl Store
+    /** The jobs the commit of transaction `txid` started, oldest first: what `AwaitJobs(txid)`
+     * reports (`ddl.md` §3.2 rule 4). Unknown, or one with no jobs: none.
+     */
+    jobs_of(self, txid: u64) -> Buf[JobRecord]
+        val out = buf[JobRecord]()
+
+        for j in self.jobs
+            if j.txid == txid then out.push(j)
+
+        out
+
+    /** Runs the jobs the commit of transaction `txid` started (`ddl.md` §7 rule 1): a `build_index`
+     * for every index of the newest committed catalog that is `building` and backs no constraint,
+     * and for the index of every `unique` constraint whose validation is due (§8.7). A constraint
+     * added with `defer_validation` is not due, and its index stays `building`.
+     */
+    private[terndb] run_jobs(*self, txid: u64)
+        val c = self.latest_catalog()
+        val due = buf[u64]()
+
+        for x in c.indexes
+            if x.state == IndexBuilding && x.constraint == 0 then due.push(x.oid)
+
+        for k in c.constraints
+            if k.job && k.index != 0
+                k.kind match
+                    ConUnique(_) -> due.push(k.index)
+                    _ -> ()
+
+        for oid in due
+            self.build_index(txid, oid)
+    end run_jobs
+
+    /** The `build_index` job of index `oid` (`ddl.md` §8.9), in an internal read committed
+     * transaction whose snapshot is the newest commit. The index's entries are those of every row
+     * already (`sync_uniques`), so the job checks that no two rows it sees hold one value of a unique
+     * index. In its final transaction it sets the index `ready`, and a constraint the index backs
+     * validated; or, on failure, sets the index `failed` and drops it, but keeps the failed index of
+     * a constraint, which stays not validated and enforced (§8.7 "Failure").
+     */
+    private build_index(*self, txid: u64, oid: u64)
+        val before = self.latest_catalog()
+
+        val x = before.index_by_oid(oid) match
+            Some(i) -> before.indexes[i]
+            None -> return
+
+        val j = self.begin(ReadCommitted)
+        j.snapshot = self.horizon
+        self.install(before, false)
+
+        val end = self.index_duplicates(j, x) match
+            Ok(_) -> JobSucceeded
+            Err(e) -> JobFailed(e.code, e.message)
+
+        var m = before
+        val i = m.index_by_oid(oid).unwrap()
+
+        val k = m.constraint_by_oid(x.constraint) match
+            Some(ci) -> ci
+            None -> m.constraints.len()
+
+        if end == JobSucceeded
+            m.indexes[i].state = IndexReady
+
+            if k < m.constraints.len()
+                m.constraints[k].validated = true
+                m.constraints[k].job = false
+        else
+            m.indexes[i].state = IndexFailed
+
+            if k < m.constraints.len()
+                m.constraints[k].job = false
+            else
+                val _ = m.indexes.remove(i)
+
+        val c = self.rows.commit(j.id).unwrap()
+        self.publish_job(before, m, c)
+        self.horizon = c
+        j.state = CommittedAt(c)
+        self.retire(j)
+        self.jobs.push(JobRecord(u64(self.jobs.len()) + 1, txid, "build_index", oid, end))
+    end build_index
+
+    // Whether the rows visible to job `j` hold two equal entries of unique index `x`: `unique_violation`
+    // if so. A non-unique index has none to find. A row the index's definition cannot be evaluated over
+    // fails the job with the evaluation's error.
+    private index_duplicates(*self, j: &Txn, x: CatIndex) -> Result[unit, CodecError]
+        if !x.unique then return Ok(())
+        val d = self.table_data(x.table)?
+        self.sync_uniques(d)?
+
+        var at = d.uniques.len()
+
+        for n in 0..<d.uniques.len()
+            if d.uniques[n].oid == x.oid then at = n
+
+        if at == d.uniques.len() then return Ok(())
+        val ix = d.uniques[at]
+        val rows = buf[StoredRow]()
+
+        for s in self.slots_of(d)?
+            self.visible(d, s, j.snapshot, j.id)? match
+                Some(r) -> rows.push(r)
+                None -> ()
+
+        val vs = self.ix_values(d, ix, rows, true)?
+        var held = buf[Value]()
+
+        for v in vs
+            v match
+                Some(u) -> held.push(u)
+                None -> ()
+
+        val ty = ix.ty
+        sort_by(held.view_mut(), (a, b) -> cmp(ty, a, b) < 0)
+
+        var n: usize = 1
+
+        while n < held.len()
+            if cmp(ty, held[n - 1], held[n]) == 0
+                return fail("T3001", s"two rows hold the same value of unique index '${x.name}'")
+
+            n += 1
+
+        Ok(())
+    end index_duplicates
+end Store

@@ -87,6 +87,29 @@ a_unique_lookup_is_logged_found_or_not()
         assert_eq(st_code(s.commit(t)), if same_value then "T1001" else "ok")
 
 @test
+a_row_locked_only_by_a_committed_transaction_still_holds_its_unique_value()
+    for purged in [true, false]
+        val s = sc_store()
+        val u = st_oid(s, "u")
+        val t = s.begin(Snapshot)
+        assert_eq(st_done(s.insert(t, u, sc_user(s, 1, "x"))), 1)
+        st_commit(s, t)
+
+        // A `LOCK_ONLY` lock, as a reference check takes, committed; purge passes its record unless
+        // a snapshot older than it is still live.
+        val old = s.begin(Snapshot)
+        val l = s.begin(Snapshot)
+        val d = s.table_data(u).unwrap()
+        val kb = s.key_bytes(d, st_key(1)).unwrap()
+        assert(s.rows.lock(l.id, u, kb.view()).is_ok())
+        l.locks.push(st_key(1))
+        st_commit(s, l)
+        if purged then assert(s.abort(old).is_ok())
+
+        assert_eq(st_code(s.insert(s.begin(Snapshot), u, sc_user(s, 2, "x"))), "T3001")
+        assert_eq(st_code(s.insert(s.begin(Snapshot), u, sc_user(s, 3, "y"))), "ok")
+
+@test
 a_unique_key_added_after_rows_exist_covers_them()
     val s = sc_store()
     val u = st_oid(s, "u")

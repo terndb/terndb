@@ -302,17 +302,13 @@ ddl_creates_alters_and_drops()
     s.ok("CREATE TABLE seq (id serial PRIMARY KEY, v text); INSERT INTO seq (v) VALUES ('a'), ('b')")
     assert(sq_ints(s.rows("SELECT id FROM seq ORDER BY id")) == sq_is([1, 2]), "serial")
 
-// TODO: un-ignore when the engine builds indexes and enforces a `building` unique index (`ddl.md` §8.9:
-// "while `building`, aware writers check uniqueness against the entries present") and a partial one
-// (§2.5 rule 3); `store_index.sysl`'s `unique_keys` takes only ready indexes without a predicate.
-@test(ignore: "the engine leaves a created index building, and enforces no building or partial unique index")
+@test
 a_unique_index_enforces()
     var s = sq_db()
     s.ok("CREATE UNIQUE INDEX users_city ON users (city)")
     assert_eq(s.code("UPDATE users SET city = 'oslo' WHERE id = 2"), "T3001")
 
-// TODO: un-ignore with `a_unique_index_enforces`.
-@test(ignore: "the engine leaves a created index building, and enforces no building or partial unique index")
+@test
 a_partial_unique_index_enforces_among_the_rows_it_covers()
     var s = sq_db()
     s.ok("CREATE UNIQUE INDEX users_town ON users (city) WHERE city IS NOT NULL")

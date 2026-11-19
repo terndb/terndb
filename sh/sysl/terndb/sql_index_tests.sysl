@@ -1,0 +1,185 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Unique, partial and expression indexes end to end (`ddl.md` §2.5, §8.9, §8.10): SQL run over the
+// wire against an in-memory engine, each index built by its job at the commit of the statement that
+// created it.
+
+/** A connection to a new engine holding `public.t(id, a text, b int64)` with no rows. */
+private si_db() -> SqSession
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    s.ok("CREATE SCHEMA public; CREATE TABLE t (id int64 PRIMARY KEY, a text, b int64)")
+    s
+
+/** Another connection to `s`'s engine. */
+private si_other(s: SqSession) -> SqSession = SqSession(s.e, ew_duo(s.e), 0)
+
+/** The state of index `name` in the newest committed catalog, "absent" when there is none. */
+private si_state(s: SqSession, name: string) -> string
+    for x in s.e.store.latest_catalog().indexes
+        if x.name == name
+            return x.state match
+                IndexBuilding -> "building"
+                IndexReady -> "ready"
+                IndexFailed -> "failed"
+
+    "absent"
+
+/** How the last job the engine ran ended: "succeeded", or its code; "none" when it ran none. */
+private si_last_job(s: SqSession) -> string
+    val js = s.e.store.jobs
+    if js.len() == 0 then return "none"
+
+    js[js.len() - 1].end match
+        JobSucceeded -> "succeeded"
+        JobFailed(code, _) -> code
+
+/** `users(id, name, city)` holding ('ann', 'oslo') and ('bob', 'rome'), and `posts` referencing
+ * user `post_of` (none for 0), which leaves that row locked `LOCK_ONLY` by a committed transaction.
+ */
+private si_referenced(post_of: i128) -> SqSession
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    s.ok("CREATE SCHEMA public; CREATE TABLE users (id int64 PRIMARY KEY, name text NOT NULL, city text)")
+    s.ok("INSERT INTO users VALUES (1, 'ann', 'oslo'), (2, 'bob', 'rome')")
+    s.ok("CREATE TABLE posts (id int64 PRIMARY KEY, author int64 NOT NULL REFERENCES users, title text)")
+    if post_of > 0 then s.ok(s"INSERT INTO posts VALUES (10, $post_of, 'a')")
+    s
+
+@test
+a_unique_index_value_held_by_a_referenced_row_conflicts()
+    for post_of in [0, 1, 2]
+        var s = si_referenced(post_of)
+        s.ok("CREATE UNIQUE INDEX users_city ON users (city)")
+        assert_eq(s.code("UPDATE users SET city = 'oslo' WHERE id = 2"), "T3001")
+        assert_eq(s.code("INSERT INTO users VALUES (5, 'e', 'oslo')"), "T3001")
+        assert_eq(s.code("INSERT INTO users VALUES (6, 'f', 'rome')"), "T3001")
+
+@test
+a_unique_constraint_value_held_by_a_referenced_row_conflicts()
+    for post_of in [0, 1, 2]
+        var s = si_referenced(post_of)
+        s.ok("ALTER TABLE users ADD CONSTRAINT users_name_key UNIQUE (name)")
+        assert_eq(s.code("UPDATE users SET name = 'ann' WHERE id = 2"), "T3001")
+        assert_eq(s.code("INSERT INTO users VALUES (5, 'bob', NULL)"), "T3001")
+
+@test
+a_created_unique_index_is_built_ready()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1), (2, 'y', 2)")
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    assert_eq(si_last_job(s), "succeeded")
+    assert_eq(si_state(s, "t_a"), "ready")
+    assert_eq(s.code("INSERT INTO t VALUES (3, 'x', 3)"), "T3001")
+    assert_eq(s.code("UPDATE t SET a = 'x' WHERE id = 2"), "T3001")
+    s.ok("INSERT INTO t VALUES (3, 'z', 3)")
+
+@test
+a_plain_index_is_built_ready_over_duplicates_and_enforces_nothing()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1), (2, 'x', 2)")
+    s.ok("CREATE INDEX t_a ON t (a)")
+    assert_eq(si_last_job(s), "succeeded")
+    assert_eq(si_state(s, "t_a"), "ready")
+    s.ok("INSERT INTO t VALUES (3, 'x', 3)")
+
+@test
+a_plain_index_over_an_empty_table_is_built_ready()
+    var s = si_db()
+    s.ok("CREATE INDEX t_b ON t (b DESC, a)")
+    assert_eq(si_state(s, "t_b"), "ready")
+
+@test
+a_unique_index_over_existing_duplicates_fails_its_build_and_is_dropped()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1), (2, 'x', 2)")
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    assert_eq(si_last_job(s), "T3001")
+    assert_eq(si_state(s, "t_a"), "absent")
+    s.ok("INSERT INTO t VALUES (3, 'x', 3)")
+
+@test
+nulls_never_conflict_in_a_unique_index()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, NULL, 1), (2, NULL, 2)")
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    assert_eq(si_last_job(s), "succeeded")
+    s.ok("INSERT INTO t VALUES (3, NULL, 3)")
+    s.ok("UPDATE t SET b = 9 WHERE a IS NULL")
+
+@test
+a_multi_column_unique_index_conflicts_on_the_whole_key()
+    var s = si_db()
+    s.ok("CREATE UNIQUE INDEX t_ab ON t (a, b)")
+    s.ok("INSERT INTO t VALUES (1, 'x', 1), (2, 'x', 2), (3, 'y', 1), (4, 'x', NULL), (5, 'x', NULL)")
+    assert_eq(s.code("INSERT INTO t VALUES (6, 'x', 2)"), "T3001")
+
+@test
+an_expression_unique_index_conflicts_on_the_expression()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'Ann', 1)")
+    s.ok("CREATE UNIQUE INDEX t_lower ON t ((lower(a)))")
+    assert_eq(si_state(s, "t_lower"), "ready")
+    assert_eq(s.code("INSERT INTO t VALUES (2, 'aNN', 2)"), "T3001")
+    s.ok("INSERT INTO t VALUES (2, 'bob', 2)")
+
+@test
+a_partial_unique_index_covers_only_the_rows_its_predicate_holds_for()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 0), (2, 'x', 0)")
+    s.ok("CREATE UNIQUE INDEX t_a_pos ON t (a) WHERE b > 0")
+    assert_eq(si_last_job(s), "succeeded")
+    s.ok("INSERT INTO t VALUES (3, 'x', 1)")
+    assert_eq(s.code("INSERT INTO t VALUES (4, 'x', 2)"), "T3001")
+    assert_eq(s.code("UPDATE t SET b = 5 WHERE id = 1"), "T3001")
+    s.ok("UPDATE t SET b = 0 WHERE id = 3")
+    s.ok("UPDATE t SET b = 5 WHERE id = 1")
+
+@test
+a_create_index_rolled_back_enforces_nothing()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1)")
+    s.ok("BEGIN; CREATE UNIQUE INDEX t_a ON t (a); ROLLBACK")
+    assert_eq(si_last_job(s), "none")
+    assert_eq(si_state(s, "t_a"), "absent")
+    s.ok("INSERT INTO t VALUES (2, 'x', 2)")
+
+@test
+the_creating_transaction_meets_its_building_index()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1)")
+    s.ok("BEGIN; CREATE UNIQUE INDEX t_a ON t (a)")
+    assert_eq(s.code("INSERT INTO t VALUES (2, 'x', 2)"), "T3001")
+
+@test
+sql_drop_index_allows_duplicates_again()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1)")
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    assert_eq(s.code("INSERT INTO t VALUES (2, 'x', 2)"), "T3001")
+    s.ok("DROP INDEX t_a")
+    s.ok("INSERT INTO t VALUES (2, 'x', 2)")
+
+@test
+a_writer_that_did_not_see_the_index_fails_at_commit_on_a_duplicate()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1)")
+    var w = si_other(s)
+    w.ok("BEGIN ISOLATION LEVEL READ COMMITTED; INSERT INTO t VALUES (2, 'x', 2)")
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    assert_eq(si_last_job(s), "succeeded")
+    assert_eq(w.code("COMMIT"), "T3001")
+    assert_eq(s.rows("SELECT id FROM t").len(), 1)
+
+@test
+a_writer_that_did_not_see_the_index_commits_a_value_that_does_not_conflict()
+    var s = si_db()
+    s.ok("INSERT INTO t VALUES (1, 'x', 1)")
+    var w = si_other(s)
+    w.ok("BEGIN ISOLATION LEVEL READ COMMITTED; INSERT INTO t VALUES (2, 'y', 2)")
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    w.ok("COMMIT")
+    assert_eq(s.code("INSERT INTO t VALUES (3, 'y', 3)"), "T3001")

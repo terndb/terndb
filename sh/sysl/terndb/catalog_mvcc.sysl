@@ -472,6 +472,21 @@ impl Store
                 self.install(m, false)
             None -> ()
 
+    /** Publishes `m`, the newest committed catalog `before` as a job's final transaction changed it,
+     * at that transaction's commit `c` (`ddl.md` §7): every catalog key the change touches is recorded
+     * as changed at `c`, and `m` is installed.
+     */
+    private[terndb] publish_job(*self, before: MemCatalog, m: MemCatalog, c: u64)
+        var n = m
+        self.cat.version += 1
+        n.version = self.cat.version
+
+        for key in changed_keys(before, n)
+            self.set_change(key, c)
+
+        self.cat.versions.push(CatalogAt(c, n))
+        self.install(n, false)
+
     private set_change(*self, key: string, c: u64)
         for i in 0..<self.cat.changes.len()
             if self.cat.changes[i].key == key
