@@ -422,7 +422,7 @@ operators_bind_by_precedence()
     sq_expect(sq_e("a || b = c"), sq_2("eq", sq_2("concat", sq_t("a"), sq_t("b")), sq_t("c")), "concat over comparison")
     sq_expect(sq_e("a || b + c"), sq_2("concat", sq_t("a"), sq_2("add", sq_t("b"), sq_t("c"))), "plus over concat")
     sq_expect(sq_e("-a * b"), sq_2("mul", sq_1("neg", sq_t("a")), sq_t("b")), "unary minus")
-    sq_expect(sq_e("-a::int64"), sq_1("neg", Cast(sq_t("a"), Int64, Strict)), "cast over minus")
+    sq_expect(sq_e("-a::int64"), sq_1("neg", Cast(sq_t("a"), Nullable(Int64), Strict)), "cast over minus")
     sq_expect(sq_e("+a"), sq_t("a"), "unary plus")
     sq_expect(sq_e("a = b IS NULL"), sq_1("is_null", sq_2("eq", sq_t("a"), sq_t("b"))), "is below comparison")
     sq_expect(sq_e("a IS NOT NULL"), sq_1("is_not_null", sq_t("a")), "is not null")
@@ -468,8 +468,9 @@ case_is_an_if()
 
 @test
 casts_read_constants_as_their_type()
-    sq_expect(sq_e("CAST(a AS int64)"), Cast(sq_t("a"), Int64, Strict), "cast")
-    sq_expect(sq_e("a::text::int16"), Cast(Cast(sq_t("a"), Text, Strict), Int16, Strict), "chained")
+    sq_expect(sq_e("CAST(a AS int64)"), Cast(sq_t("a"), Nullable(Int64), Strict), "cast")
+    sq_expect(sq_e("a::text::int16"), Cast(Cast(sq_t("a"), Nullable(Text), Strict), Nullable(Int16), Strict), "chained")
+    sq_expect(sq_e("(a + 1)::int64"), Cast(sq_2("add", sq_t("a"), sq_i32(1)), Nullable(Int64), Strict), "an expression")
     sq_expect(sq_e("'2024-01-02'::date"), sq_lit(Date, "2024-01-02"), "a string")
     sq_expect(sq_e("CAST('12' AS int16)"), sq_i16(12), "a string to an integer")
     sq_expect(sq_e("NULL::text"), Null(Text), "null")
@@ -493,7 +494,7 @@ type_names_map_to_tree_types()
         ("float64", Float64), ("float", Float64), ("double precision", Float64), ("text", Text), ("bytes", Bytes), ("bytea", Bytes), ("json", Json),
         ("date", Date), ("time", Time), ("time without time zone", Time), ("datetime", DateTime), ("timestamp without time zone", DateTime),
         ("timestamp", Timestamp), ("timestamptz", Timestamp), ("timestamp with time zone", Timestamp), ("interval", Interval), ("uuid", Uuid)]
-        sq_expect(sq_e(s"CAST(a AS $name)"), Cast(sq_t("a"), ty, Strict), name)
+        sq_expect(sq_e(s"CAST(a AS $name)"), Cast(sq_t("a"), Nullable(ty), Strict), name)
     for name in ["int2", "int4", "float4", "float8", "jsonb", "char", "character", "money"]
         assert_eq(sq_err(s"SELECT CAST(a AS $name) FROM t"), "Q8006@1:18")
 

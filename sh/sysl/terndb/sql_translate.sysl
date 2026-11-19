@@ -666,7 +666,8 @@ struct SqlTr
                         Null(_) | Param(_) -> return Ok(c)
                         _ -> ()
                     return Ok(Cast(c, ty, Strict))
-                Ok(Cast(self.expr(*x)?, ty, Strict))
+                // The operand's nullability is not known here, so the target admits null (`sql.md` §5.8).
+                Ok(Cast(self.expr(*x)?, nullable(ty), Strict))
             SqCall(name, args, distinct, star, filter, order, at) -> self.call_of(name, args, distinct, star, filter, order, at)
             SqExists(q, _) -> Ok(Exists(self.subquery(*q)?))
             SqSubquery(q, _) -> Ok(Scalar(self.subquery(*q)?))
@@ -1333,8 +1334,14 @@ struct SqlTr
         val fields = buf[Field]()
         val tys = buf[Type]()
         for i in 0..<targets.len()
-            fields.push(Field(targets[i], types[i].unwrap()))
-            tys.push(types[i].unwrap())
+            val t = types[i].unwrap()
+            var holds_null = false
+            for r in rows
+                r[i] match
+                    SqNull(_) -> holds_null = true
+                    _ -> ()
+            fields.push(Field(targets[i], if holds_null then nullable(t) else t))
+            tys.push(t)
         Ok(Values(self.fresh("values"), fields, self.value_rows(rows, tys)?))
 
     on_conflict(*self, c: SqlConflict, target: SqlSource, info: Option[SqlTable]) -> Result[OnConflict, SqlError]

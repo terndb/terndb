@@ -156,7 +156,9 @@ set      = name "=" expr
    an opaque table). `DEFAULT VALUES` is `columns = []` and `source = Values(values, [], [[]])`, one row of no
    columns, so every column takes its default.
 3. A `VALUES` source with no `ORDER BY`/`LIMIT` is `Values(values, [(c, T)…], rows)` with one column per target,
-   `T` the target column's type, and each constant typed as `T` (§5.9, as an assignment). With an opaque table it is
+   `T` the target column's type, made nullable (`T?`) when a value in that column is `NULL`, and each constant
+   typed as `T` (§5.9, as an assignment). So a `NULL` into a `NOT NULL` column is refused as a nullable source
+   column, `Q3005` ([QT] §9.2 rule 1). With an opaque table it is
    the `VALUES` query of §5.3, its columns named after the targets. A row with another number of values than
    targets is `Q8012`; `DEFAULT` as a value is `Q8005`.
 4. Any other source is the query of §5.
@@ -444,8 +446,12 @@ From lowest to highest; all binary operators are left-associative except the com
    `NOT IN` is `not(In(…))`. A row constructor `(x, y)` anywhere else is `Q8005`.
 3. `x LIKE p` is `like(x, p, '')`; with `ESCAPE e` it is `like(x, p, e)`. **There is no default escape
    character**, as in standard SQL (PostgreSQL's default is `\`).
-4. `CAST(x AS T)` and `x::T` are `Cast(x, T, strict)`, except on a constant, which is read as a `T` where it can be
-   (§5.9): `'2024-01-01'::date` is `Literal(date, …)`, `NULL::int64` is `Null(int64)`, `$1::int64` is `Param(0)`.
+4. `CAST(x AS T)` and `x::T` are `Cast(x, T?, strict)`: the target is nullable, because a nullable value casts
+   only to a nullable type ([QT] §7.6) and the front end does not know whether `x` is one. A constant is the
+   exception, read as a `T` where it can be (§5.9): `'2024-01-01'::date` is `Literal(date, …)`, `NULL::int64` is
+   `Null(int64)`, `$1::int64` is `Param(0)`, and a constant that is not read so is `Cast(c, T, strict)`. A cast
+   result assigned to a `NOT NULL` column is therefore refused (`Q3005`); `assert_not_null(CAST(x AS T))` is the
+   non-null form.
 5. `CASE WHEN c THEN v … [ELSE e] END` is `If([(c, v)…], e)`; `CASE x WHEN w THEN v …` compares with `eq(x, w)`.
    `ELSE NULL` is no `else`. A constant result takes the type of another result whose type is known.
 6. `EXISTS (q)` is `Exists(rel)`; a parenthesised query as a value is `Scalar(rel)`.
