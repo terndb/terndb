@@ -39,6 +39,12 @@ private sh_tree(s: Statement) -> ShellRequest = RunTree(envelope([], s))
 private sh_one(n: i128) -> Envelope =
     envelope([], Query(Values("v", items_of([Field("n", Int64)]), items_of([items_of([Literal(Int64, Int(n))])]))))
 
+/** The users table's columns as `create table users (id int64 primary key, name text)` makes them: `name` is
+ * nullable (sql.md §4 rule 2).
+ */
+private sh_users_columns() -> [2]Field = [Field("id", Int64), Field("name", nullable(Text))]
+
+/** The types of the literals inserted into users, which are never nullable. */
 private sh_users() -> [2]Field = [Field("id", Int64), Field("name", Text)]
 
 private sh_select_users() -> ShellRequest =
@@ -53,8 +59,8 @@ private sh_front_end() -> &TableFrontEnd
     fe.know("select 2;", [RunTree(sh_one(2))])
     fe.know("select\n1;", [RunTree(sh_one(1))])
     fe.know("create namespace app;", [sh_tree(CreateNamespace("app", false))])
-    fe.know("create table users (id int64 primary key, name text);", [RunTree(ew_table("users", sh_users(), "id"))])
-    fe.know("create table users (\n  id int64 primary key,\n  name text\n);", [RunTree(ew_table("users", sh_users(), "id"))])
+    fe.know("create table users (id int64 primary key, name text);", [RunTree(ew_table("users", sh_users_columns(), "id"))])
+    fe.know("create table users (\n  id int64 primary key,\n  name text\n);", [RunTree(ew_table("users", sh_users_columns(), "id"))])
     fe.know("insert into users values (1, 'ann'), (2, 'bo'), (3, 'cy');",
         [sh_insert([rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")]), rec([Int(3), Text("cy")])])])
     fe.know("insert into users values (4, 'di');", [sh_insert([rec([Int(4), Text("di")])])])
@@ -569,42 +575,53 @@ include_of_itself_stops_at_the_depth_limit()
 
 // -- the catalog meta-commands, against the engine -------------------------------------------------
 
-@test(ignore: "the engine does not serve the catalog relations yet")
+@test
 dt_lists_the_tables()
-    // TODO: un-ignore when catalog relations (branch catrel) land
     var s = sh_with_users(sh_front_end())
     s.feed_line("\\dt")
     assert_eq(sh_printed(&s), " ".repeat(11) + "List of tables\n Namespace | Name  | Type  | Owner\n-----------+-------+-------+--------\n app       | users | table | terndb\n(1 row)\n")
 
-@test(ignore: "the engine does not serve the catalog relations yet")
+@test
 dt_with_no_tables_says_so()
-    // TODO: un-ignore when catalog relations (branch catrel) land
     var s = sh_embedded(sh_front_end())
     s.feed_line("\\dt")
     assert_eq(sh_printed(&s), "Did not find any tables.\n")
     s.feed_line("\\d")
     assert_eq(sh_printed(&s), "Did not find any relations.\n")
 
-@test(ignore: "the engine does not serve the catalog relations yet")
+@test
 d_describes_a_table()
-    // TODO: un-ignore when catalog relations (branch catrel) land
     var s = sh_with_users(sh_front_end())
     s.feed_line("\\d users")
     assert_eq(sh_printed(&s), " ".repeat(10) + "Table \"app.users\"\n Column | Type  | Nullable | Default\n--------+-------+----------+---------\n id     | int64 | not null |\n name   | text  |          |\nPrimary key: (id)\n")
     s.feed_line("\\d app.users")
     assert(sh_printed(&s).contains("Table \"app.users\""), "a qualified name")
 
-@test(ignore: "the engine does not serve the catalog relations yet")
+@test
+d_says_a_columns_own_nullability_once_and_keeps_nested_ones()
+    val create = "create table kinds (k int64 primary key, a text, b list<text?> not null, c list<text?>);"
+    val fe = sh_front_end()
+    fe.know(create, [RunTree(ew_table("kinds", [Field("k", Int64), Field("a", nullable(Text)), Field("b", list(nullable(Text))),
+        Field("c", nullable(list(nullable(Text))))], "k"))])
+    var s = sh_with_users(fe)
+    s.feed_line(create)
+    assert_eq(sh_printed(&s), "CREATE TABLE\n")
+    s.feed_line("\\d kinds")
+    val got = sh_printed(&s)
+    assert(got.contains(" k      | int64       | not null |\n"), got)
+    assert(got.contains(" a      | text        |          |\n"), got)
+    assert(got.contains(" b      | list<text?> | not null |\n"), got)
+    assert(got.contains(" c      | list<text?> |          |\n"), got)
+
+@test
 d_of_a_missing_relation_is_an_error()
-    // TODO: un-ignore when catalog relations (branch catrel) land
     var s = sh_with_users(sh_front_end())
     s.feed_line("\\d nothing")
     assert_eq(sh_errors(&s), "Did not find any relation named \"nothing\".\n")
     assert_eq(s.errors, 1)
 
-@test(ignore: "the engine does not serve the catalog relations yet")
+@test
 d_lists_relations()
-    // TODO: un-ignore when catalog relations (branch catrel) land
     var s = sh_with_users(sh_front_end())
     s.feed_line("\\d")
     assert(sh_printed(&s).contains(" app       | users | table | terndb"), "the table")

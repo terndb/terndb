@@ -375,9 +375,12 @@ private columns_grid(columns: CatRows, with_details: bool) -> Grid
     for i in order
         val row = buf[string]()
         row.push(cat_text(columns.at(i, "name")))
-        row.push(cat_text(columns.at(i, "type_text")))
+        val type_text = cat_text(columns.at(i, "type_text"))
+        val nullable = cat_bool(columns.at(i, "nullable"))
+        // With a Nullable column, the column's own `?` is said there, as psql says it; nested `?`s stay.
+        row.push(if with_details && nullable && type_text.ends_with("?") then type_text[0..<type_text.len - 1] else type_text)
         if with_details
-            row.push(if cat_bool(columns.at(i, "nullable")) then "" else "not null")
+            row.push(if nullable then "" else "not null")
             val generated = columns.at(i, "generated")
             val identity = variant_name(columns.type_of("identity"), columns.at(i, "identity"))
             row.push(
