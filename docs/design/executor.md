@@ -218,7 +218,9 @@ of every binder's columns in §8.4 order instead, which `flatten` builds: the re
 stay visible above it.
 
 **Merge join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
-of `and`) with `a` reading only left binders and `b` only right ones. Both inputs are drained. Each
+of `and`) with `a` reading only left binders and `b` only right ones; one of the two may instead be
+a literal or a parameter, one value on every row (`same(true, d.k)` joins an uncorrelated subquery
+back to its one-row domain). Both inputs are drained. Each
 key is evaluated over each side, coerced to the two operands' common type, and both sides sorted by
 the keys with `cmp` (§3.3) through one vector of both sides' keys, so that a left and a right row
 compare as two rows of it. Runs of equal keys on the two sides are a group, and every pair of a
@@ -241,11 +243,25 @@ row under `single` is `R0003` at once. After the last left row, `right` and `ful
 right rows nothing matched. Output is queued as pieces of at most `BatchSize` rows and handed up in
 batches of exactly `BatchSize` until the last, never empty.
 
+**Semi, anti and mark joins whose `on` is keys alone** test no pair: a left row in a group of equal
+keys has a right row making `on` `true`, which is all they ask, so the group answers every left row
+in it at once.
+
 **A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a merge
-join's keys do not say for a left row they did not match. When `on` is `bool` it never is. With one
-scalar `eq` key and no residual, the mark is null exactly when the left key is null or some right
-key is (and there is a right row). Otherwise `on` is evaluated on that left row's pairs with every
-right row.
+join's keys do not say for a left row they did not match. When `on` is `bool` it never is. Otherwise
+a pair can have `on` null only where its `same` keys agree (`same` is never null), some `eq` key
+holds a null on one side, and the `eq` keys holding none on either side agree (two non-null keys that
+differ are `false`; a pair whose keys all agree was a candidate and was tested). So both sides are
+partitioned by the `same` keys; a partition's right rows are grouped by which `eq` keys hold a null
+(a mask), and each unmatched left row looks up, in each group, the rows agreeing with it on the keys
+neither holds a null in, sorted by those keys once per pair of masks. With scalar keys and no residual
+a row found decides the mark (null); otherwise `on` is evaluated on the pairs found. A `not in` over a
+subquery with nulls is therefore a sort and a search per row, not a pair per right row.
+
+**Work counts.** Every operator of an execution shares one `Work` (`exec_eval.sysl`, in `Ctx`): the
+pairs a join tested `on` on and the rows it sorted by its keys. They depend only on the plan and the
+rows, so a test bounds them to catch a plan that does quadratic work, whatever the machine's speed
+(`unnest_work_tests.sysl`).
 
 **When `on` is evaluated** is §6.5 rule 8, written into the spec by this work: only on pairs, so
 never when a side is empty (the merge join evaluates no key then), and a conjunct may go unevaluated

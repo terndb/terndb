@@ -20,16 +20,33 @@ struct TExpr
     node: u64
 
 /** What every expression of one execution reads: the parameter values (§10.1), each of its declared
- * type, the statement's timestamp (§7.12), in microseconds since the Unix epoch, and the sequences
- * `next_value` draws from (`exec_sequence.sysl`), absent where an expression may not draw.
+ * type, the statement's timestamp (§7.12), in microseconds since the Unix epoch, the sequences
+ * `next_value` draws from (`exec_sequence.sysl`), absent where an expression may not draw, and the
+ * counts of the work its operators do.
  */
 struct Ctx
     params: Buf[Value]
     now: i64
     draws: Option[Draws]
+    work: &Work
 
     /** The same execution with parameters `params`. */
-    with_params(self, params: Buf[Value]) -> Ctx = Ctx(params, self.now, self.draws)
+    with_params(self, params: Buf[Value]) -> Ctx = Ctx(params, self.now, self.draws, self.work)
+
+/** Counts of the work an execution's operators did, shared by every operator of it. They depend only
+ * on the plan and the rows, never on timing, so a test can bound them: a plan whose work grows
+ * quadratically in its input fails such a bound deterministically.
+ *
+ * - `pairs`: the pairs of rows a join tested `on` on (`exec_join.sysl`), including those a mark join
+ *   tests only to learn whether its mark is null;
+ * - `sorted`: the rows a join sorted by its keys, each side counted once per sort.
+ */
+struct Work
+    pairs: u64
+    sorted: u64
+
+/** Counts at zero, for a new execution. */
+no_work() -> &Work = Work(0, 0)
 
 /** A binder visible to an expression, with its rows: a vector of the binder's element type. */
 struct Binder

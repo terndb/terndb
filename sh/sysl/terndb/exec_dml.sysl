@@ -24,7 +24,7 @@ enum Executed
  */
 run_statement(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
     s.statement(t)
-    val c = if ctx.draws.is_some() then ctx else Ctx(ctx.params, ctx.now, Some(Draws(s, None)))
+    val c = if ctx.draws.is_some() then ctx else Ctx(ctx.params, ctx.now, Some(Draws(s, None)), ctx.work)
 
     run_in(env, s, t, c) match
         Ok(o) -> Ok(o)
@@ -204,7 +204,7 @@ private eval_defs(s: &Store, ctx: Ctx, rows: ColumnVector, exprs: Buf[Expr]) -> 
 
     val env = envelope([ParamDecl(None, bag(rows.ty))], Query(Project(ParamScan("row", 0), "d", items)))
     val typing = type_envelope(env, s.catalog)?
-    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now, as_definer(ctx.draws)), buf[MemTable]())
+    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now, as_definer(ctx.draws), ctx.work), buf[MemTable]())
     val r = drain_rows(plan.op, plan.elem)?
 
     for j in 0..<exprs.len()

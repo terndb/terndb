@@ -54,7 +54,7 @@ the subtree is evaluated only when the outer side has rows (§6.6 rule 4). A lis
 |---|---|
 | `Scan`, `ParamScan` | never correlated: joined to the domain as above |
 | `Values` | rows that read the outer side: an index `Values` of `0..n` joined to the domain; each column the `If` of the rows by index (only the selected row's expression is evaluated, §7.5), cast to the column's type where it differs |
-| `Filter` | the predicate over the pushed input |
+| `Filter` | the predicate over the pushed input; where that input is a cross join (an uncorrelated subtree beside the domain, as above), the predicate's conjuncts that hold no subquery become the join's `on`, and the `Filter` stays only for the rest |
 | `Project` | the items, plus the domain columns (and the order's keys) as items under the same binder |
 | `Sort` | sorted as it was; the order kept is its keys then its input's order (it is stable) |
 | `Limit` | a `Window` numbering each domain group's rows in the group's order (`row_number`, and `rank` over the sort keys for `ties`), and a `Filter` on the numbers: `rn > offset`, `rn − offset ≤ count`, and with ties `count > 0 ∧ rank − offset ≤ count` |
@@ -67,6 +67,16 @@ the subtree is evaluated only when the outer side has rows (§6.6 rule 4). A lis
 | `Nest`, keyed | the domain columns lead the keys |
 | `Nest`, no keys | the `Aggregate` §6.14 rule 1 says it equals (one `collect` of the items' record), with the count bug's treatment |
 | `Unnest` | `value` over the pushed input |
+
+The `Filter` rule is what keeps the common shape linear. `exists (select … from orders o where
+o.user_id = u.id and …)` pushes the domain into `Scan(orders)` as a cross join with it, and a `Filter`
+over that pair would test every order against every binding — the per-row form's cost, |orders| ×
+|users|. As the join's `on`, `eq(o.user_id, d.k)` is a merge key (`executor.md` §4.1), so only the
+pairs of one binding are formed. A `Filter` over a cross join and the join with its predicate as `on`
+have one result (§6.4 rule 3, §6.5 rule 8: a conjunct may go unevaluated where another is not `true`,
+and the join tests exactly the rows the `Filter` saw). A conjunct holding a subquery stays in a
+`Filter` above, and is lifted over the join already narrowed, so a subquery nested in it is
+decorrelated against the matching pairs only — correlation two levels deep stays linear too.
 
 Under a domain a relation is a bag, so an original list carries its **order** as sort keys that put
 each domain group's rows back in order; `Limit`, `Window`, a list's `Relation` and the order-reading
@@ -104,4 +114,21 @@ output unchanged; a kept subquery likewise.
 The outer side is evaluated once more for each domain, as a copy: there is no shared subplan yet (the
 executor runs no `With`). A keyless `Aggregate` or `Nest` under a domain, and each `Relation`, copy the
 domain once more. Each list kept in order costs a row number and a sort. All of these are linear in the
-rows, where the per-row form re-plans and re-runs the correlated side for every outer row.
+rows (each sort `n log n`), where the per-row form re-plans and re-runs the correlated side for every
+outer row.
+
+The joins back to the outer side are merge joins on the `same` keys, and an uncorrelated subquery's
+one-row domain is joined back on `same(true, d.k)`, a constant beside a column, which is a merge key
+too. `Exists` and `In` become mark joins whose `on` is keys alone, so no pair is tested (§4.1); `In`'s
+null mark is found by lookup. What is left that grows with the product of two sides is a correlation
+that is not an equality (`o.day > u.age` alone), whose pairs are those of one binding, and a mark
+join's residual condition beside a null key, tested with the null-keyed rows of the left row's
+partition.
+
+`unnest_work_tests.sysl` holds this down: every shape — `exists`, `not exists`, scalar subqueries in
+`where` and the select list (the count bug), `in` and `not in` correlated or not over nulls, an `in` of
+two columns, correlation on two columns and two levels deep, `any` and `all` — runs over 100 and 1000
+users with ten orders each and at the benchmark's 1000 and 10000, and the pairs its joins test
+(`Work`, `exec_eval.sysl`) must stay under four per table row. The benchmark's three correlated
+shapes test 7.2e3 to 1.5e4 pairs at 1000 users and 7.2e4 to 1.5e5 at 10000; a `Filter` left over the
+cross join would test 1.0e7 and 1.0e9.
