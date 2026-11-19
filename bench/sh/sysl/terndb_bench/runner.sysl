@@ -265,10 +265,12 @@ answer_of(db: &Db, w: Workload, s: Scale) -> Result[Buf[Buf[Cell]], string]
  * one other is right; one agreeing with none, when some others agree, is a mismatch; when no two
  * agree, every engine is.
  */
-verify_workload(dbs: []const &Db, w: Workload, s: Scale) -> Buf[Record]
+verify_workload(dbs: []const &Db, w: Workload, s: Scale, log: (string) -> unit) -> Buf[Record]
     val answers = buf[Result[Buf[Buf[Cell]], string]]()
     for db in dbs
+        val t0 = monotonic().us
         answers.push(answer_of(db, w, s))
+        log(s"  ${w.name} ${db.name()}: ${real(monotonic().us - t0) / 1000.0} ms (untimed check, includes setup)")
     val out = buf[Record]()
     var any_agree = false
     for i in 0..<dbs.len

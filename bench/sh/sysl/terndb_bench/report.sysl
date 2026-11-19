@@ -3,6 +3,7 @@ module sh.sysl.terndb_bench
 import sysl.buf.{Buf, buf}
 import sysl.fmt.format_real
 import sysl.slices.sort_by
+import sysl.text.split
 
 // The report's tables, generated from the raw results so no number is copied by hand: per pair and
 // scale, each engine's mean ± standard deviation per run with its run count, and TernDB's ratio to
@@ -59,6 +60,20 @@ workloads_of(f: ResultFile) -> Buf[string]
         if !seen then out.push(r.workload)
     out
 
+/** How the note of an engine deliberately left untimed at a scale begins. */
+const NotTimed: string = "not timed"
+
+/** Why TernDB is left untimed on a workload at scale `scale`. */
+skip_why(scale: string) -> string =
+    s" at scale $scale: TernDB's time on it grows with the product of two tables' sizes (the answer check at M took tens of seconds a run), so a run here would take over an hour"
+
+/** Whether `name` is one of the comma-separated `names`. */
+in_list(name: string, names: string) -> bool
+    if names.len == 0 then return false
+    for n in split(names, ",")
+        if n == name then return true
+    false
+
 /** A record's cell in a time table: its spread and run count, or why it has none. A record the
  * answer check (`verify`) found wrong shows the mismatch instead of its time.
  */
@@ -72,7 +87,7 @@ cell_of(r: Option[Record], verdict: Option[Outcome]) -> string
             Measured ->
                 val s = summarize(x.runs_us.view())
                 spread_text(s.mean, s.stddev) + s" (n=${s.runs})"
-            Unsupported(_) -> "unsupported"
+            Unsupported(why) -> if why.starts_with(NotTimed) then "not timed" else "unsupported"
             Mismatch(_) -> "wrong answer"
             Failed(_) -> "failed"
 

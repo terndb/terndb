@@ -1,0 +1,47 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The correlated subqueries of the release benchmark (`bench/sh/sysl/terndb_bench/workloads.sysl`),
+// translated from SQL against a real catalog: each is decorrelated whole (`docs/design/unnesting.md`),
+// so none of them is evaluated once per outer row.
+
+private us_db() -> &Engine
+    val e = engine(sql_catalog(), 1700000000000000, MonotonicClock())
+    val link = embedded_link(e, "terndb", "pw").unwrap()
+    val conn = connect_shell(link, shell_client_config("terndb", "terndb", "pw").unwrap()).unwrap()
+    var sh = shell(conn, Embedded, "terndb", "terndb")
+    sh.run_script("create table users (id bigint primary key, age bigint not null); create table orders (id bigint primary key, user_id bigint not null, amount bigint not null, status text not null);")
+    assert_eq(sh.errors, 0)
+    e
+
+/** Asserts `sql` is rewritten by unnesting and nothing of it is kept per row. */
+private us_unnested(e: &Engine, sql: string, file: string = __FILE__, line: long = __LINE__)
+    val catalog = e.store.latest_catalog()
+    val sts = sql_statements(sql, "public", catalog).unwrap()
+    sts[0].action match
+        SqlTree(env) ->
+            val typing = type_envelope(env, catalog).unwrap()
+            val plan = unnest_plan(env, typing, catalog, buf())
+            assert(plan.env.statement != env.statement, s"$sql: not rewritten", file, line)
+            var why = ""
+            for f in plan.fallbacks
+                why = why + f + "; "
+            assert(plan.fallbacks.len() == 0, s"$sql: kept per row: $why", file, line)
+        _ -> assert(false, "a query", file, line)
+
+@test("EXISTS with a residual predicate is decorrelated")
+us_exists_residual() = us_unnested(us_db(), "select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and o.amount > 95000);")
+
+@test("EXISTS with only the correlation is decorrelated")
+us_exists_plain() = us_unnested(us_db(), "select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id);")
+
+@test("NOT EXISTS is decorrelated")
+us_not_exists() = us_unnested(us_db(), "select count(*) as n from users u where not exists (select 1 from orders o where o.user_id = u.id and o.status = 'returned');")
+
+@test("a correlated scalar aggregate compared with an outer column is decorrelated")
+us_scalar() = us_unnested(us_db(), "select count(*) as n from users u where u.age * 1000 < (select max(o.amount) from orders o where o.user_id = u.id);")
+
+@test("EXISTS outside an aggregate is decorrelated")
+us_exists_rows() = us_unnested(us_db(), "select u.id from users u where exists (select 1 from orders o where o.user_id = u.id);")

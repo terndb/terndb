@@ -24,8 +24,9 @@ package {
 }
 
 // `docs/` holds the specifications and the survey's standalone probe programs, none of them part of
-// the package.
-exclude = ["docs"]
+// the package. `bench/` is the release benchmark, a project of its own (`bench/sysl.hocon`) that
+// links DuckDB and libpq; its tests are `sysl test bench`.
+exclude = ["docs", "bench"]
 
 // A result's size is not known until it is built or read, so buffers grow on the heap. The one file
 // read is the host's time zone database, which `at_zone` and `from_zone` look a zone up in

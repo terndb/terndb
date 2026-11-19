@@ -9,10 +9,10 @@
 // The TernDB server's password is $TERNDB_PASSWORD.
 
 import sh.sysl.duckdb
-import sh.sysl.terndb_bench.{AInt, Change, Db, Failed, Improved, Lost, Measured, Record, Regressed, ResultFile, Scale, Workload,
+import sh.sysl.terndb_bench.{AInt, NotTimed, Unsupported, in_list, skip_why, Change, Db, Failed, Improved, Lost, Measured, Record, Regressed, ResultFile, Scale, Workload,
     behind_of, diff_files, duck_open, file_json, file_of, load_all, only, pg_open, ranked, scale_named, spread_text, summarize,
     tern_embedded, tern_server, time_table, time_workload, time_text, verify_table, verify_workload, workloads, sig3}
-import sysl.args.{cli, option, parse_or_exit}
+import sysl.args.{cli, long_option, option, parse_or_exit}
 import sysl.buf.{Buf, buf}
 import sysl.env
 import sysl.fs.{entries, read_text, write_text}
@@ -105,7 +105,7 @@ verify_main(args: []string)
     var f = ResultFile("0.0.1", "verify", s.name, facts(s), buf())
     for w in chosen(opts.value_or(only, ""))
         log(s"verify ${w.name}")
-        f.records.extend(verify_workload(dbs.view(), w, s).view())
+        f.records.extend(verify_workload(dbs.view(), w, s, log).view())
         save(opts.value_or(out, "verify.json"), f)
     for db in dbs
         db.close()
@@ -118,8 +118,9 @@ time_main(args: []string)
     val pg = option('p', "pg", "conninfo", "the PostgreSQL database (server pair)")
     val socket = option('k', "socket", "path", "the TernDB server's Unix socket (server pair)")
     val only = option('w', "only", "names", "only these workloads, comma-separated")
+    val skip = long_option("skip-terndb", "names", "workloads TernDB is not timed on at this scale, comma-separated")
     val out = option('o', "out", "path", "where the results go")
-    val opts = parse_or_exit(cli("bench time", [pair, scale, pg, socket, only, out], about = "Times the workloads on one pair."), args)
+    val opts = parse_or_exit(cli("bench time", [pair, scale, pg, socket, only, out, skip], about = "Times the workloads on one pair."), args)
     val s = scale_of(opts.value_or(scale, "S"))
     val p = opts.value_or(pair, "inproc")
 
@@ -155,7 +156,12 @@ time_main(args: []string)
     for w in chosen(opts.value_or(only, ""))
         log(s"time ${w.name} at ${s.name}")
         val lanes = buf[&Db]()
-        lanes.extend(dbs.view())
+        val skipped = in_list(w.name, opts.value_or(skip, ""))
+        for db in dbs
+            if skipped && sh.sysl.terndb_bench.family(db.name()) == "terndb"
+                f.records.push(Record(w.name, db.name(), w.ops, 0, Unsupported(NotTimed + skip_why(opts.value_or(scale, "S"))), buf()))
+            else
+                lanes.push(db)
         if w.kind == sh.sysl.terndb_bench.Kind.Read then lanes.extend(reads_only.view())
         f.records.extend(time_workload(lanes.view(), w, s, log).view())
         save(opts.value_or(out, s"$p-${s.name}.json"), f)

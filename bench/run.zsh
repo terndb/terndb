@@ -1,5 +1,5 @@
 #!/bin/zsh
-# One benchmark job: `run.zsh <bin dir> <mode> <scale> <out file> [workloads]`, mode one of verify,
+# One benchmark job: `run.zsh <bin dir> <mode> <scale> <out file> [workloads] [workloads TernDB skips]`, mode one of verify,
 # inproc, server, concurrent. It expects PostgreSQL already running from its own data directory
 # (bench/README.md), makes a fresh database for the job, starts a TernDB server for the modes that
 # need one, runs the harness, and stops the server it started.
@@ -10,6 +10,7 @@ mode=$2
 scale=$3
 out=$4
 only=${5:-}
+skipt=${6:-}
 
 pgbin=/opt/homebrew/opt/postgresql@16/bin
 sockdir=/Users/ed/.claude/tmp/tdbb
@@ -40,6 +41,7 @@ trap stop_server EXIT
 
 args=()
 [[ -n $only ]] && args=(--only $only)
+[[ -n $skipt ]] && args+=(--skip-terndb $skipt)
 
 case $mode in
   verify)
