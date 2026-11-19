@@ -10,7 +10,7 @@ import sysl.buf.{Buf, buf}
 // §3.5 text quoted with `'` doubled, then `::` and its type, a `Call` as `(call f arg …)`, an
 // aggregate or window call as `(f arg … :field value …)`, a `SortKey` as `(asc|desc e
 // nulls_first|nulls_last)`, and the other auxiliary records (`IfArm`, `MatchArm`, `CteDef`, `Frame`,
-// `Bound`) as nodes named after them (decision Q54).
+// `Bound`) as nodes named after them (decision Q67).
 
 /** The statement `Query(r)`, as a view's `query` is reported. */
 query_text(r: Rel) -> string = nd("query", [fv("rel", rel_text(r))])
