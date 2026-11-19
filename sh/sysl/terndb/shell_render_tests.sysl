@@ -1,0 +1,248 @@
+module sh.sysl.terndb
+@tests
+
+// The shell's result display (`shell_render.sysl`), from values and types built directly: column
+// widths, wide and combining characters, empty results, nulls, long values, line breaks, nested
+// relations, records, unions and the expanded format.
+
+/** The aligned rendering of `rows` under record type `fs`. */
+private sr_table(fs: []const Field, rows: []const Value) -> string = render_aligned(result_grid(Bag(record(fs)), items_of(rows)), "", true)
+
+private sr_expanded(fs: []const Field, rows: []const Value) -> string = render_expanded(result_grid(Bag(record(fs)), items_of(rows)), "")
+
+@test
+a_table_has_a_centred_heading_a_rule_and_a_footer()
+    val got = sr_table([Field("id", Int64), Field("name", Text)], [rec([Int(1), Text("ann")]), rec([Int(22), Text("bo")])])
+    assert_eq(got, " id | name\n----+------\n  1 | ann\n 22 | bo\n(2 rows)\n")
+
+@test
+one_row_says_row()
+    val got = sr_table([Field("n", Int64)], [rec([Int(7)])])
+    assert_eq(got, " n\n---\n 7\n(1 row)\n")
+
+@test
+an_empty_result_shows_its_headings_and_no_rows()
+    val got = sr_table([Field("id", Int64), Field("name", Text)], [])
+    assert_eq(got, " id | name\n----+------\n(0 rows)\n")
+
+@test
+a_result_with_no_columns_shows_a_short_rule()
+    val got = sr_table([], [rec([]), rec([])])
+    assert_eq(got, "--\n(2 rows)\n")
+
+@test
+numbers_align_right_and_text_left()
+    val got = sr_table([Field("a", Text), Field("b", Decimal(10, 2)), Field("c", Float64), Field("d", UInt8)],
+        [rec([Text("x"), Int(12345), Float(1.5), UInt(3)]), rec([Text("longer"), Int(5), Float(-0.25), UInt(255)])])
+    assert_eq(got, "   a    |   b    |   c   |  d\n--------+--------+-------+-----\n x      | 123.45 |   1.5 |   3\n longer |   0.05 | -0.25 | 255\n(2 rows)\n")
+
+@test
+a_heading_wider_than_its_values_sets_the_width()
+    val got = sr_table([Field("a_long_heading", Int64)], [rec([Int(1)])])
+    assert_eq(got, " a_long_heading\n" + "-".repeat(16) + "\n" + " ".repeat(14) + "1\n(1 row)\n")
+
+@test
+an_odd_padding_puts_the_extra_column_right_of_the_heading()
+    val got = sr_table([Field("ab", Text)], [rec([Text("abcde")])])
+    assert_eq(got, "  ab\n-------\n abcde\n(1 row)\n")
+
+@test
+null_is_an_empty_cell()
+    val got = sr_table([Field("a", nullable(Int64)), Field("b", nullable(Text))], [rec([Null, Text("x")]), rec([Int(2), Null])])
+    assert_eq(got, " a | b\n---+---\n   | x\n 2 |\n(2 rows)\n")
+
+@test
+a_row_of_nulls_is_blank()
+    val got = sr_table([Field("a", nullable(Text))], [rec([Null])])
+    assert_eq(got, " a\n---\n\n(1 row)\n")
+
+@test
+wide_characters_take_two_columns()
+    val got = sr_table([Field("w", Text), Field("n", Int64)], [rec([Text("世界"), Int(1)]), rec([Text("ab"), Int(2)])])
+    assert_eq(got, "  w   | n\n------+---\n 世界 | 1\n ab   | 2\n(2 rows)\n")
+
+@test
+combining_marks_take_no_column()
+    val got = sr_table([Field("t", Text)], [rec([Text("e\u{301}e\u{301}")]), rec([Text("abc")])])
+    assert_eq(got, "  t\n-----\n e\u{301}e\u{301}\n abc\n(2 rows)\n")
+
+@test
+a_wide_heading_is_measured_in_columns()
+    val got = sr_table([Field("名前", Int64)], [rec([Int(1)])])
+    assert_eq(got, " 名前\n------\n    1\n(1 row)\n")
+
+@test
+a_long_value_widens_its_column_and_is_never_cut()
+    val long = "x".repeat(300)
+    val got = sr_table([Field("v", Text)], [rec([Text(long)])])
+    assert_eq(got, " " + " ".repeat(149) + "v\n" + "-".repeat(302) + "\n " + long + "\n(1 row)\n")
+
+@test
+text_with_line_breaks_spans_lines_in_its_cell()
+    val got = sr_table([Field("id", Int64), Field("t", Text)], [rec([Int(1), Text("one\ntwo")]), rec([Int(2), Text("x")])])
+    assert_eq(got, " id |  t\n----+-----\n  1 | one\n    | two\n  2 | x\n(2 rows)\n")
+
+@test
+a_multi_line_cell_in_a_right_aligned_column_pads_each_line()
+    var g = grid(["n", "t"])
+    g.right[0] = true
+    g.rows.push(items_of(["10\n2", "a"]))
+    assert_eq(render_aligned(g, "", false), " n  | t\n----+---\n 10 | a\n  2 |\n")
+
+@test
+a_title_is_centred_above_the_table()
+    var g = grid(["Namespace", "Name"])
+    g.rows.push(items_of(["app", "users"]))
+    assert_eq(render_aligned(g, "List of tables", true), "  List of tables\n Namespace | Name\n-----------+-------\n app       | users\n(1 row)\n")
+
+@test
+a_title_wider_than_the_table_is_not_cut()
+    var g = grid(["a"])
+    g.rows.push(items_of(["1"]))
+    assert_eq(render_aligned(g, "A long title", false), "A long title\n a\n---\n 1\n")
+
+@test
+the_footer_can_be_left_off()
+    var g = grid(["a"])
+    g.rows.push(items_of(["1"]))
+    assert_eq(render_aligned(g, "", false), " a\n---\n 1\n")
+
+@test
+row_footer_counts()
+    assert_eq(row_footer(0), "(0 rows)")
+    assert_eq(row_footer(1), "(1 row)")
+    assert_eq(row_footer(2), "(2 rows)")
+    assert_eq(row_footer(1000000), "(1000000 rows)")
+
+// -- non-scalar values ----------------------------------------------------------------------------
+
+@test
+a_nested_relation_of_records_is_a_table_in_its_cell()
+    val comment = record([Field("id", Int64), Field("body", Text)])
+    val got = sr_table([Field("id", Int64), Field("comments", Bag(comment))],
+        [rec([Int(10), rel([rec([Int(100), Text("x")]), rec([Int(101), Text("yes")])])]), rec([Int(11), rel([])])])
+    assert_eq(got, " id |   comments\n----+--------------\n 10 |  id  | body\n    | -----+------\n    |  100 | x\n    |  101 | yes\n 11 |  id | body\n    | ----+------\n(2 rows)\n")
+
+@test
+nested_relations_nest_twice()
+    val c = record([Field("b", Text)])
+    val p = record([Field("t", Text), Field("cs", List(c))])
+    val got = sr_table([Field("ps", Bag(p))], [rec([rel([rec([Text("a"), rel([rec([Text("x")])])])])])])
+    assert_eq(got, "    ps\n-----------\n  t | cs\n ---+-----\n  a |  b\n    | ---\n    |  x\n(1 row)\n")
+
+@test
+a_null_nested_relation_is_an_empty_cell()
+    val c = record([Field("b", Text)])
+    val got = sr_table([Field("id", Int64), Field("cs", nullable(Bag(c)))], [rec([Int(1), Null])])
+    assert_eq(got, " id | cs\n----+----\n  1 |\n(1 row)\n")
+
+@test
+a_record_is_compact_and_quotes_its_text()
+    val got = sr_table([Field("r", record([Field("id", Int64), Field("name", Text), Field("note", nullable(Text))]))],
+        [rec([rec([Int(1), Text("it's"), Null])])])
+    val v = "{id: 1, name: 'it''s', note: null}"
+    assert_eq(v.len, 34)
+    assert_eq(got, " ".repeat(17) + "r\n" + "-".repeat(36) + "\n " + v + "\n(1 row)\n")
+
+@test
+an_empty_record_is_braces()
+    assert_eq(cell_text(record([]), rec([])), "{}")
+
+@test
+a_union_shows_its_variant_and_a_payload_with_fields()
+    val u = union_of([Field("ready", record([])), Field("rebuilding", record([Field("job", UInt64)]))])
+    assert_eq(cell_text(u, variant(0, rec([]))), "ready")
+    assert_eq(cell_text(u, variant(1, rec([UInt(7)]))), "rebuilding {job: 7}")
+
+@test
+a_relation_of_scalars_is_a_compact_list()
+    assert_eq(cell_text(List(Text), rel([Text("id"), Text("name")])), "['id', 'name']")
+    assert_eq(cell_text(Bag(Int64), rel([Int(1), Int(2), Int(3)])), "[1, 2, 3]")
+    assert_eq(cell_text(List(Text), rel([])), "[]")
+    assert_eq(cell_text(List(nullable(Int64)), rel([Int(1), Null])), "[1, null]")
+
+@test
+records_inside_a_list_are_compact()
+    val k = record([Field("column", nullable(Text)), Field("desc", Bool)])
+    assert_eq(compact_text(List(k), rel([rec([Text("a"), Bool(true)]), rec([Null, Bool(false)])])), "[{column: 'a', desc: true}, {column: null, desc: false}]")
+
+@test
+scalars_take_their_canonical_text_forms()
+    assert_eq(cell_text(Bool, Bool(true)), "true")
+    assert_eq(cell_text(Date, Int(0)), "1970-01-01")
+    assert_eq(cell_text(Bytes, bytes_value([0xde, 0xad])), "\\xdead")
+    assert_eq(cell_text(Decimal(5, 2), Int(-5)), "-0.05")
+    assert_eq(cell_text(Text, Text("")), "")
+    assert_eq(cell_text(nullable(Int64), Null), "")
+
+@test
+a_result_of_scalars_is_one_column_named_column()
+    val got = render_aligned(result_grid(Bag(Int64), items_of([Int(1), Int(20)])), "", true)
+    assert_eq(got, " ?column?\n----------\n        1\n       20\n(2 rows)\n")
+
+@test
+numeric_types_are_the_right_aligned_ones()
+    assert(is_numeric(Int8) && is_numeric(UInt64) && is_numeric(Float32) && is_numeric(Decimal(3, 1)), "numbers")
+    assert(is_numeric(nullable(Int32)), "a nullable number")
+    assert(!is_numeric(Text) && !is_numeric(Bool) && !is_numeric(Date) && !is_numeric(Interval), "not numbers")
+
+// -- expanded -------------------------------------------------------------------------------------
+
+@test
+expanded_shows_a_block_per_row()
+    val got = sr_expanded([Field("id", Int64), Field("name", Text)], [rec([Int(1), Text("ann")]), rec([Int(2), Text("bo")])])
+    assert_eq(got, "-[ RECORD 1 ]\nid   | 1\nname | ann\n-[ RECORD 2 ]\nid   | 2\nname | bo\n")
+
+@test
+expanded_rules_the_record_line_to_the_widest_value()
+    val got = sr_expanded([Field("id", Int64), Field("name", Text)], [rec([Int(1), Text("a rather long name")])])
+    assert_eq(got, "-[ RECORD 1 ]" + "-".repeat(12) + "\nid   | 1\nname | a rather long name\n")
+
+@test
+expanded_with_no_rows_says_so()
+    assert_eq(sr_expanded([Field("id", Int64)], []), "(0 rows)\n")
+
+@test
+expanded_shows_null_as_nothing()
+    assert_eq(sr_expanded([Field("a", nullable(Text))], [rec([Null])]), "-[ RECORD 1 ]\na |\n")
+
+@test
+expanded_continues_a_multi_line_value_under_its_first_line()
+    val got = sr_expanded([Field("id", Int64), Field("t", Text)], [rec([Int(1), Text("one\ntwo")])])
+    assert_eq(got, "-[ RECORD 1 ]\nid | 1\nt  | one\n   | two\n")
+
+@test
+expanded_draws_a_nested_relation_under_its_heading()
+    val c = record([Field("b", Text)])
+    val got = sr_expanded([Field("id", Int64), Field("cs", Bag(c))], [rec([Int(1), rel([rec([Text("x")])])])])
+    assert_eq(got, "-[ RECORD 1 ]\nid | 1\ncs |  b\n   | ---\n   |  x\n")
+
+@test
+expanded_measures_wide_headings_in_columns()
+    val got = sr_expanded([Field("名", Int64), Field("ab", Int64)], [rec([Int(1), Int(2)])])
+    assert_eq(got, "-[ RECORD 1 ]\n名 | 1\nab | 2\n")
+
+@test
+expanded_puts_a_title_above()
+    var g = grid(["a"])
+    g.rows.push(items_of(["1"]))
+    assert_eq(render_expanded(g, "T"), "T\n-[ RECORD 1 ]\na | 1\n")
+
+@test
+render_grid_picks_the_format()
+    var g = grid(["a"])
+    g.rows.push(items_of(["1"]))
+    assert_eq(render_grid(g, "", false), " a\n---\n 1\n(1 row)\n")
+    assert_eq(render_grid(g, "", true), "-[ RECORD 1 ]\na | 1\n")
+
+@test
+text_width_counts_columns()
+    assert_eq(text_width(""), 0)
+    assert_eq(text_width("abc"), 3)
+    assert_eq(text_width("世界"), 4)
+    assert_eq(text_width("e\u{301}"), 1)
+
+@test
+quoted_text_doubles_quotes()
+    assert_eq(quoted_text(""), "''")
+    assert_eq(quoted_text("a'b"), "'a''b'")

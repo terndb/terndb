@@ -1,0 +1,474 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+import sysl.slices.sort_by
+
+// The shell's meta-commands (`docs/design/shell.md` § Meta-commands): a line whose first non-blank
+// character is `\`, run at once whatever the statement buffer holds. `\dt`, `\d` and `\d <name>` are
+// queries over the catalog relations of `ddl.md` §4, whose rows are read by column name, so a column
+// a later tree-schema minor appends changes nothing here.
+
+/** What `\?` prints. */
+shell_help() -> string =
+    "General\n" +
+    "  \\q                     quit terndb\n" +
+    "  \\?                     show this help\n" +
+    "  \\conninfo              show where the shell is connected\n" +
+    "  \\i FILE                run the statements and meta-commands in FILE\n" +
+    "  \\r                     forget the statement being typed\n" +
+    "\n" +
+    "Display\n" +
+    "  \\x [on|off]            expanded display: one block of lines per row\n" +
+    "  \\timing [on|off]       print the time each statement takes\n" +
+    "\n" +
+    "Catalog\n" +
+    "  \\d                     list tables and views\n" +
+    "  \\d NAME                describe a table or view (NAME or NAMESPACE.NAME)\n" +
+    "  \\dt                    list tables\n" +
+    "\n" +
+    "Statements end with ';' and may span lines. Meta-commands take one line and run at once.\n"
+
+/** The words of a meta-command line: the command (without its `\`) first, then its arguments, split
+ * at white space; an argument in double quotes keeps its spaces and loses its quotes.
+ */
+meta_words(line: string) -> Buf[string]
+    val out = buf[string]()
+    val b = line.bytes
+    var i: usize = 0
+    while i < b.len && (b[i] == u8(' ') || b[i] == u8('\t'))
+        i += 1
+    if i < b.len && b[i] == u8('\\') then i += 1
+
+    loop
+        while i < b.len && (b[i] == u8(' ') || b[i] == u8('\t') || b[i] == u8('\r'))
+            i += 1
+        if i >= b.len then break
+        if b[i] == u8('"')
+            val start = i + 1
+            i = start
+            while i < b.len && b[i] != u8('"')
+                i += 1
+            out.push(line[start..<i])
+            if i < b.len then i += 1
+        else
+            val start = i
+            while i < b.len && b[i] != u8(' ') && b[i] != u8('\t') && b[i] != u8('\r')
+                i += 1
+            out.push(line[start..<i])
+    out
+
+/** What follows a meta-command's name on its line, trimmed: `\i`'s file name, which may hold spaces.
+ * Quotes around all of it are taken off.
+ */
+meta_rest(line: string) -> string
+    val t = line.trim()
+    var i: usize = 1
+    while i < t.len && t.bytes[i] != u8(' ') && t.bytes[i] != u8('\t')
+        i += 1
+    val rest = t[i..<t.len].trim()
+    if rest.len >= 2
+        val q = rest.bytes[0]
+        if (q == u8('\'') || q == u8('"')) && rest.bytes[rest.len - 1] == q then return rest[1..<rest.len - 1]
+    rest
+
+/** A boolean setting's new value: `on` or `off`, or the opposite of `now` when none is given;
+ * `None` for anything else.
+ */
+setting_value(args: Buf[string], now: bool) -> Option[bool]
+    if args.len() < 2 then return Some(!now)
+    val v = args[1].to_lower()
+    if v == "on" || v == "true" || v == "1" then Some(true)
+    elif v == "off" || v == "false" || v == "0" then Some(false)
+    else None
+
+impl Shell
+    /** Runs meta-command `line`. */
+    meta(*self, line: string)
+        val words = meta_words(line)
+        if words.len() == 0
+            self.fail("invalid command \\\nTry \\? for help.\n")
+            return
+        val cmd = words[0]
+
+        if cmd == "q" || cmd == "quit"
+            self.quit = true
+        elif cmd == "?"
+            self.say(shell_help())
+        elif cmd == "r" || cmd == "reset"
+            self.buffer.reset()
+            self.say("Query buffer reset (cleared).\n")
+        elif cmd == "x"
+            setting_value(words, self.expanded) match
+                Some(v) ->
+                    self.expanded = v
+                    self.say(if v then "Expanded display is on.\n" else "Expanded display is off.\n")
+                None -> self.fail(s"\\x: unrecognized value \"${words[1]}\": on or off expected\n")
+        elif cmd == "timing"
+            setting_value(words, self.timing) match
+                Some(v) ->
+                    self.timing = v
+                    self.say(if v then "Timing is on.\n" else "Timing is off.\n")
+                None -> self.fail(s"\\timing: unrecognized value \"${words[1]}\": on or off expected\n")
+        elif cmd == "conninfo"
+            self.say(conninfo_text(self.place, self.database, self.user))
+        elif cmd == "i" || cmd == "include"
+            self.include(meta_rest(line))
+        elif cmd == "dt"
+            val _ = self.list_relations(true)
+        elif cmd == "d"
+            if words.len() == 1
+                val _ = self.list_relations(false)
+            else
+                for i in 1..<words.len()
+                    val _ = self.describe(words[i])
+        else
+            self.fail(s"invalid command \\$cmd\nTry \\? for help.\n")
+    end meta
+
+    /** `\i`: the file's lines run as a script, with a statement buffer of their own. */
+    include(*self, file: string)
+        if file.len == 0
+            self.fail("\\i: missing required argument\n")
+            return
+        if self.depth >= MaxIncludeDepth
+            self.fail(s"\\i: $file: files are nested more than $MaxIncludeDepth deep\n")
+            return
+        val text = read_text(file) match
+            Ok(t) -> t
+            Err(e) ->
+                self.fail(s"\\i: $file: ${e.message()}\n")
+                return
+        val outer = self.buffer
+        self.buffer = statement_buffer()
+        self.depth += 1
+        self.run_script(text)
+        self.depth -= 1
+        self.buffer = outer
+
+    /** The catalog rows of `env`, or `None` after printing why the query failed. */
+    private catalog(*self, env: Envelope) -> Option[CatRows]
+        val (t, rows) = self.query_rows(env)?
+        Some(cat_rows(t, rows))
+
+    /** `\dt` (`tables_only`) and `\d`: the tables, and the views unless `tables_only`, by namespace and
+     * name. `None` when a catalog query failed, which has been printed.
+     */
+    list_relations(*self, tables_only: bool) -> Option[unit]
+        val tables = self.catalog(catalog_tables_query())?
+        val entries = buf[RelEntry]()
+        for i in 0..<tables.rows.len()
+            entries.push(RelEntry(cat_u64(tables.at(i, "oid")), cat_text(tables.at(i, "namespace")), cat_text(tables.at(i, "name")),
+                "table", cat_text(tables.at(i, "owner"))))
+        if !tables_only
+            val views = self.catalog(catalog_views_query())?
+            for i in 0..<views.rows.len()
+                entries.push(RelEntry(cat_u64(views.at(i, "oid")), cat_text(views.at(i, "namespace")), cat_text(views.at(i, "name")),
+                    "view", cat_text(views.at(i, "owner"))))
+        if entries.len() == 0
+            self.say(if tables_only then "Did not find any tables.\n" else "Did not find any relations.\n")
+            return Some(())
+        self.say(relations_text(entries, if tables_only then "List of tables" else "List of relations", self.expanded))
+        Some(())
+
+    /** `\d name`: each table or view named `name`, or `namespace.name`. `None` when a catalog query
+     * failed, which has been printed.
+     */
+    describe(*self, name: string) -> Option[unit]
+        val tables = self.catalog(catalog_tables_query())?
+        val views = self.catalog(catalog_views_query())?
+        val (ns, rel) = split_name(name)
+
+        val names = buf[RelEntry]()
+        for i in 0..<tables.rows.len()
+            names.push(RelEntry(cat_u64(tables.at(i, "oid")), cat_text(tables.at(i, "namespace")), cat_text(tables.at(i, "name")),
+                "table", ""))
+
+        var found = false
+        for i in 0..<tables.rows.len()
+            if matches(ns, rel, cat_text(tables.at(i, "namespace")), cat_text(tables.at(i, "name")))
+                found = true
+                val oid = cat_u64(tables.at(i, "oid"))
+                val columns = self.catalog(catalog_columns_query(oid))?
+                val indexes = self.catalog(catalog_indexes_query(oid))?
+                val constraints = self.catalog(catalog_constraints_query(oid))?
+                val title = s"Table \"${cat_text(tables.at(i, "namespace"))}.${cat_text(tables.at(i, "name"))}\""
+                self.say(describe_table_text(title, cat_texts(tables.at(i, "primary_key")), columns, indexes, constraints, names,
+                    self.expanded))
+
+        for i in 0..<views.rows.len()
+            if matches(ns, rel, cat_text(views.at(i, "namespace")), cat_text(views.at(i, "name")))
+                found = true
+                val columns = self.catalog(catalog_columns_query(cat_u64(views.at(i, "oid"))))?
+                val title = s"View \"${cat_text(views.at(i, "namespace"))}.${cat_text(views.at(i, "name"))}\""
+                self.say(describe_view_text(title, columns, cat_text(views.at(i, "query")), self.expanded))
+
+        if !found then self.fail(s"Did not find any relation named \"$name\".\n")
+        Some(())
+    end describe
+end Shell
+
+/** What `\conninfo` prints. */
+conninfo_text(place: ShellPlace, database: string, user: string) -> string = place match
+    Embedded -> s"You are connected to the in-memory database \"$database\" as user \"$user\", embedded in this process.\n"
+    OverSocket(socket) -> s"You are connected to database \"$database\" as user \"$user\" via socket \"$socket\".\n"
+
+/** `name` split at its first `.` into a namespace and a name; no `.`, no namespace. */
+split_name(name: string) -> (Option[string], string) = name.index_of(".") match
+    Some(i) -> (Some(name[0..<i]), name[i + 1..<name.len])
+    None -> (None, name)
+
+private matches(ns: Option[string], rel: string, namespace: string, name: string) -> bool =
+    name == rel && ns.map(n -> n == namespace).unwrap_or(true)
+
+// -- the catalog queries ----------------------------------------------------------------------------
+
+private cat_items(binder: string, names: []const string) -> Buf[Item]
+    val out = buf[Item]()
+    for n in names
+        out.push(item(n, col(binder, n)))
+    out
+
+/** `catalog.tables`: every table's oid, namespace, name, owner and primary key. */
+catalog_tables_query() -> Envelope =
+    envelope([], Query(Project(scan("catalog", "tables", "t"), "r", cat_items("t", ["oid", "namespace", "name", "owner", "primary_key"]))))
+
+/** `catalog.views`: every view's oid, namespace, name, owner and query text. */
+catalog_views_query() -> Envelope =
+    envelope([], Query(Project(scan("catalog", "views", "v"), "r", cat_items("v", ["oid", "namespace", "name", "owner", "query"]))))
+
+private of_table(binder: string, oid: u64) -> Expr = call("eq", [col(binder, "table_oid"), Literal(UInt64, UInt(oid))])
+
+/** `catalog.columns` of the table or view `oid`. */
+catalog_columns_query(oid: u64) -> Envelope =
+    envelope([], Query(Project(Filter(scan("catalog", "columns", "c"), of_table("c", oid)), "r",
+        cat_items("c", ["ordinal", "name", "type_text", "nullable", "default", "generated", "identity"]))))
+
+/** `catalog.indexes` of table `oid`. */
+catalog_indexes_query(oid: u64) -> Envelope =
+    envelope([], Query(Project(Filter(scan("catalog", "indexes", "i"), of_table("i", oid)), "r",
+        cat_items("i", ["name", "unique", "keys", "predicate", "state"]))))
+
+/** `catalog.constraints` of table `oid`. */
+catalog_constraints_query(oid: u64) -> Envelope =
+    envelope([], Query(Project(Filter(scan("catalog", "constraints", "k"), of_table("k", oid)), "r",
+        cat_items("k", ["name", "validated", "kind"]))))
+
+// -- reading catalog rows ---------------------------------------------------------------------------
+
+/** Rows of a catalog query, read by column name. */
+struct CatRows
+    fields: Buf[Field]
+    rows: Buf[Value]
+
+    /** Column `name` of row `i`; null where the result has no such column. */
+    at(self, i: usize, name: string) -> Value
+        for j in 0..<self.fields.len()
+            if self.fields[j].name == name
+                return self.rows[i] match
+                    Record(vs) -> vs[j]
+                    _ -> Null
+        Null
+
+    /** The type of column `name`; null's where there is none. */
+    type_of(self, name: string) -> Type
+        for f in self.fields
+            if f.name == name then return f.ty
+        Nullable(Bool)
+
+/** The rows of a result of type `t`. */
+cat_rows(t: Type, rows: Buf[Value]) -> CatRows
+    val e = t.base() match
+        Bag(x) -> (*x).base()
+        List(x) -> (*x).base()
+        other -> other
+    e match
+        Record(fs) -> CatRows(fs, rows)
+        _ -> CatRows(buf(), rows)
+
+cat_text(v: Value) -> string = v match
+    Text(s) -> s
+    _ -> ""
+
+cat_bool(v: Value) -> bool = v match
+    Bool(b) -> b
+    _ -> false
+
+cat_u64(v: Value) -> u64 = v match
+    UInt(n) -> n
+    Int(n) -> if n < 0 then 0 else u64(n)
+    _ -> 0
+
+cat_texts(v: Value) -> Buf[string]
+    val out = buf[string]()
+    v match
+        Relation(elems) ->
+            for e in elems
+                out.push(cat_text(e))
+        _ -> ()
+    out
+
+/** The name of the variant union value `v` of type `t` holds, `""` for null. */
+variant_name(t: Type, v: Value) -> string = (t.base(), v) match
+    (Union(vs), Variant(tag, _)) -> if tag < vs.len() then vs[tag].name else ""
+    _ -> ""
+
+/** Field `name` of the payload of union value `v` of type `t`. */
+variant_field(t: Type, v: Value, name: string) -> (Type, Value)
+    (t.base(), v) match
+        (Union(vs), Variant(tag, payload)) ->
+            if tag < vs.len()
+                vs[tag].ty.base() match
+                    Record(fs) ->
+                        (*payload) match
+                            Record(xs) ->
+                                for j in 0..<fs.len()
+                                    if fs[j].name == name then return (fs[j].ty, xs[j])
+                            _ -> ()
+                    _ -> ()
+        _ -> ()
+    (Nullable(Bool), Null)
+
+/** A relation in a listing. */
+struct RelEntry
+    oid: u64
+    namespace: string
+    name: string
+    kind: string
+    owner: string
+
+/** The listing of `\d` and `\dt`, sorted by namespace and name. */
+relations_text(entries: Buf[RelEntry], title: string, expanded: bool) -> string
+    var sorted = entries
+    sort_by(sorted.view_mut(), (a, b) -> a.namespace < b.namespace || (a.namespace == b.namespace && a.name < b.name))
+    var g = grid(["Namespace", "Name", "Type", "Owner"])
+    for e in sorted
+        g.rows.push(items_of([e.namespace, e.name, e.kind, e.owner]))
+    render_grid(g, title, expanded)
+
+private joined(xs: Buf[string]) -> string
+    var out = ""
+    for i in 0..<xs.len()
+        if i > 0 then out = out + ", "
+        out = out + xs[i]
+    out
+
+/** The text of a foreign key's action: `CASCADE`, `SET NULL`, …; `""` for `no_action`. */
+private fk_action(t: Type, v: Value) -> string
+    val n = variant_name(t, v)
+    if n == "no_action" || n.len == 0 then "" else n.replace_all("_", " ").to_upper()
+
+/** The name of table `oid` among `tables`, qualified. */
+private table_name(tables: Buf[RelEntry], oid: u64) -> string
+    for t in tables
+        if t.oid == oid then return t.namespace + "." + t.name
+    s"oid $oid"
+
+/** The columns of a table or view as `\d` shows them. */
+private columns_grid(columns: CatRows, with_details: bool) -> Grid
+    var order = buf[usize]()
+    for i in 0..<columns.rows.len()
+        order.push(i)
+    sort_by(order.view_mut(), (a, b) -> cat_u64(columns.at(a, "ordinal")) < cat_u64(columns.at(b, "ordinal")))
+
+    var g = if with_details then grid(["Column", "Type", "Nullable", "Default"]) else grid(["Column", "Type"])
+    for i in order
+        val row = buf[string]()
+        row.push(cat_text(columns.at(i, "name")))
+        row.push(cat_text(columns.at(i, "type_text")))
+        if with_details
+            row.push(if cat_bool(columns.at(i, "nullable")) then "" else "not null")
+            val generated = columns.at(i, "generated")
+            val identity = variant_name(columns.type_of("identity"), columns.at(i, "identity"))
+            row.push(
+                if !generated.is_null() then s"generated always as (${cat_text(generated)})"
+                elif identity == "always" then "generated always as identity"
+                elif identity == "by_default" then "generated by default as identity"
+                else cat_text(columns.at(i, "default")))
+        g.rows.push(row)
+    g
+
+/** What `\d` prints for a table: its columns, then its primary key, indexes and constraints. */
+describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, indexes: CatRows, constraints: CatRows,
+        tables: Buf[RelEntry], expanded: bool) -> string
+    val g = columns_grid(columns, true)
+    var out = if expanded then render_expanded(g, title) else render_aligned(g, title, false)
+
+    if primary_key.len() > 0 then out = out + s"Primary key: (${joined(primary_key)})\n"
+
+    if indexes.rows.len() > 0
+        var lines = buf[string]()
+        for i in 0..<indexes.rows.len()
+            val keys = buf[string]()
+            val kt = indexes.type_of("keys")
+            val et = kt.base() match
+                Bag(x) -> *x
+                List(x) -> *x
+                other -> other
+            indexes.at(i, "keys") match
+                Relation(elems) ->
+                    for k in elems
+                        val kr = cat_rows(Bag(et), items_of([k]))
+                        var text = cat_text(kr.at(0, "expr"))
+                        if text.len == 0 then text = cat_text(kr.at(0, "column"))
+                        if cat_bool(kr.at(0, "descending")) then text = text + " DESC"
+                        keys.push(text)
+                _ -> ()
+            var line = s"    \"${cat_text(indexes.at(i, "name"))}\""
+            if cat_bool(indexes.at(i, "unique")) then line = line + " UNIQUE"
+            line = line + s" (${joined(keys)})"
+            val pred = indexes.at(i, "predicate")
+            if !pred.is_null() then line = line + s" WHERE ${cat_text(pred)}"
+            val state = variant_name(indexes.type_of("state"), indexes.at(i, "state"))
+            if state == "building" then line = line + " BUILDING"
+            elif state == "failed" then line = line + " INVALID"
+            lines.push(line)
+        sort_by(lines.view_mut(), (a, b) -> a < b)
+        out = out + "Indexes:\n"
+        for l in lines
+            out = out + l + "\n"
+
+    val checks = buf[string]()
+    val uniques = buf[string]()
+    val fks = buf[string]()
+    val kt = constraints.type_of("kind")
+    for i in 0..<constraints.rows.len()
+        val kind = constraints.at(i, "kind")
+        val name = s"    \"${cat_text(constraints.at(i, "name"))}\""
+        val invalid = if cat_bool(constraints.at(i, "validated")) then "" else " NOT VALID"
+        val k = variant_name(kt, kind)
+        if k == "check"
+            checks.push(s"$name CHECK (${cat_text(variant_field(kt, kind, "expr").1)})$invalid")
+        elif k == "unique"
+            uniques.push(s"$name UNIQUE (${joined(cat_texts(variant_field(kt, kind, "columns").1))})$invalid")
+        elif k == "foreign_key"
+            val refs = table_name(tables, cat_u64(variant_field(kt, kind, "ref_table_oid").1))
+            var line = s"$name FOREIGN KEY (${joined(cat_texts(variant_field(kt, kind, "columns").1))}) REFERENCES $refs(${joined(cat_texts(variant_field(kt, kind, "ref_columns").1))})"
+            val (dt, dv) = variant_field(kt, kind, "on_delete")
+            val on_delete = fk_action(dt, dv)
+            if on_delete.len > 0 then line = line + " ON DELETE " + on_delete
+            val (ut, uv) = variant_field(kt, kind, "on_update")
+            val on_update = fk_action(ut, uv)
+            if on_update.len > 0 then line = line + " ON UPDATE " + on_update
+            if cat_bool(variant_field(kt, kind, "deferred").1) then line = line + " DEFERRABLE INITIALLY DEFERRED"
+            fks.push(line + invalid)
+
+    out = out + constraint_section("Unique constraints:", uniques)
+    out = out + constraint_section("Check constraints:", checks)
+    out + constraint_section("Foreign-key constraints:", fks)
+end describe_table_text
+
+private constraint_section(heading: string, lines: Buf[string]) -> string
+    if lines.len() == 0 then return ""
+    var sorted = lines
+    sort_by(sorted.view_mut(), (a, b) -> a < b)
+    var out = heading + "\n"
+    for l in sorted
+        out = out + l + "\n"
+    out
+
+/** What `\d` prints for a view: its columns and its definition. */
+describe_view_text(title: string, columns: CatRows, query: string, expanded: bool) -> string
+    val g = columns_grid(columns, false)
+    val out = if expanded then render_expanded(g, title) else render_aligned(g, title, false)
+    out + "View definition:\n " + query + "\n"

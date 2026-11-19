@@ -15,7 +15,7 @@
 // format, type descriptors, the order-preserving key encoding and secondary-index entries
 // (`docs/spec/on-disk-format.md` §4, `docs/design/row-format.md`); and the in-memory B+tree over 16 KiB pages
 // laid out as `docs/spec/on-disk-format.md` §3 specifies (`docs/design/btree.md`). The `terndb` program
-// is `server/`, a project of its own.
+// is `cli/`, a project of its own; and the interactive shell it runs (`docs/design/shell.md`).
 
 package {
   name    = "terndb"
