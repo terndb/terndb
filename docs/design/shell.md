@@ -137,7 +137,36 @@ sessions, and a line wider than the terminal redraws incorrectly.
 
 ## The SQL front end
 
-The shell takes SQL through the `SqlFrontEnd` trait: the text of one complete statement goes in, and either a
-list of `ShellRequest`s (a tree to run, or a transaction-control request) or a `ShellSqlError` with a byte offset
-comes out. Error offsets are relative to the statement text that was passed in, which starts at its first
-non-blank character.
+The shell's statements are TernDB's SQL ([`sql.md`](../spec/sql.md)), translated by the SQL front end
+([`docs/design/sql.md`](sql.md)) in the shell's process: the server never sees SQL. The shell takes SQL through the
+`SqlFrontEnd` trait: the text of one complete statement and a resolver go in, and either a list of `ShellRequest`s
+(a tree to run, or a transaction-control request) or the front end's `SqlError` comes out. `DialectFrontEnd` is
+the dialect, over the default schema `public`, and `shell(…)` uses it unless it is given another front end; the
+tests give one only to see the exact text handed over, or to run a tree SQL cannot write.
+
+- **Errors** print as `ERROR:  <code>: <message>` and the `LINE n:` excerpt with its caret. The offset is relative
+  to the statement's own text, which starts at its first non-blank character, so a statement that follows
+  another on its line, or starts on a later line of a script, is excerpted from its own first line. A
+  statement the front end refuses sends nothing: inside a transaction, the transaction stays open and is not
+  failed, unlike psql, whose server is the one that finds the error.
+- **The resolver.** SQL leaves to the database the column lists that a tree spells out (`sql.md` §1 rule 4: `*`
+  beside other items or over several tables, unqualified columns over several tables, `INSERT` without a column
+  list, a constant's type from a column). The shell answers the front end from the catalog relations
+  (`catalog.tables`, `catalog.views` and `catalog.columns`, `ddl.md` §4), read over its own connection in its open
+  transaction, so a table created earlier in the transaction is known. It translates, looks up every table the
+  front end asked about and did not know, and translates again, until nothing new is asked. A column's type is
+  read structurally (`catalog.columns.type`) and only ready columns count; the primary key is
+  `catalog.tables.primary_key`. Names in the namespace `catalog` are answered from the catalog's own column
+  lists, without a query.
+- **What it remembers.** Outside a transaction every statement looks its tables up afresh, so DDL by another
+  session is seen at once. Inside one, answers are kept until the transaction ends, until it runs DDL, or until a
+  rollback to a savepoint. In a failed transaction, which can read nothing, the committed catalog is read in a
+  transaction of its own, so the statement still translates and the server refuses it with `W2003`, as it
+  refuses any statement there.
+- **A missing table.** A table the catalog does not have is opaque to the front end. Where the statement needed
+  its columns (an `INSERT` without a column list, say) the front end's `Q8010` is printed as the server would
+  put it, `Q2001: no table or view 'ns.name'`, with the caret under the table's name. Where it did not (`SELECT * FROM t`), the tree
+  is sent and the server reports the missing table.
+
+`terndb` serves, and embeds, a database that starts with the namespace `public` (`sql_catalog`), owned by the
+bootstrap role, so unqualified names work from the first statement.

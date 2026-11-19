@@ -1,6 +1,7 @@
 module sh.sysl.terndb
 
 import sysl.buf.{Buf, buf}
+import sysl.slices.sort_by
 import sysl.time.monotonic
 
 // The interactive shell (`docs/design/shell.md`): lines in, statements gathered by the statement
@@ -20,26 +21,84 @@ enum ShellRequest
     RollbackToTxn(name: string)
     ReleaseTxn(name: string)
 
-/** Why a statement's text could not be turned into requests: an error code from `errors.md`, its
- * message, and the byte offset in the text it concerns, when it concerns one.
- */
-struct ShellSqlError
-    code: string
-    message: string
-    at: Option[usize]
-
 /** The SQL front end, as the shell uses it. */
 trait SqlFrontEnd
-    /** The requests of one complete statement's text, `;` included. */
-    translate(*self, text: string) -> Result[Buf[ShellRequest], ShellSqlError]
+    /** The requests of one complete statement's text, `;` included, or why there are none: an error
+     * whose offset is a byte offset into `text`. `tables` gives the columns of the tables the
+     * statement names (`sql.md` §1 rule 4).
+     */
+    translate(*self, text: string, tables: &SqlTables) -> Result[Buf[ShellRequest], SqlError]
 
-/** A front end that has no SQL: every statement is refused. It stands where none is built in. */
-struct NoSqlFrontEnd
-end NoSqlFrontEnd
+/** TernDB's SQL dialect (`docs/spec/sql.md`), the shell's front end: each statement translated by
+ * `sql_statements`, unqualified names in `schema`.
+ */
+struct DialectFrontEnd
+    schema: string
 
-impl SqlFrontEnd for NoSqlFrontEnd
-    translate(*self, text: string) -> Result[Buf[ShellRequest], ShellSqlError] =
-        Err(ShellSqlError("", "this build of terndb has no SQL front end; only meta-commands run", None))
+impl SqlFrontEnd for DialectFrontEnd
+    translate(*self, text: string, tables: &SqlTables) -> Result[Buf[ShellRequest], SqlError]
+        val out = buf[ShellRequest]()
+        for st in sql_statements(text, self.schema, tables)?
+            out.push(st.action match
+                SqlTree(env) -> RunTree(env)
+                SqlControl(c) -> c match
+                    SqlBegin(options) -> BeginTxn(options)
+                    SqlCommit -> CommitTxn
+                    SqlRollback -> RollbackTxn
+                    SqlSavepoint(name) -> SavepointTxn(name)
+                    SqlRelease(name) -> ReleaseTxn(name)
+                    SqlRollbackTo(name) -> RollbackToTxn(name))
+        Ok(out)
+
+/** The SQL front end over the default schema, `public`. */
+dialect_front_end() -> &DialectFrontEnd = DialectFrontEnd(SqlDefaultSchema)
+
+/** What the shell learnt of a table the front end asked about. */
+enum TableAnswer
+    /** The table or view exists, with these columns. */
+    TableFound(table: SqlTable)
+    /** No table or view has the name. */
+    TableAbsent
+    /** It could not be asked: the transaction has failed, or the catalog query did. */
+    TableUnknown
+
+struct KnownTable
+    name: QualName
+    answer: TableAnswer
+
+/** The resolver the shell gives the front end for one statement: it answers from what the shell has
+ * already read of the catalog, and notes every other name it was asked, for the shell to look up and
+ * translate again.
+ */
+struct ShellTables
+    known: Buf[KnownTable]
+    /** Every name asked, once each. */
+    asked: Buf[QualName]
+
+    /** What is known of `name`, if it was looked up. */
+    answer(self, name: QualName) -> Option[TableAnswer]
+        for k in self.known
+            if k.name == name then return Some(k.answer)
+        None
+
+    /** The first name asked that is known not to exist. */
+    first_absent(self) -> Option[QualName]
+        for n in self.asked
+            self.answer(n) match
+                Some(TableAbsent) -> return Some(n)
+                _ -> ()
+        None
+end ShellTables
+
+impl SqlTables for ShellTables
+    sql_table(self, name: QualName) -> Option[SqlTable]
+        var seen = false
+        for n in self.asked
+            if n == name then seen = true
+        if !seen then self.asked.push(name)
+        self.answer(name) match
+            Some(TableFound(t)) -> Some(t)
+            _ -> None
 
 /** Where the shell's database is. */
 enum ShellPlace
@@ -88,6 +147,12 @@ struct Shell
     /** How many `\i` files are being read. */
     depth: usize
     printed: Buf[Printed]
+    /** The tables looked up in the open transaction, which keep their answers until it ends or runs
+     * DDL; empty outside one.
+     */
+    known: Buf[KnownTable]
+    /** The transaction `known` belongs to. */
+    known_txn: u64
 
     // -- output ----------------------------------------------------------------------------------
 
@@ -161,21 +226,104 @@ struct Shell
      */
     run_statement(*self, text: string)
         val started = monotonic().us
-        self.sql.translate(text) match
+        self.translated(text) match
             Ok(reqs) ->
                 for r in reqs
                     if !self.run_request(text, r) then break
-            Err(e) -> self.fail(sql_error_text(text, e))
+            Err(e) -> if !self.quit then self.fail(sql_error_text(text, e))
         if self.timing then self.say(timing_text(monotonic().us - started))
 
-    /** Runs one request; whether it succeeded. */
+    /** `text` through the front end, the tables it names looked up in the catalog as the front end
+     * asks for them (`docs/design/shell.md` § The SQL front end). A statement that needs the columns
+     * of a table that does not exist is reported as the missing table, `Q2001`.
+     */
+    translated(*self, text: string) -> Result[Buf[ShellRequest], SqlError]
+        if self.txn == 0 || self.txn != self.known_txn
+            self.known = buf()
+            self.known_txn = self.txn
+        val tables: &ShellTables = ShellTables(if self.txn != 0 then self.known else buf(), buf())
+
+        loop
+            val got = self.sql.translate(text, tables)
+            var asked = false
+            for n in tables.asked
+                if tables.answer(n).is_none()
+                    tables.known.push(KnownTable(n, self.look_up(n)))
+                    asked = true
+            if !asked || self.quit
+                return got match
+                    Err(e) ->
+                        if e.code != "Q8010" then return Err(e)
+                        tables.first_absent() match
+                            Some(n) -> Err(sql_located(text, SqlError("Q2001", s"no table or view '${n.schema}.${n.name}'",
+                                name_offset(text, n.name).unwrap_or(e.offset), 0, 0)))
+                            None -> Err(e)
+                    ok -> ok
+
+    /** What the catalog says of table or view `name`: its ready columns in order and its primary key.
+     * The namespace `catalog` is answered without a query. A failed transaction can read nothing, so
+     * then the committed catalog is read, outside it: the statement is translated, and the server
+     * refuses it as it refuses any statement of a failed transaction.
+     */
+    private look_up(*self, name: QualName) -> TableAnswer
+        if name.schema == "catalog"
+            return catalog_relation(name.name) match
+                Some(fields) -> TableFound(SqlTable(fields, buf()))
+                None -> TableAbsent
+        val outside = self.mode == TxnFailed
+
+        val tables = self.catalog_quietly(catalog_tables_query(), outside) match
+            Some(c) -> c
+            None -> return TableUnknown
+        var oid: Option[u64] = None
+        var key = buf[string]()
+        for i in 0..<tables.rows.len()
+            if cat_text(tables.at(i, "namespace")) == name.schema && cat_text(tables.at(i, "name")) == name.name
+                oid = Some(cat_u64(tables.at(i, "oid")))
+                key = cat_texts(tables.at(i, "primary_key"))
+        if oid.is_none()
+            val views = self.catalog_quietly(catalog_views_query(), outside) match
+                Some(c) -> c
+                None -> return TableUnknown
+            for i in 0..<views.rows.len()
+                if cat_text(views.at(i, "namespace")) == name.schema && cat_text(views.at(i, "name")) == name.name
+                    oid = Some(cat_u64(views.at(i, "oid")))
+        if oid.is_none() then return TableAbsent
+
+        val columns = self.catalog_quietly(column_types_query(oid.unwrap()), outside) match
+            Some(c) -> c
+            None -> return TableUnknown
+        val state = columns.type_of("state")
+        var ordered = buf[(u64, Field)]()
+        for i in 0..<columns.rows.len()
+            if variant_name(state, columns.at(i, "state")) == "ready"
+                val ty = columns.at(i, "type") match
+                    Bytes(b) -> decode_type(b.view())
+                    _ -> return TableUnknown
+                ty match
+                    Ok(t) -> ordered.push((cat_u64(columns.at(i, "ordinal")), Field(cat_text(columns.at(i, "name")), t)))
+                    Err(_) -> return TableUnknown
+        sort_by(ordered.view_mut(), (a, b) -> a.0 < b.0)
+        val fields = buf[Field]()
+        for (_, f) in ordered
+            fields.push(f)
+        TableFound(SqlTable(fields, key))
+    end look_up
+
+    /** Runs one request; whether it succeeded. DDL, and a rollback to a savepoint, may change the
+     * tables, so they forget what was looked up.
+     */
     run_request(*self, source: string, r: ShellRequest) -> bool = r match
-        RunTree(env) -> self.run_tree(source, env)
+        RunTree(env) ->
+            if is_ddl(env.statement) then self.known.clear()
+            self.run_tree(source, env)
         BeginTxn(options) -> self.begin(options)
         CommitTxn -> self.commit()
         RollbackTxn -> self.rollback()
         SavepointTxn(name) -> self.txn_call(Savepoint(self.txn, name), "SAVEPOINT", "SAVEPOINT")
-        RollbackToTxn(name) -> self.txn_call(RollbackToSavepoint(self.txn, name), "ROLLBACK", "ROLLBACK TO SAVEPOINT")
+        RollbackToTxn(name) ->
+            self.known.clear()
+            self.txn_call(RollbackToSavepoint(self.txn, name), "ROLLBACK", "ROLLBACK TO SAVEPOINT")
         ReleaseTxn(name) -> self.txn_call(ReleaseSavepoint(self.txn, name), "RELEASE", "RELEASE SAVEPOINT")
 
     /** Sends `m` and answers its responses; a lost connection ends the shell. */
@@ -192,6 +340,10 @@ struct Shell
     /** A failure the server reported, and what it did to the transaction. */
     private failed(*self, source: string, w: WireError)
         self.fail(wire_error_text(source, w))
+        self.txn_after(w)
+
+    /** What a server's error did to the open transaction. */
+    private txn_after(*self, w: WireError)
         if self.txn != 0
             w.txn_state match
                 Aborted -> self.mode = TxnFailed
@@ -349,20 +501,22 @@ struct Shell
         false
 
     /** Runs a query tree for a meta-command, answering its result type and rows, or `None` after
-     * printing why it failed.
+     * printing why it failed. `quietly`, a failure the server reports is not printed, though what it
+     * did to the transaction is kept; a lost connection is always printed. `outside` the open
+     * transaction, the query runs in a transaction of its own.
      */
-    query_rows(*self, env: Envelope) -> Option[(Type, Buf[Value])]
+    query_rows(*self, env: Envelope, quietly: bool = false, outside: bool = false) -> Option[(Type, Buf[Value])]
         val bytes = encode_envelope(env) match
             Ok(b) -> b
             Err(e) ->
-                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                if !quietly then self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
                 return None
         val params = encode_params([], no_params()) match
             Ok(b) -> b
             Err(e) ->
-                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                if !quietly then self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
                 return None
-        val replies = self.call(ExecuteMsg(Execute(self.txn, None, no_exec_options(), bytes, params, None)))?
+        val replies = self.call(ExecuteMsg(Execute(if outside then 0 else self.txn, None, no_exec_options(), bytes, params, None)))?
         var result: Option[Type] = None
         val rows = buf[Value]()
         for m in replies
@@ -376,10 +530,11 @@ struct Shell
                         decoded match
                             Ok(b) -> rows.extend(b.rows().view())
                             Err(e) ->
-                                self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
+                                if !quietly then self.fail(s"ERROR:  ${e.code}: ${e.message}\n")
                                 return None
                 ErrorReply(w) ->
-                    self.failed("", w)
+                    if !quietly then self.fail(wire_error_text("", w))
+                    if !outside then self.txn_after(w)
                     return None
                 _ -> ()
         result match
@@ -387,13 +542,22 @@ struct Shell
             None -> Some((Bag(record([])), rows))
     end query_rows
 
+    /** The rows of catalog query `env`, read by name, or `None` without printing a failure the
+     * server reported.
+     */
+    private catalog_quietly(*self, env: Envelope, outside: bool) -> Option[CatRows]
+        val (t, rows) = self.query_rows(env, true, outside)?
+        Some(cat_rows(t, rows))
+
     /** Ends the session. */
     close(*self) = self.conn.close()
 end Shell
 
-/** A shell over `conn`, in database `database` as `user`, its statements translated by `sql`. */
-shell(conn: ShellConn, sql: &SqlFrontEnd, place: ShellPlace, database: string, user: string) -> Shell =
-    Shell(conn, sql, place, database, user, statement_buffer(), 0, TxnIdle, 1, false, false, 0, false, 0, buf())
+/** A shell over `conn`, in database `database` as `user`, its statements translated by `sql`: TernDB's
+ * SQL unless another front end is given.
+ */
+shell(conn: ShellConn, place: ShellPlace, database: string, user: string, sql: &SqlFrontEnd = dialect_front_end()) -> Shell =
+    Shell(conn, sql, place, database, user, statement_buffer(), 0, TxnIdle, 1, false, false, 0, false, 0, buf(), buf(), 0)
 
 /** The lines of `text`, a last line without a line break included, a `\r` before a line break
  * dropped.
@@ -495,8 +659,21 @@ private entry_text(source: string, code: string, message: string, at: Option[u64
         Some(p) -> if source.len > 0 then head + line_excerpt(source, usize(p)) else head
         None -> head
 
-/** What the shell prints for a front-end error in statement `source`. */
-sql_error_text(source: string, e: ShellSqlError) -> string = entry_text(source, e.code, e.message, e.at.map(p -> u64(p)))
+/** The offset of the first identifier in `text` that is `name`, as SQL folds it. */
+name_offset(text: string, name: string) -> Option[u64]
+    val tokens = sql_tokens(text) match
+        Ok(ts) -> ts
+        Err(_) -> return None
+    for t in tokens
+        t.tok match
+            TkIdent(n, _) -> if n == name then return Some(t.start)
+            _ -> ()
+    None
+
+/** What the shell prints for a front-end error in statement `source`: its code and message, and the
+ * line of `source` its offset falls in, with a caret under that character.
+ */
+sql_error_text(source: string, e: SqlError) -> string = entry_text(source, e.code, e.message, Some(e.offset))
 
 /** What the shell prints for a server's `Error` about statement `source`: each entry, with an excerpt
  * where it carries a source range.

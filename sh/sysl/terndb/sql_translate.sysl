@@ -68,6 +68,14 @@ struct SqlStatement derives Eq
 /** The default schema of unqualified names (`sql.md` §1 rule 3). */
 const SqlDefaultSchema: string = "public"
 
+/** A new catalog holding the default schema, owned by the bootstrap role: the database `terndb`
+ * starts with, so SQL's unqualified names have somewhere to live.
+ */
+sql_catalog() -> MemCatalog
+    var c = mem_catalog()
+    c.apply(envelope([], CreateNamespace(SqlDefaultSchema, false)), BootstrapRole).expect("the default schema")
+    c
+
 /** The statements of `text`, translated in order: one per `;`-separated statement, empty statements
  * skipped. Unqualified table names are in `schema`; `tables` gives the column lists the translator
  * uses (`sql.md` §1 rule 4). The first error in the text, lexical, syntactic or of translation, is

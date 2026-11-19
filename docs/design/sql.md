@@ -51,11 +51,10 @@ spells out (`sql.md` §1 rule 4). `SqlTables` supplies them:
 
 - `SqlNoTables` knows nothing: every table is opaque, and the constructs that need columns fail with `Q8010`.
 - `MemCatalog` implements it, for an embedded engine and for the tests.
-- A shell connected to a server answers it by describing `Query(Scan(table))`: the result type of a `Describe` is
-  the table's columns ([WIRE] §4.4). It caches answers for the session and forgets them after any DDL it sends.
-  The primary key is not in a result type, so a shell that wants `ON CONFLICT DO NOTHING` without a target or
-  `REFERENCES t` without columns reads it from `catalog.constraints` ([DDL] §4), or leaves it empty, in which case
-  those two constructs fail with `Q8010`.
+- The `terndb` shell answers it from the catalog relations ([DDL] §4) over its connection, in its open
+  transaction: `catalog.tables` for the table and its primary key, `catalog.views`, and `catalog.columns` for each
+  ready column's structural type. It keeps answers only for the rest of a transaction, and forgets them after DDL
+  or a rollback to a savepoint (`shell.md` § The SQL front end).
 
 A script's own `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` statements update the translator's view of their
 tables for the statements after them, so `CREATE TABLE t (…); INSERT INTO t VALUES (…);` needs no round trip.
