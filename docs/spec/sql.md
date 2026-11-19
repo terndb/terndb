@@ -473,12 +473,14 @@ From lowest to highest; all binary operators are left-associative except the com
 5. `CASE WHEN c THEN v … [ELSE e] END` is `If([(c, v)…], e)`; `CASE x WHEN w THEN v …` compares with `eq(x, w)`.
    `ELSE NULL` is no `else`. A constant result takes the type of another result whose type is known.
 6. `EXISTS (q)` is `Exists(rel)`; a parenthesised query as a value is `Scalar(rel)`.
-7. **An integer beside a float widens.** In `+ - * / %` and in each comparison `= <> < <= > >=` (those `BETWEEN`,
-   `IN (…)` and a simple `CASE` are made of included), after the constants are typed (§5.9), an operand of an
-   integer type (signed or unsigned, any width) beside one of a float type (`float32`, `float64`) is
-   `Cast(x, float64?, strict)`, or `Cast(x, float64, strict)` when `x` is a constant or a parameter declared
-   non-null; a `NULL` of an integer type becomes `Null(float64)`. The tree refuses the mix ([QT] §4.4 rule 4);
-   PostgreSQL converts `int8` to `float8` implicitly, and so does TernDB's SQL. The cast's target is nullable for
+7. **An exact number beside a float widens.** In `+ - * / %` and in each comparison `= <> < <= > >=` (those
+   `BETWEEN`, `IN (…)` and a simple `CASE` are made of included), after the constants are typed (§5.9), an operand
+   of an integer type (signed or unsigned, any width) or a `decimal` type beside one of a float type (`float32`,
+   `float64`) is `Cast(x, float64?, strict)`, or `Cast(x, float64, strict)` when `x` is a constant or a parameter
+   declared non-null; a `NULL` of an integer or decimal type becomes `Null(float64)`. The tree refuses the mix
+   ([QT] §4.4 rule 4); PostgreSQL converts `int8` and `numeric` to `float8` implicitly, and so does TernDB's SQL.
+   A decimal widens to the nearest `float64`, so `1.1 * 1e0` is not exactly `1.1`. An integer beside a decimal
+   is not widened: it meets the decimal exactly ([QT] §4.4 rule 2). The cast's target is nullable for
    the reason of rule 4, so a widened value assigned to a `NOT NULL` column is `Q3005` until wrapped in
    `assert_not_null`. An `int64` beyond 2⁵³ is rounded to the nearest `float64`, as in PostgreSQL.
    1. The front end widens only where it knows both operands' types: a constant, a cast, a parameter whose
@@ -487,10 +489,11 @@ From lowest to highest; all binary operators are left-associative except the com
       over integers and decimals, `float64` over floats; `min`/`max` have the argument's type, [QT] §6.7 rule 4),
       and `-`, `coalesce` and arithmetic over such operands. Anything else is left as written, and validation
       decides.
-   2. The integer operand is computed in its own type first, so `(2147483647 + 1) * 2.5e0` overflows (`R0001`)
-      before it widens, while `2147483647 + 1 * 2.5e0` adds a widened `2147483647` to `2.5`.
-   3. Nothing else widens: a decimal beside a float, `avg` of an integer beside a float, and every other mix the
-      tree refuses stay `Q3002`; `||` is not arithmetic.
+   2. The exact operand is computed in its own type first, so `(2147483647 + 1) * 2.5e0` overflows (`R0001`)
+      before it widens, while `2147483647 + 1 * 2.5e0` adds a widened `2147483647` to `2.5`. `avg` of an integer
+      is a decimal, so it widens beside a float too.
+   3. Nothing else widens: every other mix the tree refuses (`text`, `bool` or a temporal type beside a float)
+      stays `Q3002`; `||` is not arithmetic.
    *Rationale: the user chose PostgreSQL's reading on 2026-11-19 (Q73).*
 
 ### 5.9 Constants take their type from context

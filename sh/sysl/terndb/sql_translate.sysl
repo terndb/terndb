@@ -592,8 +592,8 @@ struct SqlTr
                     _ -> if is_int_type(a) then Some(Decimal(38, 6)) else None
             else None
 
-    /** Operands `a` and `b` of an arithmetic operator or a comparison: an integer one beside a float
-     * one is widened to `float64` (`sql.md` §5.8 rule 7). Where either type is not known, both are
+    /** Operands `a` and `b` of an arithmetic operator or a comparison: an integer or decimal one beside
+     * a float one is widened to `float64` (`sql.md` §5.8 rule 7). Where either type is not known, both are
      * left as they are and validation decides.
      */
     widen(self, a: Expr, b: Expr) -> (Expr, Expr)
@@ -602,11 +602,11 @@ struct SqlTr
         if ta.is_none() || tb.is_none() then return (a, b)
         val x = ta.unwrap()
         val y = tb.unwrap()
-        if sql_is_float(x) && is_int_type(y) then return (a, self.to_float(b))
-        if is_int_type(x) && sql_is_float(y) then return (self.to_float(a), b)
+        if sql_is_float(x) && sql_is_exact(y) then return (a, self.to_float(b))
+        if sql_is_exact(x) && sql_is_float(y) then return (self.to_float(a), b)
         (a, b)
 
-    /** Integer `e` as a `float64`: `Cast(e, float64)` for a value known not to be null (a constant,
+    /** Integer or decimal `e` as a `float64`: `Cast(e, float64)` for a value known not to be null (a constant,
      * a parameter declared non-null), `Cast(e, float64?)` for the rest, whose nullability the front
      * end does not know (`sql.md` §5.8 rule 4).
      */
@@ -1908,7 +1908,12 @@ private sql_is_numeric(t: Type) -> bool = t match
 
 private sql_is_float(t: Type) -> bool = t == Float32 || t == Float64
 
-/** The base type of arithmetic over operands of base types `a` and `b`, after an integer beside a
+/** An integer or a decimal: the exact numbers, which widen beside a float (`sql.md` §5.8 rule 7). */
+private sql_is_exact(t: Type) -> bool = t match
+    Decimal(_, _) -> true
+    _ -> is_int_type(t)
+
+/** The base type of arithmetic over operands of base types `a` and `b`, after an exact number beside a
  * float is widened (`sql.md` §5.8 rule 7); `None` where the tree refuses the mix.
  */
 private sql_arith_type(a: Type, b: Type) -> Option[Type]
@@ -1916,7 +1921,7 @@ private sql_arith_type(a: Type, b: Type) -> Option[Type]
     val fb = sql_is_float(b)
     if fa && fb then return Some(if a == Float32 && b == Float32 then Float32 else Float64)
     if fa || fb
-        if is_int_type(a) || is_int_type(b) then return Some(Float64)
+        if sql_is_exact(a) || sql_is_exact(b) then return Some(Float64)
         return None
     common_type(a, b) match
         Ok(t) -> Some(t)

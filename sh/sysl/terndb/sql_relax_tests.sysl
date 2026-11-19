@@ -212,12 +212,51 @@ a_group_key_widens_by_its_expression_s_type()
         _ -> assert(false, "a project")
 
 @test
-mixes_other_than_integer_and_float_are_left_to_validation()
-    rx_eq(rx_e("d * f"), rx_2("mul", rx_nums("d"), rx_nums("f")), "decimal and float")
+a_decimal_column_beside_a_float_widens_the_decimal()
+    rx_eq(rx_e("d * f"), rx_2("mul", rx_wide(rx_nums("d")), rx_nums("f")), "decimal * float")
+    rx_eq(rx_e("f + d"), rx_2("add", rx_nums("f"), rx_wide(rx_nums("d"))), "float + decimal")
+    for (op, f) in rx_arith_ops()
+        rx_eq(rx_e(s"d $op f"), rx_2(f, rx_wide(rx_nums("d")), rx_nums("f")), op)
+
+@test
+a_decimal_beside_a_float_widens_in_every_comparison()
+    for (op, f) in rx_cmp_ops()
+        rx_eq(rx_e(s"d $op f"), rx_2(f, rx_wide(rx_nums("d")), rx_nums("f")), op)
+        rx_eq(rx_e(s"f $op d"), rx_2(f, rx_nums("f"), rx_wide(rx_nums("d"))), op)
+    rx_eq(rx_e("d = 1e0"), rx_2("eq", rx_wide(rx_nums("d")), rx_f(1.0)), "a float constant is not a decimal value")
+
+@test
+a_decimal_constant_beside_a_float_widens_as_a_non_null_value()
+    val dec = Literal(Decimal(2, 1), Value.Int(15))
+    rx_eq(rx_bare("1.5 * 2e0"), rx_2("mul", rx_wide_const(dec), rx_f(2.0)), "1.5 * 2e0")
+    rx_eq(rx_bare("2e0 * 1.5"), rx_2("mul", rx_f(2.0), rx_wide_const(dec)), "2e0 * 1.5")
+    rx_eq(rx_bare("CAST(NULL AS decimal(5, 2)) * 2e0"), rx_2("mul", Null(Float64), rx_f(2.0)), "a typed null decimal")
+
+@test
+a_decimal_constant_beside_a_float_column_is_typed_as_the_column()
+    rx_eq(rx_e("f * 1.5"), rx_2("mul", rx_nums("f"), rx_f(1.5)), "f * 1.5")
+
+@test
+a_decimal_beside_a_float32_widens_to_float64()
+    val single = Literal(Float32, from_text(Float32, "1.5").unwrap())
+    rx_eq(rx_e("CAST(1.5 AS float32) * d"), rx_2("mul", single, rx_wide(rx_nums("d"))), "float32 and decimal")
+
+@test
+decimal_aggregates_beside_a_float_widen()
+    rx_eq(rx_e("avg(i) * 2e0"), rx_2("mul", rx_wide(Col("group", "a1")), rx_f(2.0)), "avg of an integer is a decimal")
+    rx_eq(rx_e("sum(d) > max(f)"), rx_2("gt", rx_wide(Col("group", "a1")), Col("group", "a2")), "sum of a decimal")
+    rx_eq(rx_e("avg(d) + 0.5e0"), rx_2("add", rx_wide(Col("group", "a1")), rx_f(0.5)), "avg of a decimal")
+
+@test
+a_decimal_beside_a_float_widens_in_between_and_in()
+    rx_eq(rx_e("f BETWEEN d AND 10"), rx_2("and", rx_2("ge", rx_nums("f"), rx_wide(rx_nums("d"))), rx_2("le", rx_nums("f"), rx_f(10.0))), "between")
+    rx_eq(rx_e("d IN (1.5, 2e0)"), rx_2("or", rx_2("eq", rx_nums("d"), Literal(Decimal(10, 2), Value.Int(150))), rx_2("eq", rx_wide(rx_nums("d")), rx_f(2.0))), "in")
+
+@test
+an_integer_beside_a_decimal_is_left_as_it_was()
     rx_eq(rx_e("i * d"), rx_2("mul", rx_nums("i"), rx_nums("d")), "integer and decimal")
-    rx_eq(rx_e("avg(i) * 2e0"), rx_2("mul", Col("group", "a1"), rx_f(2.0)), "avg of an integer is a decimal")
+    rx_eq(rx_e("d < i"), rx_2("lt", rx_nums("d"), rx_nums("i")), "decimal and integer")
     rx_eq(rx_e("i * 2"), rx_2("mul", rx_nums("i"), sq_i32(2)), "integers")
-    rx_eq(rx_bare("1.5 * 2e0"), rx_2("mul", Literal(Decimal(2, 1), Value.Int(15)), rx_f(2.0)), "decimal constant")
 
 @test
 an_operand_of_unknown_type_is_not_widened()

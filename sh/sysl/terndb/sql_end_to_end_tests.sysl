@@ -442,13 +442,25 @@ aggregates_over_mixed_types_widen()
     assert(sq_ints(s.rows("SELECT count(*) FROM m WHERE i > 1.5e0")) == sq_is([2]), "count")
 
 @test
+a_decimal_beside_a_float_widens()
+    var s = sq_mixed()
+    assert(sq_floats(s.rows("SELECT d * f FROM m ORDER BY id")) == sq_fs([0.75, 3.375]), "decimal column * double")
+    assert(sq_floats(s.rows("SELECT f + d FROM m ORDER BY id")) == sq_fs([2.0, 3.75]), "double + decimal column")
+    assert(s.rows("SELECT 1.5 * 2e0, 2e0 * 1.5")[0] == rec([Float(3.0), Float(3.0)]), "a decimal constant")
+    assert(sq_floats(s.rows("SELECT d * r FROM m ORDER BY id")) == sq_fs([0.375, 4.5]), "decimal beside real")
+    assert(s.rows("SELECT avg(i) * 2e0, sum(d) + 0.5e0 FROM m")[0] == rec([Float(6.0), Float(4.25)]), "aggregates")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE d > f ORDER BY id")) == sq_is([1, 2]), "comparison")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE d = 2.25e0")) == sq_is([2]), "comparison with a float constant")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE d BETWEEN f AND 2e0")) == sq_is([1]), "between")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE i NOT BETWEEN d AND 3.5e0")) == sq_is([2]), "not between")
+    assert(sq_ints(s.rows("SELECT id FROM m WHERE d IN (1.5e0, 9e0)")) == sq_is([1]), "in")
+    assert(s.rows("SELECT i * d FROM m WHERE id = 1")[0] == rec([Int(300)]), "an integer beside a decimal stays exact")
+
+@test
 widening_leaves_other_mixes_refused()
     var s = sq_mixed()
-    assert_eq(s.code("SELECT d * f FROM m"), "Q3002")
-    assert_eq(s.code("SELECT f + d FROM m"), "Q3002")
-    assert_eq(s.code("SELECT 1.5 * 2e0"), "Q3002")
-    assert_eq(s.code("SELECT avg(i) * 2e0 FROM m"), "Q3002")
     assert_eq(s.code("SELECT 'a' * 2e0"), "Q3002")
+    assert_eq(s.code("SELECT true + 2e0"), "Q3002")
 
 @test
 a_widened_value_is_nullable_so_a_not_null_target_needs_assert_not_null()
