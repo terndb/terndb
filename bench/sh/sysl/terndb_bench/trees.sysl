@@ -1,0 +1,71 @@
+module sh.sysl.terndb_bench
+
+import sh.sysl.terndb.{AggCall, Bound, CteDef, Envelope, Expr, Field, Frame, Item, NamedAgg, NamedWin, ParamDecl, QualName, Rel,
+    SortKey, Statement, TreeMajor, TreeMinor, Type, Value, WinCall}
+import sh.sysl.terndb.{BoundKind, FrameExclude, FrameUnit, JoinKind, SetOpKind}
+import sysl.buf.{Buf, buf}
+
+// The query trees TernDB runs for the workloads its 0.0.1 SQL cannot spell (`docs/spec/sql.md` §8):
+// each is the tree the PostgreSQL and DuckDB text of the same workload would translate to, written
+// node for node from `docs/spec/query-tree.md` §6.
+
+private bf[T](xs: []const T) -> Buf[T]
+    val b = buf[T]()
+    b.extend(xs)
+    b
+
+private col(binder: string, name: string) -> Expr = Expr.Col(binder, name)
+private call(f: string, args: []const Expr) -> Expr = Expr.Call(f, bf(args))
+private int64(n: long) -> Expr = Expr.Literal(Type.Int64, Value.Int(i128(n)))
+private item(name: string, e: Expr) -> Item = Item(name, e)
+private scan(table: string, binder: string) -> Rel = Rel.Scan(QualName("public", table), binder)
+private agg(name: string, f: string, args: []const Expr) -> NamedAgg = NamedAgg(name, AggCall(f, bf(args), false, None, buf()))
+private asc(e: Expr) -> SortKey = SortKey(e, false, false)
+private desc(e: Expr) -> SortKey = SortKey(e, true, true)
+
+private query(rel: Rel, params: []const Type) -> Envelope
+    val decls = buf[ParamDecl]()
+    for t in params
+        decls.push(ParamDecl(None, t))
+    Envelope(TreeMajor, TreeMinor, decls, Statement.Query(rel), None)
+
+/** `rank() over (partition by user_id order by amount desc, id)` and a running `sum(amount)` per
+ * user, counted and summed: the `window` workload.
+ */
+window_tree() -> Envelope
+    val rank = WinCall("rank", buf(), bf([col("o", "user_id")]), bf([desc(col("o", "amount")), asc(col("o", "id"))]), None)
+    val frame = Frame(FrameUnit.Rows, Bound(BoundKind.UnboundedPreceding, None), Bound(BoundKind.CurrentRow, None), FrameExclude.ExcludeNone)
+    val running = WinCall("sum", bf([col("o", "amount")]), bf([col("o", "user_id")]), bf([asc(col("o", "id"))]), Some(frame))
+    val win = Rel.Window(scan("orders", "o"), "w", bf([NamedWin("r", rank), NamedWin("running", running)]))
+    query(Rel.Aggregate(win, "g", buf(), bf([agg("n", "count", []), agg("rs", "sum", [col("w", "r")]), agg("total", "sum", [col("w", "running")])])), [])
+
+/** The depth of every employee below the root, by linear recursion: the `cte_recursive` workload. */
+recursive_tree() -> Envelope
+    val seed = Rel.Project(Rel.Filter(scan("emps", "e0"), call("is_null", [col("e0", "parent_id")])), "seed",
+        bf([item("id", col("e0", "id")), item("depth", int64(0))]))
+    val join = Rel.Join(JoinKind.Inner, scan("emps", "e"), Rel.CteRef("tree", "t"), Some(call("eq", [col("e", "parent_id"), col("t", "id")])), None, None)
+    val step = Rel.Project(join, "step", bf([item("id", col("e", "id")), item("depth", call("add", [col("t", "depth"), int64(1)]))]))
+    val columns = bf([Field("id", Type.Int64), Field("depth", Type.Int64)])
+    val cte = CteDef("tree", Some(columns), Rel.SetOp(SetOpKind.Union, true, "u", bf([seed, step])))
+    val body = Rel.Aggregate(Rel.CteRef("tree", "r"), "g", buf(),
+        bf([agg("n", "count", []), agg("deepest", "max", [col("r", "depth")]), agg("total", "sum", [col("r", "depth")])]))
+    query(Rel.With(true, bf([cte]), body), [])
+
+/** Users `$1` through `$2`, each with its orders as a relation-valued column and each order with its
+ * lines: the `nested` workload, the GraphQL-shaped result of `README.md`.
+ */
+nested_tree() -> Envelope
+    val lines = Rel.Project(Rel.Filter(scan("lines", "l"), call("eq", [col("l", "order_id"), col("o", "id")])), "pl",
+        bf([item("product_id", col("l", "product_id")), item("qty", col("l", "qty"))]))
+    val orders = Rel.Project(Rel.Filter(scan("orders", "o"), call("eq", [col("o", "user_id"), col("u", "id")])), "po",
+        bf([item("id", col("o", "id")), item("amount", col("o", "amount")), item("lines", Expr.Relation(lines))]))
+    val users = Rel.Filter(scan("users", "u"), call("and", [call("ge", [col("u", "id"), Expr.Param(0)]), call("le", [col("u", "id"), Expr.Param(1)])]))
+    query(Rel.Project(users, "pu", bf([item("id", col("u", "id")), item("name", col("u", "name")), item("orders", Expr.Relation(orders))])),
+        [Type.Int64, Type.Int64])
+
+/** The tree named `name`. */
+tree_named(name: string) -> Option[Envelope] = name match
+    "window" -> Some(window_tree())
+    "cte_recursive" -> Some(recursive_tree())
+    "nested" -> Some(nested_tree())
+    _ -> None

@@ -1,0 +1,141 @@
+module sh.sysl.terndb_bench
+
+import sh.sysl.duckdb
+import sh.sysl.duckdb.{Column, Connection, Database, Prepared, TypeId}
+import sh.sysl.terndb.Envelope
+import sysl.buf.{Buf, buf}
+
+// DuckDB in this process through its C API (`sh.sysl.duckdb`), on a `:memory:` database. A prepared
+// statement is `duckdb_prepare`; a run binds, executes (which materialises the result) and fetches
+// every chunk.
+
+struct DuckDb
+    label: string
+    db: &Database
+    con: &Connection
+    stmts: Buf[&Prepared]
+
+    private bind(*self, stmt: usize, args: []const Arg) -> Result[unit, string]
+        val p = self.stmts[stmt]
+        for i in 0..<args.len
+            val k = i + 1
+            val r = args[i] match
+                ANull -> p.bind_null(k)
+                AInt(n) -> p.bind_i64(k, n)
+                AReal(x) -> p.bind_f64(k, x)
+                AText(s) -> p.bind_text(k, s)
+            r match
+                Ok(_) -> ()
+                Err(e) -> return Err(e.message)
+        Ok(())
+end DuckDb
+
+/** Cell `row` of DuckDB column `c`. */
+duck_cell(c: Column, row: usize) -> Result[Cell, string]
+    if c.is_null(row) then return Ok(CNull)
+    val id = c.id()
+    Ok(id match
+        TypeId.Boolean -> CBool(c.bools().map_err((e) -> e.message)?[row])
+        TypeId.Tinyint -> CInt(i128(c.i8s().map_err((e) -> e.message)?[row]))
+        TypeId.Smallint -> CInt(i128(c.i16s().map_err((e) -> e.message)?[row]))
+        TypeId.Integer -> CInt(i128(c.i32s().map_err((e) -> e.message)?[row]))
+        TypeId.Bigint -> CInt(i128(c.i64s().map_err((e) -> e.message)?[row]))
+        TypeId.Ubigint -> CInt(i128(c.u64s().map_err((e) -> e.message)?[row]))
+        TypeId.Hugeint -> CInt(c.i128s().map_err((e) -> e.message)?[row])
+        TypeId.Float -> CNum(real(c.f32s().map_err((e) -> e.message)?[row]))
+        TypeId.Double -> CNum(c.f64s().map_err((e) -> e.message)?[row])
+        TypeId.DecimalType -> c.decimal(row).map_err((e) -> e.message)? match
+            Some(d) -> numeric_cell(d.text())
+            None -> CNull
+        TypeId.Varchar -> c.text(row).map_err((e) -> e.message)? match
+            Some(s) -> CText(s)
+            None -> CNull
+        TypeId.List ->
+            val entry = c.lists().map_err((e) -> e.message)?[row]
+            val elems = c.elements()
+            val rows = buf[Buf[Cell]]()
+            for k in entry.offset..<entry.offset + entry.length
+                rows.push(duck_row(elems, usize(k))?)
+            CNest(rows)
+        _ -> CText(s"<${id.name()}>"))
+
+/** Element `row` of `c` as a row: a STRUCT's fields, or the one value. */
+private duck_row(c: Column, row: usize) -> Result[Buf[Cell], string]
+    val out = buf[Cell]()
+    if c.id() == TypeId.Struct
+        val n = c.type_of().fields()
+        for i in 0..<n
+            out.push(duck_cell(c.field(i), row)?)
+    else
+        out.push(duck_cell(c, row)?)
+    Ok(out)
+
+impl Db for DuckDb
+    name(self) -> string = self.label
+
+    exec(*self, sql: string) -> Result[unit, string] = self.con.query(sql) match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(e.message)
+
+    prepare(*self, sql: string) -> Result[usize, string] = self.con.prepare(sql) match
+        Ok(p) ->
+            self.stmts.push(p)
+            Ok(self.stmts.len() - 1)
+        Err(e) -> Err(e.message)
+
+    prepare_tree(*self, env: Envelope) -> Result[usize, string] = Err("DuckDB takes SQL, not a TernDB tree")
+
+    run(*self, stmt: usize, args: []const Arg) -> Result[u64, string]
+        self.bind(stmt, args)?
+        val r = self.stmts[stmt].execute() match
+            Ok(r) -> r
+            Err(e) -> return Err(e.message)
+        var rows = 0u64
+        loop
+            r.next() match
+                Some(ch) -> rows += u64(ch.size())
+                None -> break
+        Ok(if rows > 0 then rows else r.rows_changed())
+
+    answer(*self, stmt: usize, args: []const Arg) -> Result[Buf[Buf[Cell]], string]
+        self.bind(stmt, args)?
+        val r = self.stmts[stmt].execute() match
+            Ok(r) -> r
+            Err(e) -> return Err(e.message)
+        val out = buf[Buf[Cell]]()
+        loop
+            r.next() match
+                Some(ch) ->
+                    val n = ch.columns()
+                    for i in 0..<ch.size()
+                        val cells = buf[Cell]()
+                        for k in 0..<n
+                            cells.push(duck_cell(ch.column(k), i)?)
+                        out.push(cells)
+                None -> break
+        Ok(out)
+
+    /** The appender, DuckDB's bulk path. */
+    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
+        val app = self.con.appender(table).map_err((e) -> e.message)?
+        for id in from..to
+            for a in row(s, table, id)
+                val r = a match
+                    ANull -> app.add_null()
+                    AInt(n) -> app.add_i64(n)
+                    AReal(x) -> app.add_f64(x)
+                    AText(t) -> app.add_text(t)
+                r.map_err((e) -> e.message)?
+            app.end_row().map_err((e) -> e.message)?
+        app.flush().map_err((e) -> e.message)?
+        Ok(())
+
+    close(*self) = self.con.close()
+
+/** A DuckDB `:memory:` database; `threads` 0 leaves DuckDB's own default (one per core). */
+duck_open(label: string, threads: int) -> Result[&DuckDb, string]
+    val db = duckdb.open().map_err((e) -> e.message)?
+    val con = db.connect().map_err((e) -> e.message)?
+    val d: &DuckDb = DuckDb(label, db, con, buf())
+    if threads > 0 then d.exec(s"set threads = $threads")?
+    Ok(d)

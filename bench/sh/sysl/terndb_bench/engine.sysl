@@ -1,0 +1,39 @@
+module sh.sysl.terndb_bench
+
+import sh.sysl.terndb.Envelope
+import sysl.buf.Buf
+
+// What the harness asks of an engine. Each driver is one engine's client library, used the way an
+// application would use it: statements prepared once and run with parameters, results received in
+// full before a run's clock stops.
+
+trait Db
+    /** The engine as reports name it, e.g. `duckdb` or `terndb-server`. */
+    name(self) -> string
+
+    /** Runs one statement of SQL for its effect: DDL, a load, `begin`, `commit`. */
+    exec(*self, sql: string) -> Result[unit, string]
+
+    /** Prepares one statement, answering its index for `run` and `answer`. */
+    prepare(*self, sql: string) -> Result[usize, string]
+
+    /** Prepares a TernDB query tree, for the workloads TernDB's SQL cannot spell yet; `Err` from an
+     * engine that takes only SQL.
+     */
+    prepare_tree(*self, env: Envelope) -> Result[usize, string]
+
+    /** Runs prepared statement `stmt` with `args`, receiving its whole result into the client
+     * library's own form; answers the rows it returned, or for DML the rows it changed.
+     */
+    run(*self, stmt: usize, args: []const Arg) -> Result[u64, string]
+
+    /** Runs prepared statement `stmt` and answers its rows in canonical form, for the answer check. */
+    answer(*self, stmt: usize, args: []const Arg) -> Result[Buf[Buf[Cell]], string]
+
+    /** Loads rows `from` through `to` of `table` by the engine's own fastest path, inside the open
+     * transaction, or `Err` naming why it has none.
+     */
+    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
+
+    /** Ends the session. */
+    close(*self)

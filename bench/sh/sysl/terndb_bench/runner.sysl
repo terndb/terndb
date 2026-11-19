@@ -1,0 +1,298 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+import sysl.text.replace_all
+import sysl.time.monotonic
+
+// Running workloads on engines. Every engine is loaded with the same generated data first (untimed).
+// A workload is prepared on each engine, warmed up, then timed in rounds: each round runs it once on
+// every engine still going, so drift in the machine's state falls on all engines alike rather than
+// on whichever ran last. An engine stops once it has `MinRuns` runs and either `MaxRuns` or
+// `BudgetUs` of timed work; a load or a mutation runs exactly `FixedRuns` times.
+
+const MinRuns: usize = 5
+const MaxRuns: usize = 15
+const FixedRuns: usize = 3
+const BudgetUs: real = 3000000.0
+const Warmups: usize = 2
+
+/** Which engine this is, for choosing its SQL text and its own setup. */
+family(name: string) -> string =
+    if name.starts_with("terndb") then "terndb"
+    elif name.starts_with("duckdb") then "duckdb"
+    else "postgres"
+
+/** The arguments of execution `op` of run `run` of `w`, the same for every engine. */
+args_for(w: Workload, s: Scale, run: usize, op: usize) -> Buf[Arg]
+    val out = buf[Arg]()
+    val key = long(run * 1000 + op)
+    w.gen match
+        NoArgs -> ()
+        Key(table) -> out.push(AInt(1 + draw(77, key, u64(w.name.len), u64(table_rows(s, table)))))
+        KeyRange(table, per_mille) ->
+            val rows = table_rows(s, table)
+            var width = rows * per_mille / 1000
+            if width < 10 then width = 10
+            val start = 1 + draw(78, key, u64(w.name.len), u64(rows - width + 1))
+            out.push(AInt(start))
+            out.push(AInt(start + width - 1))
+        NewEvent ->
+            out.push(AInt(key + 1))
+            out.push(AInt(1 + draw(79, key, 1, u64(s.users()))))
+            out.push(AInt(1 + draw(79, key, 2, 100000)))
+    out
+
+/** Loads every table at scale `s` into `db`: by the engine's bulk path in chunks of 10,000 rows,
+ * each its own transaction, or by multi-row inserts once the bulk path has failed; then the engine's
+ * own preparation of the data, as its operator would do it.
+ */
+load_all(db: &Db, s: Scale) -> Result[unit, string]
+    var bulk_ok = true
+    for t in Tables
+        db.exec(table_ddl(t))?
+        val rows = table_rows(s, t)
+        var at = 1
+        while at <= rows
+            val last = if at + 9999 < rows then at + 9999 else rows
+            if bulk_ok
+                db.bulk(s, t, at, last) match
+                    Ok(_) -> ()
+                    Err(_) ->
+                        bulk_ok = false
+                        insert_rows(db, s, t, at, last)?
+            else
+                insert_rows(db, s, t, at, last)?
+            at = last + 1
+    db.exec("create table events (id bigint primary key, user_id bigint not null, amount bigint not null)")?
+    if family(db.name()) == "postgres"
+        db.exec("create index orders_user_id on orders (user_id)")?
+        db.exec("create index lines_order_id on lines (order_id)")?
+        db.exec("create index emps_parent_id on emps (parent_id)")?
+        db.exec("vacuum analyze")?
+    Ok(())
+
+/** Rows `from` through `to` of `table` as `INSERT`s of 1,000 rows each. */
+insert_rows(db: &Db, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
+    var at = from
+    while at <= to
+        val last = if at + 999 < to then at + 999 else to
+        db.exec(insert_sql(s, table, at, last))?
+        at = last + 1
+    Ok(())
+
+/** The statement `db` runs for `w`. */
+prepare_for(db: &Db, w: Workload) -> Result[usize, string]
+    val fam = family(db.name())
+    if fam == "terndb"
+        return w.tern match
+            TernSql(sql) -> db.prepare(sql)
+            TernTree(name) -> db.prepare_tree(tree_named(name).unwrap())
+    db.prepare(if fam == "postgres" then w.pg else w.duck)
+
+/** What a workload needs made before it runs at all, and before each run. */
+private setup_once(db: &Db, w: Workload) -> Result[unit, string]
+    if w.name == "insert_txn"
+        db.exec("drop table if exists events")?
+        db.exec("create table events (id bigint primary key, user_id bigint not null, amount bigint not null)")?
+    if w.kind == WriteTxn && w.pg.contains("scratch") then make_scratch(db)?
+    Ok(())
+
+private make_scratch(db: &Db) -> Result[unit, string]
+    db.exec("drop table if exists scratch")?
+    db.exec(replace_all(table_ddl("orders"), "table orders", "table scratch"))?
+    db.exec("insert into scratch select * from orders")?
+    if family(db.name()) == "postgres" then db.exec("vacuum analyze scratch")?
+    Ok(())
+
+private make_load_table(db: &Db) -> Result[unit, string]
+    db.exec("drop table if exists load_orders")?
+    db.exec(replace_all(table_ddl("orders"), "table orders", "table load_orders"))
+
+/** One engine's state through a workload's runs. */
+struct Lane
+    db: &Db
+    stmt: usize
+    /** Set when the engine cannot go on: the outcome to record instead of times. */
+    stopped: Option[Outcome]
+    runs: Buf[real]
+    total: real
+    rows: u64
+    done: bool
+
+/** One run of `w` on lane `l`, run number `run` (warm-ups count too, so keys stay fresh): its
+ * microseconds, or why it failed. Setup a run needs happens before the clock starts.
+ */
+run_once(l: *Lane, w: Workload, s: Scale, run: usize, insert_texts: []const string) -> Result[real, string]
+    val db = l.db
+    val all = buf[Buf[Arg]]()
+    for op in 0..<usize(w.ops)
+        all.push(args_for(w, s, run, op))
+    w.kind match
+        Read ->
+            val t0 = monotonic().us
+            var rows = 0u64
+            for a in all
+                rows = db.run(l.stmt, a.view())?
+            val t1 = monotonic().us
+            l.rows = rows
+            Ok(real(t1 - t0))
+        WriteTxn ->
+            val t0 = monotonic().us
+            db.exec("begin")?
+            var rows = 0u64
+            for a in all
+                rows += db.run(l.stmt, a.view())?
+            db.exec("commit")?
+            val t1 = monotonic().us
+            l.rows = rows
+            Ok(real(t1 - t0))
+        Mutate ->
+            make_scratch(db)?
+            val t0 = monotonic().us
+            val rows = db.run(l.stmt, [])?
+            val t1 = monotonic().us
+            l.rows = rows
+            Ok(real(t1 - t0))
+        LoadInsert ->
+            make_load_table(db)?
+            val t0 = monotonic().us
+            db.exec("begin")?
+            for t in insert_texts
+                db.exec(t)?
+            db.exec("commit")?
+            val t1 = monotonic().us
+            l.rows = u64(s.orders)
+            Ok(real(t1 - t0))
+        LoadBulk ->
+            make_load_table(db)?
+            val t0 = monotonic().us
+            db.exec("begin")?
+            var at = 1
+            while at <= s.orders
+                val last = if at + 9999 < s.orders then at + 9999 else s.orders
+                db.bulk(s, "load_orders", at, last)?
+                at = last + 1
+            db.exec("commit")?
+            val t1 = monotonic().us
+            l.rows = u64(s.orders)
+            Ok(real(t1 - t0))
+
+/** The multi-row `INSERT` texts of `load_orders`, made once, outside every clock. */
+load_texts(s: Scale) -> Buf[string]
+    val out = buf[string]()
+    var at = 1
+    while at <= s.orders
+        val last = if at + 999 < s.orders then at + 999 else s.orders
+        out.push(replace_all(insert_sql(s, "orders", at, last), "insert into orders", "insert into load_orders"))
+        at = last + 1
+    out
+
+private fixed(w: Workload) -> bool = w.kind == Mutate || w.kind == LoadInsert || w.kind == LoadBulk
+
+/** Times `w` on every engine of `dbs`, interleaved by rounds. */
+time_workload(dbs: []const &Db, w: Workload, s: Scale, log: (string) -> unit) -> Buf[Record]
+    val lanes = buf[Lane]()
+    for db in dbs
+        var l = Lane(db, 0, None, buf(), 0.0, 0, false)
+        setup_once(db, w) match
+            Err(e) -> l.stopped = Some(Failed(e))
+            Ok(_) -> ()
+        if l.stopped.is_none() && (w.kind == Read || w.kind == WriteTxn || w.kind == Mutate)
+            prepare_for(db, w) match
+                Ok(i) -> l.stmt = i
+                Err(e) -> l.stopped = Some(Unsupported(e))
+        lanes.push(l)
+
+    val texts = if w.kind == LoadInsert then load_texts(s) else buf[string]()
+    val warm = if fixed(w) then 1 else Warmups
+    for i in 0..<lanes.len()
+        for r in 0..<warm
+            if lanes[i].stopped.is_none()
+                run_once(&lanes[i], w, s, r, texts.view()) match
+                    Ok(_) -> ()
+                    Err(e) -> lanes[i].stopped = Some(Failed(e))
+
+    var run = warm
+    loop
+        var any = false
+        for i in 0..<lanes.len()
+            var l = &lanes[i]
+            if l.stopped.is_some() || l.done then continue
+            any = true
+            run_once(l, w, s, run, texts.view()) match
+                Ok(us) ->
+                    l.runs.push(us)
+                    l.total += us
+                    log(s"  ${w.name} ${l.db.name()} run ${l.runs.len()}: ${us} us")
+                Err(e) -> l.stopped = Some(Failed(e))
+            val n = l.runs.len()
+            if fixed(w)
+                if n >= FixedRuns then l.done = true
+            elif n >= MaxRuns || (n >= MinRuns && l.total >= BudgetUs)
+                l.done = true
+        if !any then break
+        run += 1
+
+    val out = buf[Record]()
+    for l in lanes
+        val outcome = l.stopped.unwrap_or(Measured)
+        out.push(Record(w.name, l.db.name(), w.ops, l.rows, outcome, l.runs))
+    out
+
+/** The answer `db` gives for `w`: its rows for a read (the first execution's arguments), or the
+ * check query's after the writes for a write.
+ */
+answer_of(db: &Db, w: Workload, s: Scale) -> Result[Buf[Buf[Cell]], string]
+    setup_once(db, w)?
+    w.kind match
+        Read ->
+            val stmt = prepare_for(db, w)?
+            val first = db.answer(stmt, args_for(w, s, 0, 0).view())?
+            // Every execution of a multi-execution read is checked, its rows appended.
+            for op in 1..<usize(w.ops)
+                val more = db.answer(stmt, args_for(w, s, 0, op).view())?
+                first.extend(more.view())
+            Ok(first)
+        _ ->
+            var l = Lane(db, 0, None, buf(), 0.0, 0, false)
+            if w.kind == WriteTxn || w.kind == Mutate then l.stmt = prepare_for(db, w)?
+            val texts = if w.kind == LoadInsert then load_texts(s) else buf[string]()
+            val _ = run_once(&l, w, s, 0, texts.view())?
+            val check = db.prepare(w.check)?
+            db.answer(check, [])
+
+/** Checks `w`'s answer on every engine of `dbs` against the others: an engine agreeing with at least
+ * one other is right; one agreeing with none, when some others agree, is a mismatch; when no two
+ * agree, every engine is.
+ */
+verify_workload(dbs: []const &Db, w: Workload, s: Scale) -> Buf[Record]
+    val answers = buf[Result[Buf[Buf[Cell]], string]]()
+    for db in dbs
+        answers.push(answer_of(db, w, s))
+    val out = buf[Record]()
+    var any_agree = false
+    for i in 0..<dbs.len
+        for j in 0..<dbs.len
+            if i != j && agree(answers[i], answers[j], w.ordered) then any_agree = true
+    for i in 0..<dbs.len
+        val outcome = answers[i] match
+            Err(e) -> Unsupported(e)
+            Ok(rows) ->
+                var with = 0
+                var other: Option[usize] = None
+                for j in 0..<dbs.len
+                    if i != j
+                        if agree(answers[i], answers[j], w.ordered) then with += 1
+                        elif other.is_none() && answers[j].is_ok() then other = Some(j)
+                if with > 0 || (!any_agree && other.is_none()) then Measured
+                else
+                    val k = other.unwrap()
+                    Mismatch(s"against ${dbs[k].name()}: " + mismatch(answers[k].unwrap(), rows, w.ordered).unwrap_or("differs"))
+        val rows = answers[i] match
+            Ok(r) -> u64(r.len())
+            Err(_) -> 0
+        out.push(Record(w.name, dbs[i].name(), w.ops, rows, outcome, buf()))
+    out
+
+private agree(a: Result[Buf[Buf[Cell]], string], b: Result[Buf[Buf[Cell]], string], ordered: bool) -> bool =
+    a.is_ok() && b.is_ok() && mismatch(a.unwrap(), b.unwrap(), ordered).is_none()

@@ -1,0 +1,129 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{Json, Member, parse}
+
+// The raw results of a benchmark run, kept per release under `bench/results/<release>/` so the next
+// release diffs against them. One file is one pair (`inproc` or `server`) at one scale; each record
+// is one engine on one workload, with every timed run's duration.
+
+/** What happened to one engine on one workload. */
+enum Outcome derives Eq
+    /** Timed, and its answer matched the reference engine's. */
+    Measured
+    /** The engine cannot run the workload; the text says why. */
+    Unsupported(why: string)
+    /** The engine's answer differed from the reference's: a bug, so no time is reported. */
+    Mismatch(detail: string)
+    /** The engine failed with an error. */
+    Failed(error: string)
+
+struct Record
+    workload: string
+    engine: string
+    /** How many operations one timed run performs; times are per run. */
+    ops: u64
+    /** The rows the operation's answer had (the last run's), or the rows it changed. */
+    rows: u64
+    outcome: Outcome
+    /** Microseconds, one per timed run, in the order run. */
+    runs_us: Buf[real]
+
+struct ResultFile
+    release: string
+    pair: string
+    scale: string
+    /** `key=value` facts about the run: machine, versions, settings. */
+    facts: Buf[(string, string)]
+    records: Buf[Record]
+
+private member(k: string, v: Json) -> Member = Member(k, v)
+
+private outcome_json(o: Outcome) -> (string, string) = o match
+    Measured -> ("measured", "")
+    Unsupported(w) -> ("unsupported", w)
+    Mismatch(d) -> ("mismatch", d)
+    Failed(e) -> ("failed", e)
+
+record_json(r: Record) -> Json
+    val ms = buf[Member]()
+    val (kind, note) = outcome_json(r.outcome)
+    ms.push(member("workload", Json.Str(r.workload)))
+    ms.push(member("engine", Json.Str(r.engine)))
+    ms.push(member("ops", Json.Int(long(r.ops))))
+    ms.push(member("rows", Json.Int(long(r.rows))))
+    ms.push(member("outcome", Json.Str(kind)))
+    ms.push(member("note", Json.Str(note)))
+    val runs = buf[Json]()
+    for x in r.runs_us
+        runs.push(Json.Real(x))
+    ms.push(member("runs_us", Json.Arr(runs)))
+    Json.Obj(ms)
+
+file_json(f: ResultFile) -> Json
+    val ms = buf[Member]()
+    ms.push(member("release", Json.Str(f.release)))
+    ms.push(member("pair", Json.Str(f.pair)))
+    ms.push(member("scale", Json.Str(f.scale)))
+    val facts = buf[Member]()
+    for (k, v) in f.facts
+        facts.push(member(k, Json.Str(v)))
+    ms.push(member("facts", Json.Obj(facts)))
+    val rs = buf[Json]()
+    for r in f.records
+        rs.push(record_json(r))
+    ms.push(member("records", Json.Arr(rs)))
+    Json.Obj(ms)
+
+private field(j: Json, k: string) -> Result[Json, string] = j.get(k) match
+    Some(v) -> Ok(v)
+    None -> Err(s"no member '$k'")
+
+private text_field(j: Json, k: string) -> Result[string, string] = field(j, k)?.as_str() match
+    Some(s) -> Ok(s)
+    None -> Err(s"'$k' is not a string")
+
+private int_field(j: Json, k: string) -> Result[u64, string] = field(j, k)?.as_int() match
+    Some(n) ->
+        if n < 0 then Err(s"'$k' is negative") else Ok(u64(n))
+    None -> Err(s"'$k' is not an integer")
+
+record_of(j: Json) -> Result[Record, string]
+    val kind = text_field(j, "outcome")?
+    val note = text_field(j, "note")?
+    val outcome = kind match
+        "measured" -> Measured
+        "unsupported" -> Unsupported(note)
+        "mismatch" -> Mismatch(note)
+        "failed" -> Failed(note)
+        _ -> return Err(s"unknown outcome '$kind'")
+    val runs = buf[real]()
+    val arr = field(j, "runs_us")?
+    arr match
+        Json.Arr(items) ->
+            for it in items
+                it.as_real() match
+                    Some(x) -> runs.push(x)
+                    None -> return Err("a run is not a number")
+        _ -> return Err("'runs_us' is not an array")
+    Ok(Record(text_field(j, "workload")?, text_field(j, "engine")?, int_field(j, "ops")?, int_field(j, "rows")?, outcome, runs))
+
+file_of(text: string) -> Result[ResultFile, string]
+    val j = parse(text) match
+        Ok(v) -> v
+        Err(e) -> return Err(e.to_string())
+    val facts = buf[(string, string)]()
+    field(j, "facts")? match
+        Json.Obj(members) ->
+            for m in members
+                m.value.as_str() match
+                    Some(s) -> facts.push((m.key, s))
+                    None -> return Err(s"fact '${m.key}' is not a string")
+        _ -> return Err("'facts' is not an object")
+    val records = buf[Record]()
+    field(j, "records")? match
+        Json.Arr(items) ->
+            for it in items
+                records.push(record_of(it)?)
+        _ -> return Err("'records' is not an array")
+    Ok(ResultFile(text_field(j, "release")?, text_field(j, "pair")?, text_field(j, "scale")?, facts, records))

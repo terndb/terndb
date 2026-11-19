@@ -1,0 +1,204 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{Json, parse}
+import sysl.slices.sort_by
+import sysl.text.{parse_long, parse_real}
+
+// The canonical form of an answer, in which three engines' results are compared. Each engine's
+// driver turns what its client library hands back into `Cell`s, so a comparison never depends on
+// how a library spells a value: PostgreSQL's text `12.50` and DuckDB's `DOUBLE` 12.5 are both a
+// number, and a nested relation is a list of rows whatever its wire form was.
+
+/** One value of an answer. */
+enum Cell
+    CNull
+    /** An integer, whatever its width. */
+    CInt(n: i128)
+    /** A number with a fraction: a float or a decimal. */
+    CNum(x: real)
+    CText(s: string)
+    CBool(b: bool)
+    /** A nested relation: its rows, each a list of cells. */
+    CNest(rows: Buf[Buf[Cell]])
+
+/** The relative tolerance two numbers may differ by and still be one answer. Every engine sums
+ * floats in its own order, so the last bits of an average differ legitimately.
+ */
+const Tolerance: real = 1e-9
+
+/** Whether `a` and `b` are the same number to within `Tolerance`, relative to the larger. */
+near(a: real, b: real) -> bool
+    if a == b then return true
+    val diff = if a > b then a - b else b - a
+    var scale = if a < 0.0 then -a else a
+    val bs = if b < 0.0 then -b else b
+    if bs > scale then scale = bs
+    if scale < 1.0 then scale = 1.0
+    diff <= Tolerance * scale
+
+/** Whether two cells are one answer. An integer and a number are compared as numbers, since one
+ * engine's `sum` of integers is another's decimal.
+ */
+same_cell(a: Cell, b: Cell) -> bool = a match
+    CNull -> b match
+        CNull -> true
+        _ -> false
+    CInt(x) -> b match
+        CInt(y) -> x == y
+        CNum(y) -> near(real(x), y)
+        _ -> false
+    CNum(x) -> b match
+        CInt(y) -> near(x, real(y))
+        CNum(y) -> near(x, y)
+        _ -> false
+    CText(x) -> b match
+        CText(y) -> x == y
+        _ -> false
+    CBool(x) -> b match
+        CBool(y) -> x == y
+        _ -> false
+    CNest(xs) -> b match
+        CNest(ys) -> same_rows(xs, ys)
+        _ -> false
+
+same_row(a: Buf[Cell], b: Buf[Cell]) -> bool
+    if a.len() != b.len() then return false
+    for i in 0..<a.len()
+        if !same_cell(a[i], b[i]) then return false
+    true
+
+same_rows(a: Buf[Buf[Cell]], b: Buf[Buf[Cell]]) -> bool
+    if a.len() != b.len() then return false
+    for i in 0..<a.len()
+        if !same_row(a[i], b[i]) then return false
+    true
+
+/** A cell's text, for a mismatch report and for sorting. Numbers print with 12 significant digits,
+ * so two cells `same_cell` holds equal sort alike except at a rounding boundary.
+ */
+cell_text(c: Cell) -> string = c match
+    CNull -> "NULL"
+    CInt(n) -> n.to_string()
+    CNum(x) -> num_text(x)
+    CText(s) -> "'" + s + "'"
+    CBool(b) -> if b then "true" else "false"
+    CNest(rows) -> "[" + rows_text(rows) + "]"
+
+private num_text(x: real) -> string
+    if x == real(long(x)) && x < 9.0e15 && x > -9.0e15 then return long(x).to_string()
+    sysl.fmt.format_real(x, "%.12g", 0, -1)
+
+row_text(r: Buf[Cell]) -> string
+    var out = "("
+    for i in 0..<r.len()
+        if i > 0 then out = out + ", "
+        out = out + cell_text(r[i])
+    out + ")"
+
+rows_text(rows: Buf[Buf[Cell]]) -> string
+    var out = ""
+    for i in 0..<rows.len()
+        if i > 0 then out = out + ", "
+        out = out + row_text(rows[i])
+    out
+
+/** The rows in one canonical order, nested relations sorted too: for an answer whose order the query
+ * leaves open, two engines' rows compare equal exactly when they are the same bag.
+ */
+canonical(rows: Buf[Buf[Cell]]) -> Buf[Buf[Cell]]
+    val out = buf[Buf[Cell]]()
+    for r in rows
+        val cells = buf[Cell]()
+        for c in r
+            cells.push(c match
+                CNest(inner) -> CNest(canonical(inner))
+                other -> other)
+        out.push(cells)
+    var keyed = buf[(string, usize)]()
+    for i in 0..<out.len()
+        keyed.push((row_text(out[i]), i))
+    sort_by(keyed.view_mut(), (a, b) -> a.0 < b.0)
+    val sorted = buf[Buf[Cell]]()
+    for (_, i) in keyed
+        sorted.push(out[i])
+    sorted
+
+/** Why `got` is not `want`, or `None` when they are one answer. `ordered` compares row by row;
+ * otherwise both are put in canonical order first.
+ */
+mismatch(want: Buf[Buf[Cell]], got: Buf[Buf[Cell]], ordered: bool) -> Option[string]
+    val a = if ordered then want else canonical(want)
+    val b = if ordered then got else canonical(got)
+    if a.len() != b.len() then return Some(s"${a.len()} rows expected, ${b.len()} answered")
+    for i in 0..<a.len()
+        if !same_row(a[i], b[i]) then return Some(s"row $i: expected ${row_text(a[i])}, answered ${row_text(b[i])}")
+    None
+
+/** A PostgreSQL text-format value of type `oid` as a cell: the integer types as integers, `numeric`
+ * and the floats as numbers, `bool` as a boolean, `json` as a nested relation, anything else as text.
+ */
+pg_cell(oid: u32, text: string) -> Cell = oid match
+    20 | 21 | 23 -> parse_long(text) match
+        Ok(n) -> CInt(i128(n))
+        Err(_) -> CText(text)
+    700 | 701 | 1700 -> numeric_cell(text)
+    16 -> CBool(text == "t")
+    114 | 3802 -> json_cell(text)
+    _ -> CText(text)
+
+/** A decimal's text: an integer when it has no fraction, else a number. */
+numeric_cell(text: string) -> Cell
+    var whole = true
+    for b in text.bytes
+        if b == u8('.') || b == u8('e') || b == u8('E') then whole = false
+    if whole
+        parse_long(text) match
+            Ok(n) -> return CInt(i128(n))
+            Err(_) -> ()
+    parse_real(text) match
+        Ok(x) -> CNum(x)
+        Err(_) -> CText(text)
+
+/** A JSON array of objects as a nested relation, each object's members in the order written. `null`
+ * stays a null: `json_agg` of no rows is null, so a query wanting the empty relation coalesces it to
+ * `'[]'`, as the nested workloads' PostgreSQL text does.
+ */
+json_cell(text: string) -> Cell = parse(text) match
+    Ok(j) -> json_value(j)
+    Err(_) -> CText(text)
+
+private json_value(j: Json) -> Cell = j match
+    Json.Null -> CNull
+    Json.Arr(items) ->
+        val rows = buf[Buf[Cell]]()
+        for it in items
+            rows.push(json_row(it))
+        CNest(rows)
+    other -> json_scalar(other)
+
+private json_row(j: Json) -> Buf[Cell] = j match
+    Json.Obj(members) ->
+        val cells = buf[Cell]()
+        for m in members
+            cells.push(json_member(m.value))
+        cells
+    other ->
+        val one = buf[Cell]()
+        one.push(json_scalar(other))
+        one
+
+private json_member(j: Json) -> Cell = j match
+    Json.Arr(_) -> json_value(j)
+    Json.Null -> CNull
+    other -> json_scalar(other)
+
+private json_scalar(j: Json) -> Cell = j match
+    Json.Null -> CNull
+    Json.Bool(b) -> CBool(b)
+    Json.Int(n) -> CInt(i128(n))
+    Json.Big(d) -> CText(d)
+    Json.Real(x) -> CNum(x)
+    Json.Str(s) -> CText(s)
+    Json.Arr(_) -> json_value(j)
+    Json.Obj(_) -> CText(j.to_string())

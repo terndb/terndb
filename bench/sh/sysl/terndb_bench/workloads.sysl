@@ -1,0 +1,124 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+
+// The workloads: what 0.0.1 can do, each written once for every engine. Where one SQL text serves all
+// three it is written once; where a dialect differs (PostgreSQL's `json_agg` and DuckDB's `list` for a
+// nested result) each engine has its own text producing the same answer; where TernDB's 0.0.1 SQL
+// cannot spell a construct its engine has (windows, `WITH RECURSIVE`, relation-valued columns), TernDB
+// runs the equivalent query tree, built in `trees.sysl`, since the tree is TernDB's native input.
+
+/** TernDB's form of a workload's statement. */
+enum TernForm
+    TernSql(sql: string)
+    /** A tree `trees.sysl` builds, by name. */
+    TernTree(name: string)
+
+/** What one timed run does. */
+enum Kind derives Eq
+    /** `ops` executions of one prepared query. */
+    Read
+    /** `begin`, `ops` executions of one prepared statement, `commit`. */
+    WriteTxn
+    /** One statement over a fresh copy of `orders` named `scratch`, made before the run. */
+    Mutate
+    /** A fresh table `load_orders`, loaded with every order by multi-row `INSERT`s in one
+     * transaction.
+     */
+    LoadInsert
+    /** As `LoadInsert`, through the engine's own bulk path. */
+    LoadBulk
+
+/** The parameters of each execution. */
+enum Gen derives Eq
+    NoArgs
+    /** One key drawn from 1..rows of the table. */
+    Key(table: string)
+    /** A range of keys of the table, `width` of them, from a drawn start. */
+    KeyRange(table: string, width_per_mille: long)
+    /** A new event: a fresh key, a user and an amount. */
+    NewEvent
+
+struct Workload
+    name: string
+    /** The feature it exercises, as the report groups them. */
+    feature: string
+    kind: Kind
+    tern: TernForm
+    pg: string
+    duck: string
+    gen: Gen
+    ops: u64
+    /** Whether the answer's row order is part of it. */
+    ordered: bool
+    /** For a write: a query whose answer checks what the writes left behind. */
+    check: string
+
+private w(name: string, feature: string, kind: Kind, sql: string, gen: Gen, ops: u64, ordered: bool = false, check: string = "") -> Workload =
+    Workload(name, feature, kind, TernSql(sql), sql, sql, gen, ops, ordered, check)
+
+private const NestedPg: string = "select u.id, u.name, coalesce((select json_agg(json_build_object('id', o.id, 'amount', o.amount, 'lines', coalesce((select json_agg(json_build_object('product_id', l.product_id, 'qty', l.qty)) from lines l where l.order_id = o.id), '[]'::json))) from orders o where o.user_id = u.id), '[]'::json) as orders from users u where u.id between $1 and $2"
+
+private const NestedDuck: string = "select u.id, u.name, coalesce((select list({'id': o.id, 'amount': o.amount, 'lines': coalesce((select list({'product_id': l.product_id, 'qty': l.qty}) from lines l where l.order_id = o.id), [])}) from orders o where o.user_id = u.id), []) as orders from users u where u.id between $1 and $2"
+
+private const WindowSql: string = "select count(*) as n, sum(r) as rs, sum(running) as total from (select rank() over (partition by user_id order by amount desc, id) as r, sum(amount) over (partition by user_id order by id rows between unbounded preceding and current row) as running from orders) w"
+
+private const RecursiveSql: string = "with recursive tree(id, depth) as (select id, 0 from emps where parent_id is null union all select e.id, t.depth + 1 from emps e join tree t on e.parent_id = t.id) select count(*) as n, max(depth) as deepest, sum(depth) as total from tree"
+
+private const MutateCheck: string = "select count(*) as n, sum(amount) as total, sum(day) as days from scratch"
+
+/** Every workload, in the order a run takes them: reads, then writes to tables of their own. */
+workloads() -> Buf[Workload]
+    val out = buf[Workload]()
+    out.push(w("point_pk", "point lookup", Read, "select id, user_id, amount, status from orders where id = $1", Key("orders"), 20))
+    out.push(w("range_pk", "range scan", Read, "select count(*) as n, sum(amount) as total from orders where id between $1 and $2",
+        KeyRange("orders", 10), 5))
+    out.push(w("filter_scan", "scan and filter", Read,
+        "select count(*) as n, sum(amount) as total from orders where status = 'shipped' and amount > 50000 and note is not null", NoArgs, 1))
+    out.push(w("sort_limit", "sort with limit", Read, "select id, user_id, amount from orders order by amount desc, id limit 100", NoArgs, 1, true))
+    out.push(w("join_agg", "join", Read,
+        "select u.city, count(*) as n, sum(o.amount) as total from orders o join users u on o.user_id = u.id group by u.city", NoArgs, 1))
+    out.push(w("join_multi", "multi-way join", Read,
+        "select p.category, count(*) as n, sum(l.qty * p.price) as revenue from lines l join orders o on l.order_id = o.id join products p on l.product_id = p.id join users u on o.user_id = u.id where u.age < 30 group by p.category",
+        NoArgs, 1))
+    out.push(w("group_agg", "group by", Read,
+        "select status, day % 7 as dow, count(*) as n, sum(amount) as total, min(amount) as lo, max(amount) as hi, avg(amount) as mean from orders group by status, day % 7",
+        NoArgs, 1))
+    out.push(w("count_distinct", "group by", Read, "select count(distinct user_id) as n from orders", NoArgs, 1))
+    out.push(Workload("window", "window", Read, TernTree("window"), WindowSql, WindowSql, NoArgs, 1, false, ""))
+    out.push(w("union", "set operation", Read,
+        "select count(*) as n from (select user_id as k from orders where amount > 90000 union select id from users where age > 70) s", NoArgs, 1))
+    out.push(w("intersect", "set operation", Read,
+        "select count(*) as n from (select user_id from orders where status = 'returned' intersect select id from users where city = 'oslo') s",
+        NoArgs, 1))
+    out.push(w("except", "set operation", Read,
+        "select count(*) as n from (select id from users except select user_id from orders where amount > 50000) s", NoArgs, 1))
+    out.push(w("cte", "CTE", Read,
+        "with spend as (select user_id, sum(amount) as total from orders group by user_id) select count(*) as n, max(total) as hi, min(total) as lo from spend where total > 500000",
+        NoArgs, 1))
+    out.push(Workload("cte_recursive", "recursive CTE", Read, TernTree("cte_recursive"), RecursiveSql, RecursiveSql, NoArgs, 1, false, ""))
+    out.push(w("exists", "correlated subquery", Read,
+        "select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and o.amount > 95000)", NoArgs, 1))
+    out.push(w("not_exists", "correlated subquery", Read,
+        "select count(*) as n from users u where not exists (select 1 from orders o where o.user_id = u.id and o.status = 'returned')", NoArgs, 1))
+    out.push(w("scalar_subquery", "correlated subquery", Read,
+        "select count(*) as n from users u where u.age * 1000 < (select max(o.amount) from orders o where o.user_id = u.id)", NoArgs, 1))
+    out.push(w("in_subquery", "correlated subquery", Read,
+        "select count(*) as n, sum(amount) as total from orders where user_id in (select id from users where city = 'rome')", NoArgs, 1))
+    out.push(Workload("nested", "nested result", Read, TernTree("nested"), NestedPg, NestedDuck, KeyRange("users", 10), 1, false, ""))
+
+    out.push(w("update_pk_txn", "update", WriteTxn, "update scratch set amount = amount + 1 where id = $1", Key("orders"), 100,
+        check = MutateCheck))
+    out.push(w("update_where", "update", Mutate, "update scratch set amount = amount * 2 where status = 'new'", NoArgs, 1, check = MutateCheck))
+    out.push(w("delete_where", "delete", Mutate, "delete from scratch where day < 36", NoArgs, 1, check = MutateCheck))
+    out.push(w("insert_txn", "insert", WriteTxn, "insert into events values ($1, $2, $3)", NewEvent, 100,
+        check = "select count(*) as n, sum(user_id) as users, sum(amount) as total from events"))
+    out.push(w("load_insert", "bulk load", LoadInsert, "", NoArgs, 0, check = "select count(*) as n, sum(amount) as total, sum(day) as days from load_orders"))
+    out.push(w("load_bulk", "bulk load", LoadBulk, "", NoArgs, 0, check = "select count(*) as n, sum(amount) as total, sum(day) as days from load_orders"))
+    out
+
+/** The workload named `name`. */
+workload_named(name: string) -> Option[Workload]
+    for x in workloads()
+        if x.name == name then return Some(x)
+    None

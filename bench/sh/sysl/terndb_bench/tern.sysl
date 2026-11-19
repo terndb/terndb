@@ -1,0 +1,226 @@
+module sh.sysl.terndb_bench
+
+import sh.sysl.terndb.{BatchReply, ByHandle, Complete, Embedded, Envelope, ErrorReply, ExecutePrepared, ExecutePreparedMsg,
+    Field, Insert, MonotonicClock, OverSocket, ParamDecl, ParamScan, Params, Prepare, Prepared, QualName, RunTree, Shell, TreeMajor,
+    TreeMinor, Type, Value, WireError, column_tree, connect_shell, decode_batch, embedded_link, encode_envelope, encode_params,
+    engine, no_exec_options, shell, shell_client_config, socket_link, sql_catalog}
+import sysl.buf.{Buf, buf}
+import sysl.time.now
+
+// TernDB through its native client: the shell's connection (`docs/design/shell.md` § Connections),
+// over a server session in this process (`terndb-embedded`) or over the server's Unix socket
+// (`terndb-server`). SQL is translated in the client by TernDB's front end; a prepared statement is
+// the protocol's `Prepare`, so a run is one `ExecutePrepared` with an encoded parameter block, and its
+// batches are decoded into values before the run ends. TernDB 0.0.1 has no C API, so the embedded
+// engine is reached through the same protocol, in memory.
+
+struct TernStmt
+    handle: u64
+    params: Buf[Type]
+    result: Option[Type]
+
+struct TernDb
+    label: string
+    sh: Shell
+    stmts: Buf[TernStmt]
+    next: u64
+
+    /** The error the shell printed since `before` errors. */
+    private failure(*self, before: usize) -> Option[string]
+        val printed = self.sh.take_printed()
+        if self.sh.errors == before then return None
+        var text = ""
+        for p in printed
+            if p.to_err then text = text + p.text
+        Some(text.trim_end())
+
+    /** Prepares a tree, as a statement translated from SQL is. */
+    prepare_env(*self, env: Envelope) -> Result[usize, string]
+        val bytes = encode_envelope(env) match
+            Ok(b) -> b
+            Err(e) -> return Err(s"${e.code}: ${e.message}")
+        val h = self.next
+        self.next += 1
+        val replies = self.sh.conn.call(Prepare(h, bytes))?
+        var result: Option[Type] = None
+        for m in replies
+            m match
+                Prepared(_, _, t) -> result = t
+                ErrorReply(w) -> return Err(wire_text(w))
+                _ -> ()
+        val types = buf[Type]()
+        for p in env.params
+            types.push(p.ty)
+        self.stmts.push(TernStmt(h, types, result))
+        Ok(self.stmts.len() - 1)
+
+    /** Runs statement `stmt` with one parameter tuple, answering its decoded rows (empty for DML)
+     * and the rows DML changed.
+     */
+    private execute(*self, stmt: usize, values: Buf[Value]) -> Result[(Buf[Value], u64), string]
+        val st = self.stmts[stmt]
+        val tuples = buf[Buf[Value]]()
+        tuples.push(values)
+        var columnar = buf[u64]()
+        for i in 0..<st.params.len()
+            st.params[i].base() match
+                Type.Bag(_) -> columnar.push(u64(i))
+                _ -> ()
+        val params = encode_params(st.params.view(), Params(columnar, tuples)) match
+            Ok(b) -> b
+            Err(e) -> return Err(s"${e.code}: ${e.message}")
+        val replies = self.sh.conn.call(ExecutePreparedMsg(ExecutePrepared(self.sh.txn, None, no_exec_options(), ByHandle(st.handle), params)))?
+        val rows = buf[Value]()
+        var changed = 0u64
+        for m in replies
+            m match
+                BatchReply(payload) ->
+                    val tree = column_tree(st.result.unwrap()) match
+                        Ok(t) -> t
+                        Err(e) -> return Err(s"${e.code}: ${e.message}")
+                    decode_batch(tree, payload.view()) match
+                        Ok(b) -> rows.extend(b.rows().view())
+                        Err(e) -> return Err(s"${e.code}: ${e.message}")
+                Complete(counts, _) ->
+                    for c in counts
+                        changed += c
+                ErrorReply(w) -> return Err(wire_text(w))
+                _ -> ()
+        Ok((rows, changed))
+
+    private args_values(*self, stmt: usize, args: []const Arg) -> Result[Buf[Value], string]
+        val st = self.stmts[stmt]
+        if st.params.len() != args.len then return Err(s"${st.params.len()} parameters declared, ${args.len} given")
+        val out = buf[Value]()
+        for i in 0..<args.len
+            out.push(tern_value(st.params[i], args[i])?)
+        Ok(out)
+end TernDb
+
+private wire_text(w: WireError) -> string = if w.entries.len() > 0 then s"${w.entries[0].code}: ${w.entries[0].message}" else "an error with no entry"
+
+/** `a` as a value of parameter type `t`. */
+tern_value(t: Type, a: Arg) -> Result[Value, string] = a match
+    ANull -> Ok(Value.Null)
+    AInt(n) -> t.base() match
+        Type.Float64 | Type.Float32 -> Ok(Value.Float(real(n)))
+        Type.UInt8 | Type.UInt16 | Type.UInt32 | Type.UInt64 -> Ok(Value.UInt(u64(n)))
+        Type.Text -> Ok(Value.Text(n.to_string()))
+        _ -> Ok(Value.Int(i128(n)))
+    AReal(x) -> Ok(Value.Float(x))
+    AText(s) -> Ok(Value.Text(s))
+
+/** A TernDB value of type `t` as a cell. */
+tern_cell(t: Type, v: Value) -> Cell
+    if v.is_null() then return CNull
+    (t.base(), v) match
+        (Type.Decimal(_, s), Value.Int(n)) ->
+            if s == 0 then return CInt(n)
+            var scale = 1.0
+            for _ in 0..<int(s)
+                scale = scale * 10.0
+            CNum(real(n) / scale)
+        (_, Value.Int(n)) -> CInt(n)
+        (_, Value.UInt(n)) -> CInt(i128(n))
+        (_, Value.Float(x)) -> CNum(x)
+        (_, Value.Text(s)) -> CText(s)
+        (_, Value.Bool(b)) -> CBool(b)
+        (Type.Bag(e) | Type.List(e), Value.Relation(elems)) -> CNest(tern_rows(*e, elems))
+        _ -> CText("<unreadable>")
+
+/** Rows of element type `elem` (a record) as cells. */
+tern_rows(elem: Type, rows: Buf[Value]) -> Buf[Buf[Cell]]
+    val fields = elem.base() match
+        Type.Record(fs) -> fs
+        _ -> buf[Field]()
+    val out = buf[Buf[Cell]]()
+    for r in rows
+        val cells = buf[Cell]()
+        r match
+            Value.Record(vs) ->
+                for i in 0..<vs.len()
+                    cells.push(tern_cell(fields[i].ty, vs[i]))
+            other -> cells.push(tern_cell(elem, other))
+        out.push(cells)
+    out
+
+impl Db for TernDb
+    name(self) -> string = self.label
+
+    exec(*self, sql: string) -> Result[unit, string]
+        val before = self.sh.errors
+        self.sh.run_statement(sql + ";")
+        self.failure(before) match
+            Some(e) -> Err(e)
+            None -> Ok(())
+
+    prepare(*self, sql: string) -> Result[usize, string]
+        val reqs = self.sh.translated(sql + ";") match
+            Ok(r) -> r
+            Err(e) -> return Err(s"${e.code}: ${e.message}")
+        if reqs.len() != 1 then return Err("not one statement")
+        reqs[0] match
+            RunTree(env) -> self.prepare_env(env)
+            _ -> Err("a transaction statement cannot be prepared")
+
+    prepare_tree(*self, env: Envelope) -> Result[usize, string] = self.prepare_env(env)
+
+    run(*self, stmt: usize, args: []const Arg) -> Result[u64, string]
+        val values = self.args_values(stmt, args)?
+        val (rows, changed) = self.execute(stmt, values)?
+        Ok(if self.stmts[stmt].result.is_some() && rows.len() > 0 then u64(rows.len()) else changed)
+
+    answer(*self, stmt: usize, args: []const Arg) -> Result[Buf[Buf[Cell]], string]
+        val values = self.args_values(stmt, args)?
+        val (rows, _) = self.execute(stmt, values)?
+        self.stmts[stmt].result match
+            Some(t) -> t.base() match
+                Type.Bag(e) | Type.List(e) -> Ok(tern_rows(*e, rows))
+                _ -> Ok(buf())
+            None -> Ok(buf())
+
+    /** A relation-valued parameter (`query-tree.md` §10.4) as an `Insert`'s source, sent columnar. */
+    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
+        val probe = self.prepare(s"select * from $table where id = 0")?
+        val record = self.stmts[probe].result.unwrap().base() match
+            Type.Bag(e) | Type.List(e) -> *e
+            _ -> return Err("no record type")
+        val fields = record match
+            Type.Record(fs) -> fs
+            _ -> return Err("no record type")
+        val columns = buf[string]()
+        for f in fields
+            columns.push(f.name)
+        val decls = buf[ParamDecl]()
+        decls.push(ParamDecl(None, Type.Bag(record)))
+        val env = Envelope(TreeMajor, TreeMinor, decls, Insert(QualName("public", table), table, None, columns,
+            ParamScan("source", 0), None, buf()), None)
+        val stmt = self.prepare_env(env)?
+        val rows = buf[Value]()
+        for id in from..to
+            val vs = buf[Value]()
+            val r = row(s, table, id)
+            for i in 0..<r.len()
+                vs.push(tern_value(fields[i].ty, r[i])?)
+            rows.push(Value.Record(vs))
+        val one = buf[Value]()
+        one.push(Value.Relation(rows))
+        val _ = self.execute(stmt, one)?
+        Ok(())
+
+    close(*self) = self.sh.close()
+
+/** A TernDB engine in this process, reached through a server session over the native protocol. */
+tern_embedded() -> Result[&TernDb, string]
+    val e = engine(sql_catalog(), now().us, MonotonicClock())
+    val link = embedded_link(e, "terndb", "bench")?
+    val conn = connect_shell(link, shell_client_config("terndb", "terndb", "bench")?)?
+    val d: &TernDb = TernDb("terndb-embedded", shell(conn, Embedded, "terndb", "terndb"), buf(), 1)
+    Ok(d)
+
+/** The TernDB server listening on the Unix socket at `at`, with password `password`. */
+tern_server(at: string, password: string) -> Result[&TernDb, string]
+    val link = socket_link(at)?
+    val conn = connect_shell(link, shell_client_config("terndb", "terndb", password)?)?
+    val d: &TernDb = TernDb("terndb-server", shell(conn, OverSocket(at), "terndb", "terndb"), buf(), 1)
+    Ok(d)

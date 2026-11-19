@@ -1,0 +1,84 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+
+// Release against release: each engine's time on each workload, the previous release's raw results
+// against this one's. A change is called only when it is both large (past `Threshold`) and outside
+// the noise: the difference of the means exceeds `Sigmas` times the standard error of that
+// difference (Welch), so two noisy runs are not called a regression on a coin toss.
+
+/** A slowdown or a speed-up smaller than this fraction of the old mean is no change. */
+const Threshold: real = 0.10
+
+/** How many standard errors the difference must exceed. */
+const Sigmas: real = 3.0
+
+enum Verdict derives Eq
+    Regressed
+    Improved
+    Unchanged
+    /** Measured now and not before. */
+    Added
+    /** Measured before and not now: a workload that broke is listed, never dropped silently. */
+    Lost
+
+struct Change
+    scale: string
+    workload: string
+    engine: string
+    verdict: Verdict
+    /** New mean over old mean; 0 where one side has no measurement. */
+    ratio: real
+    old_us: real
+    new_us: real
+
+/** The verdict on a workload whose mean went from `a` to `b`. */
+judge(a: Summary, b: Summary) -> Verdict
+    if a.runs == 0 || b.runs == 0 || a.mean == 0.0 then return Unchanged
+    val se = (a.stddev * a.stddev / real(a.runs) + b.stddev * b.stddev / real(b.runs)).sqrt()
+    val delta = b.mean - a.mean
+    val big = delta > Threshold * a.mean || -delta > Threshold * a.mean
+    val clear = delta > Sigmas * se || -delta > Sigmas * se
+    if !big || !clear then Unchanged
+    elif delta > 0.0 then Regressed
+    else Improved
+
+private measured(r: Record) -> bool = r.outcome == Measured && r.runs_us.len() > 0
+
+private find(f: ResultFile, workload: string, engine: string) -> Option[Record]
+    for r in f.records
+        if r.workload == workload && r.engine == engine then return Some(r)
+    None
+
+/** Every workload and engine of `new` against the same in `old`, and every one measured in `old`
+ * that `new` no longer measures. The two files must be one pair at one scale.
+ */
+diff_files(old: ResultFile, new: ResultFile) -> Buf[Change]
+    val out = buf[Change]()
+    for r in new.records
+        if !measured(r) then
+            find(old, r.workload, r.engine) match
+                Some(o) ->
+                    if measured(o) then out.push(Change(new.scale, r.workload, r.engine, Lost, 0.0, summarize(o.runs_us.view()).mean, 0.0))
+                None -> ()
+            continue
+        val b = summarize(r.runs_us.view())
+        find(old, r.workload, r.engine) match
+            Some(o) ->
+                if measured(o)
+                    val a = summarize(o.runs_us.view())
+                    out.push(Change(new.scale, r.workload, r.engine, judge(a, b), b.mean / a.mean, a.mean, b.mean))
+                else
+                    out.push(Change(new.scale, r.workload, r.engine, Added, 0.0, 0.0, b.mean))
+            None -> out.push(Change(new.scale, r.workload, r.engine, Added, 0.0, 0.0, b.mean))
+    for o in old.records
+        if measured(o) && find(new, o.workload, o.engine).is_none()
+            out.push(Change(old.scale, o.workload, o.engine, Lost, 0.0, summarize(o.runs_us.view()).mean, 0.0))
+    out
+
+/** The changes of one verdict. */
+only(changes: Buf[Change], v: Verdict) -> Buf[Change]
+    val out = buf[Change]()
+    for c in changes
+        if c.verdict == v then out.push(c)
+    out

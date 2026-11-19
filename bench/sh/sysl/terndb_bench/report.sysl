@@ -1,0 +1,203 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.format_real
+import sysl.slices.sort_by
+
+// The report's tables, generated from the raw results so no number is copied by hand: per pair and
+// scale, each engine's mean ± standard deviation per run with its run count, and TernDB's ratio to
+// each rival; the answer check's outcome per workload and engine; and the workloads where TernDB is
+// behind, ranked by how far.
+
+/** `us` microseconds in the unit that keeps it between 1 and 1000, to three significant figures. */
+time_text(us: real) -> string
+    if us < 1000.0 then return sig3(us) + " µs"
+    if us < 1000000.0 then return sig3(us / 1000.0) + " ms"
+    sig3(us / 1000000.0) + " s"
+
+/** `mean ± sd` in the mean's unit. */
+spread_text(mean: real, sd: real) -> string
+    val (div, unit) = if mean < 1000.0 then (1.0, " µs") elif mean < 1000000.0 then (1000.0, " ms") else (1000000.0, " s")
+    sig3(mean / div) + " ± " + sig3(sd / div) + unit
+
+/** `x` to three significant figures, without an exponent. */
+sig3(x: real) -> string
+    val a = if x < 0.0 then -x else x
+    if a >= 100.0 then return format_real(x, "%.0f", 0, -1)
+    if a >= 10.0 then return format_real(x, "%.1f", 0, -1)
+    if a >= 1.0 then return format_real(x, "%.2f", 0, -1)
+    format_real(x, "%.3f", 0, -1)
+
+/** A ratio as `2.41×`, or `—` when there is none. */
+ratio_text(r: Option[(real, real)]) -> string = r match
+    Some((x, sd)) -> sig3(x) + "× ± " + sig3(sd)
+    None -> "—"
+
+/** The record of `engine` on `workload` in `f`. */
+record_in(f: ResultFile, workload: string, engine: string) -> Option[Record]
+    for r in f.records
+        if r.workload == workload && r.engine == engine then return Some(r)
+    None
+
+/** Every engine of `f`, in the order first seen. */
+engines_of(f: ResultFile) -> Buf[string]
+    val out = buf[string]()
+    for r in f.records
+        var seen = false
+        for e in out
+            if e == r.engine then seen = true
+        if !seen then out.push(r.engine)
+    out
+
+/** Every workload of `f`, in the order first seen. */
+workloads_of(f: ResultFile) -> Buf[string]
+    val out = buf[string]()
+    for r in f.records
+        var seen = false
+        for x in out
+            if x == r.workload then seen = true
+        if !seen then out.push(r.workload)
+    out
+
+/** A record's cell in a time table: its spread and run count, or why it has none. A record the
+ * answer check (`verify`) found wrong shows the mismatch instead of its time.
+ */
+cell_of(r: Option[Record], verdict: Option[Outcome]) -> string
+    verdict match
+        Some(Mismatch(_)) -> return "wrong answer"
+        _ -> ()
+    r match
+        None -> "not run"
+        Some(x) -> x.outcome match
+            Measured ->
+                val s = summarize(x.runs_us.view())
+                spread_text(s.mean, s.stddev) + s" (n=${s.runs})"
+            Unsupported(_) -> "unsupported"
+            Mismatch(_) -> "wrong answer"
+            Failed(_) -> "failed"
+
+/** The verify outcome of `engine` on `workload`, matched by engine family for the timing pairs'
+ * engines that verify did not run itself (DuckDB's one-thread lane, PostgreSQL's parallel lane).
+ */
+verdict_for(v: Option[ResultFile], workload: string, engine: string) -> Option[Outcome]
+    val f = v?
+    record_in(f, workload, engine) match
+        Some(r) -> return Some(r.outcome)
+        None -> ()
+    for r in f.records
+        if r.workload == workload && family(r.engine) == family(engine) && family(engine) != "terndb" then return Some(r.outcome)
+    None
+
+/** The summary of a measured record that the answer check did not refuse. */
+measured_summary(r: Option[Record], verdict: Option[Outcome]) -> Option[Summary]
+    verdict match
+        Some(Mismatch(_)) -> return None
+        _ -> ()
+    val x = r?
+    if x.outcome != Measured || x.runs_us.len() == 0 then return None
+    Some(summarize(x.runs_us.view()))
+
+/** The time table of one result file: a row per workload, a column per engine, then TernDB's ratio
+ * to each other engine (above 1 is TernDB slower).
+ */
+time_table(f: ResultFile, v: Option[ResultFile]) -> string
+    val engines = engines_of(f)
+    var tern = ""
+    for e in engines
+        if family(e) == "terndb" then tern = e
+    var head = "| workload | ops/run |"
+    var rule = "|---|---:|"
+    for e in engines
+        head = head + s" $e |"
+        rule = rule + "---:|"
+    for e in engines
+        if e != tern
+            head = head + s" $tern / $e |"
+            rule = rule + "---:|"
+    var out = head + "\n" + rule + "\n"
+    for wl in workloads_of(f)
+        var ops = 0u64
+        for e in engines
+            record_in(f, wl, e) match
+                Some(r) -> ops = r.ops
+                None -> ()
+        var line = s"| $wl | ${if ops == 0 then "load" else ops.to_string()} |"
+        for e in engines
+            line = line + " " + cell_of(record_in(f, wl, e), verdict_for(v, wl, e)) + " |"
+        val t = measured_summary(record_in(f, wl, tern), verdict_for(v, wl, tern))
+        for e in engines
+            if e != tern
+                val o = measured_summary(record_in(f, wl, e), verdict_for(v, wl, e))
+                val r = if t.is_some() && o.is_some() then ratio(t.unwrap(), o.unwrap()) else None
+                line = line + " " + ratio_text(r) + " |"
+        out = out + line + "\n"
+    out
+
+/** The answer check's table: a row per workload, a column per engine. */
+verify_table(v: ResultFile) -> string
+    val engines = engines_of(v)
+    var out = "| workload |"
+    var rule = "|---|"
+    for e in engines
+        out = out + s" $e |"
+        rule = rule + "---|"
+    out = out + "\n" + rule + "\n"
+    for wl in workloads_of(v)
+        var line = s"| $wl |"
+        for e in engines
+            line = line + " " + (record_in(v, wl, e) match
+                Some(r) -> r.outcome match
+                    Measured -> s"same (${r.rows} rows)"
+                    Unsupported(why) -> "cannot run: " + one_line(why)
+                    Mismatch(d) -> "**differs**: " + one_line(d)
+                    Failed(why) -> "failed: " + one_line(why)
+                None -> "—") + " |"
+        out = out + line + "\n"
+    out
+
+/** `s` on one line, its `|` escaped, so it sits in a table cell. */
+one_line(s: string) -> string
+    var out = ""
+    for ch in s.chars()
+        if ch == '\n' then out = out + " "
+        elif ch == '|' then out = out + "\\|"
+        else out = out + ch.to_string()
+    out
+
+/** One workload where TernDB is behind: how many times slower than the fastest rival. */
+struct Behind
+    pair: string
+    scale: string
+    workload: string
+    rival: string
+    times: real
+
+/** Every measured workload of `f` where TernDB's mean is above its fastest rival's, slowest first. */
+behind_of(f: ResultFile, v: Option[ResultFile]) -> Buf[Behind]
+    val engines = engines_of(f)
+    var tern = ""
+    for e in engines
+        if family(e) == "terndb" then tern = e
+    val out = buf[Behind]()
+    for wl in workloads_of(f)
+        val t = measured_summary(record_in(f, wl, tern), verdict_for(v, wl, tern))
+        if t.is_none() then continue
+        var best: Option[(string, real)] = None
+        for e in engines
+            if e == tern then continue
+            measured_summary(record_in(f, wl, e), verdict_for(v, wl, e)) match
+                Some(s) ->
+                    if best.is_none() || s.mean < best.unwrap().1 then best = Some((e, s.mean))
+                None -> ()
+        best match
+            Some((e, m)) ->
+                if m > 0.0 && t.unwrap().mean > m then out.push(Behind(f.pair, f.scale, wl, e, t.unwrap().mean / m))
+            None -> ()
+    out
+
+/** `xs` slowest first. */
+ranked(xs: Buf[Behind]) -> Buf[Behind]
+    val out = buf[Behind]()
+    out.extend(xs.view())
+    sort_by(out.view_mut(), (a, b) -> a.times > b.times)
+    out

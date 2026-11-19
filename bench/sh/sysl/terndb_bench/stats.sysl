@@ -1,0 +1,45 @@
+module sh.sysl.terndb_bench
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.sort
+
+// The statistics a report prints for one engine on one workload: the timed runs' mean, their sample
+// standard deviation, median, minimum and maximum, all in microseconds.
+
+struct Summary
+    runs: usize
+    mean: real
+    /** The sample standard deviation (n − 1); 0 for a single run. */
+    stddev: real
+    median: real
+    min: real
+    max: real
+
+/** The summary of `xs`; every field 0 when there are no runs. */
+summarize(xs: []const real) -> Summary
+    val n = xs.len
+    if n == 0 then return Summary(0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    var total = 0.0
+    for x in xs
+        total += x
+    val mean = total / real(n)
+    var sq = 0.0
+    for x in xs
+        sq += (x - mean) * (x - mean)
+    val sd = if n > 1 then (sq / real(n - 1)).sqrt() else 0.0
+
+    val sorted = buf[real]()
+    sorted.extend(xs)
+    sort(sorted.view_mut())
+    val median = if n % 2 == 1 then sorted[n / 2] else (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    Summary(n, mean, sd, median, sorted[0], sorted[n - 1])
+
+/** `a / b` with its standard deviation, propagated to first order from the two summaries' relative
+ * deviations (independent runs). `None` when `b`'s mean is 0.
+ */
+ratio(a: Summary, b: Summary) -> Option[(real, real)]
+    if b.mean == 0.0 || a.mean == 0.0 then return None
+    val r = a.mean / b.mean
+    val ra = a.stddev / a.mean
+    val rb = b.stddev / b.mean
+    Some((r, r * (ra * ra + rb * rb).sqrt()))

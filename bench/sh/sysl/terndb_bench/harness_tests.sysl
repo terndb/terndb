@@ -1,0 +1,467 @@
+module sh.sysl.terndb_bench
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The harness's own logic: the answer check's canonical form and comparison, each engine's value
+// reading, the statistics, the raw-result files, the release diff, the generated data and the report's
+// tables. The drivers are exercised by `bench verify` against the real engines.
+
+private rowv(cells: []const Cell) -> Buf[Cell]
+    val b = buf[Cell]()
+    b.extend(cells)
+    b
+
+private rowsv(rs: []const Buf[Cell]) -> Buf[Buf[Cell]]
+    val b = buf[Buf[Cell]]()
+    b.extend(rs)
+    b
+
+private reals(xs: []const real) -> Buf[real]
+    val b = buf[real]()
+    b.extend(xs)
+    b
+
+private rec(workload: string, engine: string, outcome: Outcome, runs: []const real) -> Record =
+    Record(workload, engine, 1, 1, outcome, reals(runs))
+
+private file(scale: string, records: []const Record) -> ResultFile
+    val rs = buf[Record]()
+    rs.extend(records)
+    ResultFile("0.0.1", "inproc", scale, buf(), rs)
+
+// -- cells -------------------------------------------------------------------------------------
+
+@test("numbers compare within the tolerance, integers against numbers too")
+cells_numbers()
+    assert(same_cell(CInt(5), CInt(5)))
+    assert(!same_cell(CInt(5), CInt(6)))
+    assert(same_cell(CInt(5), CNum(5.0)))
+    assert(same_cell(CNum(5.0), CInt(5)))
+    assert(same_cell(CNum(1.0e12), CNum(1.0e12 + 1.0e2)))
+    assert(!same_cell(CNum(1.0e12), CNum(1.0e12 + 1.0e4)))
+    assert(same_cell(CNum(0.0), CNum(1.0e-10)))
+    assert(!same_cell(CNum(0.0), CNum(1.0e-6)))
+    assert(same_cell(CNum(-3.5), CNum(-3.5)))
+    assert(!same_cell(CNum(-3.5), CNum(3.5)))
+end cells_numbers
+
+@test("a null equals only a null, and kinds do not mix")
+cells_kinds()
+    assert(same_cell(CNull, CNull))
+    assert(!same_cell(CNull, CInt(0)))
+    assert(!same_cell(CInt(0), CNull))
+    assert(!same_cell(CText("1"), CInt(1)))
+    assert(!same_cell(CBool(true), CInt(1)))
+    assert(same_cell(CBool(false), CBool(false)))
+    assert(!same_cell(CText("a"), CText("A")))
+    assert(same_cell(CText(""), CText("")))
+
+@test("an unordered answer is compared as a bag; an ordered one row by row")
+cells_order()
+    val a = rowsv([rowv([CInt(1)]), rowv([CInt(2)])])
+    val b = rowsv([rowv([CInt(2)]), rowv([CInt(1)])])
+    assert(mismatch(a, b, false).is_none())
+    assert(mismatch(a, b, true).is_some())
+    assert(mismatch(a, a, true).is_none())
+
+@test("duplicates count: a bag with a row twice is not the bag with it once")
+cells_duplicates()
+    val a = rowsv([rowv([CInt(1)]), rowv([CInt(1)]), rowv([CInt(2)])])
+    val b = rowsv([rowv([CInt(1)]), rowv([CInt(2)]), rowv([CInt(2)])])
+    assert(mismatch(a, b, false).is_some())
+    assert(mismatch(a, a, false).is_none())
+
+@test("empty and one-row answers, and a row count difference, are reported")
+cells_sizes()
+    val empty = buf[Buf[Cell]]()
+    assert(mismatch(empty, empty, false).is_none())
+    val one = rowsv([rowv([CNull])])
+    assert_eq(mismatch(empty, one, false), Some("0 rows expected, 1 answered"))
+    assert_eq(mismatch(one, empty, true), Some("1 rows expected, 0 answered"))
+    assert(mismatch(one, one, false).is_none())
+
+@test("a row of another width differs, and the report names the row")
+cells_width()
+    val a = rowsv([rowv([CInt(1), CInt(2)])])
+    val b = rowsv([rowv([CInt(1)])])
+    assert_eq(mismatch(a, b, true), Some("row 0: expected (1, 2), answered (1)"))
+
+@test("nested relations compare as bags at every level")
+cells_nested()
+    val inner1 = rowsv([rowv([CInt(1), CText("a")]), rowv([CInt(2), CText("b")])])
+    val inner2 = rowsv([rowv([CInt(2), CText("b")]), rowv([CInt(1), CText("a")])])
+    val a = rowsv([rowv([CInt(7), CNest(inner1)])])
+    val b = rowsv([rowv([CInt(7), CNest(inner2)])])
+    assert(mismatch(a, b, false).is_none())
+    val c = rowsv([rowv([CInt(7), CNest(rowsv([rowv([CInt(1), CText("a")])]))])])
+    assert(mismatch(a, c, false).is_some())
+    val e = rowsv([rowv([CInt(7), CNest(buf())])])
+    assert(mismatch(e, e, false).is_none())
+    assert(mismatch(a, e, false).is_some())
+end cells_nested
+
+@test("null rows sort and compare like any other")
+cells_null_rows()
+    val a = rowsv([rowv([CNull, CInt(1)]), rowv([CInt(1), CNull])])
+    val b = rowsv([rowv([CInt(1), CNull]), rowv([CNull, CInt(1)])])
+    assert(mismatch(a, b, false).is_none())
+
+@test("cell text: integers, whole floats and fractions")
+cells_text()
+    assert_eq(cell_text(CInt(-12)), "-12")
+    assert_eq(cell_text(CNum(3.0)), "3")
+    assert_eq(cell_text(CNum(2.5)), "2.5")
+    assert_eq(cell_text(CNull), "NULL")
+    assert_eq(cell_text(CText("x")), "'x'")
+    assert_eq(cell_text(CNest(rowsv([rowv([CInt(1)])]))), "[(1)]")
+
+// -- PostgreSQL values ---------------------------------------------------------------------------
+
+@test("PostgreSQL text values read by their type")
+pg_values()
+    assert(same_cell(pg_cell(20, "-42"), CInt(-42)))
+    assert(same_cell(pg_cell(23, "7"), CInt(7)))
+    assert(same_cell(pg_cell(1700, "12.50"), CNum(12.5)))
+    assert(same_cell(pg_cell(1700, "1250"), CInt(1250)))
+    assert(same_cell(pg_cell(701, "1e+20"), CNum(1.0e20)))
+    assert(same_cell(pg_cell(16, "t"), CBool(true)))
+    assert(same_cell(pg_cell(16, "f"), CBool(false)))
+    assert(same_cell(pg_cell(25, "oslo"), CText("oslo")))
+    assert(same_cell(pg_cell(20, "x"), CText("x")))
+end pg_values
+
+@test("numeric text past a long reads as a number")
+pg_big_numeric()
+    assert(same_cell(numeric_cell("123456789012345678901234"), CNum(1.23456789012345678901234e23)))
+
+@test("json_agg output is a nested relation, keys in order, nulls kept, nesting at depth")
+pg_json()
+    val c = pg_cell(114, "[{\"id\": 1, \"amount\": 50, \"lines\": [{\"product_id\": 3, \"qty\": 2}]}, {\"id\": 2, \"amount\": 7, \"lines\": []}]")
+    val want = CNest(rowsv([
+        rowv([CInt(1), CInt(50), CNest(rowsv([rowv([CInt(3), CInt(2)])]))]),
+        rowv([CInt(2), CInt(7), CNest(buf())])]))
+    assert(same_cell(c, want))
+    assert(same_cell(pg_cell(114, "[]"), CNest(buf())))
+    assert(same_cell(pg_cell(114, "null"), CNull))
+    assert(same_cell(pg_cell(114, "[{\"a\": null, \"b\": \"x\", \"c\": 1.5}]"), CNest(rowsv([rowv([CNull, CText("x"), CNum(1.5)])]))))
+    assert(same_cell(pg_cell(114, "[1, 2]"), CNest(rowsv([rowv([CInt(1)]), rowv([CInt(2)])]))))
+    assert(same_cell(pg_cell(114, "{not json"), CText("{not json")))
+end pg_json
+
+// -- TernDB values -------------------------------------------------------------------------------
+
+@test("TernDB values read by their type: decimals scaled, nullables, nested records")
+tern_values()
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.Int64, sh.sysl.terndb.Value.Int(5)), CInt(5)))
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.Decimal(10, 2), sh.sysl.terndb.Value.Int(1250)), CNum(12.5)))
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.Decimal(10, 0), sh.sysl.terndb.Value.Int(1250)), CInt(1250)))
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.Float64, sh.sysl.terndb.Value.Float(0.25)), CNum(0.25)))
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.Text, sh.sysl.terndb.Value.Null), CNull))
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.Text, sh.sysl.terndb.Value.Text("a")), CText("a")))
+    assert(same_cell(tern_cell(sh.sysl.terndb.Type.UInt64, sh.sysl.terndb.Value.UInt(3)), CInt(3)))
+end tern_values
+
+@test("arguments become values of the declared parameter type")
+tern_args()
+    assert_eq(tern_value(sh.sysl.terndb.Type.Int64, AInt(3)), Ok(sh.sysl.terndb.Value.Int(3)))
+    assert_eq(tern_value(sh.sysl.terndb.Type.Float64, AInt(3)), Ok(sh.sysl.terndb.Value.Float(3.0)))
+    assert_eq(tern_value(sh.sysl.terndb.Type.Text, AText("x")), Ok(sh.sysl.terndb.Value.Text("x")))
+    assert_eq(tern_value(sh.sysl.terndb.Type.Int64, ANull), Ok(sh.sysl.terndb.Value.Null))
+
+// -- statistics ----------------------------------------------------------------------------------
+
+@test("no runs summarise to zeros, one run has no spread")
+stats_edges()
+    val z = summarize([])
+    assert_eq(z.runs, 0)
+    assert_eq(z.mean, 0.0)
+    val one = summarize([7.0])
+    assert_eq(one.runs, 1)
+    assert_eq(one.mean, 7.0)
+    assert_eq(one.stddev, 0.0)
+    assert_eq(one.median, 7.0)
+    assert_eq(one.min, 7.0)
+    assert_eq(one.max, 7.0)
+
+@test("mean, sample deviation, median of odd and even counts, extremes")
+stats_values()
+    val s = summarize([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
+    assert_eq(s.mean, 5.0)
+    assert(near(s.stddev, (32.0 / 7.0).sqrt()))
+    assert_eq(s.median, 4.5)
+    assert_eq(s.min, 2.0)
+    assert_eq(s.max, 9.0)
+    assert_eq(summarize([3.0, 1.0, 2.0]).median, 2.0)
+    assert_eq(summarize([5.0, 5.0, 5.0]).stddev, 0.0)
+
+@test("a ratio carries its propagated deviation; a zero mean has none")
+stats_ratio()
+    val a = Summary(5, 200.0, 20.0, 200.0, 180.0, 220.0)
+    val b = Summary(5, 100.0, 10.0, 100.0, 90.0, 110.0)
+    val (r, sd) = ratio(a, b).unwrap()
+    assert_eq(r, 2.0)
+    assert(near(sd, 2.0 * (0.02).sqrt()))
+    assert(ratio(a, Summary(0, 0.0, 0.0, 0.0, 0.0, 0.0)).is_none())
+    assert(ratio(Summary(0, 0.0, 0.0, 0.0, 0.0, 0.0), b).is_none())
+
+// -- result files --------------------------------------------------------------------------------
+
+@test("a result file round-trips through JSON, every outcome kind and an empty run list")
+results_round_trip()
+    val recs = buf[Record]()
+    recs.push(rec("w", "terndb-embedded", Measured, [1.5, 2.0]))
+    recs.push(rec("w", "duckdb", Unsupported("no \"windows\"\nhere"), []))
+    recs.push(rec("x", "postgres", Mismatch("row 0"), []))
+    recs.push(rec("y", "postgres", Failed("boom"), []))
+    val facts = buf[(string, string)]()
+    facts.push(("cpu", "M5 Pro"))
+    val f = ResultFile("0.0.1", "server", "M", facts, recs)
+    val back = file_of(file_json(f).to_string()).unwrap()
+    assert_eq(back.release, "0.0.1")
+    assert_eq(back.pair, "server")
+    assert_eq(back.scale, "M")
+    assert_eq(back.facts.len(), 1)
+    assert_eq(back.facts[0].1, "M5 Pro")
+    assert_eq(back.records.len(), 4)
+    assert(back.records[0].outcome == Measured)
+    assert_eq(back.records[0].runs_us.len(), 2)
+    assert_eq(back.records[0].runs_us[1], 2.0)
+    assert(back.records[1].outcome == Unsupported("no \"windows\"\nhere"))
+    assert(back.records[2].outcome == Mismatch("row 0"))
+    assert(back.records[3].outcome == Failed("boom"))
+end results_round_trip
+
+@test("malformed result files are refused with the reason")
+results_refusals()
+    assert(file_of("not json").is_err())
+    assert(file_of("{}").is_err())
+    assert_eq(file_of("{\"release\":\"a\",\"pair\":\"b\",\"scale\":\"c\",\"facts\":{},\"records\":[{\"workload\":\"w\",\"engine\":\"e\",\"ops\":1,\"rows\":1,\"outcome\":\"odd\",\"note\":\"\",\"runs_us\":[]}]}").err(),
+        Some("unknown outcome 'odd'"))
+    assert_eq(file_of("{\"release\":\"a\",\"pair\":\"b\",\"scale\":\"c\",\"facts\":{},\"records\":[{\"workload\":\"w\",\"engine\":\"e\",\"ops\":-1,\"rows\":1,\"outcome\":\"measured\",\"note\":\"\",\"runs_us\":[]}]}").err(),
+        Some("'ops' is negative"))
+    assert_eq(file_of("{\"release\":\"a\",\"pair\":\"b\",\"scale\":\"c\",\"facts\":{},\"records\":[{\"workload\":\"w\",\"engine\":\"e\",\"ops\":1,\"rows\":1,\"outcome\":\"measured\",\"note\":\"\",\"runs_us\":[\"x\"]}]}").err(),
+        Some("a run is not a number"))
+    assert_eq(file_of("{\"release\":\"a\",\"pair\":\"b\",\"scale\":\"c\",\"facts\":[],\"records\":[]}").err(), Some("'facts' is not an object"))
+    assert(file_of("{\"release\":\"a\",\"pair\":\"b\",\"scale\":\"c\",\"facts\":{},\"records\":[]}").is_ok())
+end results_refusals
+
+// -- the release diff ----------------------------------------------------------------------------
+
+@test("a large, clear slowdown regresses; a large, clear speed-up improves")
+diff_verdicts()
+    val old = Summary(5, 100.0, 1.0, 100.0, 99.0, 101.0)
+    assert(judge(old, Summary(5, 150.0, 1.0, 150.0, 149.0, 151.0)) == Regressed)
+    assert(judge(old, Summary(5, 50.0, 1.0, 50.0, 49.0, 51.0)) == Improved)
+
+@test("a change under the threshold, or inside the noise, is no change")
+diff_noise()
+    val old = Summary(5, 100.0, 1.0, 100.0, 99.0, 101.0)
+    assert(judge(old, Summary(5, 105.0, 1.0, 105.0, 104.0, 106.0)) == Unchanged)
+    assert(judge(Summary(5, 100.0, 60.0, 100.0, 40.0, 160.0), Summary(5, 150.0, 60.0, 150.0, 90.0, 210.0)) == Unchanged)
+    assert(judge(old, old) == Unchanged)
+    assert(judge(Summary(0, 0.0, 0.0, 0.0, 0.0, 0.0), old) == Unchanged)
+
+@test("exactly at the threshold is not past it")
+diff_threshold_edge()
+    val old = Summary(5, 100.0, 0.0, 100.0, 100.0, 100.0)
+    assert(judge(old, Summary(5, 110.0, 0.0, 110.0, 110.0, 110.0)) == Unchanged)
+    assert(judge(old, Summary(5, 110.5, 0.0, 110.5, 110.5, 110.5)) == Regressed)
+
+@test("files diff by workload and engine: added, lost, a failure that was measured is lost")
+diff_files_cases()
+    val old = file("S", [rec("a", "terndb", Measured, [100.0, 101.0, 99.0]), rec("b", "terndb", Measured, [10.0, 10.0, 10.0]),
+        rec("c", "terndb", Measured, [5.0, 5.0, 5.0])])
+    val new = file("S", [rec("a", "terndb", Measured, [200.0, 201.0, 199.0]), rec("b", "terndb", Failed("x"), []),
+        rec("d", "terndb", Measured, [1.0, 1.0, 1.0])])
+    val ch = diff_files(old, new)
+    assert_eq(only(ch, Regressed).len(), 1)
+    assert_eq(only(ch, Regressed)[0].workload, "a")
+    assert_eq(only(ch, Lost).len(), 2)
+    assert_eq(only(ch, Added).len(), 1)
+    assert_eq(only(ch, Added)[0].workload, "d")
+    assert_eq(only(ch, Improved).len(), 0)
+
+@test("two identical files diff to nothing but unchanged")
+diff_same()
+    val f = file("S", [rec("a", "duckdb", Measured, [3.0, 3.1, 2.9])])
+    val ch = diff_files(f, f)
+    assert_eq(ch.len(), 1)
+    assert(ch[0].verdict == Unchanged)
+    assert_eq(diff_files(file("S", []), file("S", [])).len(), 0)
+
+// -- data ----------------------------------------------------------------------------------------
+
+@test("a generated row is the same every time and depends only on its key")
+data_deterministic()
+    val s = scale_named("S").unwrap()
+    assert(row(s, "orders", 17) == row(s, "orders", 17))
+    assert(row(s, "orders", 17) != row(s, "orders", 18))
+    assert_eq(row(s, "users", 1).len(), 5)
+    assert_eq(row(s, "orders", 1).len(), 6)
+    assert_eq(row(s, "lines", 1).len(), 4)
+    assert_eq(row(s, "emps", 1)[1], ANull)
+    assert_eq(row(s, "emps", 2)[1], AInt(1))
+    assert_eq(row(s, "emps", 5)[1], AInt(1))
+    assert_eq(row(s, "emps", 6)[1], AInt(2))
+    assert_eq(row(s, "lines", 3)[1], AInt(2))
+end data_deterministic
+
+@test("generated keys stay inside the tables they reference")
+data_references()
+    val s = scale_named("XS").unwrap()
+    for id in 1..s.orders
+        val r = row(s, "orders", id)
+        r[1] match
+            AInt(u) -> assert(u >= 1 && u <= s.users())
+            _ -> assert(false)
+    for id in 1..s.lines()
+        row(s, "lines", id)[2] match
+            AInt(p) -> assert(p >= 1 && p <= 1000)
+            _ -> assert(false)
+
+@test("about a tenth of the notes are null, as the scan workloads assume")
+data_nulls()
+    val s = scale_named("XS").unwrap()
+    var nulls = 0
+    for id in 1..s.orders
+        if row(s, "orders", id)[5] == ANull then nulls += 1
+    assert(nulls > 60 && nulls < 140)
+
+@test("SQL constants: quotes doubled, null, floats always with a point")
+data_literals()
+    assert_eq(sql_literal(AText("o'k")), "'o''k'")
+    assert_eq(sql_literal(ANull), "NULL")
+    assert_eq(sql_literal(AInt(-3)), "-3")
+    assert_eq(real_literal(2.0), "2.0")
+    assert_eq(real_literal(0.25), "0.25")
+    assert_eq(sql_literal(AText("")), "''")
+
+@test("one INSERT per range, and COPY text with \\N for null")
+data_statements()
+    val s = scale_named("XS").unwrap()
+    val sql = insert_sql(s, "emps", 1, 2)
+    assert_eq(sql, "insert into emps values (1, NULL, 'emp1'), (2, 1, 'emp2')")
+    assert_eq(copy_text(s, "emps", 1, 2), "1\t\\N\temp1\n2\t1\temp2\n")
+    assert_eq(insert_sql(s, "emps", 3, 3), "insert into emps values (3, 1, 'emp3')")
+
+@test("the scales size every table from the order count; an unknown scale is none")
+data_scales()
+    val m = scale_named("M").unwrap()
+    assert_eq(table_rows(m, "orders"), 100000)
+    assert_eq(table_rows(m, "users"), 10000)
+    assert_eq(table_rows(m, "lines"), 200000)
+    assert_eq(table_rows(m, "products"), 1000)
+    assert_eq(table_rows(m, "emps"), 10000)
+    assert(scale_named("XL").is_none())
+    assert(scale_named("").is_none())
+
+// -- workloads and arguments ---------------------------------------------------------------------
+
+@test("every workload has text for every engine, and names are unique")
+workloads_complete()
+    val ws = workloads()
+    for i in 0..<ws.len()
+        val x = ws[i]
+        val loads = x.kind == LoadInsert || x.kind == LoadBulk
+        assert(loads || x.pg.len > 0)
+        assert(loads || x.duck.len > 0)
+        if x.kind != Read then assert(x.check.len > 0)
+        x.tern match
+            TernTree(n) -> assert(tree_named(n).is_some())
+            TernSql(q) -> assert(loads || q.len > 0)
+        for j in 0..<ws.len()
+            if i != j then assert(ws[i].name != ws[j].name)
+    assert(workload_named("point_pk").is_some())
+    assert(workload_named("nope").is_none())
+end workloads_complete
+
+@test("arguments are the same for every engine and keys stay in range")
+args_ranges()
+    val s = scale_named("XS").unwrap()
+    val p = workload_named("point_pk").unwrap()
+    assert(args_for(p, s, 3, 4) == args_for(p, s, 3, 4))
+    for r in 0..<20
+        for op in 0..<20
+            args_for(p, s, r, op)[0] match
+                AInt(k) -> assert(k >= 1 && k <= s.orders)
+                _ -> assert(false)
+    val rg = workload_named("range_pk").unwrap()
+    for r in 0..<50
+        val a = args_for(rg, s, r, 0)
+        (a[0], a[1]) match
+            (AInt(lo), AInt(hi)) ->
+                assert(lo >= 1)
+                assert(hi <= s.orders)
+                assert_eq(hi - lo + 1, 10)
+            _ -> assert(false)
+    assert_eq(args_for(workload_named("sort_limit").unwrap(), s, 0, 0).len(), 0)
+end args_ranges
+
+@test("new events take a fresh key per run and execution")
+args_events()
+    val s = scale_named("XS").unwrap()
+    val w = workload_named("insert_txn").unwrap()
+    assert(args_for(w, s, 0, 1)[0] != args_for(w, s, 0, 2)[0])
+    assert(args_for(w, s, 1, 0)[0] != args_for(w, s, 0, 0)[0])
+    assert_eq(args_for(w, s, 0, 0).len(), 3)
+
+@test("engine families come from the name")
+families()
+    assert_eq(family("terndb-embedded"), "terndb")
+    assert_eq(family("terndb-server"), "terndb")
+    assert_eq(family("duckdb-1t"), "duckdb")
+    assert_eq(family("postgres-par4"), "postgres")
+
+// -- report --------------------------------------------------------------------------------------
+
+@test("times print in the unit that keeps them between 1 and 1000")
+report_units()
+    assert_eq(time_text(12.34), "12.3 µs")
+    assert_eq(time_text(999.0), "999 µs")
+    assert_eq(time_text(1000.0), "1.00 ms")
+    assert_eq(time_text(2500000.0), "2.50 s")
+    assert_eq(time_text(0.5), "0.500 µs")
+    assert_eq(spread_text(2000.0, 150.0), "2.00 ± 0.150 ms")
+    assert_eq(ratio_text(None), "—")
+    assert_eq(ratio_text(Some((2.0, 0.25))), "2.00× ± 0.250")
+
+@test("table cells escape a bar and fold lines")
+report_cells()
+    assert_eq(one_line("a|b\nc"), "a\\|b c")
+    assert_eq(one_line(""), "")
+
+@test("behind lists only measured workloads TernDB is slower on, against the fastest rival, ranked")
+report_behind()
+    val f = ResultFile("0.0.1", "inproc", "S", buf(), buf())
+    f.records.push(rec("a", "terndb-embedded", Measured, [100.0, 100.0]))
+    f.records.push(rec("a", "duckdb", Measured, [10.0, 10.0]))
+    f.records.push(rec("a", "duckdb-1t", Measured, [20.0, 20.0]))
+    f.records.push(rec("b", "terndb-embedded", Measured, [5.0, 5.0]))
+    f.records.push(rec("b", "duckdb", Measured, [10.0, 10.0]))
+    f.records.push(rec("c", "terndb-embedded", Measured, [400.0, 400.0]))
+    f.records.push(rec("c", "duckdb", Measured, [2.0, 2.0]))
+    f.records.push(rec("d", "terndb-embedded", Failed("x"), []))
+    f.records.push(rec("d", "duckdb", Measured, [1.0, 1.0]))
+    val b = ranked(behind_of(f, None))
+    assert_eq(b.len(), 2)
+    assert_eq(b[0].workload, "c")
+    assert_eq(b[0].times, 200.0)
+    assert_eq(b[1].workload, "a")
+    assert_eq(b[1].rival, "duckdb")
+    assert_eq(b[1].times, 10.0)
+end report_behind
+
+@test("a time the answer check refused is shown as a wrong answer and left out of the ranking")
+report_mismatch()
+    val f = ResultFile("0.0.1", "inproc", "S", buf(), buf())
+    f.records.push(rec("a", "terndb-embedded", Measured, [100.0, 100.0]))
+    f.records.push(rec("a", "duckdb", Measured, [10.0, 10.0]))
+    val v = ResultFile("0.0.1", "verify", "S", buf(), buf())
+    v.records.push(rec("a", "terndb-embedded", Mismatch("row 0"), []))
+    v.records.push(rec("a", "duckdb", Measured, []))
+    assert_eq(behind_of(f, Some(v)).len(), 0)
+    assert(time_table(f, Some(v)).contains("wrong answer"))
+    assert(verdict_for(Some(v), "a", "duckdb-1t") == Some(Measured))
+    assert(verdict_for(Some(v), "a", "terndb-server").is_none())
+end report_mismatch

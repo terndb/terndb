@@ -1,0 +1,128 @@
+module sh.sysl.terndb_bench
+
+import sh.sysl.terndb.Envelope
+import sh.sysl.terndb_bench.pq
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.text.{CString, cstring, from_cstring, parse_long}
+
+// PostgreSQL over its Unix socket through libpq. A prepared statement is `PQprepare` (the server
+// infers the parameter types, as for any client that sends untyped parameters); a run is
+// `PQexecPrepared` with text parameters and text results, which libpq receives in full before it
+// returns. The bulk path is `COPY … FROM STDIN` in text format.
+
+struct PgDb
+    label: string
+    conn: *pq.Conn
+    stmts: Buf[CString]
+
+    private error(self) -> string = from_cstring(pq.error_message(self.conn)).unwrap_or("").trim_end()
+
+    /** Runs prepared statement `stmt`, answering the result for the caller to read and clear. */
+    private execute(*self, stmt: usize, args: []const Arg) -> Result[*pq.Result, string]
+        val texts = buf[CString]()
+        for a in args
+            texts.push(cstring(a match
+                ANull -> ""
+                AInt(n) -> n.to_string()
+                AReal(x) -> real_literal(x)
+                AText(s) -> s))
+        val ptrs = buf[*u8]()
+        for i in 0..<args.len
+            ptrs.push(args[i] match
+                ANull -> null
+                _ -> texts[i].ptr)
+        val res = pq.exec_prepared(self.conn, self.stmts[stmt].ptr, i32(args.len), if args.len == 0 then null else as_ptr(ptrs.view()),
+            null, null, 0)
+        judged(res, self.error())
+end PgDb
+
+/** `res` when it is a success, else its error, the result cleared. */
+private judged(res: *pq.Result, otherwise: string) -> Result[*pq.Result, string]
+    if res == null then return Err(otherwise)
+    val st = pq.result_status(res)
+    if st == pq.TuplesOk || st == pq.CommandOk || st == pq.CopyIn then return Ok(res)
+    val text = from_cstring(pq.result_error_message(res)).unwrap_or(otherwise).trim_end()
+    pq.clear(res)
+    Err(text)
+
+private changed(res: *pq.Result) -> u64 = parse_long(from_cstring(pq.cmd_tuples(res)).unwrap_or("")) match
+    Ok(n) -> u64(n)
+    Err(_) -> 0
+
+impl Db for PgDb
+    name(self) -> string = self.label
+
+    exec(*self, sql: string) -> Result[unit, string]
+        val text = cstring(sql)
+        val res = judged(pq.exec(self.conn, text.ptr), self.error())?
+        pq.clear(res)
+        Ok(())
+
+    prepare(*self, sql: string) -> Result[usize, string]
+        val name = cstring(s"s${self.stmts.len()}")
+        val text = cstring(sql)
+        val res = judged(pq.prepare(self.conn, name.ptr, text.ptr, 0, null), self.error())?
+        pq.clear(res)
+        self.stmts.push(name)
+        Ok(self.stmts.len() - 1)
+
+    prepare_tree(*self, env: Envelope) -> Result[usize, string] = Err("PostgreSQL takes SQL, not a TernDB tree")
+
+    run(*self, stmt: usize, args: []const Arg) -> Result[u64, string]
+        val res = self.execute(stmt, args)?
+        val n = if pq.result_status(res) == pq.TuplesOk then u64(pq.ntuples(res)) else changed(res)
+        pq.clear(res)
+        Ok(n)
+
+    answer(*self, stmt: usize, args: []const Arg) -> Result[Buf[Buf[Cell]], string]
+        val res = self.execute(stmt, args)?
+        val out = buf[Buf[Cell]]()
+        val cols = pq.nfields(res)
+        for r in 0..<pq.ntuples(res)
+            val cells = buf[Cell]()
+            for c in 0..<cols
+                if pq.getisnull(res, r, c) != 0
+                    cells.push(CNull)
+                else
+                    val text = from_cstring(pq.getvalue(res, r, c)).unwrap_or("")
+                    cells.push(pg_cell(pq.ftype(res, c), text))
+            out.push(cells)
+        pq.clear(res)
+        Ok(out)
+
+    /** `COPY … FROM STDIN`, PostgreSQL's bulk path, in chunks of 10,000 rows. */
+    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
+        val sql = cstring(s"copy $table from stdin")
+        val res = judged(pq.exec(self.conn, sql.ptr), self.error())?
+        pq.clear(res)
+        var at = from
+        while at <= to
+            val last = if at + 9999 < to then at + 9999 else to
+            val text = copy_text(s, table, at, last)
+            if pq.put_copy_data(self.conn, as_ptr(text.bytes), i32(text.len)) != 1 then return Err(self.error())
+            at = last + 1
+        if pq.put_copy_end(self.conn, null) != 1 then return Err(self.error())
+        val done = judged(pq.get_result(self.conn), self.error())?
+        pq.clear(done)
+        loop
+            val more = pq.get_result(self.conn)
+            if more == null then break
+            pq.clear(more)
+        Ok(())
+
+    close(*self)
+        if self.conn != null
+            pq.finish(self.conn)
+            self.conn = null
+
+/** A connection to the PostgreSQL server `conninfo` names. */
+pg_open(label: string, conninfo: string) -> Result[&PgDb, string]
+    val info = cstring(conninfo)
+    val c = pq.connectdb(info.ptr)
+    if pq.status(c) != pq.ConnectionOk
+        val e = from_cstring(pq.error_message(c)).unwrap_or("").trim_end()
+        pq.finish(c)
+        return Err(e)
+    val d: &PgDb = PgDb(label, c, buf())
+    Ok(d)

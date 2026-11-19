@@ -1,0 +1,28 @@
+// The release benchmark (`bench/README.md`): TernDB against DuckDB in process and against PostgreSQL
+// over a Unix socket, every engine driven from this one sysl program, so the client side is the same
+// language and the same loop for all three.
+//
+// DuckDB installs no `.pc` file, so its header and library paths are passed:
+//
+//     sysl build bench --release -O3 --include-path duckdb=/opt/homebrew/include --link-path /opt/homebrew/lib
+package {
+  name    = "terndb_bench"
+  version = "0.0.1"
+  sysl    = "0.11.0"
+}
+
+requires {
+  os    = true
+  heap  = true
+  posix = true
+  libc  = true
+
+  pkg_config {
+    libpq = "PostgreSQL's client library: `postgresql@16` from Homebrew installs libpq.pc"
+  }
+}
+
+dependencies {
+  terndb { path = ".." }
+  duckdb { git = "github.com/sysl-lang/duckdb", version = "0.1.1" }
+}

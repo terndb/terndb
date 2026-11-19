@@ -1,0 +1,70 @@
+/** The part of libpq the benchmark's PostgreSQL driver calls, as `libpq-fe.h` declares it. Every name
+ * is a symbol of `libpq.dylib`; `PGconn` and `PGresult` are allocated and freed by the library, so
+ * both are opaque here.
+ */
+module sh.sysl.terndb_bench.pq
+
+@include("libpq-fe.h")
+
+opaque struct Conn
+
+opaque struct Result
+
+/** `CONNECTION_OK`. */
+const ConnectionOk: i32 = 0
+
+/** `PGRES_COMMAND_OK`, `PGRES_TUPLES_OK`, `PGRES_COPY_IN`. */
+const CommandOk: i32 = 1
+const TuplesOk: i32 = 2
+const CopyIn: i32 = 4
+
+@needs(posix)
+extern "PQconnectdb" connectdb(conninfo: *u8) -> *Conn
+
+extern "PQstatus" status(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQfinish" finish(conn: *Conn)
+
+extern "PQerrorMessage" error_message(conn: *Conn) -> *u8
+
+extern "PQserverVersion" server_version(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQexec" exec(conn: *Conn, command: *u8) -> *Result
+
+@needs(posix)
+extern "PQprepare" prepare(conn: *Conn, name: *u8, query: *u8, n_params: i32, param_types: *u32) -> *Result
+
+@needs(posix)
+extern "PQexecPrepared" exec_prepared(conn: *Conn, name: *u8, n_params: i32, param_values: **u8,
+                                      param_lengths: *i32, param_formats: *i32, result_format: i32) -> *Result
+
+@needs(posix)
+extern "PQputCopyData" put_copy_data(conn: *Conn, buffer: *u8, nbytes: i32) -> i32
+
+@needs(posix)
+extern "PQputCopyEnd" put_copy_end(conn: *Conn, errormsg: *u8) -> i32
+
+@needs(posix)
+extern "PQgetResult" get_result(conn: *Conn) -> *Result
+
+extern "PQresultStatus" result_status(res: *Result) -> i32
+
+extern "PQresultErrorMessage" result_error_message(res: *Result) -> *u8
+
+extern "PQntuples" ntuples(res: *Result) -> i32
+
+extern "PQnfields" nfields(res: *Result) -> i32
+
+extern "PQftype" ftype(res: *Result, field_num: i32) -> u32
+
+extern "PQgetvalue" getvalue(res: *Result, tup_num: i32, field_num: i32) -> *u8
+
+extern "PQgetlength" getlength(res: *Result, tup_num: i32, field_num: i32) -> i32
+
+extern "PQgetisnull" getisnull(res: *Result, tup_num: i32, field_num: i32) -> i32
+
+extern "PQcmdTuples" cmd_tuples(res: *Result) -> *u8
+
+extern "PQclear" clear(res: *Result)

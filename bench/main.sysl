@@ -1,0 +1,299 @@
+// `bench` -- TernDB's release benchmark (`bench/README.md`).
+//
+//     bench verify --scale S --pg <conninfo> --socket <path> --out <file>
+//     bench time --pair inproc|server --scale S [--only a,b] [--pg <conninfo>] [--socket <path>] --out <file>
+//     bench concurrent --engine terndb|postgres --clients 4 --seconds 5 --runs 5 --scale S ... --out <file>
+//     bench report <results dir>
+//     bench diff <old.json> <new.json>
+//
+// The TernDB server's password is $TERNDB_PASSWORD.
+
+import sh.sysl.duckdb
+import sh.sysl.terndb_bench.{AInt, Change, Db, Failed, Improved, Lost, Measured, Record, Regressed, ResultFile, Scale, Workload,
+    behind_of, diff_files, duck_open, file_json, file_of, load_all, only, pg_open, ranked, scale_named, spread_text, summarize,
+    tern_embedded, tern_server, time_table, time_workload, time_text, verify_table, verify_workload, workloads, sig3}
+import sysl.args.{cli, option, parse_or_exit}
+import sysl.buf.{Buf, buf}
+import sysl.env
+import sysl.fs.{entries, read_text, write_text}
+import sysl.process.start
+import sysl.text.{parse_int, split}
+import sysl.time.monotonic
+
+main(args: []string)
+    if args.len < 2 then usage()
+    args[1] match
+        "verify" -> verify_main(args[1..])
+        "time" -> time_main(args[1..])
+        "concurrent" -> concurrent_main(args[1..])
+        "client" -> client_main(args[1..])
+        "report" -> report_main(args[1..])
+        "diff" -> diff_main(args[1..])
+        _ -> usage()
+
+usage() -> never
+    eprints("usage: bench verify|time|concurrent|report|diff ... (see bench/README.md)\n")
+    exit(2)
+
+die(what: string) -> never
+    eprints(s"bench: error: $what\n")
+    exit(1)
+
+log(line: string)
+    eprints(line + "\n")
+
+private password() -> string = env.get("TERNDB_PASSWORD").unwrap_or("bench")
+
+private scale_of(name: string) -> Scale = scale_named(name) match
+    Some(s) -> s
+    None -> die(s"no scale '$name' (XS, S, M, L)")
+
+private open_or_die[T](what: string, r: Result[T, string]) -> T = r match
+    Ok(x) -> x
+    Err(e) -> die(s"$what: $e")
+
+private save(path: string, f: ResultFile)
+    write_text(path, file_json(f).to_string() + "\n") match
+        Ok(_) -> ()
+        Err(e) -> die(s"$path: ${e.message()}")
+
+private load_or_die(db: &Db, s: Scale)
+    val t0 = monotonic().us
+    load_all(db, s) match
+        Ok(_) -> log(s"loaded ${db.name()} at ${s.name} in ${time_text(real(monotonic().us - t0))}")
+        Err(e) -> die(s"loading ${db.name()}: $e")
+
+private chosen(only: string) -> Buf[Workload]
+    val out = buf[Workload]()
+    for w in workloads()
+        if only == "" then out.push(w)
+        else
+            for n in split(only, ",")
+                if n == w.name then out.push(w)
+    out
+
+private facts(s: Scale) -> Buf[(string, string)]
+    val f = buf[(string, string)]()
+    f.push(("scale_orders", s.orders.to_string()))
+    f.push(("duckdb_version", duckdb.version()))
+    f.push(("min_runs", "5"))
+    f.push(("max_runs", "15"))
+    f.push(("fixed_runs", "3"))
+    f.push(("budget_us", "3000000"))
+    f.push(("warmups", "2 (1 for a load or a mutation)"))
+    f
+
+// -- verify -----------------------------------------------------------------------------------
+
+verify_main(args: []string)
+    val scale = option('s', "scale", "name", "XS, S, M or L")
+    val pg = option('p', "pg", "conninfo", "the PostgreSQL database")
+    val socket = option('k', "socket", "path", "the TernDB server's Unix socket")
+    val only = option('w', "only", "names", "only these workloads, comma-separated")
+    val out = option('o', "out", "path", "where the results go")
+    val opts = parse_or_exit(cli("bench verify", [scale, pg, socket, only, out], about = "Checks every engine's answers against the others."), args)
+    val s = scale_of(opts.value_or(scale, "S"))
+
+    val dbs = buf[&Db]()
+    dbs.push(open_or_die("postgres", pg_open("postgres", opts.value_or(pg, ""))))
+    dbs.push(open_or_die("duckdb", duck_open("duckdb", 0)))
+    dbs.push(open_or_die("terndb-embedded", tern_embedded()))
+    if opts.given(socket) then dbs.push(open_or_die("terndb-server", tern_server(opts.value(socket).unwrap(), password())))
+    for db in dbs
+        load_or_die(db, s)
+
+    var f = ResultFile("0.0.1", "verify", s.name, facts(s), buf())
+    for w in chosen(opts.value_or(only, ""))
+        log(s"verify ${w.name}")
+        f.records.extend(verify_workload(dbs.view(), w, s).view())
+        save(opts.value_or(out, "verify.json"), f)
+    for db in dbs
+        db.close()
+
+// -- time ---------------------------------------------------------------------------------------
+
+time_main(args: []string)
+    val pair = option('P', "pair", "name", "inproc or server")
+    val scale = option('s', "scale", "name", "XS, S, M or L")
+    val pg = option('p', "pg", "conninfo", "the PostgreSQL database (server pair)")
+    val socket = option('k', "socket", "path", "the TernDB server's Unix socket (server pair)")
+    val only = option('w', "only", "names", "only these workloads, comma-separated")
+    val out = option('o', "out", "path", "where the results go")
+    val opts = parse_or_exit(cli("bench time", [pair, scale, pg, socket, only, out], about = "Times the workloads on one pair."), args)
+    val s = scale_of(opts.value_or(scale, "S"))
+    val p = opts.value_or(pair, "inproc")
+
+    // Every engine of the pair; the second lane of a pair reads the first's data where it is the
+    // same database (PostgreSQL's parallel lane), and is timed on reads only.
+    val dbs = buf[&Db]()
+    val reads_only = buf[&Db]()
+    if p == "inproc"
+        val t = open_or_die("terndb-embedded", tern_embedded())
+        val d = open_or_die("duckdb", duck_open("duckdb", 0))
+        val d1 = open_or_die("duckdb-1t", duck_open("duckdb-1t", 1))
+        load_or_die(t, s)
+        load_or_die(d, s)
+        load_or_die(d1, s)
+        dbs.push(t)
+        dbs.push(d)
+        dbs.push(d1)
+    elif p == "server"
+        val t = open_or_die("terndb-server", tern_server(opts.value_or(socket, "terndb.sock"), password()))
+        val g = open_or_die("postgres", pg_open("postgres", opts.value_or(pg, "")))
+        val g4 = open_or_die("postgres-par4", pg_open("postgres-par4", opts.value_or(pg, "")))
+        load_or_die(t, s)
+        load_or_die(g, s)
+        open_or_die("set", g.exec("set max_parallel_workers_per_gather = 0"))
+        open_or_die("set", g4.exec("set max_parallel_workers_per_gather = 4"))
+        dbs.push(t)
+        dbs.push(g)
+        reads_only.push(g4)
+    else
+        die(s"no pair '$p' (inproc, server)")
+
+    var f = ResultFile("0.0.1", p, s.name, facts(s), buf())
+    for w in chosen(opts.value_or(only, ""))
+        log(s"time ${w.name} at ${s.name}")
+        val lanes = buf[&Db]()
+        lanes.extend(dbs.view())
+        if w.kind == sh.sysl.terndb_bench.Kind.Read then lanes.extend(reads_only.view())
+        f.records.extend(time_workload(lanes.view(), w, s, log).view())
+        save(opts.value_or(out, s"$p-${s.name}.json"), f)
+    for db in dbs
+        db.close()
+    for db in reads_only
+        db.close()
+
+// -- concurrent ---------------------------------------------------------------------------------
+
+// `clients` processes, each its own connection, each committing transactions of one point read of
+// `orders` and one insert into `events` for `seconds`; a run's figure is the wall time per committed
+// transaction across all clients.
+concurrent_main(args: []string)
+    val engine = option('e', "engine", "name", "terndb or postgres")
+    val clients = option('c', "clients", "n", "how many client processes")
+    val seconds = option('t', "seconds", "n", "how long each run lasts")
+    val runs = option('r', "runs", "n", "how many runs")
+    val scale = option('s', "scale", "name", "XS, S, M or L (must be the loaded one)")
+    val pg = option('p', "pg", "conninfo", "the PostgreSQL database")
+    val socket = option('k', "socket", "path", "the TernDB server's Unix socket")
+    val load = option('l', "load", "yes", "load the data first")
+    val out = option('o', "out", "path", "where the results go")
+    val opts = parse_or_exit(cli("bench concurrent", [engine, clients, seconds, runs, scale, pg, socket, load, out],
+        about = "Concurrent read/write transactions over the server pair."), args)
+    val e = opts.value_or(engine, "terndb")
+    val n = parse_int(opts.value_or(clients, "4")).unwrap_or(4)
+    val secs = opts.value_or(seconds, "5")
+    val s = scale_of(opts.value_or(scale, "S"))
+    val conn_arg = if e == "terndb" then opts.value_or(socket, "terndb.sock") else opts.value_or(pg, "")
+
+    val setup: &Db = if e == "terndb" then open_or_die("terndb", tern_server(conn_arg, password())) else open_or_die("postgres", pg_open("postgres", conn_arg))
+    if opts.given(load) then load_or_die(setup, s)
+    val name = if e == "terndb" then "terndb-server" else "postgres"
+    val runs_us = buf[real]()
+    var last = 0u64
+    for r in 0..<parse_int(opts.value_or(runs, "5")).unwrap_or(5)
+        open_or_die("setup", setup.exec("drop table if exists events"))
+        open_or_die("setup", setup.exec("create table events (id bigint primary key, user_id bigint not null, amount bigint not null)"))
+        val exe = env.current_exe().unwrap_or(args[0])
+        val kids = buf[&sysl.process.Child]()
+        val t0 = monotonic().us
+        for c in 0..<n
+            kids.push(open_or_die("client", start(exe, ["client", e, conn_arg, s.name, secs, (c + 1).to_string()]).map_err((x) -> x.message())))
+        var total = 0u64
+        for k in kids
+            val o = open_or_die("client", k.wait().map_err((x) -> x.message()))
+            parse_int(o.text.trim()) match
+                Ok(v) -> total += u64(v)
+                Err(_) -> die(s"a client said '${o.text.trim()}'")
+        val t1 = monotonic().us
+        if total == 0 then die("no transaction committed")
+        val per = real(t1 - t0) / real(total)
+        log(s"concurrent $name clients=$n run ${r + 1}: $total txns, ${sig3(per)} us/txn")
+        runs_us.push(per)
+        last = total
+    val rec = Record(s"concurrent_c$n", name, last, last, Measured, runs_us)
+    val path = opts.value_or(out, s"concurrent-$name-$n.json")
+    val prior = read_text(path) match
+        Ok(t) -> file_of(t).ok()
+        Err(_) -> None
+    var f = prior.unwrap_or(ResultFile("0.0.1", "concurrent", s.name, facts(s), buf()))
+    f.records.push(rec)
+    save(path, f)
+    setup.close()
+
+// One concurrent client: prints how many transactions it committed in `seconds`.
+client_main(args: []string)
+    if args.len < 6 then usage()
+    val e = args[1]
+    val s = scale_of(args[3])
+    val secs = parse_int(args[4]).unwrap_or(5)
+    val id = long(parse_int(args[5]).unwrap_or(1))
+    val db: &Db = if e == "terndb" then open_or_die("terndb", tern_server(args[2], password())) else open_or_die("postgres", pg_open("postgres", args[2]))
+    val read = open_or_die("prepare", db.prepare("select amount from orders where id = $1"))
+    val write = open_or_die("prepare", db.prepare("insert into events values ($1, $2, $3)"))
+    val until = monotonic().us + long(secs) * 1000000
+    var committed = 0
+    var i = 0
+    while monotonic().us < until
+        i += 1
+        val key = id * 1000000000 + long(i)
+        var ok = db.exec("begin").is_ok()
+        ok = ok && db.run(read, [AInt(1 + (key * 7919) % s.orders)]).is_ok()
+        ok = ok && db.run(write, [AInt(key), AInt(1 + key % s.users()), AInt(key % 100000)]).is_ok()
+        ok = ok && db.exec("commit").is_ok()
+        if ok then committed += 1
+        else
+            val _ = db.exec("rollback")
+    print(committed.to_string())
+    db.close()
+
+// -- report and diff ----------------------------------------------------------------------------
+
+report_main(args: []string)
+    if args.len < 2 then usage()
+    val dir = args[1]
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(e) -> die(s"$dir: ${e.message()}")
+    val files = buf[ResultFile]()
+    for n in names
+        if n.ends_with(".json")
+            read_text(dir + "/" + n) match
+                Ok(t) -> files.push(open_or_die(n, file_of(t)))
+                Err(e) -> die(s"$n: ${e.message()}")
+    var text = ""
+    val behind = buf[sh.sysl.terndb_bench.Behind]()
+    for pass in ["verify", "inproc", "server", "concurrent"]
+        for scale in ["XS", "S", "M", "L"]
+            for f in files
+                if f.pair != pass || f.scale != scale then continue
+                var verify: Option[ResultFile] = None
+                for v in files
+                    if v.pair == "verify" && v.scale == f.scale then verify = Some(v)
+                text = text + s"\n#### ${f.pair}, scale ${f.scale}\n\n"
+                if pass == "verify"
+                    text = text + verify_table(f)
+                else
+                    text = text + time_table(f, verify)
+                    behind.extend(behind_of(f, verify).view())
+    text = text + "\n#### TernDB behind its fastest rival, slowest first\n\n| pair | scale | workload | fastest rival | TernDB's time over the rival's |\n|---|---|---|---|---:|\n"
+    for b in ranked(behind)
+        text = text + s"| ${b.pair} | ${b.scale} | ${b.workload} | ${b.rival} | ${sig3(b.times)}× |\n"
+    prints(text)
+
+diff_main(args: []string)
+    if args.len < 3 then usage()
+    val a = open_or_die(args[1], file_of(open_or_die(args[1], read_text(args[1]).map_err((e) -> e.message()))))
+    val b = open_or_die(args[2], file_of(open_or_die(args[2], read_text(args[2]).map_err((e) -> e.message()))))
+    val changes = diff_files(a, b)
+    prints("| scale | workload | engine | verdict | old | new | new/old |\n|---|---|---|---|---:|---:|---:|\n")
+    for c in changes
+        val v = c.verdict match
+            Regressed -> "**regressed**"
+            Improved -> "improved"
+            Lost -> "**no longer measured**"
+            sh.sysl.terndb_bench.Added -> "new"
+            _ -> "unchanged"
+        prints(s"| ${c.scale} | ${c.workload} | ${c.engine} | $v | ${time_text(c.old_us)} | ${time_text(c.new_us)} | ${sig3(c.ratio)} |\n")
+    if only(changes, Regressed).len() > 0 then exit(3)
