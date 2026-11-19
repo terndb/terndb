@@ -116,8 +116,8 @@ impl Db for DuckDb
         Ok(out)
 
     /** The appender, DuckDB's bulk path. */
-    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
-        val app = self.con.appender(table).map_err((e) -> e.message)?
+    bulk(*self, s: Scale, table: string, into: string, from: long, to: long) -> Result[unit, string]
+        val app = self.con.appender(into).map_err((e) -> e.message)?
         for id in from..to
             for a in row(s, table, id)
                 val r = a match

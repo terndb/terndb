@@ -1,7 +1,7 @@
 module sh.sysl.terndb_bench
 
 import sysl.buf.{Buf, buf}
-import sysl.slices.sort
+import sysl.slices.sort_by
 
 // The statistics a report prints for one engine on one workload: the timed runs' mean, their sample
 // standard deviation, median, minimum and maximum, all in microseconds.
@@ -28,9 +28,9 @@ summarize(xs: []const real) -> Summary
         sq += (x - mean) * (x - mean)
     val sd = if n > 1 then (sq / real(n - 1)).sqrt() else 0.0
 
-    val sorted = buf[real]()
+    var sorted = buf[real]()
     sorted.extend(xs)
-    sort(sorted.view_mut())
+    sort_by(sorted.view_mut(), (a, b) -> a.total_lt(b))
     val median = if n % 2 == 1 then sorted[n / 2] else (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     Summary(n, mean, sd, median, sorted[0], sorted[n - 1])
 

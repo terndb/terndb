@@ -92,8 +92,8 @@ impl Db for PgDb
         Ok(out)
 
     /** `COPY … FROM STDIN`, PostgreSQL's bulk path, in chunks of 10,000 rows. */
-    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
-        val sql = cstring(s"copy $table from stdin")
+    bulk(*self, s: Scale, table: string, into: string, from: long, to: long) -> Result[unit, string]
+        val sql = cstring(s"copy $into from stdin")
         val res = judged(pq.exec(self.conn, sql.ptr), self.error())?
         pq.clear(res)
         var at = from

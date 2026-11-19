@@ -158,7 +158,7 @@ verify_table(v: ResultFile) -> string
 /** `s` on one line, its `|` escaped, so it sits in a table cell. */
 one_line(s: string) -> string
     var out = ""
-    for ch in s.chars()
+    for ch in s.chars
         if ch == '\n' then out = out + " "
         elif ch == '|' then out = out + "\\|"
         else out = out + ch.to_string()
@@ -197,7 +197,7 @@ behind_of(f: ResultFile, v: Option[ResultFile]) -> Buf[Behind]
 
 /** `xs` slowest first. */
 ranked(xs: Buf[Behind]) -> Buf[Behind]
-    val out = buf[Behind]()
+    var out = buf[Behind]()
     out.extend(xs.view())
     sort_by(out.view_mut(), (a, b) -> a.times > b.times)
     out

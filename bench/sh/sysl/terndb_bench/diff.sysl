@@ -13,7 +13,7 @@ const Threshold: real = 0.10
 /** How many standard errors the difference must exceed. */
 const Sigmas: real = 3.0
 
-enum Verdict derives Eq
+enum Verdict
     Regressed
     Improved
     Unchanged

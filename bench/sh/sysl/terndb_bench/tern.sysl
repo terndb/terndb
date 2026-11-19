@@ -180,8 +180,8 @@ impl Db for TernDb
             None -> Ok(buf())
 
     /** A relation-valued parameter (`query-tree.md` §10.4) as an `Insert`'s source, sent columnar. */
-    bulk(*self, s: Scale, table: string, from: long, to: long) -> Result[unit, string]
-        val probe = self.prepare(s"select * from $table where id = 0")?
+    bulk(*self, s: Scale, table: string, into: string, from: long, to: long) -> Result[unit, string]
+        val probe = self.prepare(s"select * from $into where id = 0")?
         val record = self.stmts[probe].result.unwrap().base() match
             Type.Bag(e) | Type.List(e) -> *e
             _ -> return Err("no record type")
@@ -193,7 +193,7 @@ impl Db for TernDb
             columns.push(f.name)
         val decls = buf[ParamDecl]()
         decls.push(ParamDecl(None, Type.Bag(record)))
-        val env = Envelope(TreeMajor, TreeMinor, decls, Insert(QualName("public", table), table, None, columns,
+        val env = Envelope(TreeMajor, TreeMinor, decls, Insert(QualName("public", into), into, None, columns,
             ParamScan("source", 0), None, buf()), None)
         val stmt = self.prepare_env(env)?
         val rows = buf[Value]()

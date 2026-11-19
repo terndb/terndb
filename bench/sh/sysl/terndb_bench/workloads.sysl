@@ -15,7 +15,7 @@ enum TernForm
     TernTree(name: string)
 
 /** What one timed run does. */
-enum Kind derives Eq
+enum Kind
     /** `ops` executions of one prepared query. */
     Read
     /** `begin`, `ops` executions of one prepared statement, `commit`. */

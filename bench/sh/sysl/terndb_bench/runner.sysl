@@ -55,7 +55,7 @@ load_all(db: &Db, s: Scale) -> Result[unit, string]
         while at <= rows
             val last = if at + 9999 < rows then at + 9999 else rows
             if bulk_ok
-                db.bulk(s, t, at, last) match
+                db.bulk(s, t, t, at, last) match
                     Ok(_) -> ()
                     Err(_) ->
                         bulk_ok = false
@@ -170,7 +170,7 @@ run_once(l: *Lane, w: Workload, s: Scale, run: usize, insert_texts: []const stri
             var at = 1
             while at <= s.orders
                 val last = if at + 9999 < s.orders then at + 9999 else s.orders
-                db.bulk(s, "load_orders", at, last)?
+                db.bulk(s, "orders", "load_orders", at, last)?
                 at = last + 1
             db.exec("commit")?
             val t1 = monotonic().us
