@@ -319,6 +319,69 @@ a_statement_with_a_parameter_is_refused()
     assert(got.starts_with("ERROR:  "), got)
     assert_eq(s.errors, 1)
 
+@test
+a_missing_table_in_a_named_schema_points_at_its_name()
+    var s = sq_shell()
+    s.run_script("insert into app.nosuch values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'app.nosuch'\nLINE 1: insert into app.nosuch values (1);\n" + " ".repeat(24) + "^\n")
+
+@test
+a_missing_quoted_table_keeps_its_case()
+    var s = sq_shell()
+    s.run_script("insert into \"NoSuch\" values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.NoSuch'\nLINE 1: insert into \"NoSuch\" values (1);\n" + " ".repeat(20) + "^\n")
+
+@test
+a_missing_relation_of_the_catalog_namespace()
+    var s = sq_shell()
+    s.run_script("insert into catalog.nosuch values (1);\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'catalog.nosuch'\nLINE 1: insert into catalog.nosuch values (1);\n" + " ".repeat(28) + "^\n")
+
+@test
+a_missing_table_beside_a_known_one_is_the_one_named()
+    var s = sq_shell()
+    s.run_script("select name, title from users join nosuch on author = users.id;\n")
+    assert_eq(sq_err(&s), "ERROR:  Q2001: no table or view 'public.nosuch'\nLINE 1: select name, title from users join nosuch on author = users.id;\n" +
+        " ".repeat(43) + "^\n")
+
+@test
+nesting_past_the_limit_is_refused_before_it_is_sent()
+    var s = sq_shell()
+    s.run_script("select " + "(".repeat(300) + "1" + ")".repeat(300) + ";\n")
+    assert(sq_err(&s).starts_with("ERROR:  Q1006: "), "too deep")
+    assert_eq(s.errors, 1)
+
+// -- edges -----------------------------------------------------------------------------------------
+
+@test
+empty_statements_run_nothing()
+    var s = sq_shell()
+    s.run_script(";\n;;\n  ;  -- nothing\n")
+    assert_eq(sq_out(&s), "")
+    assert_eq(s.errors, 0)
+
+@test
+on_conflict_without_a_target_uses_the_primary_key_from_the_catalog()
+    assert_eq(sq_run("insert into users values (1, 'again', null), (4, 'di', null) on conflict do nothing;\nselect count(*) from users;\n"),
+        "INSERT 0 1\n count\n-------\n     4\n(1 row)\n")
+
+@test
+a_view_s_columns_resolve_beside_a_table()
+    assert_eq(sq_run("create view busy as select author, count(*) as n from posts group by author;\n" +
+        "select name, n from busy join users on author = id order by name;\n"),
+        "CREATE VIEW\n name | n\n------+---\n ann  | 2\n bob  | 1\n cy   | 1\n(3 rows)\n")
+
+@test
+an_empty_table_shows_its_headings()
+    assert_eq(sq_run("create table e (a int64 primary key, b text);\nselect * from e;\nselect count(*) from e;\n"),
+        "CREATE TABLE\n a | b\n---+---\n(0 rows)\n count\n-------\n     0\n(1 row)\n")
+
+@test
+a_table_without_a_primary_key_is_refused_by_the_server_and_stays_missing()
+    assert_eq(sq_run("create table k (a int64, b text);\ninsert into k values (1, 'x');\n"),
+        "ERROR:  Q6009: a table has no primary key\nERROR:  Q2001: no table or view 'public.k'\nLINE 1: insert into k values (1, 'x');\n" +
+        " ".repeat(20) + "^\n")
+
 // -- engine errors -----------------------------------------------------------------------------------
 
 @test

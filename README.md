@@ -7,20 +7,51 @@ GraphQL-shaped answer of users, their posts and each post's comments comes back 
 batched join per level. The native input is a typed query tree, and SQL and GraphQL are front ends that produce it.
 One storage engine runs in memory for development and tests, and on disk for production.
 
-TernDB is in design. What runs so far is one program, `terndb`: a psql-like shell, and an in-memory server
-over a Unix-domain socket.
+TernDB is in design. What runs so far is one program, `terndb`: a psql-like shell that speaks
+[TernDB's SQL](docs/spec/sql.md), and an in-memory server over a Unix-domain socket.
+
+## Quick start
+
+Build it from the repository's root:
 
 ```
 sysl build cli
-cli/terndb
+```
+
+Run `cli/terndb` for a shell over an in-memory database of its own, which lasts as long as the shell does. Type
+statements ending in `;` (they may span lines), `\dt` to list tables, `\d name` to describe one, `\?` for help and
+`\q` to quit:
+
+```
+terndb=> create table users (id int64 primary key, name text not null, city text);
+CREATE TABLE
+terndb=> insert into users values (1, 'ann', 'oslo'), (2, 'bob', 'rome');
+INSERT 0 2
+terndb=> select name from users where city = 'oslo';
+ name
+------
+ ann
+(1 row)
+```
+
+Every table needs a primary key. Unqualified names are in the schema `public`, which a new database already has.
+The shell also runs a statement given with `-c`, or a file with `-f`, and reads a script from standard input:
+
+```
+cli/terndb -c "select 1 + 1 as two;"
+```
+
+To share one database between shells, start a server in one terminal and connect to it from another:
+
+```
 TERNDB_PASSWORD=secret cli/terndb serve --socket /tmp/terndb.sock
 TERNDB_PASSWORD=secret cli/terndb --socket /tmp/terndb.sock
 ```
 
-With no socket the shell opens an in-memory database of its own, which lasts as long as the shell does. A
-client logs in as the role `terndb` with the server's password (SCRAM-SHA-256) and speaks the
-[native protocol](docs/spec/wire-protocol.md). TCP needs TLS, which is not served yet. Flags and design:
-[the server](docs/design/engine.md#the-server) and [the shell](docs/design/shell.md).
+The server stops on Ctrl-C, and its data goes with it. A client logs in as the role `terndb` with the server's
+password (SCRAM-SHA-256) and speaks the [native protocol](docs/spec/wire-protocol.md). TCP needs TLS, which is
+not served yet. Flags and design: [the server](docs/design/engine.md#the-server) and
+[the shell](docs/design/shell.md).
 
 ## What it does differently
 
