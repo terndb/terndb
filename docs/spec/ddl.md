@@ -82,7 +82,8 @@ in the same statement, in dependency order (§2.11).
 3. A column is in one of three **states**: `ready`, `filling` (being backfilled, §8.2) or `converting` (being
    retyped, §8.5). Only a `ready` column is visible to statements: a `Scan` does not output a column in another
    state, and naming one is `Q2003`. A writer still writes every column of its schema version, whatever its state
-   (§5.4).
+   (§5.4). That rule is for queries and definition expressions; what an `AlterTable` action may do to a column
+   that is not `ready` is §2.13 rule 11.
 
 ### 2.4 The primary key
 
@@ -405,6 +406,18 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
     a table with no room is refused here, before anything is recorded; a retype that does not enlarge it (a text to
     an int8, an int64 to an int8) never is, because the table already fitted.
     `Q6011` (rule 2) is checked first. The statement has no effect when refused.
+11. **Actions on a column that is not `ready`.** An `AlterTable` action naming a column in state `converting` or
+    `filling` finds it by name (it is the statement, not a query, so `Q2003` of §2.3 rule 3 does not apply to it), and
+    the actions of one statement apply in order. A statement never sees a column its own earlier action made
+    `converting` or `filling`, because a name touched by two actions is `Q6016` (§3.3 rule 3): the state is the one
+    the column had before the statement.
+    - `retype_column` of a `converting` column is `Q6023` (§8.5 rule 4); of a `filling` column `Q6024` (§8.5 rule 5).
+    - `drop_column` of a `converting` column is allowed and abandons its conversion (§8.3).
+    - `rename_column` of a `converting` column is allowed and the conversion continues under the new name (§8.4).
+    - `set_default` of a `converting` column is allowed only for a default valid at both its current type and its
+      target type; a default that is not is `Q3001` as for any column (§8.6).
+    A refused action leaves the catalog unchanged and the statement's other actions unapplied. A column that is
+    `filling` takes `drop_column`, `rename_column` and `set_default` as a `ready` one does.
 
 ## 3. DDL statement trees
 
@@ -990,6 +1003,12 @@ that record rolls it back like any write.
 
 - **Kind:** metadata-only. A new schema version without the column. A primary-key column cannot be dropped
   (`Q6007`); nor can a column an index, constraint, generated column or view uses, unless `cascade` drops those.
+- **A `converting` column** may be dropped (§2.13 rule 11). The drop abandons the conversion: the column's entry,
+  its target type, its `using`, its guard and its replacement indexes (§8.5 rule 2) leave with it in the same
+  transaction, and the `convert_column` job is cancelled in that transaction (§7 rule 6), so it finds nothing left
+  to do: no converted value survives and its final transaction never runs. The `cascade` rule above applies to the
+  column's own indexes and constraints as to any column's. Re-adding a column under the dropped name adds a new
+  column with a new column id (§2.3 rule 1), which is `ready` or `filling` by §8.1 and §8.2 and never `converting`.
 - **Running transactions:** a transaction that resolved the column, or read the whole column list, conflicts. One
   that never named it commits; its writes at the old version still carry the column's bytes, which no later
   version reads.
@@ -1004,6 +1023,10 @@ that record rolls it back like any write.
   unchanged, so no row is touched. Every stored definition that names the column (checks, index expressions,
   generated columns, defaults, views) is rewritten to the new name in the same transaction. Renaming a table also
   rewrites the views that scan it.
+- **A `converting` column** may be renamed (§2.13 rule 11). The column keeps its id, its state and its target, the
+  `using` expression and the guard (§8.5 rule 2) are rewritten to the new name with every other definition, and the
+  `convert_column` job, which finds its column by id, continues; its final transaction makes the column `ready` in
+  its target type under the new name. A `retype_column` of it under the new name is `Q6023`.
 - **Running transactions:** a transaction that resolved the old name conflicts; others do not notice.
 - **Crash:** the catalog rows only.
 - **Old rows:** unchanged; they are matched by column id.
@@ -1048,10 +1071,21 @@ its old type and at its new one (`Q6022`, nothing recorded), whether the retype 
    transaction has made it `ready`, including after a failed job, which returns it to `ready` in its old type. A
    metadata-only retype (rule 1) completes within its statement, so a later retype of the column is never refused
    for it, and a retype of another column of the same table is unaffected by one that converts.
+5. **A column that is still `filling` is not retyped.** A `retype_column` naming a column in state `filling` (§8.2)
+   is refused with `Q6024` ("the column is being filled; wait for the fill to finish"), whatever the new type or
+   `using`, with the effects of rule 4: checked at the same point, before rule 2's conversion and §2.13 rule 10's
+   limits, nothing recorded, the statement's other actions unapplied. It is a code of its own, not `Q6023`, because
+   `Q6023` says the column is being *retyped* and a fill is not a retype, and a client's remedy differs (wait for
+   the `fill_column` job). The column can be retyped once the job has made it `ready`. A column added by the same
+   `AlterTable` is not retyped in it either, but that is `Q6016` (§3.3 rule 3), not this code.
 
 ### 8.6 Set or drop a default; drop or set not null
 
 - **Set or drop a default:** metadata-only, a new schema version. The fill of existing columns does not change.
+  Setting the default of a `converting` column (§2.13 rule 11) checks it twice, against the column's current type
+  and against its target type (§8.5 rule 2); it is accepted only if both accept it, and otherwise `Q3001`, the code
+  of a default that does not fit its column. A default that is null is valid at both when both types are nullable.
+  Dropping the default is always allowed, and the default stays when the conversion finishes or fails.
   Transactions that inserted without naming the column conflict (§6.3).
 - **Drop not null** (`set_nullable` true): metadata-only, a new schema version, lossless (`T → T?`). Transactions
   that resolved the column conflict, since its type changed.

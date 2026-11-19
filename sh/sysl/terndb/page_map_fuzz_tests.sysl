@@ -1,0 +1,293 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+import sysl.slices.sort_by
+
+// Differential tests of the page map (`page_map.sysl`, `docs/design/page-map.md`): many short seeded
+// runs, each applying random sets, replacements, removes and lookups to the map and to a plain sorted
+// model, comparing every answer, while a sample of older versions is kept and re-verified against the
+// model copies taken with them. A failure names the seed, the PID pattern and the operation index, and
+// the run is replayed with `fz_run(seed, mode, ops)`.
+
+/** The PID patterns: dense low pages, sparse PIDs over all 63 bits, PIDs at and beside every level
+ * boundary, the extremes of every space, a single PID, and growth to a deep tree then removal of all.
+ */
+private const FzModes: usize = 6
+
+private struct FzEntry
+    pid: u64
+    f: &PageFrame
+
+private fz_frame(pid: u64) -> &PageFrame = PageFrame(pid, 0, [0; 16384])
+
+/** Fails the test naming the run: `seed`, `mode`, operation `step` and what went wrong. */
+private fz_fail(seed: u64, mode: usize, step: usize, what: string)
+    panic(s"page map fuzz: seed $seed mode $mode op $step: $what")
+
+private fz_need(c: bool, seed: u64, mode: usize, step: usize, what: string)
+    if !c then fz_fail(seed, mode, step, what)
+
+/** Where `pid` is in the model (a linear scan, so that nothing is shared with the map's own search),
+ * or where it would go.
+ */
+private fz_find(m: Buf[FzEntry], pid: u64) -> (usize, bool)
+    var i: usize = 0
+
+    while i < m.len() && m[i].pid < pid
+        i += 1
+
+    (i, i < m.len() && m[i].pid == pid)
+
+private fz_pow(k: usize) -> u64 = u64(1) << (6 * u64(k))
+
+/** The PIDs every pattern leans on: the first and last page of each space and each level's boundary,
+ * with their neighbours.
+ */
+private fz_edges() -> Buf[u64]
+    val out = buf[u64]()
+
+    for s in 0..<8
+        val base = u64(s) << 60
+        out.push(base)
+        out.push(base | PidNumberMask)
+        for k in 1..<10
+            out.push(base | (fz_pow(k) - 1))
+            out.push(base | fz_pow(k))
+            out.push(base | (fz_pow(k) + 1))
+
+    out.push(MaxPid)
+    out.push(MaxPid - 1)
+    out
+
+private fz_pick(g: *Rng, mode: usize, edges: Buf[u64], model: Buf[FzEntry], phase_down: bool) -> u64
+    if mode == 0 then return g.below(300)
+    if mode == 1 then return (g.next_u64() & MaxPid) >> g.below(63)
+    if mode == 2
+        val e = edges[usize(g.below(u64(edges.len())))]
+        val p = if g.below(3) == 0 && e > 0 then e - 1 else e
+        return if p > MaxPid then MaxPid else p
+    if mode == 3 then return edges[usize(g.below(u64(edges.len())))] & MaxPid
+    if mode == 4 then return [u64(0), 63, 64, 4096, MaxPid, u64(1) << 60][usize(g.below(6))]
+
+    if phase_down && model.len() > 0 && g.below(8) != 0
+        return model[usize(g.below(u64(model.len())))].pid
+
+    (g.next_u64() & MaxPid) >> g.below(63)
+
+/** The nodes of `m`, as addresses. */
+private fz_nodes(m: PageMap) -> Buf[u64]
+    val out = buf[u64]()
+
+    for s in 0..<8
+        m.roots[s] match
+            Some(r) -> fz_collect(r, out)
+            None -> ()
+
+    out
+
+private fz_collect(n: &PmNode, out: Buf[u64])
+    out.push(u64(usize(&*n)))
+
+    for i in 0..<64
+        pm_kid(n, i) match
+            Some(c) -> fz_collect(c, out)
+            None -> ()
+
+private fz_has(xs: Buf[u64], x: u64) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+/** The number of nodes of `b` that `a` does not have. A path copy to one PID makes at most one per
+ * level of the space's tree, and a set makes exactly that many.
+ */
+private fz_fresh(a: PageMap, b: PageMap) -> usize
+    val old = fz_nodes(a)
+    var n: usize = 0
+
+    for x in fz_nodes(b)
+        if !fz_has(old, x) then n += 1
+
+    n
+
+/** `m` and `model` agree on everything observable: the check, `len`, `last`, the full walk, and
+ * `get`, `seek` and `iter_from` at the model's PIDs, their neighbours and random ones.
+ */
+private fz_agree(m: PageMap, model: Buf[FzEntry], g: *Rng, mode: usize, edges: Buf[u64], seed: u64, step: usize, tag: string)
+    check_page_map(m) match
+        Some(e) -> fz_fail(seed, mode, step, s"$tag: structure: $e")
+        None -> ()
+
+    fz_need(m.len() == u64(model.len()), seed, mode, step, s"$tag: len ${m.len()} != ${model.len()}")
+    fz_need(m.is_empty() == (model.len() == 0), seed, mode, step, s"$tag: is_empty")
+    var i: usize = 0
+
+    for (p, f) in m.iter()
+        fz_need(i < model.len(), seed, mode, step, s"$tag: walk runs past the model at $p")
+        fz_need(p == model[i].pid, seed, mode, step, s"$tag: walk pid $p, model ${model[i].pid}")
+        fz_need(f === model[i].f, seed, mode, step, s"$tag: walk frame of $p")
+        i += 1
+
+    fz_need(i == model.len(), seed, mode, step, s"$tag: walk length $i != ${model.len()}")
+
+    m.last() match
+        Some((p, f)) ->
+            fz_need(model.len() > 0 && p == model[model.len() - 1].pid && f === model[model.len() - 1].f, seed, mode, step, s"$tag: last $p")
+        None -> fz_need(model.len() == 0, seed, mode, step, s"$tag: last is None")
+
+    for k in 0..<12
+        val p = if k < 4 && model.len() > 0 then model[usize(g.below(u64(model.len())))].pid else fz_pick(g, mode, edges, model, false)
+        fz_probe(m, model, p, seed, mode, step, tag)
+        if p < MaxPid then fz_probe(m, model, p + 1, seed, mode, step, tag)
+        if p > 0 then fz_probe(m, model, p - 1, seed, mode, step, tag)
+
+    fz_probe(m, model, 0, seed, mode, step, tag)
+    fz_probe(m, model, MaxPid, seed, mode, step, tag)
+    fz_probe(m, model, MaxPid + 1, seed, mode, step, tag)
+    fz_probe(m, model, 0xFFFFFFFFFFFFFFFF, seed, mode, step, tag)
+
+/** `get`, `seek` and a bounded `iter_from` at `p` against the model. */
+private fz_probe(m: PageMap, model: Buf[FzEntry], p: u64, seed: u64, mode: usize, step: usize, tag: string)
+    val (at, found) = fz_find(model, p)
+    val legal = p <= MaxPid
+
+    m.get(p) match
+        Some(f) -> fz_need(legal && found && f === model[at].f, seed, mode, step, s"$tag: get $p answered a frame it should not")
+        None -> fz_need(!(legal && found), seed, mode, step, s"$tag: get $p missed a mapped page")
+
+    m.seek(p) match
+        Some((q, f)) ->
+            fz_need(legal && at < model.len() && q == model[at].pid && f === model[at].f, seed, mode, step, s"$tag: seek $p answered $q")
+        None -> fz_need(!legal || at == model.len(), seed, mode, step, s"$tag: seek $p found nothing")
+
+    var j = at
+    var n: usize = 0
+
+    for (q, f) in m.iter_from(p)
+        if n >= 6 then break
+        fz_need(legal && j < model.len() && q == model[j].pid && f === model[j].f, seed, mode, step, s"$tag: iter_from $p gave $q")
+        j += 1
+        n += 1
+
+    fz_need(n == 6 || !legal || j == model.len(), seed, mode, step, s"$tag: iter_from $p stopped early")
+
+/** One seeded run of pattern `mode`: `ops` operations, with older versions sampled as they appear and
+ * re-verified against the models taken with them, so that no later write may have disturbed one.
+ */
+private fz_run(seed: u64, mode: usize, ops: usize)
+    var g = rng(seed, 1000 + u64(mode))
+    val edges = fz_edges()
+    var m = page_map()
+    val model = buf[FzEntry]()
+    val olds = buf[PageMap]()
+    val old_models = buf[Buf[FzEntry]]()
+    val old_steps = buf[usize]()
+
+    for step in 0..<ops
+        val phase_down = mode == 5 && step >= ops / 2
+        val p = fz_pick(&g, mode, edges, model, phase_down)
+        val (at, found) = fz_find(model, p)
+        val before = m
+        val sp = pid_space(p)
+        val op = g.below(10)
+        var kind = "get"
+
+        if phase_down && op < 8 || !phase_down && op >= 6 && op < 8
+            kind = "remove"
+            m = m.remove(p)
+            if found
+                model.remove(at)
+                fz_need(fz_fresh(before, m) <= before.heights[sp], seed, mode, step, "remove copied more than its path")
+            else
+                fz_need(m.len() == before.len(), seed, mode, step, "remove of an absent PID changed len")
+                fz_need(fz_fresh(before, m) == 0, seed, mode, step, "remove of an absent PID built nodes")
+        elif !phase_down && op < 6
+            kind = if found then "replace" else "set"
+            val f = fz_frame(p)
+            m = m.set(p, f)
+            if found then model[at] = FzEntry(p, f) else model.insert(at, FzEntry(p, f))
+            val grown = before.heights[sp] > 0 && m.heights[sp] > before.heights[sp]
+            val expect = if grown then 2 * m.heights[sp] - 1 - before.heights[sp] else m.heights[sp]
+            fz_need(fz_fresh(before, m) == expect, seed, mode, step, s"$kind of $p copied ${fz_fresh(before, m)} nodes, expected $expect")
+            fz_need(m.get(p).unwrap() === f, seed, mode, step, s"$kind of $p not read back")
+        else
+            m.get(p) match
+                Some(f) -> fz_need(found && f === model[at].f, seed, mode, step, s"get $p")
+                None -> fz_need(!found, seed, mode, step, s"get $p missed")
+
+        fz_need(m.len() == u64(model.len()), seed, mode, step, s"$kind $p: len")
+
+        if g.below(10) == 0
+            if olds.len() < 12
+                olds.push(m)
+                old_models.push(model.copy())
+                old_steps.push(step)
+            else
+                val k = usize(g.below(12))
+                olds[k] = m
+                old_models[k] = model.copy()
+                old_steps[k] = step
+
+        if step % 60 == 59
+            fz_agree(m, model, &g, mode, edges, seed, step, "current")
+            for k in 0..<olds.len()
+                fz_agree(olds[k], old_models[k], &g, mode, edges, seed, step, s"version taken at op ${old_steps[k]}")
+
+    fz_agree(m, model, &g, mode, edges, seed, ops, "final")
+
+    for k in 0..<olds.len()
+        fz_agree(olds[k], old_models[k], &g, mode, edges, seed, ops, s"version taken at op ${old_steps[k]} (end)")
+
+    // Every PID removed again: the map is empty, and the versions still hold.
+    var left = buf[u64]()
+
+    for e in model
+        left.push(e.pid)
+
+    g.shuffle(left.view_mut())
+
+    for i in 0..<left.len()
+        m = m.remove(left[i])
+        val (at, found) = fz_find(model, left[i])
+        fz_need(found, seed, mode, ops + i, "model lost a PID")
+        model.remove(at)
+
+    fz_agree(m, model, &g, mode, edges, seed, ops + left.len(), "emptied")
+    var tail = m.iter()
+    fz_need(m.is_empty() && m.last().is_none() && tail.next().is_none(), seed, mode, ops + left.len(), "emptied map is not empty")
+
+    for k in 0..<olds.len()
+        fz_agree(olds[k], old_models[k], &g, mode, edges, seed, ops + left.len(), s"version taken at op ${old_steps[k]} (after emptying)")
+
+@test
+the_map_agrees_with_the_model_on_dense_low_pages()
+    for seed in 0..<30
+        fz_run(seed, 0, 400)
+
+@test
+the_map_agrees_with_the_model_on_sparse_pids_over_63_bits()
+    for seed in 0..<8
+        fz_run(seed, 1, 300)
+
+@test
+the_map_agrees_with_the_model_at_every_level_boundary()
+    for seed in 0..<8
+        fz_run(seed, 2, 300)
+
+@test
+the_map_agrees_with_the_model_at_the_extremes_of_every_space()
+    for seed in 0..<8
+        fz_run(seed, 3, 200)
+
+@test
+the_map_agrees_with_the_model_as_a_single_element_map()
+    for seed in 0..<30
+        fz_run(seed, 4, 120)
+
+@test
+the_map_agrees_with_the_model_growing_deep_and_shrinking_back()
+    for seed in 0..<8
+        fz_run(seed, 5, 400)
