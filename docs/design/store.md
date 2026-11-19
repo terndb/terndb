@@ -2,7 +2,7 @@
 
 `sh/sysl/terndb/store.sysl` is the table store of the in-memory mode and its multi-version concurrency control:
 `isolation.md` §4.1–§4.5 and the abort rules and codes of §5. The executor runs statements against it
-(`executor.md` §4.5) through `scan_rows`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
+(`executor.md` §4.5) through `scan_range`, `get` and `write_rows`. Its tests are `store_tests.sysl` (the mechanism and every code) and `store_anomaly_tests.sysl` (the §7.2
 workloads at each level, and each forbidden anomaly again on a fault-injected store); the unique keys and
 foreign keys of `store_index.sysl` are tested in `store_constraint_tests.sysl` and, through DML, in
 `exec_dml_constraint_tests.sysl`. `Faults` holds the fault-injected builds of §7.1 (validation or first-updater-wins
@@ -79,8 +79,11 @@ version older than the newest committed image's aborts with `schema_changed` (`d
 
 ## What the executor calls
 
-- **`scan_rows(t, table, logged)`** answers every row visible to `t` and logs `logged`; the executor filters the
-  rows itself, vectorised, so the predicate's closure runs only in validation.
+- **`scan_range(t, table, lo, hi, logged)`** answers every row visible to `t` whose encoded key lies between `lo`
+  and `hi`, and logs `logged` whatever the range, even an empty one; `scan_rows(t, table, logged)` is the whole
+  range. The executor chooses the range from its filter (`executor.md` §4.6) and filters the rows itself,
+  vectorised, so the predicate's closure runs only in validation. `slots_read` counts the leaf entries these
+  scans visit, for the tests that an access path reads only its range.
 - **`write_rows(t, table, changes)`** applies one statement's writes, each a `RowChange`: `Put` a new row (an
   insert, under §4.2 rule 4), `Replace` or `Remove` the row of a key the statement read. It answers `Wait`
   before writing any of them if one key is locked, so a waited statement leaves no trace. The executor orders

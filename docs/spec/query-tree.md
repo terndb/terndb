@@ -391,6 +391,12 @@ rows (§10.4).
 2. `Project` evaluates each item once per input row. `items` MUST be non-empty (`Q5009`) with unique
    names (`Q2005`). Items MAY be relation-valued (`Relation`, §7.9); this is how nested results are
    written. A list input stays a list in the same order.
+3. When `predicate` is an `and` (at any nesting) one of whose conjuncts is not `true` for a row, the
+   other conjuncts MAY go unevaluated for that row, and a runtime error they would raise then does
+   not occur; this relaxes §7.12 rule 1 for a `Filter`'s predicate, and for an `Update`'s or
+   `Delete`'s `filter` (§9.4). If every row's predicate evaluates without error, the `Filter` raises
+   no error from it. *Rationale: a scan that reads only the key range a conjunct on the primary key
+   allows never evaluates the predicate on the rows outside it.*
 
 ### 6.5 Join
 

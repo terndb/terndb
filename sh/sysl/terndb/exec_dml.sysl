@@ -24,7 +24,7 @@ enum Executed
  */
 run_statement(env: Envelope, s: &Store, t: &Txn, ctx: Ctx) -> Result[Executed, CodecError]
     s.statement(t)
-    val c = if ctx.draws.is_some() then ctx else Ctx(ctx.params, ctx.now, Some(Draws(s, None)))
+    val c = if ctx.draws.is_some() then ctx else Ctx(ctx.params, ctx.now, Some(Draws(s, None)), ctx.work)
 
     run_in(env, s, t, c) match
         Ok(o) -> Ok(o)
@@ -204,7 +204,7 @@ private eval_defs(s: &Store, ctx: Ctx, rows: ColumnVector, exprs: Buf[Expr]) -> 
 
     val env = envelope([ParamDecl(None, bag(rows.ty))], Query(Project(ParamScan("row", 0), "d", items)))
     val typing = type_envelope(env, s.catalog)?
-    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now, as_definer(ctx.draws)), buf[MemTable]())
+    val plan = plan_query(env, typing, Ctx(items_of([rel(values_of(rows).view())]), ctx.now, as_definer(ctx.draws), ctx.work), buf[MemTable]())
     val r = drain_rows(plan.op, plan.elem)?
 
     for j in 0..<exprs.len()
@@ -975,7 +975,9 @@ private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
         None -> ()
 
     val none = buf[TKey]()
-    val scan: &Operator = ScanOp(s, t, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), buf[ColumnVector](), false, 0)
+    // The rows `filter` keeps, or whose pairs an inner join's `on` keeps, lie in the key range its
+    // comparisons of the target's primary key allow (`exec_access.sysl`).
+    val scan = store_scan(db, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), access_of(db, tg.table, binder, f, c))
     val target = Lowered(scan, binder, tg.row, none)
 
     val input = joined match

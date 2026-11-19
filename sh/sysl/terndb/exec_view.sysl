@@ -52,7 +52,7 @@ private[terndb] view_op(d: Db, name: QualName, elem: Type, ctx: Ctx) -> &Operato
         Some(x) -> Some(Draws(x.store, if x.role.is_some() then Some(v.owner) else None))
         None -> None
 
-    ViewOp(d, v.query, elem, Ctx(buf[Value](), ctx.now, draws), None)
+    ViewOp(d, v.query, elem, Ctx(buf[Value](), ctx.now, draws, ctx.work), None)
 
 // -- privileges, `ddl.md` §2.10 rule 8 -----------------------------------------------------------
 

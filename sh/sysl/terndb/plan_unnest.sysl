@@ -1091,10 +1091,18 @@ private struct Unnester
             Values(b, cols, rows) -> self.push_values(d, b, cols, rows, elem, ordered)
             Filter(input, p) ->
                 self.unordered = !ordered
-                val i = self.push(d, *input)?
+                val pushed = self.push(d, *input)?
+                val m = un_subst_of(d.keys, pushed.dref)
+                // Over a cross join with the domain, the predicate's plain conjuncts become the join's
+                // `on`, so that a conjunct equating an input column with an outer reference is a merge
+                // key and the pairs of different bindings are never formed (unnesting.md §2).
+                val (i, whole) = un_fold(pushed, p, m)
                 var l = self.lifter(i, true)
-                val p2 = self.expr(p, un_subst_of(d.keys, i.dref), &l, true)
+                val p2 = self.expr(p, m, &l, true)
                 val f = self.finish(l)
+
+                if whole then return Some(f)
+
                 Some(un_over(f, Filter(f.rel, p2)))
             Project(input, b, items) ->
                 self.unordered = !ordered
@@ -1399,6 +1407,49 @@ end Unnester
 private un_sorted(w: UnRw) -> Rel = w.order match
     Some(ks) -> if ks.len() > 0 then Sort(w.rel, ks) else w.rel
     None -> w.rel
+
+/** The conjuncts of `e`, through every `and`. */
+private un_conjuncts(e: Expr, out: Buf[Expr])
+    e match
+        Call(f, args) ->
+            if f == "and" && args.len() == 2
+                un_conjuncts(args[0], out)
+                un_conjuncts(args[1], out)
+                return
+        _ -> ()
+
+    out.push(e)
+
+/** `i`, the input of a `Filter` by `p` under a domain, with the conjuncts of `p` that hold no
+ * subquery, their outer references replaced by `m`, made the `on` of `i` where `i` is a cross join
+ * (an inner join with no `on`, as `cross` makes one); and whether that is all of `p`, so that the
+ * `Filter` is not needed. A `Filter` over a cross join and the join with the `Filter`'s predicate as its
+ * `on` have one result; the predicate's conjuncts may go unevaluated on a pair another makes not
+ * `true` in both (§6.4 rule 3, §6.5 rule 8), and the join's are evaluated only on pairs, which are the
+ * rows the `Filter` saw. A conjunct holding a subquery stays in the `Filter`, laid over the join.
+ */
+private un_fold(i: UnRw, p: Expr, m: UnSubst) -> (UnRw, bool)
+    val (a, b) = i.rel match
+        Join(k, a, b, None, None, None) -> if k == Inner then (*a, *b) else return (i, false)
+        _ -> return (i, false)
+
+    val cs = buf[Expr]()
+    un_conjuncts(p, cs)
+    var on: Option[Expr] = None
+    var whole = true
+
+    for c in cs
+        if un_has_subquery(c)
+            whole = false
+        else
+            var w = un_mapper()
+            w.keys = m.keys
+            w.vals = m.vals
+            on = Some(un_and_opt(on, w.expr(c)))
+
+    on match
+        Some(x) -> (un_over(i, Join(Inner, a, b, Some(x), None, None)), whole)
+        None -> (i, false)
 
 /** `w` with its relation replaced by `r`, which passes its binders through. */
 private un_over(w: UnRw, r: Rel) -> UnRw = UnRw(r, w.orig, w.names, w.list, w.dref, w.order, w.positional, w.polluted)

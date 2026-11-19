@@ -218,7 +218,9 @@ of every binder's columns in §8.4 order instead, which `flatten` builds: the re
 stay visible above it.
 
 **Merge join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
-of `and`) with `a` reading only left binders and `b` only right ones. Both inputs are drained. Each
+of `and`) with `a` reading only left binders and `b` only right ones; one of the two may instead be
+a literal or a parameter, one value on every row (`same(true, d.k)` joins an uncorrelated subquery
+back to its one-row domain). Both inputs are drained. Each
 key is evaluated over each side, coerced to the two operands' common type, and both sides sorted by
 the keys with `cmp` (§3.3) through one vector of both sides' keys, so that a left and a right row
 compare as two rows of it. Runs of equal keys on the two sides are a group, and every pair of a
@@ -241,11 +243,25 @@ row under `single` is `R0003` at once. After the last left row, `right` and `ful
 right rows nothing matched. Output is queued as pieces of at most `BatchSize` rows and handed up in
 batches of exactly `BatchSize` until the last, never empty.
 
+**Semi, anti and mark joins whose `on` is keys alone** test no pair: a left row in a group of equal
+keys has a right row making `on` `true`, which is all they ask, so the group answers every left row
+in it at once.
+
 **A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a merge
-join's keys do not say for a left row they did not match. When `on` is `bool` it never is. With one
-scalar `eq` key and no residual, the mark is null exactly when the left key is null or some right
-key is (and there is a right row). Otherwise `on` is evaluated on that left row's pairs with every
-right row.
+join's keys do not say for a left row they did not match. When `on` is `bool` it never is. Otherwise
+a pair can have `on` null only where its `same` keys agree (`same` is never null), some `eq` key
+holds a null on one side, and the `eq` keys holding none on either side agree (two non-null keys that
+differ are `false`; a pair whose keys all agree was a candidate and was tested). So both sides are
+partitioned by the `same` keys; a partition's right rows are grouped by which `eq` keys hold a null
+(a mask), and each unmatched left row looks up, in each group, the rows agreeing with it on the keys
+neither holds a null in, sorted by those keys once per pair of masks. With scalar keys and no residual
+a row found decides the mark (null); otherwise `on` is evaluated on the pairs found. A `not in` over a
+subquery with nulls is therefore a sort and a search per row, not a pair per right row.
+
+**Work counts.** Every operator of an execution shares one `Work` (`exec_eval.sysl`, in `Ctx`): the
+pairs a join tested `on` on and the rows it sorted by its keys. They depend only on the plan and the
+rows, so a test bounds them to catch a plan that does quadratic work, whatever the machine's speed
+(`unnest_work_tests.sysl`).
 
 **When `on` is evaluated** is §6.5 rule 8, written into the spec by this work: only on pairs, so
 never when a side is empty (the merge join evaluates no key then), and a conjunct may go unevaluated
@@ -381,9 +397,9 @@ or `Blocked` on a row lock. At read committed it first takes the statement's sna
 validation, runtime, a constraint, the store's — aborts the transaction with its code
 (`isolation.md` §5.1); a statement on an ended transaction is `W2001` or `W2003`.
 
-- **Scan** (§6.1): `ScanOp` reads every row visible at the snapshot from the store on its first pull,
-  in key order, and hands it up in `BatchSize` batches. A correlated scan is planned again per outer
-  row (§4.2) and so read and logged once per row.
+- **Scan** (§6.1): `ScanOp` reads the rows visible at the snapshot in its access path's key range
+  (§4.6) from the store on its first pull, in key order, and hands them up in `BatchSize` batches. A
+  correlated scan is planned again per outer row (§4.2) and so read and logged once per row.
 - **The logged predicate** (`isolation.md` §4.4). A `Filter` directly over a `Scan` is the scan's
   logged predicate unless it holds a subquery: the store keeps it as a closure that evaluates the
   typed filter on a one-row vector of a write image, counting an error or an image of another schema
@@ -393,7 +409,8 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
   whole, which reads every column. A projection, aggregate or nest above a scan narrows it to the
   columns their expressions name.
 - **DML** (§9). A statement reads everything first and writes last (§9.1). `Update`/`Delete` scan the
-  target (logging `filter` when there is no `from`/`using`), join `from`/`using` by `filter` with
+  target (logging `filter` when there is no `from`/`using`, its key range chosen from `filter` as a
+  `Filter`'s is, §4.6), join `from`/`using` by `filter` with
   `plan_join` or filter the scan, refuse a target key matched twice (`R0007`), evaluate `set` over the
   matched rows vectorised, and coerce each value into its column. `Insert` drains its source, places
   each column by name with its default (evaluated per row) or null (`Q3005` for a NOT NULL column with
@@ -421,6 +438,48 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
   `sysl.posix.time`.
 
 Not yet: translation of a row of an older schema version (`ddl.md` §5.3).
+
+### 4.6 Access paths: the primary key
+
+The code is `exec_access.sysl`. A scan of a table that a `Filter` sits directly over, and the target
+scan of an `Update` or `Delete`, read only the range of the table's B+tree that the filter's
+comparisons of the **primary key** allow; the filter itself still runs over every row read.
+
+- **Which conjuncts count.** The filter is split into its `and` conjuncts at any nesting. A conjunct
+  counts when it is `eq`, `lt`, `le`, `gt` or `ge` between a key column of the scan's own binder (a bare
+  `Col`, on either side) and an operand fixed for the statement: a `Literal`, a `Null`, a `Param` or a
+  `Cast` of these. An outer row's value is a `Param` by the time the filter is planned (§4.2), so a
+  correlated subquery's key comparison counts, looked up afresh per outer row. `BETWEEN` arrives as
+  `ge` and `le`. An `or`, a `not`, `ne`, `is_null`, a call and a subquery never narrow the scan.
+- **Values.** The operand is evaluated once at planning. A null makes the conjunct, and so the
+  filter, never true: the scan reads nothing (`NoRows`). An operand that fails to evaluate is dropped,
+  so its error is raised by the filter on the rows it reads, exactly as without the access path. The
+  operand is encoded under the key column's §4.6 encoding when its type is the column's, or when both
+  are integers and the column's type holds the value (an `int32` against an `int64` key, a
+  non-negative `int64` against a `uint32` one); any other pair, a value out of the column's range and
+  a column whose type in the tree is not the catalog's leave the conjunct to the filter.
+- **The range.** Equalities on a leading run of the key's columns fix a prefix of the key's encoding,
+  which no other component's encoding extends (§4.6 rule 3), so the keys beginning with it are exactly
+  the rows holding those values: `KeyLookup` when every column is fixed, a range otherwise. The column
+  after the run may take one bound on each side, the tighter one where several are given:
+  `>= v` starts at prefix·v, `> v` at the successor of prefix·v (the least string above every string
+  beginning with it), `< v` ends before prefix·v and `<= v` before its successor. A condition on a
+  later column, or on a column after a gap, is left to the filter. Inverted bounds make an empty range,
+  which the B+tree cursor ends at once.
+- **Semantics.** The range holds every row the filter keeps, so the result is the full scan's, in the
+  same key order. The read is logged with the same predicate as before (`isolation.md` §4.4: the
+  filter, which implies the range, so `key ∈ [a, b) ∧ F` is `F`), and it is logged even when the range
+  is empty or a null made it `NoRows`, so a phantom inserted into the range still fails a serializable
+  commit. Visibility is per slot and every version of a row lives at its key's slot, so a range read
+  sees exactly the versions a full scan would. The rows outside the range are never filtered, so a
+  runtime error the filter would raise only on them does not occur (`query-tree.md` §6.4 rule 3).
+- **Measured, not timed.** `Store.slots_read` counts the leaf entries the executor's scans visit; the
+  tests assert each access path visits only its range, and a differential test compares random
+  predicates with the same predicate under `or false`, which is never narrowed.
+
+Not yet: secondary and unique indexes (`store_index.sysl`) as access paths. A read through one must
+fetch each primary row and check its visibility, and must not use an index whose build has not
+finished; that is a later item.
 
 ## 5. What this note relies on in `query-tree.md`
 

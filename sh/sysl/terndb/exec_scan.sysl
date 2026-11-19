@@ -141,11 +141,13 @@ private row_passes(p: TExpr, binder: string, elem: Type, version: u64, ctx: Ctx,
         Err(_) -> true
 
 /** The operator reading `table` under `binder` from `d`'s store at its transaction's snapshot, its
- * read logged with `filter` as its predicate. A view reads its stored query in its place
- * (`exec_view.sysl`), whose scans log their own reads; a relation of `catalog` reads the catalog the
- * transaction sees (`catalog_relations.sysl`), and logs nothing.
+ * read logged with `filter` as its predicate. `kept` is the predicate its rows are filtered by above
+ * it, whose comparisons of the primary key with fixed values choose the key range it reads
+ * (`exec_access.sysl`). A view reads its stored query in its place (`exec_view.sysl`), whose scans
+ * log their own reads; a relation of `catalog` reads the catalog the transaction sees
+ * (`catalog_relations.sysl`), and logs nothing.
  */
-private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filter: Option[TExpr], ctx: Ctx) -> &Operator
+private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filter: Option[TExpr], ctx: Ctx, kept: Option[TExpr] = None) -> &Operator
     if table.schema == "catalog" then return catalog_scan_op(d, table.name, elem)
 
     val i = d.store.catalog.table_at(table) match
@@ -153,10 +155,14 @@ private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filt
         None -> return view_op(d, table, elem, ctx)
 
     val ct = d.store.catalog.tables[i]
-    ScanOp(d.store, d.txn, ct.oid, elem, read_pred(d, ct, items_of([binder]), elem, filter, ctx), buf[ColumnVector](), false, 0)
+    store_scan(d, ct.oid, elem, read_pred(d, ct, items_of([binder]), elem, filter, ctx), access_of(d, ct, binder, kept, ctx))
 
-/** A table's rows visible to `txn`, read from the store on the first pull, all at once and in key
- * order, and handed up in batches of `BatchSize`.
+/** A `ScanOp` of table `oid` reading the keys `access` allows, its read logged as `logged`. */
+private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access) -> &Operator =
+    ScanOp(d.store, d.txn, oid, elem, logged, access, buf[ColumnVector](), false, 0)
+
+/** A table's rows visible to `txn` in the key range of its access path, read from the store on the
+ * first pull, all at once and in key order, and handed up in batches of `BatchSize`.
  */
 struct ScanOp
     store: &Store
@@ -164,6 +170,7 @@ struct ScanOp
     oid: u64
     elem: Type
     logged: Pred
+    access: Access
     batches: Buf[ColumnVector]
     read: bool
     at: usize
@@ -172,7 +179,7 @@ impl Operator for ScanOp
     next_batch(*self) -> Result[Option[ColumnVector], CodecError]
         if !self.read
             self.read = true
-            val hits = self.store.scan_rows(self.txn, self.oid, self.logged)?
+            val hits = self.store.scan_range(self.txn, self.oid, self.access.lo, self.access.hi, self.logged)?
             val rows = buf[Value]()
 
             for h in hits

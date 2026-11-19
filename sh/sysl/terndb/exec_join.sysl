@@ -146,6 +146,12 @@ private reads_only(x: TExpr, names: Buf[string]) -> bool
 
     bs.len() > 0
 
+/** Whether `x` reads no binder but `names`, or is a literal or a parameter, one value for every row. */
+private reads_within(x: TExpr, names: Buf[string]) -> bool
+    x.e match
+        Literal(_, _) | Param(_) | Null(_) -> true
+        _ -> reads_only(x, names)
+
 /** `x`'s conjuncts, through every `and`, sorted into equi-keys between `left` and `right` and the
  * rest.
  */
@@ -161,11 +167,14 @@ private split_on(x: TExpr, left: Buf[string], right: Buf[string], keys: Buf[Equi
                 val (a, b) = (x.kids[0], x.kids[1])
                 val t = common_type(a.ty, b.ty).unwrap()
 
-                if reads_only(a, left) && reads_only(b, right)
+                // One side may read no binder at all (a constant, or a parameter), which is the same
+                // value on every row of either side: `same(true, d.k)`, joining an uncorrelated
+                // subquery back to its one-row domain, is such a key.
+                if reads_within(a, left) && reads_within(b, right) && (reads_only(a, left) || reads_only(b, right))
                     keys.push(EquiKey(a, b, t, f == "same"))
                     return
 
-                if reads_only(b, left) && reads_only(a, right)
+                if reads_within(b, left) && reads_within(a, right) && (reads_only(b, left) || reads_only(a, right))
                     keys.push(EquiKey(b, a, t, f == "same"))
                     return
         _ -> ()
@@ -245,10 +254,62 @@ private struct Group
     r0: usize
     r1: usize
 
+/** The right rows of a mark join's partition whose `eq` keys holding a null are `mask`'s. */
+private struct MaskRun
+    mask: u64
+    rows: Buf[usize]
+
+/** A `MaskRun`'s rows sorted by the `eq` keys neither they nor a left row hold a null in (`both`
+ * being the two masks together), for looking left rows up in.
+ */
+private struct MaskLookup
+    mask: u64
+    both: u64
+    orders: Buf[KeyOrder]
+    rows: Buf[usize]
+
+/** `rows` sorted by `orders` (stable). */
+private sorted_rows(orders: Buf[KeyOrder], rows: Buf[usize]) -> Buf[usize]
+    var out = buf[usize]()
+    out.extend(rows.view())
+    var scratch = buf[usize]()
+    scratch.extend(rows.view())
+
+    if !sort_stable_by(out.view_mut(), scratch.view_mut(), (p, q) -> compare_rows(orders, p, q) < 0) then
+        panic("sorted_rows: the scratch is too short")
+
+    out
+
+/** The range of `rows`, sorted by `orders`, that compare equal to row `i`. */
+private equal_range(orders: Buf[KeyOrder], rows: Buf[usize], i: usize) -> (usize, usize)
+    var lo: usize = 0
+    var hi = rows.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if compare_rows(orders, rows[mid], i) < 0 then lo = mid + 1 else hi = mid
+
+    val first = lo
+    hi = rows.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+        if compare_rows(orders, rows[mid], i) <= 0 then lo = mid + 1 else hi = mid
+
+    (first, lo)
+
 private join_op(spec: JoinSpec, left: &Operator, right: &Operator) -> &Operator =
     JoinOp(spec, left, right, false, false, false, empty_vector(spec.lelem), buf[ColumnVector](), false, 0, 0, buf[u8](), buf[bool](),
         empty_vector(spec.relem), buf[ColumnVector](), buf[bool](), buf[usize](), buf[usize](), buf[Group](), buf[bool](), false,
-        buf[ColumnVector](), 0, 0)
+        buf[KeyOrder](), buf[KeyOrder](), buf[u64](), buf[u64](), buf[ColumnVector](), 0, 0)
+
+private zeros(n: usize) -> Buf[u64]
+    val out = buf[u64]()
+
+    for _ in 0..<n
+        out.push(0)
+
+    out
 
 private falses(n: usize) -> Buf[bool]
     val out = buf[bool]()
@@ -318,6 +379,12 @@ private struct JoinOp
     groups: Buf[Group]
     lnull: Buf[bool]
     rnull: bool
+    // for a mark's null: the orders of the `same` keys, which partition both sides, and of the `eq`
+    // keys, and each row's mask of the `eq` keys holding a null
+    porders: Buf[KeyOrder]
+    eorders: Buf[KeyOrder]
+    lmask: Buf[u64]
+    rmask: Buf[u64]
     // the output not yet handed up
     out: Buf[ColumnVector]
     out_at: usize
@@ -348,6 +415,17 @@ private struct JoinOp
             // A key is evaluated only when the other side has a row, as a nested loop would (§6.5 rule 8).
             if self.rows.len > 0 && self.rights.len > 0 then self.match_keys()?
 
+            // A semi, anti or mark join whose `on` is all keys needs no pair: a left row in a group
+            // has a right row making `on` `true`, and that is all these joins ask.
+            val k = self.spec.kind
+
+            if (k == Semi || k == Anti || k == MarkJoin) && self.spec.conds.len() == 0
+                for g in self.groups
+                    for x in g.l0..<g.l1
+                        self.hits[self.ls[x]] = 1
+
+                self.groups = buf[Group]()
+
         Ok(())
 
     /** Puts `b` in play as the left rows. */
@@ -369,28 +447,46 @@ private struct JoinOp
     private match_keys(*self) -> Result[unit, CodecError]
         val nl = self.rows.len
         val nr = self.rights.len
+        self.spec.ctx.work.sorted += u64(nl + nr)
         val lenv = env_of(self.spec.ctx, self.spec.lbinder, self.rows)
         val renv = env_of(self.spec.ctx, self.spec.rbinder, self.rights)
         val orders = buf[KeyOrder]()
+        val porders = buf[KeyOrder]()
+        val eorders = buf[KeyOrder]()
         self.lnull = falses(nl)
         val rnull = falses(nr)
+        self.lmask = zeros(nl)
+        self.rmask = zeros(nr)
 
         for k in self.spec.keys
             val a = coerce_vector(eval(k.left, lenv)?, k.ty)?.as_type(k.ty)
             val b = coerce_vector(eval(k.right, renv)?, k.ty)?.as_type(k.ty)
+            // One vector of both sides' keys, so that a left row and a right row compare as two of its rows.
+            val o = key_order(concat(k.ty, [a, b]), false, true)
+            orders.push(o)
 
-            if !k.nulls_match
+            if k.nulls_match
+                porders.push(o)
+            else
+                // Bit `e` of a row's mask: its `e`-th `eq` key holds a null (the first 64 keys).
+                val bit: u64 = if eorders.len() < 64 then u64(1) << u64(eorders.len()) else 0
+                eorders.push(o)
+
                 for i in 0..<nl
-                    if !a.is_valid(i) || (!is_scalar_type(k.ty) && holds_null(value_at(a, i))) then self.lnull[i] = true
+                    if !a.is_valid(i) || (!is_scalar_type(k.ty) && holds_null(value_at(a, i)))
+                        self.lnull[i] = true
+                        self.lmask[i] = self.lmask[i] | bit
 
                 for j in 0..<nr
-                    if !b.is_valid(j) || (!is_scalar_type(k.ty) && holds_null(value_at(b, j))) then rnull[j] = true
-
-            // One vector of both sides' keys, so that a left row and a right row compare as two of its rows.
-            orders.push(key_order(concat(k.ty, [a, b]), false, true))
+                    if !b.is_valid(j) || (!is_scalar_type(k.ty) && holds_null(value_at(b, j)))
+                        rnull[j] = true
+                        self.rmask[j] = self.rmask[j] | bit
 
         for j in 0..<nr
             if rnull[j] then self.rnull = true
+
+        self.porders = porders
+        self.eorders = eorders
 
         val ls = sorted_subset(orders, self.lnull, 0)
         val rs = sorted_subset(orders, rnull, nl)
@@ -512,6 +608,7 @@ private struct JoinOp
      * by the joins that output pairs; a second match of a left row is `R0003` for `single` (§6.5 rule 6).
      */
     private consider(*self, li: Buf[usize], ri: Buf[usize]) -> Result[unit, CodecError]
+        self.spec.ctx.work.pairs += u64(li.len())
         val (yes, unknown) = self.truth(self.spec.conds, li.view(), ri.view())?
         val pl = buf[usize]()
         val pr = buf[usize]()
@@ -563,37 +660,138 @@ private struct JoinOp
         Ok(())
 
     /** For a merge join's unmatched left rows, whether `on` is null for some right row (§6.5 rule 5),
-     * which the keys alone do not say. With one scalar `eq` key and nothing else in `on`, it is null
-     * exactly where the left key is null or some right key is; otherwise `on` is evaluated on each
-     * such row's pairs with every right row.
+     * which the keys alone do not say. A pair can have `on` null only where its `same` keys agree
+     * (`same` is never null), some `eq` key holds a null on one side, and every `eq` key holding none
+     * on either side agrees: two non-null keys that differ make `on` `false`, and a pair whose keys all
+     * agree was considered. So both sides are partitioned by the `same` keys, the right rows of a
+     * partition grouped by which `eq` keys hold a null (their mask), and a left row looks up, in each
+     * group, the rows agreeing with it on the keys neither holds a null in, sorted by those keys once
+     * per pair of masks. With scalar keys and nothing in `on` but keys, such a row decides the mark;
+     * otherwise `on` is evaluated on the pairs found. The work is a sort and a search per row, not a
+     * pair per right row.
      */
     private mark_unknowns(*self, rows: Buf[usize]) -> Result[unit, CodecError]
-        val ks = self.spec.keys
+        var scalar = true
 
-        if ks.len() == 1 && self.spec.conds.len() == 0 && !ks[0].nulls_match && is_scalar_type(ks[0].ty)
-            for i in rows
-                self.unknown[i] = self.lnull[i] || self.rnull
+        for k in self.spec.keys
+            if !k.nulls_match && !is_scalar_type(k.ty) then scalar = false
 
-            return Ok(())
+        // With no `eq` key, every pair whose keys differ has `on` false, and the pairs whose keys agree
+        // were all considered.
+        val ne = self.eorders.len()
 
+        if ne == 0 then return Ok(())
+
+        // Beyond 64 `eq` keys a mask cannot say which hold a null: every pair of a partition is a
+        // candidate.
+        val wide = ne > 64
+        val exact = scalar && self.spec.conds.len() == 0 && !wide
+        val nl = self.rows.len
+        val nr = self.rights.len
+        val open = falses(nl)
+
+        for i in rows
+            open[i] = true
+
+        // The partitions: runs of rows, of both sides, whose `same` keys agree (all rows, with none).
+        self.spec.ctx.work.sorted += u64(nl + nr)
+        val ls = sorted_subset(self.porders, falses(nl), 0)
+        val rs = sorted_subset(self.porders, falses(nr), nl)
         val on = items_of([self.spec.on.unwrap()])
         var li = buf[usize]()
         var ri = buf[usize]()
+        var a: usize = 0
+        var b: usize = 0
 
-        for i in rows
-            for j in 0..<self.rights.len
-                li.push(i)
-                ri.push(j)
+        while a < ls.len() && b < rs.len()
+            val c = compare_rows(self.porders, ls[a], rs[b])
 
-                if li.len() == BatchSize
-                    self.note_unknowns(on, li, ri)?
-                    li = buf[usize]()
-                    ri = buf[usize]()
+            if c < 0
+                a += 1
+            elif c > 0
+                b += 1
+            else
+                var a2 = a + 1
+                var b2 = b + 1
 
-        self.note_unknowns(on, li, ri)
+                while a2 < ls.len() && compare_rows(self.porders, ls[a], ls[a2]) == 0
+                    a2 += 1
+
+                while b2 < rs.len() && compare_rows(self.porders, rs[b], rs[b2]) == 0
+                    b2 += 1
+
+                // The partition's right rows by mask, and the lookups built so far.
+                val groups = buf[MaskRun]()
+
+                for y in b..<b2
+                    val m = if wide then 0 else self.rmask[rs[y] - nl]
+                    var at = groups.len()
+
+                    for g in 0..<groups.len()
+                        if groups[g].mask == m then at = g
+
+                    if at == groups.len() then groups.push(MaskRun(m, buf[usize]()))
+
+                    groups[at].rows.push(rs[y])
+
+                val runs = buf[MaskLookup]()
+
+                for x in a..<a2
+                    val i = ls[x]
+
+                    if !open[i] then continue
+
+                    val ml = if wide then 0 else self.lmask[i]
+
+                    for g in groups
+                        val u = ml | g.mask
+
+                        if u == 0 && !wide then continue
+
+                        var at = runs.len()
+
+                        for r in 0..<runs.len()
+                            if runs[r].mask == g.mask && runs[r].both == u then at = r
+
+                        if at == runs.len()
+                            val shared = buf[KeyOrder]()
+
+                            if !wide
+                                for e in 0..<ne
+                                    if (u & (u64(1) << u64(e))) == 0 then shared.push(self.eorders[e])
+
+                            self.spec.ctx.work.sorted += u64(g.rows.len())
+                            runs.push(MaskLookup(g.mask, u, shared, sorted_rows(shared, g.rows)))
+
+                        val run = runs[at]
+                        val (lo, hi) = equal_range(run.orders, run.rows, i)
+
+                        if exact
+                            if hi > lo
+                                self.unknown[i] = true
+                                break
+
+                            continue
+
+                        for y in lo..<hi
+                            li.push(i)
+                            ri.push(run.rows[y] - nl)
+
+                            if li.len() == BatchSize
+                                self.note_unknowns(on, li, ri)?
+                                li = buf[usize]()
+                                ri = buf[usize]()
+
+                a = a2
+                b = b2
+
+        if li.len() > 0 then self.note_unknowns(on, li, ri)?
+
+        Ok(())
     end mark_unknowns
 
     private note_unknowns(*self, on: Buf[TExpr], li: Buf[usize], ri: Buf[usize]) -> Result[unit, CodecError]
+        self.spec.ctx.work.pairs += u64(li.len())
         val (_, unknown) = self.truth(on, li.view(), ri.view())?
 
         for k in 0..<li.len()

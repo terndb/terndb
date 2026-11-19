@@ -475,3 +475,108 @@ a_key_on_a_field_of_a_nested_record()
 
     for kind in xj_kinds()
         xj_check(kind, d, on, oracle)
+
+// -- several keys, constant keys, and the work done ---------------------------------------------------
+
+/** Part `x` or `n.z` of the point of a row, null where the point is. */
+private xj_part(row: Value, z: bool) -> Value = xj_fields(row)[0] match
+    Record(fs) -> if z then xj_fields(fs[1])[0] else fs[0]
+    _ -> Null
+
+private xj_part_expr(b: string, c: string, z: bool) -> Expr =
+    if z then Field(Field(col(b, c), "n"), "z") else Field(col(b, c), "x")
+
+/** Points with every pattern of nulls, duplicates, and points unmatched on either side. */
+private xj_point_data() -> XjData
+    val acols = items_of([Field("ap", nullable(xj_point())), Field("v", Text)])
+    val bcols = items_of([Field("bp", nullable(xj_point())), Field("w", Text)])
+    val ap = [xj_pt(1, 1), xj_pt(1, 2), xj_pt(1, -1), xj_pt(-1, 1), Null, xj_pt(1, 1), xj_pt(2, 0), xj_pt(-1, -1), xj_pt(4, 4), xj_pt(3, 9)]
+    val bp = [xj_pt(1, 1), xj_pt(1, -1), xj_pt(-1, 1), Null, xj_pt(2, 0), xj_pt(2, 0), xj_pt(3, 3), xj_pt(5, -1), xj_pt(-1, 7)]
+    val sizes: [2]usize = [2, 3]
+    XjData(acols, bcols, xj_points("a", ap), xj_points("b", bp), items_of(sizes), buf[usize]())
+
+@test
+two_eq_keys_with_nulls_give_every_kind_its_three_valued_result()
+    // A mark is null where some right row is null-or-equal on both parts and null on one: the pairs a
+    // mark join looks up by which parts hold a null.
+    val on = call("and", [call("eq", [xj_part_expr("a", "ap", false), xj_part_expr("b", "bp", false)]),
+        call("eq", [xj_part_expr("a", "ap", true), xj_part_expr("b", "bp", true)])])
+    val oracle = (a: Value, b: Value) -> xj_kleene_and(eq(nullable(Int64), xj_part(a, false), xj_part(b, false)).unwrap(),
+        eq(nullable(Int64), xj_part(a, true), xj_part(b, true)).unwrap())
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_point_data(), on, oracle)
+
+@test
+a_same_key_beside_an_eq_key_partitions_the_null_marks()
+    // `same` on x (a null x meets a null x), `eq` on z: a mark is null only through a row of its own x.
+    val on = call("and", [call("same", [xj_part_expr("a", "ap", false), xj_part_expr("b", "bp", false)]),
+        call("eq", [xj_part_expr("a", "ap", true), xj_part_expr("b", "bp", true)])])
+    val oracle = (a: Value, b: Value) -> xj_kleene_and(Some(same(nullable(Int64), xj_part(a, false), xj_part(b, false))),
+        eq(nullable(Int64), xj_part(a, true), xj_part(b, true)).unwrap())
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_point_data(), on, oracle)
+
+@test
+an_eq_key_with_a_residual_that_can_be_null_marks_by_evaluating_on()
+    // `a.ap.x = b.bp.x and a.ap.n.z > b.bp.n.z`: the residual decides between null and false.
+    val on = call("and", [call("eq", [xj_part_expr("a", "ap", false), xj_part_expr("b", "bp", false)]),
+        call("gt", [xj_part_expr("a", "ap", true), xj_part_expr("b", "bp", true)])])
+    val oracle = (a: Value, b: Value) -> xj_kleene_and(eq(nullable(Int64), xj_part(a, false), xj_part(b, false)).unwrap(),
+        gt(nullable(Int64), xj_part(a, true), xj_part(b, true)).unwrap())
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_point_data(), on, oracle)
+
+@test
+a_constant_beside_a_column_is_a_key()
+    // `1 = b.bk and a.ak = b.bk`, and `same(true, …)` as an unnested uncorrelated subquery joins back.
+    val one = call("and", [call("eq", [Literal(Int64, Int(1)), col("b", "bk")]), xj_on_eq()])
+    val one_oracle = (a: Value, b: Value) -> xj_kleene_and(eq(nullable(Int64), Int(1), xj_k(b)).unwrap(), xj_eq_k(a, b))
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), one, one_oracle)
+
+    val t = call("and", [call("same", [Literal(Bool, Bool(true)), call("is_not_null", [col("b", "bk")])]), xj_on_eq()])
+    val t_oracle = (a: Value, b: Value) -> xj_kleene_and(Some(xj_k(b) != Null), xj_eq_k(a, b))
+
+    for kind in xj_kinds()
+        xj_check(kind, xj_mixed(), t, t_oracle)
+
+/** The pairs `r` over `d` tested. */
+private xj_pairs(d: XjData, r: Rel) -> u64
+    val q = envelope([], Query(r))
+    val typing = type_envelope(q, xj_catalog(d)).unwrap()
+    val ctx = xe_ctx([])
+    val root = plan_query(q, typing, ctx, xj_tables(d))
+    val _ = drain(root.op).unwrap()
+    ctx.work.pairs
+
+@test
+a_semi_anti_or_mark_join_on_keys_alone_tests_no_pair()
+    // A group of equal keys answers them; `inner` outputs its pairs, and a residual is tested on them.
+    for kind in [Semi, Anti, MarkJoin]
+        assert_eq(xj_pairs(xj_mixed(), xj_join(kind, Some(xj_on_eq()))), 0u64, xj_kind_name(kind))
+
+    // ak 1 twice and bk 1 once, ak 2 twice and bk 2 three times.
+    assert_eq(xj_pairs(xj_mixed(), xj_join(Inner, Some(xj_on_eq()))), 8u64)
+    val residual = call("and", [xj_on_eq(), call("lt", [col("a", "v"), col("b", "w")])])
+    assert_eq(xj_pairs(xj_mixed(), xj_join(Semi, Some(residual))), 8u64)
+
+@test
+a_mark_with_null_keys_tests_no_pair_when_on_is_scalar_keys()
+    // The null marks of two scalar `eq` keys are found by lookup alone.
+    val on = call("and", [call("eq", [xj_part_expr("a", "ap", false), xj_part_expr("b", "bp", false)]),
+        call("eq", [xj_part_expr("a", "ap", true), xj_part_expr("b", "bp", true)])])
+    assert_eq(xj_pairs(xj_point_data(), xj_join(MarkJoin, Some(on))), 0u64)
+
+@test
+a_mark_with_a_residual_pairs_an_unmatched_row_only_with_rows_a_null_could_match()
+    // `a.ak = b.bk and a.v < b.w`, left keys 1, 2, 3, null and right 1, null, 5, 6, 7: key 1's group
+    // is one pair; unmatched 2 and 3 are paired with the one null-keyed right row each, and the null
+    // left key with all five. Every unmatched row with every right row would be 3 × 5 more.
+    val on = call("and", [xj_on_eq(), call("lt", [col("a", "v"), col("b", "w")])])
+    val d = xj_data(xj_rows("a", [1, 2, 3, -1]), xj_rows("b", [1, -1, 5, 6, 7]), [], [])
+    assert_eq(xj_pairs(d, xj_join(MarkJoin, Some(on))), 8u64)
+    assert(xj_marks(d, on) == items_of([Null, Bool(true), Null, Null]))

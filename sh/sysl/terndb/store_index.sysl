@@ -130,7 +130,7 @@ private def_values(c: MemCatalog, row: Type, rows: Buf[Value], exprs: Buf[Expr])
 
     val env = envelope([ParamDecl(None, bag(row))], Query(Project(ParamScan("row", 0), "d", items)))
     val typing = type_envelope(env, c)?
-    val plan = plan_query(env, typing, Ctx(items_of([rel(rows.view())]), 0, None), buf[MemTable]())
+    val plan = plan_query(env, typing, Ctx(items_of([rel(rows.view())]), 0, None, no_work()), buf[MemTable]())
     val r = drain_rows(plan.op, plan.elem)?
 
     for j in 0..<exprs.len()

@@ -161,13 +161,14 @@ private[terndb] struct Planner
             ParamScan(binder, param) -> Lowered(param_scan(elem, self.ctx.params[usize(param)]), binder, elem, none)
             Filter(input, predicate) ->
                 // A filter right over a scan of the store is the scan's logged predicate (`isolation.md`
-                // §4.4), unless it holds a subquery, which would read other rows when validated.
+                // §4.4), unless it holds a subquery, which would read other rows when validated; its
+                // comparisons of the primary key choose the key range the scan reads.
                 (*input, self.db) match
                     (Scan(table, b), Some(d)) ->
                         val _ = self.take_type()
                         val p = self.expr(predicate)
                         val logged = if has_subquery(p) then None else Some(p)
-                        val src = scan_op(d, table, b, elem, logged, self.ctx)
+                        val src = scan_op(d, table, b, elem, logged, self.ctx, Some(p))
                         return Lowered(FilterOp(src, b, p, self.ctx), b, elem, none)
                     _ -> ()
 

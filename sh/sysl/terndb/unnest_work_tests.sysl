@@ -1,0 +1,477 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// The work an unnested correlated subquery does (`plan_unnest.sysl`, `docs/design/unnesting.md` §4).
+// Each shape is unnested and run over tables of two sizes, ten times apart, and the pairs of rows its
+// joins tested (`Work`, `exec_eval.sysl`) are bounded by a multiple of the rows the tables hold, and
+// may grow little more than ten times: a plan that pairs every outer binding with every inner row,
+// which is what the per-row form costs, fails both bounds deterministically, at any machine speed.
+// Every query is also run per row (§6.6 rule 3), the reference, and must give the same result; the
+// edge cases check the result itself, and a differential test runs every shape over random tables
+// with nulls and duplicates both ways.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+/** `users(id, age, city)`, `orders(id, user_id, amount, status, day)` and `lines(id, order_id, qty)`,
+ * with every column but the keys nullable.
+ */
+private uw_cols(table: string) -> Buf[Field] = table match
+    "users" -> items_of([Field("id", Int64), Field("age", nullable(Int64)), Field("city", nullable(Text))])
+    "orders" -> items_of([Field("id", Int64), Field("user_id", nullable(Int64)), Field("amount", nullable(Int64)), Field("status", nullable(Text)),
+        Field("day", nullable(Int64))])
+    _ -> items_of([Field("id", Int64), Field("order_id", nullable(Int64)), Field("qty", nullable(Int64))])
+
+private uw_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+
+    for t in ["users", "orders", "lines"]
+        val cs = buf[ColumnDef]()
+
+        for f in uw_cols(t)
+            cs.push(cat_col(f.name, f.ty))
+
+        c = cat_ok(c, cat_table(t, cs.view(), ["id"]))
+
+    c
+
+/** The tree of SQL query `text` over `uw_catalog`. */
+private uw_env(text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope
+    sql_statements(text, "app", uw_catalog()) match
+        Ok(sts) -> sts[0].action match
+            SqlTree(env) -> return env
+            SqlControl(_) -> ()
+        Err(e) -> print(s"\n$text\n  -> ${e.code} ${e.message}\n")
+
+    assert(false, "the query translates", file, line)
+    panic("untranslated")
+
+private uw_city(i: i128) -> Value = (i % 5) match
+    0 -> Text("rome")
+    1 -> Text("oslo")
+    2 -> Text("lima")
+    3 -> Text("kyiv")
+    _ -> Text("pune")
+
+private uw_int_or_null(present: bool, n: i128) -> Value = if present then Int(n) else Null
+
+/** The three tables holding `users`, `orders` and `lines`, in batches of `size`. */
+private uw_of(users: Buf[Value], orders: Buf[Value], lines: Buf[Value], size: usize = 256) -> [3]XnTable =
+    [xn_table("users", uw_cols("users").view(), users, size), xn_table("orders", uw_cols("orders").view(), orders, size),
+        xn_table("lines", uw_cols("lines").view(), lines, size)]
+
+/** `n` users and `10 n` orders, two lines each, deterministically: every fourth user has no order
+ * and the orders that would be theirs belong to no user; one order in seven is returned; one user in
+ * thirteen has no age, one order in eleven no day and one in twenty-nine no user.
+ */
+private uw_tables(n: i128) -> [3]XnTable
+    val users = buf[Value]()
+    val orders = buf[Value]()
+    val lines = buf[Value]()
+
+    for i in 1..<n + 1
+        users.push(rec([Int(i), uw_int_or_null(i % 13 != 0, 18 + (i * 37) % 80), uw_city(i)]))
+
+    for j in 1..<10 * n + 1
+        var uid = (j * 7919) % n + 1
+        if uid % 4 == 0 then uid += n
+        val status: Value = if j % 7 == 0 then Text("returned") else Text("new")
+        orders.push(rec([Int(j), uw_int_or_null(j % 29 != 0, uid), Int((j * 104729) % 100000), status, uw_int_or_null(j % 11 != 0, j % 90)]))
+        lines.push(rec([Int(2 * j), Int(j), Int(j % 13)]))
+        lines.push(rec([Int(2 * j + 1), Int(j), Int(j % 17)]))
+
+    uw_of(users, orders, lines)
+
+/** A run of a query: its outcome, the work it did, and what was kept per row. */
+struct UwRun
+    result: Result[(Type, Buf[Value]), CodecError]
+    pairs: u64
+    sorted: u64
+    fallbacks: usize
+
+/** `q` over `ts`, unnested or per row. */
+private uw_run(q: Envelope, ts: []const XnTable, unnest: bool) -> UwRun
+    val catalog = xn_catalog(ts)
+    val typing = type_envelope(q, catalog).unwrap()
+    val ctx = xe_ctx([])
+    var env = q
+    var ty = typing
+    var fallbacks: usize = 0
+
+    if unnest
+        val p = unnest_plan(q, typing, catalog, buf[Value]())
+        env = p.env
+        ty = p.typing
+        fallbacks = p.fallbacks.len()
+
+    val root = plan_query(env, ty, ctx, xn_mem(ts))
+    val out = buf[Value]()
+
+    val result: Result[(Type, Buf[Value]), CodecError] = drain(root.op) match
+        Ok(bs) ->
+            for b in bs
+                out.extend(values_of(if root.binder == Composite then flatten(b) else b).view())
+            Ok((typing.result.unwrap(), out))
+        Err(e) -> Err(e)
+
+    UwRun(result, ctx.work.pairs, ctx.work.sorted, fallbacks)
+
+/** `q` over `ts` unnested, with nothing kept per row, agreeing with its per-row run; the unnested run. */
+private uw_agree(q: Envelope, ts: []const XnTable, what: string, file: string = __FILE__, line: long = __LINE__) -> UwRun
+    val u = uw_run(q, ts, true)
+    val p = uw_run(q, ts, false)
+    assert_eq(u.fallbacks, 0usize, s"$what: kept per row", file, line)
+    assert_eq(xn_code(u.result), xn_code(p.result), s"$what: the outcome", file, line)
+
+    if xn_code(p.result) == "ok"
+        val (t, want) = p.result.unwrap()
+        val (_, got) = u.result.unwrap()
+        assert(xn_same(t, got, want), s"$what: ${got.len()} rows unnested, ${want.len()} per row", file, line)
+
+    u
+
+// -- the shapes ------------------------------------------------------------------------------------
+
+private uw_users() -> Rel = Scan(QualName("app", "users"), "u")
+
+private uw_orders() -> Rel = Scan(QualName("app", "orders"), "o")
+
+/** `count(*)` of the users whose age is greater than `any` (or, with `all`, `all`) of the days of
+ * their orders, with SQL's three-valued meaning: `x > all S` is `not (x <= any S)`, and `any` is a mark
+ * join (§6.5 rule 5). The SQL dialect has no quantified comparison, so the tree is written directly.
+ */
+private uw_quantified(all: bool) -> Envelope
+    val mine = Filter(uw_orders(), call("eq", [col("o", "user_id"), col("u", "id")]))
+    val on = call(if all then "le" else "gt", [col("u", "age"), col("o", "day")])
+    val a = Apply(MarkApply, uw_users(), mine, Some(on), Some("m"), Some("mk"))
+    val keep = if all then call("not", [col("mk", "m")]) else col("mk", "m")
+    envelope([], Query(Aggregate(Filter(a, keep), "c", buf[Item](), items_of([ut_count("n")]))))
+
+private uw_sql(text: string) -> Option[string] = Some(text)
+
+/** Every shape, by name: SQL, or `None` for the quantified ones (`uw_quantified`). */
+private uw_shapes() -> [14](string, Option[string]) = [
+    ("exists", uw_sql("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and o.amount > 95000)")),
+    ("not_exists", uw_sql("select count(*) as n from users u where not exists (select 1 from orders o where o.user_id = u.id and o.status = 'returned')")),
+    ("scalar_where", uw_sql("select count(*) as n from users u where u.age * 1000 < (select max(o.amount) from orders o where o.user_id = u.id)")),
+    ("scalar_select", uw_sql("select u.id, (select count(*) from orders o where o.user_id = u.id) as n, (select sum(o.amount) from orders o where o.user_id = u.id) as s from users u")),
+    ("in", uw_sql("select count(*) as n, sum(amount) as total from orders where user_id in (select id from users where city = 'rome')")),
+    ("not_in", uw_sql("select count(*) as n from users u where u.age not in (select o.day from orders o where o.status = 'returned')")),
+    ("in_correlated", uw_sql("select u.id, u.age in (select o.day from orders o where o.user_id = u.id) as m from users u")),
+    ("not_in_correlated", uw_sql("select count(*) as n from users u where u.age not in (select o.day from orders o where o.user_id = u.id)")),
+    ("in_two_columns", uw_sql("select u.id, (u.id, u.age) in (select o.user_id, o.day from orders o where o.status = 'new') as m from users u")),
+    ("two_columns", uw_sql("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and o.day = u.age)")),
+    ("two_levels", uw_sql("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and exists (select 1 from lines l where l.order_id = o.id and l.qty > u.age - 60))")),
+    ("scalar_two_levels", uw_sql("select u.id, (select count(*) from orders o where o.user_id = u.id and o.day > (select min(l.qty) from lines l where l.order_id = o.id and l.qty < u.age)) as n from users u")),
+    ("any", None),
+    ("all", None)]
+
+private uw_query(shape: (string, Option[string])) -> Envelope = shape.1 match
+    Some(text) -> uw_env(text)
+    None -> uw_quantified(shape.0 == "all")
+
+private uw_shape(name: string) -> Envelope
+    for s in uw_shapes()
+        if s.0 == name then return uw_query(s)
+
+    panic(s"no shape $name")
+
+// -- work grows linearly ---------------------------------------------------------------------------
+
+/** How many pairs a shape may test per row its tables hold. */
+private const UwPairsPerRow: u64 = 4
+
+private uw_bounded(name: string, n: u64, r: UwRun, file: string, line: long)
+    val rows = 31 * n
+    assert(r.pairs <= UwPairsPerRow * rows, s"$name over $n users: ${r.pairs} pairs for $rows rows", file, line)
+
+/** `name` over 100 and 1000 users (31 times as many rows): the result agrees with the per-row run at
+ * the smaller size, and at both the pairs tested stay under `UwPairsPerRow` per table row and grow at
+ * most fifteen times. The per-row form's pairs grow a hundred times.
+ */
+private uw_linear(name: string, file: string = __FILE__, line: long = __LINE__)
+    val q = uw_shape(name)
+    val small = uw_agree(q, uw_tables(100), s"$name over 100 users", file, line)
+    val big = uw_run(q, uw_tables(1000), true)
+    assert(big.result.is_ok(), s"$name over 1000 users runs", file, line)
+
+    uw_bounded(name, 100, small, file, line)
+    uw_bounded(name, 1000, big, file, line)
+    assert(big.pairs <= 15 * small.pairs + 1000, s"$name: ${small.pairs} pairs grew to ${big.pairs}", file, line)
+
+@test
+exists_does_linear_work()
+    uw_linear("exists")
+
+@test
+not_exists_does_linear_work()
+    uw_linear("not_exists")
+
+@test
+a_scalar_subquery_in_where_does_linear_work()
+    uw_linear("scalar_where")
+
+@test
+scalar_subqueries_in_select_do_linear_work()
+    uw_linear("scalar_select")
+
+@test
+an_uncorrelated_in_does_linear_work()
+    uw_linear("in")
+
+@test
+an_uncorrelated_not_in_over_nulls_does_linear_work()
+    uw_linear("not_in")
+
+@test
+a_correlated_in_over_nulls_does_linear_work()
+    uw_linear("in_correlated")
+
+@test
+a_correlated_not_in_over_nulls_does_linear_work()
+    uw_linear("not_in_correlated")
+
+@test
+an_in_of_two_columns_over_nulls_does_linear_work()
+    uw_linear("in_two_columns")
+
+@test
+a_correlation_on_two_columns_does_linear_work()
+    uw_linear("two_columns")
+
+@test
+a_correlation_two_levels_deep_does_linear_work()
+    uw_linear("two_levels")
+
+@test
+a_scalar_subquery_two_levels_deep_does_linear_work()
+    uw_linear("scalar_two_levels")
+
+@test
+a_correlated_any_does_linear_work()
+    uw_linear("any")
+
+@test
+a_correlated_all_does_linear_work()
+    uw_linear("all")
+
+// -- edge cases ------------------------------------------------------------------------------------
+
+private uw_user(id: i128, age: Value) -> Value = rec([Int(id), age, Text("rome")])
+
+private uw_order(id: i128, user: Value, day: Value) -> Value = rec([Int(id), user, Int(id * 10), Text("new"), day])
+
+private uw_small(users: []const Value, orders: []const Value) -> [3]XnTable = uw_of(rows_of(users), rows_of(orders), buf[Value](), 2)
+
+/** Users 1 (age 5), 2 (no age) and 3 (age 7); orders of user 1 on days 5 and null, of user 3 on day 9
+ * twice, and one of no user on day 7.
+ */
+private uw_mixed() -> [3]XnTable = uw_small([uw_user(1, Int(5)), uw_user(2, Null), uw_user(3, Int(7))],
+    [uw_order(10, Int(1), Int(5)), uw_order(11, Int(1), Null), uw_order(12, Int(3), Int(9)), uw_order(13, Int(3), Int(9)), uw_order(14, Null, Int(7))])
+
+private uw_pair(id: i128, v: Value) -> Value = rec([Int(id), v])
+
+private uw_check(text: string, ts: []const XnTable, want: []const Value, file: string = __FILE__, line: long = __LINE__)
+    val r = uw_agree(uw_env(text, file, line), ts, text, file, line)
+    xn_check(r.result, rows_of(want), text, file, line)
+
+private uw_count(text: string, ts: []const XnTable, n: i128, file: string = __FILE__, line: long = __LINE__)
+    uw_check(text, ts, [rec([Int(n)])], file, line)
+
+@test
+exists_over_an_empty_outer_side_is_no_row()
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id)",
+        uw_small([], [uw_order(10, Int(1), Int(5))]), 0)
+
+@test
+exists_over_an_empty_inner_side_is_false_for_every_row()
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id)", uw_small([uw_user(1, Int(5))], []), 0)
+
+@test
+not_exists_over_an_empty_inner_side_keeps_every_row()
+    uw_count("select count(*) as n from users u where not exists (select 1 from orders o where o.user_id = u.id)",
+        uw_small([uw_user(1, Int(5)), uw_user(2, Null)], []), 2)
+
+@test
+exists_counts_a_row_with_duplicate_matches_once()
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id)", uw_mixed(), 2)
+
+@test
+exists_keeps_duplicate_outer_rows()
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id)",
+        uw_small([uw_user(1, Int(5)), uw_user(1, Int(5)), uw_user(2, Null)], [uw_order(10, Int(1), Null)]), 2)
+
+@test
+a_null_correlation_value_matches_nothing()
+    // Order 14 has no user, and `eq` never matches null: no user's subquery sees it.
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and o.day = 7)", uw_mixed(), 0)
+
+@test
+a_correlation_on_two_columns_with_nulls()
+    // User 1 has an order on its age's day; user 2's age is null, which `eq` matches with nothing.
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and o.day = u.age)", uw_mixed(), 1)
+
+@test
+in_is_true_false_or_null_by_three_valued_logic()
+    // User 1: 5 is among {5, null}, true. User 2: a null age over no order is false. User 3: 7 is not
+    // among {9, 9}, false. User 4: a null age over an order is null.
+    val m = uw_mixed()
+    val users = rows_of([uw_user(1, Int(5)), uw_user(2, Null), uw_user(3, Int(7)), uw_user(4, Null)])
+    val orders = rows_of([uw_order(10, Int(1), Int(5)), uw_order(11, Int(1), Null), uw_order(12, Int(3), Int(9)), uw_order(13, Int(3), Int(9)),
+        uw_order(15, Int(4), Int(1))])
+    uw_check("select u.id, u.age in (select o.day from orders o where o.user_id = u.id) as m from users u", uw_of(users, orders, m[2].rows, 2),
+        [uw_pair(1, Bool(true)), uw_pair(2, Bool(false)), uw_pair(3, Bool(false)), uw_pair(4, Null)])
+
+@test
+in_of_a_null_over_no_row_is_false()
+    uw_check("select u.id, u.age in (select o.day from orders o where o.user_id = u.id) as m from users u",
+        uw_small([uw_user(2, Null)], [uw_order(10, Int(1), Int(5))]), [uw_pair(2, Bool(false))])
+
+@test
+in_with_a_null_among_the_rows_and_no_match_is_null()
+    uw_check("select u.id, u.age in (select o.day from orders o where o.user_id = u.id) as m from users u",
+        uw_small([uw_user(1, Int(6))], [uw_order(10, Int(1), Int(5)), uw_order(11, Int(1), Null)]), [uw_pair(1, Null)])
+
+@test
+not_in_drops_a_row_whose_subquery_holds_a_null()
+    // User 1's orders hold a null day: `6 not in {5, null}` is null and drops the row; user 3's do not.
+    uw_count("select count(*) as n from users u where u.age not in (select o.day from orders o where o.user_id = u.id)",
+        uw_small([uw_user(1, Int(6)), uw_user(3, Int(7))], [uw_order(10, Int(1), Int(5)), uw_order(11, Int(1), Null), uw_order(12, Int(3), Int(9))]), 1)
+
+@test
+not_in_over_no_row_keeps_a_null()
+    uw_count("select count(*) as n from users u where u.age not in (select o.day from orders o where o.user_id = u.id)",
+        uw_small([uw_user(2, Null)], []), 1)
+
+@test
+an_uncorrelated_not_in_with_a_null_keeps_no_row()
+    uw_count("select count(*) as n from users u where u.age not in (select o.day from orders o)", uw_mixed(), 0)
+
+@test
+an_uncorrelated_in_with_nulls_on_both_sides()
+    uw_check("select u.id, u.age in (select o.day from orders o) as m from users u", uw_mixed(),
+        [uw_pair(1, Bool(true)), uw_pair(2, Null), uw_pair(3, Bool(true))])
+
+@test
+an_in_of_two_columns_is_null_only_where_a_null_could_match()
+    // (1, 5) matches order 10. (2, null) is false against (1, 5) and (3, 9), but null against order
+    // 14's (null, 7). (3, 7) is false against user 3's day 9, and null against (null, 7).
+    uw_check("select u.id, (u.id, u.age) in (select o.user_id, o.day from orders o) as m from users u", uw_mixed(),
+        [uw_pair(1, Bool(true)), uw_pair(2, Null), uw_pair(3, Null)])
+
+@test
+an_in_of_two_columns_is_false_where_every_row_differs_on_a_non_null_column()
+    // (2, null) against (1, 5) and (3, 9): the first column differs, so false despite the null.
+    uw_check("select u.id, (u.id, u.age) in (select o.user_id, o.day from orders o) as m from users u",
+        uw_small([uw_user(2, Null)], [uw_order(10, Int(1), Int(5)), uw_order(12, Int(3), Int(9))]), [uw_pair(2, Bool(false))])
+
+@test
+a_count_over_no_matching_row_is_zero()
+    uw_check("select u.id, (select count(*) from orders o where o.user_id = u.id) as n from users u", uw_mixed(),
+        [uw_pair(1, Int(2)), uw_pair(2, Int(0)), uw_pair(3, Int(2))])
+
+@test
+a_sum_over_no_matching_row_is_null()
+    uw_check("select u.id, (select sum(o.day) from orders o where o.user_id = u.id) as s from users u", uw_mixed(),
+        [uw_pair(1, Int(5)), uw_pair(2, Null), uw_pair(3, Int(18))])
+
+@test
+a_scalar_subquery_of_no_row_is_null_and_of_one_its_value()
+    uw_check("select u.id, (select o.day from orders o where o.user_id = u.id and o.id <> 11 and o.id <> 13) as d from users u", uw_mixed(),
+        [uw_pair(1, Int(5)), uw_pair(2, Null), uw_pair(3, Int(9))])
+
+@test
+a_scalar_subquery_of_two_rows_raises_r0003()
+    val r = uw_agree(uw_env("select u.id, (select o.day from orders o where o.user_id = u.id) as d from users u"), uw_mixed(), "two rows")
+    assert_eq(xn_code(r.result), "R0003")
+
+@test
+a_scalar_subquery_in_where_compares_with_three_valued_logic()
+    // User 1: 5 < max(5, null) = 5 is false; user 2's null age is null; user 3: 7 < 9.
+    uw_count("select count(*) as n from users u where u.age < (select max(o.day) from orders o where o.user_id = u.id)", uw_mixed(), 1)
+
+@test
+a_scalar_subquery_over_an_empty_outer_side_raises_nothing()
+    uw_count("select count(*) as n from users u where u.age < (select o.day from orders o)", uw_small([], [uw_order(10, Int(1), Int(5)),
+        uw_order(11, Int(1), Int(6))]), 0)
+
+@test
+a_correlation_two_levels_deep_reads_the_outermost_row()
+    val lines = rows_of([rec([Int(1), Int(10), Int(3)]), rec([Int(2), Int(12), Int(8)])])
+    val m = uw_mixed()
+    val ts = [m[0], m[1], xn_table("lines", uw_cols("lines").view(), lines, 2)]
+    // User 1's order 10 has a line of 3, under its age 5; user 3's order 12 a line of 8, over its 7.
+    uw_count("select count(*) as n from users u where exists (select 1 from orders o where o.user_id = u.id and exists (select 1 from lines l where l.order_id = o.id and l.qty < u.age))",
+        ts, 1)
+
+private uw_quantified_count(all: bool, ts: []const XnTable, n: i128, file: string = __FILE__, line: long = __LINE__)
+    val r = uw_agree(uw_quantified(all), ts, if all then "all" else "any", file, line)
+    xn_check(r.result, rows_of([rec([Int(n)])]), if all then "all" else "any", file, line)
+
+@test
+any_is_true_only_where_a_row_compares_true()
+    // User 1: 5 > {5, null} is null; user 2: null; user 3: 7 > {9, 9} false.
+    uw_quantified_count(false, uw_mixed(), 0)
+
+@test
+any_over_no_row_is_false_and_all_true()
+    val ts = uw_small([uw_user(1, Int(5)), uw_user(2, Null)], [])
+    uw_quantified_count(false, ts, 0)
+    uw_quantified_count(true, ts, 2)
+
+@test
+all_is_null_where_a_row_is_null_and_none_false()
+    // User 1: 5 > all {4, null} is null; user 3: 7 > all {6, 6} is true.
+    val ts = uw_small([uw_user(1, Int(5)), uw_user(3, Int(7))], [uw_order(10, Int(1), Int(4)), uw_order(11, Int(1), Null),
+        uw_order(12, Int(3), Int(6)), uw_order(13, Int(3), Int(6))])
+    uw_quantified_count(true, ts, 1)
+    uw_quantified_count(false, ts, 2)
+
+// -- differential ----------------------------------------------------------------------------------
+
+private uw_maybe(g: *Rng, n: u64) -> Value = if g.below(5) == 0 then Null else Int(i128(g.below(n)))
+
+/** Random tables over few values, so that duplicates and nulls are common, of up to 12 users, 24
+ * orders and 24 lines, any of them possibly empty.
+ */
+private uw_random(seed: u64) -> [3]XnTable
+    var g = rng(seed, 7177)
+    val users = buf[Value]()
+    val orders = buf[Value]()
+    val lines = buf[Value]()
+
+    for _ in 0..<g.below(13)
+        users.push(rec([Int(1 + i128(g.below(6))), uw_maybe(&g, 6), uw_city(i128(g.below(5)))]))
+
+    for _ in 0..<g.below(25)
+        val status: Value = if g.below(3) == 0 then Text("returned") else Text("new")
+        orders.push(rec([Int(1 + i128(g.below(10))), uw_maybe(&g, 7), Int(i128(g.below(100000))), status, uw_maybe(&g, 6)]))
+
+    for _ in 0..<g.below(25)
+        lines.push(rec([Int(i128(g.below(10))), uw_maybe(&g, 11), uw_maybe(&g, 80)]))
+
+    uw_of(users, orders, lines, 1 + usize(g.below(4)))
+
+@test
+every_shape_unnested_agrees_with_the_per_row_run_on_random_tables()
+    for seed in 0..<40
+        val ts = uw_random(u64(seed))
+
+        for s in uw_shapes()
+            val _ = uw_agree(uw_query(s), ts, s"${s.0}, seed $seed")
+
+@test
+every_shape_stays_linear_at_the_benchmarks_scales()
+    // The 0.0.1 benchmark's S and M: 1000 and 10000 users, ten orders each. Per row, the three
+    // correlated workloads tested 1.0e7 pairs at S and 1.0e9 at M (every order with every user).
+    val sizes: [2]u64 = [1000, 10000]
+
+    for n in sizes
+        val ts = uw_tables(i128(n))
+
+        for s in uw_shapes()
+            val r = uw_run(uw_query(s), ts, true)
+            assert_eq(xn_code(r.result), "ok", s"${s.0} over $n users")
+            uw_bounded(s.0, n, r, __FILE__, __LINE__)
