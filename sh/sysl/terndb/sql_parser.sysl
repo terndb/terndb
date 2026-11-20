@@ -426,7 +426,8 @@ struct SqlParser
 
         val ty = word match
             "double" ->
-                self.expect_kw("precision")?
+                // `double` alone is `double precision` (`sql.md` §4.1).
+                val _ = self.eat_kw("precision")
                 Float64
             "decimal" | "numeric" ->
                 if !self.eat_op("(") then return sql_fail("Q8006", s"$word needs a precision: write $word(p) or $word(p, s)", at)

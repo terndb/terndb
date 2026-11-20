@@ -895,8 +895,8 @@ null_is_null_has_no_type()
     assert_eq(se_code("SELECT NULL IS NULL"), "Q8007")
 
 @test
-null_as_a_where_condition_has_no_type()
-    assert_eq(se_code("SELECT a FROM t WHERE NULL"), "Q8007")
+null_as_a_where_condition_is_a_null_bool()
+    se_eq(sq_rel("SELECT * FROM t WHERE NULL"), Filter(sq_scan("t", "t"), Null(Bool)), "WHERE NULL")
 
 @test
 null_in_between_takes_the_column_s_type()
@@ -1008,7 +1008,8 @@ a_typed_null_parameter_cast()
 
 private se_type_pairs() -> []const (string, string) = [("bool", "boolean"), ("int16", "smallint"), ("int32", "int"), ("int32", "integer"),
     ("int64", "bigint"), ("decimal(5, 0)", "decimal(5)"), ("decimal(5, 2)", "numeric(5, 2)"), ("decimal(7, 0)", "numeric(7)"),
-    ("float32", "real"), ("float64", "float"), ("float64", "double precision"), ("bytes", "bytea"), ("datetime", "timestamp without time zone"),
+    ("float32", "real"), ("float64", "float"), ("float64", "double precision"), ("float64", "double"), ("float64", "DOUBLE"),
+    ("float64", "Double Precision"), ("bytes", "bytea"), ("datetime", "timestamp without time zone"),
     ("timestamp", "timestamptz"), ("timestamp", "timestamp with time zone"), ("time", "time without time zone")]
 
 @test
@@ -1036,8 +1037,8 @@ every_refused_type_name_is_refused_in_a_column_definition()
         assert_eq(se_code(s"CREATE TABLE x (a $name)"), "Q8006")
 
 @test
-double_without_precision_ends_too_early()
-    assert_eq(sq_err("CREATE TABLE x (a double)"), "Q8001@1:25")
+double_without_precision_is_float64()
+    se_same("CREATE TABLE x (a double)", "CREATE TABLE x (a float64)")
 
 @test
 an_array_type_is_out_of_scope()

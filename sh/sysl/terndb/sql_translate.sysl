@@ -130,7 +130,8 @@ struct SqlMerged derives Eq
 /** One query level's scope (`sql.md` §5.2): its sources and `USING` columns; and when it is grouped,
  * the `Aggregate` binder, its keys and the aggregate calls collected so far. `in_agg` is set while an
  * aggregate's arguments are translated, which see the rows being grouped; `allow_aggs` says whether
- * an aggregate may be written here at all.
+ * an aggregate may be written here at all. `assign` holds, for an `INSERT`'s query, the type of the
+ * target column each select-list item is assigned to, where it is known (`sql.md` §3.2 rule 4).
  */
 struct SqlLevel
     sources: Buf[SqlSource]
@@ -141,8 +142,9 @@ struct SqlLevel
     aggs: Buf[NamedAgg]
     in_agg: bool
     allow_aggs: bool
+    assign: Buf[Option[Type]]
 
-private sql_level() -> &SqlLevel = SqlLevel(buf(), buf(), false, "", buf(), buf(), false, false)
+private sql_level() -> &SqlLevel = SqlLevel(buf(), buf(), false, "", buf(), buf(), false, false, buf())
 
 /** A CTE in scope and its output columns, when known. */
 struct SqlCteInfo
@@ -358,6 +360,10 @@ struct SqlTr
     ctes: Buf[SqlCteInfo]
     params: Buf[Option[Type]]
     param_at: Buf[u64]
+    /** The target types an `INSERT` hands to the query it reads, until that query's select list or
+     * `VALUES` takes them.
+     */
+    assign: Buf[Option[Type]]
 
     /** `name`'s columns: those a script statement left it with, else the resolver's. */
     table_of(self, name: QualName) -> Option[SqlTable]
@@ -421,6 +427,7 @@ struct SqlTr
         self.ctes = buf()
         self.params = buf()
         self.param_at = buf()
+        self.assign = buf()
 
         s match
             StTxn(c, _) -> Ok(SqlControl(c))
@@ -517,6 +524,113 @@ struct SqlTr
         SqCast(_, ty, _) -> Some(ty)
         SqTyped(ty, _, _) -> Some(ty)
         _ -> None
+
+    /** The base type translated expression `x` is known to have (`sql.md` §5.8 rule 7): a constant's,
+     * a cast's, a declared parameter's, a column's whose type is known, a grouping key's, a core
+     * aggregate's, and that of `neg`, `coalesce` and arithmetic over known operands. `None` otherwise.
+     */
+    known(self, x: Expr) -> Option[Type]
+        x match
+            Literal(t, _) -> Some(t.base())
+            Null(t) -> Some(t.base())
+            Cast(_, t, _) -> Some(t.base())
+            Param(i) -> if usize(i) < self.params.len() then self.params[usize(i)].map(t -> t.base()) else None
+            Col(b, n) -> self.known_col(b, n)
+            Call(f, args) -> f match
+                "neg" -> if args.len() == 1 then self.known(args[0]) else None
+                "add" | "sub" | "mul" | "div" | "mod" ->
+                    if args.len() != 2 then return None
+                    val a = self.known(args[0])
+                    val c = self.known(args[1])
+                    if a.is_none() || c.is_none() then return None
+                    sql_arith_type(a.unwrap(), c.unwrap())
+                "coalesce" ->
+                    for a in args
+                        val t = self.known(a)
+                        if t.is_some() then return t
+                    None
+                else None
+            _ -> None
+
+    /** The base type of column `n` read through binder `b`: a source's column, or a grouped level's
+     * key or aggregate.
+     */
+    known_col(self, b: string, n: string) -> Option[Type]
+        var k = self.levels.len()
+        while k > 0
+            k -= 1
+            val lvl = self.levels[k]
+            if lvl.grouped && lvl.group == b
+                for key in lvl.keys
+                    if key.name == n then return self.known(key.expr)
+                for a in lvl.aggs
+                    if a.name == n then return self.agg_type(a.call)
+                return None
+            for src in lvl.sources
+                if src.binder == b then return sql_known(src.columns, n).map(c -> c.ty).unwrap_or(None).map(t -> t.base())
+        None
+
+    /** The base type of a core aggregate's result (`query-tree.md` §6.7 rule 4), where it is known. */
+    agg_type(self, c: AggCall) -> Option[Type]
+        if c.function == "count" then return Some(Int64)
+        if c.args.len() != 1 then return None
+        val t = self.known(c.args[0])
+        if t.is_none() then return None
+        val a = t.unwrap()
+        c.function match
+            "min" | "max" -> Some(a)
+            "sum" ->
+                if is_int_type(a) then return Some(Int128)
+                if sql_is_float(a) then return Some(Float64)
+                a match
+                    Decimal(_, s) -> Some(Decimal(38, s))
+                    _ -> None
+            "avg" ->
+                if sql_is_float(a) then return Some(Float64)
+                a match
+                    Decimal(_, s) -> Some(Decimal(38, if s > 6 then s else 6))
+                    _ -> if is_int_type(a) then Some(Decimal(38, 6)) else None
+            else None
+
+    /** Operands `a` and `b` of an arithmetic operator or a comparison: an integer or decimal one beside
+     * a float one is widened to `float64` (`sql.md` §5.8 rule 7). Where either type is not known, both are
+     * left as they are and validation decides.
+     */
+    widen(self, a: Expr, b: Expr) -> (Expr, Expr)
+        val ta = self.known(a)
+        val tb = self.known(b)
+        if ta.is_none() || tb.is_none() then return (a, b)
+        val x = ta.unwrap()
+        val y = tb.unwrap()
+        if sql_is_float(x) && sql_is_exact(y) then return (a, self.to_float(b))
+        if sql_is_exact(x) && sql_is_float(y) then return (self.to_float(a), b)
+        (a, b)
+
+    /** Integer or decimal `e` as a `float64`: `Cast(e, float64)` for a value known not to be null (a constant,
+     * a parameter declared non-null), `Cast(e, float64?)` for the rest, whose nullability the front
+     * end does not know (`sql.md` §5.8 rule 4).
+     */
+    to_float(self, e: Expr) -> Expr = e match
+        Literal(_, _) -> Cast(e, Float64, Strict)
+        Null(_) -> Null(Float64)
+        Param(i) ->
+            val non_null = usize(i) < self.params.len() && self.params[usize(i)].map(t -> !t.is_nullable()).unwrap_or(false)
+            Cast(e, if non_null then Float64 else nullable(Float64), Strict)
+        _ -> Cast(e, nullable(Float64), Strict)
+
+    /** `e` where a `bool` is wanted: a `NULL` there is `Null(bool)` (`sql.md` §5.9 rule 3). */
+    cond(*self, e: SqlExpr) -> Result[Expr, SqlError]
+        e match
+            SqNull(_) -> Ok(Null(Bool))
+            _ -> self.expr(e)
+
+    /** The target types an `INSERT` handed down, which the first select list or `VALUES` to ask
+     * takes, so that no query nested in it sees them.
+     */
+    take_assign(*self) -> Buf[Option[Type]]
+        val a = self.assign
+        self.assign = buf()
+        a
 
     // -- expressions ------------------------------------------------------------------------------------
 
@@ -625,17 +739,21 @@ struct SqlTr
             SqNeg(x, at) -> *x match
                 SqNumber(text, _) -> sql_number(text, true, at)
                 _ -> Ok(sql_call1("neg", self.expr(*x)?))
-            SqNot(x, _) -> Ok(sql_call1("not", self.expr(*x)?))
+            SqNot(x, _) -> Ok(sql_call1("not", self.cond(*x)?))
             SqBinary(op, l, r, at) ->
-                if op == "and" || op == "or" then return Ok(sql_call2(op, self.expr(*l)?, self.expr(*r)?))
+                if op == "and" || op == "or" then return Ok(sql_call2(op, self.cond(*l)?, self.cond(*r)?))
                 val (a, b) = self.pair(*l, *r)?
-                Ok(sql_call2(sql_operator_function(op), a, b))
+                if op == "||" then return Ok(sql_call2(sql_operator_function(op), a, b))
+                val (x, y) = self.widen(a, b)
+                Ok(sql_call2(sql_operator_function(op), x, y))
             SqIsNull(x, negated, _) -> Ok(sql_call1(if negated then "is_not_null" else "is_null", self.expr(*x)?))
             SqBetween(x, lo, hi, negated, _) ->
                 val es = items_of([*x, *lo, *hi])
                 val t = self.sibling(es)
                 val v = self.typed(*x, t, false)?
-                val both = sql_call2("and", sql_call2("ge", v, self.typed(*lo, t, false)?), sql_call2("le", v, self.typed(*hi, t, false)?))
+                val (gx, gl) = self.widen(v, self.typed(*lo, t, false)?)
+                val (lx, lh) = self.widen(v, self.typed(*hi, t, false)?)
+                val both = sql_call2("and", sql_call2("ge", gx, gl), sql_call2("le", lx, lh))
                 Ok(if negated then sql_call1("not", both) else both)
             SqInList(x, items, negated, _) ->
                 val es = buf[SqlExpr]()
@@ -645,7 +763,8 @@ struct SqlTr
                 val v = self.typed(*x, t, false)?
                 var any: Option[Expr] = None
                 for i in items
-                    val test = sql_call2("eq", v, self.typed(i, t, false)?)
+                    val (a, b) = self.widen(v, self.typed(i, t, false)?)
+                    val test = sql_call2("eq", a, b)
                     any = Some(any match
                         Some(a) -> sql_call2("or", a, test)
                         None -> test)
@@ -709,8 +828,9 @@ struct SqlTr
             val cond = operand match
                 Some(o) ->
                     val (a, b) = self.pair(*o, w.cond)?
-                    sql_call2("eq", a, b)
-                None -> self.expr(w.cond)?
+                    val (x, y) = self.widen(a, b)
+                    sql_call2("eq", x, y)
+                None -> self.cond(w.cond)?
             out.push(IfArm(cond, self.typed(w.value, t, false)?))
 
         val other: Option[&Expr] = otherwise match
@@ -767,7 +887,7 @@ struct SqlTr
         for o in order
             keys.push(SortKey(self.expr(o.expr)?, o.desc, o.nulls_first.unwrap_or(o.desc)))
         filter match
-            Some(fe) -> Ok(Some(self.expr(*fe)?))
+            Some(fe) -> Ok(Some(self.cond(*fe)?))
             None -> Ok(None)
 
     /** A subquery of an expression, translated as a level of its own above the current one. */
@@ -783,9 +903,12 @@ struct SqlTr
                 val v = self.values(rows, hint, names, at)?
                 self.tail_over(v, tail)
             QySetOp(op, all, _, _, tail, at) ->
+                // Each input of an `INSERT`'s set operation is assigned to the targets.
+                val assign = self.take_assign()
                 val inputs = buf[Rel]()
                 var first: Option[SqlRel] = None
                 for input in sql_setop_inputs(q, op, all)
+                    self.assign = assign
                     val r = self.query(input, "select", if first.is_none() then names else buf())?
                     if first.is_none() then first = Some(r)
                     inputs.push(r.rel)
@@ -793,6 +916,8 @@ struct SqlTr
                 val s = SqlRel(SetOp(op, all, b, inputs), b, first.unwrap().columns)
                 self.tail_over(s, tail)
             QyWith(ctes, body, at) ->
+                // The body, not a CTE, is what an `INSERT` assigns to its targets.
+                val assign = self.take_assign()
                 val defs = buf[CteDef]()
                 val mark = self.ctes.len()
                 val names_here = buf[string]()
@@ -802,6 +927,7 @@ struct SqlTr
                     val r = self.query(c.query, c.name, c.columns)?
                     defs.push(CteDef(c.name, None, r.rel))
                     self.ctes.push(SqlCteInfo(c.name, r.columns))
+                self.assign = assign
                 val b = self.query(*body, hint, names)
                 self.ctes.truncate(mark)
                 val inner = b?
@@ -877,12 +1003,24 @@ struct SqlTr
             if r.len() != width then return sql_fail("Q8012", "every VALUES row must have the same number of values", r[0].pos())
         if names.len() > 0 && names.len() != width then return sql_fail("Q8012", s"${names.len()} column names are given for $width VALUES columns", at)
 
+        // In an `INSERT`'s query, a column of constants only has its target's type (`sql.md` §3.2 rule 4).
+        val assign = self.take_assign()
         val types = buf[Type]()
         for j in 0..<width
             val column = buf[SqlExpr]()
+            var constants = true
+            var holds_null = false
             for r in rows
                 column.push(r[j])
-            types.push(self.column_type(column, j)?)
+                if !sql_is_const(r[j]) then constants = false
+                r[j] match
+                    SqNull(_) -> holds_null = true
+                    _ -> ()
+            val target = if j < assign.len() then assign[j] else None
+            if constants && target.is_some()
+                types.push(if holds_null then nullable(target.unwrap()) else target.unwrap())
+            else
+                types.push(self.column_type(column, j)?)
 
         val fields = buf[Field]()
         for j in 0..<width
@@ -944,6 +1082,7 @@ struct SqlTr
      */
     select(*self, s: SqlSelect, tail: SqlTail, hint: string, names: Buf[string]) -> Result[SqlRel, SqlError]
         val lvl = self.push_level()
+        lvl.assign = self.take_assign()
         val r = self.select_in(lvl, s, tail, hint, names)
         self.pop_level()
         r
@@ -952,7 +1091,7 @@ struct SqlTr
         var input = if s.from.len() == 0 then Values(self.fresh("one"), buf[Field](), sql_one_empty_row()) else self.from_list(s.from)?
 
         s.where match
-            Some(w) -> input = Filter(input, self.expr(w)?)
+            Some(w) -> input = Filter(input, self.cond(w)?)
             None -> ()
 
         var grouped = s.group.len() > 0 || s.having.is_some()
@@ -978,7 +1117,7 @@ struct SqlTr
 
         var having: Option[Expr] = None
         s.having match
-            Some(h) -> having = Some(self.expr(h)?)
+            Some(h) -> having = Some(self.cond(h)?)
             None -> ()
 
         // ORDER BY below the select list reads the input, and an output name or position as its item.
@@ -1104,7 +1243,9 @@ struct SqlTr
             item.expr match
                 SqStar(q, sat) -> self.star(q, sat, outs)?
                 _ ->
-                    val x = self.expr(item.expr)?
+                    // In an `INSERT`'s query a constant item is assigned to its target column (`sql.md` §3.2 rule 4).
+                    val target = if outs.len() < lvl.assign.len() then lvl.assign[outs.len()] else None
+                    val x = if target.is_some() && sql_is_const(item.expr) then self.typed(item.expr, target, true)? else self.expr(item.expr)?
                     val ty = self.peek_type(item.expr)
                     item.alias match
                         Some(a) -> outs.push(SqlOut(a, x, ty, true))
@@ -1250,7 +1391,7 @@ struct SqlTr
                     return Ok(Join(jk, l, r, cond, None, None))
 
                 on match
-                    Some(e) -> Ok(Join(jk, l, r, Some(self.expr(e)?), None, None))
+                    Some(e) -> Ok(Join(jk, l, r, Some(self.cond(e)?), None, None))
                     None -> Ok(Join(jk, l, r, None, None, None))
 
     /** Column `name` of the one source in `[from, to)` of the current level that has it, for `USING`. */
@@ -1313,8 +1454,8 @@ struct SqlTr
         val rel = source match
             None -> Values(self.fresh("values"), buf[Field](), sql_one_empty_row())
             Some(QyValues(rows, tail, vat)) ->
-                if !tail.is_empty() then self.query(source.unwrap(), "values", buf())?.rel else self.insert_values(rows, targets, types, vat)?
-            Some(sq) -> self.query(sq, "select", buf())?.rel
+                if !tail.is_empty() then self.assigned_query(source.unwrap(), "values", types)? else self.insert_values(rows, targets, types, vat)?
+            Some(sq) -> self.assigned_query(sq, "select", types)?
 
         val target = SqlSource(shown, binder, info.map(i -> sql_cols_of(i.columns)))
         val oc = conflict match
@@ -1323,6 +1464,15 @@ struct SqlTr
 
         val ret = self.returning(target, buf[SqlSource](), returning)?
         Ok(Insert(q, binder, None, targets, rel, oc, ret))
+
+    /** An `INSERT`'s query: each constant select-list item, and each `VALUES` column of constants, is
+     * assigned to its target column's type where that is known (`sql.md` §3.2 rule 4).
+     */
+    assigned_query(*self, q: SqlQuery, hint: string, types: Buf[Option[Type]]) -> Result[Rel, SqlError]
+        self.assign = types
+        val r = self.query(q, hint, buf())
+        self.assign = buf()
+        Ok(r?.rel)
 
     /** An `INSERT`'s `VALUES`: typed as the target columns where they are known (`sql.md` §5.9). */
     insert_values(*self, rows: Buf[Buf[SqlExpr]], targets: Buf[string], types: Buf[Option[Type]], at: u64) -> Result[Rel, SqlError]
@@ -1392,7 +1542,7 @@ struct SqlTr
             val ty = sql_known(target.columns, s.column).map(c -> c.ty).unwrap_or(None)
             out.push(Item(s.column, self.typed(s.value, ty, true)?))
         val w = where match
-            Some(e) -> Some(self.expr(e)?)
+            Some(e) -> Some(self.cond(e)?)
             None -> None
         Ok((out, w))
 
@@ -1455,7 +1605,7 @@ struct SqlTr
     delete_in(*self, lvl: &SqlLevel, target: SqlSource, using: Buf[SqlFrom], where: Option[SqlExpr], at: u64) -> Result[(Option[Rel], Buf[SqlSource], Option[Expr]), SqlError]
         val (rel, others) = self.dml_sources(lvl, target, using, at)?
         val filter = where match
-            Some(e) -> Some(self.expr(e)?)
+            Some(e) -> Some(self.cond(e)?)
             None -> None
         Ok((rel, others, filter))
 
@@ -1692,7 +1842,7 @@ struct SqlTr
 end SqlTr
 
 private sql_translator(schema: string, tables: &SqlTables) -> SqlTr =
-    SqlTr(schema, tables, buf(), buf(), buf(), buf(), buf(), buf())
+    SqlTr(schema, tables, buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 /** One row of no values: the input of a `SELECT` without `FROM`. */
 private[terndb] sql_one_empty_row() -> Buf[Buf[Expr]]
@@ -1755,6 +1905,27 @@ private sql_has_text_form(t: Type) -> bool = t match
 private sql_is_numeric(t: Type) -> bool = t match
     Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | Decimal(_, _) | Float32 | Float64 -> true
     _ -> false
+
+private sql_is_float(t: Type) -> bool = t == Float32 || t == Float64
+
+/** An integer or a decimal: the exact numbers, which widen beside a float (`sql.md` §5.8 rule 7). */
+private sql_is_exact(t: Type) -> bool = t match
+    Decimal(_, _) -> true
+    _ -> is_int_type(t)
+
+/** The base type of arithmetic over operands of base types `a` and `b`, after an exact number beside a
+ * float is widened (`sql.md` §5.8 rule 7); `None` where the tree refuses the mix.
+ */
+private sql_arith_type(a: Type, b: Type) -> Option[Type]
+    val fa = sql_is_float(a)
+    val fb = sql_is_float(b)
+    if fa && fb then return Some(if a == Float32 && b == Float32 then Float32 else Float64)
+    if fa || fb
+        if sql_is_exact(a) || sql_is_exact(b) then return Some(Float64)
+        return None
+    common_type(a, b) match
+        Ok(t) -> Some(t)
+        Err(_) -> None
 
 /** The inputs of a chain of one set operation, flattened on the left (`query-tree.md` §6.12). */
 private sql_setop_inputs(q: SqlQuery, op: SetOpKind, all: bool) -> Buf[SqlQuery]

@@ -167,7 +167,16 @@ set      = name "=" expr
    column, `Q3005` ([QT] §9.2 rule 1). With an opaque table it is
    the `VALUES` query of §5.3, its columns named after the targets. A row with another number of values than
    targets is `Q8012`; `DEFAULT` as a value is `Q8005`.
-4. Any other source is the query of §5.
+4. Any other source is the query of §5, with the targets' types handed to it as assignments (§5.9 rule 1)
+   where the table is known: each item of its select list that is a constant (§5.9), counted after `*` is
+   expanded, is typed as the target in its position, and so is each column of a `VALUES` list whose values are
+   all constants, made nullable when one is `NULL`. This holds in each input of a set operation and in the body
+   of a `WITH`, not in a CTE, a derived table or a subquery, which are queries of their own. So `INSERT INTO t
+   (small) SELECT 1` writes an `int16`, `SELECT NULL` a `Null(T)` (`Q3005` into a `NOT NULL` column, as in rule 3),
+   and a constant that is not a value of its target is `Q8004`. An item with no target, or an item that is not a
+   constant, keeps its own type, and validation refuses a type the target does not take (`Q3001`).
+   *Rationale: PostgreSQL types an untyped constant by the column it is inserted into; the user chose this
+   reading on 2026-11-19 (Q74).*
 5. `ON CONFLICT` is `OnConflict { target, excluded, action }` ([QT] §9.3): the column list, `Constraint(name)`, or,
    when neither is written, the primary key's columns (`Q8010` when not known). `excluded` is the binder
    `excluded`, which `excluded.c` names; `DO NOTHING` is `nothing`, `DO UPDATE SET … [WHERE …]` is `update { set,
@@ -292,7 +301,7 @@ and `ALTER TABLE IF EXISTS` are `Q8005`.
 | `uint8`, `uint16`, `uint32`, `uint64` | the unsigned integers |
 | `decimal(p)`, `decimal(p, s)`, `numeric(…)` | `decimal(p, s)`, `s` 0 when absent; outside `1 ≤ p ≤ 38`, `0 ≤ s ≤ p` is `Q8006` |
 | `float32`, `real` | `float32` |
-| `float64`, `float`, `double precision` | `float64` |
+| `float64`, `float`, `double precision`, `double` | `float64` |
 | `text` | `text` |
 | `bytes`, `bytea` | `bytes` |
 | `json` | `json` |
@@ -306,7 +315,9 @@ and `ALTER TABLE IF EXISTS` are `Q8005`.
 1. `decimal` and `numeric` without a precision are `Q8006`: TernDB has no arbitrary-precision decimal ([QT] §2.1
    rule 1). `varchar`, `char` and `character` are `Q8006` (a length limit is a `CHECK`); a modifier on any other
    type (`timestamp(3)`), `time with time zone` and an unknown name are `Q8006`; array types are `Q8005`.
-2. `int2`, `int4`, `float4`, `float8` and `jsonb` are not type names.
+2. `int2`, `int4`, `float4`, `float8` and `jsonb` are not type names. `double` alone is `double precision`
+   (Q76), so `double` followed by `precision` is one type name: `x::double precision` is a cast, never a cast
+   to `double` with an output name `precision`.
    *Rationale: the dialect is TernDB's own, and its type names are the tree's. PostgreSQL's `int8` is a 64-bit
    integer and TernDB's an 8-bit one; accepting PostgreSQL's numbered names beside it would make `int8` mean the
    one thing in a dialect that otherwise reads like the other. `timestamp` names the instant, as in the tree,
@@ -462,6 +473,28 @@ From lowest to highest; all binary operators are left-associative except the com
 5. `CASE WHEN c THEN v … [ELSE e] END` is `If([(c, v)…], e)`; `CASE x WHEN w THEN v …` compares with `eq(x, w)`.
    `ELSE NULL` is no `else`. A constant result takes the type of another result whose type is known.
 6. `EXISTS (q)` is `Exists(rel)`; a parenthesised query as a value is `Scalar(rel)`.
+7. **An exact number beside a float widens.** In `+ - * / %` and in each comparison `= <> < <= > >=` (those
+   `BETWEEN`, `IN (…)` and a simple `CASE` are made of included), after the constants are typed (§5.9), an operand
+   of an integer type (signed or unsigned, any width) or a `decimal` type beside one of a float type (`float32`,
+   `float64`) is `Cast(x, float64?, strict)`, or `Cast(x, float64, strict)` when `x` is a constant or a parameter
+   declared non-null; a `NULL` of an integer or decimal type becomes `Null(float64)`. The tree refuses the mix
+   ([QT] §4.4 rule 4); PostgreSQL converts `int8` and `numeric` to `float8` implicitly, and so does TernDB's SQL.
+   A decimal widens to the nearest `float64`, so `1.1 * 1e0` is not exactly `1.1`. An integer beside a decimal
+   is not widened: it meets the decimal exactly ([QT] §4.4 rule 2). The cast's target is nullable for
+   the reason of rule 4, so a widened value assigned to a `NOT NULL` column is `Q3005` until wrapped in
+   `assert_not_null`. An `int64` beyond 2⁵³ is rounded to the nearest `float64`, as in PostgreSQL.
+   1. The front end widens only where it knows both operands' types: a constant, a cast, a parameter whose
+      type is decided, a column whose type the resolver gives, a grouping key (its expression's type), a core
+      aggregate (`count` is `int64`; `sum` is `int128` over integers, `float64` over floats; `avg` is a decimal
+      over integers and decimals, `float64` over floats; `min`/`max` have the argument's type, [QT] §6.7 rule 4),
+      and `-`, `coalesce` and arithmetic over such operands. Anything else is left as written, and validation
+      decides.
+   2. The exact operand is computed in its own type first, so `(2147483647 + 1) * 2.5e0` overflows (`R0001`)
+      before it widens, while `2147483647 + 1 * 2.5e0` adds a widened `2147483647` to `2.5`. `avg` of an integer
+      is a decimal, so it widens beside a float too.
+   3. Nothing else widens: every other mix the tree refuses (`text`, `bool` or a temporal type beside a float)
+      stays `Q3002`; `||` is not arithmetic.
+   *Rationale: the user chose PostgreSQL's reading on 2026-11-19 (Q73).*
 
 ### 5.9 Constants take their type from context
 
@@ -477,6 +510,12 @@ it is written as a value of `T` rather than of its own type (§2.6):
    nullability, when it is exactly a value of it; otherwise it keeps its own type. The same holds among
    `coalesce`'s arguments and `CASE` results.
 3. `NULL` is `Null(T)`; without context it is `Q8007`. A string without context is `text`.
+4. **A boolean context** gives `NULL` the type `bool`: written as the whole condition of `WHERE` (of a `SELECT`,
+   `UPDATE`, `DELETE` or `ON CONFLICT … DO UPDATE`), `HAVING`, `JOIN … ON`, a searched `CASE`'s `WHEN`, an
+   aggregate's `FILTER (WHERE …)`, or as an operand of `AND`, `OR` or `NOT`, it is `Null(bool)`. A filter keeps no
+   row on it, and `NOT NULL` as an expression is `not(Null(bool))`, which is null. `NULL` anywhere else inside a
+   condition (`NULL = 1`, `NULL IS NULL`, `NULL + 1 > 0`) still needs a context of rule 2 (`Q8007`).
+   *Rationale: PostgreSQL accepts `WHERE NULL`; the user chose its reading on 2026-11-19 (Q75).*
 
 *Rationale: the tree has no untyped constant and coerces implicitly only losslessly ([QT] §4.1), so `INSERT INTO t
 (small) VALUES (1)` and `WHERE day = '2024-01-01'` would otherwise be type errors. Typing a constant by the
