@@ -1,0 +1,712 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Predicate pushdown (`docs/design/executor.md` §4.7): a query tree rewritten so that the conjuncts of
+// a `Filter` over joins, and of the joins' own `on`, are evaluated as low in the tree as the results and
+// the runtime errors of `query-tree.md` allow. A conjunct reading one input of a join is moved into that
+// input, where a scan's access path can use it (§4.6); one equating the two inputs becomes part of the
+// join's `on`, where the join takes it as a key (§4.1). Only a **safe** conjunct moves: one built of
+// columns, constants, comparisons, `and`, `or`, `not`, `is_null`, `is_not_null` and `coalesce`, which can
+// raise no runtime error and is not volatile, so that evaluating it on more or fewer rows changes no
+// error. The rewrite runs after unnesting, and its result is type-checked again before it is planned.
+
+/** `env` with its query's conjuncts pushed down; `catalog` tells a table's scan from a view's. A statement
+ * other than a query, and a query nothing moves in, are returned as they are.
+ */
+push_query(env: Envelope, catalog: &Catalog) -> Envelope
+    val r = env.statement match
+        Query(x) -> x
+        _ -> return env
+
+    val p = Pusher(catalog)
+    val out = p.rel(r, false)
+
+    if out == r then return env
+
+    Envelope(env.major, env.minor, env.params, Query(out), None)
+
+// -- conjuncts ----------------------------------------------------------------------------------------
+
+/** The conjuncts of `e`, through every `and`. */
+private pd_conjuncts(e: Expr, out: Buf[Expr])
+    e match
+        Call(f, args) ->
+            if f == "and" && args.len() == 2
+                pd_conjuncts(args[0], out)
+                pd_conjuncts(args[1], out)
+                return
+        _ -> ()
+
+    out.push(e)
+
+private pd_conjuncts_of(e: Option[Expr]) -> Buf[Expr]
+    val out = buf[Expr]()
+
+    e match
+        Some(x) -> pd_conjuncts(x, out)
+        None -> ()
+
+    out
+
+/** `cs` conjoined, or none when there are none. */
+private pd_and(cs: Buf[Expr]) -> Option[Expr]
+    var out: Option[Expr] = None
+
+    for c in cs
+        out = out match
+            Some(x) -> Some(call("and", [x, c]))
+            None -> Some(c)
+
+    out
+
+/** `r` under a `Filter` by `cs`, or `r` when there are none. */
+private pd_over(r: Rel, cs: Buf[Expr]) -> Rel = pd_and(cs) match
+    Some(p) -> Filter(r, p)
+    None -> r
+
+/** `r` filtered by the safe conjuncts `cs` as well: a safe filter right over `r` takes them into its own
+ * predicate, so that a scan under it sees them all (§4.6); an unsafe one keeps its rows, and `cs` filter
+ * above it.
+ */
+private pd_filter(r: Rel, cs: Buf[Expr]) -> Rel
+    val p = pd_and(cs) match
+        Some(p) -> p
+        None -> return r
+
+    r match
+        Filter(input, q) ->
+            if pd_safe(q) then return Filter(*input, call("and", [q, p]))
+        _ -> ()
+
+    Filter(r, p)
+
+/** Whether evaluating `e` can raise no runtime error and draws nothing volatile, on any row: so it may
+ * be evaluated on more rows or fewer without changing which errors a statement raises.
+ */
+private pd_safe(e: Expr) -> bool = e match
+    Col(_, _) | Row(_) | Param(_) | Null(_) | Literal(_, _) -> true
+    Field(x, _) -> pd_safe(*x)
+    Call(f, args) -> pd_safe_call(f, args)
+    _ -> false
+
+private pd_safe_call(f: string, args: Buf[Expr]) -> bool
+    val known = f match
+        "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "same" | "is_null" | "is_not_null" | "and" | "or" | "not" | "coalesce" -> true
+        _ -> false
+
+    if !known then return false
+
+    for a in args
+        if !pd_safe(a) then return false
+
+    true
+
+private pd_safe_opt(e: Option[Expr]) -> bool = e match
+    Some(x) -> pd_safe(x)
+    None -> true
+
+/** The binders a safe expression reads. */
+private pd_refs(e: Expr, out: Buf[string])
+    e match
+        Col(b, _) | Row(b) -> out.push(b)
+        Field(x, _) -> pd_refs(*x, out)
+        Call(_, args) ->
+            for a in args
+                pd_refs(a, out)
+        _ -> ()
+
+private pd_refs_of(e: Expr) -> Buf[string]
+    val out = buf[string]()
+    pd_refs(e, out)
+    out
+
+private pd_has(names: Buf[string], n: string) -> bool
+    for x in names
+        if x == n then return true
+
+    false
+
+/** Whether any of `refs` is among `names`. */
+private pd_reads_any(refs: Buf[string], names: Buf[string]) -> bool
+    for r in refs
+        if pd_has(names, r) then return true
+
+    false
+
+/** Whether `x` is a column of one of the binders `side`. */
+private pd_col_in(x: Expr, side: Buf[string]) -> bool = x match
+    Col(b, _) -> pd_has(side, b)
+    _ -> false
+
+/** Whether the conjunct `c` is never `true` on a row whose columns of the binders `side` are all null:
+ * a comparison (§3.2: null when an operand is) or `is_not_null` of a bare column of one of them.
+ */
+private pd_rejects(c: Expr, side: Buf[string]) -> bool
+    val (f, args) = c match
+        Call(f, args) -> (f, args)
+        _ -> return false
+
+    if args.len() == 1 && f == "is_not_null" then return pd_col_in(args[0], side)
+    if args.len() != 2 then return false
+    if f != "eq" && f != "ne" && f != "lt" && f != "le" && f != "gt" && f != "ge" then return false
+
+    pd_col_in(args[0], side) || pd_col_in(args[1], side)
+
+// -- what a relation exposes ----------------------------------------------------------------------------
+
+/** The binders `r` exposes (§8.2 rule 3, §6.5 rule 3). */
+private pd_exposed(r: Rel, out: Buf[string])
+    r match
+        Scan(_, b) | Values(b, _, _) | ParamScan(b, _) | CteRef(_, b) | Project(_, b, _) | Aggregate(_, b, _, _) | SetOp(_, _, b, _) -> out.push(b)
+        Nest(_, b, _, _, _, _) | Tag(_, b, _, _) -> out.push(b)
+        Filter(i, _) | Sort(i, _) | Limit(i, _, _, _, _) | Distinct(i) -> pd_exposed(*i, out)
+        With(_, _, body) -> pd_exposed(*body, out)
+        Window(i, b, _) | Unnest(i, b, _, _, _) ->
+            pd_exposed(*i, out)
+            out.push(b)
+        Join(k, l, x, _, _, b) ->
+            pd_exposed(*l, out)
+
+            if k == MarkJoin
+                pd_push_opt(b, out)
+            else if k != Semi && k != Anti
+                pd_exposed(*x, out)
+        Apply(k, l, x, _, _, b) ->
+            pd_exposed(*l, out)
+
+            if k == MarkApply
+                pd_push_opt(b, out)
+            else if k != SemiApply && k != AntiApply
+                pd_exposed(*x, out)
+
+private pd_push_opt(b: Option[string], out: Buf[string])
+    b match
+        Some(m) -> out.push(m)
+        None -> ()
+
+private pd_names(r: Rel) -> Buf[string]
+    val out = buf[string]()
+    pd_exposed(r, out)
+    out
+
+// -- inner-join regions -------------------------------------------------------------------------------
+
+/** Whether `r` is a join of an inner-join region: an `inner` join whose `on` is absent or safe, so that
+ * its conjuncts may be evaluated at any join of the region that sees their binders.
+ */
+private pd_region_join(r: Rel) -> bool = r match
+    Join(k, _, _, on, _, _) -> k == Inner && pd_safe_opt(on)
+    _ -> false
+
+/** A node of a join tree over a region's leaves: leaf `leaf`, or the join of nodes `l` and `r`. */
+private struct PdNode
+    leaf: usize
+    pair: bool
+    l: usize
+    r: usize
+
+/** The leaves of the region `r`, left to right, its conjuncts gathered into `pool`, and its shape in
+ * `nodes`; the index of its root node. A safe `Filter` between two of its joins is one more set of
+ * conjuncts.
+ */
+private pd_collect(r: Rel, leaves: Buf[Rel], pool: Buf[Expr], nodes: Buf[PdNode]) -> usize
+    r match
+        Join(_, left, right, on, _, _) ->
+            if pd_region_join(r)
+                val l = pd_collect(*left, leaves, pool, nodes)
+                val x = pd_collect(*right, leaves, pool, nodes)
+
+                on match
+                    Some(e) -> pd_conjuncts(e, pool)
+                    None -> ()
+
+                nodes.push(PdNode(0, true, l, x))
+                return nodes.len() - 1
+        Filter(input, p) ->
+            if pd_safe(p) && pd_region_join(*input)
+                pd_conjuncts(p, pool)
+                return pd_collect(*input, leaves, pool, nodes)
+        _ -> ()
+
+    leaves.push(r)
+    pd_leaf(leaves.len() - 1, nodes)
+
+private pd_leaf(i: usize, nodes: Buf[PdNode]) -> usize
+    nodes.push(PdNode(i, false, 0, 0))
+    nodes.len() - 1
+
+private pd_pair(l: usize, r: usize, nodes: Buf[PdNode]) -> usize
+    nodes.push(PdNode(0, true, l, r))
+    nodes.len() - 1
+
+private pd_bit(i: usize) -> u64 = u64(1) << u64(i)
+
+/** The leaves the binders `refs` belong to, as a mask over `names`, one per leaf. */
+private pd_mask(refs: Buf[string], names: Buf[Buf[string]]) -> u64
+    var m: u64 = 0
+
+    for i in 0..<names.len()
+        if pd_reads_any(refs, names[i]) then m = m | pd_bit(i)
+
+    m
+
+private pd_within(a: u64, b: u64) -> bool = (a & b) == a
+
+/** Whether a key of `lks`/`rks` (the leaves the two operands of an `eq` or `same` conjunct read) equates
+ * a row of leaves `s` with a row of leaves `t`, so that a join of the two finds its pairs by it.
+ */
+private pd_edge(s: u64, t: u64, lks: Buf[u64], rks: Buf[u64]) -> bool
+    for i in 0..<lks.len()
+        val (a, b) = (lks[i], rks[i])
+
+        if a != 0 && b != 0 && ((pd_within(a, s) && pd_within(b, t)) || (pd_within(a, t) && pd_within(b, s))) then return true
+
+    false
+
+/** The joins of the tree at `n` that no key joins, and the leaves under it. */
+private pd_cost(nodes: Buf[PdNode], n: usize, lks: Buf[u64], rks: Buf[u64]) -> (u64, u64)
+    val nd = nodes[n]
+
+    if !nd.pair then return (0, pd_bit(nd.leaf))
+
+    val (lc, lm) = pd_cost(nodes, nd.l, lks, rks)
+    val (rc, rm) = pd_cost(nodes, nd.r, lks, rks)
+    val cross: u64 = if pd_edge(lm, rm, lks, rks) then 0 else 1
+    (lc + rc + cross, lm | rm)
+
+private pd_span(i: usize, j: usize) -> u64
+    var m: u64 = 0
+
+    for k in i..<j + 1
+        m = m | pd_bit(k)
+
+    m
+
+/** The tree over leaves `0..<n`, in their order, with the fewest joins no key joins: every bracketing is
+ * considered (the leaves' order, and so the columns' order of §8.4, is kept), and of two as good the one
+ * whose right input is the shorter.
+ */
+private pd_interval(n: usize, nodes: Buf[PdNode], lks: Buf[u64], rks: Buf[u64]) -> usize
+    val cost = buf[u64]()
+    val split = buf[usize]()
+
+    for _ in 0..<n * n
+        cost.push(0)
+        split.push(0)
+
+    for len in 2..<n + 1
+        for i in 0..<n - len + 1
+            val j = i + len - 1
+            var best: u64 = u64(n) + 1
+            var at = j - 1
+            var k = j
+
+            while k > i
+                k -= 1
+                val cross: u64 = if pd_edge(pd_span(i, k), pd_span(k + 1, j), lks, rks) then 0 else 1
+                val c = cost[i * n + k] + cost[(k + 1) * n + j] + cross
+
+                if c < best
+                    best = c
+                    at = k
+
+            cost[i * n + j] = best
+            split[i * n + j] = at
+
+    pd_interval_node(0, n - 1, n, split, nodes)
+
+private pd_interval_node(i: usize, j: usize, n: usize, split: Buf[usize], nodes: Buf[PdNode]) -> usize
+    if i == j then return pd_leaf(i, nodes)
+
+    val k = split[i * n + j]
+    val l = pd_interval_node(i, k, n, split, nodes)
+    val r = pd_interval_node(k + 1, j, n, split, nodes)
+    pd_pair(l, r, nodes)
+
+/** A left-deep tree over leaves `0..<n` that joins next the first leaf a key joins to those joined so
+ * far, or the first leaf left when none is: as few joins no key joins as the keys allow, in another
+ * order than the leaves'.
+ */
+private pd_greedy(n: usize, nodes: Buf[PdNode], lks: Buf[u64], rks: Buf[u64]) -> usize
+    val used = buf[bool]()
+
+    for _ in 0..<n
+        used.push(false)
+
+    used[0] = true
+    var cur = pd_bit(0)
+    var tree = pd_leaf(0, nodes)
+
+    for _ in 1..<n
+        var next = n
+
+        for x in 0..<n
+            if next == n && !used[x] && pd_edge(cur, pd_bit(x), lks, rks) then next = x
+
+        if next == n
+            for x in 0..<n
+                if next == n && !used[x] then next = x
+
+        used[next] = true
+        cur = cur | pd_bit(next)
+        tree = pd_pair(tree, pd_leaf(next, nodes), nodes)
+
+    tree
+
+private pd_leftmost(nodes: Buf[PdNode], n: usize) -> usize
+    var at = n
+
+    while nodes[at].pair
+        at = nodes[at].l
+
+    nodes[at].leaf
+
+/** The leaves an `eq` or `same` conjunct's two operands read, or none for any other conjunct. */
+private pd_key_masks(c: Expr, names: Buf[Buf[string]]) -> (u64, u64)
+    c match
+        Call(f, args) ->
+            if (f == "eq" || f == "same") && args.len() == 2
+                return (pd_mask(pd_refs_of(args[0]), names), pd_mask(pd_refs_of(args[1]), names))
+        _ -> ()
+
+    (0, 0)
+
+/** What building a region's tree reads: its leaves and conjuncts, the leaves each conjunct reads, and
+ * which are placed.
+ */
+private struct PdRegion
+    nodes: Buf[PdNode]
+    leaves: Buf[Rel]
+    pool: Buf[Expr]
+    masks: Buf[u64]
+    placed: Buf[bool]
+    free: bool
+
+// -- the rewrite ----------------------------------------------------------------------------------------
+
+/** The rewrite of a tree. `free` says the order of a relation's columns is not seen by what reads it
+ * (a `Project`, an `Aggregate` or a `Nest` reads its input's columns by binder and name), so that the
+ * leaves of an inner-join region under it may be joined in another order.
+ */
+private struct Pusher
+    catalog: &Catalog
+
+impl Pusher
+    rel(self, r: Rel, free: bool) -> Rel
+        r match
+            Filter(input, p) -> self.filter(*input, p, free)
+            Join(kind, left, right, on, mark, binder) ->
+                if pd_region_join(r) then return self.region(r, buf[Expr](), free)
+
+                kind match
+                    Inner -> self.inner(*left, *right, on, free)
+                    Left | Right | Full -> self.outer(kind, *left, *right, on, buf[Expr](), free)
+                    SingleJoin -> Join(kind, self.rel(*left, free), self.rel(*right, free), on, mark, binder)
+                    _ -> Join(kind, self.rel(*left, free), self.rel(*right, true), on, mark, binder)
+            Apply(kind, left, right, on, mark, binder) ->
+                val rf = kind match
+                    Cross | Outer | SingleApply -> free
+                    _ -> true
+                Apply(kind, self.rel(*left, free), self.rel(*right, rf), on, mark, binder)
+            Scan(_, _) | Values(_, _, _) | ParamScan(_, _) | CteRef(_, _) -> r
+            Project(input, binder, items) -> Project(self.rel(*input, true), binder, items)
+            Aggregate(input, binder, keys, aggs) -> Aggregate(self.rel(*input, true), binder, keys, aggs)
+            Nest(input, binder, keys, name, items, order) -> Nest(self.rel(*input, true), binder, keys, name, items, order)
+            Window(input, binder, items) -> Window(self.rel(*input, free), binder, items)
+            Sort(input, keys) -> Sort(self.rel(*input, free), keys)
+            Limit(input, count, offset, ties, arbitrary) -> Limit(self.rel(*input, free), count, offset, ties, arbitrary)
+            Distinct(input) -> Distinct(self.rel(*input, free))
+            Unnest(input, binder, value, outer, ordinality) -> Unnest(self.rel(*input, free), binder, value, outer, ordinality)
+            Tag(input, binder, ty, tag) -> Tag(self.rel(*input, false), binder, ty, tag)
+            SetOp(op, all, binder, inputs) ->
+                val out = buf[Rel]()
+
+                for x in inputs
+                    out.push(self.rel(x, false))
+
+                SetOp(op, all, binder, out)
+            With(recursive, ctes, body) ->
+                val out = buf[CteDef]()
+
+                for c in ctes
+                    out.push(CteDef(c.name, c.columns, self.rel(c.rel, false)))
+
+                With(recursive, out, self.rel(*body, free))
+    end rel
+
+    /** `Filter(input, p)` rewritten. Over an inner-join region, the safe conjuncts of `p` join the
+     * region's (a `Filter` over a join and the join with the conjuncts in its `on` have one result, and
+     * the conjuncts of either may go unevaluated on a row or pair another makes not `true`, §6.4 rule 3
+     * and §6.5 rule 8); the others stay above it, evaluated on the rows the region keeps. Over an outer
+     * join, see `outer`.
+     */
+    filter(self, input: Rel, p: Expr, free: bool) -> Rel
+        val cs = buf[Expr]()
+        pd_conjuncts(p, cs)
+
+        input match
+            Join(kind, left, right, on, _, _) ->
+                if pd_region_join(input)
+                    val safe = buf[Expr]()
+                    val rest = buf[Expr]()
+
+                    for c in cs
+                        if pd_safe(c) then safe.push(c) else rest.push(c)
+
+                    return pd_over(self.region(input, safe, free), rest)
+
+                if kind == Left || kind == Right || kind == Full then return self.outer(kind, *left, *right, on, cs, free)
+            _ -> ()
+
+        Filter(self.rel(input, free), p)
+
+    /** Whether evaluating `r` can raise no runtime error: a scan of a table (not a view), a parameter's
+     * relation, and filters, projections and joins of these by safe expressions. Only beside such a
+     * relation may a join's right input be made emptier, since an empty right input ends an `inner` join
+     * before its left input is read (§6.5 rule 10), which would leave that input's errors unraised.
+     */
+    safe_rel(self, r: Rel) -> bool = r match
+        Scan(t, _) -> self.catalog.table(t).map(info -> !info.is_view).unwrap_or(false)
+        ParamScan(_, _) -> true
+        Values(_, _, rows) -> pd_safe_rows(rows)
+        Filter(input, p) -> pd_safe(p) && self.safe_rel(*input)
+        Project(input, _, items) -> pd_safe_items(items) && self.safe_rel(*input)
+        Distinct(input) -> self.safe_rel(*input)
+        Join(k, l, x, on, _, _) -> k != SingleJoin && pd_safe_opt(on) && self.safe_rel(*l) && self.safe_rel(*x)
+        _ -> false
+
+    /** The inner-join region whose top join is `top`, with the safe conjuncts `fs` of a `Filter` over it:
+     * its conjuncts placed each at the lowest point of a join tree over its leaves that sees every binder
+     * it reads — a conjunct of one leaf into that leaf, one of several into the `on` of the join that
+     * first meets them, where an `eq` or `same` across that join's inputs is a key (§4.1). A conjunct
+     * reading no leaf (a constant, or an outer row's value) goes into the leftmost leaf.
+     *
+     * The tree is the region's own, unless every leaf is safe to evaluate (`safe_rel`), when its errors
+     * cannot depend on the shape: then the bracketing of the leaves in their order with the fewest joins
+     * no key joins is taken, if it has fewer than the region's own, and, where `free` holds, a left-deep
+     * tree in another order if that has fewer still.
+     */
+    region(self, top: Rel, fs: Buf[Expr], free: bool) -> Rel
+        val leaves = buf[Rel]()
+        val pool = buf[Expr]()
+        val nodes = buf[PdNode]()
+        val root = pd_collect(top, leaves, pool, nodes)
+        pool.extend(fs.view())
+
+        if leaves.len() > 63
+            top match
+                Join(k, l, x, on, m, b) -> return pd_over(Join(k, self.rel(*l, free), self.rel(*x, free), on, m, b), fs)
+                _ -> return pd_over(top, fs)
+
+        val names = buf[Buf[string]]()
+
+        for l in leaves
+            names.push(pd_names(l))
+
+        val masks = buf[u64]()
+        val lks = buf[u64]()
+        val rks = buf[u64]()
+
+        for c in pool
+            masks.push(pd_mask(pd_refs_of(c), names))
+            val (a, b) = pd_key_masks(c, names)
+            lks.push(a)
+            rks.push(b)
+
+        var chosen = root
+        var all_safe = true
+
+        for l in leaves
+            if !self.safe_rel(l) then all_safe = false
+
+        if all_safe
+            val (own, _) = pd_cost(nodes, root, lks, rks)
+            val d = pd_interval(leaves.len(), nodes, lks, rks)
+            val (dc, _) = pd_cost(nodes, d, lks, rks)
+            var best = own
+
+            if dc < own
+                chosen = d
+                best = dc
+
+            if free && best > 0
+                val g = pd_greedy(leaves.len(), nodes, lks, rks)
+                val (gc, _) = pd_cost(nodes, g, lks, rks)
+                if gc < best then chosen = g
+
+        val first = pd_bit(pd_leftmost(nodes, chosen))
+
+        for i in 0..<masks.len()
+            if masks[i] == 0 then masks[i] = first
+
+        val placed = buf[bool]()
+
+        for _ in pool
+            placed.push(false)
+
+        val (out, _) = self.build(PdRegion(nodes, leaves, pool, masks, placed, free), chosen, true)
+        out
+    end region
+
+    /** The tree at node `n` of region `g`, its conjuncts placed, and the leaves under it. `right_ok`
+     * says the relation at `n` may be made emptier: it is not the right input of a join, at any depth
+     * of the region, whose left input could raise an error.
+     */
+    build(self, g: PdRegion, n: usize, right_ok: bool) -> (Rel, u64)
+        val nd = g.nodes[n]
+
+        if !nd.pair
+            val bit = pd_bit(nd.leaf)
+            val mine = buf[Expr]()
+
+            if right_ok
+                for c in 0..<g.pool.len()
+                    if !g.placed[c] && g.masks[c] == bit
+                        g.placed[c] = true
+                        mine.push(g.pool[c])
+
+            return (self.rel(pd_filter(g.leaves[nd.leaf], mine), g.free), bit)
+
+        val (l, lm) = self.build(g, nd.l, right_ok)
+        val (x, rm) = self.build(g, nd.r, right_ok && self.safe_rel(l))
+        val m = lm | rm
+        val on = buf[Expr]()
+
+        for c in 0..<g.pool.len()
+            if !g.placed[c] && pd_within(g.masks[c], m)
+                g.placed[c] = true
+                on.push(g.pool[c])
+
+        (Join(Inner, l, x, pd_and(on), None, None), m)
+
+    /** An `inner` join whose `on` holds a conjunct that is not safe, and so is evaluated on every pair
+     * of its inputs: only `on`'s safe conjuncts reading one input move into it (the others may go
+     * unevaluated on a pair that one makes not `true`, §6.5 rule 8), into the right input only beside a
+     * left input that raises no error. A `Filter` over it keeps its conjuncts, since fewer pairs would
+     * leave `on`'s errors unraised.
+     */
+    inner(self, a: Rel, b: Rel, on: Option[Expr], free: bool) -> Rel
+        val na = pd_names(a)
+        val nb = pd_names(b)
+        val into_b = self.safe_rel(a)
+        val pa = buf[Expr]()
+        val pb = buf[Expr]()
+        val keep = buf[Expr]()
+
+        for c in pd_conjuncts_of(on)
+            if pd_safe(c)
+                val refs = pd_refs_of(c)
+
+                if !pd_reads_any(refs, nb)
+                    pa.push(c)
+                    continue
+
+                if into_b && !pd_reads_any(refs, na)
+                    pb.push(c)
+                    continue
+
+            keep.push(c)
+
+        Join(Inner, self.rel(pd_filter(a, pa), free), self.rel(pd_filter(b, pb), free), pd_and(keep), None, None)
+
+    /** A `left`, `right` or `full` join of `a` and `b` under the `Filter` conjuncts `cs` (none when there
+     * is no `Filter`).
+     *
+     * - A safe conjunct of `cs` that rejects a side's nulls (`pd_rejects`) removes every row that side
+     *   was null-extended in, so the join is the one that does not extend it: `left` with the right side
+     *   rejected is `inner`, `right` with the left side rejected is `inner`, and `full` is `right`, `left`
+     *   or `inner`. The null-extended rows are the only ones lost, and the conjunct, raising nothing, is
+     *   not `true` on them, so the rest of `cs` could go unevaluated there (§6.4 rule 3). It becomes
+     *   `inner` only when `a` is safe, since an `inner` join's empty right input leaves its left unread.
+     * - A safe conjunct of `cs` reading only the preserved side of a `left` or `right` join moves into it,
+     *   when `on` is safe: a row it removes takes all its pairs, and so all its output rows, with it.
+     * - A safe conjunct of `on` reading only the null-supplying side moves into it: a row it removes made
+     *   `on` not `true` for every pair, so it was null-extended either way.
+     *
+     * Nothing moves past a `full` join that stays one.
+     */
+    outer(self, kind: JoinKind, a: Rel, b: Rel, on: Option[Expr], cs: Buf[Expr], free: bool) -> Rel
+        val na = pd_names(a)
+        val nb = pd_names(b)
+        var rej_a = false
+        var rej_b = false
+
+        for c in cs
+            if pd_safe(c)
+                if pd_rejects(c, na) then rej_a = true
+                if pd_rejects(c, nb) then rej_b = true
+
+        val inner_ok = self.safe_rel(a)
+        var k = kind
+
+        if kind == Left && rej_b && inner_ok then k = Inner
+        if kind == Right && rej_a && inner_ok then k = Inner
+
+        if kind == Full
+            if rej_a && rej_b && inner_ok
+                k = Inner
+            else if rej_b
+                k = Right
+            else if rej_a
+                k = Left
+
+        if k == Inner
+            val j = Join(Inner, a, b, on, None, None)
+
+            pd_and(cs) match
+                Some(p) -> return self.filter(j, p, free)
+                None -> return self.rel(j, free)
+
+        val pa = buf[Expr]()
+        val pb = buf[Expr]()
+        val keep = buf[Expr]()
+        val on_safe = pd_safe_opt(on)
+
+        for c in cs
+            if pd_safe(c) && on_safe
+                val refs = pd_refs_of(c)
+
+                if k == Left && !pd_reads_any(refs, nb)
+                    pa.push(c)
+                    continue
+
+                if k == Right && !pd_reads_any(refs, na)
+                    pb.push(c)
+                    continue
+
+            keep.push(c)
+
+        val on_keep = buf[Expr]()
+
+        for c in pd_conjuncts_of(on)
+            if pd_safe(c)
+                val refs = pd_refs_of(c)
+
+                if k == Left && !pd_reads_any(refs, na)
+                    pb.push(c)
+                    continue
+
+                if k == Right && !pd_reads_any(refs, nb)
+                    pa.push(c)
+                    continue
+
+            on_keep.push(c)
+
+        val j = Join(k, self.rel(pd_filter(a, pa), free), self.rel(pd_filter(b, pb), free), pd_and(on_keep), None, None)
+        pd_over(j, keep)
+    end outer
+end Pusher
+
+private pd_safe_rows(rows: Buf[Buf[Expr]]) -> bool
+    for row in rows
+        for e in row
+            if !pd_safe(e) then return false
+
+    true
+
+private pd_safe_items(items: Buf[Item]) -> bool
+    for it in items
+        if !pd_safe(it.expr) then return false
+
+    true

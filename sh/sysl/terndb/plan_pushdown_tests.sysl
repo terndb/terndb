@@ -1,0 +1,838 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// Predicate pushdown (`plan_pushdown.sysl`, `docs/design/executor.md` §4.7). Each query runs pushed
+// down (through `unnest_plan`) and as written (the reference), and the two must agree; the pairs the
+// joins tested (`Work`, `exec_eval.sysl`) show that no pair of different keys is formed, the leaf
+// entries a scan of the store visited (`Store.slots_read`) that a pushed conjunct chose its access path,
+// and the shape of the pushed tree that a conjunct went where it may and nowhere else. A differential
+// test runs random comma, inner and outer joins over random tables with nulls and duplicates both ways.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+/** `t(t_id, t_k, t_v)`, the key not null and the others nullable, so that every column name is unique
+ * across the tables and a tree with no `Project` has unique output names.
+ */
+private pp_cols(t: string) -> Buf[Field] = items_of([Field(t + "_id", Int64), Field(t + "_k", nullable(Int64)), Field(t + "_v", nullable(Int64))])
+
+private pp_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+
+    for t in ["a", "b", "c", "d"]
+        val cs = buf[ColumnDef]()
+
+        for f in pp_cols(t)
+            cs.push(cat_col(f.name, f.ty))
+
+        c = cat_ok(c, cat_table(t, cs.view(), [t + "_id"]))
+
+    c
+
+/** The tree of SQL query `text` over `catalog`. */
+private pp_sql(text: string, catalog: MemCatalog, file: string, line: long) -> Envelope
+    sql_statements(text, "app", catalog) match
+        Ok(sts) -> sts[0].action match
+            SqlTree(env) -> return env
+            SqlControl(_) -> ()
+        Err(e) -> print(s"\n$text\n  -> ${e.code} ${e.message}\n")
+
+    assert(false, "the query translates", file, line)
+    panic("untranslated")
+
+private pp_env(text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope = pp_sql(text, pp_catalog(), file, line)
+
+private pp_row(id: i128, k: Value, v: Value) -> Value = rec([Int(id), k, v])
+
+/** Rows `1..=n` keyed by `k = id`, with `v = id % 7`. */
+private pp_keyed(n: i128) -> Buf[Value]
+    val out = buf[Value]()
+
+    for i in 1..<n + 1
+        out.push(pp_row(i, Int(i), Int(i % 7)))
+
+    out
+
+private pp_none() -> Buf[Value] = buf[Value]()
+
+private pp_of(a: Buf[Value], b: Buf[Value], c: Buf[Value], d: Buf[Value], size: usize = 64) -> [4]XnTable =
+    [xn_table("a", pp_cols("a").view(), a, size), xn_table("b", pp_cols("b").view(), b, size), xn_table("c", pp_cols("c").view(), c, size),
+        xn_table("d", pp_cols("d").view(), d, size)]
+
+/** Every table holding `pp_keyed(n)`. */
+private pp_same(n: i128) -> [4]XnTable = pp_of(pp_keyed(n), pp_keyed(n), pp_keyed(n), pp_keyed(n))
+
+/** A run of a query: its outcome and the pairs its joins tested. */
+struct PpRun
+    result: Result[(Type, Buf[Value]), CodecError]
+    pairs: u64
+    fallbacks: usize
+
+/** `q` over `ts`, pushed down or as written. */
+private pp_run(q: Envelope, ts: []const XnTable, push: bool) -> PpRun
+    val catalog = xn_catalog(ts)
+    val typing = type_envelope(q, catalog).unwrap()
+    val ctx = xe_ctx([])
+    var env = q
+    var ty = typing
+    var fallbacks: usize = 0
+
+    if push
+        val p = unnest_plan(q, typing, catalog, buf[Value]())
+        env = p.env
+        ty = p.typing
+        fallbacks = p.fallbacks.len()
+
+    val root = plan_query(env, ty, ctx, xn_mem(ts))
+    val out = buf[Value]()
+
+    val result: Result[(Type, Buf[Value]), CodecError] = drain(root.op) match
+        Ok(bs) ->
+            for b in bs
+                out.extend(values_of(if root.binder == Composite then flatten(b) else b).view())
+            Ok((typing.result.unwrap(), out))
+        Err(e) -> Err(e)
+
+    PpRun(result, ctx.work.pairs, fallbacks)
+
+/** `q` over `ts` pushed down, agreeing with the run as written in outcome and rows; the pushed run. */
+private pp_agree(q: Envelope, ts: []const XnTable, what: string, file: string = __FILE__, line: long = __LINE__) -> PpRun
+    val p = pp_run(q, ts, true)
+    val w = pp_run(q, ts, false)
+    assert_eq(p.fallbacks, 0usize, s"$what: a fallback", file, line)
+    assert_eq(xn_code(p.result), xn_code(w.result), s"$what: the outcome", file, line)
+
+    if xn_code(w.result) == "ok"
+        val (t, want) = w.result.unwrap()
+        val (_, got) = p.result.unwrap()
+        assert(xn_same(t, got, want), s"$what: ${got.len()} rows pushed down, ${want.len()} as written", file, line)
+
+    p
+
+/** `text` over `ts`, agreeing, with exactly `pairs` pairs tested pushed down. */
+private pp_pairs(text: string, ts: []const XnTable, pairs: u64, file: string = __FILE__, line: long = __LINE__) -> PpRun
+    val r = pp_agree(pp_env(text, file, line), ts, text, file, line)
+    assert_eq(r.pairs, pairs, s"pairs tested by: $text", file, line)
+    r
+
+/** `text` over `ts` pushed down: its rows must be `n`. */
+private pp_rows_are(r: PpRun, n: usize, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(xn_code(r.result), "ok", "the query runs", file, line)
+    val (_, got) = r.result.unwrap()
+    assert_eq(got.len(), n, "rows", file, line)
+
+/** The pairs of `xs` and `ys` whose keys (field 1) are equal and not null. */
+private pp_matching(xs: Buf[Value], ys: Buf[Value]) -> u64
+    var n: u64 = 0
+
+    for x in xs
+        for y in ys
+            val (p, q) = (pp_key(x), pp_key(y))
+
+            if p.is_some() && q.is_some() && p.unwrap() == q.unwrap() then n += 1
+
+    n
+
+private pp_key(v: Value) -> Option[i128]
+    val k = v match
+        Record(fs) -> fs[1]
+        _ -> return None
+
+    k match
+        Int(n) -> Some(n)
+        _ -> None
+
+// -- the shape of a pushed-down tree -------------------------------------------------------------------
+
+/** The relation of `text`'s query after unnesting and pushdown. */
+private pp_tree(text: string, file: string = __FILE__, line: long = __LINE__) -> Rel = pp_tree_over(text, pp_same(2), file, line)
+
+/** The relation of `text`'s query over `ts` after unnesting and pushdown. */
+private pp_tree_over(text: string, ts: []const XnTable, file: string = __FILE__, line: long = __LINE__) -> Rel
+    val q = pp_env(text, file, line)
+    val catalog = xn_catalog(ts)
+    val p = unnest_plan(q, type_envelope(q, catalog).unwrap(), catalog, buf[Value]())
+    assert_eq(p.fallbacks.len(), 0usize, "no fallback", file, line)
+
+    p.env.statement match
+        Query(r) -> r
+        _ -> panic("a query")
+
+private pp_children(r: Rel) -> Buf[Rel]
+    val out = buf[Rel]()
+
+    r match
+        Filter(i, _) | Project(i, _, _) | Sort(i, _) | Limit(i, _, _, _, _) | Distinct(i) | Aggregate(i, _, _, _) -> out.push(*i)
+        Join(_, l, x, _, _, _) ->
+            out.push(*l)
+            out.push(*x)
+        _ -> ()
+
+    out
+
+/** Whether some `Filter` of `r` sits right over a scan of `table`. */
+private pp_filtered(r: Rel, table: string) -> bool
+    r match
+        Filter(i, _) ->
+            if pp_scans(*i, table) then return true
+        _ -> ()
+
+    for c in pp_children(r)
+        if pp_filtered(c, table) then return true
+
+    false
+
+private pp_scans(r: Rel, table: string) -> bool = r match
+    Scan(q, _) -> q.name == table
+    _ -> false
+
+private pp_kind_name(k: JoinKind) -> string = k match
+    Inner -> "inner"
+    Left -> "left"
+    Right -> "right"
+    Full -> "full"
+    _ -> "other"
+
+/** The kinds of `r`'s joins in pre-order, comma-separated, each with `+on` when it has an `on`. */
+private pp_kinds(r: Rel) -> string
+    val ks = buf[string]()
+    pp_kinds_into(r, ks)
+    var out = ""
+
+    for i in 0..<ks.len()
+        out = if i == 0 then ks[i] else out + "," + ks[i]
+
+    out
+
+private pp_kinds_into(r: Rel, out: Buf[string])
+    r match
+        Join(k, _, _, on, _, _) ->
+            val suffix = if on.is_some() then "+on" else ""
+            out.push(pp_kind_name(k) + suffix)
+        _ -> ()
+
+    for c in pp_children(r)
+        pp_kinds_into(c, out)
+
+/** Whether a `Filter` sits above every join of `r`. */
+private pp_filter_above(r: Rel) -> bool = r match
+    Filter(_, _) -> true
+    Project(i, _, _) | Sort(i, _) | Limit(i, _, _, _, _) | Distinct(i) | Aggregate(i, _, _, _) -> pp_filter_above(*i)
+    _ -> false
+
+/** The functions of the top-level conjuncts of every join's `on` in `r`. */
+private pp_on_calls(r: Rel, out: Buf[string])
+    val cs = buf[Expr]()
+
+    r match
+        Join(_, _, _, on, _, _) ->
+            if on.is_some() then pp_conj(on.unwrap(), cs)
+        _ -> ()
+
+    for c in cs
+        c match
+            Call(f, _) -> out.push(f)
+            _ -> ()
+
+    for c in pp_children(r)
+        pp_on_calls(c, out)
+
+private pp_conj(e: Expr, out: Buf[Expr])
+    e match
+        Call(f, args) ->
+            if f == "and" && args.len() == 2
+                pp_conj(args[0], out)
+                pp_conj(args[1], out)
+                return
+        _ -> ()
+
+    out.push(e)
+
+private pp_has(xs: Buf[string], x: string) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+private pp_on_has(r: Rel, f: string) -> bool
+    val out = buf[string]()
+    pp_on_calls(r, out)
+    pp_has(out, f)
+
+// -- comma joins form no pair of different keys ----------------------------------------------------------
+
+@test
+a_two_way_comma_join_forms_no_pair_of_different_keys()
+    val ts = pp_of(pp_keyed(200), pp_keyed(200), pp_none(), pp_none())
+    val r = pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k", ts, 200)
+    pp_rows_are(r, 200)
+    // As written, the filter sees every pair.
+    assert_eq(pp_run(pp_env("select a.a_id, b.b_id from a, b where a.a_k = b.b_k"), ts, false).pairs, 40000u64)
+
+@test
+a_two_way_comma_join_with_the_equality_turned_round_is_keyed_too()
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where b.b_k = a.a_k", pp_of(pp_keyed(50), pp_keyed(50), pp_none(), pp_none()), 50), 50)
+
+@test
+a_three_way_chain_of_comma_joins_forms_no_pair_of_different_keys()
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id, c.c_id from a, b, c where a.a_k = b.b_k and b.b_k = c.c_k", pp_same(12), 24), 12)
+    val big = pp_run(pp_env("select a.a_id, b.b_id, c.c_id from a, b, c where a.a_k = b.b_k and b.b_k = c.c_k"), pp_same(300), true)
+    assert_eq(big.pairs, 600u64)
+
+@test
+a_three_way_comma_join_keyed_only_to_its_last_table_is_bracketed_to_its_keys()
+    // a and b are not keyed to each other: joined first, as written, they would form every pair.
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id, c.c_id from a, b, c where a.a_k = c.c_k and b.b_k = c.c_k", pp_same(12), 24), 12)
+
+@test
+a_four_way_chain_of_comma_joins_forms_no_pair_of_different_keys()
+    val text = "select a.a_id, d.d_id from a, b, c, d where a.a_k = b.b_k and b.b_k = c.c_k and c.c_k = d.d_k"
+    pp_rows_are(pp_pairs(text, pp_same(10), 30), 10)
+    assert_eq(pp_run(pp_env(text), pp_same(200), true).pairs, 600u64)
+
+@test
+a_four_way_star_of_comma_joins_forms_no_pair_of_different_keys()
+    pp_rows_are(pp_pairs("select a.a_id, d.d_id from a, b, c, d where a.a_k = b.b_k and a.a_k = c.c_k and a.a_k = d.d_k", pp_same(10), 30), 10)
+
+@test
+a_four_way_comma_join_no_bracketing_of_keys_in_order_is_reordered_under_a_select_list()
+    // a-c, a-d and b-d: every bracketing of a, b, c, d in this order joins two tables no key joins, so
+    // the tables are joined in another order, which the select list's names make invisible.
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id, c.c_id, d.d_id from a, b, c, d where a.a_k = c.c_k and a.a_k = d.d_k and b.b_k = d.d_k",
+        pp_same(10), 30), 10)
+
+@test
+duplicate_keys_form_exactly_the_pairs_of_equal_keys()
+    val xs = buf[Value]()
+    val ys = buf[Value]()
+
+    for i in 0..<60
+        xs.push(pp_row(i, Int(i % 7), Int(i)))
+        ys.push(pp_row(i, Int(i % 5), Int(i)))
+
+    val want = pp_matching(xs, ys)
+    val _ = pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k", pp_of(xs, ys, pp_none(), pp_none()), want)
+
+@test
+null_keys_form_no_pair_and_match_nothing()
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Null, Int(0)), pp_row(3, Null, Int(0)), pp_row(4, Int(2), Int(0))])
+    val ys = rows_of([pp_row(1, Null, Int(0)), pp_row(2, Int(1), Int(0)), pp_row(3, Null, Int(0)), pp_row(4, Int(3), Int(0))])
+    val r = pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k", pp_of(xs, ys, pp_none(), pp_none()), 1)
+    pp_rows_are(r, 1)
+
+@test
+a_three_way_comma_join_over_null_keys_agrees()
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Null, Int(0)), pp_row(3, Int(2), Null)])
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id, c.c_id from a, b, c where a.a_k = b.b_k and b.b_k = c.c_k", pp_of(xs, xs, xs, pp_none()), 4), 2)
+
+// -- hand-built trees with no select list: the columns' order is kept ------------------------------------
+
+private pp_s(t: string) -> Rel = scan("app", t, t)
+
+private pp_k(t: string) -> Expr = col(t, t + "_k")
+
+private pp_eq(x: Expr, y: Expr) -> Expr = call("eq", [x, y])
+
+private pp_cross(l: Rel, r: Rel) -> Rel = Join(Inner, l, r, None, None, None)
+
+/** `filter(cross of the tables, p)`, the root with no `Project`, so its columns' order is the result's. */
+private pp_bare(tables: []const string, p: Expr) -> Envelope
+    var r = pp_s(tables[0])
+
+    for i in 1..<tables.len
+        r = pp_cross(r, pp_s(tables[i]))
+
+    query([], filter(r, p))
+
+@test
+a_bare_three_way_join_keyed_to_its_last_table_keeps_its_columns_in_order()
+    val q = pp_bare(["a", "b", "c"], call("and", [pp_eq(pp_k("a"), pp_k("c")), pp_eq(pp_k("b"), pp_k("c"))]))
+    val r = pp_agree(q, pp_same(12), "a-c and b-c, no select list")
+    assert_eq(r.pairs, 24u64)
+    pp_rows_are(r, 12)
+
+@test
+a_bare_four_way_join_with_no_bracketing_of_its_keys_keeps_its_columns_and_agrees()
+    // a-c, a-d, b-d: no bracketing in this order avoids a pair of tables no key joins, and with no
+    // select list the order cannot change; the result still agrees.
+    val p = call("and", [call("and", [pp_eq(pp_k("a"), pp_k("c")), pp_eq(pp_k("a"), pp_k("d"))]), pp_eq(pp_k("b"), pp_k("d"))])
+    pp_rows_are(pp_agree(pp_bare(["a", "b", "c", "d"], p), pp_same(6), "a-c, a-d, b-d, no select list"), 6)
+
+@test
+a_bare_four_way_join_bracketed_right_deep_forms_no_pair_of_different_keys()
+    // a-c, b-d, c-d: a (b (c d)) joins every pair by a key.
+    val p = call("and", [call("and", [pp_eq(pp_k("a"), pp_k("c")), pp_eq(pp_k("b"), pp_k("d"))]), pp_eq(pp_k("c"), pp_k("d"))])
+    val r = pp_agree(pp_bare(["a", "b", "c", "d"], p), pp_same(8), "a-c, b-d, c-d, no select list")
+    assert_eq(r.pairs, 24u64)
+
+// -- what stays above ------------------------------------------------------------------------------------
+
+@test
+a_comparison_across_the_sides_that_is_not_eq_stays_in_the_join()
+    val text = "select a.a_id, b.b_id from a, b where a.a_k < b.b_k"
+    pp_rows_are(pp_pairs(text, pp_of(pp_keyed(20), pp_keyed(20), pp_none(), pp_none()), 400), 190)
+    val t = pp_tree(text)
+    assert(pp_on_has(t, "lt"), "the comparison is the join's on")
+    assert(!pp_filtered(t, "a") && !pp_filtered(t, "b"), "and no side's filter")
+
+@test
+a_comparison_across_the_sides_beside_a_key_is_tested_on_the_keys_pairs_only()
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and a.a_v < b.b_id", pp_of(pp_keyed(30), pp_keyed(30), pp_none(), pp_none()), 30), 30)
+
+@test
+an_or_across_the_sides_stays_whole_and_keys_nothing()
+    val text = "select a.a_id, b.b_id from a, b where a.a_k = b.b_k or a.a_v = b.b_v"
+    val _ = pp_pairs(text, pp_of(pp_keyed(14), pp_keyed(14), pp_none(), pp_none()), 196)
+    val t = pp_tree(text)
+    assert(pp_on_has(t, "or"), "the or is the join's on")
+    assert(!pp_filtered(t, "a") && !pp_filtered(t, "b"), "and no side's filter")
+
+@test
+an_or_within_one_side_moves_into_it()
+    val text = "select a.a_id, b.b_id from a, b where (a.a_v = 1 or a.a_v = 2) and a.a_k = b.b_k"
+    pp_rows_are(pp_pairs(text, pp_of(pp_keyed(21), pp_keyed(21), pp_none(), pp_none()), 6), 6)
+    assert(pp_filtered(pp_tree(text), "a"), "the or filters a")
+
+@test
+a_conjunct_on_one_side_moves_into_it()
+    val text = "select a.a_id, b.b_id from a, b where a.a_k = b.b_k and b.b_v > 4"
+    pp_rows_are(pp_pairs(text, pp_of(pp_keyed(21), pp_keyed(21), pp_none(), pp_none()), 6), 6)
+    val t = pp_tree(text)
+    assert(pp_filtered(t, "b") && !pp_filtered(t, "a"), "b is filtered and a is not")
+    assert(!pp_filter_above(t), "no filter is left above the join")
+
+@test
+a_constant_false_conjunct_forms_no_pair()
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and 1 = 0", pp_same(30), 0), 0)
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where false", pp_same(30), 0), 0)
+
+@test
+a_constant_true_conjunct_changes_nothing()
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and 1 = 1", pp_same(30), 30), 30)
+
+@test
+an_empty_side_forms_no_pair()
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and a.a_v > 1", pp_of(pp_keyed(20), pp_none(), pp_none(), pp_none()), 0), 0)
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and b.b_v > 1", pp_of(pp_none(), pp_keyed(20), pp_none(), pp_none()), 0), 0)
+    // c, the right input of the top join, is empty, so its left input, the join of a and b, is never read.
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id, c.c_id from a, b, c where a.a_k = b.b_k and b.b_k = c.c_k", pp_of(pp_keyed(20), pp_keyed(20), pp_none(), pp_none()), 0), 0)
+
+@test
+a_conjunct_reading_an_outer_row_moves_with_the_side_it_reads()
+    val text = "select a.a_id from a where exists (select 1 from b, c where b.b_k = c.c_k and b.b_v = a.a_v)"
+    pp_rows_are(pp_agree(pp_env(text), pp_same(14), text), 14)
+
+// -- runtime errors --------------------------------------------------------------------------------
+
+@test
+a_division_on_one_side_with_the_other_side_empty_raises_nothing()
+    // The division may raise, so it stays above the join, which over an empty side forms no row.
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Int(2), Int(5))])
+    val text = "select a.a_id, b.b_id from a, b where a.a_k = b.b_k and 10 / a.a_v > 0"
+    pp_rows_are(pp_agree(pp_env(text), pp_of(xs, pp_none(), pp_none(), pp_none()), text), 0)
+    assert(!pp_filtered(pp_tree(text), "a"), "the division does not filter a")
+
+@test
+a_division_by_zero_on_a_row_no_key_matches_is_not_evaluated()
+    // §6.4 rule 3: the key's conjunct is not true on every pair of row 1, so the division may go
+    // unevaluated there; as written the filter evaluates it on those pairs and raises.
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Int(2), Int(5))])
+    val ys = rows_of([pp_row(7, Int(2), Int(0))])
+    val q = pp_env("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and 10 / a.a_v > 0")
+    val ts = pp_of(xs, ys, pp_none(), pp_none())
+    pp_rows_are(pp_run(q, ts, true), 1)
+    assert_eq(xn_code(pp_run(q, ts, false).result), "R0002")
+
+@test
+a_division_by_zero_on_a_row_a_key_matches_raises_either_way()
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Int(2), Int(5))])
+    val ys = rows_of([pp_row(7, Int(1), Int(0))])
+    val text = "select a.a_id, b.b_id from a, b where a.a_k = b.b_k and 10 / a.a_v > 0"
+    val r = pp_agree(pp_env(text), pp_of(xs, ys, pp_none(), pp_none()), text)
+    assert_eq(xn_code(r.result), "R0002")
+
+@test
+a_constant_division_by_zero_raises_only_where_there_is_a_row()
+    val text = "select a.a_id, b.b_id from a, b where a.a_k = b.b_k and 1 / 0 > 0"
+    assert_eq(xn_code(pp_agree(pp_env(text), pp_of(pp_keyed(3), pp_none(), pp_none(), pp_none()), text).result), "ok")
+    assert_eq(xn_code(pp_agree(pp_env(text), pp_same(3), text).result), "R0002")
+
+@test
+a_where_conjunct_does_not_move_below_an_on_that_may_raise()
+    // The `on` is evaluated on every pair; removing a's rows below it would leave its error on row 1's
+    // pairs unraised.
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Int(2), Int(5))])
+    val text = "select a.a_id, b.b_id from a join b on 10 / a.a_v > b.b_v where a.a_id = 2"
+    val r = pp_agree(pp_env(text), pp_of(xs, pp_keyed(2), pp_none(), pp_none()), text)
+    assert_eq(xn_code(r.result), "R0002")
+    val t = pp_tree_over(text, pp_of(xs, pp_keyed(2), pp_none(), pp_none()))
+    assert(pp_filter_above(t) && !pp_filtered(t, "a"), "the filter stays above the join")
+
+@test
+a_safe_on_conjunct_of_one_side_moves_below_an_on_that_may_raise()
+    // §6.5 rule 8: the division may go unevaluated on a pair the moved conjunct makes not true.
+    val xs = rows_of([pp_row(1, Int(1), Int(0)), pp_row(2, Int(2), Int(5))])
+    val text = "select a.a_id, b.b_id from a join b on 10 / a.a_v > b.b_v and a.a_id = 2"
+    val ts = pp_of(xs, pp_keyed(2), pp_none(), pp_none())
+    pp_rows_are(pp_run(pp_env(text), ts, true), 1)
+    assert(pp_filtered(pp_tree_over(text, ts), "a"), "a is filtered")
+
+@test
+a_conjunct_drawing_a_sequence_value_is_not_moved()
+    assert(!pp_safe(call("next_value", [Literal(Text, Text("app")), Literal(Text, Text("s"))])), "next_value is not safe")
+    assert(!pp_safe(call("div", [col("a", "x"), col("a", "y")])), "div is not safe")
+    assert(!pp_safe(Cast(col("a", "x"), Int32, Strict)), "a cast is not safe")
+    assert(pp_safe(call("or", [call("is_null", [col("a", "x")]), call("eq", [col("a", "x"), col("b", "y")])])), "comparisons and logic are safe")
+
+private pp_safe(e: Expr) -> bool = pd_safe(e)
+
+// -- outer joins -------------------------------------------------------------------------------------
+
+/** Rows 1..6 of a keyed 1..6 with v = id; b keyed 3..8 with v = id; nulls in a row of each. */
+private pp_outer() -> [4]XnTable
+    val xs = buf[Value]()
+    val ys = buf[Value]()
+
+    for i in 1..<7
+        xs.push(pp_row(i, Int(i), Int(i)))
+        ys.push(pp_row(i + 2, Int(i + 2), Int(i + 2)))
+
+    xs.push(pp_row(20, Null, Null))
+    ys.push(pp_row(30, Null, Null))
+    pp_of(xs, ys, pp_none(), pp_none())
+
+/** `text` over `pp_outer`, agreeing, with `rows` rows and its joins `kinds` (`pp_kinds`) pushed down. */
+private pp_outer_case(text: string, kinds: string, rows: usize, file: string = __FILE__, line: long = __LINE__)
+    val _ = pp_outer_rel(text, kinds, rows, file, line)
+
+/** `pp_outer_case`, and the pushed-down tree. */
+private pp_outer_rel(text: string, kinds: string, rows: usize, file: string = __FILE__, line: long = __LINE__) -> Rel
+    val r = pp_agree(pp_env(text, file, line), pp_outer(), text, file, line)
+    pp_rows_are(r, rows, file, line)
+    val t = pp_tree_over(text, pp_outer(), file, line)
+    assert_eq(pp_kinds(t), kinds, s"the joins of: $text", file, line)
+    t
+
+@test
+a_left_join_where_on_the_preserved_side_moves_into_it()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where a.a_v > 4", "left+on", 2)
+    assert(pp_filtered(t, "a") && !pp_filter_above(t), "a is filtered below the join")
+
+@test
+a_left_join_where_rejecting_the_null_supplying_sides_nulls_is_inner()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where b.b_v > 4", "inner+on", 2)
+    assert(pp_filtered(t, "b"), "b is filtered")
+
+@test
+a_left_join_where_is_not_null_on_the_null_supplying_side_is_inner()
+    pp_outer_case("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where b.b_id is not null", "inner+on", 4)
+
+@test
+a_left_join_where_is_null_on_the_null_supplying_side_stays_left()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where b.b_id is null", "left+on", 3)
+    assert(pp_filter_above(t), "the filter stays above")
+
+@test
+a_left_join_where_coalescing_the_null_supplying_side_stays_left()
+    pp_outer_case("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where coalesce(b.b_v, 0) = 0", "left+on", 3)
+
+@test
+a_left_join_where_equating_the_two_sides_is_inner_with_the_key()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where b.b_v = a.a_v", "inner+on", 4)
+    assert(!pp_filter_above(t), "the equality joined the on")
+
+@test
+a_left_join_on_conjunct_of_the_null_supplying_side_moves_into_it()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k and b.b_v > 4", "left+on", 7)
+    assert(pp_filtered(t, "b"), "b is filtered")
+
+@test
+a_left_join_on_conjunct_of_the_preserved_side_stays_in_on()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k and a.a_v > 4", "left+on", 7)
+    assert(!pp_filtered(t, "a"), "a is not filtered")
+
+@test
+a_left_join_on_false_null_extends_every_row()
+    pp_outer_case("select a.a_id, b.b_id from a left join b on 1 = 0", "left", 7)
+
+@test
+a_left_join_where_does_not_move_into_the_preserved_side_under_an_on_that_may_raise()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a left join b on a.a_k = b.b_k and 10 / b.b_v > 0 where a.a_v > 4", "left+on", 2)
+    assert(pp_filter_above(t) && !pp_filtered(t, "a"), "the filter stays above")
+
+@test
+a_right_join_where_on_the_preserved_side_moves_into_it()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a right join b on a.a_k = b.b_k where b.b_v > 6", "right+on", 2)
+    assert(pp_filtered(t, "b") && !pp_filter_above(t), "b is filtered below the join")
+
+@test
+a_right_join_where_rejecting_the_null_supplying_sides_nulls_is_inner()
+    pp_outer_case("select a.a_id, b.b_id from a right join b on a.a_k = b.b_k where a.a_v < 5", "inner+on", 2)
+
+@test
+a_right_join_where_is_null_on_the_null_supplying_side_stays_right()
+    pp_outer_case("select a.a_id, b.b_id from a right join b on a.a_k = b.b_k where a.a_id is null", "right+on", 3)
+
+@test
+a_right_join_on_conjunct_of_the_null_supplying_side_moves_into_it()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a right join b on a.a_k = b.b_k and a.a_v < 5", "right+on", 7)
+    assert(pp_filtered(t, "a"), "a is filtered")
+
+@test
+a_right_join_on_conjunct_of_the_preserved_side_stays_in_on()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a right join b on a.a_k = b.b_k and b.b_v < 5", "right+on", 7)
+    assert(!pp_filtered(t, "b"), "b is not filtered")
+
+@test
+a_full_join_where_rejecting_the_right_sides_nulls_is_right()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a full join b on a.a_k = b.b_k where b.b_v > 6", "right+on", 2)
+    assert(pp_filtered(t, "b"), "the preserved side of the right join takes the conjunct")
+
+@test
+a_full_join_where_rejecting_the_left_sides_nulls_is_left()
+    pp_outer_case("select a.a_id, b.b_id from a full join b on a.a_k = b.b_k where a.a_v < 3", "left+on", 2)
+
+@test
+a_full_join_where_rejecting_both_sides_nulls_is_inner()
+    pp_outer_case("select a.a_id, b.b_id from a full join b on a.a_k = b.b_k where a.a_v < 5 and b.b_v > 3", "inner+on", 1)
+
+@test
+a_full_join_where_is_null_stays_full()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a full join b on a.a_k = b.b_k where a.a_id is null", "full+on", 3)
+    assert(pp_filter_above(t), "the filter stays above")
+
+@test
+a_full_join_on_conjuncts_of_either_side_stay_in_on()
+    val t = pp_outer_rel("select a.a_id, b.b_id from a full join b on a.a_k = b.b_k and a.a_v > 3 and b.b_v < 6", "full+on", 12)
+    assert(!pp_filtered(t, "a") && !pp_filtered(t, "b"), "no side is filtered")
+
+@test
+a_left_join_inside_a_comma_join_takes_its_conjuncts()
+    val text = "select a.a_id, b.b_id, c.c_id from a left join b on a.a_k = b.b_k, c where c.c_k = a.a_k and a.a_v > 2 and b.b_v > 3"
+    val ts = pp_of(pp_keyed(9), pp_keyed(6), pp_keyed(9), pp_none())
+    val _ = pp_agree(pp_env(text), ts, text)
+    val t = pp_tree_over(text, ts)
+    assert_eq(pp_kinds(t), "inner+on,inner+on")
+    assert(pp_filtered(t, "a") && pp_filtered(t, "b"), "both sides are filtered")
+
+// -- the store: a pushed conjunct chooses the scan's access path -------------------------------------------
+
+private pp_db_env(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope = pp_sql(text, s.latest_catalog(), file, line)
+
+private pp_db_ok(s: &Store, text: string)
+    val t = s.begin(Snapshot)
+    val _ = xd_ran(s, t, pp_db_env(s, text))
+    assert(s.commit(t).is_ok(), "the transaction commits")
+
+/** A store whose tables `a`, `b` and `c` hold ids `1..=n`, with `k = id` and `v = id % 7` (so row 7's
+ * `v` is zero).
+ */
+private pp_store(n: i128) -> &Store
+    val s = mem_store(pp_catalog())
+
+    for t in ["a", "b", "c"]
+        var text = s"INSERT INTO $t (${t}_id, ${t}_k, ${t}_v) VALUES "
+
+        for i in 1..<n + 1
+            if i > 1 then text = text + ", "
+            text = text + s"($i, $i, ${i % 7})"
+
+        pp_db_ok(s, text)
+
+    s
+
+/** The rows of `text` as one integer each, its first column times 1000 plus its second, and the leaf
+ * entries it visited.
+ */
+private pp_db(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__) -> (Buf[i128], u64)
+    val before = s.slots_read
+    val o = xd_ran(s, s.begin(Snapshot), pp_db_env(s, text, file, line), [], file, line)
+    val out = buf[i128]()
+
+    for r in xd_rows(o)
+        r match
+            Record(fs) -> out.push(1000 * pp_int(fs[0]) + pp_int(fs[1]))
+            _ -> out.push(-1)
+
+    (out, s.slots_read - before)
+
+private pp_int(v: Value) -> i128 = v match
+    Int(n) -> n
+    _ -> 999
+
+private pp_db_check(s: &Store, text: string, want: []const i128, visits: u64, file: string = __FILE__, line: long = __LINE__)
+    val (got, seen) = pp_db(s, text, file, line)
+    assert_eq(got.len(), want.len, s"rows of: $text", file, line)
+
+    for i in 0..<want.len
+        if i < got.len() then assert_eq(got[i], want[i], s"row $i of: $text", file, line)
+
+    assert_eq(seen, visits, s"leaf entries visited by: $text", file, line)
+
+@test
+a_key_equality_on_the_left_side_of_a_comma_join_is_a_key_lookup()
+    pp_db_check(pp_store(50), "select a.a_id, b.b_id from a, b where a.a_id = 5 and a.a_k = b.b_k", [5005], 51)
+
+@test
+a_key_equality_on_the_right_side_of_a_comma_join_is_a_key_lookup()
+    pp_db_check(pp_store(50), "select a.a_id, b.b_id from a, b where b.b_id = 5 and a.a_k = b.b_k", [5005], 51)
+
+@test
+key_equalities_on_both_sides_are_two_lookups()
+    pp_db_check(pp_store(50), "select a.a_id, b.b_id from a, b where a.a_id = 5 and b.b_id = 6", [5006], 2)
+
+@test
+a_key_range_on_one_side_of_a_comma_join_reads_only_its_range()
+    pp_db_check(pp_store(50), "select a.a_id, b.b_id from a, b where a.a_id >= 48 and a.a_k = b.b_k order by a.a_id", [48048, 49049, 50050], 53)
+
+@test
+a_key_lookup_in_a_three_way_comma_join()
+    pp_db_check(pp_store(40), "select a.a_id, c.c_id from a, b, c where a.a_id = 5 and a.a_k = b.b_k and b.b_k = c.c_k", [5005], 81)
+
+@test
+a_key_equality_in_an_inner_joins_on_is_a_key_lookup()
+    pp_db_check(pp_store(50), "select a.a_id, b.b_id from a join b on a.a_k = b.b_k and b.b_id = 9", [9009], 51)
+
+@test
+a_key_equality_on_a_left_joins_preserved_side_is_a_key_lookup()
+    pp_db_check(pp_store(50), "select a.a_id, b.b_id from a left join b on a.a_k = b.b_k where a.a_id = 5", [5005], 51)
+
+@test
+a_key_equality_on_a_left_joins_null_supplying_side_in_on_is_a_key_lookup()
+    // Every row of a is kept, and only row 3 meets a row of b.
+    val (got, seen) = pp_db(pp_store(4), "select a.a_id, b.b_id from a left join b on a.a_k = b.b_k and b.b_id = 3 order by a.a_id")
+    assert_eq(got.len(), 4usize)
+    assert_eq(got[0], 1999)
+    assert_eq(got[2], 3003)
+    assert_eq(seen, 5u64)
+
+@test
+a_key_lookup_never_reads_the_row_a_division_by_zero_is_on()
+    // Row 7 has v = 0. Its key is outside the lookup, so the division is never evaluated on it.
+    val s = pp_store(10)
+    pp_db_check(s, "select a.a_id, b.b_id from a, b where a.a_id = 2 and 10 / a.a_v > 0 and b.b_id = 1", [2001], 2)
+
+@test
+a_division_by_zero_on_a_row_the_lookup_reads_is_raised()
+    val s = pp_store(10)
+    assert_eq(xd_code(s, s.begin(Snapshot), pp_db_env(s, "select a.a_id, b.b_id from a, b where a.a_id = 7 and 10 / a.a_v > 0 and b.b_id = 1")), "R0002")
+
+@test
+a_conjunct_does_not_empty_a_right_input_beside_a_view()
+    // A view's query may raise, and an empty right input would leave it unread (§6.5 rule 10).
+    val view = FakeTable(QualName("app", "va"), TableInfo(items_of([cat_column("a_id", Int64), cat_column("a_k", nullable(Int64))]), buf[UniqueKey](), true))
+    val tb = fake_table("b", [cat_column("b_id", Int64), cat_column("b_k", nullable(Int64))], [])
+    val catalog = FakeCatalog(items_of([view, tb]), buf[FakeType](), buf[FakeFunction]())
+    val p = call("and", [pp_eq(col("va", "a_k"), col("b", "b_k")), pp_eq(col("b", "b_id"), Literal(Int64, Int(5)))])
+    val q = query([], filter(pp_cross(scan("app", "va", "va"), pp_s("b")), p))
+    val out = push_query(q, catalog)
+
+    val r = out.statement match
+        Query(r) -> r
+        _ -> panic("a query")
+
+    assert(!pp_filtered(r, "b"), "b is not filtered beside the view")
+    assert(pp_on_has(r, "eq"), "the conjuncts are the join's on")
+    // With a table on the left, b takes its conjunct.
+    val tables = FakeCatalog(items_of([fake_table("va", [cat_column("a_id", Int64), cat_column("a_k", nullable(Int64))], []), tb]), buf[FakeType](), buf[FakeFunction]())
+
+    val r2 = push_query(q, tables).statement match
+        Query(r) -> r
+        _ -> panic("a query")
+
+    assert(pp_filtered(r2, "b"), "b is filtered beside a table")
+
+// -- differential -------------------------------------------------------------------------------------
+
+private pp_maybe(g: *Rng) -> Value = if g.below(5) == 0 then Null else Int(i128(g.below(4)))
+
+/** Up to seven rows a table, over few values, so that duplicates and nulls are common; any table may be
+ * empty.
+ */
+private pp_random_tables(g: *Rng) -> [4]XnTable
+    val ts = buf[Buf[Value]]()
+
+    for _ in 0..<4
+        val rows = buf[Value]()
+
+        for i in 0..<g.below(8)
+            rows.push(pp_row(i128(i), pp_maybe(g), pp_maybe(g)))
+
+        ts.push(rows)
+
+    pp_of(ts[0], ts[1], ts[2], ts[3], 1 + usize(g.below(3)))
+
+private pp_pick(g: *Rng, tables: Buf[string]) -> string = tables[usize(g.below(u64(tables.len())))]
+
+private pp_column(g: *Rng, tables: Buf[string]) -> string
+    val t = pp_pick(g, tables)
+    val c = if g.below(3) == 0 then "_id" else if g.below(2) == 0 then "_k" else "_v"
+    s"$t.$t$c"
+
+/** A random conjunct over the columns of `tables`, raising no error. */
+private pp_atom(g: *Rng, tables: Buf[string], depth: u64 = 0) -> string = g.below(if depth > 0 then 6 else 9) match
+    0 | 1 -> s"${pp_column(g, tables)} = ${pp_column(g, tables)}"
+    2 -> s"${pp_column(g, tables)} < ${pp_column(g, tables)}"
+    3 -> s"${pp_column(g, tables)} = ${g.below(4)}"
+    4 -> s"${pp_column(g, tables)} > ${g.below(4)}"
+    5 -> if g.below(2) == 0 then s"${pp_column(g, tables)} is null" else s"${pp_column(g, tables)} is not null"
+    6 -> s"(${pp_atom(g, tables, depth + 1)} or ${pp_atom(g, tables, depth + 1)})"
+    7 -> s"coalesce(${pp_column(g, tables)}, 9) = ${pp_column(g, tables)}"
+    _ -> if g.below(4) == 0 then "1 = 0" else s"${pp_column(g, tables)} <> ${g.below(4)}"
+
+private pp_conjunction(g: *Rng, tables: Buf[string], n: u64) -> string
+    var out = pp_atom(g, tables)
+
+    for _ in 1..<n
+        out = out + " and " + pp_atom(g, tables)
+
+    out
+
+/** A random query over two to four of the tables: comma joins and explicit joins of every kind, each
+ * `on` reading the tables of its own `FROM` item, and a `WHERE` of up to three conjuncts.
+ */
+private pp_random_query(g: *Rng) -> string
+    val names = ["a", "b", "c", "d"]
+    val m = 2 + usize(g.below(3))
+    val all = items_of([names[0]])
+    var item = items_of([names[0]])
+    var from = names[0]
+    var select = "a.a_id, a.a_k"
+
+    for i in 1..<m
+        val t = names[i]
+        select = select + s", $t.${t}_id, $t.${t}_v"
+        all.push(t)
+
+        if g.below(3) == 0
+            from = from + s", $t"
+            item = items_of([t])
+        else
+            item.push(t)
+            val kind = g.below(5) match
+                0 -> "join"
+                1 -> "left join"
+                2 -> "right join"
+                3 -> "full join"
+                _ -> "cross join"
+
+            if kind == "cross join"
+                from = from + s" cross join $t"
+            else
+                from = from + s" $kind $t on ${pp_conjunction(g, item, 1 + g.below(2))}"
+
+    val w = g.below(4)
+    val where = if w == 0 then "" else s" where ${pp_conjunction(g, all, w)}"
+    s"select $select from $from$where"
+
+@test
+random_joins_pushed_down_agree_with_the_tree_as_written()
+    for seed in 0..<80
+        var g = rng(u64(seed), 4211)
+        val ts = pp_random_tables(&g)
+
+        for _ in 0..<8
+            val text = pp_random_query(&g)
+            val _ = pp_agree(pp_env(text), ts, s"seed $seed: $text")
