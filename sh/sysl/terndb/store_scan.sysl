@@ -1,0 +1,229 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// The executor's table scan read straight into column vectors (`docs/design/store.md` "What the
+// executor calls", `docs/design/executor.md` §4.5). A row whose current image the reader sees, in the
+// table's current schema version, is decoded from its leaf entry where the page holds it: its key
+// components from the key, each scalar or octet-string column from its stored octets into its
+// vector's lane, and a column the statement does not read not at all. A row whose visible version must
+// be rebuilt through the undo log, one locked `LOCK_ONLY`, or one of an older schema version takes
+// the path every other read takes (`visible`, `translated`) and is appended as values.
+
+/** The work the store's reads have done, for the tests that pin what a scan costs per row:
+ * leaf entries `copied` out of their page, row `images` built (a buffer per column), `rows` built
+ * as `StoredRow` records, stored values decoded into `values`, and stored `columns` decoded straight
+ * into a vector's lanes.
+ */
+struct ReadWork derives Eq
+    copied: u64
+    images: u64
+    rows: u64
+    values: u64
+    columns: u64
+
+/** Nothing counted yet. */
+no_reads() -> ReadWork = ReadWork(0, 0, 0, 0, 0)
+
+/** How a scan into vectors reads the rows of one schema version: its codec and layout widths; for
+ * each column, by ordinal, its place among the key components (none for a non-key column) and
+ * whether the statement reads it; for each non-key column, whether its stored octets go straight into
+ * its vector's lanes. `fast` is false when the version's codec is not the vector's columns, and then
+ * every row takes the general path.
+ */
+private struct ScanShape
+    fast: bool
+    codec: SchemaCodec
+    widths: Buf[usize]
+    key_of: Buf[Option[usize]]
+    wanted: Buf[bool]
+    direct: Buf[bool]
+
+impl Store
+    /** The rows of `table` visible to `t` whose encoded keys lie between `lo` and `hi`, in key order,
+     * as vectors of `elem` (the table's row type) of at most `BatchSize` rows, none empty; the read
+     * logged as `logged`, as `scan_range` logs it. `columns` names, by id, the columns the statement
+     * reads: every other non-key column's slots hold a placeholder. None reads every column.
+     */
+    scan_vectors(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred, elem: Type, columns: Option[Buf[u32]]) -> Result[Buf[ColumnVector], CodecError]
+        val r = self.scan_vectors_in(t, table, lo, hi, logged, elem, columns)
+        self.guard(t, r)
+
+    private scan_vectors_in(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred, elem: Type, columns: Option[Buf[u32]]) -> Result[Buf[ColumnVector], CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+        val now = self.current_version(table)
+
+        val fields = elem.base() match
+            Record(fs) -> fs
+            _ -> return self.scan_as_values(t, table, lo, hi, logged, elem)
+
+        val ok = self.columns_at(table, now) match
+            Some(cs) -> cs.len() == fields.len()
+            None -> false
+
+        if now == 0 || now > 0xFFFF || !ok then return self.scan_as_values(t, table, lo, hi, logged, elem)
+
+        val builders = buf[&VectorBuilder]()
+
+        for f in fields
+            builders.push(vector_builder(f.ty))
+
+        val out = buf[ColumnVector]()
+        val shapes = buf[ScanShape]()
+        val key = buf[u8]()
+        val spans = buf[ColumnSpan]()
+        val keys = buf[Value]()
+        var n: usize = 0
+
+        self.rows.table_cursor(d.oid, lo, hi) match
+            Some(c) ->
+                var cur = c
+
+                loop
+                    val v = cur.next_into(key) match
+                        Some(v) -> v
+                        None -> break
+
+                    self.slots_read += 1
+                    val hd = decode_row_header(v)?
+                    var fast = hd.flags & RowLockOnly == 0 && u64(hd.schema_version) == now
+                    if fast && hd.txn != 0 then fast = self.rows.sees(hd.txn, t.snapshot, t.id)?
+
+                    if fast && shapes.len() == 0 then shapes.push(self.scan_shape(d, hd.schema_version, fields, columns)?)
+                    if fast then fast = shapes[0].fast
+
+                    var taken = false
+
+                    if !fast
+                        taken = self.take_slow(t, d, v, key, builders)?
+                    else if hd.flags & RowDeleted == 0
+                        taken = self.take_leaf(d, shapes[0], v, key, spans, keys, builders)?
+
+                    if taken
+                        n += 1
+
+                        if n == BatchSize
+                            out.push(batch_of(elem, builders, n))
+                            n = 0
+            None -> ()
+
+        if n > 0 then out.push(batch_of(elem, builders, n))
+        self.log_read(t, table, logged, None)
+        Ok(out)
+    end scan_vectors_in
+
+    // Appends the row whose leaf entry is key `key` and value `v` to `builders`, read as `sh` says:
+    // a row the reader sees in its current image, which is not a ghost.
+    private take_leaf(*self, d: &TableData, sh: ScanShape, v: []const u8, key: Buf[u8], spans: Buf[ColumnSpan], keys: Buf[Value], builders: Buf[&VectorBuilder]) -> Result[bool, CodecError]
+        val _ = leaf_spans(v, sh.widths.view(), spans)?
+        if spans.len() != sh.codec.types.len() then return fail("D1001", "a row with another column count than its schema version")
+        decode_key_into(d.key_spec.view(), key.view(), keys)?
+        self.reads.values += u64(keys.len())
+        var k: usize = 0
+
+        for j in 0..<builders.len()
+            val b = builders[j]
+
+            sh.key_of[j] match
+                Some(i) -> b.push_value(keys[i])
+                None ->
+                    val s = spans[k]
+
+                    if !sh.wanted[j]
+                        b.push_unread()
+                    else if s.is_null
+                        b.push_null()
+                    else if sh.direct[k]
+                        b.push_stored(sh.codec.types[k], s.of(v))?
+                        self.reads.columns += 1
+                    else
+                        b.push_value(decode_value(sh.codec.types[k], s.of(v))?)
+                        self.reads.values += 1
+
+                    k += 1
+
+        Ok(true)
+
+    // Appends the version of the row whose leaf entry is key `key` and value `v` that `t` sees, if
+    // any, read as every other read reads it: the image rebuilt through the undo log and translated to
+    // the current schema version.
+    private take_slow(*self, t: &Txn, d: &TableData, v: []const u8, key: Buf[u8], builders: Buf[&VectorBuilder]) -> Result[bool, CodecError]
+        val kb = buf[u8]()
+        kb.extend(key.view())
+        val img = self.rows.decode_leaf(d.oid, v)?
+        self.reads.copied += 1
+        self.reads.images += 1
+        val kv = self.key_value(d, kb.view())?
+        self.reads.values += u64(d.key_spec.len())
+
+        val r = self.visible(d, Slot(kv, kb, img), t.snapshot, t.id)? match
+            Some(r) -> self.translated(d.oid, r)?
+            None -> return Ok(false)
+
+        val fs = r.value match
+            Record(fs) -> fs
+            _ -> return fail("D1001", "a stored row is not a record")
+
+        if fs.len() != builders.len() then return fail("D1001", "a row with another column count than its table")
+
+        for j in 0..<fs.len()
+            builders[j].push_value(fs[j])
+
+        Ok(true)
+
+    // How rows of schema version `schema` of `d` are read into vectors of `fields`, reading the
+    // columns `columns` names (every column when none).
+    private scan_shape(*self, d: &TableData, schema: u16, fields: Buf[Field], columns: Option[Buf[u32]]) -> Result[ScanShape, CodecError]
+        val c = self.codec_of(d, u64(schema))?
+
+        val widths = self.rows.widths_of(d.oid, schema) match
+            Some(w) -> w
+            None -> return fail("D1001", "a row encoded in a schema version with no layout")
+
+        val key_of = buf[Option[usize]]()
+        val wanted = buf[bool]()
+        val direct = buf[bool]()
+        if c.columns.len() != fields.len() then return Ok(ScanShape(false, c, widths, key_of, wanted, direct))
+
+        for j in 0..<c.columns.len()
+            var kp: Option[usize] = None
+
+            for i in 0..<c.key_at.len()
+                if c.key_at[i] == j then kp = Some(i)
+
+            key_of.push(kp)
+
+            wanted.push(columns match
+                Some(ids) -> id_among(ids, c.columns[j].id)
+                None -> true)
+
+            if kp.is_none() then direct.push(same_lanes(c.types[direct.len()], fields[j].ty))
+
+        Ok(ScanShape(true, c, widths, key_of, wanted, direct))
+
+    // The general path for a scan whose row type is not its table's columns: the rows as values.
+    private scan_as_values(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred, elem: Type) -> Result[Buf[ColumnVector], CodecError]
+        val hits = self.scan_range_in(t, table, lo, hi, logged)?
+        val rows = buf[Value]()
+
+        for h in hits
+            rows.push(h.row.value)
+
+        Ok(batches_of(vector_of(elem, rows.view())))
+end Store
+
+// The batch of `n` rows of `elem` the builders hold, each of them begun again empty.
+private batch_of(elem: Type, builders: Buf[&VectorBuilder], n: usize) -> ColumnVector
+    val children = buf[ColumnVector]()
+
+    for b in builders
+        children.push(b.finish())
+
+    ColumnVector(elem, n, buf[u8](), Members(children))
+
+private id_among(ids: Buf[u32], id: u32) -> bool
+    for x in ids
+        if x == id then return true
+
+    false

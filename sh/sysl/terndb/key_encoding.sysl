@@ -190,9 +190,24 @@ decode_key(cols: []const KeyColumn, bytes: []const u8) -> Result[Buf[Value], Cod
 
     Ok(vals)
 
+/** `decode_key` into `vals`, which it empties first: the same values and the same checks, with no
+ * buffer made for them.
+ */
+decode_key_into(cols: []const KeyColumn, bytes: []const u8, vals: Buf[Value]) -> Result[unit, CodecError]
+    vals.clear()
+    var c = cursor(bytes)
+    read_key_values_into(&c, cols, vals)?
+
+    if c.left() != 0 then return corrupt("octets follow the key's last component")
+
+    Ok(())
+
 private read_key_values(c: *ByteCursor, cols: []const KeyColumn) -> Result[Buf[Value], CodecError]
     val vals = buf[Value]()
+    read_key_values_into(c, cols, vals)?
+    Ok(vals)
 
+private read_key_values_into(c: *ByteCursor, cols: []const KeyColumn, vals: Buf[Value]) -> Result[unit, CodecError]
     for col in cols
         val t = col.ty.base()
 
@@ -207,7 +222,7 @@ private read_key_values(c: *ByteCursor, cols: []const KeyColumn) -> Result[Buf[V
         vals.push(if present then read_key_value(c, t)? else Value.Null)
 
     c.flip = 0
-    Ok(vals)
+    Ok(())
 
 private read_key_value(c: *ByteCursor, t: Type) -> Result[Value, CodecError]
     val w = row_width(t)

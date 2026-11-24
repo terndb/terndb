@@ -1,0 +1,242 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// Building a column vector one slot at a time, from values or straight from a column's stored
+// encoding (`on-disk-format.md` §4.4): what a table scan decodes its rows into, so that a scalar
+// column goes from the leaf's octets to its vector's lane with no `Value` in between
+// (`docs/design/executor.md` §4.5).
+
+/** A vector of `ty` being built: `len` slots so far, the validity of each, and its lanes. A type
+ * whose lanes are a single buffer (a scalar, or an octet string) is written to `lanes` directly
+ * (`direct`); a record, union or relation is kept as `values` and made into lanes by `finish`.
+ */
+struct VectorBuilder
+    ty: Type
+    direct: bool
+    len: usize
+    nulls: usize
+    valid: Buf[bool]
+    lanes: Lanes
+    values: Buf[Value]
+
+    /** Appends a null slot. */
+    push_null(*self)
+        self.valid.push(false)
+        self.nulls += 1
+        self.len += 1
+        if self.direct then push_zero(self.lanes) else self.values.push(Null)
+
+    /** Appends `v`, a value of the builder's type or a null, as `vector_of` would hold it. */
+    push_value(*self, v: Value)
+        if v.is_null() then return self.push_null()
+
+        self.valid.push(true)
+        self.len += 1
+        if self.direct then push_lane(self.lanes, v) else self.values.push(v)
+
+    /** Appends a slot nothing will read: valid, holding its type's placeholder (§6.5). */
+    push_unread(*self)
+        if !self.direct then return self.push_value(placeholder(self.ty.base()))
+
+        self.valid.push(true)
+        self.len += 1
+        push_zero(self.lanes)
+
+    /** Appends the non-null value whose stored encoding (§4.4) as a column of type `t` is `bytes`,
+     * checked as `decode_value` checks it. `t` must have the builder's lanes (`same_lanes`); a builder
+     * that is not `direct` decodes it into a value.
+     */
+    push_stored(*self, t: Type, bytes: []const u8) -> Result[unit, CodecError]
+        if !self.direct then return Ok(self.push_value(decode_value(t, bytes)?))
+
+        val w = row_width(t)
+        if w > 0 && bytes.len != w then return corrupt(s"a fixed-width value of $w octets has ${bytes.len}")
+
+        self.lanes match
+            Bools(x) ->
+                if bytes[0] > 1 then return corrupt("a bool is neither 0 nor 1")
+                x.push(bytes[0] == 1)
+            I8s(x) -> x.push(i8.wrap(sign_extend(le_of(bytes), 1)))
+            I16s(x) -> x.push(i16.wrap(sign_extend(le_of(bytes), 2)))
+            I32s(x) -> x.push(i32.wrap(sign_extend(le_of(bytes), 4)))
+            I64s(x) -> x.push(i64.wrap(sign_extend(le_of(bytes), 8)))
+            I128s(x) ->
+                val n = sign_extend(le_of(bytes), w)
+
+                t match
+                    Decimal(p, _) -> if !within_precision(n, p) then return corrupt("a decimal has more digits than its precision")
+                    _ -> ()
+
+                x.push(n)
+            U8s(x) -> x.push(u8(le_of(bytes)))
+            U16s(x) -> x.push(u16(le_of(bytes)))
+            U32s(x) -> x.push(u32(le_of(bytes)))
+            U64s(x) -> x.push(u64(le_of(bytes)))
+            F32s(x) -> x.push(f32(float32_from_bits(u32(le_of(bytes)))))
+            F64s(x) -> x.push(real.from_bits(u64(le_of(bytes))))
+            Intervals(x) ->
+                val months = i32.wrap(u32(le_of(bytes[0..<4])))
+                val days = i32.wrap(u32(le_of(bytes[4..<8])))
+                x.push(Ival(months, days, i64.wrap(u64(le_of(bytes[8..<16])))))
+            Uuids(x) ->
+                var v: u128 = 0
+
+                for b in bytes
+                    v = v << 8 | u128(b)
+
+                x.push(v)
+            Bins(offsets, data) ->
+                if t != Bytes && from_utf8(bytes).is_err() then return corrupt("a text value is not valid UTF-8")
+                data.extend(bytes)
+                offsets.push(u32(data.len()))
+            _ -> return Ok(self.push_value(decode_value(t, bytes)?))
+
+        self.valid.push(true)
+        self.len += 1
+        Ok(())
+    end push_stored
+
+    /** The vector of the slots appended since the builder was made or last finished, which begins
+     * the next one empty.
+     */
+    finish(*self) -> ColumnVector
+        val v = self.built()
+        val fresh = vector_builder(self.ty)
+        self.lanes = fresh.lanes
+        self.values = fresh.values
+        self.valid = fresh.valid
+        self.len = 0
+        self.nulls = 0
+        v
+
+    private built(self) -> ColumnVector
+        if !self.direct then return vector_of(self.ty, self.values.view())
+
+        val validity = if self.nulls == 0 then buf[u8]() else bits_of(self.valid.view())
+        ColumnVector(self.ty, self.len, validity, self.lanes)
+end VectorBuilder
+
+/** An empty builder of a vector of `ty`. */
+vector_builder(ty: Type) -> &VectorBuilder
+    val b: &VectorBuilder = direct_lanes(ty.base()) match
+        Some(l) -> VectorBuilder(ty, true, 0, 0, buf[bool](), l, buf[Value]())
+        None -> VectorBuilder(ty, false, 0, 0, buf[bool](), Bools(buf[bool]()), buf[Value]())
+
+    b
+
+/** Whether a value of type `a` and one of type `b` are held in the same kind of lane, which is
+ * what lets a column stored as `a` be decoded straight into a vector of `b`.
+ */
+same_lanes(a: Type, b: Type) -> bool = (direct_lanes(a.base()), direct_lanes(b.base())) match
+    (Some(x), Some(y)) -> lane_kind(x) == lane_kind(y)
+    _ -> false
+
+/** Empty lanes for a vector of the non-null type `t` when they are a single buffer, as `lanes_of`
+ * lays them out; none for a record, union or relation.
+ */
+private direct_lanes(t: Type) -> Option[Lanes] = t match
+    Bool -> Some(Bools(buf[bool]()))
+    Int8 -> Some(I8s(buf[i8]()))
+    Int16 -> Some(I16s(buf[i16]()))
+    Int32 | Date -> Some(I32s(buf[i32]()))
+    Int64 | Time | DateTime | Timestamp -> Some(I64s(buf[i64]()))
+    Int128 | Decimal(_, _) -> Some(I128s(buf[i128]()))
+    UInt8 -> Some(U8s(buf[u8]()))
+    UInt16 -> Some(U16s(buf[u16]()))
+    UInt32 -> Some(U32s(buf[u32]()))
+    UInt64 -> Some(U64s(buf[u64]()))
+    Float32 -> Some(F32s(buf[f32]()))
+    Float64 -> Some(F64s(buf[real]()))
+    Interval -> Some(Intervals(buf[Ival]()))
+    Uuid -> Some(Uuids(buf[u128]()))
+    Text | Bytes | Json ->
+        val offsets = buf[u32]()
+        offsets.push(0)
+        Some(Bins(offsets, buf[u8]()))
+    _ -> None
+
+private lane_kind(l: Lanes) -> u8 = l match
+    Bools(_) -> 1
+    I8s(_) -> 2
+    I16s(_) -> 3
+    I32s(_) -> 4
+    I64s(_) -> 5
+    I128s(_) -> 6
+    U8s(_) -> 7
+    U16s(_) -> 8
+    U32s(_) -> 9
+    U64s(_) -> 10
+    F32s(_) -> 11
+    F64s(_) -> 12
+    Intervals(_) -> 13
+    Uuids(_) -> 14
+    Bins(_, _) -> 15
+    _ -> 0
+
+// `bytes`, least significant first.
+private le_of(bytes: []const u8) -> u128
+    var v: u128 = 0
+
+    for i in 0..<bytes.len
+        v = v | u128(bytes[i]) << (8 * i)
+
+    v
+
+// Appends the slot `lanes_of` holds for a null or an unread slot: zero, or no octets.
+private push_zero(lanes: Lanes) = lanes match
+    Bools(x) -> x.push(false)
+    I8s(x) -> x.push(0)
+    I16s(x) -> x.push(0)
+    I32s(x) -> x.push(0)
+    I64s(x) -> x.push(0)
+    I128s(x) -> x.push(0)
+    U8s(x) -> x.push(0)
+    U16s(x) -> x.push(0)
+    U32s(x) -> x.push(0)
+    U64s(x) -> x.push(0)
+    F32s(x) -> x.push(0.0)
+    F64s(x) -> x.push(0.0)
+    Intervals(x) -> x.push(Ival(0, 0, 0))
+    Uuids(x) -> x.push(0)
+    Bins(offsets, data) -> offsets.push(u32(data.len()))
+    _ -> ()
+
+// Appends `v` to a single-buffer lane as `lanes_of` converts it.
+private push_lane(lanes: Lanes, v: Value) = lanes match
+    Bools(x) -> x.push(v == Bool(true))
+    I8s(x) -> x.push(int_of[i8](v))
+    I16s(x) -> x.push(int_of[i16](v))
+    I32s(x) -> x.push(int_of[i32](v))
+    I64s(x) -> x.push(int_of[i64](v))
+    I128s(x) -> x.push(int_of[i128](v))
+    U8s(x) -> x.push(int_of[u8](v))
+    U16s(x) -> x.push(int_of[u16](v))
+    U32s(x) -> x.push(int_of[u32](v))
+    U64s(x) -> x.push(int_of[u64](v))
+    F32s(x) -> x.push(v match
+        Float(f) -> f32(f)
+        _ -> 0.0)
+    F64s(x) -> x.push(v match
+        Float(f) -> f
+        _ -> 0.0)
+    Intervals(x) -> x.push(v match
+        Interval(m, d, u) -> Ival(m, d, u)
+        _ -> Ival(0, 0, 0))
+    Uuids(x) -> x.push(v match
+        Uuid(b) -> b
+        _ -> 0)
+    Bins(offsets, data) ->
+        v match
+            Text(s) -> data.extend(s.bytes)
+            Bytes(b) -> data.extend(b.view())
+            _ -> ()
+
+        offsets.push(u32(data.len()))
+    _ -> ()
+
+private int_of[T: Integer](v: Value) -> T = v match
+    Int(n) -> T.wrap(n)
+    UInt(n) -> T.wrap(i128(n))
+    _ -> T(0)
