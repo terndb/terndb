@@ -1,0 +1,400 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf_filled}
+import sysl.checksum.crc32c
+import sysl.encoding.{get_u32_le, put_u64_le}
+
+// Page I/O with its checks (`page_io.sysl`): the §3.1 checksum, the PID check, the slot a PID sits
+// at, and what each fault of the simulated device becomes once it reaches a reader — detected as
+// `data_corrupted` or `io_error` naming the PID (`on-disk-format.md` §9 D11, D15), tolerated as an
+// older valid page, or, for a failed sync, fatal (D14).
+
+/** What reading `pid` through `io` gives: "fill F" (the byte at offset 100), or the error's code. */
+private pi_read(io: &PageIo, pid: u64) -> string
+    var b = buf_filled(DbPageSize, u8(0))
+
+    io.read(pid, b.view_mut()) match
+        Ok(_) -> s"fill ${b[100]}"
+        Err(e) -> e.code
+
+/** The error reading `pid` through `io` gives; stops the test if it succeeds. */
+private pi_error(io: &PageIo, pid: u64) -> CodecError
+    var b = buf_filled(DbPageSize, u8(0))
+
+    io.read(pid, b.view_mut()) match
+        Ok(_) -> panic(s"page $pid was read")
+        Err(e) -> e
+
+private pi_write(io: &PageIo, pid: u64, fill: u8) -> string
+    var p = sd_page(pid, fill)
+
+    io.write(pid, p.view_mut()) match
+        Ok(_) -> "ok"
+        Err(e) -> e.code
+
+private pi_code(r: Result[unit, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** A device holding pages 0..<n, each with body byte its number + 1, synced. */
+private pi_disk(n: u64) -> &SimDisk
+    val d = sim_disk(1)
+
+    for i in 0..<n
+        sd_put(d, i, u8(i + 1))
+
+    assert_eq(d.sync(), Ok(()))
+    d
+
+// -- the checksum -----------------------------------------------------------------------------------
+
+the_checksum_is_crc32c_over_bytes_4_to_the_end()
+    val p = sd_page(3, 9)
+    assert_eq(page_checksum(p.view()), crc32c(p.view()[4..<DbPageSize]))
+
+the_checksum_does_not_cover_its_own_field()
+    var p = sd_page(3, 9)
+    val before = page_checksum(p.view())
+    p[0] = 0xff
+    p[3] = 0x01
+    assert_eq(page_checksum(p.view()), before)
+
+sealing_writes_the_checksum_little_endian_into_the_first_four_bytes()
+    val p = sd_sealed(3, 9)
+    assert_eq(get_u32_le(p.view()[0..<4]).unwrap(), page_checksum(p.view()))
+
+a_sealed_page_passes_its_checks()
+    assert_eq(pi_code(check_page(3, sd_sealed(3, 9).view())), "ok")
+
+an_unsealed_page_fails_its_checks()
+    assert_eq(pi_code(check_page(3, sd_page(3, 9).view())), "D1001")
+
+an_all_zero_page_fails_its_checks()
+    // A page allocated and never written (§2.3) is valid only where recovery says so.
+    val z = buf_filled(DbPageSize, u8(0))
+    assert_eq(pi_code(check_page(0, z.view())), "D1001")
+
+a_page_naming_another_pid_fails_its_checks()
+    assert_eq(pi_code(check_page(4, sd_sealed(3, 9).view())), "D1001")
+
+a_buffer_that_is_not_one_page_fails_its_checks()
+    val p = sd_sealed(3, 9)
+    assert_eq(pi_code(check_page(3, p.view()[0..<DbPageSize - 1])), "D1001")
+
+a_page_that_fails_its_checks_names_its_pid()
+    check_page(77, sd_page(77, 1).view()) match
+        Ok(_) -> panic("an unsealed page passed")
+        Err(e) -> assert_eq(e.detail("pid"), Some("77"))
+
+// -- the slot a pid sits at ------------------------------------------------------------------------
+
+a_data_pid_sits_at_its_page_number_within_its_segment()
+    assert_eq(pid_slot(3), Ok(u64(3)))
+    assert_eq(pid_slot(65535), Ok(u64(65535)))
+    assert_eq(pid_slot(65536 + 3), Ok(u64(3)))
+
+an_undo_pid_sits_at_its_page_number_within_its_undo_segment()
+    val undo = u64(1) << 60
+    assert_eq(pid_slot(undo | 4095), Ok(u64(4095)))
+    assert_eq(pid_slot(undo | 4097), Ok(u64(1)))
+
+a_pid_in_a_reserved_space_is_refused()
+    for space in 2..<8
+        assert_eq(pi_slot_code(u64(space) << 60), "D1001", s"space $space")
+
+a_swizzled_reference_is_no_pid()
+    assert_eq(pi_slot_code(SwizzleTag | 3), "D1001")
+
+private pi_slot_code(pid: u64) -> string = pid_slot(pid) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+// -- reads and writes through the checks ------------------------------------------------------------
+
+a_written_page_is_read_back_through_its_checks()
+    val d = sim_disk(1)
+    val io = page_io(d)
+    assert_eq(pi_write(io, 2, 9), "ok")
+    assert_eq(pi_read(io, 2), "fill 9")
+
+a_write_seals_the_page_it_is_given()
+    val d = sim_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 9)
+    _ = d.sync()
+    assert_eq(d.durable_page(0), sd_sealed(0, 9))
+
+a_write_of_a_page_naming_another_pid_is_refused()
+    val d = sim_disk(1)
+    val io = page_io(d)
+    var p = sd_page(5, 1)
+    assert_eq(pi_code(io.write(3, p.view_mut())), "D1001")
+    assert_eq(d.page_count(), Ok(u64(0)))
+
+a_write_of_a_buffer_that_is_not_one_page_is_refused()
+    val io = page_io(sim_disk(1))
+    var p = buf_filled(DbPageSize + 1, u8(0))
+    assert_eq(pi_code(io.write(0, p.view_mut())), "D1001")
+
+a_misdirected_write_is_detected_by_the_pid()
+    val d = sim_disk(1)
+    _ = d.write_page(3, sd_sealed(5, 1).view())
+    val e = pi_error(page_io(d), 3)
+    assert_eq(e.code, "D1001")
+    assert_eq(e.detail("pid"), Some("3"))
+
+a_page_of_another_segment_at_the_same_slot_is_detected_by_the_pid()
+    val d = sim_disk(1)
+    val io = page_io(d)
+    pi_write(io, 3, 1)
+    assert_eq(pi_read(io, 65536 + 3), "D1001")
+
+a_page_never_written_inside_the_device_is_data_corrupted()
+    val d = sim_disk(1)
+    val io = page_io(d)
+    pi_write(io, 2, 1)
+    assert_eq(pi_read(io, 0), "D1001")
+
+a_page_past_the_end_of_the_device_is_io_error()
+    val io = page_io(pi_disk(2))
+    val e = pi_error(io, 2)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("errno"), Some("22"))
+
+an_empty_device_has_no_page_to_read()
+    assert_eq(pi_read(page_io(sim_disk(1)), 0), "D4004")
+
+an_empty_device_syncs()
+    assert_eq(pi_code(page_io(sim_disk(1)).sync()), "ok")
+
+a_one_page_device_reads_its_page_and_no_other()
+    val io = page_io(pi_disk(1))
+    assert_eq(pi_read(io, 0), "fill 1")
+    assert_eq(pi_read(io, 1), "D4004")
+
+// -- read errors (D15) ------------------------------------------------------------------------------
+
+a_read_error_on_the_first_page_is_io_error_naming_it()
+    val d = pi_disk(4)
+    d.schedule(d.next_op(), DkReadError)
+    val e = pi_error(page_io(d), 0)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("pid"), Some("0"))
+    assert_eq(e.detail("errno"), Some("5"))
+    assert_eq(e.detail("file"), Some("sim-1"))
+
+a_read_error_on_the_last_page_is_io_error_naming_it()
+    val d = pi_disk(4)
+    d.schedule(d.next_op(), DkReadError)
+    val e = pi_error(page_io(d), 3)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("pid"), Some("3"))
+
+a_read_error_fails_only_the_read_that_met_it()
+    val d = pi_disk(4)
+    val io = page_io(d)
+    d.schedule(d.next_op(), DkReadError)
+    assert_eq(pi_read(io, 1), "D4004")
+    assert_eq(pi_read(io, 1), "fill 2")
+    assert_eq(pi_read(io, 2), "fill 3")
+
+// -- bit flips at rest (D15) ------------------------------------------------------------------------
+
+/** Reads page 1 of a 3-page device after bit `bit` of it flipped on the media. */
+private pi_flipped(bit: u64) -> string
+    val d = pi_disk(3)
+    d.flip_bit(1, bit)
+    pi_read(page_io(d), 1)
+
+a_bit_flip_in_the_checksum_field_is_detected()
+    for bit in 0..<32
+        assert_eq(pi_flipped(u64(bit)), "D1001", s"bit $bit")
+
+a_bit_flip_in_the_header_is_detected()
+    for bit in 32..<256
+        assert_eq(pi_flipped(u64(bit)), "D1001", s"bit $bit")
+
+a_bit_flip_in_the_pid_field_is_detected()
+    for bit in 128..<192
+        assert_eq(pi_flipped(u64(bit)), "D1001", s"bit $bit")
+
+a_bit_flip_in_the_body_is_detected()
+    for bit in [256, 257, 8 * 100, 8 * DiskSectorSize - 1, 8 * DiskSectorSize, 8 * 2 * DiskSectorSize + 5, 8 * DbPageSize - 1]
+        assert_eq(pi_flipped(u64(bit)), "D1001", s"bit $bit")
+
+a_flip_of_any_single_bit_of_a_page_is_detected()
+    val d = pi_disk(1)
+    val io = page_io(d)
+
+    for bit in 0..<8 * DbPageSize
+        d.flip_bit(0, u64(bit))
+        assert_eq(pi_read(io, 0), "D1001", s"bit $bit")
+        d.flip_bit(0, u64(bit))
+
+    assert_eq(pi_read(io, 0), "fill 1")
+
+a_bit_flip_names_the_page_it_is_in()
+    val d = pi_disk(3)
+    d.flip_bit(2, 1000)
+    assert_eq(pi_error(page_io(d), 2).detail("pid"), Some("2"))
+
+a_bit_flip_leaves_the_other_pages_readable()
+    val d = pi_disk(3)
+    d.flip_bit(1, 1000)
+    val io = page_io(d)
+    assert_eq(pi_read(io, 0), "fill 1")
+    assert_eq(pi_read(io, 2), "fill 3")
+
+a_rewrite_of_a_flipped_page_heals_it()
+    val d = pi_disk(3)
+    d.flip_bit(1, 1000)
+    val io = page_io(d)
+    pi_write(io, 1, 7)
+    assert_eq(pi_read(io, 1), "fill 7")
+
+// -- torn writes (D11) ------------------------------------------------------------------------------
+
+/** Page 0 written as fill 0x11 and synced, then a write of it as 0x22 torn after `cut` sectors of
+ * `order`; what a reader after the restart gets.
+ */
+private pi_torn(order: []const u8, cut: usize) -> string
+    val d = sim_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 0x11)
+    _ = io.sync()
+    d.schedule(d.next_op(), DkTornWrite(buf_of_u8(order), cut, KeepNone))
+    assert_eq(pi_write(io, 0, 0x22), "D4004")
+    d.restart()
+    pi_read(page_io(d), 0)
+
+a_write_torn_before_any_sector_leaves_the_old_page()
+    assert_eq(pi_torn([0, 1, 2, 3], 0), "fill 17")
+
+a_write_torn_at_the_first_sector_boundary_is_detected()
+    assert_eq(pi_torn([0, 1, 2, 3], 1), "D1001")
+
+a_write_torn_at_the_second_sector_boundary_is_detected()
+    assert_eq(pi_torn([0, 1, 2, 3], 2), "D1001")
+
+a_write_torn_at_the_third_sector_boundary_is_detected()
+    assert_eq(pi_torn([0, 1, 2, 3], 3), "D1001")
+
+a_write_torn_after_every_sector_is_the_new_page()
+    assert_eq(pi_torn([0, 1, 2, 3], 4), "fill 34")
+
+a_write_torn_in_any_order_of_sectors_is_detected()
+    for order in all_sector_orders()
+        for cut in 1..<SectorsPerPage
+            assert_eq(pi_torn(order.view(), cut), "D1001", s"order $order, cut $cut")
+
+a_torn_write_keeping_only_the_header_sector_is_detected()
+    assert_eq(pi_torn([0, 1, 2, 3], 1), "D1001")
+
+a_torn_write_keeping_all_but_the_header_sector_is_detected()
+    assert_eq(pi_torn([1, 2, 3, 0], 3), "D1001")
+
+a_torn_first_write_of_a_page_is_detected()
+    val d = sim_disk(1)
+    d.schedule(0, DkTornWrite(buf_of_u8([2, 0, 1, 3]), 2, KeepNone))
+    pi_write(page_io(d), 0, 0x22)
+    d.restart()
+    assert_eq(pi_read(page_io(d), 0), "D1001")
+
+a_torn_page_is_reported_naming_its_pid()
+    val d = sim_disk(1)
+    d.schedule(0, DkTornWrite(buf_of_u8([0, 1, 2, 3]), 2, KeepNone))
+    pi_write(page_io(d), 5, 0x22)
+    d.restart()
+    assert_eq(pi_error(page_io(d), 5).detail("pid"), Some("5"))
+
+a_crash_keeping_part_of_a_cached_write_tears_it_and_is_detected()
+    val d = sim_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 0x11)
+    _ = io.sync()
+    pi_write(io, 0, 0x22)
+    d.schedule(d.next_op(), DkCrash(KeepSectors(buf_of_u8([0x06]))))
+    _ = io.sync()
+    d.restart()
+    assert_eq(pi_read(page_io(d), 0), "D1001")
+
+// -- crashes, lost writes ----------------------------------------------------------------------------
+
+a_crash_before_the_sync_leaves_the_last_synced_page_valid()
+    val d = pi_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 9)
+    d.schedule(d.next_op(), DkCrash(KeepNone))
+    assert_eq(pi_code(io.sync()), "D4004")
+    d.restart()
+    assert_eq(pi_read(page_io(d), 0), "fill 1")
+
+a_crash_after_the_sync_keeps_the_synced_page()
+    val d = pi_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 9)
+    _ = io.sync()
+    d.schedule(d.next_op(), DkCrash(KeepNone))
+    pi_read(io, 0)
+    d.restart()
+    assert_eq(pi_read(page_io(d), 0), "fill 9")
+
+an_io_during_a_crash_is_io_error()
+    val d = pi_disk(1)
+    d.schedule(d.next_op(), DkCrash(KeepNone))
+    val e = pi_error(page_io(d), 0)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("pid"), Some("0"))
+
+a_lost_write_leaves_the_older_valid_page()
+    // The page is not torn, so its checks pass: only the WAL's LSNs can tell it is stale.
+    val d = pi_disk(1)
+    val io = page_io(d)
+    d.schedule(d.next_op(), DkLostWrite)
+    pi_write(io, 0, 9)
+    d.schedule(d.next_op(), DkCrash(KeepAll))
+    _ = io.sync()
+    d.restart()
+    assert_eq(pi_read(page_io(d), 0), "fill 1")
+
+// -- sync failures (D14) ----------------------------------------------------------------------------
+
+a_failed_sync_is_io_error()
+    val d = pi_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 9)
+    d.schedule(d.next_op(), DkSyncFail(KeepNone))
+    val r = io.sync()
+    assert_eq(pi_code(r), "D4004")
+    assert(io.failed())
+
+a_sync_retried_after_a_failure_is_refused()
+    val d = pi_disk(1)
+    val io = page_io(d)
+    pi_write(io, 0, 9)
+    d.schedule(d.next_op(), DkSyncFail(KeepNone))
+    _ = io.sync()
+    val ops = d.next_op()
+    assert_eq(pi_code(io.sync()), "D4004")
+    assert_eq(d.next_op(), ops)
+
+reads_and_writes_after_a_failed_sync_are_refused()
+    val d = pi_disk(1)
+    val io = page_io(d)
+    d.schedule(d.next_op(), DkSyncFail(KeepNone))
+    _ = io.sync()
+    assert_eq(pi_read(io, 0), "D4004")
+    assert_eq(pi_write(io, 0, 3), "D4004")
+
+recovery_after_a_failed_sync_finds_what_reached_the_media()
+    val d = pi_disk(2)
+    val io = page_io(d)
+    pi_write(io, 0, 9)
+    pi_write(io, 1, 8)
+    d.schedule(d.next_op(), DkSyncFail(KeepSectors(buf_of_u8([0x0f, 0x00]))))
+    _ = io.sync()
+    val again = page_io(d)
+    assert(!again.failed())
+    assert_eq(pi_read(again, 0), "fill 9")
+    assert_eq(pi_read(again, 1), "fill 2")

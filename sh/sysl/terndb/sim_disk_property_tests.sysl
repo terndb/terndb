@@ -1,0 +1,166 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.encoding.{get_u64_le, put_u64_le}
+import sysl.rand.{Rng, rng}
+
+// A seeded property test of the simulated device under page I/O: random writes, syncs and reads over
+// a few pages while the device draws crashes, torn writes, lost writes, sync failures and read errors,
+// checked against a reference model of what may be on the media. The model keeps, for each page, what
+// is known durable and the versions written since the last sync. A read in normal running must give
+// the newest version; after a crash or a failed sync, a page must read as its durable version or one
+// of the versions written since, or be detected as `data_corrupted` when a write of it was in flight —
+// and never anything else (`on-disk-format.md` §9 D11, D15). Every assertion names its seed.
+
+/** What the model knows is on the media for a page. */
+enum PmDurable derives Eq
+    PmNever
+    PmStamp(stamp: u64)
+    PmCorrupt
+
+struct PmPage
+    durable: PmDurable
+    pending: Buf[u64]
+
+/** What a read through the checks gave: a version's stamp, or an error's code and errno. */
+enum PmRead derives Eq
+    PmGot(stamp: u64)
+    PmFailed(code: string, errno: string)
+
+const PmPages: u64 = 6
+
+/** Page `pid` carrying version `stamp`, at offset 32 of the body. */
+private pm_page(pid: u64, stamp: u64) -> Buf[u8]
+    var p = sd_page(pid, u8(stamp % 251))
+    put_u64_le(p.view_mut()[32..<40], stamp)
+    p
+
+private pm_read(io: &PageIo, n: u64) -> PmRead
+    var b = buf_filled(DbPageSize, u8(0))
+
+    io.read(n, b.view_mut()) match
+        Ok(_) -> PmGot(get_u64_le(b.view()[32..<40]).unwrap())
+        Err(e) -> PmFailed(e.code, e.detail("errno").unwrap_or(""))
+
+/** What the run has met, for the test to show the faults were exercised. */
+struct PmCounts
+    recoveries: u64
+    corrupt: u64
+    read_errors: u64
+
+/** After a crash or a failed sync: restarts the device, reads every page back and checks each
+ * against the model, then makes what was read the durable version. A crash or a read error during
+ * the reads is met by reading again.
+ */
+private pm_recover(d: &SimDisk, pages: Buf[PmPage], counts: *PmCounts, what: string) -> &PageIo
+    if d.is_down() then d.restart()
+    var io = page_io(d)
+    counts.recoveries += 1
+
+    for n in 0..<PmPages
+        val m = pages[usize(n)]
+        var got = pm_read(io, n)
+
+        while true
+            if d.is_down()
+                d.restart()
+                io = page_io(d)
+            elif got != PmFailed("D4004", "5")
+                break
+
+            got = pm_read(io, n)
+
+        val where = s"$what, recovering page $n (durable ${m.durable}, pending ${m.pending})"
+
+        got match
+            PmGot(s) ->
+                var known = m.durable == PmStamp(s)
+
+                for p in m.pending
+                    if p == s then known = true
+
+                assert(known, s"$where: read version $s, which was never written there")
+                pages[usize(n)] = PmPage(PmStamp(s), buf[u64]())
+            PmFailed(code, errno) ->
+                if code == "D1001"
+                    val may = m.pending.len() > 0 || m.durable == PmNever || m.durable == PmCorrupt
+                    assert(may, s"$where: a page no write was in flight for is corrupted")
+                    counts.corrupt += 1
+                    pages[usize(n)] = PmPage(PmCorrupt, buf[u64]())
+                else
+                    assert(code == "D4004" && errno == "22" && m.durable == PmNever, s"$where: $code $errno")
+                    pages[usize(n)] = PmPage(PmNever, buf[u64]())
+
+    io
+
+/** One seeded run of `ops` operations; answers what it met. */
+private pm_run(seed: u64, ops: usize) -> PmCounts
+    val rates = FaultRates(4000, 6000, 20000, 15000, 15000, 0)
+    val d = sim_disk_with(seed, rates)
+    var io = page_io(d)
+    var g = rng(seed, 0x504d)
+    val pages = buf[PmPage]()
+    var counts = PmCounts(0, 0, 0)
+    var stamp: u64 = 0
+
+    for k in 0..<PmPages
+        pages.push(PmPage(PmNever, buf[u64]()))
+
+    for i in 0..<ops
+        val what = s"seed $seed, op $i"
+        val r = g.below(100)
+        val n = g.below(PmPages)
+
+        if r < 45
+            stamp += 1
+            var p = pm_page(n, stamp)
+
+            io.write(n, p.view_mut()) match
+                Ok(_) -> pages[usize(n)].pending.push(stamp)
+                Err(e) ->
+                    assert(e.code == "D4004" && d.is_down(), s"$what: a write failed with ${e.code}")
+                    // A torn write reached the media in part.
+                    pages[usize(n)].pending.push(stamp)
+                    io = pm_recover(d, pages, &counts, what)
+        elif r < 60
+            io.sync() match
+                Ok(_) ->
+                    for k in 0..<PmPages
+                        val m = pages[usize(k)]
+                        if m.pending.len() > 0 then pages[usize(k)] = PmPage(PmStamp(m.pending[m.pending.len() - 1]), buf[u64]())
+                Err(e) ->
+                    assert_eq(e.code, "D4004", what)
+                    io = pm_recover(d, pages, &counts, what)
+        else
+            val m = pages[usize(n)]
+
+            val want = if m.pending.len() > 0 then Some(m.pending[m.pending.len() - 1]) else m.durable match
+                PmStamp(s) -> Some(s)
+                _ -> None
+
+            if want == None then continue
+
+            pm_read(io, n) match
+                PmGot(s) -> assert_eq(Some(s), want, s"$what: page $n")
+                PmFailed(code, errno) ->
+                    if d.is_down()
+                        io = pm_recover(d, pages, &counts, what)
+                    else
+                        assert(code == "D4004" && errno == "5", s"$what: page $n read as $code $errno")
+                        counts.read_errors += 1
+
+    counts
+
+writes_syncs_and_crashes_agree_with_the_model_over_many_seeds()
+    var total = PmCounts(0, 0, 0)
+
+    for seed in 1..<301
+        val c = pm_run(u64(seed), 400)
+        total.recoveries += c.recoveries
+        total.corrupt += c.corrupt
+        total.read_errors += c.read_errors
+
+    assert(total.recoveries > 300, s"only ${total.recoveries} recoveries")
+    assert(total.corrupt > 10, s"only ${total.corrupt} torn pages detected")
+    assert(total.read_errors > 100, s"only ${total.read_errors} read errors")

@@ -1,0 +1,555 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.encoding.{put_u16_le, put_u64_le}
+import sysl.fs.{IoError, NotOpen, Other}
+
+// The simulated device (`sim_disk.sysl`): the volatile cache and what a sync makes durable, each
+// fault of `isolation.md` §7.3 scheduled at a chosen I/O, and the trace a seed reproduces. What the
+// checks above the device make of each fault is in `page_io_tests.sysl`.
+
+/** A page for `pid` of a test type (`on-disk-format.md` §3.2), every body byte `fill`, not sealed. */
+sd_page(pid: u64, fill: u8) -> Buf[u8]
+    var p = buf_filled(DbPageSize, fill)
+
+    for i in 0..<32
+        p[i] = 0
+
+    put_u16_le(p.view_mut()[4..<6], 1)
+    p[6] = 0xf0
+    put_u64_le(p.view_mut()[16..<24], pid)
+    p
+
+/** `sd_page`, sealed with its checksum. */
+sd_sealed(pid: u64, fill: u8) -> Buf[u8]
+    var p = sd_page(pid, fill)
+    seal_page(p.view_mut())
+    p
+
+/** What reading page `n` straight off device `d` gives: "fill F" with F the byte at offset 100, or
+ * the error.
+ */
+sd_raw(d: &SimDisk, n: u64) -> string
+    var b = buf_filled(DbPageSize, u8(0))
+
+    d.read_page(n, b.view_mut()) match
+        Ok(_) -> s"fill ${b[100]}"
+        Err(e) -> s"error ${e.code()}"
+
+/** The byte at offset 100 of page `n` on the media of `d`. */
+sd_durable(d: &SimDisk, n: u64) -> u8 = d.durable_page(n)[100]
+
+/** Writes the sealed page `n` with every body byte `fill`, and expects it taken. */
+sd_put(d: &SimDisk, n: u64, fill: u8) = assert_eq(d.write_page(n, sd_sealed(n, fill).view()), Ok(()))
+
+// -- the cache and the media ------------------------------------------------------------------------
+
+an_empty_device_holds_no_pages()
+    val d = sim_disk(1)
+    assert_eq(d.page_count(), Ok(u64(0)))
+    assert_eq(sd_raw(d, 0), "error 22")
+    assert_eq(d.durable_count(), u64(0))
+
+an_empty_device_syncs_with_nothing_to_do()
+    val d = sim_disk(1)
+    assert_eq(d.sync(), Ok(()))
+    assert_eq(d.durable_count(), u64(0))
+
+an_empty_device_comes_back_empty_from_a_crash()
+    val d = sim_disk(1)
+    d.schedule(0, DkCrash(KeepAll))
+    assert_eq(d.sync(), Err(NotOpen))
+    d.restart()
+    assert_eq(d.page_count(), Ok(u64(0)))
+
+a_one_page_device_holds_page_0_only()
+    val d = sim_disk(1)
+    sd_put(d, 0, 7)
+    assert_eq(d.page_count(), Ok(u64(1)))
+    assert_eq(sd_raw(d, 0), "fill 7")
+    assert_eq(sd_raw(d, 1), "error 22")
+
+a_write_is_read_back_before_any_sync()
+    val d = sim_disk(1)
+    sd_put(d, 2, 9)
+    assert_eq(sd_raw(d, 2), "fill 9")
+    assert_eq(d.unsynced(), usize(1))
+
+a_write_is_not_on_the_media_until_a_sync()
+    val d = sim_disk(1)
+    sd_put(d, 0, 9)
+    assert_eq(d.durable_count(), u64(0))
+    assert_eq(d.sync(), Ok(()))
+    assert_eq(d.durable_count(), u64(1))
+    assert_eq(sd_durable(d, 0), u8(9))
+    assert_eq(d.unsynced(), usize(0))
+
+a_write_past_the_end_grows_the_device_with_zero_pages()
+    val d = sim_disk(1)
+    sd_put(d, 3, 9)
+    assert_eq(d.page_count(), Ok(u64(4)))
+    assert_eq(sd_raw(d, 1), "fill 0")
+    assert_eq(d.sync(), Ok(()))
+    assert_eq(d.durable_count(), u64(4))
+
+the_newest_cached_write_of_a_page_is_what_a_read_sees()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 0, 2)
+    assert_eq(sd_raw(d, 0), "fill 2")
+
+a_sync_puts_the_newest_write_of_each_page_on_the_media()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 5)
+    sd_put(d, 0, 2)
+    assert_eq(d.sync(), Ok(()))
+    assert_eq(sd_durable(d, 0), u8(2))
+    assert_eq(sd_durable(d, 1), u8(5))
+
+a_buffer_that_is_not_one_page_is_refused()
+    val d = sim_disk(1)
+    var small = buf_filled(DbPageSize - 1, u8(0))
+    assert_eq(d.write_page(0, small.view()), Err(Other(22)))
+    sd_put(d, 0, 1)
+    assert_eq(d.read_page(0, small.view_mut()), Err(Other(22)))
+
+every_read_write_and_sync_is_one_numbered_io()
+    val d = sim_disk(1)
+    assert_eq(d.next_op(), u64(0))
+    sd_put(d, 0, 1)
+    sd_raw(d, 0)
+    _ = d.sync()
+    _ = d.page_count()
+    assert_eq(d.next_op(), u64(3))
+
+// -- crashes ----------------------------------------------------------------------------------------
+
+a_crash_keeping_none_loses_every_unsynced_write()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 2)
+    d.schedule(2, DkCrash(KeepNone))
+    assert_eq(d.sync(), Err(NotOpen))
+    d.restart()
+    assert_eq(d.page_count(), Ok(u64(0)))
+
+a_crash_keeping_all_keeps_every_unsynced_write_whole()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 2)
+    d.schedule(2, DkCrash(KeepAll))
+    assert_eq(sd_raw(d, 0), s"error ${NotOpen.code()}")
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+    assert_eq(sd_raw(d, 1), "fill 2")
+
+a_crash_keeps_exactly_the_sectors_it_names()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 2)
+    d.schedule(2, DkCrash(KeepSectors(buf_of_u8([0x0f, 0x05]))))
+    _ = d.sync()
+    val p0 = d.durable_page(0)
+    val p1 = d.durable_page(1)
+    assert_eq(p0[DbPageSize - 1], u8(1))
+    assert_eq(p1[100], u8(2))
+    assert_eq(p1[DiskSectorSize + 100], u8(0))
+    assert_eq(p1[2 * DiskSectorSize + 100], u8(2))
+    assert_eq(p1[3 * DiskSectorSize + 100], u8(0))
+
+a_crash_naming_fewer_masks_than_writes_keeps_none_of_the_rest()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 2)
+    d.schedule(2, DkCrash(KeepSectors(buf_of_u8([0x0f]))))
+    _ = d.sync()
+    assert_eq(d.durable_count(), u64(1))
+
+a_crash_takes_the_device_down_until_restart()
+    val d = sim_disk(1)
+    d.schedule(0, DkCrash(KeepNone))
+    assert_eq(d.sync(), Err(NotOpen))
+    assert(d.is_down())
+    assert_eq(d.page_count(), Err(NotOpen))
+    assert_eq(d.write_page(0, sd_sealed(0, 1).view()), Err(NotOpen))
+    assert_eq(d.sync(), Err(NotOpen))
+    d.restart()
+    assert(!d.is_down())
+    sd_put(d, 0, 1)
+
+the_io_a_crash_happens_at_does_not_run()
+    val d = sim_disk(1)
+    d.schedule(0, DkCrash(KeepAll))
+    assert_eq(d.write_page(0, sd_sealed(0, 1).view()), Err(NotOpen))
+    d.restart()
+    assert_eq(d.page_count(), Ok(u64(0)))
+
+a_crash_before_the_sync_loses_the_write()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkCrash(KeepNone))
+    assert_eq(sd_raw(d, 0), s"error ${NotOpen.code()}")
+    d.restart()
+    assert_eq(d.durable_count(), u64(0))
+
+a_crash_during_the_sync_keeps_any_subset_of_its_writes()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 2)
+    sd_put(d, 2, 3)
+    d.schedule(3, DkCrash(KeepSectors(buf_of_u8([0x0f, 0x00, 0x0f]))))
+    assert_eq(d.sync(), Err(NotOpen))
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+    assert_eq(sd_raw(d, 1), "fill 0")
+    assert_eq(sd_raw(d, 2), "fill 3")
+
+a_crash_after_the_sync_loses_nothing_it_covered()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    assert_eq(d.sync(), Ok(()))
+    d.schedule(2, DkCrash(KeepNone))
+    assert_eq(sd_raw(d, 0), s"error ${NotOpen.code()}")
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_crash_dropping_an_unsynced_overwrite_leaves_the_synced_page()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    _ = d.sync()
+    sd_put(d, 0, 2)
+    d.schedule(3, DkCrash(KeepNone))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_crash_keeping_only_the_older_of_two_writes_of_a_page_leaves_the_older()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 0, 2)
+    d.schedule(2, DkCrash(KeepSectors(buf_of_u8([0x0f, 0x00]))))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_crash_keeping_only_the_newer_of_two_writes_of_a_page_leaves_the_newer()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 0, 2)
+    d.schedule(2, DkCrash(KeepSectors(buf_of_u8([0x00, 0x0f]))))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 2")
+
+a_crash_keeping_both_writes_of_a_page_leaves_the_newer()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 0, 2)
+    d.schedule(2, DkCrash(KeepAll))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 2")
+
+two_crashes_in_a_row_keep_what_the_first_kept()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkCrash(KeepAll))
+    _ = d.sync()
+    d.restart()
+    d.schedule(1, DkCrash(KeepNone))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+// -- torn writes ------------------------------------------------------------------------------------
+
+/** Writes page 0 as `old` and syncs it, then tears a write of it as `new` after `cut` sectors of
+ * `order`, and answers the page's media bytes.
+ */
+sd_torn(order: []const u8, cut: usize) -> Buf[u8]
+    val d = sim_disk(1)
+    sd_put(d, 0, 0x11)
+    _ = d.sync()
+    d.schedule(2, DkTornWrite(buf_of_u8(order), cut, KeepNone))
+    assert_eq(d.write_page(0, sd_sealed(0, 0x22).view()), Err(NotOpen))
+    assert(d.is_down())
+    d.restart()
+    d.durable_page(0)
+
+/** Whether sector `s` of `page` holds the write of `fill` (its body byte at offset 100 of the sector,
+ * or past the header for sector 0).
+ */
+sd_sector_is(page: Buf[u8], s: usize, fill: u8) -> bool = page[s * DiskSectorSize + 100] == fill
+
+a_torn_write_keeps_exactly_the_sectors_before_its_cut_in_every_order()
+    val orders = all_sector_orders()
+    assert_eq(orders.len(), usize(24))
+
+    for order in orders
+        for cut in 0..<SectorsPerPage + 1
+            val page = sd_torn(order.view(), cut)
+
+            for s in 0..<SectorsPerPage
+                var early = false
+
+                for i in 0..<cut
+                    if usize(order[i]) == s then early = true
+
+                assert(sd_sector_is(page, s, if early then 0x22 else 0x11), s"order $order, cut $cut, sector $s")
+
+a_torn_write_resolves_the_writes_cached_before_it_first()
+    val d = sim_disk(1)
+    sd_put(d, 1, 5)
+    d.schedule(1, DkTornWrite(buf_of_u8([0, 1, 2, 3]), 2, KeepAll))
+    _ = d.write_page(0, sd_sealed(0, 0x22).view())
+    d.restart()
+    assert_eq(sd_raw(d, 1), "fill 5")
+
+a_torn_write_over_an_older_cached_write_of_its_page_lands_on_top_of_it()
+    val d = sim_disk(1)
+    sd_put(d, 0, 0x11)
+    d.schedule(1, DkTornWrite(buf_of_u8([3, 2, 1, 0]), 1, KeepAll))
+    _ = d.write_page(0, sd_sealed(0, 0x22).view())
+    d.restart()
+    val p = d.durable_page(0)
+    assert(sd_sector_is(p, 0, 0x11))
+    assert(sd_sector_is(p, 3, 0x22))
+
+a_torn_write_of_a_page_never_written_leaves_zeros_in_the_rest()
+    val d = sim_disk(1)
+    d.schedule(0, DkTornWrite(buf_of_u8([1, 0, 2, 3]), 1, KeepNone))
+    _ = d.write_page(0, sd_sealed(0, 0x22).view())
+    d.restart()
+    val p = d.durable_page(0)
+    assert(sd_sector_is(p, 1, 0x22))
+    assert(sd_sector_is(p, 0, 0))
+    assert(sd_sector_is(p, 2, 0))
+
+// -- lost writes ------------------------------------------------------------------------------------
+
+a_lost_write_is_acknowledged_and_read_back()
+    val d = sim_disk(1)
+    d.schedule(0, DkLostWrite)
+    sd_put(d, 0, 3)
+    assert_eq(sd_raw(d, 0), "fill 3")
+
+a_lost_write_is_gone_after_a_crash_that_keeps_everything_else()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    _ = d.sync()
+    d.schedule(2, DkLostWrite)
+    sd_put(d, 0, 2)
+    sd_put(d, 1, 3)
+    d.schedule(4, DkCrash(KeepAll))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+    assert_eq(sd_raw(d, 1), "fill 3")
+
+a_lost_write_a_sync_covers_is_durable()
+    val d = sim_disk(1)
+    d.schedule(0, DkLostWrite)
+    sd_put(d, 0, 3)
+    assert_eq(d.sync(), Ok(()))
+    d.schedule(2, DkCrash(KeepNone))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 3")
+
+// -- sync failures ----------------------------------------------------------------------------------
+
+a_failed_sync_reports_eio()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkSyncFail(KeepNone))
+    assert_eq(d.sync(), Err(Other(5)))
+    assert(!d.is_down())
+
+a_failed_sync_drops_the_cache_so_a_read_sees_the_media()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    _ = d.sync()
+    sd_put(d, 0, 2)
+    d.schedule(3, DkSyncFail(KeepNone))
+    _ = d.sync()
+    assert_eq(d.unsynced(), usize(0))
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_failed_sync_may_keep_some_of_its_writes()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    sd_put(d, 1, 2)
+    d.schedule(2, DkSyncFail(KeepSectors(buf_of_u8([0x00, 0x0f]))))
+    _ = d.sync()
+    assert_eq(sd_raw(d, 0), "fill 0")
+    assert_eq(sd_raw(d, 1), "fill 2")
+
+a_retried_sync_succeeds_over_the_writes_the_failure_dropped()
+    // Why `on-disk-format.md` D14 forbids the retry: it says nothing of what was lost.
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkSyncFail(KeepNone))
+    assert_eq(d.sync(), Err(Other(5)))
+    assert_eq(d.sync(), Ok(()))
+    assert_eq(d.durable_count(), u64(0))
+
+// -- read errors ------------------------------------------------------------------------------------
+
+a_read_error_fails_that_read_with_eio()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkReadError)
+    assert_eq(sd_raw(d, 0), "error 5")
+
+a_read_error_is_over_once_it_has_happened()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkReadError)
+    sd_raw(d, 0)
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_read_error_leaves_the_cache_as_it_was()
+    val d = sim_disk(1)
+    sd_put(d, 0, 1)
+    d.schedule(1, DkReadError)
+    sd_raw(d, 0)
+    assert_eq(d.unsynced(), usize(1))
+    _ = d.sync()
+    assert_eq(sd_durable(d, 0), u8(1))
+
+// -- bit flips --------------------------------------------------------------------------------------
+
+a_bit_flip_changes_one_bit_of_the_media()
+    val d = sim_disk(1)
+    sd_put(d, 0, 0)
+    _ = d.sync()
+    d.flip_bit(0, 8 * 100 + 3)
+    assert_eq(sd_durable(d, 0), u8(8))
+
+a_bit_flip_scheduled_at_an_io_happens_before_it_runs()
+    val d = sim_disk(1)
+    sd_put(d, 0, 0)
+    _ = d.sync()
+    d.schedule(2, DkBitFlip(0, 8 * 100))
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_bit_flip_under_a_cached_write_shows_only_after_a_crash_drops_the_write()
+    val d = sim_disk(1)
+    sd_put(d, 0, 0)
+    _ = d.sync()
+    sd_put(d, 0, 4)
+    d.flip_bit(0, 8 * 100)
+    assert_eq(sd_raw(d, 0), "fill 4")
+    d.schedule(3, DkCrash(KeepNone))
+    _ = d.sync()
+    d.restart()
+    assert_eq(sd_raw(d, 0), "fill 1")
+
+a_bit_flip_in_a_page_not_on_the_media_changes_nothing()
+    val d = sim_disk(1)
+    sd_put(d, 0, 0)
+    d.flip_bit(0, 0)
+    d.flip_bit(5, 0)
+    assert_eq(d.durable_count(), u64(0))
+    assert_eq(d.trace().len(), usize(2))
+
+a_bit_flip_past_the_end_of_a_page_changes_nothing()
+    val d = sim_disk(1)
+    sd_put(d, 0, 0)
+    _ = d.sync()
+    d.flip_bit(0, u64(DbPageSize * 8))
+    assert_eq(d.durable_page(0), sd_sealed(0, 0))
+
+// -- the trace a seed reproduces ------------------------------------------------------------------
+
+/** Every fault at once, often enough that a short run meets each. */
+sd_busy_rates() -> FaultRates = FaultRates(20000, 30000, 30000, 60000, 50000, 30000)
+
+/** A fixed run of `ops` I/Os over 4 pages, drawn from `seed`, restarting after each crash; its trace. */
+sd_run(seed: u64, rates: FaultRates, ops: usize) -> Buf[string]
+    val d = sim_disk_with(seed, rates)
+
+    for i in 0..<ops
+        if d.is_down() then d.restart()
+        val n = u64(i % 4)
+
+        val kind = i % 5
+
+        if kind < 2
+            _ = d.write_page(n, sd_sealed(n, u8(i % 256)).view())
+        elif kind == 2
+            _ = d.sync()
+        else
+            sd_raw(d, n)
+
+    val out = d.trace()
+
+    for n in 0..<4
+        out.push(s"page $n: ${d.durable_page(u64(n))[100]}")
+
+    out
+
+one_seed_gives_the_same_trace_twice()
+    for seed in 1..<21
+        val a = sd_run(u64(seed), sd_busy_rates(), 400)
+        assert_eq(a, sd_run(u64(seed), sd_busy_rates(), 400), s"seed $seed")
+        assert(a.len() > 4, s"seed $seed drew no fault")
+
+different_seeds_give_different_traces()
+    for seed in 1..<21
+        assert(sd_run(u64(seed), sd_busy_rates(), 400) != sd_run(u64(seed + 1000), sd_busy_rates(), 400), s"seed $seed")
+
+a_device_with_no_rates_draws_no_fault()
+    val t = sd_run(7, no_disk_faults(), 400)
+    assert_eq(t.len(), usize(4))
+
+each_fault_is_drawn_at_random_somewhere()
+    val all = buf[string]()
+
+    for seed in 1..<11
+        all.extend(sd_run(u64(seed), sd_busy_rates(), 400).view())
+
+    for word in ["crash", "tears", "will be lost", "sync fails", "fails", "flipped"]
+        var found = false
+
+        for line in all
+            if line.contains(word) then found = true
+
+        assert(found, s"no run drew '$word'")
+
+a_drawn_crash_keeps_the_same_sectors_for_the_same_seed()
+    for seed in 1..<11
+        val a = sim_disk(u64(seed))
+        val b = sim_disk(u64(seed))
+
+        for d in [a, b]
+            for n in 0..<4
+                _ = d.write_page(u64(n), sd_sealed(u64(n), u8(n + 1)).view())
+
+            d.schedule(4, DkCrash(KeepDrawn))
+            _ = d.sync()
+            d.restart()
+
+        for n in 0..<4
+            assert_eq(a.durable_page(u64(n)), b.durable_page(u64(n)), s"seed $seed, page $n")
+
+/** The bytes of `xs`, as a buffer. */
+buf_of_u8(xs: []const u8) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(xs)
+    out
+
+/** Every order of a page's four sectors. */
+all_sector_orders() -> Buf[Buf[u8]]
+    val out = buf[Buf[u8]]()
+
+    for a in 0..<4
+        for b in 0..<4
+            for c in 0..<4
+                for e in 0..<4
+                    if a != b && a != c && a != e && b != c && b != e && c != e
+                        out.push(buf_of_u8([u8(a), u8(b), u8(c), u8(e)]))
+
+    out

@@ -38,6 +38,7 @@ private src(out: Buf[SourceText], file: string, text: []const u8) = out.push(Sou
  */
 sources() -> Buf[SourceText]
     val out = buf[SourceText]()
+    src(out, "block_device.sysl", embed("block_device.sysl"))
     src(out, "btree_check.sysl", embed("btree_check.sysl"))
     src(out, "btree.sysl", embed("btree.sysl"))
     src(out, "catalog_alter.sysl", embed("catalog_alter.sysl"))
@@ -83,6 +84,7 @@ sources() -> Buf[SourceText]
     src(out, "iso_model.sysl", embed("iso_model.sysl"))
     src(out, "json.sysl", embed("json.sysl"))
     src(out, "key_encoding.sysl", embed("key_encoding.sysl"))
+    src(out, "page_io.sysl", embed("page_io.sysl"))
     src(out, "page_map.sysl", embed("page_map.sysl"))
     src(out, "page.sysl", embed("page.sysl"))
     src(out, "plan_unnest.sysl", embed("plan_unnest.sysl"))
@@ -105,6 +107,7 @@ sources() -> Buf[SourceText]
     src(out, "shell_render.sysl", embed("shell_render.sysl"))
     src(out, "shell_split.sysl", embed("shell_split.sysl"))
     src(out, "shell.sysl", embed("shell.sysl"))
+    src(out, "sim_disk.sysl", embed("sim_disk.sysl"))
     src(out, "sql_lexer.sysl", embed("sql_lexer.sysl"))
     src(out, "sql_parser.sysl", embed("sql_parser.sysl"))
     src(out, "sql_translate.sysl", embed("sql_translate.sysl"))
