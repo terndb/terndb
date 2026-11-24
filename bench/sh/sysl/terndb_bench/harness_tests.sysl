@@ -484,3 +484,111 @@ report_not_timed()
     assert_eq(cell_of(Some(rec("a", "duckdb", Failed("x"), [])), None), "failed")
     assert_eq(cell_of(Some(rec("a", "duckdb", Measured, [10.0, 10.0])), Some(Mismatch("row 0"))), "wrong answer")
     assert_eq(cell_of(Some(rec("a", "duckdb", Measured, [10.0, 10.0])), None), "10.0 ± 0.000 µs (n=2)")
+
+// -- the answer check's judgement --------------------------------------------------------------
+
+/** `judge` over answers labelled by group: answers with the same label agree, -1 is an engine's error. */
+private judged(groups: []const i64) -> Buf[Option[usize]]
+    val n = groups.len
+    val ok = buf[bool]()
+    val same = buf[bool]()
+    for i in 0..<n
+        ok.push(groups[i] >= 0)
+        for j in 0..<n
+            same.push(i != j && groups[i] >= 0 && groups[i] == groups[j])
+    judge(n, ok.view(), same.view())
+
+@test("four agreeing answers are all right")
+judge_all_agree()
+    val v = judged([0, 0, 0, 0])
+    assert_eq(v.len(), 4)
+    for i in 0..<4
+        assert(v[i].is_none())
+
+@test("one answer against three is wrong, shown against the first right one")
+judge_three_against_one()
+    val v = judged([0, 0, 1, 0])
+    assert(v[0].is_none())
+    assert(v[1].is_none())
+    assert(v[3].is_none())
+    assert_eq(v[2].unwrap(), 0)
+    val w = judged([1, 0, 0, 0])
+    assert_eq(w[0].unwrap(), 1)
+    assert(w[1].is_none())
+
+@test("an even split, both TernDB lanes against both rivals, makes every answer wrong")
+judge_even_split()
+    val v = judged([0, 0, 1, 1])
+    for i in 0..<4
+        assert(v[i].is_some())
+    assert_eq(v[0].unwrap(), 2)
+    assert_eq(v[1].unwrap(), 2)
+    assert_eq(v[2].unwrap(), 0)
+    assert_eq(v[3].unwrap(), 0)
+    val w = judged([0, 1, 0, 1])
+    assert_eq(w[0].unwrap(), 1)
+    assert_eq(w[1].unwrap(), 0)
+
+@test("a pair beats two lone answers, each lone one shown against the pair")
+judge_pair_and_two_singles()
+    val v = judged([0, 1, 0, 2])
+    assert(v[0].is_none())
+    assert(v[2].is_none())
+    assert_eq(v[1].unwrap(), 0)
+    assert_eq(v[3].unwrap(), 0)
+
+@test("four different answers are all wrong")
+judge_all_differ()
+    val v = judged([0, 1, 2, 3])
+    for i in 0..<4
+        assert(v[i].is_some())
+    assert_eq(v[0].unwrap(), 1)
+    assert_eq(v[3].unwrap(), 0)
+
+@test("a lone given answer is right when every other engine failed")
+judge_lone_answer()
+    val v = judged([-1, 0, -1, -1])
+    assert(v[1].is_none())
+    assert(v[0].is_none())
+    assert(v[2].is_none())
+    assert(v[3].is_none())
+
+@test("two given answers that differ, the rest failed, are both wrong")
+judge_two_differ_rest_failed()
+    val v = judged([0, -1, 1, -1])
+    assert_eq(v[0].unwrap(), 2)
+    assert_eq(v[2].unwrap(), 0)
+    assert(v[1].is_none())
+
+@test("a failed engine counts for no group: three agreeing beside a failure are right")
+judge_failure_beside_agreement()
+    val v = judged([0, 0, -1, 0])
+    for i in 0..<4
+        assert(v[i].is_none())
+    val w = judged([0, 0, -1, 1])
+    assert(w[0].is_none())
+    assert(w[1].is_none())
+    assert_eq(w[3].unwrap(), 0)
+
+@test("every engine failing judges nothing wrong")
+judge_all_failed()
+    val v = judged([-1, -1, -1, -1])
+    for i in 0..<4
+        assert(v[i].is_none())
+
+@test("one engine alone is right; no engines judge to nothing")
+judge_one_and_none()
+    val v = judged([0])
+    assert_eq(v.len(), 1)
+    assert(v[0].is_none())
+    val e = judged([])
+    assert_eq(e.len(), 0)
+
+@test("two engines agreeing are right, two differing are both wrong")
+judge_two_engines()
+    val v = judged([3, 3])
+    assert(v[0].is_none())
+    assert(v[1].is_none())
+    val w = judged([3, 4])
+    assert_eq(w[0].unwrap(), 1)
+    assert_eq(w[1].unwrap(), 0)

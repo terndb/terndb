@@ -261,10 +261,46 @@ answer_of(db: &Db, w: Workload, s: Scale) -> Result[Buf[Buf[Cell]], string]
             val check = db.prepare(w.check)?
             db.answer(check, [])
 
-/** Checks `w`'s answer on every engine of `dbs` against the others: an engine agreeing with at least
- * one other is right; one agreeing with none, when some others agree, is a mismatch; when no two
- * agree, every engine is.
+/** Judges `n` answers from which of them an engine gave (`ok`) and which pairs agree (`same`, row-major
+ * `n` by `n`): for each given answer, `None` when it is right, or `Some(k)`, the answer it is shown
+ * against, when it is wrong. An answer's group is itself and every given answer agreeing with it. An
+ * answer is right when its group is the largest and it agrees with every other answer whose group is
+ * as large, so a lone given answer is right, one answer against three is wrong, and an even split, such
+ * as both TernDB lanes against both rivals, makes every answer wrong rather than passing all of them.
+ * A wrong answer is shown against a right one when there is one, else against one it differs from.
+ * An answer no engine gave is `None`; its outcome is the engine's error.
  */
+judge(n: usize, ok: []const bool, same: []const bool) -> Buf[Option[usize]]
+    val size = buf[usize]()
+    var best: usize = 0
+    for i in 0..<n
+        var c: usize = 0
+        if ok[i]
+            c = 1
+            for j in 0..<n
+                if j != i && ok[j] && same[i * n + j] then c += 1
+        size.push(c)
+        if c > best then best = c
+    val right = buf[bool]()
+    for i in 0..<n
+        var r = ok[i] && size[i] == best
+        for j in 0..<n
+            if r && j != i && ok[j] && size[j] == best && !same[i * n + j] then r = false
+        right.push(r)
+    val out = buf[Option[usize]]()
+    for i in 0..<n
+        var against: Option[usize] = None
+        if ok[i] && !right[i]
+            for j in 0..<n
+                if against.is_none() && j != i && right[j] then against = Some(j)
+            for j in 0..<n
+                if against.is_none() && j != i && ok[j] && !same[i * n + j] then against = Some(j)
+            for j in 0..<n
+                if against.is_none() && j != i && ok[j] then against = Some(j)
+        out.push(against)
+    out
+
+/** Checks `w`'s answer on every engine of `dbs` against the others, as `judge` rules. */
 verify_workload(dbs: []const &Db, w: Workload, s: Scale, log: (string) -> unit) -> Buf[Record]
     val answers = buf[Result[Buf[Buf[Cell]], string]]()
     for db in dbs
@@ -272,24 +308,20 @@ verify_workload(dbs: []const &Db, w: Workload, s: Scale, log: (string) -> unit) 
         answers.push(answer_of(db, w, s))
         log(s"  ${w.name} ${db.name()}: ${real(monotonic().us - t0) / 1000.0} ms (untimed check, includes setup)")
     val out = buf[Record]()
-    var any_agree = false
+    val ok = buf[bool]()
+    val same = buf[bool]()
     for i in 0..<dbs.len
+        ok.push(answers[i].is_ok())
         for j in 0..<dbs.len
-            if i != j && agree(answers[i], answers[j], w.ordered) then any_agree = true
+            same.push(i != j && agree(answers[i], answers[j], w.ordered))
+    val verdicts = judge(dbs.len, ok.view(), same.view())
     for i in 0..<dbs.len
         val outcome = answers[i] match
             Err(e) -> Unsupported(e)
             Ok(rows) ->
-                var with = 0
-                var other: Option[usize] = None
-                for j in 0..<dbs.len
-                    if i != j
-                        if agree(answers[i], answers[j], w.ordered) then with += 1
-                        elif other.is_none() && answers[j].is_ok() then other = Some(j)
-                if with > 0 || (!any_agree && other.is_none()) then Measured
-                else
-                    val k = other.unwrap()
-                    Mismatch(s"against ${dbs[k].name()}: " + mismatch(answers[k].unwrap(), rows, w.ordered).unwrap_or("differs"))
+                verdicts[i] match
+                    None -> Measured
+                    Some(k) -> Mismatch(s"against ${dbs[k].name()}: " + mismatch(answers[k].unwrap(), rows, w.ordered).unwrap_or("differs"))
         val rows = answers[i] match
             Ok(r) -> u64(r.len())
             Err(_) -> 0
