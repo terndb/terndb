@@ -1,0 +1,38 @@
+// Need 6 on 0.13.5: mask to bits, run-time lane picks, gather and compress.
+first_byte(hay: []const u8, needle: u8) -> Option[usize]
+    var i: usize = 0
+
+    while i + 16 <= hay.len
+        val v: <16>u8 = hay.load(i)
+        val m = v == needle
+
+        if m.any() then return Some(i + usize(m.bits().trailing_zeros()))
+        i += 16
+
+    while i < hay.len
+        if hay[i] == needle then return Some(i)
+        i += 1
+
+    None
+
+val s = "the quick brown fox jumps over the lazy dog"
+print(first_byte(s.bytes, u8('z')), first_byte(s.bytes, u8('!')))
+
+val a: <16>u8 = [1; 16]
+val b: <16>u8 = [1, 1, 1, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 9]
+val m = a != b
+print(m.bits(), m.bits().count_ones())
+
+val classes: <16>u8 = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0]
+val idx: <16>u8 = [10, 1, 99, 0, 10, 10, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1]
+val l = classes.lookup(idx)
+print(l[0], l[1], l[2], l[15])
+
+val col: [8]i64 = [10, 20, 30, 40, 50, 60, 70, 80]
+val rows: <4>i32 = [7, 0, 3, 3]
+val g = col.gather(rows)
+print(g[0], g[1], g[2], g[3])
+
+val v: <4>i64 = [5, 50, 7, 70]
+val kept = v.compress(v > 6)
+print(kept[0], kept[1], kept[2], kept[3], (v > 6).bits().count_ones())

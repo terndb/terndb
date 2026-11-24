@@ -1,0 +1,17 @@
+// Need 10 on 0.13.5: CRC32C (one shot and incremental) and a seeded, persistable hash.
+import sysl.checksum.{crc32c, new_crc32c, hash64, crc32}
+
+print(crc32c("123456789".bytes) == 0xe3069283)
+print(crc32c("".bytes))
+
+var c = new_crc32c()
+c.update("1234".bytes)
+c.update("56789".bytes)
+print(c.finish() == 0xe3069283)
+
+val page: [16384]u8 = [0xab; 16384]
+print(crc32c(page[..]) == crc32c(page[..]), crc32c(page[..]) != crc32(page[..]))
+
+print(hash64("hello world".bytes) == 0x2f27cb27d5240940)
+print(hash64("hello world".bytes, 1) != hash64("hello world".bytes, 2))
+print(hash64("hello world".bytes) == hash64("hello world".bytes, 0))
