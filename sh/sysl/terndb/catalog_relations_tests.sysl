@@ -90,6 +90,9 @@ private cr_type(t: Type) -> Value
     encode_type(t, out)
     Bytes(out)
 
+/** Expression `e` as a `…_tree` column reports it: its canonical encoding alone. */
+private cr_tree(e: Expr) -> Value = Bytes(encode_expr(e).unwrap())
+
 private cr_texts(names: []const string) -> Value
     val out = buf[Value]()
 
@@ -187,6 +190,16 @@ a_column_reports_its_default_generation_expression_and_identity_in_text_form()
     assert(rows[4] == rec([Text("y"), Null, Null, variant(1, rec([]))]))
 
 @test
+a_column_reports_its_default_and_generation_expression_as_trees()
+    val d = ColumnDef("d", Text, Some(cat_text("it's")), None, NoIdentity, None)
+    val g = ColumnDef("g", Int64, None, Some(call("add", [cat_row("id"), cat_int(1)])), NoIdentity, None)
+    val c = cat_ok(cat_ok(mem_catalog(), CreateNamespace("app", false)), cat_table("w", [cat_col("id", Int64), d, g], ["id"]))
+    val rows = cr_on(c, cr_pick("columns", ["name", "default_tree", "generated_tree"]))
+    assert(rows[0] == rec([Text("id"), Null, Null]))
+    assert(rows[1] == rec([Text("d"), cr_tree(cat_text("it's")), Null]))
+    assert(rows[2] == rec([Text("g"), Null, cr_tree(call("add", [cat_row("id"), cat_int(1)]))]))
+
+@test
 a_column_of_a_named_type_reports_the_structure_and_the_name()
     val status = union_of([Field("active", record([])), Field("banned", record([Field("reason", Text)]))])
     var c = cat_ok(cat_base(), CreateType(cat_q("status"), status, false))
@@ -222,8 +235,8 @@ a_view_s_columns_are_listed_with_no_key_and_no_default()
     val v = c.views[c.view_at(cat_q("vt")).unwrap()]
     val rows = cr_on(c, Filter(scan("catalog", "columns", "c"), call("eq", [col("c", "table_oid"), Literal(UInt64, UInt(v.oid))])))
     assert_eq(rows.len(), 2)
-    assert(rows[0] == rec([UInt(v.oid), UInt(1), UInt(0), Text("b"), cr_type(Text), Text("text"), Null, Bool(false), Bool(false), Null, Null, Null, cr_ready()]))
-    assert(rows[1] == rec([UInt(v.oid), UInt(2), UInt(1), Text("a"), cr_type(nullable(Int32)), Text("int32?"), Null, Bool(true), Bool(false), Null, Null, Null, cr_ready()]))
+    assert(rows[0] == rec([UInt(v.oid), UInt(1), UInt(0), Text("b"), cr_type(Text), Text("text"), Null, Bool(false), Bool(false), Null, Null, Null, cr_ready(), Null, Null]))
+    assert(rows[1] == rec([UInt(v.oid), UInt(2), UInt(1), Text("a"), cr_type(nullable(Int32)), Text("int32?"), Null, Bool(true), Bool(false), Null, Null, Null, cr_ready(), Null, Null]))
 
 @test
 an_index_row_reports_every_column_of_catalog_indexes()
@@ -232,17 +245,59 @@ an_index_row_reports_every_column_of_catalog_indexes()
     val x = c.indexes[c.index_at(cat_q("t_lower")).unwrap()]
     val rows = cr_now(c, "indexes")
     assert_eq(rows.len(), 1)
-    val ks = rel([rec([Null, Text("(call lower row.b)"), Bool(true)]), rec([Text("id"), Text("row.id"), Bool(false)])])
+    val ks = rel([rec([Null, Text("(call lower row.b)"), Bool(true), cr_tree(call("lower", [cat_row("b")]))]),
+        rec([Text("id"), Text("row.id"), Bool(false), cr_tree(cat_row("id"))])])
     // A new index is building until its job finishes; no job runs here, so it stays so.
     assert(rows[0] == rec([UInt(x.oid), UInt(cr_oid(c, "t")), Text("app"), Text("t_lower"), Bool(true), ks, Text("(call is_not_null row.a)"),
-        variant(0, rec([UInt(0)]))]))
+        variant(0, rec([UInt(0)])), cr_tree(call("is_not_null", [cat_row("a")]))]))
+
+@test
+an_index_without_a_predicate_has_no_predicate_tree()
+    val c = cat_ok(cat_base(), CreateIndex("t_a", IndexDef(cat_q("t"), false, items_of([IndexKey(KeyColumn("a"), false)]), None), false))
+    val rows = cr_on(c, cr_where("indexes", "name", cat_text("t_a"), ["predicate", "predicate_tree"]))
+    assert(rows[0] == rec([Null, Null]))
+
+@test
+a_tree_column_decodes_to_the_expression_its_text_spells()
+    val e = call("gt", [cat_row("k"), cat_int(0)])
+    cr_tree(e) match
+        Bytes(b) -> decode_expr(b.view()) match
+            Ok(x) -> assert(x == e, "decodes to the expression")
+            Err(_) -> assert(false, "decodes")
+        _ -> assert(false, "bytes")
+
+@test
+a_tree_column_with_octets_after_the_expression_is_refused()
+    val b = encode_expr(cat_row("k")).unwrap()
+    b.push(0)
+    decode_expr(b.view()) match
+        Err(err) -> assert_eq(err.code, "Q1001")
+        Ok(_) -> assert(false, "refused")
+
+@test
+a_truncated_tree_column_is_refused()
+    val b = encode_expr(call("lower", [cat_row("k")])).unwrap()
+    decode_expr(b.view()[0..<b.len() - 1]) match
+        Err(err) -> assert_eq(err.code, "Q1001")
+        Ok(_) -> assert(false, "refused")
+    assert(decode_expr(buf[u8]().view()).is_err(), "nothing is no expression")
+
+@test
+a_statement_tree_decodes_alone_and_refuses_trailing_octets()
+    val s = Query(scan("app", "t", "x"))
+    decode_statement(encode_statement(s).unwrap().view()) match
+        Ok(x) -> assert(x == s, "decodes to the statement")
+        Err(_) -> assert(false, "decodes")
+    val b = encode_statement(s).unwrap()
+    b.push(7)
+    assert(decode_statement(b.view()).is_err(), "trailing octets")
 
 @test
 a_unique_constraint_s_index_is_ready_and_named_for_it()
     val c = cat_ok(cat_base(), cat_table("e", [cat_col("id", Int64), cat_col("mail", Text)], ["id"], [cat_unique("e_mail", ["mail"])]))
     val rows = cr_on(c, cr_where("indexes", "name", cat_text("e_mail"), ["unique", "keys", "predicate", "state"]))
     assert_eq(rows.len(), 1)
-    assert(rows[0] == rec([Bool(true), rel([rec([Text("mail"), Text("row.mail"), Bool(false)])]), Null, variant(1, rec([]))]))
+    assert(rows[0] == rec([Bool(true), rel([rec([Text("mail"), Text("row.mail"), Bool(false), cr_tree(cat_row("mail"))])]), Null, variant(1, rec([]))]))
 
 @test
 every_kind_of_constraint_is_listed_with_its_definition()
@@ -267,7 +322,8 @@ every_kind_of_constraint_is_listed_with_its_definition()
 
     assert_eq(rows.len(), 6)
     assert(cr_has(rows, rec([UInt(pk.unwrap().oid), UInt(u), Text("app"), Text(pk.unwrap().name), Bool(true), variant(0, rec([cr_texts(["k"])]))])))
-    assert(cr_has(rows, rec([UInt(ck.unwrap().oid), UInt(u), Text("app"), Text("u_k_pos"), Bool(true), variant(3, rec([Text("(call gt row.k '0'::int64)")]))])))
+    assert(cr_has(rows, rec([UInt(ck.unwrap().oid), UInt(u), Text("app"), Text("u_k_pos"), Bool(true), variant(3, rec([Text("(call gt row.k '0'::int64)"),
+        cr_tree(call("gt", [cat_row("k"), cat_int(0)]))]))])))
     assert(cr_has(rows, rec([UInt(fo.unwrap().oid), UInt(u), Text("app"), Text("u_t"), Bool(true), variant(4, rec([cr_texts(["t_id"]),
         UInt(cr_oid(c, "t")), cr_texts(["id"]), variant(2, rec([])), variant(3, rec([])), Bool(true)]))])))
     assert(cr_has(rows, rec([UInt(un.unwrap().oid), UInt(u), Text("app"), Text("u_m"), Bool(true), variant(1, rec([cr_texts(["m"]), UInt(un.unwrap().index)]))])))

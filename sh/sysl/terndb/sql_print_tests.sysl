@@ -59,9 +59,12 @@ private sp_check_of(text: string) -> Result[Expr, string]
 
 /** `e` prints as `want` and reads back as `e`. */
 private sp_exact(e: Expr, want: string, file: string = __FILE__, line: long = __LINE__)
-    val got = sp_print(e)
-    assert_eq(got, want, file, line)
+    sp_same(sp_print(e), want, file, line)
     sp_round_trips(e, file, line)
+
+private sp_same(got: string, want: string, file: string = __FILE__, line: long = __LINE__)
+    if got != want then print(s"\n  printed: $got\n  wanted:  $want\n")
+    assert(got == want, "the printed text", file, line)
 
 /** `e` prints as SQL that reads back as `e`. */
 private sp_round_trips(e: Expr, file: string = __FILE__, line: long = __LINE__)
@@ -76,7 +79,7 @@ private sp_round_trips(e: Expr, file: string = __FILE__, line: long = __LINE__)
 
 /** `e` prints as `want` and reads back as `normal`, what the front end makes of it. */
 private sp_normalised(e: Expr, want: string, normal: Expr, file: string = __FILE__, line: long = __LINE__)
-    assert_eq(sp_print(e), want, file, line)
+    sp_same(sp_print(e), want, file, line)
     sp_check_of(want) match
         Ok(back) ->
             if back != normal then print(s"\n$want\n  read back as ${expr_text(back)}\n")
@@ -438,7 +441,7 @@ a_right_nested_subtraction_keeps_its_parentheses()
 
 @test
 a_left_nested_subtraction_needs_none()
-    sp_exact(call("sub", [call("sub", [sp_row("a"), sp_row("a")]), Literal(Int64, Int(1))]), "a - a - 1")
+    sp_exact(call("sub", [call("sub", [sp_row("a"), sp_row("a")]), Literal(Int64, Int(1))]), "a - a - 1::int64")
 
 @test
 a_double_negation_parenthesises_its_inner_minus()
@@ -494,9 +497,11 @@ a_negative_constant_after_minus_keeps_a_space()
     sp_exact(call("mul", [Literal(Int64, Int(-5)), sp_row("a")]), "-5 * a")
 
 @test
-like_operands_parenthesise_comparisons()
+like_binds_looser_than_concatenation_and_tighter_than_a_comparison()
     sp_exact(call("like", [call("concat", [sp_row("b"), sp_row("b")]), sp_text_lit("x"), sp_text_lit("")]), "b || b LIKE 'x'")
-    sp_exact(call("eq", [call("like", [sp_row("b"), sp_text_lit("x"), sp_text_lit("")]), sp_row("flag")]), "(b LIKE 'x') = flag")
+    sp_exact(call("eq", [call("like", [sp_row("b"), sp_text_lit("x"), sp_text_lit("")]), sp_row("flag")]), "b LIKE 'x' = flag")
+    sp_exact(call("like", [call("eq", [sp_row("b"), sp_row("b")]), sp_text_lit("x"), sp_text_lit("")]), "(b = b) LIKE 'x'")
+    sp_exact(call("like", [sp_row("b"), call("concat", [sp_row("b"), sp_text_lit("%")]), sp_text_lit("")]), "b LIKE b || '%'")
 
 // -- definitions through the shell's columns --------------------------------------------------------
 
@@ -516,3 +521,378 @@ a_default_of_another_type_carries_it()
 an_unknown_table_s_columns_give_no_type()
     assert_eq(sql_definition_text(call("eq", [sp_row("a"), Literal(Int64, Int(1))]), None), "a = 1::int64")
     assert_eq(sql_definition_text(call("eq", [sp_row("a"), sp_int(1)]), None), "a = 1")
+
+// -- queries ---------------------------------------------------------------------------------------
+
+/** The query of `create view v as <text>` over the tables `SpTables` knows. */
+private sp_view(text: string, file: string = __FILE__, line: long = __LINE__) -> Option[Rel]
+    sql_statement("create view v as " + text, "public", SpTables()) match
+        Ok(SqlTree(env)) -> env.statement match
+            CreateView(_, r, _) -> Some(r)
+            _ -> None
+        Ok(_) -> None
+        Err(err) ->
+            print(s"\n$text\n  -> ${err.code}@${err.column}: ${err.message}\n")
+            None
+
+private sp_shape(r: Rel) -> Buf[u8] = shape_form(envelope([], Query(r))).unwrap()
+
+/** `r` prints as `want`, which reads back as `r` up to binder names. */
+private sp_query_tree(r: Rel, want: string, file: string = __FILE__, line: long = __LINE__)
+    val got = sql_query_text(r, SpTables())
+    sp_same(got, want, file, line)
+    sp_view(got) match
+        Some(back) ->
+            val same = same_octets(sp_shape(back).view(), sp_shape(r).view())
+            if !same then print(s"\n$got\n  printed from ${rel_text(r)}\n  read back as ${rel_text(back)}\n")
+            assert(same, "reads back as the query it was printed from", file, line)
+        None -> assert(false, "the printed query translates", file, line)
+
+/** Query `text` translated, printed as `want`, and read back as the same tree. */
+private sp_query(text: string, want: string, file: string = __FILE__, line: long = __LINE__)
+    sp_view(text) match
+        Some(r) -> sp_query_tree(r, want, file, line)
+        None -> assert(false, "the query translates", file, line)
+
+@test
+a_select_qualifies_its_columns_by_their_source()
+    sp_query("select a, b from t where a > 1", "SELECT t.a, t.b FROM t WHERE t.a > 1")
+
+@test
+an_alias_is_the_binder()
+    sp_query("select x.a from t as x", "SELECT x.a FROM t AS x")
+
+@test
+a_renamed_item_has_an_alias()
+    sp_query("select a as z, a + 1 from t", "SELECT t.a AS z, t.a + 1 AS column2 FROM t")
+
+@test
+joins_are_written_with_their_conditions()
+    sp_query("select t.a, u.name from t join u on u.t_a = t.a", "SELECT t.a, u.name FROM t JOIN u ON u.t_a = t.a")
+    sp_query("select t.a from t left join u on u.t_a = t.a", "SELECT t.a FROM t LEFT JOIN u ON u.t_a = t.a")
+    sp_query("select t.a from t right join u on u.t_a = t.a", "SELECT t.a FROM t RIGHT JOIN u ON u.t_a = t.a")
+    sp_query("select t.a from t full join u on u.t_a = t.a", "SELECT t.a FROM t FULL JOIN u ON u.t_a = t.a")
+
+@test
+a_cross_join_and_a_comma_are_one_join()
+    sp_query("select t.a from t, u", "SELECT t.a FROM t CROSS JOIN u")
+    sp_query("select t.a from t cross join u", "SELECT t.a FROM t CROSS JOIN u")
+
+@test
+a_join_on_the_right_of_a_join_is_parenthesised()
+    sp_query("select x.a from t as x join (u as y join u as z on y.id = z.id) on x.a = y.id",
+        "SELECT x.a FROM t AS x JOIN (u AS y JOIN u AS z ON y.id = z.id) ON x.a = y.id")
+
+@test
+using_reads_back_as_its_condition()
+    sp_query("select t.a from t join u using (name)", "SELECT t.a FROM t JOIN u ON t.name = u.name")
+
+@test
+grouping_writes_keys_and_aggregates_in_place()
+    sp_query("select b, count(*) as n from t group by b having count(*) > 1",
+        "SELECT t.b, count(*) AS n FROM t GROUP BY t.b HAVING count(*) > 1")
+
+@test
+an_aggregate_without_grouping_has_no_group_by()
+    sp_query("select max(a) from t", "SELECT max(t.a) AS max FROM t")
+
+@test
+an_aggregate_writes_distinct_order_and_filter()
+    sp_query("select string_agg(distinct b, ',' order by b desc) filter (where a > 0) as s from t",
+        "SELECT string_agg(DISTINCT t.b, ',' ORDER BY t.b DESC) FILTER (WHERE t.a > 0) AS s FROM t")
+
+@test
+order_limit_and_offset_follow_the_select()
+    sp_query("select a from t order by a desc limit 5 offset 2", "SELECT t.a FROM t ORDER BY t.a DESC LIMIT 5 OFFSET 2")
+    sp_query("select a from t limit 5", "SELECT t.a FROM t LIMIT 5")
+    sp_query("select a from t offset 3", "SELECT t.a FROM t OFFSET 3")
+
+@test
+nulls_are_written_only_against_their_default()
+    sp_query("select a from t order by a nulls first, b desc nulls last, c desc", "SELECT t.a FROM t ORDER BY t.a NULLS FIRST, t.b DESC NULLS LAST, t.c DESC")
+
+@test
+with_ties_is_a_fetch()
+    sp_query("select a from t order by a offset 1 fetch first 3 rows with ties", "SELECT t.a FROM t ORDER BY t.a OFFSET 1 FETCH FIRST 3 ROWS WITH TIES")
+
+@test
+distinct_orders_by_output_names()
+    sp_query("select distinct b from t order by b limit 2", "SELECT DISTINCT t.b FROM t ORDER BY b LIMIT 2")
+
+@test
+a_lone_star_passes_its_source_through()
+    sp_query("select * from t where a = 1", "SELECT * FROM t WHERE t.a = 1")
+    sp_query("select distinct * from t", "SELECT DISTINCT * FROM t")
+
+@test
+a_select_without_from_reads_one_row()
+    sp_query("select 1 as one", "SELECT 1 AS one")
+
+@test
+set_operations_parenthesise_their_inputs()
+    sp_query("select a from t union all select id from u", "(SELECT t.a FROM t) UNION ALL (SELECT u.id FROM u)")
+    sp_query("select a from t intersect select id from u except select id from u",
+        "((SELECT t.a FROM t) INTERSECT (SELECT u.id FROM u)) EXCEPT (SELECT u.id FROM u)")
+    sp_query("select a from t union select id from u union select id from u",
+        "(SELECT t.a FROM t) UNION (SELECT u.id FROM u) UNION (SELECT u.id FROM u)")
+
+@test
+a_set_operation_orders_by_output_names()
+    sp_query("select a from t union select id from u order by a limit 1", "(SELECT t.a FROM t) UNION (SELECT u.id FROM u) ORDER BY a LIMIT 1")
+
+@test
+values_write_each_constant_with_its_type()
+    sp_query("values (1, 'x'), (2, null)", "VALUES (1::int32, 'x'::text), (2::int32, NULL)")
+
+@test
+with_names_its_queries()
+    sp_query("with c as (select a from t) select c.a from c", "WITH c AS (SELECT t.a FROM t) SELECT c.a FROM c")
+    sp_query("with c (x) as (values (1)) select c.x from c", "WITH c (x) AS (VALUES (1::int32)) SELECT c.x FROM c")
+
+@test
+a_table_a_cte_shadows_is_qualified()
+    sp_query("with t as (select id from u) select p.a from public.t as p, t", "WITH t AS (SELECT u.id FROM u) SELECT p.a FROM public.t AS p CROSS JOIN t")
+
+@test
+a_table_of_another_namespace_is_qualified()
+    sp_query("select x.id from other.x", "SELECT x.id FROM other.x")
+
+@test
+a_derived_table_is_aliased_by_its_binder()
+    sp_query("select s.a from (select a from t) as s", "SELECT s.a FROM (SELECT t.a FROM t) AS s")
+    sp_query("select s.column1 from (values (1)) as s", "SELECT s.column1 FROM (VALUES (1::int32)) AS s (column1)")
+
+@test
+a_scalar_subquery_is_parenthesised()
+    sp_query("select (select max(id) from u) as m from t", "SELECT (SELECT max(u.id) AS max FROM u) AS m FROM t")
+
+@test
+exists_writes_its_query()
+    sp_query("select a from t where exists (select 1 from u where u.t_a = t.a)",
+        "SELECT t.a FROM t WHERE EXISTS (SELECT 1 AS column1 FROM u WHERE u.t_a = t.a)")
+
+@test
+in_and_not_in_write_their_query()
+    sp_query("select a from t where a in (select t_a from u)", "SELECT t.a FROM t WHERE t.a IN (SELECT u.t_a FROM u)")
+    sp_query("select a from t where a not in (select t_a from u)", "SELECT t.a FROM t WHERE t.a NOT IN (SELECT u.t_a FROM u)")
+    sp_query("select a from t where (a, b) in (select id, name from u)", "SELECT t.a FROM t WHERE (t.a, t.b) IN (SELECT u.id, u.name FROM u)")
+
+@test
+a_constant_beside_a_derived_column_carries_its_type()
+    val inner = Project(scan("public", "t", "t"), "s", items_of([item("a", col("t", "a"))]))
+    sp_query_tree(Filter(inner, call("gt", [col("s", "a"), Literal(Int64, Int(1))])), "SELECT * FROM (SELECT t.a FROM t) AS s WHERE s.a > 1::int64")
+
+@test
+a_project_over_a_project_is_a_derived_table()
+    val inner = Project(scan("public", "t", "t"), "s", items_of([item("a", col("t", "a"))]))
+    sp_query_tree(Project(inner, "o", items_of([item("z", col("s", "a"))])), "SELECT s.a AS z FROM (SELECT t.a FROM t) AS s")
+
+@test
+a_limit_that_disagrees_with_its_sort_is_its_tree_text()
+    val r = Limit(scan("public", "t", "t"), Some(Literal(Int64, Int(1))), None, false, false)
+    assert_eq(sql_query_text(r, SpTables()), "SELECT * FROM (limit :input (scan :table public.t :as t) :count '1'::int64)")
+
+@test
+a_window_is_its_tree_text()
+    val w = Window(scan("public", "t", "t"), "w", items_of([NamedWin("r", WinCall("row_number", buf[Expr](), buf[Expr](), buf[SortKey](), None))]))
+    assert_eq(sql_query_text(Project(w, "p", items_of([item("r", col("w", "r"))])), SpTables()),
+        "SELECT w.r AS r FROM (window :input (scan :table public.t :as t) :as w :items [r: (row_number)])")
+
+// -- \d through the shell ------------------------------------------------------------------------
+
+private sp_shell() -> Shell
+    val e = engine(sql_catalog(), 1700000000000000, MonotonicClock())
+    val link = embedded_link(e, "terndb", "pencil").unwrap()
+    val conn = connect_shell(link, shell_client_config("terndb", BootstrapRole, "pencil").unwrap()).unwrap()
+    shell(conn, Embedded, "terndb", BootstrapRole)
+
+/** What `\d k` prints after `script` has run. */
+private sp_describe(script: string, name: string = "k") -> string
+    var s = sp_shell()
+    s.run_script(script)
+    val _ = s.take_printed()
+    s.feed_line("\\d " + name)
+    var out = ""
+    for p in s.take_printed()
+        out = out + p.text
+    out
+
+@test
+d_shows_a_check_as_sql()
+    val got = sp_describe("create table k (id int64 primary key, score int32 check (score >= 0 and score < 100));")
+    assert(got.contains("Check constraints:\n    \"k_check\" CHECK (score >= 0 AND score < 100)\n"), got)
+
+@test
+d_shows_a_default_as_sql_typed_by_its_column()
+    val got = sp_describe("create table k (id int64 primary key, n int64 default 0, s text default 'it''s', w int32 default -1);")
+    assert(got.contains(" n      | int64 |          | 0\n"), got)
+    assert(got.contains(" s      | text  |          | 'it''s'\n"), got)
+    assert(got.contains(" w      | int32 |          | -1\n"), got)
+
+@test
+d_shows_a_generated_column_as_sql()
+    val got = sp_describe("create table k (id int64 primary key, twice int64 generated always as (id * 2) stored);")
+    assert(got.contains("generated always as (id * 2)"), got)
+
+@test
+d_shows_an_expression_key_as_sql()
+    val got = sp_describe("create table k (id int64 primary key, \"Name\" text);\ncreate index k_lower on k ((lower(\"Name\")) desc, id);")
+    assert(got.contains("    \"k_lower\" (lower(\"Name\") DESC, id)\n"), got)
+
+@test
+d_quotes_a_key_column_that_needs_it()
+    val got = sp_describe("create table k (id int64 primary key, \"Name\" text);\ncreate index k_name on k (\"Name\");")
+    assert(got.contains("    \"k_name\" (\"Name\")\n"), got)
+
+@test
+d_shows_a_partial_predicate_as_sql()
+    val got = sp_describe("create table k (id int64 primary key, score int32, gone bool);\ncreate index k_live on k (id) where not gone and score > 0;")
+    assert(got.contains("    \"k_live\" (id) WHERE NOT gone AND score > 0\n"), got)
+
+@test
+d_shows_a_view_definition_as_sql()
+    val got = sp_describe("create table k (id int64 primary key, score int32);\ncreate view kv as select id, score * 2 as dbl from k where score > 0 order by id;", "kv")
+    assert(got.ends_with("View definition:\n SELECT k.id, k.score * 2 AS dbl FROM k WHERE k.score > 0 ORDER BY k.id\n"), got)
+
+@test
+d_shows_a_view_over_a_view_as_sql()
+    val got = sp_describe("create table k (id int64 primary key);\ncreate view kv as select id from k;\ncreate view kw as select kv.id from kv where kv.id > 3;", "kw")
+    assert(got.ends_with("View definition:\n SELECT kv.id FROM kv WHERE kv.id > 3\n"), got)
+
+@test
+d_shows_text_where_a_catalog_row_has_no_tree()
+    assert_eq(definition_text(Text("row.a"), Null, None, None), "row.a")
+    assert_eq(definition_text(Text("row.a"), Bytes(buf[u8]()), None, None), "row.a")
+    assert_eq(definition_text(Text("x"), Bytes(encode_expr(call("is_null", [col("row", "a")])).unwrap()), None, None), "a IS NULL")
+
+// -- the round-trip property -------------------------------------------------------------------------
+
+const SpSeeds: usize = 300
+
+private sp_pick[T](r: *Rng, xs: []const T) -> T = xs[usize(r.below(u64(xs.len)))]
+
+/** The scalar categories the generator types its trees by, so that every tree is one the tree's type
+ * rules accept (no float beside an exact number, which the front end would widen).
+ */
+private enum SpCat
+    SpBool
+    SpInt
+    SpText
+    SpFloat
+    SpDec
+    SpDate
+
+private sp_any_cat(r: *Rng) -> SpCat = sp_pick(r, [SpBool, SpInt, SpText, SpFloat, SpDec, SpDate])
+
+private sp_rand_text(r: *Rng) -> string
+    var s = ""
+    for _ in 0..<usize(r.below(5))
+        s = s + sp_pick(r, ["a", "'", "\\", "\n", "\u{e9}", "%", "\"", " ", "\0"])
+    s
+
+private sp_rand_int(r: *Rng) -> Expr
+    r.below(6) match
+        0 -> Literal(Int32, Int(i128(r.range(-3, 3))))
+        1 -> Literal(Int32, Int(sp_pick(r, [i128(-2147483648), i128(2147483647)])))
+        2 -> Literal(Int64, Int(sp_pick(r, [i128(-9223372036854775808), i128(9223372036854775807), i128(0), i128(-1), i128(3000000000)])))
+        3 -> Literal(Int16, Int(i128(r.range(-5, 5))))
+        4 -> Literal(UInt32, UInt(r.below(10)))
+        _ -> Literal(Int64, Int(i128(r.range(-9, 9))))
+
+/** A random expression of category `c`, at most `depth` deep. */
+private sp_gen(r: *Rng, c: SpCat, depth: usize) -> Expr
+    val leaf = depth == 0 || r.below(3) == 0
+    c match
+        SpBool ->
+            if leaf
+                return r.below(4) match
+                    0 -> sp_row("flag")
+                    1 -> Literal(Bool, Value.Bool(r.boolean()))
+                    2 -> Null(Bool)
+                    _ -> call("is_null", [sp_gen(r, sp_any_cat(r), 0)])
+            r.below(7) match
+                0 -> call("and", [sp_gen(r, SpBool, depth - 1), sp_gen(r, SpBool, depth - 1)])
+                1 -> call("or", [sp_gen(r, SpBool, depth - 1), sp_gen(r, SpBool, depth - 1)])
+                2 -> call("not", [sp_gen(r, SpBool, depth - 1)])
+                3 -> call(if r.boolean() then "is_null" else "is_not_null", [sp_gen(r, sp_any_cat(r), depth - 1)])
+                4 -> call("like", [sp_gen(r, SpText, depth - 1), sp_gen(r, SpText, depth - 1), sp_text_lit(sp_pick(r, ["", "!", "\\"]))])
+                _ ->
+                    val k = sp_pick(r, [SpInt, SpText, SpFloat, SpDec, SpDate, SpBool])
+                    call(sp_pick(r, ["eq", "ne", "lt", "le", "gt", "ge"]), [sp_gen(r, k, depth - 1), sp_gen(r, k, depth - 1)])
+        SpInt ->
+            if leaf
+                return r.below(5) match
+                    0 -> sp_row("a")
+                    1 -> sp_row("c")
+                    2 -> Null(sp_pick(r, [Int64, Int32]))
+                    _ -> sp_rand_int(r)
+            r.below(7) match
+                0 -> call("neg", [sp_gen(r, SpInt, depth - 1)])
+                1 -> Cast(sp_gen(r, SpInt, depth - 1), nullable(sp_pick(r, [Int64, Int32, Int16])), Strict)
+                2 -> call("coalesce", [sp_gen(r, SpInt, depth - 1), sp_gen(r, SpInt, depth - 1)])
+                3 -> If(items_of([IfArm(sp_gen(r, SpBool, depth - 1), sp_gen(r, SpInt, depth - 1))]),
+                    if r.boolean() then Some(sp_gen(r, SpInt, depth - 1)) else None)
+                4 -> call("length", [sp_gen(r, SpText, depth - 1)])
+                _ -> call(sp_pick(r, ["add", "sub", "mul", "div", "mod"]), [sp_gen(r, SpInt, depth - 1), sp_gen(r, SpInt, depth - 1)])
+        SpText ->
+            if leaf
+                return r.below(3) match
+                    0 -> sp_row("b")
+                    1 -> Null(Text)
+                    _ -> sp_text_lit(sp_rand_text(r))
+            r.below(4) match
+                0 -> call("concat", [sp_gen(r, SpText, depth - 1), sp_gen(r, SpText, depth - 1)])
+                1 -> call("lower", [sp_gen(r, SpText, depth - 1)])
+                2 -> Cast(sp_gen(r, sp_pick(r, [SpInt, SpDate]), depth - 1), nullable(Text), Strict)
+                _ -> If(items_of([IfArm(sp_gen(r, SpBool, depth - 1), sp_gen(r, SpText, depth - 1))]), Some(sp_gen(r, SpText, depth - 1)))
+        SpFloat ->
+            if leaf
+                return r.below(4) match
+                    0 -> sp_row("f")
+                    1 -> Literal(Float64, Float(sp_pick(r, [0.0, -0.0, 1.5, -2.25, 1e300, 1e-7, 123456789.0])))
+                    2 -> Literal(Float64, Float(real.from_bits(0x7FF0000000000000)))
+                    _ -> Null(Float64)
+            r.below(3) match
+                0 -> call(sp_pick(r, ["add", "sub", "mul", "div"]), [sp_gen(r, SpFloat, depth - 1), sp_gen(r, SpFloat, depth - 1)])
+                1 -> Cast(sp_gen(r, SpInt, depth - 1), nullable(Float64), Strict)
+                _ -> call("neg", [sp_gen(r, SpFloat, depth - 1)])
+        SpDec ->
+            if leaf
+                return r.below(3) match
+                    0 -> sp_row("d")
+                    1 -> sp_lit(Decimal(10, 2), sp_pick(r, ["0.00", "1.50", "-99999999.99"]))
+                    _ -> sp_lit(sp_pick(r, [Decimal(3, 2), Decimal(1, 0), Decimal(5, 1)]), sp_pick(r, ["0", "1", "-1"]))
+            call(sp_pick(r, ["add", "sub", "mul"]), [sp_gen(r, SpDec, depth - 1), sp_gen(r, SpDec, depth - 1)])
+        SpDate ->
+            if leaf || r.boolean()
+                return r.below(3) match
+                    0 -> sp_row("dt")
+                    1 -> sp_lit(Date, sp_pick(r, ["2024-02-29", "1970-01-01", "0001-01-01"]))
+                    _ -> Null(Date)
+            call("coalesce", [sp_gen(r, SpDate, depth - 1), sp_gen(r, SpDate, depth - 1)])
+end sp_gen
+
+@test
+random_definition_trees_read_back_as_themselves()
+    for seed in 0..<SpSeeds
+        var r = rng(0x5ab1_0000 + u64(seed), 3)
+        val e = sp_gen(&r, SpBool, 4)
+        val text = sp_print(e)
+        sp_check_of(text) match
+            Ok(back) ->
+                if back != e then print(s"\nseed $seed: $text\n  printed from ${expr_text(e)}\n  read back as ${expr_text(back)}\n")
+                assert(back == e, s"seed $seed reads back as its tree")
+            Err(why) ->
+                print(s"\nseed $seed: $text\n  printed from ${expr_text(e)}\n  -> $why\n")
+                assert(false, s"seed $seed translates")
+
+@test
+random_trees_print_the_same_after_a_round_trip()
+    for seed in 0..<SpSeeds
+        var r = rng(0x5ab2_0000 + u64(seed), 5)
+        val text = sp_print(sp_gen(&r, sp_any_cat(&r), 4))
+        sp_check_of(text) match
+            Ok(back) -> assert_eq(sp_print(back), text)
+            Err(why) ->
+                print(s"\nseed $seed: $text -> $why\n")
+                assert(false, s"seed $seed translates")
