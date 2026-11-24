@@ -51,21 +51,22 @@ struct VectorBuilder
     push_stored(*self, t: Type, bytes: []const u8) -> Result[unit, CodecError]
         if !self.direct then return Ok(self.push_value(decode_value(t, bytes)?))
 
-        val w = row_width(t)
+        val b = t.base()
+        val w = row_width(b)
         if w > 0 && bytes.len != w then return corrupt(s"a fixed-width value of $w octets has ${bytes.len}")
 
         self.lanes match
             Bools(x) ->
                 if bytes[0] > 1 then return corrupt("a bool is neither 0 nor 1")
                 x.push(bytes[0] == 1)
-            I8s(x) -> x.push(i8.wrap(sign_extend(le_of(bytes), 1)))
-            I16s(x) -> x.push(i16.wrap(sign_extend(le_of(bytes), 2)))
-            I32s(x) -> x.push(i32.wrap(sign_extend(le_of(bytes), 4)))
-            I64s(x) -> x.push(i64.wrap(sign_extend(le_of(bytes), 8)))
+            I8s(x) -> x.push(i8.wrap(sign_extend(le_of(bytes), w)))
+            I16s(x) -> x.push(i16.wrap(sign_extend(le_of(bytes), w)))
+            I32s(x) -> x.push(i32.wrap(sign_extend(le_of(bytes), w)))
+            I64s(x) -> x.push(i64.wrap(sign_extend(le_of(bytes), w)))
             I128s(x) ->
                 val n = sign_extend(le_of(bytes), w)
 
-                t match
+                b match
                     Decimal(p, _) -> if !within_precision(n, p) then return corrupt("a decimal has more digits than its precision")
                     _ -> ()
 
@@ -88,7 +89,11 @@ struct VectorBuilder
 
                 x.push(v)
             Bins(offsets, data) ->
-                if t != Bytes && from_utf8(bytes).is_err() then return corrupt("a text value is not valid UTF-8")
+                val text = b match
+                    Bytes -> false
+                    _ -> true
+
+                if text && from_utf8(bytes).is_err() then return corrupt("a text value is not valid UTF-8")
                 data.extend(bytes)
                 offsets.push(u32(data.len()))
             _ -> return Ok(self.push_value(decode_value(t, bytes)?))

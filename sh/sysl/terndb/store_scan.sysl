@@ -10,26 +10,27 @@ import sysl.buf.{Buf, buf}
 // be rebuilt through the undo log, one locked `LOCK_ONLY`, or one of an older schema version takes
 // the path every other read takes (`visible`, `translated`) and is appended as values.
 
-/** The work the store's reads have done, for the tests that pin what a scan costs per row:
- * leaf entries `copied` out of their page, row `images` built (a buffer per column), `rows` built
- * as `StoredRow` records, stored values decoded into `values`, and stored `columns` decoded straight
- * into a vector's lanes.
+/** The work the store's reads have done, for the tests that pin what a scan costs per row: leaf
+ * entries `copied` out of their page, row `images` built (a buffer per column), `rows` built as
+ * `StoredRow` records, stored values decoded into `values`, stored `columns` decoded straight into a
+ * vector's lanes, and columns `skipped` because the statement does not read them.
  */
-struct ReadWork derives Eq
+struct ReadWork
     copied: u64
     images: u64
     rows: u64
     values: u64
     columns: u64
+    skipped: u64
 
 /** Nothing counted yet. */
-no_reads() -> ReadWork = ReadWork(0, 0, 0, 0, 0)
+no_reads() -> &ReadWork = ReadWork(0, 0, 0, 0, 0, 0)
 
 /** How a scan into vectors reads the rows of one schema version: its codec and layout widths; for
  * each column, by ordinal, its place among the key components (none for a non-key column) and
  * whether the statement reads it; for each non-key column, whether its stored octets go straight into
- * its vector's lanes. `fast` is false when the version's codec is not the vector's columns, and then
- * every row takes the general path.
+ * its vector's lanes. `fast` is false when the version's columns are not the vector's, and then every
+ * row takes the general path.
  */
 private struct ScanShape
     fast: bool
@@ -42,8 +43,9 @@ private struct ScanShape
 impl Store
     /** The rows of `table` visible to `t` whose encoded keys lie between `lo` and `hi`, in key order,
      * as vectors of `elem` (the table's row type) of at most `BatchSize` rows, none empty; the read
-     * logged as `logged`, as `scan_range` logs it. `columns` names, by id, the columns the statement
-     * reads: every other non-key column's slots hold a placeholder. None reads every column.
+     * logged as `logged`, as `scan_range` logs it. `columns` names, by id, the non-key columns the
+     * statement reads: every other one is not decoded, and its slots hold its type's placeholder. None
+     * reads every column.
      */
     scan_vectors(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred, elem: Type, columns: Option[Buf[u32]]) -> Result[Buf[ColumnVector], CodecError]
         val r = self.scan_vectors_in(t, table, lo, hi, logged, elem, columns)
@@ -81,10 +83,9 @@ impl Store
                 var cur = c
 
                 loop
-                    val v = cur.next_into(key) match
-                        Some(v) -> v
-                        None -> break
-
+                    val got = cur.next_into(key)
+                    if got.is_none() then break
+                    val v = got.unwrap()
                     self.slots_read += 1
                     val hd = decode_row_header(v)?
                     var fast = hd.flags & RowLockOnly == 0 && u64(hd.schema_version) == now
@@ -92,12 +93,11 @@ impl Store
 
                     if fast && shapes.len() == 0 then shapes.push(self.scan_shape(d, hd.schema_version, fields, columns)?)
                     if fast then fast = shapes[0].fast
-
                     var taken = false
 
                     if !fast
                         taken = self.take_slow(t, d, v, key, builders)?
-                    else if hd.flags & RowDeleted == 0
+                    elif hd.flags & RowDeleted == 0
                         taken = self.take_leaf(d, shapes[0], v, key, spans, keys, builders)?
 
                     if taken
@@ -132,9 +132,10 @@ impl Store
 
                     if !sh.wanted[j]
                         b.push_unread()
-                    else if s.is_null
+                        self.reads.skipped += 1
+                    elif s.is_null
                         b.push_null()
-                    else if sh.direct[k]
+                    elif sh.direct[k]
                         b.push_stored(sh.codec.types[k], s.of(v))?
                         self.reads.columns += 1
                     else
@@ -155,7 +156,6 @@ impl Store
         self.reads.copied += 1
         self.reads.images += 1
         val kv = self.key_value(d, kb.view())?
-        self.reads.values += u64(d.key_spec.len())
 
         val r = self.visible(d, Slot(kv, kb, img), t.snapshot, t.id)? match
             Some(r) -> self.translated(d.oid, r)?
