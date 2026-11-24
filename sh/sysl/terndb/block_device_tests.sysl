@@ -18,6 +18,7 @@ private bd_raw(d: &FileDevice, n: u64) -> string
         Ok(_) -> s"fill ${b[100]}"
         Err(e) -> s"error ${e.code()}"
 
+@test
 a_new_file_device_is_empty()
     val dir = bd_dir("empty")
     val d = create_file_device(s"$dir/data").unwrap()
@@ -27,6 +28,7 @@ a_new_file_device_is_empty()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 a_file_device_reads_back_a_page_it_wrote()
     val dir = bd_dir("one")
     val d = create_file_device(s"$dir/data").unwrap()
@@ -37,6 +39,7 @@ a_file_device_reads_back_a_page_it_wrote()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 a_file_device_puts_page_n_at_byte_n_times_the_page_size()
     val dir = bd_dir("offset")
     val d = create_file_device(s"$dir/data").unwrap()
@@ -48,6 +51,7 @@ a_file_device_puts_page_n_at_byte_n_times_the_page_size()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 a_synced_page_is_there_when_the_file_is_opened_again()
     val dir = bd_dir("reopen")
     val path = s"$dir/data"
@@ -65,6 +69,7 @@ a_synced_page_is_there_when_the_file_is_opened_again()
     again.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 a_file_device_refuses_a_buffer_that_is_not_one_page()
     val dir = bd_dir("size")
     val d = create_file_device(s"$dir/data").unwrap()
@@ -75,6 +80,7 @@ a_file_device_refuses_a_buffer_that_is_not_one_page()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 a_file_shorter_than_a_page_holds_no_page()
     val dir = bd_dir("short")
     write_text(s"$dir/data", "not a page").unwrap()
@@ -84,11 +90,13 @@ a_file_shorter_than_a_page_holds_no_page()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 opening_a_missing_file_device_is_not_found()
     val dir = bd_dir("missing")
     assert(open_file_device(s"$dir/none").is_err())
     remove_dir_all(dir).unwrap()
 
+@test
 a_file_device_is_named_by_its_path()
     val dir = bd_dir("name")
     val d = create_file_device(s"$dir/data").unwrap()
@@ -96,6 +104,7 @@ a_file_device_is_named_by_its_path()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 page_io_over_a_file_device_detects_a_corrupted_page()
     val dir = bd_dir("corrupt")
     val d = create_file_device(s"$dir/data").unwrap()
@@ -111,6 +120,7 @@ page_io_over_a_file_device_detects_a_corrupted_page()
     d.close().unwrap()
     remove_dir_all(dir).unwrap()
 
+@test
 page_io_over_a_file_device_names_the_file_in_an_io_error()
     val dir = bd_dir("ioerr")
     val d = create_file_device(s"$dir/data").unwrap()

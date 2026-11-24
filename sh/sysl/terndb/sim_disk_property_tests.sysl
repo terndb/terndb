@@ -152,6 +152,7 @@ private pm_run(seed: u64, ops: usize) -> PmCounts
 
     counts
 
+@test
 writes_syncs_and_crashes_agree_with_the_model_over_many_seeds()
     var total = PmCounts(0, 0, 0)
 
