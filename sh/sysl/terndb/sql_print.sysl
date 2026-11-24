@@ -1,0 +1,1054 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+
+// Query trees printed back as TernDB's SQL (`sql.md`): what `\d` shows of a table's definition
+// expressions and of a view's query (`docs/design/shell.md` § Meta-commands). The text parses and
+// translates back to the tree it was printed from, up to what the front end normalises
+// (`docs/design/sql.md` § Printing trees as SQL). Parentheses are added only where precedence
+// (`sql.md` §5.8) needs them, an identifier is quoted only where it would not read back as itself
+// (§2.2), and a constant is written so that the type it takes from its context (§5.9) is the
+// literal's own: bare (`5`, `'x'`, `NULL`) where the front end reads it as exactly that literal, and
+// otherwise in a form that carries its type (`5::int64`, `date '2024-01-01'`, `NULL::text`). A node
+// SQL has no spelling for prints in its `query-tree.md` §15 text form (`text_tree.sysl`), that node
+// alone.
+
+/** Definition expression `e` (`ddl.md` §2.12) as SQL, its row's columns unquoted and unqualified as
+ * a `CHECK`, index or `GENERATED` expression writes them. `columns` are the table's ready columns as
+ * the front end's resolver would give them (`None` when not known); `ty` is the type a constant at
+ * its top takes, as a default's or generated column's does from its column.
+ */
+sql_definition_text(e: Expr, columns: Option[Buf[Field]], ty: Option[Type] = None, schema: string = SqlDefaultSchema) -> string
+    var p = sql_printer(schema, SqlNoTables(), true)
+    p.binders.push(SpBinder("row", SpSource(columns)))
+    val ctx = ty match
+        Some(t) -> SpAs(t.base())
+        None -> SpOwn
+    p.ex(e, ctx).text
+
+/** Query `r` as SQL, a view's definition: the tables it scans described by `tables`, as the front end's
+ * resolver would describe them, and a table of `schema` named without it.
+ */
+sql_query_text(r: Rel, tables: &SqlTables = SqlNoTables(), schema: string = SqlDefaultSchema) -> string
+    var p = sql_printer(schema, tables, false)
+    p.scope_rel(r)
+    p.query(r)
+
+/** `name` as an SQL identifier: as it is where it reads back as itself, else in double quotes with
+ * each `"` doubled (`sql.md` §2.2).
+ */
+sql_ident(name: string) -> string
+    if sql_plain_ident(name) then return name
+    var out = "\""
+    var from: usize = 0
+    for i in 0..<name.len
+        if name.bytes[i] == u8('"')
+            out = out + name[from..<i + 1] + "\""
+            from = i + 1
+    out + name[from..<name.len] + "\""
+
+/** Text `s` as an SQL string constant: `'…'` with `'` doubled, or `E'…'` with backslash escapes when
+ * it holds a control character, which a plain constant would keep but a reader could not see.
+ */
+sql_string(s: string) -> string
+    var control = false
+    for c in s.bytes
+        if c < 0x20 || c == 0x7f then control = true
+
+    if !control
+        var out = "'"
+        var from: usize = 0
+        for i in 0..<s.len
+            if s.bytes[i] == u8('\'')
+                out = out + s[from..<i + 1] + "'"
+                from = i + 1
+        return out + s[from..<s.len] + "'"
+
+    var out = "E'"
+    var from: usize = 0
+    for i in 0..<s.len
+        val esc = sp_escape(s.bytes[i])
+        if esc.len > 0
+            out = out + s[from..<i] + esc
+            from = i + 1
+    out + s[from..<s.len] + "'"
+
+/** Octet `c`'s escape in an `E'…'` constant (§2.4 rule 2), or `""` for one that stands for itself. */
+private sp_escape(c: u8) -> string
+    if c == u8('\n') then return "\\n"
+    if c == u8('\t') then return "\\t"
+    if c == u8('\r') then return "\\r"
+    if c == 0x08 then return "\\b"
+    if c == 0x0c then return "\\f"
+    if c == u8('\\') then return "\\\\"
+    if c == u8('\'') then return "\\'"
+    if c < 0x20 || c == 0x7f then return "\\u00" + hex_digit(u128(c >> 4)) + hex_digit(u128(c & 0xf))
+    ""
+
+/** Whether `name` reads back as itself unquoted: a lower-case unquoted identifier that is no reserved
+ * word.
+ */
+private sql_plain_ident(name: string) -> bool
+    if name.len == 0 || sql_reserved(name) then return false
+    val c0 = name.bytes[0]
+    if !((c0 >= u8('a') && c0 <= u8('z')) || c0 == u8('_') || c0 >= 0x80) then return false
+    for c in name.bytes
+        if !((c >= u8('a') && c <= u8('z')) || (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('$') || c >= 0x80) then return false
+    true
+
+/** A scalar type's SQL name (`sql.md` §4.1); `None` for records, unions, relations and named types,
+ * which SQL does not spell.
+ */
+sql_type_name(t: Type) -> Option[string]
+    t match
+        Nullable(_) | Record(_) | Union(_) | Bag(_) | List(_) | Named(_, _) -> None
+        _ -> Some(type_text(t))
+
+// -- precedence, `sql.md` §5.8, lowest first ---------------------------------------------------
+
+const SpOr: int = 1
+const SpAnd: int = 2
+const SpNot: int = 3
+const SpIs: int = 4
+const SpCmp: int = 5
+const SpPred: int = 6
+const SpConcat: int = 7
+const SpAdd: int = 8
+const SpMul: int = 9
+const SpUnary: int = 10
+const SpCast: int = 11
+const SpPrimary: int = 12
+
+/** How a constant written in an operand's place takes its type when the front end reads it back
+ * (`sql.md` §5.9).
+ */
+private enum SpCtx
+    /** It keeps its own type (§2.6), and a bare `NULL` has none. */
+    SpOwn
+    /** As `SpOwn`, but a bare `NULL` is `Null(bool)` (§5.9 rule 4). */
+    SpCond
+    /** It takes `ty` where it is exactly a value of it (§5.9 rules 1 and 2). */
+    SpAs(ty: Type)
+    /** The front end may see a type here that the printer cannot: only a form carrying its own type
+     * is safe.
+     */
+    SpUnsure
+
+/** The type the front end sees in a printed operand, for typing a constant beside it (the
+ * translator's `peek_type`): a column's, a cast's or a typed constant's.
+ */
+private enum SpPeek
+    SpNoType
+    SpType(ty: Type)
+    /** A column whose type the front end may know and the printer does not. */
+    SpMaybe
+
+/** A printed expression: its text, the precedence of its top operator, what the front end sees of
+ * its type beside it, and whether the front end reads it as a constant that its context types.
+ */
+private struct SpOut
+    text: string
+    prec: int
+    peek: SpPeek
+    constant: bool
+
+/** What the printer knows of a binder. */
+private enum SpKind
+    /** A scanned table, `VALUES` list or definition row: its columns, where the resolver knows them. */
+    SpSource(columns: Option[Buf[Field]])
+    /** An `Aggregate`'s output: its keys and aggregates, which SQL writes in place. */
+    SpGroup(keys: Buf[Item], aggs: Buf[NamedAgg])
+    /** A query read as a derived table, a CTE or a match arm: its columns' types are the front end's. */
+    SpDerived
+
+private struct SpBinder
+    name: string
+    kind: SpKind
+
+private sql_printer(schema: string, tables: &SqlTables, definition: bool) -> SqlPrinter =
+    SqlPrinter(schema, tables, definition, buf[SpBinder](), buf[string](), "")
+
+private struct SqlPrinter
+    schema: string
+    tables: &SqlTables
+    /** A definition expression: `row`'s columns are written unqualified. */
+    definition: bool
+    binders: Buf[SpBinder]
+    /** The CTE names in scope, which an unqualified table name would read as. */
+    ctes: Buf[string]
+    /** A binder whose columns are named alone: the output an `ORDER BY` of a `DISTINCT`, `VALUES`
+     * list or set operation reads (`sql.md` §5.6 rule 3).
+     */
+    output: string
+
+    // -- scopes -----------------------------------------------------------------------------------
+
+    binder(self, b: string) -> Option[SpKind]
+        var i = self.binders.len()
+        while i > 0
+            i -= 1
+            if self.binders[i].name == b then return Some(self.binders[i].kind)
+        None
+
+    /** Every binder `r` introduces, at any depth, with what is known of its columns. */
+    scope_rel(*self, r: Rel)
+        r match
+            Scan(table, b) -> self.binders.push(SpBinder(b, SpSource(self.tables.sql_table(table).map(t -> t.columns))))
+            Values(b, columns, rows) ->
+                self.binders.push(SpBinder(b, SpSource(Some(columns))))
+                for row in rows
+                    for e in row
+                        self.scope_expr(e)
+            ParamScan(b, _) -> self.binders.push(SpBinder(b, SpDerived))
+            Filter(input, p) ->
+                self.scope_rel(*input)
+                self.scope_expr(p)
+            Project(input, b, items) ->
+                self.scope_rel(*input)
+                self.binders.push(SpBinder(b, SpDerived))
+                for it in items
+                    self.scope_expr(it.expr)
+            Join(_, l, rr, on, mark, b) ->
+                self.scope_rel(*l)
+                self.scope_rel(*rr)
+                self.scope_opt(on)
+                self.scope_name(mark)
+                self.scope_name(b)
+            Apply(_, l, rr, on, mark, b) ->
+                self.scope_rel(*l)
+                self.scope_rel(*rr)
+                self.scope_opt(on)
+                self.scope_name(mark)
+                self.scope_name(b)
+            Aggregate(input, b, keys, aggs) ->
+                self.scope_rel(*input)
+                self.binders.push(SpBinder(b, SpGroup(keys, aggs)))
+                for k in keys
+                    self.scope_expr(k.expr)
+                for a in aggs
+                    self.scope_agg(a.call)
+            Window(input, b, _) ->
+                self.scope_rel(*input)
+                self.binders.push(SpBinder(b, SpDerived))
+            Sort(input, keys) ->
+                self.scope_rel(*input)
+                for k in keys
+                    self.scope_expr(k.expr)
+            Limit(input, _, _, _, _) -> self.scope_rel(*input)
+            Distinct(input) -> self.scope_rel(*input)
+            SetOp(_, _, b, inputs) ->
+                for x in inputs
+                    self.scope_rel(x)
+                self.binders.push(SpBinder(b, SpDerived))
+            With(_, ctes, body) ->
+                for c in ctes
+                    self.scope_rel(c.rel)
+                self.scope_rel(*body)
+            CteRef(_, b) -> self.binders.push(SpBinder(b, SpDerived))
+            Nest(input, b, _, _, _, _) ->
+                self.scope_rel(*input)
+                self.binders.push(SpBinder(b, SpDerived))
+            Unnest(input, b, value, _, ordinality) ->
+                self.scope_rel(*input)
+                self.binders.push(SpBinder(b, SpDerived))
+                self.scope_expr(value)
+                self.scope_name(ordinality)
+            Tag(input, b, _, _) ->
+                self.scope_rel(*input)
+                self.binders.push(SpBinder(b, SpDerived))
+    end scope_rel
+
+    scope_name(*self, b: Option[string])
+        b match
+            Some(x) -> self.binders.push(SpBinder(x, SpDerived))
+            None -> ()
+
+    scope_opt(*self, e: Option[Expr])
+        e match
+            Some(x) -> self.scope_expr(x)
+            None -> ()
+
+    scope_agg(*self, a: AggCall)
+        for x in a.args
+            self.scope_expr(x)
+        self.scope_opt(a.filter)
+        for k in a.order
+            self.scope_expr(k.expr)
+
+    /** The binders of the queries inside `e`, and of its match arms. */
+    scope_expr(*self, e: Expr)
+        e match
+            Call(_, args) ->
+                for a in args
+                    self.scope_expr(a)
+            Cast(x, _, _) -> self.scope_expr(*x)
+            If(arms, otherwise) ->
+                for a in arms
+                    self.scope_expr(a.cond)
+                    self.scope_expr(a.value)
+                otherwise match
+                    Some(o) -> self.scope_expr(*o)
+                    None -> ()
+            Match(x, arms, otherwise) ->
+                self.scope_expr(*x)
+                for a in arms
+                    self.binders.push(SpBinder(a.binder, SpDerived))
+                    self.scope_expr(a.expr)
+                otherwise match
+                    Some(o) -> self.scope_expr(*o)
+                    None -> ()
+            Record(fields) ->
+                for f in fields
+                    self.scope_expr(f.expr)
+            Field(x, _) -> self.scope_expr(*x)
+            Variant(_, _, x) -> self.scope_expr(*x)
+            Relation(r) -> self.scope_rel(*r)
+            Scalar(r) -> self.scope_rel(*r)
+            Exists(r) -> self.scope_rel(*r)
+            In(xs, r) ->
+                for x in xs
+                    self.scope_expr(x)
+                self.scope_rel(*r)
+            _ -> ()
+    end scope_expr
+
+    // -- expressions ------------------------------------------------------------------------------
+
+    /** `e` printed, a constant at its top typed under `ctx`. */
+    ex(*self, e: Expr, ctx: SpCtx) -> SpOut
+        e match
+            Col(b, name) -> self.column(b, name)
+            Param(i) -> SpOut("$" + (i + 1).to_string(), SpPrimary, SpNoType, true)
+            Null(ty) -> sp_null(e, ty, ctx)
+            Literal(ty, v) -> sp_literal(e, ty, v, ctx)
+            Call(f, args) -> self.call(e, f, args)
+            Cast(x, ty, mode) ->
+                val name = sql_type_name(ty.base())
+                if mode != Strict || name.is_none() then return sp_fallback(e)
+                val xo = self.ex(*x, SpUnsure)
+                SpOut(sp_wrap(xo, SpCast) + "::" + name.unwrap(), SpCast, SpType(ty.base()), false)
+            If(arms, otherwise) -> self.case_of(arms, otherwise)
+            Scalar(r) -> SpOut("(" + self.query(*r) + ")", SpPrimary, SpNoType, false)
+            Exists(r) -> SpOut("EXISTS (" + self.query(*r) + ")", SpPrimary, SpNoType, false)
+            In(xs, r) -> self.in_query(e, xs, *r, false)
+            _ -> sp_fallback(e)
+    end ex
+
+    /** A column: `c` for a definition's row, `b.c` for a source, the key or aggregate it reads for a
+     * group, and its name alone for the output an `ORDER BY` above it reads.
+     */
+    column(*self, b: string, name: string) -> SpOut
+        if b == self.output then return SpOut(sql_ident(name), SpPrimary, SpMaybe, false)
+        val qualified = sql_ident(b) + "." + sql_ident(name)
+
+        self.binder(b) match
+            Some(SpSource(columns)) ->
+                val text = if self.definition && b == "row" then sql_ident(name) else qualified
+                SpOut(text, SpPrimary, sp_known(columns, name), false)
+            Some(SpGroup(keys, aggs)) ->
+                for k in keys
+                    if k.name == name then return self.ex(k.expr, SpUnsure)
+                for a in aggs
+                    if a.name == name
+                        self.agg(a.call) match
+                            Some(t) -> return SpOut(t, SpPrimary, SpNoType, false)
+                            None -> ()
+                SpOut(qualified, SpPrimary, SpMaybe, false)
+            _ -> SpOut(qualified, SpPrimary, SpMaybe, false)
+
+    /** A call: an operator where SQL has one for it (§5.8), else `f(args)` where `f` reads back as
+     * itself, else the call's §15 form.
+     */
+    call(*self, e: Expr, f: string, args: Buf[Expr]) -> SpOut
+        val n = args.len()
+
+        if n == 2
+            val op = sp_binary_op(f)
+            if op.len > 0
+                val (lp, rp) = sp_binary_sides(f)
+                val (l, r) = self.pair(args[0], args[1])
+                return SpOut(sp_wrap(l, lp) + " " + op + " " + sp_wrap(r, rp), sp_binary_prec(f), SpNoType, false)
+            if f == "and" || f == "or"
+                val p = if f == "and" then SpAnd else SpOr
+                val l = self.ex(args[0], SpCond)
+                val r = self.ex(args[1], SpCond)
+                return SpOut(sp_wrap(l, p) + " " + f.to_upper() + " " + sp_wrap(r, p + 1), p, SpNoType, false)
+
+        if n == 1
+            if f == "not" then return self.not_of(args[0])
+            if f == "neg"
+                val x = self.ex(args[0], SpUnsure)
+                var t = sp_wrap(x, SpUnary)
+                if t.starts_with("-") then t = "(" + t + ")"
+                return SpOut("-" + t, SpUnary, SpNoType, false)
+            if f == "is_null" || f == "is_not_null"
+                val x = self.ex(args[0], SpOwn)
+                return SpOut(sp_wrap(x, SpIs) + (if f == "is_null" then " IS NULL" else " IS NOT NULL"), SpIs, SpNoType, false)
+
+        if f == "like" && n == 3 then return self.like(args, false)
+        if f == "statement_timestamp" && n == 0 then return SpOut("now()", SpPrimary, SpNoType, false)
+        if !sp_callable(f) then return sp_fallback(e)
+
+        val outs = if f == "coalesce" then self.siblings(args, false, false) else self.each(args, SpOwn)
+        var text = f + "("
+        for i in 0..<outs.len()
+            if i > 0 then text = text + ", "
+            text = text + outs[i].text
+        SpOut(text + ")", SpPrimary, SpNoType, false)
+    end call
+
+    /** `NOT x`, or `x NOT IN (q)` and `x NOT LIKE p` for the forms SQL negates in place. */
+    not_of(*self, x: Expr) -> SpOut
+        x match
+            In(xs, r) -> return self.in_query(x, xs, *r, true)
+            Call(f, args) -> if f == "like" && args.len() == 3 then return self.like(args, true)
+            _ -> ()
+        val o = self.ex(x, SpCond)
+        SpOut("NOT " + sp_wrap(o, SpNot), SpNot, SpNoType, false)
+
+    /** `x [NOT] LIKE p [ESCAPE e]`; an empty escape is no `ESCAPE` (§5.8 rule 3). */
+    like(*self, args: Buf[Expr], negated: bool) -> SpOut
+        val (x, p) = self.pair(args[0], args[1])
+        var text = sp_wrap(x, SpConcat) + (if negated then " NOT LIKE " else " LIKE ") + sp_wrap(p, SpConcat)
+        val none = args[2] match
+            Literal(Text, Value.Text(s)) -> s.len == 0
+            _ -> false
+        if !none then text = text + " ESCAPE " + sp_wrap(self.ex(args[2], SpAs(Text)), SpConcat)
+        SpOut(text, SpPred, SpNoType, false)
+
+    /** `x [NOT] IN (q)`, or `(x, y) [NOT] IN (q)`. */
+    in_query(*self, e: Expr, xs: Buf[Expr], r: Rel, negated: bool) -> SpOut
+        if xs.len() == 0 then return sp_fallback(e)
+        val outs = self.each(xs, SpOwn)
+        var left = ""
+        if outs.len() == 1
+            left = sp_wrap(outs[0], SpConcat)
+        else
+            left = "("
+            for i in 0..<outs.len()
+                if i > 0 then left = left + ", "
+                left = left + outs[i].text
+            left = left + ")"
+        SpOut(left + (if negated then " NOT IN (" else " IN (") + self.query(r) + ")", SpPred, SpNoType, false)
+
+    each(*self, xs: Buf[Expr], ctx: SpCtx) -> Buf[SpOut]
+        val out = buf[SpOut]()
+        for x in xs
+            out.push(self.ex(x, ctx))
+        out
+
+    /** The two operands of a binary operator, each constant typed by the other side as the front end
+     * types it (`pair`, §5.9 rule 2): bare where that reads back as the tree's literal, else both in
+     * forms that carry their types.
+     */
+    pair(*self, l: Expr, r: Expr) -> (SpOut, SpOut)
+        val lc = sp_constant(l)
+        val rc = sp_constant(r)
+
+        if !lc && !rc then return (self.ex(l, SpOwn), self.ex(r, SpOwn))
+        if lc && !rc
+            val ro = self.ex(r, SpOwn)
+            return (self.ex(l, sp_ctx_of(ro.peek)), ro)
+        if !lc
+            val lo = self.ex(l, SpOwn)
+            return (lo, self.ex(r, sp_ctx_of(lo.peek)))
+
+        val lo = self.ex(l, SpOwn)
+        val ro = self.ex(r, SpOwn)
+        if lo.constant && ro.constant then return (lo, ro)
+        (self.ex(l, SpUnsure), self.ex(r, SpUnsure))
+
+    /** Expressions whose constants take the type of the first one that has a type the front end sees
+     * (`sibling`: `coalesce`'s arguments, `CASE`'s results); with `fixes`, when none has one, the
+     * first constant's own type. With `explicit_last`, the last is a `NULL` written with its type.
+     */
+    siblings(*self, es: Buf[Expr], fixes: bool, explicit_last: bool) -> Buf[SpOut]
+        val n = es.len()
+        val outs = buf[SpOut]()
+        var maybe = false
+        var t: Option[Type] = None
+
+        for i in 0..<n
+            val forced = explicit_last && i + 1 == n
+            if forced || !sp_constant(es[i])
+                val o = self.ex(es[i], if forced then SpUnsure else SpOwn)
+                outs.push(o)
+                o.peek match
+                    SpType(x) -> if t.is_none() then t = Some(x)
+                    SpMaybe -> maybe = true
+                    SpNoType -> ()
+            else
+                outs.push(SpOut("", 0, SpNoType, true))
+
+        var bare = !maybe
+        if bare && t.is_none() && fixes
+            for i in 0..<n
+                if explicit_last && i + 1 == n then break
+                es[i] match
+                    Literal(ty, v) ->
+                        if ty != Bool
+                            if sp_literal(es[i], ty, v, SpOwn).constant then t = Some(ty) else bare = false
+                            break
+                    _ -> ()
+
+        if bare
+            for i in 0..<n
+                if (explicit_last && i + 1 == n) || !sp_constant(es[i]) then continue
+                val ok = es[i] match
+                    Literal(ty, _) -> t match
+                        Some(s) -> s == ty
+                        None -> self.ex(es[i], SpOwn).constant
+                    Null(ty) -> t match
+                        Some(s) -> s == ty.base() && !ty.is_nullable()
+                        None -> false
+                    _ -> true
+                if !ok then bare = false
+
+        var ctx = SpUnsure
+        if bare
+            ctx = t match
+                Some(s) -> SpAs(s)
+                None -> SpOwn
+        for i in 0..<n
+            if (explicit_last && i + 1 == n) || !sp_constant(es[i]) then continue
+            outs[i] = self.ex(es[i], ctx)
+        outs
+    end siblings
+
+    /** `CASE WHEN c THEN v … [ELSE e] END`; an `ELSE` that is `NULL` is written with its type, since
+     * `ELSE NULL` is no `ELSE` (§5.8 rule 5).
+     */
+    case_of(*self, arms: Buf[IfArm], otherwise: Option[&Expr]) -> SpOut
+        if arms.len() == 0 then return sp_fallback(If(arms, otherwise))
+        val results = buf[Expr]()
+        for a in arms
+            results.push(a.value)
+        var null_else = false
+        otherwise match
+            Some(o) ->
+                results.push(*o)
+                null_else = *o match
+                    Null(_) -> true
+                    _ -> false
+            None -> ()
+
+        val outs = self.siblings(results, true, null_else)
+        var text = "CASE"
+        for i in 0..<arms.len()
+            text = text + " WHEN " + self.ex(arms[i].cond, SpCond).text + " THEN " + outs[i].text
+        if otherwise.is_some() then text = text + " ELSE " + outs[arms.len()].text
+        SpOut(text + " END", SpPrimary, SpNoType, false)
+
+    /** An aggregate call as SQL writes it (§5.5 rule 4), or `None` for one it cannot. */
+    agg(*self, a: AggCall) -> Option[string]
+        if !sql_is_aggregate(a.function) then return None
+        if a.args.len() == 0
+            if a.function != "count" || a.distinct || a.order.len() > 0 then return None
+        var text = a.function + "("
+        if a.args.len() == 0 then text = text + "*"
+        if a.distinct then text = text + "DISTINCT "
+        for i in 0..<a.args.len()
+            if i > 0 then text = text + ", "
+            text = text + self.ex(a.args[i], SpOwn).text
+        if a.order.len() > 0 then text = text + " ORDER BY " + self.sort_keys(a.order)
+        text = text + ")"
+        a.filter match
+            Some(f) -> text = text + " FILTER (WHERE " + self.ex(f, SpCond).text + ")"
+            None -> ()
+        Some(text)
+
+    sort_keys(*self, keys: Buf[SortKey]) -> string
+        var text = ""
+        for i in 0..<keys.len()
+            val k = keys[i]
+            if i > 0 then text = text + ", "
+            text = text + self.ex(k.expr, SpUnsure).text
+            if k.desc then text = text + " DESC"
+            if k.nulls_first != k.desc then text = text + (if k.nulls_first then " NULLS FIRST" else " NULLS LAST")
+        text
+
+    // -- queries ----------------------------------------------------------------------------------
+
+    /** `r` as the `query` of `sql.md` §5. */
+    query(*self, r: Rel) -> string
+        r match
+            With(recursive, ctes, body) -> return self.with_of(r, recursive, ctes, *body)
+            SetOp(op, all, _, inputs) -> return self.set_op(r, op, all, inputs)
+            Values(_, columns, rows) -> return self.values_query(r, columns, rows)
+            Sort(_, _) | Limit(_, _, _, _, _) ->
+                // A tail over a `DISTINCT`, `VALUES` list or set operation reads its output by name.
+                var below = r
+                var keys = buf[SortKey]()
+                var lim: Option[Rel] = None
+                below match
+                    Limit(input, _, _, _, _) ->
+                        lim = Some(below)
+                        below = *input
+                    _ -> ()
+                below match
+                    Sort(input, ks) ->
+                        keys = ks
+                        below = *input
+                    _ -> ()
+                val outputs = below match
+                    Distinct(_) | SetOp(_, _, _, _) | Values(_, _, _) -> true
+                    _ -> false
+                if outputs
+                    val ob = sp_out_binder(below).unwrap_or("")
+                    val tail = self.tail(keys, lim, ob)
+                    if tail.is_some() then return self.query(below) + tail.unwrap()
+            _ -> ()
+        self.select(r)
+
+    /** `ORDER BY …` and `LIMIT`/`OFFSET`/`FETCH` (§5.6, §5.7) of keys over `output` (a query's output,
+     * named alone) or over the input (`output` empty); `None` when the `Limit` cannot be written.
+     */
+    tail(*self, keys: Buf[SortKey], lim: Option[Rel], output: string) -> Option[string]
+        var text = ""
+        if keys.len() > 0
+            val was = self.output
+            self.output = output
+            text = " ORDER BY " + self.sort_keys(keys)
+            self.output = was
+        lim match
+            Some(Limit(_, count, offset, ties, arbitrary)) ->
+                if arbitrary != (keys.len() == 0) || (ties && (keys.len() == 0 || count.is_none())) then return None
+                val c = sp_limit_value(count)?
+                val o = sp_limit_value(offset)?
+                if ties
+                    if o.len > 0 then text = text + " OFFSET " + o
+                    val n = if c.starts_with("-") then "(" + c + ")" else c
+                    text = text + " FETCH FIRST " + n + " ROWS WITH TIES"
+                else
+                    if c.len > 0 then text = text + " LIMIT " + c
+                    if o.len > 0 then text = text + " OFFSET " + o
+            _ -> ()
+        Some(text)
+
+    /** `SELECT`: `r` read top down as `sql.md` §5.1 builds one, bottom to top. What does not fit is
+     * its `FROM` item.
+     */
+    select(*self, r: Rel) -> string
+        var cur = r
+        var distinct = false
+        cur match
+            Distinct(x) ->
+                distinct = true
+                cur = *x
+            _ -> ()
+
+        var proj_binder = ""
+        var items = buf[Item]()
+        var projected = false
+        cur match
+            Project(input, b, its) ->
+                projected = true
+                proj_binder = b
+                items = its
+                cur = *input
+            _ -> ()
+
+        var tail = ""
+        var stuck: Option[string] = None
+        if !distinct
+            var lim: Option[Rel] = None
+            var keys = buf[SortKey]()
+            cur match
+                Limit(input, _, _, _, _) ->
+                    lim = Some(cur)
+                    cur = *input
+                _ -> ()
+            cur match
+                Sort(input, ks) ->
+                    keys = ks
+                    cur = *input
+                _ -> ()
+            self.tail(keys, lim, "") match
+                Some(t) -> tail = t
+                None ->
+                    // A `Limit` SQL cannot write here: it is the `FROM` item, in its §15 form.
+                    stuck = Some(rel_text(lim.unwrap()))
+
+        var where = ""
+        var group = ""
+        var having = ""
+        if stuck.is_none()
+            if projected
+                cur match
+                    Filter(input, p) ->
+                        *input match
+                            Aggregate(_, _, _, _) ->
+                                having = " HAVING " + self.ex(p, SpCond).text
+                                cur = *input
+                            _ -> ()
+                    _ -> ()
+                cur match
+                    Aggregate(input, _, keys, aggs) ->
+                        var ok = true
+                        for a in aggs
+                            if self.agg(a.call).is_none() then ok = false
+                        if ok
+                            if keys.len() > 0
+                                group = " GROUP BY "
+                                for i in 0..<keys.len()
+                                    if i > 0 then group = group + ", "
+                                    group = group + self.ex(keys[i].expr, SpUnsure).text
+                            cur = *input
+                        else
+                            having = ""
+                    _ -> ()
+            cur match
+                Filter(input, p) ->
+                    where = " WHERE " + self.ex(p, SpCond).text
+                    cur = *input
+                _ -> ()
+
+        var from = ""
+        stuck match
+            Some(s) -> from = " FROM " + s
+            None ->
+                if !sp_no_from(cur) then from = " FROM " + self.from_item(cur)
+                elif !projected then from = " FROM " + rel_text(cur)
+
+        var list = ""
+        if projected
+            for i in 0..<items.len()
+                if i > 0 then list = list + ", "
+                list = list + self.item(items[i])
+        else
+            list = "*"
+
+        val head = if distinct then "SELECT DISTINCT " else "SELECT "
+        head + list + from + where + group + having + tail
+    end select
+
+    /** A select-list item: `expr AS name`, the `AS` left out where a column gives the item its name. */
+    item(*self, it: Item) -> string
+        val o = self.ex(it.expr, SpOwn)
+        var named = false
+        it.expr match
+            Col(b, c) ->
+                if c == it.name && b != self.output
+                    self.binder(b) match
+                        Some(SpSource(_)) -> named = true
+                        _ -> ()
+            _ -> ()
+        if named then o.text else o.text + " AS " + sql_ident(it.name)
+
+    /** A `FROM` item: a table, a CTE, a join, or a query in parentheses with the binder it outputs as
+     * its alias.
+     */
+    from_item(*self, r: Rel) -> string
+        r match
+            Scan(table, b) -> self.table_name(table) + (if b == table.name then "" else " AS " + sql_ident(b))
+            CteRef(name, b) -> sql_ident(name) + (if b == name then "" else " AS " + sql_ident(b))
+            Join(kind, l, rr, on, mark, b) ->
+                if mark.is_some() || b.is_some() then return rel_text(r)
+                val word = kind match
+                    Inner -> "JOIN"
+                    Left -> "LEFT JOIN"
+                    Right -> "RIGHT JOIN"
+                    Full -> "FULL JOIN"
+                    _ -> return rel_text(r)
+                val lt = self.from_item(*l)
+                var rt = self.from_item(*rr)
+                *rr match
+                    Join(_, _, _, _, _, _) -> rt = "(" + rt + ")"
+                    _ -> ()
+                on match
+                    Some(c) -> lt + " " + word + " " + rt + " ON " + self.ex(c, SpCond).text
+                    None -> if kind == Inner then lt + " CROSS JOIN " + rt else rel_text(r)
+            Values(b, columns, rows) ->
+                var names = ""
+                for i in 0..<columns.len()
+                    if i > 0 then names = names + ", "
+                    names = names + sql_ident(columns[i].name)
+                "(" + self.values_rows(columns, rows) + ") AS " + sql_ident(b) + " (" + names + ")"
+            Project(_, _, _) | SetOp(_, _, _, _) | With(_, _, _) | Distinct(_) | Filter(_, _) | Sort(_, _) | Limit(_, _, _, _, _) ->
+                sp_out_binder(r) match
+                    Some(b) -> "(" + self.query(r) + ") AS " + sql_ident(b)
+                    None -> rel_text(r)
+            _ -> rel_text(r)
+
+    /** A table's name, without its namespace where that is the default one and no CTE takes the name. */
+    table_name(self, q: QualName) -> string
+        if q.schema == self.schema
+            var shadowed = false
+            for c in self.ctes
+                if c == q.name then shadowed = true
+            if !shadowed then return sql_ident(q.name)
+        sql_ident(q.schema) + "." + sql_ident(q.name)
+
+    /** `WITH c AS (q), … body` (§5.11 rule 2). */
+    with_of(*self, r: Rel, recursive: bool, ctes: Buf[CteDef], body: Rel) -> string
+        if recursive || ctes.len() == 0 then return rel_text(r)
+        for c in ctes
+            if c.columns.is_some() then return rel_text(r)
+        val mark = self.ctes.len()
+        var text = "WITH "
+        for i in 0..<ctes.len()
+            val c = ctes[i]
+            if i > 0 then text = text + ", "
+            var names = ""
+            c.rel match
+                Values(_, columns, _) ->
+                    if !sp_default_names(columns)
+                        names = " ("
+                        for j in 0..<columns.len()
+                            if j > 0 then names = names + ", "
+                            names = names + sql_ident(columns[j].name)
+                        names = names + ")"
+                _ -> ()
+            val inner = c.rel match
+                Values(_, columns, rows) -> self.values_rows(columns, rows)
+                _ -> self.query(c.rel)
+            text = text + sql_ident(c.name) + names + " AS (" + inner + ")"
+            self.ctes.push(c.name)
+        text = text + " " + self.query(body)
+        self.ctes.truncate(mark)
+        text
+
+    /** `(q) UNION [ALL] (q) …` (§5.11 rule 1), each input in parentheses. */
+    set_op(*self, r: Rel, op: SetOpKind, all: bool, inputs: Buf[Rel]) -> string
+        if inputs.len() < 2 then return rel_text(r)
+        var word = op match
+            Union -> " UNION "
+            Intersect -> " INTERSECT "
+            Except -> " EXCEPT "
+        if all then word = word + "ALL "
+        var text = ""
+        for i in 0..<inputs.len()
+            if i > 0 then text = text + word
+            text = text + "(" + self.query(inputs[i]) + ")"
+        text
+
+    /** A `VALUES` list as a whole query: its columns must have the names SQL gives them. */
+    values_query(*self, r: Rel, columns: Buf[Field], rows: Buf[Buf[Expr]]) -> string
+        if sp_no_from(r) || !sp_default_names(columns) then return rel_text(r)
+        self.values_rows(columns, rows)
+
+    /** `VALUES (…), …`: each constant in a form carrying its type, so that the column's type is the
+     * common type of those (§5.3); a `NULL` bare where another value gives the type.
+     */
+    values_rows(*self, columns: Buf[Field], rows: Buf[Buf[Expr]]) -> string
+        var text = "VALUES "
+        for i in 0..<rows.len()
+            if i > 0 then text = text + ", "
+            text = text + "("
+            for j in 0..<rows[i].len()
+                if j > 0 then text = text + ", "
+                val e = rows[i][j]
+                val o = e match
+                    Null(ty) ->
+                        var typed = false
+                        for row in rows
+                            if j < row.len()
+                                row[j] match
+                                    Null(_) -> ()
+                                    _ -> typed = true
+                        if typed then SpOut("NULL", SpPrimary, SpNoType, true) else self.ex(e, SpUnsure)
+                    _ -> self.ex(e, SpUnsure)
+                text = text + o.text
+            text = text + ")"
+        text
+end SqlPrinter
+
+// -- the pieces ----------------------------------------------------------------------------------
+
+/** `o`'s text, in parentheses where its precedence is below `min`. */
+private sp_wrap(o: SpOut, min: int) -> string = if o.prec < min then "(" + o.text + ")" else o.text
+
+/** A node SQL has no spelling for, in its §15 text form, which reads as one primary. */
+private sp_fallback(e: Expr) -> SpOut = SpOut(expr_text(e), SpPrimary, SpMaybe, false)
+
+/** Whether the front end reads `e`, printed bare, as a constant that its context types (§5.9). */
+private sp_constant(e: Expr) -> bool = e match
+    Literal(ty, _) -> ty != Bool
+    Null(_) | Param(_) -> true
+    _ -> false
+
+private sp_ctx_of(p: SpPeek) -> SpCtx = p match
+    SpNoType -> SpOwn
+    SpType(t) -> SpAs(t)
+    SpMaybe -> SpUnsure
+
+/** The base type of column `name` among `columns`, as the front end sees it beside a constant. */
+private sp_known(columns: Option[Buf[Field]], name: string) -> SpPeek
+    columns match
+        Some(cs) ->
+            for c in cs
+                if c.name == name then return SpType(c.ty.base())
+            SpNoType
+        None -> SpNoType
+
+private sp_binary_op(f: string) -> string = f match
+    "eq" -> "="
+    "ne" -> "<>"
+    "lt" -> "<"
+    "le" -> "<="
+    "gt" -> ">"
+    "ge" -> ">="
+    "add" -> "+"
+    "sub" -> "-"
+    "mul" -> "*"
+    "div" -> "/"
+    "mod" -> "%"
+    "concat" -> "||"
+    else ""
+
+private sp_binary_prec(f: string) -> int = f match
+    "eq" | "ne" | "lt" | "le" | "gt" | "ge" -> SpCmp
+    "add" | "sub" -> SpAdd
+    "mul" | "div" | "mod" -> SpMul
+    else SpConcat
+
+/** The least precedence of a binary operator's left and right operands: left-associative, except that
+ * comparisons do not chain.
+ */
+private sp_binary_sides(f: string) -> (int, int)
+    val p = sp_binary_prec(f)
+    if p == SpCmp then return (SpPred, SpPred)
+    (p, p + 1)
+
+/** Whether a call of `f` can be written `f(…)`: a name that reads back as itself and that the front
+ * end translates as a plain call (§5.10).
+ */
+private sp_callable(f: string) -> bool
+    if !sql_plain_ident(f) || sql_is_aggregate(f) then return false
+    f match
+        "now" | "current_timestamp" | "statement_timestamp" | "row" | "array" -> false
+        else true
+
+/** A `Limit`'s count or offset: an `int64` literal or a parameter; `""` when absent, `None` when SQL
+ * cannot write it (§5.7 rule 1).
+ */
+private sp_limit_value(e: Option[Expr]) -> Option[string]
+    e match
+        None -> Some("")
+        Some(Literal(Int64, v)) -> to_text(Int64, v) match
+            Ok(t) -> Some(t)
+            Err(_) -> None
+        Some(Param(i)) -> Some("$" + (i + 1).to_string())
+        _ -> None
+
+/** The binder a query outputs: the one its columns are read through from outside. */
+private sp_out_binder(r: Rel) -> Option[string] = r match
+    Scan(_, b) -> Some(b)
+    Values(b, _, _) -> Some(b)
+    CteRef(_, b) -> Some(b)
+    Project(_, b, _) -> Some(b)
+    SetOp(_, _, b, _) -> Some(b)
+    Filter(i, _) -> sp_out_binder(*i)
+    Sort(i, _) -> sp_out_binder(*i)
+    Limit(i, _, _, _, _) -> sp_out_binder(*i)
+    Distinct(i) -> sp_out_binder(*i)
+    With(_, _, body) -> sp_out_binder(*body)
+    _ -> None
+
+/** The one empty row a `SELECT` without `FROM` reads (§5.1 rule 1). */
+private sp_no_from(r: Rel) -> bool = r match
+    Values(_, columns, rows) -> columns.len() == 0 && rows.len() == 1 && rows[0].len() == 0
+    _ -> false
+
+/** Whether `columns` are named `column1`, `column2`, …, as an unaliased `VALUES` names them. */
+private sp_default_names(columns: Buf[Field]) -> bool
+    for i in 0..<columns.len()
+        if columns[i].name != s"column${i + 1}" then return false
+    true
+
+// -- constants -------------------------------------------------------------------------------------
+
+/** `NULL` where the front end types it as `ty` from its context, else `NULL::ty`. */
+private sp_null(e: Expr, ty: Type, ctx: SpCtx) -> SpOut
+    val base = ty.base()
+    var bare = false
+    if !ty.is_nullable()
+        bare = ctx match
+            SpAs(s) -> s == base
+            SpCond -> base == Bool
+            _ -> false
+    if bare then return SpOut("NULL", SpPrimary, SpNoType, true)
+    sql_type_name(base) match
+        Some(n) -> SpOut("NULL::" + n, SpCast, SpType(base), false)
+        None -> sp_fallback(e)
+
+/** Literal `v` of `ty`: bare where the front end reads it back as exactly this literal under `ctx`,
+ * else in a form that carries its type.
+ */
+private sp_literal(e: Expr, ty: Type, v: Value, ctx: SpCtx) -> SpOut
+    if ty == Bool
+        val b = v match
+            Value.Bool(x) -> x
+            _ -> false
+        return SpOut(if b then "TRUE" else "FALSE", SpPrimary, SpNoType, false)
+
+    val text = to_text(ty, v) match
+        Ok(t) -> t
+        Err(_) -> return sp_fallback(e)
+    val name = sql_type_name(ty) match
+        Some(n) -> n
+        None -> return sp_fallback(e)
+
+    ctx match
+        SpAs(s) -> if s == ty then return sp_bare(ty, text)
+        SpOwn | SpCond ->
+            val own = sp_own_bare(ty, text)
+            if own.len > 0 then return SpOut(own, if own.starts_with("-") then SpUnary else SpPrimary, SpNoType, true)
+        SpUnsure -> ()
+
+    if sp_is_number_type(ty) && !sp_special_float(text)
+        val n = if text.starts_with("-") then "(" + text + ")" else text
+        return SpOut(n + "::" + name, SpCast, SpType(ty), false)
+    if ty == Text then return SpOut(sql_string(text) + "::text", SpCast, SpType(ty), false)
+    if sp_special_float(text) then return SpOut(sql_string(text) + "::" + name, SpCast, SpType(ty), false)
+    SpOut(name + " " + sql_string(text), SpPrimary, SpType(ty), false)
+
+/** A literal whose context gives it its own type: its number, or its text as a string. */
+private sp_bare(ty: Type, text: string) -> SpOut
+    if sp_is_number_type(ty) && !sp_special_float(text)
+        return SpOut(text, if text.starts_with("-") then SpUnary else SpPrimary, SpNoType, true)
+    SpOut(sql_string(text), SpPrimary, SpNoType, true)
+
+/** The bare form whose own type (§2.6) is `ty`, or `""`: an `int32` (or a wider integer or a decimal
+ * the digits alone make), a decimal with its point, a `float64` with an exponent, a `text` string.
+ */
+private sp_own_bare(ty: Type, text: string) -> string
+    if ty == Text then return sql_string(text)
+    if sp_special_float(text) then return ""
+    val candidate = ty match
+        Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 -> text
+        Decimal(_, s) -> if s == 0 then text + "." else text
+        Float64 -> if text.contains("e") then text else text + "e0"
+        else return ""
+    if sp_number_type(candidate) == Some(ty) then candidate else ""
+
+private sp_is_number_type(t: Type) -> bool = t match
+    Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64 | Decimal(_, _) -> true
+    else false
+
+private sp_special_float(text: string) -> bool = text == "nan" || text == "inf" || text == "-inf"
+
+/** The type a number written `text` (an optional `-`, then digits) has without context (§2.6), as
+ * the translator's `sql_number` computes it.
+ */
+private sp_number_type(text: string) -> Option[Type]
+    val digits0 = if text.starts_with("-") then text[1..] else text
+    if digits0.contains("e") then return Some(Float64)
+
+    var digits = digits0
+    while digits.len > 1 && digits.starts_with("0") && !digits.starts_with("0.")
+        digits = digits[1..]
+    var scale: usize = 0
+    var point = false
+    for i in 0..<digits.len
+        if digits.bytes[i] == u8('.')
+            point = true
+            scale = digits.len - i - 1
+    var whole = digits.len - (if point then scale + 1 else 0)
+    if whole == 1 && digits.starts_with("0") then whole = 0
+    val precision = if whole + scale == 0 then 1 else whole + scale
+    if precision > 38 then return None
+    if point then return Some(Decimal(u8(precision), u8(scale)))
+    if from_text(Int32, text).is_ok() then return Some(Int32)
+    if from_text(Int64, text).is_ok() then return Some(Int64)
+    Some(Decimal(u8(precision), 0))

@@ -700,7 +700,9 @@ each phase in pre-order. They need nothing but the tree, so a client library MAY
 4. A type is reported twice: `type` is its canonical [QT] §12.3 encoding (structural, with the nullable wrapper,
    never a named reference), which a client decodes with the decoder it already has; `type_text` is the [QT] §15
    text form of the same structural type, so it names no named type either (`type_name` does, where there is one).
-   An expression is reported as its [QT] §15 text form, its row binder `row` (§2.12).
+   An expression is reported twice as well, its row binder `row` (§2.12): as its [QT] §15 text form, and in a
+   column named after that one with `_tree` appended, as the canonical [QT] §12.4 encoding of the expression node
+   alone, which a client decodes into the tree (the `terndb` shell prints it back as SQL).
 5. Objects not yet visible to the reader's snapshot are absent; objects in a non-`ready` state are present with
    their state, so a tool can watch a change in progress. A generator SHOULD use only `ready` columns.
 
@@ -719,17 +721,19 @@ uint32}`.
 **`catalog.columns`** — `table_oid`, `column_id: uint32`, `ordinal: uint16`, `name: text`, `type: bytes`,
 `type_text: text`, `type_name: QualName?`, `nullable: bool`, `in_primary_key: bool`, `default: text?`,
 `generated: text?`, `identity: union<always: {}, by_default: {}>?`, `state: union<ready: {}, filling: {job:
-uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`. One row per column of the table's current
+uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`, `default_tree: bytes?`, `generated_tree:
+bytes?`. One row per column of the table's current
 schema version, in every state, including the columns of views (`table_oid` the view's oid, no key, no default,
 `ready`). `ordinal` counts from 0 in the current schema version; a view's column has `column_id` its ordinal plus 1.
 
 **`catalog.indexes`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `unique: bool`, `keys:
-list<{column: text?, expr: text, descending: bool}>` (`column` set when the component is a plain column),
-`predicate: text?`, `state: union<building: {job: uint64}, ready: {}, failed: {job: uint64}>`.
+list<{column: text?, expr: text, descending: bool, expr_tree: bytes}>` (`column` set when the component is a plain
+column, whose `expr` is then `Col(row, column)`), `predicate: text?`, `state: union<building: {job: uint64}, ready:
+{}, failed: {job: uint64}>`, `predicate_tree: bytes?`.
 
 **`catalog.constraints`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `validated: bool`, `kind:
 union<primary_key: {columns: list<text>}, unique: {columns: list<text>, index_oid: uint64}, not_null: {column:
-text}, check: {expr: text}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
+text}, check: {expr: text, expr_tree: bytes}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
 on_delete: FkAction, on_update: FkAction, deferred: bool}>`, where `FkAction` is `union<no_action: {}, restrict:
 {}, cascade: {}, set_null: {}, set_default: {}>`. A `not_null` row is listed for each column whose type is not
 nullable; it is no object (§2.6), so its `oid` is 0, its name `<table>_<column>_not_null`, and it is validated.

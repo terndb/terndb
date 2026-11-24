@@ -107,6 +107,7 @@ sources() -> Buf[SourceText]
     src(out, "shell.sysl", embed("shell.sysl"))
     src(out, "sql_lexer.sysl", embed("sql_lexer.sysl"))
     src(out, "sql_parser.sysl", embed("sql_parser.sysl"))
+    src(out, "sql_print.sysl", embed("sql_print.sysl"))
     src(out, "sql_translate.sysl", embed("sql_translate.sysl"))
     src(out, "store_index.sysl", embed("store_index.sysl"))
     src(out, "store_jobs.sysl", embed("store_jobs.sysl"))

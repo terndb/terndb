@@ -1,0 +1,518 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// `sql_print.sysl`: query trees printed as TernDB's SQL. Each case checks the exact text and that the
+// SQL front end reads it back to the same tree: a definition expression through `ALTER TABLE t ADD
+// CHECK (…)` over table `t`, whose columns the resolver knows, and a query through `CREATE VIEW`,
+// compared by shape form (binders renamed). Then a seeded property over random definition trees.
+
+/** Table `public.t`, whose columns cover the scalar types, and `public.u`; `public.opaque` is known
+ * to nobody.
+ */
+struct SpTables
+end SpTables
+
+impl SqlTables for SpTables
+    sql_table(self, name: QualName) -> Option[SqlTable]
+        if name.schema != "public" then return None
+        name.name match
+            "t" -> Some(SqlTable(sp_cols(), sql_names(["a"])))
+            "u" -> Some(SqlTable(items_of([Field("id", Int64), Field("t_a", nullable(Int64)), Field("name", nullable(Text))]), sql_names(["id"])))
+            else None
+
+private sp_cols() -> Buf[Field] = items_of([
+    Field("a", Int64), Field("b", nullable(Text)), Field("c", nullable(Int32)), Field("d", nullable(Decimal(10, 2))),
+    Field("f", nullable(Float64)), Field("g", nullable(Float32)), Field("dt", nullable(Date)), Field("ts", nullable(Timestamp)),
+    Field("flag", nullable(Bool)), Field("s", nullable(Int16)), Field("tiny", nullable(Int8)), Field("big", nullable(Int128)),
+    Field("n", nullable(UInt32)), Field("j", nullable(Json)), Field("by", nullable(Bytes)), Field("iv", nullable(Interval)),
+    Field("tm", nullable(Time)), Field("dtm", nullable(DateTime)), Field("id", nullable(Uuid)), Field("select", nullable(Int64)),
+    Field("MixedCase", nullable(Int64)), Field("a\"b", nullable(Int64)), Field("key", nullable(Int64))])
+
+private sp_row(name: string) -> Expr = Col("row", name)
+
+private sp_lit(ty: Type, text: string) -> Expr = Literal(ty, from_text(ty, text).unwrap())
+
+private sp_int(n: i128) -> Expr = Literal(Int32, Int(n))
+
+private sp_text_lit(s: string) -> Expr = Literal(Text, Value.Text(s))
+
+/** Definition expression `e` of `t` as the printer writes it. */
+private sp_print(e: Expr) -> string = sql_definition_text(e, Some(sp_cols()))
+
+/** The check `text` translates to over `t`, or the error's code. */
+private sp_check_of(text: string) -> Result[Expr, string]
+    sql_statement("alter table t add check (" + text + ")", "public", SpTables()) match
+        Ok(SqlTree(env)) -> env.statement match
+            AlterTable(_, actions) ->
+                if actions.len() != 1 then return Err("actions")
+                actions[0] match
+                    AddConstraint(c, _) -> c.body match
+                        Check(x) -> Ok(x)
+                        _ -> Err("not a check")
+                    _ -> Err("not an added constraint")
+            _ -> Err("not an ALTER TABLE")
+        Ok(_) -> Err("not a tree")
+        Err(err) -> Err(s"${err.code}@${err.column}: ${err.message}")
+
+/** `e` prints as `want` and reads back as `e`. */
+private sp_exact(e: Expr, want: string, file: string = __FILE__, line: long = __LINE__)
+    val got = sp_print(e)
+    assert_eq(got, want, file, line)
+    sp_round_trips(e, file, line)
+
+/** `e` prints as SQL that reads back as `e`. */
+private sp_round_trips(e: Expr, file: string = __FILE__, line: long = __LINE__)
+    val text = sp_print(e)
+    sp_check_of(text) match
+        Ok(back) ->
+            if back != e then print(s"\n$text\n  printed from ${expr_text(e)}\n  read back as ${expr_text(back)}\n")
+            assert(back == e, "reads back as the tree it was printed from", file, line)
+        Err(why) ->
+            print(s"\n$text\n  -> $why\n")
+            assert(false, "the printed text translates", file, line)
+
+/** `e` prints as `want` and reads back as `normal`, what the front end makes of it. */
+private sp_normalised(e: Expr, want: string, normal: Expr, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(sp_print(e), want, file, line)
+    sp_check_of(want) match
+        Ok(back) ->
+            if back != normal then print(s"\n$want\n  read back as ${expr_text(back)}\n")
+            assert(back == normal, "reads back normalised", file, line)
+        Err(why) ->
+            print(s"\n$want\n  -> $why\n")
+            assert(false, "the printed text translates", file, line)
+
+// -- columns and identifiers ---------------------------------------------------------------------
+
+@test
+a_definition_column_is_unqualified()
+    sp_exact(call("gt", [sp_row("a"), Literal(Int64, Int(0))]), "a > 0")
+
+@test
+a_reserved_word_column_is_quoted()
+    sp_exact(call("is_null", [sp_row("select")]), "\"select\" IS NULL")
+
+@test
+a_mixed_case_column_is_quoted()
+    sp_exact(call("is_null", [sp_row("MixedCase")]), "\"MixedCase\" IS NULL")
+
+@test
+a_column_with_a_double_quote_doubles_it()
+    sp_exact(call("is_null", [sp_row("a\"b")]), "\"a\"\"b\" IS NULL")
+
+@test
+a_non_reserved_keyword_column_is_not_quoted()
+    sp_exact(call("is_null", [sp_row("key")]), "key IS NULL")
+
+@test
+identifiers_quote_only_what_would_not_read_back()
+    assert_eq(sql_ident("abc_1$"), "abc_1$")
+    assert_eq(sql_ident("_x"), "_x")
+    assert_eq(sql_ident("1a"), "\"1a\"")
+    assert_eq(sql_ident("a b"), "\"a b\"")
+    assert_eq(sql_ident("$a"), "\"$a\"")
+    assert_eq(sql_ident("\u{e9}t\u{e9}"), "\u{e9}t\u{e9}")
+    assert_eq(sql_ident("\u{c9}T\u{c9}"), "\"\u{c9}T\u{c9}\"")
+    assert_eq(sql_ident("from"), "\"from\"")
+    assert_eq(sql_ident("\"\""), "\"\"\"\"\"\"")
+
+@test
+the_empty_name_is_quoted()
+    assert_eq(sql_ident(""), "\"\"")
+
+// -- literals of every type ----------------------------------------------------------------------
+
+@test
+a_bool_literal_is_true_or_false()
+    sp_exact(call("and", [Literal(Bool, Value.Bool(true)), Literal(Bool, Value.Bool(false))]), "TRUE AND FALSE")
+
+@test
+an_int32_literal_is_its_digits()
+    sp_exact(call("eq", [sp_int(5), sp_int(-7)]), "5 = -7")
+
+@test
+the_least_int32_is_one_negated_constant()
+    sp_exact(call("eq", [sp_int(-2147483648), sp_int(0)]), "-2147483648 = 0")
+
+@test
+an_int64_literal_beside_an_int64_column_is_bare()
+    sp_exact(call("eq", [sp_row("a"), Literal(Int64, Int(-5))]), "a = -5")
+
+@test
+an_int64_literal_alone_carries_its_type()
+    sp_exact(call("eq", [Literal(Int64, Int(5)), Literal(Int64, Int(-6))]), "5::int64 = (-6)::int64")
+
+@test
+an_int64_literal_beyond_int32_is_bare_alone()
+    sp_exact(call("eq", [Literal(Int64, Int(3000000000)), Literal(Int64, Int(-3000000000))]), "3000000000 = -3000000000")
+
+@test
+an_int32_literal_beside_an_int64_column_carries_its_type()
+    sp_exact(call("eq", [sp_row("a"), sp_int(5)]), "a = 5::int32")
+
+@test
+each_integer_width_carries_its_type()
+    sp_exact(call("eq", [Literal(Int8, Int(-128)), Literal(Int8, Int(127))]), "(-128)::int8 = 127::int8")
+    sp_exact(call("eq", [Literal(Int16, Int(-32768)), Literal(Int16, Int(1))]), "(-32768)::int16 = 1::int16")
+    sp_exact(call("eq", [sp_lit(Int128, "-170141183460469231731687303715884105728"), Literal(Int128, Int(1))]),
+        "(-170141183460469231731687303715884105728)::int128 = 1::int128")
+    sp_exact(call("eq", [Literal(UInt8, UInt(255)), Literal(UInt8, UInt(0))]), "255::uint8 = 0::uint8")
+    sp_exact(call("eq", [Literal(UInt16, UInt(65535)), Literal(UInt16, UInt(0))]), "65535::uint16 = 0::uint16")
+    sp_exact(call("eq", [Literal(UInt32, UInt(4294967295)), Literal(UInt32, UInt(0))]), "4294967295::uint32 = 0::uint32")
+    sp_exact(call("eq", [Literal(UInt64, UInt(18446744073709551615)), Literal(UInt64, UInt(0))]),
+        "18446744073709551615::uint64 = 0::uint64")
+
+@test
+the_int64_extremes_round_trip()
+    sp_exact(call("eq", [Literal(Int64, Int(-9223372036854775808)), Literal(Int64, Int(9223372036854775807))]),
+        "-9223372036854775808 = 9223372036854775807")
+
+@test
+narrow_integer_columns_take_bare_constants()
+    sp_exact(call("eq", [sp_row("s"), Literal(Int16, Int(-3))]), "s = -3")
+    sp_exact(call("eq", [sp_row("tiny"), Literal(Int8, Int(3))]), "tiny = 3")
+    sp_exact(call("eq", [sp_row("n"), Literal(UInt32, UInt(3))]), "n = 3")
+    sp_exact(call("eq", [sp_row("big"), Literal(Int128, Int(3))]), "big = 3")
+
+@test
+a_decimal_literal_of_its_own_type_is_bare()
+    sp_exact(call("eq", [sp_lit(Decimal(3, 2), "1.50"), sp_lit(Decimal(2, 2), "0.05")]), "1.50 = 0.05")
+
+@test
+a_decimal_of_scale_zero_keeps_its_point()
+    sp_exact(call("eq", [sp_lit(Decimal(3, 0), "123"), sp_lit(Decimal(1, 0), "0")]), "123. = 0.")
+
+@test
+a_decimal_of_another_precision_carries_its_type()
+    sp_exact(call("eq", [sp_lit(Decimal(10, 2), "1.50"), sp_lit(Decimal(5, 0), "-7")]), "1.50::decimal(10, 2) = (-7)::decimal(5, 0)")
+
+@test
+a_decimal_beside_its_column_is_bare()
+    sp_exact(call("eq", [sp_row("d"), sp_lit(Decimal(10, 2), "-1.25")]), "d = -1.25")
+
+@test
+a_decimal_beyond_int64_written_alone_is_its_digits()
+    sp_exact(call("eq", [sp_lit(Decimal(20, 0), "12345678901234567890"), sp_lit(Decimal(20, 0), "12345678901234567890")]),
+        "12345678901234567890. = 12345678901234567890.")
+
+@test
+a_float64_literal_alone_has_an_exponent()
+    sp_exact(call("eq", [sp_lit(Float64, "1.5"), sp_lit(Float64, "1e300")]), "1.5e0 = 1e300")
+
+@test
+a_float64_beside_its_column_is_plain()
+    sp_exact(call("eq", [sp_row("f"), sp_lit(Float64, "-2.5")]), "f = -2.5")
+
+@test
+the_float_specials_are_cast_strings()
+    sp_exact(call("eq", [sp_row("f"), sp_lit(Float64, "inf")]), "f = 'inf'")
+    sp_exact(call("eq", [sp_lit(Float64, "-inf"), sp_lit(Float64, "1")]), "'-inf'::float64 = 1::float64")
+    assert_eq(sp_print(call("eq", [sp_lit(Float64, "nan"), sp_lit(Float64, "1")])), "'nan'::float64 = 1::float64")
+    sp_exact(call("eq", [sp_lit(Float64, "-0"), sp_lit(Float64, "0")]), "-0e0 = 0e0")
+
+@test
+a_float32_literal_carries_its_type_unless_beside_its_column()
+    sp_exact(call("eq", [sp_lit(Float32, "1.5"), sp_lit(Float32, "-0.25")]), "1.5::float32 = (-0.25)::float32")
+    sp_exact(call("eq", [sp_row("g"), sp_lit(Float32, "0.1")]), "g = 0.1")
+
+@test
+a_text_literal_is_a_string()
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("abc")]), "b = 'abc'")
+
+@test
+a_text_literal_doubles_its_quotes()
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("it's")]), "b = 'it''s'")
+
+@test
+a_backslash_is_an_ordinary_character()
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("a\\b")]), "b = 'a\\b'")
+
+@test
+a_control_character_makes_an_escape_string()
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("a\nb\t'\\")]), "b = E'a\\nb\\t\\'\\\\'")
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("\r\u{8}\u{c}\u{1}\u{7f}")]), "b = E'\\r\\b\\f\\u0001\\u007f'")
+
+@test
+a_nul_in_text_is_escaped()
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("a\0b")]), "b = E'a\\u0000b'")
+
+@test
+the_empty_text_is_two_quotes()
+    sp_exact(call("eq", [sp_row("b"), sp_text_lit("")]), "b = ''")
+
+@test
+text_beside_another_type_carries_its_type()
+    sp_exact(call("eq", [Cast(sp_row("a"), nullable(Text), Strict), sp_text_lit("x")]), "a::text = 'x'")
+    sp_exact(call("eq", [sp_row("c"), sp_text_lit("x")]), "c = 'x'::text")
+
+@test
+temporal_and_other_literals_are_typed_constants()
+    sp_exact(call("eq", [sp_lit(Date, "2024-02-29"), sp_lit(Date, "1970-01-01")]), "date '2024-02-29' = date '1970-01-01'")
+    sp_exact(call("eq", [sp_lit(Time, "12:30:00.5"), sp_lit(Time, "00:00:00")]), "time '12:30:00.5' = time '00:00:00'")
+    sp_exact(call("eq", [sp_lit(DateTime, "2024-01-01T00:00:00"), sp_lit(DateTime, "2024-01-01T00:00:00")]),
+        "datetime '2024-01-01T00:00:00' = datetime '2024-01-01T00:00:00'")
+    sp_exact(call("eq", [sp_lit(Timestamp, "2024-01-01T00:00:00Z"), sp_lit(Timestamp, "2024-01-01T00:00:00Z")]),
+        "timestamp '2024-01-01T00:00:00Z' = timestamp '2024-01-01T00:00:00Z'")
+    sp_exact(call("eq", [sp_lit(Interval, "P1D"), sp_lit(Interval, "PT1S")]), "interval 'P1D' = interval 'PT1S'")
+    sp_exact(call("eq", [sp_lit(Uuid, "00000000-0000-0000-0000-000000000001"), sp_lit(Uuid, "00000000-0000-0000-0000-000000000001")]),
+        "uuid '00000000-0000-0000-0000-000000000001' = uuid '00000000-0000-0000-0000-000000000001'")
+    sp_exact(call("eq", [sp_lit(Bytes, "\\x00ff"), sp_lit(Bytes, "\\x")]), "bytes '\\x00ff' = bytes '\\x'")
+    sp_exact(call("eq", [sp_lit(Json, "{\"a\":1}"), sp_lit(Json, "[]")]), "json '{\"a\":1}' = json '[]'")
+
+@test
+temporal_literals_beside_their_columns_are_strings()
+    sp_exact(call("eq", [sp_row("dt"), sp_lit(Date, "2024-02-29")]), "dt = '2024-02-29'")
+    sp_exact(call("lt", [sp_row("ts"), sp_lit(Timestamp, "2024-01-01T00:00:00Z")]), "ts < '2024-01-01T00:00:00Z'")
+    sp_exact(call("eq", [sp_row("id"), sp_lit(Uuid, "00000000-0000-0000-0000-000000000002")]), "id = '00000000-0000-0000-0000-000000000002'")
+    sp_exact(call("eq", [sp_row("j"), sp_lit(Json, "{}")]), "j = '{}'")
+    sp_exact(call("eq", [sp_row("by"), sp_lit(Bytes, "\\x01")]), "by = '\\x01'")
+    sp_exact(call("eq", [sp_row("iv"), sp_lit(Interval, "P1M")]), "iv = 'P1M'")
+    sp_exact(call("eq", [sp_row("tm"), sp_lit(Time, "01:02:03")]), "tm = '01:02:03'")
+    sp_exact(call("eq", [sp_row("dtm"), sp_lit(DateTime, "2024-01-01T00:00:00")]), "dtm = '2024-01-01T00:00:00'")
+
+// -- NULL ------------------------------------------------------------------------------------------
+
+@test
+a_null_beside_its_column_type_is_bare()
+    sp_exact(call("eq", [sp_row("a"), Null(Int64)]), "a = NULL")
+
+@test
+a_null_without_context_carries_its_type()
+    sp_exact(call("is_null", [Null(Int64)]), "NULL::int64 IS NULL")
+
+@test
+a_null_in_a_condition_is_bare()
+    sp_exact(call("or", [Null(Bool), call("not", [Null(Bool)])]), "NULL OR NOT NULL")
+
+@test
+a_null_of_another_type_than_its_neighbour_carries_its_type()
+    sp_exact(call("eq", [sp_row("a"), Null(Int32)]), "a = NULL::int32")
+
+@test
+a_null_of_a_type_sql_cannot_spell_is_its_tree_text()
+    val e = call("is_null", [Null(record([Field("x", Int64)]))])
+    assert_eq(sp_print(e), "(null :type {x: int64}) IS NULL")
+
+// -- each expression kind -------------------------------------------------------------------------
+
+@test
+a_parameter_is_dollar_and_its_number()
+    assert_eq(sp_print(call("eq", [sp_row("a"), Param(0)])), "a = $1")
+
+@test
+a_function_call_writes_its_arguments()
+    sp_exact(call("lower", [sp_row("b")]), "lower(b)")
+    sp_exact(call("length", [sp_text_lit("ab")]), "length('ab')")
+    sp_exact(call("abs", [Literal(Int64, Int(-2))]), "abs((-2)::int64)")
+
+@test
+a_call_without_arguments_has_empty_parentheses()
+    sp_exact(Call("pi", buf[Expr]()), "pi()")
+
+@test
+statement_timestamp_is_now()
+    sp_exact(call("lt", [sp_row("ts"), Call("statement_timestamp", buf[Expr]())]), "ts < now()")
+
+@test
+a_call_sql_cannot_name_is_its_tree_text()
+    assert_eq(sp_print(call("Lower", [sp_row("b")])), "(call Lower row.b)")
+    assert_eq(sp_print(call("sum", [sp_row("a")])), "(call sum row.a)")
+    assert_eq(sp_print(Call("now", buf[Expr]())), "(call now)")
+    assert_eq(sp_print(call("statement_timestamp", [sp_row("a")])), "(call statement_timestamp row.a)")
+    assert_eq(sp_print(call("like", [sp_row("b")])), "(call like row.b)")
+
+@test
+an_operator_name_with_another_arity_is_a_call()
+    sp_exact(call("eq", [sp_row("a")]), "eq(a)")
+    sp_exact(call("add", [sp_row("a"), sp_row("a"), sp_row("a")]), "add(a, a, a)")
+
+@test
+every_comparison_is_its_operator()
+    sp_exact(call("ne", [sp_row("a"), Literal(Int64, Int(1))]), "a <> 1")
+    sp_exact(call("le", [sp_row("a"), Literal(Int64, Int(1))]), "a <= 1")
+    sp_exact(call("ge", [sp_row("a"), Literal(Int64, Int(1))]), "a >= 1")
+    sp_exact(call("lt", [sp_row("a"), Literal(Int64, Int(1))]), "a < 1")
+
+@test
+every_arithmetic_operator_is_its_symbol()
+    sp_exact(call("mul", [sp_row("a"), call("div", [sp_row("a"), Literal(Int64, Int(2))])]), "a * (a / 2)")
+    sp_exact(call("mod", [sp_row("a"), Literal(Int64, Int(3))]), "a % 3")
+    sp_exact(call("concat", [sp_row("b"), sp_text_lit("!")]), "b || '!'")
+
+@test
+is_not_null_is_its_operator()
+    sp_exact(call("is_not_null", [sp_row("b")]), "b IS NOT NULL")
+
+@test
+a_cast_is_double_colon_with_a_nullable_target()
+    sp_exact(Cast(sp_row("c"), nullable(Int64), Strict), "c::int64")
+    sp_exact(Cast(sp_row("d"), nullable(Decimal(12, 3)), Strict), "d::decimal(12, 3)")
+
+@test
+a_cast_of_a_constant_keeps_the_constant_s_type()
+    sp_exact(Cast(sp_int(5), nullable(Int64), Strict), "5::int32::int64")
+    sp_exact(Cast(sp_text_lit("5"), nullable(Int64), Strict), "'5'::text::int64")
+    sp_exact(Cast(Null(Text), nullable(Int64), Strict), "NULL::text::int64")
+    sp_exact(Cast(sp_lit(Date, "2024-01-01"), nullable(Text), Strict), "date '2024-01-01'::text")
+
+@test
+a_cast_to_a_non_null_type_reads_back_nullable()
+    sp_normalised(Cast(sp_row("c"), Int64, Strict), "c::int64", Cast(sp_row("c"), nullable(Int64), Strict))
+
+@test
+a_try_cast_or_a_cast_to_a_record_is_its_tree_text()
+    assert_eq(sp_print(Cast(sp_row("b"), nullable(Int64), Try)), "(cast :expr row.b :type int64? :mode try)")
+    assert_eq(sp_print(Cast(sp_row("b"), record([]), Strict)), "(cast :expr row.b :type {})")
+
+@test
+an_if_is_a_searched_case()
+    sp_exact(If(items_of([IfArm(call("gt", [sp_row("a"), Literal(Int64, Int(0))]), sp_text_lit("pos"))]), Some(sp_text_lit("neg"))),
+        "CASE WHEN a > 0 THEN 'pos' ELSE 'neg' END")
+
+@test
+an_if_without_else_has_no_else()
+    sp_exact(If(items_of([IfArm(sp_row("flag"), sp_row("a")), IfArm(Null(Bool), Literal(Int64, Int(1)))]), None),
+        "CASE WHEN flag THEN a WHEN NULL THEN 1 END")
+
+@test
+an_if_whose_else_is_null_writes_its_type()
+    sp_exact(If(items_of([IfArm(sp_row("flag"), sp_row("a"))]), Some(Null(Int64))), "CASE WHEN flag THEN a ELSE NULL::int64 END")
+
+@test
+case_results_of_one_constant_type_are_bare()
+    sp_exact(If(items_of([IfArm(sp_row("flag"), sp_int(1))]), Some(sp_int(2))), "CASE WHEN flag THEN 1 ELSE 2 END")
+
+@test
+case_results_of_mixed_constant_types_carry_their_types()
+    sp_exact(If(items_of([IfArm(sp_row("flag"), sp_int(1))]), Some(Literal(Int64, Int(2)))), "CASE WHEN flag THEN 1::int32 ELSE 2::int64 END")
+
+@test
+case_constants_beside_a_column_take_its_type()
+    sp_exact(If(items_of([IfArm(sp_row("flag"), sp_row("a"))]), Some(Literal(Int64, Int(2)))), "CASE WHEN flag THEN a ELSE 2 END")
+
+@test
+coalesce_types_its_constants_by_the_first_typed_argument()
+    sp_exact(call("coalesce", [sp_row("b"), sp_text_lit("none")]), "coalesce(b, 'none')")
+    sp_exact(call("coalesce", [Literal(Int64, Int(1)), sp_row("a")]), "coalesce(1, a)")
+    sp_exact(call("coalesce", [sp_int(1), sp_row("a")]), "coalesce(1::int32, a)")
+    sp_exact(call("coalesce", [sp_int(1), sp_int(2)]), "coalesce(1, 2)")
+
+@test
+like_is_its_operator_and_an_escape_is_written_only_when_given()
+    sp_exact(call("like", [sp_row("b"), sp_text_lit("a%"), sp_text_lit("")]), "b LIKE 'a%'")
+    sp_exact(call("like", [sp_row("b"), sp_text_lit("a!%"), sp_text_lit("!")]), "b LIKE 'a!%' ESCAPE '!'")
+
+@test
+not_like_is_negated_in_place()
+    sp_exact(call("not", [call("like", [sp_row("b"), sp_text_lit("a%"), sp_text_lit("")])]), "b NOT LIKE 'a%'")
+
+@test
+unary_minus_writes_its_operand_with_its_type()
+    sp_exact(call("neg", [sp_row("a")]), "-a")
+    sp_exact(call("neg", [sp_int(5)]), "-5::int32")
+    sp_exact(call("neg", [sp_int(-5)]), "-(-5)::int32")
+    sp_exact(call("neg", [sp_lit(Float64, "1.5")]), "-1.5::float64")
+
+@test
+a_match_and_the_record_nodes_are_their_tree_text()
+    val m = Match(sp_row("a"), items_of([MatchArm("x", "p", Col("p", "v"))]), None)
+    assert_eq(sp_print(m), "(match :expr row.a :arms [(match_arm :tag x :binder p :expr p.v)])")
+    assert_eq(sp_print(Row("row")), "(row :binder row)")
+    assert_eq(sp_print(Variant(union_of([Field("x", record([]))]), "x", Record(buf[Item]()))), "(variant :type union<x: {}> :tag x :expr (record))")
+
+@test
+nested_records_and_fields_are_their_tree_text_inside_sql()
+    val inner = Record(items_of([Item("y", sp_row("a"))]))
+    val outer = Record(items_of([Item("x", inner)]))
+    val e = call("eq", [Field(Field(outer, "x"), "y"), Literal(Int64, Int(1))])
+    assert_eq(sp_print(e), "(field :expr (field :expr (record :fields [x: (record :fields [y: row.a])]) :name x) :name y) = 1::int64")
+
+// -- precedence and associativity -----------------------------------------------------------------
+
+@test
+a_right_nested_subtraction_keeps_its_parentheses()
+    sp_exact(call("sub", [sp_row("a"), call("sub", [sp_row("a"), Literal(Int64, Int(1))])]), "a - (a - 1)")
+
+@test
+a_left_nested_subtraction_needs_none()
+    sp_exact(call("sub", [call("sub", [sp_row("a"), sp_row("a")]), Literal(Int64, Int(1))]), "a - a - 1")
+
+@test
+a_double_negation_parenthesises_its_inner_minus()
+    sp_exact(call("neg", [call("neg", [sp_row("a")])]), "-(-a)")
+
+@test
+not_of_a_conjunction_parenthesises_it()
+    sp_exact(call("not", [call("and", [sp_row("flag"), sp_row("flag")])]), "NOT (flag AND flag)")
+
+@test
+not_binds_tighter_than_and()
+    sp_exact(call("and", [call("not", [sp_row("flag")]), sp_row("flag")]), "NOT flag AND flag")
+
+@test
+or_under_and_is_parenthesised_and_and_under_or_is_not()
+    val f = sp_row("flag")
+    sp_exact(call("and", [call("or", [f, f]), f]), "(flag OR flag) AND flag")
+    sp_exact(call("or", [call("and", [f, f]), f]), "flag AND flag OR flag")
+    sp_exact(call("or", [f, call("or", [f, f])]), "flag OR (flag OR flag)")
+
+@test
+comparisons_do_not_chain_so_nested_ones_are_parenthesised()
+    val lt = call("lt", [sp_row("a"), Literal(Int64, Int(1))])
+    sp_exact(call("eq", [lt, sp_row("flag")]), "(a < 1) = flag")
+    sp_exact(call("eq", [sp_row("flag"), lt]), "flag = (a < 1)")
+
+@test
+is_null_of_a_comparison_needs_no_parentheses()
+    sp_exact(call("is_null", [call("lt", [sp_row("a"), Literal(Int64, Int(1))])]), "a < 1 IS NULL")
+    sp_exact(call("is_null", [call("is_null", [sp_row("a")])]), "a IS NULL IS NULL")
+    sp_exact(call("is_null", [call("not", [sp_row("flag")])]), "(NOT flag) IS NULL")
+
+@test
+arithmetic_mixes_parenthesise_by_precedence()
+    sp_exact(call("mul", [call("add", [sp_row("a"), sp_row("a")]), sp_row("a")]), "(a + a) * a")
+    sp_exact(call("add", [call("mul", [sp_row("a"), sp_row("a")]), sp_row("a")]), "a * a + a")
+    sp_exact(call("lt", [call("add", [sp_row("a"), sp_row("a")]), sp_row("a")]), "a + a < a")
+
+@test
+concatenation_is_left_associative_and_binds_looser_than_plus()
+    sp_exact(call("concat", [call("concat", [sp_row("b"), sp_row("b")]), sp_row("b")]), "b || b || b")
+    sp_exact(call("concat", [sp_row("b"), call("concat", [sp_row("b"), sp_row("b")])]), "b || (b || b)")
+    sp_exact(call("concat", [Cast(call("add", [sp_row("a"), sp_row("a")]), nullable(Text), Strict), sp_row("b")]), "(a + a)::text || b")
+
+@test
+a_cast_binds_tighter_than_minus()
+    sp_exact(call("neg", [Cast(sp_row("c"), nullable(Int64), Strict)]), "-c::int64")
+    sp_exact(Cast(call("neg", [sp_row("c")]), nullable(Int64), Strict), "(-c)::int64")
+
+@test
+a_negative_constant_after_minus_keeps_a_space()
+    sp_exact(call("sub", [sp_row("a"), Literal(Int64, Int(-5))]), "a - -5")
+    sp_exact(call("mul", [Literal(Int64, Int(-5)), sp_row("a")]), "-5 * a")
+
+@test
+like_operands_parenthesise_comparisons()
+    sp_exact(call("like", [call("concat", [sp_row("b"), sp_row("b")]), sp_text_lit("x"), sp_text_lit("")]), "b || b LIKE 'x'")
+    sp_exact(call("eq", [call("like", [sp_row("b"), sp_text_lit("x"), sp_text_lit("")]), sp_row("flag")]), "(b LIKE 'x') = flag")
+
+// -- definitions through the shell's columns --------------------------------------------------------
+
+@test
+a_default_takes_its_column_type()
+    assert_eq(sql_definition_text(Literal(Int32, Int(0)), None, Some(nullable(Int32))), "0")
+    assert_eq(sql_definition_text(Literal(Int64, Int(0)), None, Some(Int64)), "0")
+    assert_eq(sql_definition_text(Literal(Text, Value.Text("anon")), None, Some(Text)), "'anon'")
+    assert_eq(sql_definition_text(Null(Int64), None, Some(nullable(Int64))), "NULL")
+    assert_eq(sql_definition_text(sp_lit(Date, "2024-01-01"), None, Some(nullable(Date))), "'2024-01-01'")
+
+@test
+a_default_of_another_type_carries_it()
+    assert_eq(sql_definition_text(Literal(Int32, Int(0)), None, Some(Int64)), "0::int32")
+
+@test
+an_unknown_table_s_columns_give_no_type()
+    assert_eq(sql_definition_text(call("eq", [sp_row("a"), Literal(Int64, Int(1))]), None), "a = 1::int64")
+    assert_eq(sql_definition_text(call("eq", [sp_row("a"), sp_int(1)]), None), "a = 1")

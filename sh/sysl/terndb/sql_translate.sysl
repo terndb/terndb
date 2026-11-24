@@ -202,7 +202,7 @@ private sql_call1(f: string, a: Expr) -> Expr = Call(f, items_of([a]))
 private sql_call2(f: string, a: Expr, b: Expr) -> Expr = Call(f, items_of([a, b]))
 
 /** The core aggregate functions a call may name (`query-tree.md` §6.7 rule 4). */
-private sql_is_aggregate(name: string) -> bool = name match
+private[terndb] sql_is_aggregate(name: string) -> bool = name match
     "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "string_agg" -> true
     else false
 
