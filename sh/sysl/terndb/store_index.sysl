@@ -1045,7 +1045,7 @@ impl Store
     // The rows of `d` keyed `keys` as the leaf holds them now, each once and in key order; a key no
     // row holds any more is skipped. Each row fetched counts in `rows_fetched`.
     private fetched(*self, d: &TableData, keys: Buf[Value]) -> Result[Buf[Slot], CodecError]
-        val at = buf[KeyAt]()
+        var at = buf[KeyAt]()
 
         for k in keys
             at.push(KeyAt(self.key_bytes(d, k)?, k))
