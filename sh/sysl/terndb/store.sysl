@@ -82,7 +82,7 @@ struct SchemaCodec
 
 /** A table's place in the store: its oid, its primary key's columns (every table has one, `Q6009`)
  * and their record type, the key's encoding (§4.6, each component ascending), the codec of each
- * schema version a row has been written in, and its secondary unique keys. Its rows are the
+ * schema version a row has been written in, and its secondary indexes. Its rows are the
  * table's B+tree in the store's `UndoRows`.
  */
 struct TableData
@@ -91,7 +91,7 @@ struct TableData
     key_type: Type
     key_spec: Buf[KeyColumn]
     codecs: Buf[SchemaCodec]
-    uniques: Buf[&UniqueIx]
+    indexes: Buf[&SecIndex]
 
 /** One row a transaction wrote: its key, the newest committed image it replaced and the image it
  * installed (§4.3 `before(w)` and `after(w)`); `None` is absent or deleted.
@@ -218,10 +218,17 @@ struct Store
     released: u64
     /** Every job a commit started, oldest first, with how it ended (`store_jobs.sysl`). */
     jobs: Buf[JobRecord]
-    /** How many leaf entries the executor's scans have visited (`scan_range`): what a test reads to
-     * know a scan read only the key range its filter allows.
+    /** How many leaf entries the executor's scans have visited (`scan_range`), and the referencing
+     * check's passes over a whole table (`referencing`): what a test reads to know a scan read only
+     * the key range its filter allows, and that a read through an index made no pass at all.
      */
     slots_read: u64
+    /** How many secondary-index entries reads through an index have visited (`scan_index`,
+     * `referencing`).
+     */
+    entries_read: u64
+    /** How many rows reads through an index have fetched by their keys. */
+    rows_fetched: u64
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
@@ -432,7 +439,7 @@ struct Store
             Some(r) -> Ok(Some(self.translated(table, r)?))
             None -> Ok(None)
 
-    private scan_range_in(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred) -> Result[Buf[Hit], CodecError]
+    private[terndb] scan_range_in(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred) -> Result[Buf[Hit], CodecError]
         live(t)?
         val d = self.table_data(table)?
         val out = buf[Hit]()
@@ -1065,7 +1072,7 @@ private fill_of(fill: Option[Expr]) -> Value = fill match
 
 /** A store over `catalog`'s tables, empty. */
 mem_store(catalog: MemCatalog) -> &Store =
-    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf(), 0)
+    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf(), 0, 0, 0)
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow

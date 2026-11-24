@@ -157,8 +157,11 @@ private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filt
     val ct = d.store.catalog.tables[i]
     store_scan(d, ct.oid, elem, read_pred(d, ct, items_of([binder]), elem, filter, ctx), access_of(d, ct, binder, kept, ctx))
 
-/** A `ScanOp` of table `oid` reading the keys `access` allows, its read logged as `logged`. */
-private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access) -> &Operator =
+/** A `ScanOp` of table `oid` reading the keys `access` allows, or an `IndexScanOp` reading the rows
+ * its range of a secondary index names (`exec_access.sysl`), its read logged as `logged`.
+ */
+private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access) -> &Operator
+    if access.path == IndexRange then return index_scan_op(d, oid, elem, logged, access)
     ScanOp(d.store, d.txn, oid, elem, logged, access, buf[ColumnVector](), false, 0)
 
 /** A table's rows visible to `txn` in the key range of its access path, read from the store on the
