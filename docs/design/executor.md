@@ -439,7 +439,7 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
 
 Not yet: translation of a row of an older schema version (`ddl.md` §5.3).
 
-### 4.6 Access paths: the primary key
+### 4.6 Access paths: the primary key and secondary indexes
 
 The code is `exec_access.sysl`. A scan of a table that a `Filter` sits directly over, and the target
 scan of an `Update` or `Delete`, read only the range of the table's B+tree that the filter's
@@ -477,9 +477,58 @@ comparisons of the **primary key** allow; the filter itself still runs over ever
   tests assert each access path visits only its range, and a differential test compares random
   predicates with the same predicate under `or false`, which is never narrowed.
 
-Not yet: secondary and unique indexes (`store_index.sysl`) as access paths. A read through one must
-fetch each primary row and check its visibility, and must not use an index whose build has not
-finished; that is a later item.
+#### Secondary indexes
+
+The same conjuncts may instead narrow the scan to a range of a secondary index's entries
+(`store_index.sysl`, `Store.scan_index`); the tests are `exec_access_index_tests.sysl`.
+
+- **Which indexes.** Only an index whose state in the transaction's catalog is `ready` (`ddl.md` §2.5
+  rule 5), unique or not, a `unique` constraint's included; one still `building` — in the transaction
+  that created it, or a constraint's whose validation is deferred — is never read through.
+- **Which conjuncts count.** As for the primary key, a comparison `eq`, `lt`, `le`, `gt` or `ge`
+  whose one operand is fixed for the statement (a `Literal`, `Null`, `Param` or `Cast` of these) and
+  whose other is a component of the index: a bare `Col` of the scan's binder for a column
+  component, or, for an expression component, an expression that **is** the definition node for
+  node — the same columns of the binder, literals, calls, casts and field accesses (`matches_def`).
+  An equivalent but different expression (`lower(lower(s))`, `200 / d` for `100 / d`) does not count.
+  The operand's value is converted to the component's type as a key column's is (same type, or
+  integers by value); any other pair is left to the filter.
+- **Partial indexes** are used only when every conjunct of the index's predicate (split at its `and`s)
+  is, node for node, one of the filter's conjuncts. This is an exact-match check, which §2.5 rule 3
+  allows: `k > 1` does not count as implying `k > 0`, and a predicate missing a conjunct is not used.
+- **The range.** Entries are compared as values in the total order (`query-tree.md` §3.3), so a
+  component's direction does not matter. Equalities on a leading run of the components fix a prefix of
+  the entry's value; the component after them may take one bound on each side, the tighter one where
+  several are given. A bound on that component also excludes its null entries, which sort first and
+  satisfy no comparison. An entry's value holds its null components (the index of a nullable column
+  must find `b = 'x'`'s rows whose next component is null).
+- **Reading.** The store visits the entries in the range, fetches each row they name by key (each
+  once, in key order, so the result is the full scan's, order included), reads its version visible at
+  the snapshot and keeps it unless that version's own entry lies outside the range — an entry is never
+  removed, so it may name a row whose version has left the value, or that an aborted transaction
+  inserted. A row whose visible version has no entry (a partial index's predicate not true of it) is
+  handed up for the filter to reject. A row one of whose versions the index's definition could not be
+  evaluated over has no entry and is kept in `unindexed`; every read through the index fetches it, so
+  the filter raises the error a full scan would raise on it.
+- **Logged.** The read is logged with the same predicate as a full scan's, the filter (`isolation.md`
+  §4.4: `key ∈ [a, b) ∧ F` is `F`, since `F` implies the range), found or not, so a phantom inserted
+  into the range, a row updated into or out of it, and write skew through it fail a serializable
+  commit exactly as they do through a full scan.
+- **The choice** (`access_of`), one rule and no cost model:
+  1. a conjunct comparing any column of the binder with a fixed null reads nothing (`NoRows`);
+  2. else a lookup of the whole primary key;
+  3. else a `ready` unique index with every component fixed by an equality, the first in catalog order;
+  4. else the primary-key range or index range fixing the most leading components, then the one whose
+     next component is bounded, ties going to the primary key and then to the earlier index; a path
+     fixing and bounding nothing is no path, and with none the scan reads every row.
+- **Measured.** `Store.entries_read` counts the index entries visited and `Store.rows_fetched` the rows
+  fetched by key; a read through an index visits no leaf entry (`slots_read`). A differential test
+  compares random predicates over random data, with stale entries, against the same predicate under
+  `or false`, in a reader's snapshot and in a writer's own uncommitted state.
+
+The referencing side of a foreign-key check (`Store.referencing`, `store.md`) reads through a `ready`
+index with no predicate whose leading components are the referencing columns in order, when the table
+has one, and makes a pass over the whole referencing table otherwise.
 
 ## 5. What this note relies on in `query-tree.md`
 

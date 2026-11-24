@@ -35,17 +35,20 @@ and the undo check over everything the store holds; `store_pages_tests.sysl` exe
 - **Limits.** A key over 1,024 bytes is `key_too_long` (`D2001`). A row whose key and value exceed 4,000 bytes
   would need columns out of line in overflow chains (§4.7–§4.8), which wait on sysl 0.12 (CRC32C), so it is
   refused with `entry_too_large` (`D2002`) before any undo record is written; nothing is approximated.
-- **`UniqueIx`** (`store_index.sysl`) is one secondary unique key of a table — a `unique` constraint, or a unique
-  index `building` or `ready`, partial or over expressions (`enforced_keys`): a `Buf[IxEntry]` sorted by the key's
-  value (then by primary key), each entry a value with no null component that some version of a row holds, and the
-  row's primary key. A value with a null component, or a version the predicate is not true of, never conflicts and
-  has no entry (Q48; on disk such an entry takes the non-unique form, §4.9 rule 1). An entry is added whenever a
-  version is installed and never removed; a lookup fetches the row and reads its versions to decide whether the
-  value is still there, as §4.9 rule 2 has a reader do. A plain key (columns only, no predicate) reads a version's
-  entry from its image; any other evaluates its predicate and expression components over the version as a row of
-  the current schema version (`ix_values`), the versions installed since the last check together. `sync_uniques`
-  brings a table's indexes in line with the catalog before each check, building a key added since from every
-  version of every row still reachable, so a `building` index holds every row's entry from its creation (Q71).
+- **`SecIndex`** (`store_index.sysl`) is one secondary index of a table — a `unique` constraint's, or an index
+  `building` or `ready`, unique or not, partial or over expressions (`maintained_indexes`): a `Buf[IxEntry]` sorted
+  by the components' value (then by primary key), each entry a value some version of a row holds, null components
+  included, and the row's primary key. A version the predicate is not true of has no entry; a value with a null
+  component has one but never conflicts (Q48; on disk such an entry takes the non-unique form, §4.9 rule 1). An
+  entry is added whenever a version is installed and never removed; a lookup fetches the row and reads its
+  versions to decide whether the value is still there, as §4.9 rule 2 has a reader do. A plain index (columns
+  only, no predicate) reads a version's entry from its image; any other evaluates its predicate and expression
+  components over the version as a row of the current schema version (`ix_values`), the versions installed since
+  the last check together, and a row one of whose versions they cannot be evaluated over joins `unindexed`, which
+  every read through the index fetches. `sync_indexes` brings a table's indexes in line with the catalog before
+  each check and read, building an index added since from every version of every row still reachable, so a
+  `building` index holds every row's entry from its creation (Q71), and records whether each is `ready`: only a
+  ready one answers a read (`ddl.md` §2.5 rule 5). Only a unique one is checked by writers.
 - **Jobs** (`store_jobs.sysl`, `ddl.md` §7): the commit of a transaction that ran DDL runs the `build_index` jobs it
   started before it returns — one per index left `building` that backs no constraint, and one per `unique`
   constraint whose validation is due — each in an internal read committed transaction at the newest snapshot that
@@ -83,7 +86,14 @@ version older than the newest committed image's aborts with `schema_changed` (`d
   and `hi`, and logs `logged` whatever the range, even an empty one; `scan_rows(t, table, logged)` is the whole
   range. The executor chooses the range from its filter (`executor.md` §4.6) and filters the rows itself,
   vectorised, so the predicate's closure runs only in validation. `slots_read` counts the leaf entries these
-  scans visit, for the tests that an access path reads only its range.
+  scans visit (and the referencing check's whole-table passes), for the tests that an access path reads only its
+  range.
+- **`scan_index(t, table, index, lo, hi, logged)`** answers the rows visible to `t` that the entries of secondary
+  index `index` between `lo` and `hi` name (`IxBound`: the leading components compared as values, inclusive or
+  not), in key order, each once, and logs `logged` as `scan_range` does. Each row is fetched by its key and read at
+  `t`'s snapshot; one whose visible version's own entry lies outside the range is dropped, one whose visible
+  version has no entry, and every `unindexed` row, is left to the executor's filter (`executor.md` §4.6).
+  `entries_read` and `rows_fetched` count the entries visited and the rows fetched by key.
 - **`write_rows(t, table, changes)`** applies one statement's writes, each a `RowChange`: `Put` a new row (an
   insert, under §4.2 rule 4), `Replace` or `Remove` the row of a key the statement read. It answers `Wait`
   before writing any of them if one key is locked, so a waited statement leaves no trace. The executor orders
@@ -134,7 +144,11 @@ the statement or a cascade wrote, the referencing values it wrote are checked (o
 values it removed or changed run their key's action — `restrict` at once, `cascade`, `set_null` and
 `set_default` as writes of the referencing rows (their generated columns recomputed and constraints checked) that
 join the work list, so a cascade reaches any depth; `no_action` is checked once every action has run. The
-referencing scan is one pass over the referencing table for all of a batch's values, binary-searched.
+referencing rows of a batch's values are found through a `ready` index with no predicate whose leading components
+are the referencing columns in order, when there is one: its entries for each value name every row some version of
+which holds it, and each row is fetched by key, once, in key order, and judged exactly as the pass judges it.
+Without such an index the referencing scan is one pass over the referencing table for all of the values,
+binary-searched.
 
 `update_where` and `delete_where`, which take the change as a closure, serve the store's own tests: a closure
 cannot fail, and the executor's changes can.
@@ -248,9 +262,6 @@ per-row latches and a real wait) is the next slice of this work.
 - Translation of a value whose representation a lossless retype changes other than integer to float (to
   `decimal`, `json` to `text`); the commit latch of `ddl.md` §6.1 rule 3, which a single-threaded store does not
   need.
-- Non-unique secondary indexes, and unique indexes with a predicate or an expression component: those need the
-  executor's evaluator inside the store, so such an index enforces nothing in the in-memory store yet. A
-  referencing scan is therefore a full scan of the referencing table. Check and NOT NULL constraints are checked
-  by the executor (`executor.md` §4.5).
+- Check and NOT NULL constraints are checked by the executor (`executor.md` §4.5), not by the store.
 - A shared `LOCK_ONLY` mode (`ddl.md` §11 question 2): concurrent inserts referencing one row serialize on it.
 - Term bits in transaction ids and commit numbers (`replication.md` §1.4).
