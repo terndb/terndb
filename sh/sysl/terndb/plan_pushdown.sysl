@@ -84,7 +84,7 @@ private pd_filter(r: Rel, cs: Buf[Expr]) -> Rel
 /** Whether evaluating `e` can raise no runtime error and draws nothing volatile, on any row: so it may
  * be evaluated on more rows or fewer without changing which errors a statement raises.
  */
-private pd_safe(e: Expr) -> bool = e match
+private[terndb] pd_safe(e: Expr) -> bool = e match
     Col(_, _) | Row(_) | Param(_) | Null(_) | Literal(_, _) -> true
     Field(x, _) -> pd_safe(*x)
     Call(f, args) -> pd_safe_call(f, args)

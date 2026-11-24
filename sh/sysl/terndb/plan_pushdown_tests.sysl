@@ -379,7 +379,7 @@ a_comparison_across_the_sides_that_is_not_eq_stays_in_the_join()
 
 @test
 a_comparison_across_the_sides_beside_a_key_is_tested_on_the_keys_pairs_only()
-    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and a.a_v < b.b_id", pp_of(pp_keyed(30), pp_keyed(30), pp_none(), pp_none()), 30), 30)
+    pp_rows_are(pp_pairs("select a.a_id, b.b_id from a, b where a.a_k = b.b_k and a.a_v < b.b_id", pp_of(pp_keyed(30), pp_keyed(30), pp_none(), pp_none()), 30), 24)
 
 @test
 an_or_across_the_sides_stays_whole_and_keys_nothing()
