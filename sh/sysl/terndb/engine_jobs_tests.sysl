@@ -157,7 +157,7 @@ a_check_whose_job_failed_is_still_enforced_on_every_write()
     assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3002")
 
     var b = ew_duo(e)
-    assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(2))), "T3002")
+    assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(2))), "header T3002")
     assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(9))), "header complete")
     assert_eq(ew_on_of(e, 1), 9)
 
@@ -166,7 +166,7 @@ a_validated_check_is_enforced_on_every_write()
     val e = ew_doctors()
     ew_setup(e, [ej_add(ej_on_gt(0))])
     var b = ew_duo(e)
-    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(0))), "T3002")
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(0))), "header T3002")
     assert_eq(ew_on_of(e, 2), 1)
 
 @test
@@ -174,13 +174,15 @@ a_deferred_check_is_enforced_on_every_write_before_it_is_validated()
     val e = ew_doctors()
     ew_setup(e, [ej_add(ej_on_gt(0), true)])
     var b = ew_duo(e)
-    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(-1))), "T3002")
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(-1))), "header T3002")
 
 private ej_ref_fields() -> [2]Field = [Field("id", Int64), Field("doc", nullable(Int64))]
 
+private ej_ins_fields() -> [2]Field = [Field("id", Int64), Field("doc", Int64)]
+
 /** `ref(id, doc int64?)` holding `(1, 99)`, which references no doctor, and `(2, 1)`. */
 private ej_refs(e: &Engine)
-    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id"), ew_insert("ref", ej_ref_fields(), [rec([Int(1), Int(99)]), rec([Int(2), Int(1)])])])
+    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id"), ew_insert("ref", ej_ins_fields(), [rec([Int(1), Int(99)]), rec([Int(2), Int(1)])])])
 
 private ej_ref_fk() -> Envelope = envelope([], AlterTable(cat_q("ref"), items_of([AddConstraint(cat_fk("ref_doc", ["doc"], "doc", ["id"]), false)])))
 
@@ -195,13 +197,13 @@ a_foreign_key_whose_job_failed_is_still_enforced_on_every_write()
     assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3003")
 
     var b = ew_duo(e)
-    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ref_fields(), [rec([Int(3), Int(98)])])), "T3003")
-    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ref_fields(), [rec([Int(3), Int(2)])])), "header complete")
-    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ref_fields(), [rec([Int(4), Null])])), "header complete")
+    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ins_fields(), [rec([Int(3), Int(98)])])), "header T3003")
+    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ins_fields(), [rec([Int(3), Int(2)])])), "header complete")
+    assert_eq(b.kinds_of(0, ew_insert("ref", [Field("id", Int64)], [rec([Int(4)])])), "header complete")
 
     // Doctor 1 is referenced, so it cannot go.
     val gone = envelope([], Delete(cat_q("doc"), "d", None, None, Some(eq(col("d", "id"), ew_lit(1))), buf[Item]()))
-    assert_eq(b.kinds_of(0, gone), "T3003")
+    assert_eq(b.kinds_of(0, gone), "header T3003")
 
 // -- writers overlapping the job (§7 rule 2, §8.7, L3) ------------------------------------------
 
@@ -239,7 +241,7 @@ a_read_committed_writer_s_statement_after_the_ddl_meets_the_check()
     var b = ew_duo(e)
     a.send(Begin(1, ew_level(ReadCommitted)))
     assert_eq(b.kinds_of(0, ej_add(ej_on_gt(0))), "header complete")
-    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-2))), "T3002")
+    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-2))), "header T3002")
 
 @test
 a_writer_that_begins_after_the_job_meets_the_check()
@@ -247,7 +249,7 @@ a_writer_that_begins_after_the_job_meets_the_check()
     ew_setup(e, [ej_add(ej_on_gt(0))])
     var a = ew_duo(e)
     a.send(Begin(1, ew_level(Serializable)))
-    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-2))), "T3002")
+    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-2))), "header T3002")
 
 @test
 a_row_committed_while_the_ddl_was_uncommitted_fails_the_job()
@@ -265,7 +267,7 @@ a_row_committed_while_the_ddl_was_uncommitted_fails_the_job()
 @test
 a_delete_of_a_referenced_row_uncommitted_when_the_job_ran_aborts_at_its_commit()
     val e = ew_doctors()
-    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id"), ew_insert("ref", ej_ref_fields(), [rec([Int(2), Int(2)])])])
+    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id"), ew_insert("ref", ej_ins_fields(), [rec([Int(2), Int(2)])])])
     var a = ew_duo(e)
     var b = ew_duo(e)
     a.send(Begin(1, ew_level(ReadCommitted)))
@@ -288,7 +290,7 @@ a_dangling_row_uncommitted_when_the_foreign_key_s_job_ran_aborts_at_its_commit()
     var a = ew_duo(e)
     var b = ew_duo(e)
     a.send(Begin(1, ew_level(Snapshot)))
-    assert_eq(a.kinds_of(1, ew_insert("ref", ej_ref_fields(), [rec([Int(1), Int(99)])])), "header complete")
+    assert_eq(a.kinds_of(1, ew_insert("ref", ej_ins_fields(), [rec([Int(1), Int(99)])])), "header complete")
 
     // The job does not see a's row and succeeds; a did not see the foreign key, and cannot commit.
     val txid = ej_txid(b.seen(b.send(ej_begin_msg())))
