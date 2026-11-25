@@ -239,7 +239,7 @@ impl MemCatalog
         for c in columns
             self.check_generated(columns, c)?
 
-        self.tables.push(CatTable(oid, ns, name.name, who, columns, buf[u32](), u32(defs.len() + 1), items_of([SchemaVersion(1, columns.copy())])))
+        self.tables.push(CatTable(oid, ns, name.name, who, columns, buf[u32](), u32(defs.len() + 1), items_of([SchemaVersion(1, columns.copy(), buf[u32]())])))
         val ti = self.tables.len() - 1
         val ids = self.column_ids(ti, pk)?
         self.check_key_columns(ti, ids, true)?
