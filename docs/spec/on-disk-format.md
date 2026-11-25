@@ -428,27 +428,49 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 | 0x0B | `bytes` | |
 | 0x0C | `date` | |
 | 0x0D | `time` | |
-| 0x0E | `datetime` (civil, no zone) | |
-| 0x0F | `timestamp` (an instant) | |
+| 0x0E | `timestamp` (civil, no zone; alias `datetime`) | |
+| 0x0F | `timestamptz` (an instant) | |
 | 0x10 | `interval` | |
 | 0x11 | `uuid` | |
 | 0x12 | reserved; never assigned | |
 | 0x13–0x16 | `uint8`, `uint16`, `uint32`, `uint64` | |
 | 0x17 | `json` | |
-| 0x18–0x1F | reserved for scalar types | |
+| 0x18 | `numeric` | |
+| 0x19 | `jsonb` | |
+| 0x1A | `xml` | |
+| 0x1B | `money` | |
+| 0x1C, 0x1D | `inet`, `cidr` | |
+| 0x1E, 0x1F | `macaddr`, `macaddr8` | |
 | 0x20 | relation, `bag<E>` or `list<E>` | `ordered` u8 (0 = bag, 1 = list), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor: a record (0x23), a union (0x21) or a scalar |
 | 0x21 | union `union<t₁: R₁, …>` | `n` u32 (1–65,536), then n × (`name_len` u16, tag UTF-8, the payload's record descriptor, tag 0x23) |
 | 0x22 | reserved; never assigned | |
 | 0x23 | record `{n₁: T₁, …}` | `n` u16 (0–65,535), then n × (`name_len` u16, name UTF-8, `nullable` u8, the field's descriptor) |
+| 0x24, 0x25 | `varchar(n)`, `char(n)` | `n` u32 |
+| 0x26, 0x27 | `varbinary(n)`, `binary(n)` | `n` u32 |
+| 0x28 | `decimal(p, s)` with `39 ≤ p ≤ 1000` | `p` u16, `s` u16 (0–`p`) |
+| 0x29 | `decfloat(p)` | `p` u8 (16 or 34) |
+| 0x2A–0x2C | `time(p)`, `timestamp(p)`, `timestamptz(p)` with `p < 6` | `p` u8 (0–5) |
+| 0x2D | `timetz(p)` | `p` u8 (0–6) |
+| 0x2E | `interval_ym(q, l)` | `q` u8, `l` u8 (`query-tree.md` §12.3 kind 73's numbering) |
+| 0x2F | `interval_dt(q, l, p)` | `q` u8, `l` u8, `p` u8 (kind 74's numbering) |
+| 0x30 | `array<E, m>` | `m` u32 (0 for no bound), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor (any descriptor) |
+| 0x31, 0x32 | `range<T>`, `multirange<T>` | `T`'s descriptor |
+| 0x33, 0x34 | `bit(n)`, `varbit(n)` | `n` u32 (`varbit`: 0 for no bound) |
+| 0x35–0x3F | reserved for scalar and constructed types | |
 
 1. **Nullability.** A column's own nullability is `sys.columns.nullable`, and its descriptor is of the non-null
-   type. Inside a descriptor, nullability is the `nullable` octet of a record field or of a relation element.
-   These are every place a type can occur in a stored type, because a union payload is a non-null record
-   (`query-tree.md` §2.4) and a relation's element is not a relation (§2.5). The nullable wrapper (kind 20 of
+   type. Inside a descriptor, nullability is the `nullable` octet of a record field, a relation element or an
+   array element. These are every place a type can occur in a stored type, because a union payload is a non-null
+   record (`query-tree.md` §2.4), a relation's element is not a relation (§2.5), and a range's subtype is a
+   non-null scalar (§2.19). The nullable wrapper (kind 20 of
    `query-tree.md` §12.3) therefore has no tag of its own.
 2. **Structural.** A descriptor never names a catalog object. A column declared with a named type (`ddl.md`
    §2.8) stores the structure the name denotes, and the name is kept beside it in `sys.columns.type_oid`.
-   An enum is a union whose payloads are all `{}` and is stored as one.
+   An enum is a union whose payloads are all `{}` and is stored as one. A domain stores its base type's
+   descriptor, a distinct type its source's, and a structured type its structure, a union (`query-tree.md`
+   §2.20); `type_oid` keeps the name, which for a distinct or structured type is also its identity.
+   `decimal(p, s)` is tag 0x09 for `p ≤ 38` and 0x28 above, and the precision-6 `time`, `timestamp` and
+   `timestamptz` are 0x0D–0x0F, never 0x2A–0x2C, so the correspondence stays one to one.
 3. **Canonical.** Names are non-empty and unique within their record or union, and a `nullable` or `ordered` octet
    is 0 or 1. A reader MUST treat an unknown or reserved tag, or a descriptor that breaks these rules, as
    `data_corrupted`.
@@ -470,10 +492,28 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 | `bytes` | variable | raw |
 | `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian) |
 | `time` | 8 | `i64` microseconds since midnight |
-| `datetime` | 8 | `i64` microseconds since 1970-01-01T00:00:00 civil time, with no zone |
-| `timestamp` | 8 | `i64` microseconds since the Unix epoch, 1970-01-01T00:00:00Z |
+| `timestamp` | 8 | `i64` microseconds since 1970-01-01T00:00:00 civil time, with no zone |
+| `timestamptz` | 8 | `i64` microseconds since the Unix epoch, 1970-01-01T00:00:00Z |
+| `time(p)`, `timestamp(p)`, `timestamptz(p)` | 8 | as the type of precision 6; the value is a multiple of 10^(6 − p) µs |
+| `timetz(p)` | 12 | `i64` microseconds since midnight, then `i32` offset in seconds east of UTC |
 | `interval` | 16 | `i32` months, `i32` days, `i64` microseconds |
+| `interval_ym` | 4 | `i32` months |
+| `interval_dt` | 8 | `i64` microseconds |
 | `uuid` | 16 | the 16 bytes in RFC 9562 order |
+| `varchar(n)` | variable | UTF-8, as `text` |
+| `char(n)` | variable | UTF-8 **without** its trailing U+0020; a reader pads to `n` code points. A stored value ending in U+0020, or longer than `n` code points, is corruption |
+| `varbinary(n)`, `binary(n)` | variable | raw; `binary(n)` exactly `n` bytes |
+| `xml` | variable | UTF-8, the text as given |
+| `numeric`, `decimal` 39 ≤ p ≤ 1000 | variable | `u8` class (0 finite, 1 NaN, 2 +∞, 3 −∞), then for a finite value `u8` sign (0 or 1), `u16` display scale, `i16` weight (the power of 10,000 of the first digit group), and the base-10,000 digit groups as `u16`, most significant first, without leading or trailing zero groups (zero has none and sign 0) |
+| `decfloat(16)`, `decfloat(34)` | 8, 16 | IEEE 754-2008 BID encoding; the canonical quiet NaN only |
+| `money` | 8 | `i64` hundredths |
+| `inet`, `cidr` | 18 | family (4 or 6), prefix length, 16 address bytes (IPv4 in the first 4, the rest zero) |
+| `macaddr`, `macaddr8` | 6, 8 | the octets |
+| `bit(n)`, `varbit(n)` | variable | `u32` bit count, then ⌈count/8⌉ bytes, most significant bit first, padding bits zero |
+| `jsonb` | variable | one value: `u8` tag (0 null, 1 false, 2 true, 3 number, 4 string, 5 array, 6 object), then a number's `numeric` encoding (`u32` length first), a string's `u32` length and UTF-8, or an array's or object's `u32` count, `u32` end offset per element (per member, for an object), and the elements (for an object, each member a key — `u32` length, UTF-8 — then a value), objects' members in key order (`query-tree.md` §2.16) |
+| array | variable | as a relation value (§4.5), each element its type's encoding |
+| range | variable | `u8` flags (`query-tree.md` §2.19 rule 6), then each finite bound, a variable-width bound preceded by its `u32` length |
+| multirange | variable | `u32` count, `u32` end offset per range, the ranges |
 | record | variable | §4.5 |
 | relation | variable | §4.5 |
 | union | variable | §4.5 |
@@ -514,21 +554,39 @@ Keys MUST compare correctly with `memcmp`, so that prefix compression, `head` an
 
 | type | encoding |
 |------|----------|
-| `intN`, `date`, `time`, `datetime`, `timestamp`, `decimal` | big-endian with the sign bit inverted |
+| `intN`, `date`, `time`, `timestamp`, `timestamptz` (any precision), `decimal` p ≤ 38, `money`, `interval_ym`, `interval_dt` | big-endian with the sign bit inverted |
 | `bool`, `uintN` | big-endian unsigned |
 | an enum: a union whose payloads are all `{}` | its discriminant as a big-endian `u16`, so keys order by declaration order (`query-tree.md` §3.3) |
 | `float32`, `float64` | big-endian bits; when the sign is 1 invert all bits, else invert the sign bit. −0 MUST be stored as +0, and every NaN as the one canonical quiet NaN, which sorts last |
 | `uuid` | the 16 bytes |
 | `interval` | months, days, microseconds, each as `iN` above |
 | `text`, `bytes` | the bytes with each 0x00 escaped as 0x00 0xFF, then the terminator 0x00 0x00 |
+| `varchar(n)`, `varbinary(n)`, `binary(n)` | as `text` and `bytes` |
+| `char(n)` | the value **padded** to `n` code points, as `text`: padded values of one length order by code points exactly as PAD SPACE compares them (`query-tree.md` §2.8 rule 4) |
+| `numeric`, `decimal` 39 ≤ p ≤ 1000, `decfloat` | a class byte: 0x00 −∞, 0x01 negative, 0x02 zero, 0x03 positive, 0x04 +∞, 0x05 NaN. A non-zero finite value, normalised to digits `d₁d₂…dₖ` (`d₁ ≠ 0`, no trailing zero) and exponent `E` with value `0.d₁…dₖ × 10^E`, follows with `E` as a big-endian `i32` with the sign bit inverted, then the digits in pairs, each pair `10a + b` (the last padded with 0) written as the byte `pair + 1`, then 0x00; for a negative value every byte after the class byte is inverted. Equal values of different scales or cohorts encode alike |
+| `timetz` | the UTC time (µs minus offset × 10⁶) as a big-endian `i64`, then the offset as a big-endian `i32`, each with the sign bit inverted |
+| `inet`, `cidr` | the family byte, the address with the bits past the prefix zeroed (4 or 16 bytes), the prefix length, the whole address |
+| `macaddr`, `macaddr8` | the octets |
+| `bit(n)`, `varbit(n)` | the packed bytes escaped and terminated as `bytes`, then the bit count as a big-endian `u32` |
+| array | for each element 0x01, then (when the element type is nullable) 0x00 for null or 0x01 and the element's key encoding, or just the element's key encoding; then 0x00 |
+| record | each field's key encoding in order, a nullable field prefixed as rule 1 prefixes a nullable component |
+| range | 0x00 for empty; else 0x01, the lower bound (0x00 when −∞, else 0x01, the value's encoding, then 0x01 inclusive or 0x02 exclusive), the upper bound (0x01, the value's encoding, then 0x01 exclusive or 0x02 inclusive; or 0x02 when +∞) |
+| multirange | each range as 0x01 and its range encoding, then 0x00 |
+| `jsonb` | a rank byte (0x01 null, 0x02 string, 0x03 number, 0x04 boolean, 0x05 array, 0x06 object), then: a string as `text`; a number as `numeric`; a boolean 0x00 or 0x01; an array its count as a big-endian `u32` and each element; an object its member count as a big-endian `u32` and each key (as `text`) and value, in stored order |
+| a domain, a distinct type | the base's or source's encoding |
 
 1. A nullable component of a secondary-index key is prefixed with 0x00 for NULL (nulls first) or 0x01 for a
    value. Primary-key columns are NOT NULL and have no prefix.
 2. A descending component has every byte of its encoding inverted, prefix included.
 3. A composite key is the concatenation of its components.
-4. `text` compares by binary UTF-8 in v1; there are no collations. When collations come (`query-tree.md` §3.1),
-   a collated key component stores its ICU sort key in the `text` encoding above and sets `key_spec` flag bit 2.
-   Relation, record and `json` values, and unions other than enums, MUST NOT be key components.
+4. A character string component compares by binary UTF-8 under `ucs_basic`, the default. A component under
+   another collation (`query-tree.md` §2.21) stores its Unicode Collation Algorithm sort key (for `char(n)`, of
+   the padded value) in the `text` encoding above and sets `key_spec` flag bit 2; the collation's name is in the
+   index's catalog row, and the sort key is computed by TernDB's own UCA implementation of the Unicode version
+   the format pins, so a key never changes under a host library upgrade.
+   Relation values (`bag`, `list`, so multisets), `json`, `xml`, structured types, and unions other than enums
+   MUST NOT be key components; a record is one only when every field could be. A bad component is refused
+   when the index is defined (`Q6005`).
 5. A key component that is an expression (`ddl.md` §2.5) is encoded by its result type, as a column of that type
    would be.
 
