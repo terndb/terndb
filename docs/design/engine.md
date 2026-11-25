@@ -135,16 +135,21 @@ connection against a server in the same process, turning its loop by hand on a `
 - **TLS and `peer`** (§ The server): TCP refuses every connection, and a `peer` login fails, until TLS 1.3 with
   `tls-exporter` and a socket's peer credentials are reachable from sysl.
 
-- **Reconciliation** (`ddl.md` §6.4) covers added unique keys only. A writer that commits after a DDL it did not
+- **Reconciliation** (`ddl.md` §6.4) covers added unique keys and the guards of completed conversions only. A writer that commits after a DDL it did not
   see which added a check, not-null or referencing foreign-key constraint, a column whose default is not its fill
   (or a generated or filling column), or a foreign key referencing a table it removed or changed rows of, aborts
   with `schema_changed` instead of being reconciled. An added unique key is reconciled whatever its kind: over
   columns, partial, or over expressions, which the store evaluates as definition expressions (`store.md`).
-- **Jobs other than `build_index`** do not run (`store.md` § Jobs): a check or foreign-key constraint stays not
-  validated, and `AwaitJobs` returns no relation yet, although the store records how each build ended.
-- **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
-  column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
-  expression applied on read. Translation (`store.md`) applies the lossless conversions only.
+- **Jobs other than `build_index` and `convert_column`** do not run (`store.md` § Jobs): a check or foreign-key
+  constraint stays not validated, and `AwaitJobs` returns no relation yet, although the store records how each
+  build and conversion ended.
+- **A retype of a primary-key column** (`ddl.md` §8.5 rule 3) is a table rebuild (§8.11), which does not run: the
+  column is left `converting` in its old type, and no `convert_column` job runs for it.
+- **Replacement indexes** (`ddl.md` §8.5 rule 2) are not catalog objects: the store computes a unique key over a
+  converted column again from every row once the conversion completes, and the `convert_column` job checks that
+  the converted values hold no value twice, failing with `unique_violation` if they do (`store.md` § Jobs). Since
+  the job runs at the commit of its retype, only the retyping transaction ever sees the column `converting`; its
+  writes then are checked against the guard by the executor, not against a `building` replacement.
 - **Credentials** are the server's own `Authority`: `CatalogAuthority` narrows it to the roles the newest committed
   catalog holds with `login`, but no SCRAM verifier or token hash is stored in the database, and nothing issues a
   token yet.

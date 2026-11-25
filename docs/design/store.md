@@ -50,7 +50,15 @@ and the undo check over everything the store holds; `store_pages_tests.sysl` exe
   started before it returns — one per index left `building` that backs no constraint, and one per `unique`
   constraint whose validation is due — each in an internal read committed transaction at the newest snapshot that
   checks no two visible rows share a value and commits the index `ready` (and the constraint validated), or
-  `failed`: a failed index is dropped, a failed constraint's index kept with the constraint not validated. Each
+  `failed`: a failed index is dropped, a failed constraint's index kept with the constraint not validated. Then
+  one **`convert_column`** job (`ddl.md` §8.5 rule 2) runs per column left `converting`, other than a
+  primary-key column: in an internal read committed transaction at the newest snapshot it builds the catalog its
+  final transaction would publish — the column `ready` in its target type, in a new schema version whose
+  `SchemaVersion.completes` names the column — and, with that catalog installed, translates every row it sees
+  through it (the guard) and checks every unique key of the table for a value held twice (the replacement
+  indexes). If both hold it publishes that catalog; else it publishes the column `ready` in its old type in a new
+  version that completes nothing, and records the failure: the conversion's own code with a message naming the
+  first failing row's key, or `unique_violation`. Rows are never rewritten. The job's object is the table. Each
   job's `JobRecord` (`Store.jobs_of`) holds how it ended.
 
 ## Version chains and visibility
@@ -215,7 +223,17 @@ anomaly check is shown able to fail; a real store has both on.
   null), one dropped since skipped, and one present converted through each retype between, in order
   (`translate.sysl`; tests `translate_tests.sysl`). A scalar step is the strict cast of `exec_functions.sysl`; a
   record, union or relation converts by position, a record value short of its named type's fields reading the
-  fills the type keeps (`CatType.fills`). A value that does not convert is `D1001`.
+  fills the type keeps (`CatType.fills`). A version that completes a column's conversion is the one step that is
+  no cast: the column takes the conversion the version before records (`using`, or the strict cast its retype
+  recorded), evaluated as a definition expression over the row as that version holds it, once for all the rows
+  of one version a scan returns. A value that does not convert is `D1001`. The unique keys and foreign keys read
+  a row's key columns straight from its image unless a later version completed the conversion of one of them,
+  when they read it translated (`image_values`); a unique key is computed again whenever the newest version that
+  completes a conversion changes (`UniqueIx.converted`).
+- **Reconciliation of conversions.** A writer committing after a conversion it did not see completed has each row
+  it inserted or updated translated through it; a row the conversion fails on aborts the writer with the
+  conversion's code (`ddl.md` §6.4 rule 2). The executor checks the guard of a `converting` column on every write
+  of the retyping transaction itself (`exec_dml.sysl` `check_rows`), with the conversion's code.
 - **Ending.** Commit publishes the transaction's merged catalog at its commit number and records each key it
   locked as changed there; any end releases its keys. A version older than the one the oldest live transaction
   sees is dropped, and with it the rows of every table no retained catalog, no live view and the installed
