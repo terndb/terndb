@@ -18,7 +18,7 @@ On an Apple Silicon Mac, install it with Homebrew:
 brew install terndb/tap/terndb
 ```
 
-Or build it from the repository's root, with [sysl](https://github.com/sysl-lang/sysl) 0.13.6 or later:
+Or build it from the repository's root, with [sysl](https://github.com/sysl-lang/sysl) 0.13.7 or later:
 
 ```
 sysl build cli
