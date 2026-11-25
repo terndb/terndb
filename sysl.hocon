@@ -20,7 +20,7 @@
 package {
   name    = "terndb"
   version = "0.0.1"
-  sysl    = "0.13.5"
+  sysl    = "0.13.6"
 }
 
 // `docs/` holds the specifications and the survey's standalone probe programs, none of them part of
