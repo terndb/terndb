@@ -1001,6 +1001,11 @@ by §1–§11. A function not listed has exactly the behaviour its section gives
 `p09-export/`) showed that an exported C API with handles and a callback works, but not this one. The items below
 go to the sysl session; the ABI above is not to be bent around them.
 
+*Status at sysl 0.13.5:* items 1 to 6 and 9 are met, probed in `docs/phase0/sysl-survey/p16-capi013/` (`into_raw`/`from_raw`,
+`void *`, `const T *`, `size_t`, array parameters, `#define` from an exported `const`, `--header-guard`, `build-c --shared`
+with exactly the `@export` symbols). Item 7 is stated in sysl's `errors.md` (a trap aborts, never unwinds); items 8 and 10
+were not re-probed. See `FINDINGS.md` § "Status at sysl 0.13.5". The text below is the requirement as written.
+
 1. **Hand C a counted `&T` and take it back** (`into_raw` / `from_raw` or an exported `&T` parameter and return).
    0.11.0 has no way to keep a reference-counted object alive while only C holds it, so the probe kept every
    handle in a module registry `Buf[&Db]`, which leaks slots, needs a lock to be thread-safe, and cannot detect a
