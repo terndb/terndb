@@ -468,8 +468,8 @@ describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, i
                         // A plain column key names its column; an expression key, whose `column` is null
                         // (ddl.md §4.2), is its expression printed as SQL.
                         val column = kr.at(0, "column")
-                        var text = if column.is_null() then definition_text(kr.at(0, "expr"), kr.at(0, "expr_tree"), row, None)
-                            else sql_ident(cat_text(column))
+                        var text = sql_ident(cat_text(column))
+                        if column.is_null() then text = definition_text(kr.at(0, "expr"), kr.at(0, "expr_tree"), row, None)
                         if cat_bool(kr.at(0, "descending")) then text = text + " DESC"
                         keys.push(text)
                 _ -> ()

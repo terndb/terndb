@@ -585,7 +585,7 @@ a_join_on_the_right_of_a_join_is_parenthesised()
 
 @test
 using_reads_back_as_its_condition()
-    sp_query("select t.a from t join u using (name)", "SELECT t.a FROM t JOIN u ON t.name = u.name")
+    sp_query("select x.id from u as x join u as y using (name)", "SELECT x.id FROM u AS x JOIN u AS y ON x.name = y.name")
 
 @test
 grouping_writes_keys_and_aggregates_in_place()
@@ -632,9 +632,9 @@ a_select_without_from_reads_one_row()
 set_operations_parenthesise_their_inputs()
     sp_query("select a from t union all select id from u", "(SELECT t.a FROM t) UNION ALL (SELECT u.id FROM u)")
     sp_query("select a from t intersect select id from u except select id from u",
-        "((SELECT t.a FROM t) INTERSECT (SELECT u.id FROM u)) EXCEPT (SELECT u.id FROM u)")
+        "((SELECT t.a FROM t) INTERSECT (SELECT u.id FROM u)) EXCEPT (SELECT u_2.id FROM u AS u_2)")
     sp_query("select a from t union select id from u union select id from u",
-        "(SELECT t.a FROM t) UNION (SELECT u.id FROM u) UNION (SELECT u.id FROM u)")
+        "(SELECT t.a FROM t) UNION (SELECT u.id FROM u) UNION (SELECT u_2.id FROM u AS u_2)")
 
 @test
 a_set_operation_orders_by_output_names()
@@ -646,12 +646,12 @@ values_write_each_constant_with_its_type()
 
 @test
 with_names_its_queries()
-    sp_query("with c as (select a from t) select c.a from c", "WITH c AS (SELECT t.a FROM t) SELECT c.a FROM c")
-    sp_query("with c (x) as (values (1)) select c.x from c", "WITH c (x) AS (VALUES (1::int32)) SELECT c.x FROM c")
+    sp_query("with c as (select a from t) select c.a from c", "WITH c AS (SELECT t.a FROM t) SELECT c_2.a FROM c AS c_2")
+    sp_query("with c (x) as (values (1)) select c.x from c", "WITH c (x) AS (VALUES (1::int32)) SELECT c_2.x FROM c AS c_2")
 
 @test
 a_table_a_cte_shadows_is_qualified()
-    sp_query("with t as (select id from u) select p.a from public.t as p, t", "WITH t AS (SELECT u.id FROM u) SELECT p.a FROM public.t AS p CROSS JOIN t")
+    sp_query("with t as (select id from u) select p.a from public.t as p, t", "WITH t AS (SELECT u.id FROM u) SELECT p.a FROM public.t AS p CROSS JOIN t AS t_2")
 
 @test
 a_table_of_another_namespace_is_qualified()
@@ -696,7 +696,7 @@ a_limit_that_disagrees_with_its_sort_is_its_tree_text()
 a_window_is_its_tree_text()
     val w = Window(scan("public", "t", "t"), "w", items_of([NamedWin("r", WinCall("row_number", buf[Expr](), buf[Expr](), buf[SortKey](), None))]))
     assert_eq(sql_query_text(Project(w, "p", items_of([item("r", col("w", "r"))])), SpTables()),
-        "SELECT w.r AS r FROM (window :input (scan :table public.t :as t) :as w :items [r: (row_number)])")
+        "SELECT w.r FROM (window :input (scan :table public.t :as t) :as w :items [r: (row_number)])")
 
 // -- \d through the shell ------------------------------------------------------------------------
 

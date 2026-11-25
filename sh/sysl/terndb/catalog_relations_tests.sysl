@@ -168,11 +168,11 @@ a_plain_column_row_reports_every_column_of_catalog_columns()
     val rows = cr_now(c, "columns")
     assert_eq(rows.len(), 3)
     assert(rows[0] == rec([UInt(oid), UInt(1), UInt(0), Text("id"), cr_type(Int64), Text("int64"), Null, Bool(false), Bool(true),
-        Null, Null, Null, cr_ready()]))
+        Null, Null, Null, cr_ready(), Null, Null]))
     assert(rows[1] == rec([UInt(oid), UInt(2), UInt(1), Text("a"), cr_type(nullable(Int32)), Text("int32?"), Null, Bool(true), Bool(false),
-        Null, Null, Null, cr_ready()]))
+        Null, Null, Null, cr_ready(), Null, Null]))
     assert(rows[2] == rec([UInt(oid), UInt(3), UInt(2), Text("b"), cr_type(Text), Text("text"), Null, Bool(false), Bool(false),
-        Null, Null, Null, cr_ready()]))
+        Null, Null, Null, cr_ready(), Null, Null]))
 
 @test
 a_column_reports_its_default_generation_expression_and_identity_in_text_form()
@@ -509,8 +509,10 @@ a_renamed_column_is_followed_by_the_definitions_that_name_it()
     var c = cat_ok(cat_base(), cat_alter("t", [AddConstraint(k, false)]))
     c = cat_ok(c, cat_index("t_b", "t", ["b"]))
     c = cat_ok(c, cat_alter("t", [RenameColumn("b", "label")]))
-    assert(cr_on(c, cr_where("constraints", "name", cat_text("t_b_set"), ["kind"]))[0] == rec([variant(3, rec([Text("(call ne row.label ''::text)")]))]))
-    assert(cr_on(c, cr_where("indexes", "name", cat_text("t_b"), ["keys"]))[0] == rec([rel([rec([Text("label"), Text("row.label"), Bool(false)])])]))
+    assert(cr_on(c, cr_where("constraints", "name", cat_text("t_b_set"), ["kind"]))[0] == rec([variant(3, rec([Text("(call ne row.label ''::text)"),
+        cr_tree(call("ne", [cat_row("label"), cat_text("")]))]))]))
+    assert(cr_on(c, cr_where("indexes", "name", cat_text("t_b"), ["keys"]))[0] == rec([rel([rec([Text("label"), Text("row.label"), Bool(false),
+        cr_tree(cat_row("label"))])])]))
 
 @test
 an_altered_column_reports_its_new_default_and_nullability()

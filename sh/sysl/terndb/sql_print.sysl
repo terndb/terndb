@@ -725,15 +725,24 @@ private struct SqlPrinter
     /** A select-list item: `expr AS name`, the `AS` left out where a column gives the item its name. */
     item(*self, it: Item) -> string
         val o = self.ex(it.expr, SpOwn)
-        var named = false
-        it.expr match
-            Col(b, c) ->
-                if c == it.name && b != self.output
-                    self.binder(b) match
-                        Some(SpSource(_)) -> named = true
-                        _ -> ()
-            _ -> ()
+        val named = self.column_name(it.expr) == Some(it.name)
         if named then o.text else o.text + " AS " + sql_ident(it.name)
+
+    /** The name the front end derives for an item that is a column reference as printed (§5.4 rule 2):
+     * the column's, or for a group's key column, that of the key's own column.
+     */
+    column_name(self, e: Expr) -> Option[string]
+        e match
+            Col(b, c) ->
+                if b == self.output then return None
+                self.binder(b) match
+                    Some(SpGroup(keys, _)) ->
+                        for k in keys
+                            if k.name == c then return self.column_name(k.expr)
+                        None
+                    Some(_) -> Some(c)
+                    None -> None
+            _ -> None
 
     /** A `FROM` item: a table, a CTE, a join, or a query in parentheses with the binder it outputs as
      * its alias.
