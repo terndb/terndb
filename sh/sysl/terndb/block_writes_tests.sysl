@@ -1,0 +1,190 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf_filled}
+import sysl.fs.{IoError, NotOpen, Other, make_temp_dir, remove_dir_all}
+
+// Writes of whole 4 KiB blocks (`BlockDevice.write_blocks`), the write-ahead log's unit, on the
+// simulated device and on a host file: they land at their offset and leave the rest of the page as
+// it was, and on the simulator a crash, a tear or a sync brings to the media only the sectors a
+// write covers (`on-disk-format.md` §1 rule 6, §6.7 rule 3).
+
+private bw_block(fill: u8) -> Buf[u8] = buf_filled(DiskSectorSize, fill)
+
+/** The fill of each sector of page `n` as a read sees it: four bytes, one per sector. */
+private bw_sectors(d: &BlockDevice, n: u64) -> Buf[u8]
+    var p = buf_filled(DbPageSize, u8(0))
+    d.read_page(n, p.view_mut()).unwrap()
+    wr_buf([p[0], p[4096], p[8192], p[12288]])
+
+/** The fill of each sector of page `n` on the simulated media. */
+private bw_media(d: &SimDisk, n: u64) -> Buf[u8]
+    val p = d.durable_page(n)
+    wr_buf([p[0], p[4096], p[8192], p[12288]])
+
+private bw_errno[T](r: Result[T, IoError]) -> int = r match
+    Ok(_) -> 0
+    Err(e) -> e.code()
+
+// -- the simulated device -----------------------------------------------------------------------------
+
+@test
+a_block_write_lands_at_its_block_and_keeps_the_rest_of_the_page()
+    val d = sim_disk(1)
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.write_blocks(2, bw_block(7).view()).unwrap()
+    assert_eq(bw_sectors(d, 0), wr_buf([u8(1), u8(1), u8(7), u8(1)]))
+
+@test
+a_write_of_several_blocks_lands_at_each()
+    val d = sim_disk(1)
+    var b = buf_filled(3 * DiskSectorSize, u8(4))
+    b[DiskSectorSize] = 5
+    d.write_blocks(5, b.view()).unwrap()
+    assert_eq(bw_sectors(d, 1), wr_buf([u8(0), u8(4), u8(5), u8(4)]))
+
+@test
+a_block_write_past_the_end_grows_the_device_to_its_whole_page()
+    val d = sim_disk(1)
+    d.write_blocks(9, bw_block(3).view()).unwrap()
+    assert_eq(d.page_count(), Ok(u64(3)))
+    assert_eq(bw_sectors(d, 2), wr_buf([u8(0), u8(3), u8(0), u8(0)]))
+    assert_eq(bw_sectors(d, 0), wr_buf([u8(0), u8(0), u8(0), u8(0)]))
+
+@test
+a_block_write_that_is_empty_unaligned_or_crosses_a_page_is_refused()
+    val d = sim_disk(1)
+    assert_eq(bw_errno(d.write_blocks(0, buf_filled(0, u8(0)).view())), ErrnoInvalid)
+    assert_eq(bw_errno(d.write_blocks(0, buf_filled(4095, u8(0)).view())), ErrnoInvalid)
+    assert_eq(bw_errno(d.write_blocks(0, buf_filled(4097, u8(0)).view())), ErrnoInvalid)
+    assert_eq(bw_errno(d.write_blocks(3, buf_filled(8192, u8(0)).view())), ErrnoInvalid)
+    assert_eq(bw_errno(d.write_blocks(0, buf_filled(5 * 4096, u8(0)).view())), ErrnoInvalid)
+    assert_eq(d.page_count(), Ok(u64(0)))
+    assert_eq(d.unsynced(), usize(0))
+
+@test
+a_whole_page_of_blocks_from_its_first_is_accepted()
+    val d = sim_disk(1)
+    assert_eq(d.write_blocks(4, buf_filled(DbPageSize, u8(2)).view()), Ok(()))
+    assert_eq(d.write_blocks(7, bw_block(3).view()), Ok(()))
+    assert_eq(bw_sectors(d, 1), wr_buf([u8(2), u8(2), u8(2), u8(3)]))
+
+@test
+a_synced_block_write_reaches_the_media_and_leaves_the_other_sectors()
+    val d = sim_disk(1)
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.sync().unwrap()
+    d.write_blocks(1, bw_block(9).view()).unwrap()
+    assert_eq(bw_media(d, 0), wr_buf([u8(1), u8(1), u8(1), u8(1)]))
+    d.sync().unwrap()
+    assert_eq(bw_media(d, 0), wr_buf([u8(1), u8(9), u8(1), u8(1)]))
+
+@test
+a_crash_keeping_everything_brings_only_the_covered_sectors_of_a_block_write()
+    val d = sim_disk(1)
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.sync().unwrap()
+    // An unsynced whole-page write, then a block write whose page image carries it: a crash that
+    // drops the first and keeps the second must not bring the first's other sectors with it.
+    d.write_page(0, buf_filled(DbPageSize, u8(2)).view()).unwrap()
+    d.write_blocks(1, bw_block(3).view()).unwrap()
+    assert_eq(bw_sectors(d, 0), wr_buf([u8(2), u8(3), u8(2), u8(2)]))
+    d.crash_now(KeepSectors(wr_buf([u8(0), u8(0x0f)])))
+    assert_eq(bw_media(d, 0), wr_buf([u8(1), u8(3), u8(1), u8(1)]))
+
+@test
+a_crash_keeping_nothing_loses_an_unsynced_block_write()
+    val d = sim_disk(1)
+    d.write_blocks(1, bw_block(3).view()).unwrap()
+    d.crash_now(KeepNone)
+    assert_eq(d.durable_count(), u64(0))
+
+@test
+a_torn_block_write_keeps_only_covered_sectors_up_to_the_cut()
+    val d = sim_disk(1)
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.sync().unwrap()
+    d.schedule(d.next_op(), DkTornWrite(wr_buf([u8(0), u8(3), u8(2), u8(1)]), 3, KeepNone))
+    assert_eq(d.write_blocks(2, buf_filled(8192, u8(6)).view()), Err(NotOpen))
+    assert(d.is_down())
+    assert_eq(bw_media(d, 0), wr_buf([u8(1), u8(1), u8(6), u8(6)]))
+
+@test
+a_lost_block_write_reads_back_is_lost_by_a_crash_and_kept_by_a_sync()
+    val d = sim_disk(1)
+    d.schedule(d.next_op(), DkLostWrite)
+    d.write_blocks(1, bw_block(4).view()).unwrap()
+    assert_eq(bw_sectors(d, 0), wr_buf([u8(0), u8(4), u8(0), u8(0)]))
+    d.crash_now(KeepAll)
+    assert_eq(d.durable_count(), u64(0))
+    d.restart()
+    d.schedule(d.next_op(), DkLostWrite)
+    d.write_blocks(1, bw_block(4).view()).unwrap()
+    d.sync().unwrap()
+    assert_eq(bw_media(d, 0), wr_buf([u8(0), u8(4), u8(0), u8(0)]))
+
+@test
+a_crash_at_a_block_write_takes_the_device_down()
+    val d = sim_disk(1)
+    d.schedule(d.next_op(), DkCrash(KeepAll))
+    assert_eq(d.write_blocks(1, bw_block(4).view()), Err(NotOpen))
+    assert(d.is_down())
+    assert_eq(d.write_blocks(1, bw_block(4).view()), Err(NotOpen))
+
+@test
+a_failed_sync_resolves_block_writes_by_their_cover()
+    val d = sim_disk(1)
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.sync().unwrap()
+    d.write_blocks(3, bw_block(8).view()).unwrap()
+    d.schedule(d.next_op(), DkSyncFail(KeepAll))
+    assert_eq(d.sync(), Err(Other(ErrnoIo)))
+    assert_eq(bw_media(d, 0), wr_buf([u8(1), u8(1), u8(1), u8(8)]))
+
+@test
+crash_now_on_a_device_already_down_changes_nothing()
+    val d = sim_disk(1)
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.crash_now(KeepNone)
+    d.crash_now(KeepAll)
+    assert_eq(d.durable_count(), u64(0))
+    d.restart()
+    assert(!d.is_down())
+
+// -- a host file -----------------------------------------------------------------------------------------
+
+@test
+a_file_device_s_block_write_keeps_the_rest_of_the_page()
+    val dir = make_temp_dir("terndb-bw-keep").unwrap()
+    val d = create_file_device(s"$dir/data").unwrap()
+    d.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.write_blocks(2, bw_block(7).view()).unwrap()
+    assert_eq(bw_sectors(d, 0), wr_buf([u8(1), u8(1), u8(7), u8(1)]))
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_device_s_block_write_past_the_end_grows_it_to_the_whole_page()
+    val dir = make_temp_dir("terndb-bw-grow").unwrap()
+    val d = create_file_device(s"$dir/data").unwrap()
+    d.write_blocks(5, bw_block(3).view()).unwrap()
+    assert_eq(d.page_count(), Ok(u64(2)))
+    assert_eq(bw_sectors(d, 1), wr_buf([u8(0), u8(3), u8(0), u8(0)]))
+    assert_eq(bw_sectors(d, 0), wr_buf([u8(0), u8(0), u8(0), u8(0)]))
+    d.sync().unwrap()
+    d.close().unwrap()
+    val again = open_file_device(s"$dir/data").unwrap()
+    assert_eq(bw_sectors(again, 1), wr_buf([u8(0), u8(3), u8(0), u8(0)]))
+    again.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_device_refuses_a_block_write_that_is_empty_unaligned_or_crosses_a_page()
+    val dir = make_temp_dir("terndb-bw-refuse").unwrap()
+    val d = create_file_device(s"$dir/data").unwrap()
+    assert_eq(bw_errno(d.write_blocks(0, buf_filled(0, u8(0)).view())), ErrnoInvalid)
+    assert_eq(bw_errno(d.write_blocks(0, buf_filled(100, u8(0)).view())), ErrnoInvalid)
+    assert_eq(bw_errno(d.write_blocks(2, buf_filled(12288, u8(0)).view())), ErrnoInvalid)
+    assert_eq(d.page_count(), Ok(u64(0)))
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()

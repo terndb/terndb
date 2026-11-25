@@ -1,0 +1,255 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// A crash before, during and after a group-commit flush, under every way a crash resolves the
+// writes in flight (`CrashKeep`), and what the log reads as afterwards (`on-disk-format.md` §6.7,
+// §6.9, §9 D1, D12). The setup is fixed: commit 100 is acknowledged in block 1, then block records
+// 1–6 are appended at blocks 2–7, and one flush writes them as two writes — page 0's blocks 2–3,
+// then page 1's blocks 4–7 — and a sync. Every outcome must be commit 100 and then a prefix of
+// 1–6 with no gap, and the log must reopen and take a commit after it.
+
+/** The setup: the directory, the log, segment 0's device, and the number of the flush's first I/O. */
+private wc_setup(seed: u64) -> (&SimWalDir, &Wal, &SimDisk, u64)
+    val (d, w) = wt_new(seed)
+    w.commit(wt_commit(100)).unwrap()
+
+    for i in 1..<7
+        w.append(wt_block(u64(i))).unwrap()
+
+    val s = wt_seg(d, 0)
+    (d, w, s, s.next_op())
+
+/** The process dies (if it has not), every cache resolved as `keep` says; the log is read, reopened,
+ * and must then hold what it held and a new commit after it. Answers the transactions read.
+ */
+private wc_recover(d: &SimWalDir, keep: CrashKeep) -> Buf[u64]
+    d.crash(keep)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    val w = wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+    w.commit(wt_commit(200)).unwrap()
+    val again = wt_txns(wt_read(d))
+    val want = got.copy()
+    want.push(200)
+    assert_eq(again, want)
+    got
+
+/** Commit 100, then 1 to `n`. */
+private wc_prefix(n: u64) -> Buf[u64]
+    val out = buf[u64]()
+    out.push(100)
+
+    for i in 1..<n + 1
+        out.push(i)
+
+    out
+
+/** Whether `got` is commit 100 and then 1, 2, … with no gap. */
+private wc_is_prefix(got: Buf[u64]) -> bool
+    if got.len() == 0 || got[0] != 100 || got.len() > 7 then return false
+
+    for i in 1..<got.len()
+        if got[i] != u64(i) then return false
+
+    true
+
+private wc_masks(a: u8, b: u8) -> CrashKeep = KeepSectors(wr_buf([a, b]))
+
+/** A crash at the flush's sync, before it runs, resolving the two cached writes as `keep` says. */
+private wc_before_sync(keep: CrashKeep) -> Buf[u64]
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 2, DkCrash(keep))
+    assert_eq(wr_code(w.flush()), "D4004")
+    assert_eq(w.durable_lsn(), u64(8192))
+    wc_recover(d, KeepNone)
+
+// -- before the sync ---------------------------------------------------------------------------------
+
+@test
+a_crash_before_the_sync_keeping_nothing_leaves_the_acknowledged_commit()
+    assert_eq(wc_before_sync(KeepNone), wc_prefix(0))
+
+@test
+a_crash_before_the_sync_keeping_everything_leaves_every_record()
+    assert_eq(wc_before_sync(KeepAll), wc_prefix(6))
+
+@test
+a_crash_before_the_sync_keeping_the_first_block_only_leaves_its_record()
+    assert_eq(wc_before_sync(wc_masks(0b0100, 0b1111)), wc_prefix(1))
+
+@test
+a_crash_before_the_sync_losing_the_first_block_leaves_nothing_after_it()
+    assert_eq(wc_before_sync(wc_masks(0b1000, 0b1111)), wc_prefix(0))
+
+@test
+a_crash_before_the_sync_keeping_page_0_and_half_of_page_1_leaves_four()
+    assert_eq(wc_before_sync(wc_masks(0b1100, 0b0011)), wc_prefix(4))
+
+@test
+a_crash_before_the_sync_losing_a_middle_block_of_page_1_stops_at_the_gap()
+    assert_eq(wc_before_sync(wc_masks(0b1100, 0b1101)), wc_prefix(3))
+
+@test
+a_crash_before_the_sync_keeping_only_page_1_leaves_nothing_after_the_commit()
+    assert_eq(wc_before_sync(wc_masks(0b0000, 0b1111)), wc_prefix(0))
+
+@test
+a_crash_before_the_sync_with_no_masks_keeps_nothing()
+    assert_eq(wc_before_sync(KeepSectors(buf[u8]())), wc_prefix(0))
+
+@test
+a_crash_before_the_sync_keeping_drawn_sectors_always_leaves_a_prefix()
+    for seed in 1..<41
+        val (d, w, s, op) = wc_setup(u64(seed))
+        s.schedule(op + 2, DkCrash(KeepDrawn))
+        w.flush().unwrap_err()
+        val got = wc_recover(d, KeepNone)
+        assert(wc_is_prefix(got), s"seed $seed: $got")
+
+// -- during the flush's writes -------------------------------------------------------------------------
+
+@test
+a_crash_before_the_flush_s_first_write_leaves_the_acknowledged_commit()
+    for keep in [KeepNone, KeepAll, KeepDrawn]
+        val (d, w, s, op) = wc_setup(1)
+        s.schedule(op, DkCrash(keep))
+        w.flush().unwrap_err()
+        assert_eq(wc_recover(d, KeepNone), wc_prefix(0))
+
+@test
+a_crash_between_the_flush_s_writes_keeping_everything_leaves_page_0_s_records()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 1, DkCrash(KeepAll))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(2))
+
+@test
+a_crash_between_the_flush_s_writes_keeping_nothing_leaves_the_acknowledged_commit()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 1, DkCrash(KeepNone))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(0))
+
+@test
+a_crash_between_the_flush_s_writes_keeping_the_second_block_only_leaves_nothing_after()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 1, DkCrash(KeepSectors(wr_buf([u8(0b1000)]))))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(0))
+
+@test
+a_torn_second_write_after_a_kept_first_leaves_up_to_the_tear()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 1, DkTornWrite(wr_buf([u8(0), u8(1), u8(2), u8(3)]), 2, KeepAll))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(4))
+
+@test
+a_torn_second_write_after_a_lost_first_leaves_nothing_after_the_gap()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 1, DkTornWrite(wr_buf([u8(0), u8(1), u8(2), u8(3)]), 4, KeepNone))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(0))
+
+@test
+a_torn_second_write_keeping_a_later_sector_first_stops_at_the_gap()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op + 1, DkTornWrite(wr_buf([u8(3), u8(0), u8(1), u8(2)]), 2, KeepAll))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(3))
+
+@test
+a_torn_first_write_keeping_its_second_block_leaves_nothing_after_the_gap()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op, DkTornWrite(wr_buf([u8(3), u8(2), u8(1), u8(0)]), 1, KeepAll))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(0))
+
+@test
+a_torn_first_write_keeping_its_first_block_leaves_that_record()
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op, DkTornWrite(wr_buf([u8(2), u8(3), u8(1), u8(0)]), 1, KeepAll))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(1))
+
+@test
+a_torn_write_never_brings_back_a_sector_the_write_did_not_cover()
+    // Page 0's write covers blocks 2 and 3 only: a tear "keeping" sectors 0 and 1 leaves block 1,
+    // the acknowledged commit, as it was.
+    val (d, w, s, op) = wc_setup(1)
+    s.schedule(op, DkTornWrite(wr_buf([u8(0), u8(1), u8(2), u8(3)]), 2, KeepAll))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(0))
+
+@test
+a_crash_during_the_flush_with_drawn_faults_always_leaves_a_prefix()
+    for seed in 1..<41
+        for at in 0..<3
+            val (d, w, s, op) = wc_setup(u64(seed))
+            s.schedule(op + u64(at), DkCrash(KeepDrawn))
+            w.flush().unwrap_err()
+            val got = wc_recover(d, KeepDrawn)
+            assert(wc_is_prefix(got), s"seed $seed at $at: $got")
+
+// -- after the sync ----------------------------------------------------------------------------------
+
+@test
+a_crash_after_the_sync_keeps_every_acknowledged_record_whatever_the_cache_does()
+    for keep in [KeepNone, KeepAll, KeepDrawn, wc_masks(0, 0), KeepSectors(buf[u8]())]
+        val (d, w, _, _) = wc_setup(1)
+        w.flush().unwrap()
+        assert_eq(wc_recover(d, keep), wc_prefix(6))
+
+@test
+a_crash_after_the_sync_with_later_appends_in_flight_keeps_the_acknowledged_ones()
+    for keep in [KeepNone, KeepAll, KeepDrawn, wc_masks(0b0010, 0b1111)]
+        val (d, w, s, _) = wc_setup(1)
+        w.flush().unwrap()
+        w.append(wt_block(7)).unwrap()
+        w.append(wt_block(8)).unwrap()
+        val op = s.next_op()
+        s.schedule(op + 1, DkCrash(keep))
+        w.flush().unwrap_err()
+        val got = wc_recover(d, KeepNone)
+        assert(got.len() >= 7, s"$got")
+
+        for i in 1..<got.len()
+            assert_eq(got[i], u64(i))
+
+@test
+a_commit_that_returned_survives_a_crash_right_after_under_every_keep()
+    for keep in [KeepNone, KeepAll, KeepDrawn, KeepSectors(buf[u8]())]
+        val (d, w) = wt_new(1)
+        w.commit(wt_commit(1)).unwrap()
+        w.commit(wt_commit(2)).unwrap()
+        assert_eq(wc_recover(d, keep).len(), usize(2))
+
+// -- whole mini-transactions only ----------------------------------------------------------------------
+
+@test
+a_crash_mid_mini_transaction_drops_it_whole()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(100)).unwrap()
+    w.append_mtr(wr_buf([wt_block(1), wt_block(2), wt_block(3)]).view()).unwrap()
+    w.append_mtr(wr_buf([wt_block(4), wt_block(5), wt_block(6)]).view()).unwrap()
+    val s = wt_seg(d, 0)
+    // Blocks 2–5 kept, 6 and 7 lost: the second mini-transaction's last two records are gone.
+    s.schedule(s.next_op() + 2, DkCrash(wc_masks(0b1100, 0b0011)))
+    w.flush().unwrap_err()
+    assert_eq(wc_recover(d, KeepNone), wc_prefix(3))
+
+@test
+a_crash_mid_mini_transaction_with_drawn_faults_leaves_whole_ones_only()
+    for seed in 1..<41
+        val (d, w) = wt_new(u64(seed))
+        w.commit(wt_commit(100)).unwrap()
+        w.append_mtr(wr_buf([wt_block(1), wt_block(2), wt_block(3)]).view()).unwrap()
+        w.append_mtr(wr_buf([wt_block(4), wt_block(5), wt_block(6)]).view()).unwrap()
+        val s = wt_seg(d, 0)
+        s.schedule(s.next_op() + 2, DkCrash(KeepDrawn))
+        w.flush().unwrap_err()
+        val got = wc_recover(d, KeepNone)
+        assert(got.len() == 1 || got.len() == 4 || got.len() == 7, s"seed $seed: $got")
+        assert(wc_is_prefix(got), s"seed $seed: $got")

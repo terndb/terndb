@@ -1,0 +1,165 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.threads.{Barrier, barrier, scope}
+
+// Group commit with threads (`wal.sysl`, `on-disk-format.md` §6.7, §9 D14): committers waiting
+// together share one sync, every commit returns only once its record is durable, mini-transactions
+// stay contiguous while threads append at once, and a failed sync fails every waiter.
+
+private wg_has(xs: Buf[u64], x: u64) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+/** Appends commit `txn`, waits at `b` until every thread has appended, then waits for it to be
+ * durable, and checks that it is.
+ */
+private wg_append_then_wait(w: *Wal, b: &sync Barrier, txn: u64)
+    val a = w.append(wt_commit(txn)).unwrap()
+    b.wait()
+    w.wait_durable(a.end).unwrap()
+    assert(w.durable_lsn() >= a.end, s"commit $txn returned before LSN ${a.end} was durable")
+
+@test
+committers_waiting_together_share_one_sync()
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+    val b = barrier(8)
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_append_then_wait(p, b, u64(i) + 1)))
+
+    assert_eq(w.flushes(), u64(1))
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(8))
+
+    for t in 1..<9
+        assert(wg_has(got, u64(t)), s"commit $t is missing from $got")
+
+/** `m` commits of transactions `base`, `base + 1`, …, each checked durable once it returns. */
+private wg_commits(w: *Wal, base: u64, m: u64)
+    for j in 0..<m
+        val a = w.commit(wt_commit(base + j)).unwrap()
+        assert(w.durable_lsn() >= a.end, s"commit ${base + j} returned before LSN ${a.end} was durable")
+
+@test
+every_commit_of_many_threads_returns_only_once_durable_and_survives_a_crash()
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_commits(p, u64(i) * 1000, 40)))
+
+    assert(w.flushes() <= 320)
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(320))
+
+    // Each thread's commits are in the log in the order the thread made them.
+    for i in 0..<8
+        var next = u64(i) * 1000
+
+        for t in got
+            if t / 1000 == u64(i)
+                assert_eq(t, next)
+                next += 1
+
+        assert_eq(next, u64(i) * 1000 + 40)
+
+/** `m` mini-transactions of three records of `base + j`, each followed by its commit. */
+private wg_mtrs(w: *Wal, base: u64, m: u64)
+    for j in 0..<m
+        val t = base + j
+        w.append_mtr(wr_buf([wt_overflow(t, 30), wt_overflow(t, 300), wt_overflow(t, 3000)]).view()).unwrap()
+        w.commit(wt_commit(t)).unwrap()
+
+@test
+mini_transactions_stay_contiguous_while_threads_append_at_once()
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+
+    scope((s) ->
+        for i in 0..<6
+            s.spawn(() -> wg_mtrs(p, u64(i) * 1000, 25)))
+
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_read(d)
+    assert_eq(got.len(), usize(6 * 25 * 4))
+    var i: usize = 0
+
+    while i < got.len()
+        if wal_kind(got[i].body) == WkOverflowWrite
+            val t = got[i].txn
+            assert_eq(got[i].flags, WalMtrCont)
+            assert_eq(got[i + 1].txn, t)
+            assert_eq(got[i + 1].flags, WalMtrCont)
+            assert_eq(got[i + 2].txn, t)
+            assert_eq(got[i + 2].flags, u8(0))
+            i += 3
+        else
+            assert_eq(wal_kind(got[i].body), WkTxnCommit)
+            i += 1
+
+/** Waits for `lsn` and expects the failed sync's `io_error`. */
+private wg_wait_fails(w: *Wal, b: &sync Barrier, lsn: u64)
+    b.wait()
+    assert_eq(wr_code(w.wait_durable(lsn)), "D4004")
+    assert_eq(wr_code(w.append(wt_commit(999))), "D4004")
+
+@test
+a_failed_sync_fails_every_committer_waiting_on_it()
+    val (d, w) = wt_new(1)
+    val ends = buf[u64]()
+
+    for t in 1..<9
+        ends.push(w.append(wt_commit(u64(t))).unwrap().end)
+
+    // Eight commits fill 512 bytes of block 1: one write, then the sync, which fails.
+    val s0 = wt_seg(d, 0)
+    s0.schedule(s0.next_op() + 1, DkSyncFail(KeepAll))
+    val p: *Wal = &*w
+    val b = barrier(8)
+    val v = ends.view()
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_wait_fails(p, b, v[i])))
+
+    assert_eq(w.flushes(), u64(0))
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+    assert(w.failed())
+
+@test
+appends_go_on_while_a_flush_is_under_way()
+    // A thread flushing over and over while others append: nothing appended is lost or doubled.
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+
+    scope((s) ->
+        s.spawn(() ->
+            for _ in 0..<200
+                p.flush().unwrap())
+
+        for i in 0..<4
+            s.spawn(() ->
+                for j in 0..<50
+                    p.append(wt_commit(u64(i) * 1000 + u64(j))).unwrap()))
+
+    w.flush().unwrap()
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(200))
+
+    for i in 0..<4
+        for j in 0..<50
+            assert(wg_has(got, u64(i) * 1000 + u64(j)))
