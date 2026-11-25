@@ -1,0 +1,183 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.fs.IoError
+import sysl.slices.copy
+
+// The WAL reader (`on-disk-format.md` §6.9): a forward scan from an LSN that hands out the records of
+// whole mini-transactions and stops at the end of the log. The end is the first position where the
+// CRC fails, `lsn` is not the position, `len` is 0, short, unaligned or runs past the segment, or the
+// segment is missing or is not this log's; that is a torn or unwritten tail, not corruption (D12).
+// A trailing mini-transaction whose last record lies past the end is dropped whole (§6.3 rule 2).
+//
+// What is corruption (`D1001`) is a record whose frame holds but that does not parse, and an end met
+// before `must_reach`: a position the caller knows was durable, such as the end of the checkpoint
+// it starts from. Records past the end are never handed out, even where some would validate.
+
+/** A forward scan of the log of `cfg` in `dir`. Build one with `wal_reader`. */
+struct WalReader
+    dir: &WalDir
+    cfg: WalConfig
+    must_reach: u64
+    pos: u64
+    seg_no: u64
+    dev: Option[&BlockDevice]
+    seg_name: string
+    page_no: u64
+    page: Buf[u8]
+    page_held: bool
+    pending: Buf[WalRecord]
+    ready: Buf[WalRecord]
+    taken: usize
+    complete_end: u64
+    stopped: bool
+    len_of_last: u64
+
+    /** The next record of the log, `None` at its end. A record is handed out only once the last
+     * record of its mini-transaction has been read and found valid; pads are not handed out.
+     */
+    next(*self) -> Result[Option[WalRecord], CodecError]
+        while true
+            if self.taken < self.ready.len()
+                val r = self.ready[self.taken]
+                self.taken += 1
+                return Ok(Some(r))
+
+            if self.stopped then return Ok(None)
+            self.ready.clear()
+            self.taken = 0
+
+            self.step()? match
+                Some(rec) -> self.take_record(rec)?
+                None ->
+                    self.stopped = true
+                    self.pending.clear()
+
+                    if self.complete_end < self.must_reach
+                        return Err(refusal("D1001", s"the WAL ends at LSN ${self.complete_end}, before LSN ${self.must_reach}, which was durable", [
+                            Detail("lsn", s"${self.complete_end}")]))
+
+        Ok(None)
+
+    /** Where the log ends: past the last record of the last whole mini-transaction, which is where a
+     * writer reopening the log starts. Meaningful once `next` has answered `None`.
+     */
+    end(self) -> u64 = self.complete_end
+
+    /** Every record left, to the end of the log. */
+    rest(*self) -> Result[Buf[WalRecord], CodecError]
+        val out = buf[WalRecord]()
+
+        while true
+            self.next()? match
+                Some(r) -> out.push(r)
+                None -> break
+
+        Ok(out)
+
+    private take_record(*self, rec: WalRecord) -> Result[unit, CodecError]
+        val after = wal_next_record(rec.lsn + u64(self.len_of_last), self.cfg.shift)
+
+        if wal_kind(rec.body) == WkPad
+            // The writer never puts a pad inside a mini-transaction (`wal.md`).
+            if self.pending.len() > 0 then return Err(refusal("D1001", s"the WAL record at LSN ${rec.lsn} is a pad inside a mini-transaction", [Detail("lsn", s"${rec.lsn}")]))
+            self.complete_end = after
+            return Ok(())
+
+        self.pending.push(rec)
+
+        if rec.flags & WalMtrCont == 0
+            for r in self.pending
+                self.ready.push(r)
+
+            self.pending.clear()
+            self.complete_end = after
+
+        Ok(())
+
+    /** Reads `into.len` bytes at offset `off` of the open segment. `Ok(false)` when the segment's
+     * file is too short to hold them, which ends the log.
+     */
+    private read_at(*self, off: u64, into: []u8) -> Result[bool, CodecError]
+        val dev = self.dev.unwrap()
+        val pages = dev.page_count() match
+            Ok(n) -> n
+            Err(e) -> return Err(wal_io_error("a read", self.seg_name, e))
+
+        if into.len == 0 then return Ok(true)
+        if (off + u64(into.len) - 1) / u64(DbPageSize) >= pages then return Ok(false)
+        var done: usize = 0
+
+        while done < into.len
+            val at = off + u64(done)
+            val n = at / u64(DbPageSize)
+
+            if !self.page_held || self.page_no != n
+                self.page_held = false
+
+                dev.read_page(n, self.page.view_mut()) match
+                    Err(e) -> return Err(wal_io_error("a read", self.seg_name, e))
+                    Ok(_) -> ()
+
+                self.page_no = n
+                self.page_held = true
+
+            val in_page = usize(at % u64(DbPageSize))
+            val take = if DbPageSize - in_page < into.len - done then DbPageSize - in_page else into.len - done
+            copy(into[done..<done + take], self.page.view()[in_page..<in_page + take])
+            done += take
+
+        Ok(true)
+
+    /** Opens segment `k`: `Ok(false)` when it is missing or its header is not this log's segment `k`. */
+    private open_segment(*self, k: u64) -> Result[bool, CodecError]
+        self.dev = None
+        self.page_held = false
+        val first = wal_segment_lsn(k, self.cfg.shift)
+        val name = wal_segment_name(self.cfg.timeline, first)
+        self.seg_name = name
+
+        val there = self.dir.has(name) match
+            Ok(b) -> b
+            Err(e) -> return Err(wal_io_error("a lookup", name, e))
+
+        if !there then return Ok(false)
+
+        val dev = self.dir.open(name) match
+            Ok(d) -> d
+            Err(e) -> return Err(wal_io_error("an open", name, e))
+
+        self.dev = Some(dev)
+        self.seg_no = k
+        var header = buf_filled(usize(WalSegmentHeaderSize), u8(0))
+        if !self.read_at(0, header.view_mut())? then return Ok(false)
+        wal_check_segment_header(header.view(), self.cfg, first)
+
+    /** The record at `pos`, or `None` at the end of the log. */
+    private step(*self) -> Result[Option[WalRecord], CodecError]
+        val k = wal_segment_of(self.pos, self.cfg.shift)
+
+        if self.dev.is_none() || self.seg_no != k
+            if !self.open_segment(k)? then return Ok(None)
+
+        val off = wal_segment_offset(self.pos, self.cfg.shift)
+        var header = buf_filled(WalHeaderSize, u8(0))
+        if !self.read_at(off, header.view_mut())? then return Ok(None)
+        val len = wal_frame_len(header.view())
+        if !wal_len_fits(len, off, self.cfg.shift) then return Ok(None)
+        var rec = buf_filled(usize(len), u8(0))
+        if !self.read_at(off, rec.view_mut())? then return Ok(None)
+        if !wal_frame_valid(rec.view(), self.pos) then return Ok(None)
+        val r = wal_decode(rec.view())?
+        self.len_of_last = u64(len)
+        self.pos = wal_next_record(self.pos + u64(len), self.cfg.shift)
+        Ok(Some(r))
+end WalReader
+
+/** A scan of the log of `cfg` in `dir` from `from`, which must be where a record starts.
+ * `must_reach` is a position the log is known to reach: an end before it is `data_corrupted`
+ * (`D1001`) rather than the end of the log. A segment header of a format this release does not read
+ * is `format_unsupported` (`D3001`); a read that fails is `io_error` (`D4004`).
+ */
+wal_reader(dir: &WalDir, cfg: WalConfig, from: u64, must_reach: u64) -> &WalReader =
+    WalReader(dir, cfg, must_reach, from, 0, None, "", 0, buf_filled(DbPageSize, u8(0)), false, buf[WalRecord](), buf[WalRecord](), 0, from, false, 0)

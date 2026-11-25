@@ -1,0 +1,324 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.checksum.crc32c
+import sysl.encoding.{get_u16_le, get_u32_le, get_u64_le, put_u16_le, put_u32_le, put_u64_le}
+import sysl.fs.{IoError, NotFound, NotOpen, entries, exists, open as fs_open, remove_file, rename as fs_rename}
+import sysl.text.from_utf8
+
+// The write-ahead log's segment files (`on-disk-format.md` §6.6): their names, the header block that
+// starts each one, and the directory that holds them. The directory is a seam as the block device is:
+// `FileWalDir` is the host's directory, and `SimWalDir` holds a simulated device per segment, so a
+// test injects every disk fault of `isolation.md` §7.3 into the log.
+
+/** The WAL format this release writes and reads (§6.6 `wal_format`). */
+const WalFormat: u16 = 1
+
+/** What a segment header's `magic` holds: ASCII `TERNWAL1`. */
+private wal_magic() -> []const u8 = "TERNWAL1".bytes
+
+/** What every segment of one log shares: the database it belongs to, its timeline, and the size of
+ * its segments, 2^`shift` bytes. The format's size is 2^26 (`WalFormatShift`); a smaller one is a
+ * test configuration that lets the simulator roll segments over without 64 MiB each (`wal.md`).
+ */
+struct WalConfig derives Eq
+    db_uuid: Buf[u8]
+    timeline: u32
+    shift: u64
+
+/** The log of database `db_uuid` on `timeline`, in segments of the format's size. */
+wal_config(db_uuid: []const u8, timeline: u32) -> WalConfig = wal_config_sized(db_uuid, timeline, WalFormatShift)
+
+/** The same with segments of 2^`shift` bytes: at least one page, at most the format's 64 MiB. */
+wal_config_sized(db_uuid: []const u8, timeline: u32, shift: u64) -> WalConfig
+    if shift < 14 || shift > WalFormatShift then panic(s"a WAL segment of 2^$shift bytes is not between one page and 64 MiB")
+    if db_uuid.len != 16 then panic(s"a database UUID is 16 bytes, not ${db_uuid.len}")
+    val id = buf[u8]()
+    id.extend(db_uuid)
+    WalConfig(id, timeline, shift)
+
+private hex_digits(v: u64, width: usize) -> string
+    val digits = "0123456789abcdef".bytes
+    var out = buf_filled(width, u8(0))
+    var x = v
+
+    for i in 0..<width
+        out[width - 1 - i] = digits[usize(x & 0xf)]
+        x = x >> 4
+
+    from_utf8(out.view()).unwrap()
+
+/** The file name of the segment of `timeline` that starts at LSN `first_lsn`:
+ * `<timeline:08x>-<first lsn:016x>.twal` (§6.6).
+ */
+wal_segment_name(timeline: u32, first_lsn: u64) -> string = s"${hex_digits(u64(timeline), 8)}-${hex_digits(first_lsn, 16)}.twal"
+
+private hex_value(c: u8) -> Option[u64]
+    if c >= 0x30 && c <= 0x39 then return Some(u64(c - 0x30))
+    if c >= 0x61 && c <= 0x66 then return Some(u64(c - 0x61 + 10))
+    None
+
+private parse_hex(b: []const u8) -> Option[u64]
+    var v: u64 = 0
+
+    for c in b
+        v = (v << 4) | hex_value(c)?
+
+    Some(v)
+
+/** The timeline and first LSN a segment file's name gives, or `None` for a name that is not a
+ * segment's: a different shape, upper-case hex, or another extension.
+ */
+wal_parse_segment_name(name: string) -> Option[(u32, u64)]
+    val b = name.bytes
+    if b.len != 30 || b[8] != 0x2d || !name.ends_with(".twal") then return None
+    val timeline = parse_hex(b[0..<8])?
+    val first = parse_hex(b[9..<25])?
+    Some((u32(timeline), first))
+
+/** The 4 KiB header block of the segment of `cfg` starting at `first_lsn`, sealed with its CRC
+ * over [4, 4096). `prev_crc` is the previous segment's header CRC, 0 for the first (§6.6).
+ */
+wal_segment_header(cfg: WalConfig, first_lsn: u64, prev_crc: u32) -> Buf[u8]
+    var h = buf_filled(usize(WalSegmentHeaderSize), u8(0))
+    val v = h.view_mut()
+
+    for i in 0..<8
+        v[4 + i] = wal_magic()[i]
+
+    put_u16_le(v[12..<14], WalFormat)
+    put_u16_le(v[14..<16], 0)
+
+    for i in 0..<16
+        v[16 + i] = cfg.db_uuid[i]
+
+    put_u32_le(v[32..<36], cfg.timeline)
+    put_u32_le(v[36..<40], cfg.timeline)
+    put_u64_le(v[40..<48], first_lsn)
+    put_u64_le(v[48..<56], u64(prev_crc))
+    put_u32_le(v[0..<4], crc32c(v[4..<usize(WalSegmentHeaderSize)]))
+    h
+
+/** The CRC a segment header block carries. */
+wal_header_crc(block: []const u8) -> u32 = get_u32_le(block[0..<4]).unwrap()
+
+/** Whether `block`, read from the start of the segment of `cfg` expected to start at `first_lsn`,
+ * is that segment's header. `Ok(false)` — a CRC that fails, a wrong magic, another database or
+ * timeline, a `term` that differs from the timeline, another first LSN — means the segment counts as
+ * missing, which ends the log there (§6.6, §6.9). A header that is whole but of a `wal_format` or a
+ * `key_version` this release does not know is `format_unsupported` (`D3001`).
+ */
+wal_check_segment_header(block: []const u8, cfg: WalConfig, first_lsn: u64) -> Result[bool, CodecError]
+    if block.len < usize(WalSegmentHeaderSize) then return Ok(false)
+    if wal_header_crc(block) != crc32c(block[4..<usize(WalSegmentHeaderSize)]) then return Ok(false)
+
+    for i in 0..<8
+        if block[4 + i] != wal_magic()[i] then return Ok(false)
+
+    val format = get_u16_le(block[12..<14]).unwrap()
+    val key_version = get_u16_le(block[14..<16]).unwrap()
+
+    if format != WalFormat || key_version != 0
+        return Err(refusal("D3001", s"the WAL segment at LSN $first_lsn has format $format and key version $key_version; this release reads format $WalFormat, unencrypted", [Detail("lsn", s"$first_lsn")]))
+
+    for i in 0..<16
+        if block[16 + i] != cfg.db_uuid[i] then return Ok(false)
+
+    val timeline = get_u32_le(block[32..<36]).unwrap()
+    val term = get_u32_le(block[36..<40]).unwrap()
+    if timeline != cfg.timeline || term != timeline then return Ok(false)
+    Ok(get_u64_le(block[40..<48]).unwrap() == first_lsn)
+
+// -- the directory ---------------------------------------------------------------------------------
+
+/** The directory a log's segment files live in. Names are bare file names.
+ *
+ * `create` makes a new, empty file, emptying one already there; `open` opens one that exists. A
+ * `create`, `rename` or `remove` is durable once `sync` has returned.
+ */
+trait WalDir
+    /** What errors name the directory by. */
+    name(self) -> string
+
+    /** Every file name in the directory, in no particular order. */
+    list(*self) -> Result[Buf[string], IoError]
+
+    has(*self, file: string) -> Result[bool, IoError]
+
+    open(*self, file: string) -> Result[&BlockDevice, IoError]
+
+    create(*self, file: string) -> Result[&BlockDevice, IoError]
+
+    rename(*self, from_name: string, to_name: string) -> Result[unit, IoError]
+
+    remove(*self, file: string) -> Result[unit, IoError]
+
+    sync(*self) -> Result[unit, IoError]
+
+/** The I/O error a WAL operation met, naming the file (`D4004`). */
+wal_io_error(what: string, file: string, e: IoError) -> CodecError =
+    refusal("D4004", s"$what of $file: ${e.message()}", [Detail("errno", s"${e.code()}"), Detail("file", file)])
+
+/** The host directory at `path`. */
+struct FileWalDir
+    path: string
+
+/** The directory's own sync, which makes its entries durable: `F_FULLFSYNC` on macOS, `fsync`
+ * elsewhere, on the directory opened for reading.
+ */
+#if macos
+private dir_sync(path: string) -> Result[unit, IoError]
+    var f = fs_open(path)?
+    f.full_sync()?
+    f.close()
+#else
+private dir_sync(path: string) -> Result[unit, IoError]
+    var f = fs_open(path)?
+    f.sync_data()?
+    f.close()
+#endif
+
+impl WalDir for FileWalDir
+    name(self) -> string = self.path
+
+    list(*self) -> Result[Buf[string], IoError] = entries(self.path)
+
+    has(*self, file: string) -> Result[bool, IoError] = Ok(exists(s"${self.path}/$file"))
+
+    open(*self, file: string) -> Result[&BlockDevice, IoError] = Ok(open_file_device(s"${self.path}/$file")?)
+
+    create(*self, file: string) -> Result[&BlockDevice, IoError] = Ok(create_file_device(s"${self.path}/$file")?)
+
+    rename(*self, from_name: string, to_name: string) -> Result[unit, IoError] =
+        fs_rename(s"${self.path}/$from_name", s"${self.path}/$to_name")
+
+    remove(*self, file: string) -> Result[unit, IoError] = remove_file(s"${self.path}/$file")
+
+    sync(*self) -> Result[unit, IoError] = dir_sync(self.path)
+
+/** The host directory at `path`, which must exist. */
+file_wal_dir(path: string) -> &FileWalDir = FileWalDir(path)
+
+/** One file of a simulated directory. */
+struct SimWalFile
+    name: string
+    disk: &SimDisk
+
+/** A simulated directory: a simulated device per file, each drawing its faults at `rates` from a
+ * seed of its own derived from the directory's. Its entries change at once and are durable at once;
+ * the faults are the devices'. A crash of the process is `crash`, which crashes every device, and
+ * `restart` brings them all back.
+ */
+struct SimWalDir
+    label: string
+    seed: u64
+    rates: FaultRates
+    files: Buf[SimWalFile]
+    made: u64
+
+    private find(self, file: string) -> Option[usize]
+        for i in 0..<self.files.len()
+            if self.files[i].name == file then return Some(i)
+
+        None
+
+    /** The simulated device of `file`, if the directory holds it. */
+    disk(self, file: string) -> Option[&SimDisk] = self.find(file) match
+        Some(i) -> Some(self.files[i].disk)
+        None -> None
+
+    /** Whether a crash has taken the process down. */
+    is_down(self) -> bool
+        for f in self.files
+            if f.disk.is_down() then return true
+
+        false
+
+    /** The process dies: every device resolves its cache as `keep` says. */
+    crash(*self, keep: CrashKeep)
+        for f in self.files
+            f.disk.crash_now(keep)
+
+    /** Brings every device back after a crash. */
+    restart(*self)
+        for f in self.files
+            if f.disk.is_down() then f.disk.restart()
+
+    /** Every device's trace, file by file. */
+    trace(self) -> Buf[string]
+        val out = buf[string]()
+
+        for f in self.files
+            for line in f.disk.trace()
+                out.push(s"${f.name}: $line")
+
+        out
+end SimWalDir
+
+impl WalDir for SimWalDir
+    name(self) -> string = self.label
+
+    list(*self) -> Result[Buf[string], IoError]
+        if self.is_down() then return Err(NotOpen)
+        val out = buf[string]()
+
+        for f in self.files
+            out.push(f.name)
+
+        Ok(out)
+
+    has(*self, file: string) -> Result[bool, IoError]
+        if self.is_down() then return Err(NotOpen)
+        Ok(self.find(file).is_some())
+
+    open(*self, file: string) -> Result[&BlockDevice, IoError]
+        if self.is_down() then return Err(NotOpen)
+
+        self.find(file) match
+            Some(i) -> Ok(self.files[i].disk)
+            None -> Err(NotFound)
+
+    create(*self, file: string) -> Result[&BlockDevice, IoError]
+        if self.is_down() then return Err(NotOpen)
+        self.made += 1
+        val d = sim_disk_with(self.seed * 1000003 + self.made, self.rates)
+
+        self.find(file) match
+            Some(i) -> self.files[i] = SimWalFile(file, d)
+            None -> self.files.push(SimWalFile(file, d))
+
+        Ok(d)
+
+    rename(*self, from_name: string, to_name: string) -> Result[unit, IoError]
+        if self.is_down() then return Err(NotOpen)
+
+        val i = self.find(from_name) match
+            Some(i) -> i
+            None -> return Err(NotFound)
+
+        val d = self.files[i].disk
+        self.files.remove(i)
+
+        // A rename over a file that exists replaces it, as on the host.
+        self.find(to_name) match
+            Some(j) -> self.files[j] = SimWalFile(to_name, d)
+            None -> self.files.push(SimWalFile(to_name, d))
+
+        Ok(())
+
+    remove(*self, file: string) -> Result[unit, IoError]
+        if self.is_down() then return Err(NotOpen)
+
+        self.find(file) match
+            Some(i) ->
+                self.files.remove(i)
+                Ok(())
+            None -> Err(NotFound)
+
+    sync(*self) -> Result[unit, IoError] = if self.is_down() then Err(NotOpen) else Ok(())
+
+/** A simulated directory whose devices inject only the faults a test schedules on them. */
+sim_wal_dir(seed: u64) -> &SimWalDir = sim_wal_dir_with(seed, no_disk_faults())
+
+/** A simulated directory whose devices draw faults at `rates`. */
+sim_wal_dir_with(seed: u64, rates: FaultRates) -> &SimWalDir = SimWalDir(s"simdir-$seed", seed, rates, buf[SimWalFile](), 0)

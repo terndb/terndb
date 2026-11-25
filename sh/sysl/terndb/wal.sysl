@@ -1,0 +1,525 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.slices.copy
+import sysl.threads.Mutex
+
+// The WAL writer (`on-disk-format.md` §6.3, §6.6, §6.7, §9 D6, D12, D14): it assigns LSNs, keeps a
+// mini-transaction's records contiguous in one segment, pads a segment it cannot fill, creates,
+// preallocates and recycles segment files, and makes the log durable by group commit. Every write
+// goes through a `WalDir` and its block devices, so the simulator can fault any of them.
+//
+// Two locks. `state` guards the buffer of records not yet written and the LSN counters, and is held
+// only for the moment an append or a flush takes its share. `io` guards the files and is held by the
+// one flusher at a time while it writes and syncs, with `state` free, so appends go on during a
+// sync. A committer that finds its LSN not yet durable takes `io`; when it gets it, the flush that
+// held it may already have covered its record, and then it returns without any I/O: every commit
+// whose record was in the buffer when a flush began shares that flush's one sync (§6.7 rule 1).
+
+/** Where an append put its records: each record's LSN, and the end of the last, which a commit waits
+ * on to be durable (§6.7 rule 2).
+ */
+struct WalAppended derives Eq
+    lsns: Buf[u64]
+    end: u64
+
+/** What `state` guards: the records appended since the last flush began, as the bytes of LSNs
+ * [base, end), with the 4 KiB of each segment header they cross held as zeros, and `durable`, the
+ * end of the prefix known synced (§6.7 rule 1). After a failed sync `failed` holds its error and the
+ * log refuses everything (D14).
+ */
+struct WalState
+    shift: u64
+    base: u64
+    bytes: Buf[u8]
+    end: u64
+    durable: u64
+    failed: Option[CodecError]
+    flushes: u64
+
+    private push_zeros(*self, n: u64)
+        for _ in 0..<n
+            self.bytes.push(0)
+
+    /** Moves `end` past the header of the next segment when it is the segment's end, or when less
+     * than a record header's room is left there; those last bytes are left zeros (`wal.md`).
+     */
+    settle(*self)
+        val next = wal_next_record(self.end, self.shift)
+        self.push_zeros(next - self.end)
+        self.end = next
+
+    /** A pad record of `n` bytes, header included, at `end`. */
+    private push_pad(*self, n: u64)
+        wal_encode(WalRecord(self.end, 0, 0, 0, WbPad(n - u64(WalHeaderSize))), self.bytes).unwrap()
+        self.end += n
+
+    /** Fills the rest of the segment with a pad, so the next record starts the next segment (§6.2
+     * rule 2).
+     */
+    fill_segment(*self)
+        self.push_pad(wal_segment_size(self.shift) - wal_segment_offset(self.end, self.shift))
+        self.settle()
+
+    /** Pads to the end of the 4 KiB block, so the next flush starts in a fresh block (§6.7 rule 3).
+     * Less than a record header's room before the boundary is padded through the next block too.
+     */
+    pad_block(*self)
+        val r = WalBlock - self.end % WalBlock
+        if r == WalBlock then return
+        self.push_pad(if r >= u64(WalHeaderSize) then r else r + WalBlock)
+        self.settle()
+end WalState
+
+/** What `io` guards: the directory, and the segment open for writing with its header's CRC. */
+struct WalIo
+    dir: &WalDir
+    cfg: WalConfig
+    seg_no: u64
+    dev: Option[&BlockDevice]
+    header_crc: u32
+
+    /** The device of segment `k`, creating it if it is not open: a spare left by recycling under
+     * its name is taken over, or else a new file is made, then its header is written, the rest of
+     * the segment preallocated as zeros where the file does not reach, and all of it synced before a
+     * record goes in.
+     */
+    segment(*self, k: u64) -> Result[&BlockDevice, CodecError]
+        if self.dev.is_some() && self.seg_no == k then return Ok(self.dev.unwrap())
+        val shift = self.cfg.shift
+        val first = wal_segment_lsn(k, shift)
+        val name = wal_segment_name(self.cfg.timeline, first)
+        val prev = if self.dev.is_some() && self.seg_no + 1 == k then self.header_crc else self.header_crc_of(k)?
+        self.dev = None
+
+        val spare = self.dir.has(name) match
+            Ok(b) -> b
+            Err(e) -> return Err(wal_io_error("a lookup", name, e))
+
+        val made = if spare then self.dir.open(name) else self.dir.create(name)
+
+        val dev = made match
+            Ok(d) -> d
+            Err(e) -> return Err(wal_io_error(if spare then "an open" else "a create", name, e))
+
+        val header = wal_segment_header(self.cfg, first, prev)
+
+        dev.write_blocks(0, header.view()) match
+            Err(e) -> return Err(wal_io_error("a write", name, e))
+            Ok(_) -> ()
+
+        val have = dev.page_count() match
+            Ok(n) -> n
+            Err(e) -> return Err(wal_io_error("a read", name, e))
+
+        val zeros = buf_filled(DbPageSize, u8(0))
+        var p = if have > 1 then have else u64(1)
+
+        while p < wal_segment_size(shift) / u64(DbPageSize)
+            dev.write_page(p, zeros.view()) match
+                Err(e) -> return Err(wal_io_error("a write", name, e))
+                Ok(_) -> ()
+
+            p += 1
+
+        dev.sync() match
+            Err(e) -> return Err(wal_io_error("a sync", name, e))
+            Ok(_) -> ()
+
+        if !spare
+            self.dir.sync() match
+                Err(e) -> return Err(wal_io_error("a sync", self.dir.name(), e))
+                Ok(_) -> ()
+
+        self.seg_no = k
+        self.dev = Some(dev)
+        self.header_crc = wal_header_crc(header.view())
+        Ok(dev)
+
+    /** The header CRC a segment after `k - 1` names as its predecessor's: segment `k - 1`'s, read
+     * from its file, or 0 when there is none or it is not this log's (§6.6 `prev_segment_crc`).
+     */
+    header_crc_of(*self, k: u64) -> Result[u32, CodecError]
+        if k == 0 then return Ok(0)
+        val first = wal_segment_lsn(k - 1, self.cfg.shift)
+        val name = wal_segment_name(self.cfg.timeline, first)
+
+        val there = self.dir.has(name) match
+            Ok(b) -> b
+            Err(e) -> return Err(wal_io_error("a lookup", name, e))
+
+        if !there then return Ok(0)
+
+        val dev = self.dir.open(name) match
+            Ok(d) -> d
+            Err(e) -> return Err(wal_io_error("an open", name, e))
+
+        var page = buf_filled(DbPageSize, u8(0))
+
+        val pages = dev.page_count() match
+            Ok(n) -> n
+            Err(e) -> return Err(wal_io_error("a read", name, e))
+
+        if pages == 0 then return Ok(0)
+
+        dev.read_page(0, page.view_mut()) match
+            Err(e) -> return Err(wal_io_error("a read", name, e))
+            Ok(_) -> ()
+
+        if wal_check_segment_header(page.view(), self.cfg, first)? then Ok(wal_header_crc(page.view())) else Ok(0)
+
+    /** Writes `bytes`, the log from LSN `from`, both ends on 4 KiB boundaries, block by block into
+     * the segments it covers, skipping their headers, then syncs every segment written (§6.7 rule 4:
+     * the writes may complete in any order, and nothing counts as durable until every sync returns).
+     */
+    write_range(*self, from: u64, bytes: []const u8) -> Result[unit, CodecError]
+        val shift = self.cfg.shift
+        val size = wal_segment_size(shift)
+        val touched = buf[&BlockDevice]()
+        val names = buf[string]()
+        var touched_seg: u64 = 0
+        var pos = from
+        var i: usize = 0
+
+        while i < bytes.len
+            val k = wal_segment_of(pos, shift)
+            val off = wal_segment_offset(pos, shift)
+
+            if off < WalSegmentHeaderSize
+                val skip = if WalSegmentHeaderSize - off < u64(bytes.len - i) then WalSegmentHeaderSize - off else u64(bytes.len - i)
+                i += usize(skip)
+                pos += skip
+                continue
+
+            val dev = self.segment(k)?
+            val name = wal_segment_name(self.cfg.timeline, wal_segment_lsn(k, shift))
+
+            if touched.len() == 0 || touched_seg != k
+                touched.push(dev)
+                names.push(name)
+                touched_seg = k
+
+            val n = if size - off < u64(bytes.len - i) then usize(size - off) else bytes.len - i
+            var j: usize = 0
+
+            while j < n
+                val at = off + u64(j)
+                val page_left = usize(u64(DbPageSize) - at % u64(DbPageSize))
+                val run = if page_left < n - j then page_left else n - j
+
+                dev.write_blocks(at / WalBlock, bytes[i + j..<i + j + run]) match
+                    Err(e) -> return Err(wal_io_error("a write", name, e))
+                    Ok(_) -> ()
+
+                j += run
+
+            i += n
+            pos += u64(n)
+
+        for t in 0..<touched.len()
+            touched[t].sync() match
+                Err(e) -> return Err(wal_io_error("a sync", names[t], e))
+                Ok(_) -> ()
+
+        Ok(())
+
+    /** The segments of this log's timeline in the directory, by number, ascending. */
+    segments(*self) -> Result[Buf[u64], CodecError]
+        val names = self.dir.list() match
+            Ok(n) -> n
+            Err(e) -> return Err(wal_io_error("a listing", self.dir.name(), e))
+
+        val out = buf[u64]()
+
+        for name in names
+            wal_parse_segment_name(name) match
+                Some((timeline, first)) ->
+                    if timeline == self.cfg.timeline && wal_segment_offset(first, self.cfg.shift) == 0
+                        val k = wal_segment_of(first, self.cfg.shift)
+                        var at = out.len()
+
+                        while at > 0 && out[at - 1] > k
+                            at -= 1
+
+                        out.insert(at, k)
+                None -> ()
+
+        Ok(out)
+
+    name_of(self, k: u64) -> string = wal_segment_name(self.cfg.timeline, wal_segment_lsn(k, self.cfg.shift))
+
+    sync_dir(*self) -> Result[unit, CodecError] = self.dir.sync() match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(wal_io_error("a sync", self.dir.name(), e))
+
+    remove(*self, k: u64) -> Result[unit, CodecError] = self.dir.remove(self.name_of(k)) match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(wal_io_error("a remove", self.name_of(k), e))
+end WalIo
+
+/** The write-ahead log, open for appending. Build one with `wal_create` or `wal_open`. Every method
+ * may be called from any thread.
+ */
+struct Wal
+    state: Mutex[WalState]
+    io: Mutex[WalIo]
+
+    /** Appends one record (`append_mtr` of one). */
+    append(*self, rec: WalRecord) -> Result[WalAppended, CodecError] = self.append_mtr([rec])
+
+    /** Appends the records of one mini-transaction, contiguously and in one segment: every record
+     * but the last gets `MTR_CONT` and the last has none, whatever the caller set (§6.3 rule 2).
+     * When the segment's rest cannot hold them all, a pad fills it and they start the next one. A
+     * record's own LSN is set as it goes in; the one the caller gave is ignored. `D2003` refuses an
+     * empty mini-transaction, one with a pad (the log writes its own), one longer than a segment
+     * holds, and any record `wal_encode` refuses. After a failed sync every append is refused (D14).
+     */
+    append_mtr(*self, recs: []const WalRecord) -> Result[WalAppended, CodecError]
+        if recs.len == 0 then return fail("D2003", "a WAL record cannot be written: a mini-transaction has no records")
+        var enc = buf[u8]()
+        val lens = buf[usize]()
+
+        for r in recs
+            if wal_kind(r.body) == WkPad then return fail("D2003", "a WAL record cannot be written: the log writes its own pads")
+            lens.push(wal_encode(WalRecord(0, r.txn, r.flags & ~WalMtrCont, r.undo_next, r.body), enc)?)
+
+        val st = self.state.lock_raw()
+        defer self.state.unlock_raw()
+        if st.failed.is_some() then return Err(st.failed.unwrap())
+        val total = u64(enc.len())
+
+        if total > wal_segment_capacity(st.shift)
+            return fail("D2003", s"a WAL record cannot be written: a mini-transaction of $total bytes is longer than a segment's ${wal_segment_capacity(st.shift)}")
+
+        if wal_segment_offset(st.end, st.shift) + total > wal_segment_size(st.shift) then st.fill_segment()
+        val lsns = buf[u64]()
+        var at: usize = 0
+
+        for i in 0..<lens.len()
+            wal_stamp(enc.view_mut()[at..<at + lens[i]], st.end, i + 1 < lens.len())
+            lsns.push(st.end)
+            st.end += u64(lens[i])
+            at += lens[i]
+
+        st.bytes.extend(enc.view())
+        val end = st.end
+        st.settle()
+        Ok(WalAppended(lsns, end))
+
+    /** Returns once the log is durable through `lsn` (or through everything appended, if that ends
+     * sooner): the commit acknowledgement of §6.7 rule 2. One caller at a time flushes — pads to the
+     * block boundary, writes everything appended and syncs — while the rest wait for it; those whose
+     * records it covered then return with no I/O of their own. `durable_lsn` advances only after
+     * every sync of the flush has returned. A write or sync that fails is fatal: this and every later
+     * call is `io_error` (`D4004`), and `durable_lsn` stays where it was (D14).
+     */
+    wait_durable(*self, lsn: u64) -> Result[unit, CodecError]
+        val st0 = self.state.lock_raw()
+        val failed0 = st0.failed
+        val done0 = st0.durable >= lsn || st0.durable >= st0.end
+        self.state.unlock_raw()
+        if failed0.is_some() then return Err(failed0.unwrap())
+        if done0 then return Ok(())
+
+        val io = self.io.lock_raw()
+        defer self.io.unlock_raw()
+        val st = self.state.lock_raw()
+
+        if st.failed.is_some()
+            val e = st.failed.unwrap()
+            self.state.unlock_raw()
+            return Err(e)
+
+        if st.durable >= lsn || st.durable >= st.end
+            self.state.unlock_raw()
+            return Ok(())
+
+        st.pad_block()
+        val from = st.base
+        val bytes = st.bytes
+        val to = st.end
+        st.bytes = buf[u8]()
+        st.base = to
+        self.state.unlock_raw()
+
+        val r = io.write_range(from, bytes.view())
+        val st2 = self.state.lock_raw()
+
+        r match
+            Ok(_) ->
+                st2.durable = to
+                st2.flushes += 1
+            Err(e) -> st2.failed = Some(e)
+
+        self.state.unlock_raw()
+        r
+
+    /** Appends `rec` and waits for it to be durable: a commit at `synchronous = on`. */
+    commit(*self, rec: WalRecord) -> Result[WalAppended, CodecError]
+        val a = self.append(rec)?
+        self.wait_durable(a.end)?
+        Ok(a)
+
+    /** Makes everything appended so far durable. */
+    flush(*self) -> Result[unit, CodecError] = self.wait_durable(self.end_lsn())
+
+    /** The end of the prefix of the log known durable (§6.7 `durable_lsn`). */
+    durable_lsn(*self) -> u64
+        val st = self.state.lock_raw()
+        val d = st.durable
+        self.state.unlock_raw()
+        d
+
+    /** Where the next record would go. */
+    end_lsn(*self) -> u64
+        val st = self.state.lock_raw()
+        val e = st.end
+        self.state.unlock_raw()
+        e
+
+    /** How many flushes have written and synced. */
+    flushes(*self) -> u64
+        val st = self.state.lock_raw()
+        val n = st.flushes
+        self.state.unlock_raw()
+        n
+
+    /** Whether a write or sync has failed, which leaves recovery from storage as the only way on. */
+    failed(*self) -> bool
+        val st = self.state.lock_raw()
+        val f = st.failed.is_some()
+        self.state.unlock_raw()
+        f
+
+    /** Recycles every segment wholly below `bound`, the lowest of the retention bounds (§6.6: the
+     * checkpoint's `redo_lsn`, the archiver, every replication slot, any running backup), and never
+     * the segment being written: each is renamed to the next number past every segment there is, to
+     * be taken over when the log reaches it. Its stale records stay, and the reader refuses them by
+     * their LSN (§6.2 rule 3). Answers how many were recycled.
+     */
+    recycle(*self, bound: u64) -> Result[u64, CodecError]
+        val io = self.io.lock_raw()
+        defer self.io.unlock_raw()
+        if self.failed() then return Err(self.failure())
+        val ks = io.segments()?
+        val size = wal_segment_size(io.cfg.shift)
+        var next = if ks.len() > 0 && ks[ks.len() - 1] > io.seg_no then ks[ks.len() - 1] + 1 else io.seg_no + 1
+        var n: u64 = 0
+
+        for k in ks
+            if (k + 1) * size <= bound && k < io.seg_no
+                io.dir.rename(io.name_of(k), io.name_of(next)) match
+                    Err(e) -> return Err(wal_io_error("a rename", io.name_of(k), e))
+                    Ok(_) -> ()
+
+                next += 1
+                n += 1
+
+        if n > 0 then io.sync_dir()?
+        Ok(n)
+
+    private failure(*self) -> CodecError
+        val st = self.state.lock_raw()
+        val e = st.failed.unwrap()
+        self.state.unlock_raw()
+        e
+end Wal
+
+/** A new log of `cfg` in `dir`, whose first segment is created, preallocated and synced, and whose
+ * first record will go at LSN 4096 (§6.1). A directory already holding a segment of the timeline is
+ * `database_exists` (`D4003`).
+ */
+wal_create(dir: &WalDir, cfg: WalConfig) -> Result[&Wal, CodecError]
+    var io = WalIo(dir, cfg, 0, None, 0)
+    val there = io.segments()?
+
+    if there.len() > 0
+        return Err(refusal("D4003", s"${dir.name()} already holds WAL segment ${io.name_of(there[0])}", [Detail("file", io.name_of(there[0]))]))
+
+    io.segment(0)?
+    val st = WalState(cfg.shift, WalFirstLsn, buf[u8](), WalFirstLsn, WalFirstLsn, None, 0)
+    Ok(Wal(Mutex.new(st), Mutex.new(io)))
+
+/** The log of `cfg` in `dir`, reopened at its end for appending after a crash or a clean stop. It is
+ * scanned from `from` as `wal_reader` scans it, `must_reach` included, to the end of its last whole
+ * mini-transaction. Then, before anything is appended: every segment past the end's goes, since one
+ * may hold records that would validate past the end, and the rest of the end's segment is filled
+ * with a pad, written and synced, so that no stale record after the end can ever be read as the log's
+ * (§6.9: "MUST write a PAD from the end of the log … MUST delete or ignore every later segment").
+ * When the end's segment is itself missing or not this log's, it is removed and made afresh when the
+ * log reaches it.
+ */
+wal_open(dir: &WalDir, cfg: WalConfig, from: u64, must_reach: u64) -> Result[&Wal, CodecError]
+    val r = wal_reader(dir, cfg, from, must_reach)
+    r.rest()?
+    val e = r.end()
+    val shift = cfg.shift
+    val k = wal_segment_of(e, shift)
+    var io = WalIo(dir, cfg, k, None, 0)
+    var removed = false
+
+    for s in io.segments()?
+        if s > k
+            io.remove(s)?
+            removed = true
+
+    if removed then io.sync_dir()?
+    val name = io.name_of(k)
+
+    val there = dir.has(name) match
+        Ok(b) -> b
+        Err(x) -> return Err(wal_io_error("a lookup", name, x))
+
+    var header_ok = false
+    var dev: Option[&BlockDevice] = None
+    var first_page = buf_filled(DbPageSize, u8(0))
+    var block = buf_filled(usize(WalBlock), u8(0))
+
+    if there
+        val d = dir.open(name) match
+            Ok(d) -> d
+            Err(x) -> return Err(wal_io_error("an open", name, x))
+
+        val pages = d.page_count() match
+            Ok(n) -> n
+            Err(x) -> return Err(wal_io_error("a read", name, x))
+
+        if pages > 0
+            d.read_page(0, first_page.view_mut()) match
+                Err(x) -> return Err(wal_io_error("a read", name, x))
+                Ok(_) -> ()
+
+            header_ok = wal_check_segment_header(first_page.view(), cfg, wal_segment_lsn(k, shift))?
+
+        dev = Some(d)
+
+    if !header_ok
+        if there
+            io.remove(k)?
+            io.sync_dir()?
+
+        val st = WalState(shift, e, buf[u8](), e, e, None, 0)
+        return Ok(Wal(Mutex.new(st), Mutex.new(io)))
+
+    // The block the end lies in is written again whole, its bytes before the end as they are.
+    val d = dev.unwrap()
+    val floor = wal_block_floor(e)
+    val off = wal_segment_offset(floor, shift)
+    var page = buf_filled(DbPageSize, u8(0))
+
+    d.read_page(off / u64(DbPageSize), page.view_mut()) match
+        Err(x) -> return Err(wal_io_error("a read", name, x))
+        Ok(_) -> ()
+
+    val in_page = usize(off % u64(DbPageSize))
+    copy(block.view_mut(), page.view()[in_page..<in_page + usize(WalBlock)])
+    val prefix = buf[u8]()
+    prefix.extend(block.view()[0..<usize(e - floor)])
+    io.dev = dev
+    io.header_crc = wal_header_crc(first_page.view())
+    var st = WalState(shift, floor, prefix, e, e, None, 0)
+    st.fill_segment()
+    val target = st.end
+    val w: &Wal = Wal(Mutex.new(st), Mutex.new(io))
+    w.wait_durable(target)?
+    Ok(w)

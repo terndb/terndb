@@ -29,6 +29,12 @@ const ErrnoInvalid: int = 22
  * at or past its end; a write is acknowledged when the device has taken it, which does not make it
  * durable. `sync` makes every write acknowledged before it durable (§1 rule 7), or fails, and after a
  * failure nothing says which of those writes survived.
+ *
+ * `write_blocks` writes whole 4 KiB blocks, block `n` being bytes [n × 4096, (n + 1) × 4096): the
+ * write-ahead log's unit, whose flush must not rewrite a block already durable (§6.7 rule 3). The
+ * blocks lie within one page, which is the unit the simulator tears, and a write past the end grows
+ * the device to hold their whole page, the rest of which reads as zeros. A buffer that is empty, not
+ * a whole number of blocks, or reaches past its first block's page is `Other(22)`.
  */
 trait BlockDevice
     /** What errors name the device by: its file's path, or the simulated device's name. */
@@ -41,7 +47,13 @@ trait BlockDevice
 
     write_page(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
 
+    write_blocks(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+
     sync(*self) -> Result[unit, IoError]
+
+/** Whether `bytes` written at block `n` is a run of whole blocks within one page (`write_blocks`). */
+blocks_fit_a_page(n: u64, bytes: []const u8) -> bool =
+    bytes.len > 0 && bytes.len % DiskSectorSize == 0 && usize(n % u64(SectorsPerPage)) + bytes.len / DiskSectorSize <= SectorsPerPage
 
 /** A device over one file of the host's, page `n` at byte `n × 16384`. */
 struct FileDevice
@@ -85,6 +97,20 @@ impl BlockDevice for FileDevice
         while done < DbPageSize
             done += self.file.write_at(n * u64(DbPageSize) + u64(done), bytes[done..<DbPageSize])?
 
+        Ok(())
+
+    write_blocks(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+        if !blocks_fit_a_page(n, bytes) then return Err(Other(ErrnoInvalid))
+        val at = n * u64(DiskSectorSize)
+        var done: usize = 0
+
+        while done < bytes.len
+            done += self.file.write_at(at + u64(done), bytes[done..<bytes.len])?
+
+        // A write that ended inside a page past the old end leaves the file a part of a page long:
+        // the page is made whole, its other blocks zeros, so the device holds it.
+        val page_end = (n / u64(SectorsPerPage) + 1) * u64(DbPageSize)
+        if self.file.extent()? < page_end then self.file.truncate(long(page_end))?
         Ok(())
 
     sync(*self) -> Result[unit, IoError] = durable_sync(&self.file)

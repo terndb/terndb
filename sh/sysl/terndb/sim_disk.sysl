@@ -13,6 +13,7 @@ import sysl.slices.copy
 // page, cached or not. A sync moves the whole cache to the media. A crash resolves each cached write
 // sector by sector — none of it, all of it, or any subset of its four sectors reaches the media
 // (`on-disk-format.md` §1 rule 6) — then empties the cache and takes the device down until `restart`.
+// A write of blocks covers only its own sectors of the page, and only those can reach the media.
 //
 // Each I/O (a read, a write or a sync) has a number, counted from 0. A test schedules a fault at a
 // number; otherwise each fault is drawn at the rate `FaultRates` gives it, in parts per million, from
@@ -70,11 +71,14 @@ struct ScheduledFault
     op: u64
     fault: DiskFault
 
-/** A write the device acknowledged and has not synced. */
+/** A write the device acknowledged and has not synced: the page as a read sees it after the write,
+ * and the sectors the write covers, the only ones it can bring to the media.
+ */
 struct CachedWrite
     page: u64
     bytes: Buf[u8]
     lost: bool
+    covers: u8
 
 /** The three kinds of I/O a fault is decided at. */
 enum DiskOp
@@ -122,6 +126,13 @@ struct SimDisk
     restart(*self)
         self.down = false
         self.events.push(s"op ${self.ops}: restart")
+
+    /** The process dies now, between I/Os: the cache is resolved as `keep` says and the device goes
+     * down. A device already down is left as it is. It is how a crash at another device of the same
+     * process reaches this one.
+     */
+    crash_now(*self, keep: CrashKeep)
+        if !self.down then self.crash(self.ops, keep)
 
     /** How many acknowledged writes no sync has covered yet. */
     unsynced(self) -> usize = self.cache.len()
@@ -260,7 +271,7 @@ struct SimDisk
     private resolve(*self, keep: CrashKeep, why: string)
         for i in 0..<self.cache.len()
             val w = self.cache[i]
-            val mask = if w.lost then u8(0) else self.kept(keep, i)
+            val mask = if w.lost then u8(0) else self.kept(keep, i) & w.covers
             self.events.push(s"$why: cached write $i of page ${w.page} keeps sectors $mask")
             self.to_media(w.page, w.bytes.view(), mask)
 
@@ -331,12 +342,56 @@ impl BlockDevice for SimDisk
             Some(DkLostWrite) ->
                 if bytes.len != DbPageSize then return Err(Other(ErrnoInvalid))
                 self.events.push(s"op $op: write of page $n will be lost")
-                self.cache.push(CachedWrite(n, buf_of_bytes(bytes), true))
+                self.cache.push(CachedWrite(n, buf_of_bytes(bytes), true, 0x0f))
                 return Ok(())
             _ -> ()
 
         if bytes.len != DbPageSize then return Err(Other(ErrnoInvalid))
-        self.cache.push(CachedWrite(n, buf_of_bytes(bytes), false))
+        self.cache.push(CachedWrite(n, buf_of_bytes(bytes), false, 0x0f))
+        Ok(())
+
+    write_blocks(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+        if self.down then return Err(NotOpen)
+        val op = self.ops
+        val fits = blocks_fit_a_page(n, bytes)
+        val page = n / u64(SectorsPerPage)
+        val first = usize(n % u64(SectorsPerPage))
+        var covers: u8 = 0
+        var image = buf_filled(DbPageSize, u8(0))
+
+        // The page as a read will see it after the write, taken before a crash resolves the cache.
+        if fits
+            for s in first..<first + bytes.len / DiskSectorSize
+                covers = covers | (u8(1) << u8(s))
+
+            self.current(page, image.view_mut())
+            copy(image.view_mut()[first * DiskSectorSize..<first * DiskSectorSize + bytes.len], bytes)
+
+        self.begin(DiskWrite) match
+            Some(DkCrash(keep)) ->
+                self.crash(op, keep)
+                return Err(NotOpen)
+            Some(DkTornWrite(order, cut, rest)) ->
+                if !is_sector_order(order) || cut > SectorsPerPage then panic(s"a torn write at I/O $op names no order of a page's sectors")
+                self.crash(op, rest)
+                var mask: u8 = 0
+
+                for i in 0..<cut
+                    mask = mask | (u8(1) << order[i])
+
+                mask = mask & covers
+                self.events.push(s"op $op: write of blocks of page $page tears after $cut sectors, keeping sectors $mask")
+                if fits then self.to_media(page, image.view(), mask)
+                return Err(NotOpen)
+            Some(DkLostWrite) ->
+                if !fits then return Err(Other(ErrnoInvalid))
+                self.events.push(s"op $op: write of blocks of page $page will be lost")
+                self.cache.push(CachedWrite(page, image, true, covers))
+                return Ok(())
+            _ -> ()
+
+        if !fits then return Err(Other(ErrnoInvalid))
+        self.cache.push(CachedWrite(page, image, false, covers))
         Ok(())
 
     sync(*self) -> Result[unit, IoError]
@@ -353,7 +408,7 @@ impl BlockDevice for SimDisk
             _ -> ()
 
         for w in self.cache
-            self.to_media(w.page, w.bytes.view(), 0x0f)
+            self.to_media(w.page, w.bytes.view(), w.covers)
 
         self.cache.clear()
         Ok(())

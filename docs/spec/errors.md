@@ -207,6 +207,7 @@ Raised under the rules of `on-disk-format.md`. None is retryable.
 | `D1001` | `data_corrupted` | A checksum or structural check failed; the server stops serving the object (`isolation.md` §8, `on-disk-format.md` §3.1). |
 | `D2001` | `key_too_long` | An encoded key longer than 1,024 bytes (`on-disk-format.md` §3.6). |
 | `D2002` | `entry_too_large` | An entry cannot be brought within 4,000 bytes by moving columns out of line (§4.7). |
+| `D2003` | `wal_record_unwritable` | A WAL record or mini-transaction the format cannot express: a field past its width, a flag its kind cannot carry, or more bytes than one segment holds (§6.2 rule 2, §6.3, §6.4). |
 | `D3001` | `format_unsupported` | The database's format is newer than this release, or a feature flag it does not know is set (§7.2, §3.10); the open is refused. |
 | `D3002` | `format_read_only` | A write to a database opened read-only because its format is older than this release can write (§7.2). |
 | `D3003` | `clone_unsupported` | An on-disk clone on a filesystem without reflink (§8.4). |
