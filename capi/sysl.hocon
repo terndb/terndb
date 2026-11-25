@@ -1,0 +1,27 @@
+// `libterndb`, TernDB's C ABI (`docs/spec/c-api.md`): `sysl build-c --shared` of this project is
+// `libterndb.dylib` and its header `terndb.h`. The ABI itself is the module `sh.sysl.terndb.capi` of
+// the library beside it; this project's one module reaches it, which is what puts its exports in the
+// build. `tests/capi/run.zsh` at the repository root shows the build line.
+package {
+  name    = "libterndb"
+  version = "0.0.1"
+  sysl    = "0.13.6"
+}
+
+requires {
+  os    = true
+  heap  = true
+  posix = true
+  libc  = true
+}
+
+dependencies {
+  terndb { path = ".." }
+}
+
+// Every allocation the library makes goes through the allocator the host gives `terndb_init`
+// (`c-api.md` §3 rule 3); these two hidden exports of `sh.sysl.terndb.capi` forward to it.
+allocator {
+  alloc = "terndb_capi_alloc"
+  free  = "terndb_capi_free"
+}

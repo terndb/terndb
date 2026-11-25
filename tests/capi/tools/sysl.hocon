@@ -1,0 +1,19 @@
+// What the C ABI's test driver needs built from sysl (`docs/spec/c-api.md` §15): the check of the
+// generated header against §12 and of the library's exports against the header, and the envelopes and
+// golden payloads the driver runs. `tests/capi/run.zsh` runs it.
+package {
+  name    = "capi-tools"
+  version = "0.0.1"
+  sysl    = "0.13.6"
+}
+
+requires {
+  os    = true
+  heap  = true
+  posix = true
+  libc  = true
+}
+
+dependencies {
+  terndb { path = "../../.." }
+}

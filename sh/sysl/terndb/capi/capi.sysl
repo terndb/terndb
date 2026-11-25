@@ -1,0 +1,395 @@
+module sh.sysl.terndb.capi
+
+@include("<stddef.h>")
+
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+
+// `libterndb`, TernDB's C ABI (`docs/spec/c-api.md`). Every function of the header `terndb.h` (§12) is
+// an `@export` of this module; `capi/` builds it with `sysl build-c --shared` into `libterndb.dylib`.
+//
+// This file holds what every other file of the module stands on: the C spellings the header needs,
+// its constants, the record at the start of every handle (§2.4), library initialisation (§3) and the
+// allocator the whole library allocates through.
+
+c type
+    /** C's `int`: what every fallible function returns (§1 rule 4). */
+    CInt = "int"
+    /** C's `char`, so that text crosses as `const char *` (§1 rule 3). */
+    CChar = "char"
+
+// -- versions (§3, §13) ---------------------------------------------------------------------------
+
+@export("TERNDB_ABI_MAJOR")
+const AbiMajor: u32 = 1
+
+@export("TERNDB_ABI_MINOR")
+const AbiMinor: u32 = 0
+
+@export("TERNDB_ABI_VERSION")
+const AbiVersion: u32 = (AbiMajor << 16) | AbiMinor
+
+/** The release version `terndb_version` answers. */
+const ReleaseVersion: string = "0.0.1"
+
+// -- constants (§12) ------------------------------------------------------------------------------
+
+@export("TERNDB_ISOLATION_SERIALIZABLE")
+const IsoSerializable: i32 = 0
+@export("TERNDB_ISOLATION_SNAPSHOT")
+const IsoSnapshot: i32 = 1
+@export("TERNDB_ISOLATION_READ_COMMITTED")
+const IsoReadCommitted: i32 = 2
+
+@export("TERNDB_SYNC_OFF")
+const SyncOff: i32 = 0
+@export("TERNDB_SYNC_ON")
+const SyncOn: i32 = 1
+@export("TERNDB_SYNC_REMOTE")
+const SyncRemote: i32 = 2
+@export("TERNDB_SYNC_REMOTE_APPLY")
+const SyncRemoteApply: i32 = 3
+
+@export("TERNDB_TXN_PENDING")
+const TxnPending: i32 = 0
+@export("TERNDB_TXN_OPEN")
+const TxnOpen: i32 = 1
+@export("TERNDB_TXN_ABORTED")
+const TxnAborted: i32 = 2
+@export("TERNDB_TXN_CLOSED")
+const TxnClosed: i32 = 3
+
+@export("TERNDB_TXN_STATUS_COMMITTED")
+const StatusCommitted: i32 = 0
+@export("TERNDB_TXN_STATUS_ABORTED")
+const StatusAborted: i32 = 1
+@export("TERNDB_TXN_STATUS_IN_PROGRESS")
+const StatusInProgress: i32 = 2
+
+@export("TERNDB_TXN_STATE_UNAFFECTED")
+const EffectUnaffected: i32 = 0
+@export("TERNDB_TXN_STATE_ABORTED")
+const EffectAborted: i32 = 1
+@export("TERNDB_TXN_STATE_CLOSED")
+const EffectClosed: i32 = 2
+
+@export("TERNDB_COL_FIXED")
+const ColFixed: i32 = 1
+@export("TERNDB_COL_VARBIN")
+const ColVarbin: i32 = 2
+@export("TERNDB_COL_RECORD")
+const ColRecord: i32 = 3
+@export("TERNDB_COL_UNION")
+const ColUnion: i32 = 4
+@export("TERNDB_COL_RELATION")
+const ColRelation: i32 = 5
+
+@export("TERNDB_TYPE_BOOL")
+const TypeBool: i32 = 0
+@export("TERNDB_TYPE_INT16")
+const TypeInt16: i32 = 1
+@export("TERNDB_TYPE_INT32")
+const TypeInt32: i32 = 2
+@export("TERNDB_TYPE_INT64")
+const TypeInt64: i32 = 3
+@export("TERNDB_TYPE_INT128")
+const TypeInt128: i32 = 4
+@export("TERNDB_TYPE_FLOAT32")
+const TypeFloat32: i32 = 5
+@export("TERNDB_TYPE_FLOAT64")
+const TypeFloat64: i32 = 6
+@export("TERNDB_TYPE_DECIMAL")
+const TypeDecimal: i32 = 7
+@export("TERNDB_TYPE_TEXT")
+const TypeText: i32 = 8
+@export("TERNDB_TYPE_BYTES")
+const TypeBytes: i32 = 9
+@export("TERNDB_TYPE_DATE")
+const TypeDate: i32 = 10
+@export("TERNDB_TYPE_TIME")
+const TypeTime: i32 = 11
+@export("TERNDB_TYPE_DATETIME")
+const TypeDatetime: i32 = 12
+@export("TERNDB_TYPE_TIMESTAMP")
+const TypeTimestamp: i32 = 13
+@export("TERNDB_TYPE_INTERVAL")
+const TypeInterval: i32 = 14
+@export("TERNDB_TYPE_UUID")
+const TypeUuid: i32 = 15
+@export("TERNDB_TYPE_RECORD")
+const TypeRecord: i32 = 16
+@export("TERNDB_TYPE_UNION")
+const TypeUnion: i32 = 17
+@export("TERNDB_TYPE_BAG")
+const TypeBag: i32 = 18
+@export("TERNDB_TYPE_LIST")
+const TypeList: i32 = 19
+@export("TERNDB_TYPE_INT8")
+const TypeInt8: i32 = 21
+@export("TERNDB_TYPE_UINT8")
+const TypeUInt8: i32 = 22
+@export("TERNDB_TYPE_UINT16")
+const TypeUInt16: i32 = 23
+@export("TERNDB_TYPE_UINT32")
+const TypeUInt32: i32 = 24
+@export("TERNDB_TYPE_UINT64")
+const TypeUInt64: i32 = 25
+@export("TERNDB_TYPE_JSON")
+const TypeJson: i32 = 26
+
+@export("TERNDB_LOG_ERROR")
+const LogError: i32 = 1
+@export("TERNDB_LOG_WARN")
+const LogWarn: i32 = 2
+@export("TERNDB_LOG_INFO")
+const LogInfo: i32 = 3
+@export("TERNDB_LOG_DEBUG")
+const LogDebug: i32 = 4
+@export("TERNDB_LOG_TRACE")
+const LogTrace: i32 = 5
+
+@export("TERNDB_METRIC_COUNTER")
+const MetricCounter: i32 = 1
+@export("TERNDB_METRIC_GAUGE")
+const MetricGauge: i32 = 2
+@export("TERNDB_METRIC_HISTOGRAM")
+const MetricHistogram: i32 = 3
+
+@export("TERNDB_TXN_OPT_ISOLATION")
+const TxnOptIsolation: i32 = 1
+@export("TERNDB_TXN_OPT_SYNCHRONOUS")
+const TxnOptSynchronous: i32 = 2
+@export("TERNDB_TXN_OPT_READ_ONLY")
+const TxnOptReadOnly: i32 = 3
+@export("TERNDB_TXN_OPT_AFTER")
+const TxnOptAfter: i32 = 4
+@export("TERNDB_TXN_OPT_LOCK_TIMEOUT")
+const TxnOptLockTimeout: i32 = 5
+@export("TERNDB_TXN_OPT_REPLICA_WAIT")
+const TxnOptReplicaWait: i32 = 6
+@export("TERNDB_TXN_OPT_MAX_LAG")
+const TxnOptMaxLag: i32 = 7
+@export("TERNDB_EXEC_OPT_PREFETCH_BYTES")
+const ExecOptPrefetchBytes: i32 = 1
+@export("TERNDB_EXEC_OPT_BATCH_ROWS")
+const ExecOptBatchRows: i32 = 2
+@export("TERNDB_EXEC_OPT_BATCH_BYTES")
+const ExecOptBatchBytes: i32 = 3
+@export("TERNDB_EXEC_OPT_STATEMENT_TIMEOUT")
+const ExecOptStatementTimeout: i32 = 4
+
+// -- callbacks (§12) ------------------------------------------------------------------------------
+
+@export("terndb_alloc_fn")
+type AllocFn = *extern(*unit, usize, usize) -> *unit
+
+@export("terndb_free_fn")
+type FreeFn = *extern(*unit, *unit, usize, usize)
+
+@export("terndb_log_fn")
+type LogFn = *extern(*unit, *const LogRecordH)
+
+// -- handles (§2) ---------------------------------------------------------------------------------
+
+/** What kind of handle a pointer is (§2.4 rule 2). */
+const KindConfig: u32 = 0x7464_0001
+const KindDb: u32 = 0x7464_0002
+const KindConn: u32 = 0x7464_0003
+const KindTxnOptions: u32 = 0x7464_0004
+const KindExecOptions: u32 = 0x7464_0005
+const KindTxn: u32 = 0x7464_0006
+const KindStmt: u32 = 0x7464_0007
+const KindResult: u32 = 0x7464_0008
+const KindBatch: u32 = 0x7464_0009
+const KindColumn: u32 = 0x7464_000a
+const KindType: u32 = 0x7464_000b
+const KindError: u32 = 0x7464_000c
+const KindQueue: u32 = 0x7464_000d
+const KindOp: u32 = 0x7464_000e
+const KindMetrics: u32 = 0x7464_000f
+const KindLogRecord: u32 = 0x7464_0010
+
+/** A handle's life: live until its `_free`, then freed for good. */
+const Live: u32 = 1
+const Freed: u32 = 2
+
+/** The record every handle begins with: its kind and whether it is live. A debug build reads it on
+ * every call (§2.4 rule 2); a freed handle's memory is never given back there, so the record stays
+ * readable and the address is never handed out again.
+ */
+struct Head
+    kind: u32
+    state: Atomic[u32]
+
+head(kind: u32) -> Head = Head(kind, Atomic(Live))
+
+/** Whether this build checks every handle on every call (§2.4 rule 2). */
+#if debug
+const DebugChecks: bool = true
+#else
+const DebugChecks: bool = false
+#endif
+
+/** Handles allocated and not yet freed, of every kind, in the process (§12.1 rule 1). */
+var live_handles: Atomic[u64] = Atomic(0)
+
+/** A handle has been made. */
+counted() = live_handles.add(1)
+
+/** A handle has been freed. */
+uncounted() = live_handles.sub(1)
+
+/** Why a handle argument is refused, if it is: `C1002` for NULL, `C1001` (debug builds) for a freed
+ * handle or one of another kind.
+ */
+enum Refusal
+    NoRefusal
+    NullHandle
+    BadHandle
+
+/** The verdict on handle `p`, which should be of kind `kind`. */
+check_handle(p: *const unit, kind: u32) -> Refusal
+    if p == null then return NullHandle
+
+    if DebugChecks
+        val h: *Head = ptr_cast(p)
+        if h.kind != kind || h.state.load() != Live then return BadHandle
+
+    NoRefusal
+
+/** Marks handle `p` freed; false when it already was (a double free, which a debug build reports). */
+mark_freed(p: *const unit) -> bool
+    val h: *Head = ptr_cast(p)
+    h.state.cas(Live, Freed) == Live
+
+/** Stops the process naming `code` and `function`, for a precondition violation found by a function
+ * with no error channel in a debug build (§1 rule 7).
+ */
+abort_with(code: string, function: string) -> never
+    eprints(s"terndb: $code in $function\n")
+    trap()
+
+/** `check_handle` for a function with no error channel: a violation aborts in a debug build. */
+expect_handle(p: *const unit, kind: u32, function: string)
+    check_handle(p, kind) match
+        NoRefusal -> ()
+        NullHandle -> if DebugChecks then abort_with("C1002", function)
+        BadHandle -> abort_with("C1001", function)
+
+// -- initialisation (§3) --------------------------------------------------------------------------
+
+/** What `terndb_init` installed, once: the host's allocator (both null for the system's) and its
+ * context. `init_state` is 0 before the first `terndb_init`, 1 while it runs and 2 after.
+ */
+var init_state: Atomic[u32] = Atomic(0)
+var host_alloc: *extern(*unit, usize, usize) -> *unit = null
+var host_free: *extern(*unit, *unit, usize, usize) = null
+var host_ctx: *unit = null
+
+/** Whether `terndb_init` has succeeded. */
+initialized() -> bool = init_state.load() == 2
+
+@export("terndb_abi_version")
+abi_version() -> u32 = AbiVersion
+
+@export("terndb_version")
+version() -> *const CChar = ptr_cast(c"0.0.1")
+
+@export("terndb_debug_checks")
+debug_checks() -> bool = DebugChecks
+
+@export("terndb_debug_live_handles")
+debug_live_handles() -> usize = usize(live_handles.load())
+
+@export("terndb_init")
+init(abi_version: u32, alloc: AllocFn, free_fn: FreeFn, ctx: *unit, err: **ErrorH) -> CInt
+    if abi_version >> 16 != AbiMajor || abi_version & 0xffff > AbiMinor
+        return fail(err, c_error("C1009", s"the caller's header is ABI ${abi_version >> 16}.${abi_version & 0xffff}, and the library is $AbiMajor.$AbiMinor"))
+
+    if (alloc == null) != (free_fn == null)
+        return fail(err, c_error("C1002", "alloc and free are both given or both NULL"))
+
+    // The first call installs; any later one must name the same allocator (§3 rule 4).
+    if init_state.cas(0, 1) == 0
+        host_alloc = alloc
+        host_free = free_fn
+        host_ctx = ctx
+        init_state.store(2)
+        return 0
+
+    while init_state.load() != 2
+        sysl.threads.yield_now()
+
+    if host_alloc == alloc && host_free == free_fn && host_ctx == ctx then return 0
+
+    fail(err, c_error("C1005", "terndb_init was already called with another allocator"))
+
+/** The refusal of a call made before `terndb_init` (§3 rule 1). */
+not_initialized() -> ErrorData = c_error("C1008", "terndb_init has not been called")
+
+@export("terndb_code_name")
+code_name(code: *const CChar) -> *const CChar
+    if code == null then return null
+
+    val text = c_text(code)
+    for i in 0..<CodeCount
+        val row = code_at(i)
+        if row.code_text == text then return ptr_cast(row.name)
+
+    null
+
+/** The NUL-terminated text at `p`, copied. */
+c_text(p: *const CChar) -> string
+    val bytes: *const u8 = ptr_cast(p)
+    var n: usize = 0
+    while bytes[n] != 0
+        n += 1
+    text_of(bytes, n)
+
+/** `n` octets at `p` as text, copied; invalid UTF-8 is replaced, never trusted. */
+text_of(p: *const u8, n: usize) -> string
+    if n == 0 || p == null then return ""
+    sysl.text.from_utf8_lossy(p[0..<n])
+
+/** `n` octets at `p`, copied. */
+bytes_of(p: *const u8, n: usize) -> sysl.buf.Buf[u8]
+    val out = sysl.buf.buf[u8]()
+    if n == 0 || p == null then return out
+    out.extend(p[0..<n])
+    out
+
+// -- the allocator (§3 rule 3) --------------------------------------------------------------------
+
+extern "posix_memalign" c_posix_memalign(out: **unit, align: usize, size: usize) -> i32
+extern "free" c_free(p: *unit)
+
+/** Octets the library holds from its allocator now, for `terndb.memory.bytes` and `memory_limit`. */
+var heap_bytes: Atomic[u64] = Atomic(0)
+
+/** Every block the library allocates, with the size and boundary sysl asks for: from the host's
+ * `alloc` once `terndb_init` installed one, otherwise from the system. Of the calls allowed before
+ * `terndb_init` only `terndb_code_name` allocates, and it gives back what it took before it returns,
+ * so no block taken from the system is ever handed to the host's `free`.
+ */
+@export("terndb_capi_alloc")
+private heap_alloc(size: usize, align: usize) -> *u8
+    val f = host_alloc
+    if f != null
+        val p = f(host_ctx, size, align)
+        if p != null then heap_bytes.add(u64(size))
+        return ptr_cast(p)
+
+    var p: *unit = null
+    if c_posix_memalign(&p, align, size) != 0 then return null
+    heap_bytes.add(u64(size))
+    ptr_cast(p)
+
+@export("terndb_capi_free")
+private heap_free(p: *u8, size: usize, align: usize)
+    if p == null then return
+    heap_bytes.sub(u64(size))
+    val f = host_free
+    if f != null
+        f(host_ctx, ptr_cast(p), size, align)
+        return
+    c_free(ptr_cast(p))

@@ -1,0 +1,456 @@
+// The C ABI test driver's tools (`docs/spec/c-api.md` §15):
+//
+//   header <c-api.md> <terndb.h> <nm.txt>   the generated header declares exactly §12's header, compared
+//                                           declaration by declaration, and the library exports exactly
+//                                           the header's functions (`nm -gU`, property 1)
+//   inputs <vectors dir> <out.h>            the envelopes, parameter blocks and golden payloads the C
+//                                           driver runs, as C arrays
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_text, write_text}
+import sysl.text.parse_int
+import sh.sysl.terndb.{BootstrapRole, Expr, Field, Int32, Int64, Item, Literal, Null, MemCatalog, ParamDecl, Params, Param, Query,
+    RawMessage, Rel, ResultHeaderMsg, SortKey, SqlTree, Type, Value, Values, Sort, Col, List, Bag, column_tree, decode_batch, encode_envelope, encode_params, envelope, nullable, sql_catalog, sql_statement}
+
+main(args: []string)
+    if args.len == 5 && args[1] == "header" then header_main(args[2], args[3], args[4])
+    elif args.len == 4 && args[1] == "inputs" then inputs_main(args[2], args[3])
+    else
+        eprints("usage: tools header <c-api.md> <terndb.h> <nm.txt> | tools inputs <vectors> <out.h>\n")
+        exit(2)
+
+// -- the header check -----------------------------------------------------------------------------
+
+/** A `#define`'s name and value. */
+struct Define
+    name: string
+    value: string
+
+/** A header's declarations, each in a canonical form: tokens joined by one space, parameter names
+ * dropped.
+ */
+struct Decls
+    guard: string
+    includes: Buf[string]
+    defines: Buf[Define]
+    opaque: Buf[string]
+    typedefs: Buf[string]
+    functions: Buf[string]
+    /** The functions' names, for the export check. */
+    names: Buf[string]
+
+/** `text` with every `/* … */` comment taken out. */
+strip_comments(text: string) -> string
+    val b = text.bytes
+    var out = ""
+    var i: usize = 0
+    var start: usize = 0
+    while i + 1 < b.len
+        if b[i] == u8('/') && b[i + 1] == u8('*')
+            out = out + utf8_of(b[start..<i])
+            var j = i + 2
+            while j + 1 < b.len && !(b[j] == u8('*') && b[j + 1] == u8('/'))
+                j += 1
+            i = j + 2
+            start = i
+        else
+            i += 1
+    if start < b.len then out = out + utf8_of(b[start..<b.len])
+    out
+
+private utf8_of(b: []const u8) -> string = sysl.text.from_utf8_lossy(b)
+
+private is_ident_byte(c: u8) -> bool = c == u8('_') || (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
+    (c >= u8('0') && c <= u8('9'))
+
+/** `s` as C tokens: identifiers and numbers, and each punctuation octet alone. */
+tokens(s: string) -> Buf[string]
+    val out = buf[string]()
+    val b = s.bytes
+    var i: usize = 0
+    while i < b.len
+        val c = b[i]
+        if c == u8(' ') || c == u8('\t') || c == u8('\n') || c == u8('\r')
+            i += 1
+        elif is_ident_byte(c)
+            var j = i
+            while j < b.len && is_ident_byte(b[j])
+                j += 1
+            out.push(utf8_of(b[i..<j]))
+            i = j
+        else
+            out.push(utf8_of(b[i..<i + 1]))
+            i += 1
+    out
+
+private is_ident(t: string) -> bool = t.len > 0 && is_ident_byte(t.bytes[0]) && !(t.bytes[0] >= u8('0') && t.bytes[0] <= u8('9'))
+
+private join(ts: []const string) -> string
+    var out = ""
+    for i in 0..<ts.len
+        if i > 0 then out = out + " "
+        out = out + ts[i]
+    out
+
+/** One parameter's type: its tokens with the parameter's name dropped. */
+private param_type(ts: Buf[string]) -> string
+    val out = buf[string]()
+    var bracket: usize = ts.len()
+    for i in 0..<ts.len()
+        if ts[i] == "[" && bracket == ts.len() then bracket = i
+    for i in 0..<ts.len()
+        val named = if bracket < ts.len() then i + 1 == bracket else i + 1 == ts.len()
+        if !(named && ts.len() > 1 && is_ident(ts[i]) && ts[i] != "void") then out.push(ts[i])
+    join(out.view())
+
+/** The parameter list in `ts[from ..< to]` (inside its parentheses), canonical. */
+private params_of(ts: Buf[string], from: usize, to: usize) -> string
+    val out = buf[string]()
+    var cur = buf[string]()
+    var depth = 0
+    for i in from..<to
+        val t = ts[i]
+        if t == "(" then depth += 1
+        if t == ")" then depth -= 1
+        if t == "," && depth == 0
+            out.push(param_type(cur))
+            cur = buf[string]()
+        else
+            cur.push(t)
+    if cur.len() > 0 then out.push(param_type(cur))
+    join(out.view())
+
+/** The index of the parenthesis closing the one at `open`. */
+private closing(ts: Buf[string], open: usize) -> usize
+    var depth = 0
+    for i in open..<ts.len()
+        if ts[i] == "(" then depth += 1
+        if ts[i] == ")"
+            depth -= 1
+            if depth == 0 then return i
+    ts.len()
+
+/** The declarations of a header's text. */
+parse_header(text: string) -> Decls
+    var d = Decls("", buf(), buf(), buf(), buf(), buf(), buf())
+    var body = ""
+    for line in strip_comments(text).split("\n")
+        val l = line.trim()
+        if l.starts_with("#")
+            val ts = tokens(l)
+            if ts.len() >= 3 && ts[1] == "ifndef" && d.guard.len == 0 then d.guard = ts[2]
+            elif ts.len() >= 3 && ts[1] == "include" then d.includes.push(join(ts.view()[2..]))
+            elif ts.len() >= 3 && ts[1] == "define" && ts[2] != d.guard
+                var v = ""
+                for i in 3..<ts.len()
+                    v = v + ts[i]
+                d.defines.push(Define(ts[2], v))
+        elif l != "extern \"C\" {" && l != "}" && l.len > 0
+            body = body + " " + l
+
+    for stmt in body.split(";")
+        val ts = tokens(stmt)
+        if ts.len() == 0 then continue
+        if ts[0] == "typedef" && ts.len() == 4 && ts[1] == "struct"
+            d.opaque.push(ts[3])
+        elif ts[0] == "typedef"
+            // typedef <ret> ( * name ) ( params )
+            var open: usize = 0
+            while open < ts.len() && ts[open] != "("
+                open += 1
+            val ret = join(ts.view()[1..open])
+            val name = ts[open + 2]
+            val p = open + 4
+            d.typedefs.push(s"$ret (*$name)(${params_of(ts, p + 1, closing(ts, p))})")
+        else
+            var open: usize = 0
+            while open < ts.len() && ts[open] != "("
+                open += 1
+            if open == 0 || open >= ts.len() then continue
+            val ret = join(ts.view()[0..open - 1])
+            val name = ts[open - 1]
+            d.functions.push(s"$ret $name(${params_of(ts, open + 1, closing(ts, open))})")
+            d.names.push(name)
+    d
+end parse_header
+
+/** The text of §12's header: the fenced C block that follows the `## 12. The header` heading. */
+spec_header(spec: string) -> string
+    var in_section = false
+    var in_block = false
+    var out = ""
+    for line in spec.split("\n")
+        if line.starts_with("## 12. ") then in_section = true
+        elif in_section && !in_block && line.starts_with("```c") then in_block = true
+        elif in_block && line.starts_with("```") then return out
+        elif in_block then out = out + line + "\n"
+    out
+
+/** The members of `a` not in `b`. */
+missing(a: Buf[string], b: Buf[string]) -> Buf[string]
+    val out = buf[string]()
+    for x in a
+        var found = false
+        for y in b
+            if x == y then found = true
+        if !found then out.push(x)
+    out
+
+private report(what: string, xs: Buf[string]) -> usize
+    for x in xs
+        eprints(s"  $what: $x\n")
+    xs.len()
+
+private define_names(ds: Buf[Define]) -> Buf[string]
+    val out = buf[string]()
+    for d in ds
+        out.push(d.name)
+    out
+
+private define_value(ds: Buf[Define], name: string) -> string
+    for d in ds
+        if d.name == name then return d.value
+    ""
+
+/** The differences between the spec's header and the generated one, written to stderr; 0 when they
+ * declare the same things. A `#define` whose spec value is not a literal (`TERNDB_ABI_VERSION`) is
+ * compared by the number it stands for.
+ */
+compare_headers(spec: Decls, gen: Decls) -> usize
+    var n: usize = 0
+    if spec.guard != gen.guard
+        eprints(s"  guard: spec ${spec.guard}, generated ${gen.guard}\n")
+        n += 1
+    n += report("include missing from the generated header", missing(spec.includes, gen.includes))
+    n += report("#define only in the spec", missing(define_names(spec.defines), define_names(gen.defines)))
+    n += report("#define only in the generated header", missing(define_names(gen.defines), define_names(spec.defines)))
+    for d in spec.defines
+        val g = define_value(gen.defines, d.name)
+        if g.len == 0 then continue
+        val expected = if d.name == "TERNDB_ABI_VERSION" then
+            s"${(parse_int(define_value(spec.defines, "TERNDB_ABI_MAJOR")).unwrap() << 16) | parse_int(define_value(spec.defines, "TERNDB_ABI_MINOR")).unwrap()}"
+        else d.value
+        if g != expected
+            eprints(s"  #define ${d.name}: spec $expected, generated $g\n")
+            n += 1
+    n += report("handle only in the spec", missing(spec.opaque, gen.opaque))
+    n += report("handle only in the generated header", missing(gen.opaque, spec.opaque))
+    n += report("callback only in the spec", missing(spec.typedefs, gen.typedefs))
+    n += report("callback only in the generated header", missing(gen.typedefs, spec.typedefs))
+    n += report("function only in the spec", missing(spec.functions, gen.functions))
+    n += report("function only in the generated header", missing(gen.functions, spec.functions))
+    n
+
+/** The names `nm -gU` lists, without Mach-O's leading underscore. */
+exported(nm: string) -> Buf[string]
+    val out = buf[string]()
+    for line in nm.split("\n")
+        val ts = line.trim().split(" ")
+        if ts.len >= 3
+            val name = ts[ts.len - 1]
+            out.push(if name.starts_with("_") then utf8_of(name.bytes[1..]) else name)
+    out
+
+header_main(spec_path: string, header_path: string, nm_path: string)
+    val spec = parse_header(spec_header(read_text(spec_path).unwrap()))
+    val gen = parse_header(read_text(header_path).unwrap())
+    var n = compare_headers(spec, gen)
+    val ex = exported(read_text(nm_path).unwrap())
+    n += report("exported and not in the header", missing(ex, gen.names))
+    n += report("in the header and not exported", missing(gen.names, ex))
+    print(s"header: ${spec.functions.len()} functions, ${spec.typedefs.len()} callbacks, ${spec.opaque.len()} handles, ${spec.defines.len()} constants; ${ex.len()} exports; $n differences")
+    exit(if n == 0 then 0 else 1)
+
+// -- the driver's inputs --------------------------------------------------------------------------
+
+/** One named input of the driver. */
+struct Input
+    name: string
+    octets: Buf[u8]
+
+/** The octets of a vector file: its hex, header lines skipped. */
+vector_octets(text: string) -> Buf[u8]
+    val out = buf[u8]()
+    for line in text.split("\n")
+        if line.starts_with("#") then continue
+        for t in line.split(" ")
+            val h = t.trim()
+            if h.len == 2 then out.push(u8(sysl.text.parse_int_base(h, 16).unwrap()))
+    out
+
+/** The payload of a one-frame vector: its octets after the 16-octet frame header. */
+frame_payload(v: Buf[u8]) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(v.view()[16..])
+    out
+
+/** The SQL the driver runs, in order against one database, each statement translated against the
+ * catalog the statements before it built.
+ */
+private sql_inputs() -> Buf[(string, string)]
+    val q = buf[(string, string)]()
+    q.push(("ENV_CREATE_T", "CREATE TABLE t (id int64 PRIMARY KEY, name text NOT NULL)"))
+    q.push(("ENV_INSERT_T", "INSERT INTO t (id, name) VALUES (1, 'ann'), (2, 'bo'), (3, 'cy')"))
+    q.push(("ENV_SELECT_T", "SELECT id, name FROM t ORDER BY id"))
+    q.push(("ENV_COUNT_T", "SELECT count(*) AS n FROM t"))
+    q.push(("ENV_INSERT_DUP", "INSERT INTO t (id, name) VALUES (1, 'dup')"))
+    q.push(("ENV_INSERT_4", "INSERT INTO t (id, name) VALUES (4, 'dee')"))
+    // The translator knows no table `missing` and leaves it to the engine, which refuses it.
+    q.push(("ENV_BAD_COLUMN", "SELECT a FROM missing"))
+    q.push(("ENV_CREATE_BIG", "CREATE TABLE big (id int64 PRIMARY KEY, pad text NOT NULL)"))
+    q.push(("ENV_SELECT_BIG", "SELECT id, pad FROM big ORDER BY id"))
+    q.push(("ENV_CROSS_BIG", "SELECT a.id AS x, b.id AS y FROM big a, big b"))
+    q
+
+header_bytes(name: string, octets: []const u8) -> string
+    var out = s"static const uint8_t $name[] = {"
+    for i in 0..<octets.len
+        if i % 16 == 0 then out = out + "\n   "
+        out = out + s" 0x${sysl.encoding.hex_string(octets[i..<i + 1])},"
+    out + s"\n};\nstatic const size_t ${name}_LEN = ${octets.len};\n\n"
+
+/** `INSERT INTO big` of `n` rows from `first`, each `pad` 100 octets long. */
+private big_insert(first: u64, n: u64) -> string
+    var sql = "INSERT INTO big (id, pad) VALUES "
+    val pad = "x".repeat(100)
+    for i in 0..<n
+        if i > 0 then sql = sql + ", "
+        sql = sql + s"(${first + i}, '$pad')"
+    sql
+
+/** The envelope of `sql` translated against `cat`, which it then updates when it is DDL. */
+private translate(cat: &MemCatalog, sql: string) -> Buf[u8]
+    val env = sql_statement(sql, "public", cat) match
+        Ok(SqlTree(e)) -> e
+        Ok(_) -> panic(s"not a tree: $sql")
+        Err(e) -> panic(s"$sql: ${e.message}")
+    // DDL changes the catalog the statements after it are translated against; anything else is
+    // refused by `apply` and changes nothing.
+    if cat.apply(env, BootstrapRole).is_err() then ()
+    encode_envelope(env).unwrap()
+
+/** A query returning `rows` (a decoded batch's rows) of record type `elem`, as a `list` when `ordered`
+ * (sorted by its first field, which holds them in order) and a `bag` otherwise.
+ */
+private literal_query(elem: Type, rows: Buf[Value], ordered: bool) -> Buf[u8] =
+    encode_envelope(envelope([], Query(values_rel(elem, rows, ordered, 0)))).unwrap()
+
+/** How many binders the literal queries have introduced, so that each is named once. */
+private var binders: u64 = 0
+
+/** A relation holding `rows` of record type `elem`: a `Values` node, sorted by its first field when
+ * `ordered`. Every `Values` gets a binder of its own.
+ */
+private values_rel(elem: Type, rows: Buf[Value], ordered: bool, depth: u64) -> Rel
+    val fields = elem.base() match
+        Type.Record(fs) -> fs
+        _ -> panic("not a record")
+    binders += 1
+    val binder = s"v$binders"
+    val exprs = buf[Buf[Expr]]()
+    for r in rows
+        val cells = buf[Expr]()
+        val vs = r match
+            Value.Record(vs) -> vs
+            _ -> panic("not a record row")
+        for i in 0..<fields.len()
+            cells.push(value_expr(fields[i].ty, vs[i], depth + 1))
+        exprs.push(cells)
+    var rel: Rel = Values(binder, fields, exprs)
+    if ordered
+        val keys = buf[SortKey]()
+        keys.push(SortKey(Col(binder, fields[0].name), false, false))
+        rel = Sort(rel, keys)
+    rel
+
+/** An expression whose value is `v`, of type `t`: a literal for a scalar, and the constructors of
+ * records, union variants and nested relations for the rest (a literal is a scalar, [QT] `Q3017`).
+ */
+private value_expr(t: Type, v: Value, depth: u64) -> Expr
+    if v.is_null() then return Null(t)
+    t.base() match
+        Type.Record(fs) ->
+            val vs = v match
+                Value.Record(vs) -> vs
+                _ -> panic("not a record value")
+            val items = buf[Item]()
+            for i in 0..<fs.len()
+                items.push(Item(fs[i].name, value_expr(fs[i].ty, vs[i], depth + 1)))
+            Expr.Record(items)
+        Type.Union(vs) ->
+            val (tag, payload) = v match
+                Value.Variant(tag, p) -> (tag, *p)
+                _ -> panic("not a variant value")
+            Expr.Variant(t.base(), vs[tag].name, value_expr(vs[tag].ty, payload, depth + 1))
+        Type.List(e) | Type.Bag(e) ->
+            val elems = v match
+                Value.Relation(es) -> es
+                _ -> panic("not a relation value")
+            Expr.Relation(values_rel(*e, elems, is_list(t.base()), depth))
+        _ -> Literal(t.base(), v)
+
+private is_list(t: Type) -> bool = t match
+    Type.List(_) -> true
+    _ -> false
+
+inputs_main(vectors: string, out_path: string)
+    val inputs = buf[Input]()
+    val cat: &MemCatalog = sql_catalog()
+    for (name, sql) in sql_inputs()
+        inputs.push(Input(name, translate(cat, sql)))
+    inputs.push(Input("ENV_INSERT_BIG_A", translate(cat, big_insert(1, 1000))))
+    inputs.push(Input("ENV_INSERT_BIG_B", translate(cat, big_insert(1001, 1000))))
+
+    // A statement with one parameter: `SELECT $0 AS v`, and a block binding 42 to it.
+    val p0 = buf[ParamDecl]()
+    p0.push(ParamDecl(None, Int64))
+    val pcols = buf[Field]()
+    pcols.push(Field("v", Int64))
+    val prow = buf[Buf[Expr]]()
+    val pcell = buf[Expr]()
+    pcell.push(Param(0))
+    prow.push(pcell)
+    inputs.push(Input("ENV_PARAM", encode_envelope(envelope(p0.view(), Query(Values("v", pcols, prow)))).unwrap()))
+    val tuples = buf[Buf[Value]]()
+    val t0 = buf[Value]()
+    t0.push(sh.sysl.terndb.Value.Int(42))
+    tuples.push(t0)
+    val types = buf[Type]()
+    types.push(Int64)
+    inputs.push(Input("PARAMS_42", encode_params(types.view(), Params(buf(), tuples)).unwrap()))
+
+    // V15 (§6.6): the result type, the batch, and a query whose result is that batch's rows.
+    val header = frame_payload(vector_octets(read_text(s"$vectors/result-header.txt").unwrap()))
+    val batch = frame_payload(vector_octets(read_text(s"$vectors/batch.txt").unwrap()))
+    val v15_type = RawMessage(0x91, 7, header).decode(0) match
+        Ok(ResultHeaderMsg(h)) -> h.result_type.unwrap()
+        _ -> panic("result-header does not decode")
+    val type_octets = buf[u8]()
+    sh.sysl.terndb.encode_type(v15_type, type_octets)
+    val v15_rows = decode_batch(column_tree(v15_type).unwrap(), batch.view()).unwrap().rows()
+    val v15_elem = v15_type match
+        List(e) -> *e
+        _ -> panic("V15 is a list")
+    inputs.push(Input("GOLD_V15_TYPE", type_octets))
+    inputs.push(Input("GOLD_V15_BATCH", batch))
+    inputs.push(Input("ENV_V15", literal_query(v15_elem, v15_rows, true)))
+
+    // V16 (§6.7): bag<{x: int32?}>, with a null and without.
+    val xs = buf[Field]()
+    xs.push(Field("x", nullable(Int32)))
+    val v16_elem = Type.Record(xs)
+    val v16_type = Bag(v16_elem)
+    val v16_bytes = buf[u8]()
+    sh.sysl.terndb.encode_type(v16_type, v16_bytes)
+    inputs.push(Input("GOLD_V16_TYPE", v16_bytes))
+    for (name, file) in [("V16", "batch-nullable"), ("V16_NO_NULL", "batch-nullable-no-null")]
+        val b = frame_payload(vector_octets(read_text(s"$vectors/$file.txt").unwrap()))
+        val rows = decode_batch(column_tree(v16_type).unwrap(), b.view()).unwrap().rows()
+        inputs.push(Input(s"GOLD_${name}_BATCH", b))
+        inputs.push(Input(s"ENV_$name", literal_query(v16_elem, rows, false)))
+
+    var text = "/* Generated by tests/capi/tools (inputs): the envelopes, parameter blocks and golden payloads of the C\n * ABI's test driver. */\n#include <stddef.h>\n#include <stdint.h>\n\n"
+    for x in inputs
+        text = text + header_bytes(x.name, x.octets.view())
+    write_text(out_path, text).unwrap()
+    print(s"inputs: ${inputs.len()} written to $out_path")

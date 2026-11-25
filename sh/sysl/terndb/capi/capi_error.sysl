@@ -1,0 +1,255 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.{from_raw, ptr_cast}
+import sysl.slices.as_ptr
+import sysl.text.{CString, cstring}
+import sh.sysl.terndb.{Aborted, Closed, Detail, ErrorEntry, ErrorReply, RawMessage, TxnEffect, Unaffected, WireError,
+    encode_payload}
+
+// Errors (`c-api.md` §10): an owned `terndb_error` through the last parameter of every fallible
+// function, carrying all of [WIRE] §8.1. An error made on one thread and reported on another (an
+// operation's) crosses as the octets of an `Error` payload, which the receiving thread decodes.
+//
+// An error is immutable and may be read by many threads at once (§2.3), so a handle lays out, when it
+// is made, every field an accessor answers as plain addresses and numbers; no accessor touches a
+// counted value.
+
+/** What a failure is, before it becomes a handle: the fields of [WIRE] §8.1. */
+type ErrorData = WireError
+
+/** An error the C layer raises itself (`C…`, `D4…`): one entry, an empty path, `unaffected`, never
+ * retryable (§10.2 rule 3).
+ */
+c_error(code: string, message: string) -> ErrorData = c_error_with(code, message, buf())
+
+c_error_with(code: string, message: string, details: Buf[Detail]) -> ErrorData
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry(code, message, "", details, None))
+    WireError(entries, false, Unaffected, None, None)
+
+/** One detail, for `c_error_with`. */
+details1(key: string, value: string) -> Buf[Detail]
+    val d = buf[Detail]()
+    d.push(Detail(key, value))
+    d
+
+/** `C1002` naming the argument that is missing or wrong. */
+bad_argument(what: string) -> ErrorData = c_error("C1002", what)
+
+/** `C1002` for a NULL handle, `C1001` for a freed one or one of another kind. */
+refusal_error(r: Refusal, what: string) -> ErrorData = r match
+    BadHandle -> c_error("C1001", s"$what is a freed handle or a handle of another kind")
+    _ -> c_error("C1002", s"$what is NULL")
+
+/** `C1006`: the handle's connection or database has been closed. */
+closed_error(what: string) -> ErrorData = c_error("C1006", s"$what has been closed")
+
+/** An error as the octets of an `Error` payload, to cross to another thread. */
+error_octets(e: ErrorData) -> Buf[u8] = encode_payload(ErrorReply(e), 0).unwrap()
+
+/** The error whose `Error` payload is `octets`. */
+error_from_octets(octets: Buf[u8]) -> ErrorData = RawMessage(0xc0, 0, octets).decode(0) match
+    Ok(ErrorReply(e)) -> e
+    _ -> c_error("C1005", "an error could not be read back")
+
+/** Text lent to C: an address and a length. */
+struct Lent
+    ptr: *const u8
+    len: usize
+
+lent(s: string) -> Lent = Lent(as_ptr(s.bytes), s.bytes.len)
+
+/** One detail, lent. */
+struct DetailText
+    key: Lent
+    value: Lent
+
+/** One entry, lent: the code and name static, the rest borrowed from the error; its details are
+ * `details[first_detail ..< first_detail + detail_count]` of the handle.
+ */
+struct EntryText
+    code: *u8
+    name: *u8
+    message: Lent
+    path: Lent
+    first_detail: usize
+    detail_count: usize
+    has_span: bool
+    start: u64
+    end: u64
+
+@export("terndb_error")
+opaque struct ErrorH
+    head: Head
+    /** What every lent address points into; never read after the handle is made. */
+    e: WireError
+    /** The copies of codes the registry the library was built with does not hold. */
+    own_codes: Buf[CString]
+    entries: Buf[EntryText]
+    details: Buf[DetailText]
+    retryable: bool
+    txn_state: i32
+    has_txid: bool
+    txid: u64
+    has_tuple: bool
+    tuple: u64
+
+/** A new error handle holding `e`. */
+error_handle(e: ErrorData) -> *ErrorH
+    val own = buf[CString]()
+    val entries = buf[EntryText]()
+    val details = buf[DetailText]()
+    for x in e.entries
+        var code: *u8 = null
+        var name: *u8 = c""
+        for i in 0..<CodeCount
+            val row = code_at(i)
+            if row.code_text == x.code
+                code = row.code
+                name = row.name
+        if code == null
+            val c = cstring(x.code)
+            code = c.ptr
+            own.push(c)
+
+        val first = details.len()
+        for d in x.details
+            details.push(DetailText(lent(d.key), lent(d.value)))
+
+        val (has_span, start, end) = x.span match
+            Some(r) -> (true, r.start, r.end)
+            None -> (false, u64(0), u64(0))
+
+        entries.push(EntryText(code, name, lent(x.message), lent(x.path), first, details.len() - first, has_span, start, end))
+
+    val (has_txid, txid) = e.txid match
+        Some(t) -> (true, t)
+        None -> (false, u64(0))
+    val (has_tuple, tuple) = e.tuple match
+        Some(t) -> (true, t)
+        None -> (false, u64(0))
+
+    counted()
+    val h: &ErrorH = ErrorH(head(KindError), e, own, entries, details, e.retryable, effect_code(e.txn_state), has_txid,
+        txid, has_tuple, tuple)
+    h.into_raw()
+
+/** Writes a new error holding `e` to `*err` when `err` is not NULL, and answers -1 (§10.1). */
+fail(err: **ErrorH, e: ErrorData) -> CInt
+    if err != null then *err = error_handle(e)
+    CInt(-1)
+
+/** `fail` with the error a handle check refused. */
+refuse(err: **ErrorH, r: Refusal, what: string) -> CInt = fail(err, refusal_error(r, what))
+
+/** `TxnEffect` as its `TERNDB_TXN_STATE_` constant. */
+effect_code(t: TxnEffect) -> i32 = t match
+    Unaffected -> EffectUnaffected
+    Aborted -> EffectAborted
+    Closed -> EffectClosed
+
+/** Checks `e` and `entry` for a getter, aborting a debug build on a violation (§12.1 rule 24). */
+private check_entry(e: *const ErrorH, entry: usize, function: string) -> bool
+    expect_handle(ptr_cast(e), KindError, function)
+    if e == null then return false
+    if entry >= e.entries.len()
+        if DebugChecks then abort_with("C1002", function)
+        return false
+    true
+
+private lend(l: Lent, ptr: **const CChar, len: *usize)
+    if ptr != null then *ptr = ptr_cast(l.ptr)
+    if len != null then *len = l.len
+
+@export("terndb_error_entry_count")
+error_entry_count(e: *const ErrorH) -> usize
+    expect_handle(ptr_cast(e), KindError, "terndb_error_entry_count")
+    if e == null then return 0
+    e.entries.len()
+
+@export("terndb_error_code")
+error_code(e: *const ErrorH, entry: usize) -> *const CChar
+    if !check_entry(e, entry, "terndb_error_code") then return ptr_cast(c"")
+    ptr_cast(e.entries[entry].code)
+
+@export("terndb_error_name")
+error_name(e: *const ErrorH, entry: usize) -> *const CChar
+    if !check_entry(e, entry, "terndb_error_name") then return ptr_cast(c"")
+    ptr_cast(e.entries[entry].name)
+
+@export("terndb_error_message")
+error_message(e: *const ErrorH, entry: usize, ptr: **const CChar, len: *usize)
+    if check_entry(e, entry, "terndb_error_message") then lend(e.entries[entry].message, ptr, len)
+
+@export("terndb_error_path")
+error_path(e: *const ErrorH, entry: usize, ptr: **const CChar, len: *usize)
+    if check_entry(e, entry, "terndb_error_path") then lend(e.entries[entry].path, ptr, len)
+
+@export("terndb_error_detail_count")
+error_detail_count(e: *const ErrorH, entry: usize) -> usize
+    if !check_entry(e, entry, "terndb_error_detail_count") then return 0
+    e.entries[entry].detail_count
+
+@export("terndb_error_detail")
+error_detail(e: *const ErrorH, entry: usize, k: usize, key: **const CChar, key_len: *usize, value: **const CChar,
+        value_len: *usize)
+    if !check_entry(e, entry, "terndb_error_detail") then return
+    val x = e.entries[entry]
+    if k >= x.detail_count
+        if DebugChecks then abort_with("C1002", "terndb_error_detail")
+        return
+    lend(e.details[x.first_detail + k].key, key, key_len)
+    lend(e.details[x.first_detail + k].value, value, value_len)
+
+@export("terndb_error_span")
+error_span(e: *const ErrorH, entry: usize, start: *u64, end: *u64) -> bool
+    if !check_entry(e, entry, "terndb_error_span") then return false
+    if !e.entries[entry].has_span then return false
+    if start != null then *start = e.entries[entry].start
+    if end != null then *end = e.entries[entry].end
+    true
+
+@export("terndb_error_retryable")
+error_retryable(e: *const ErrorH) -> bool
+    expect_handle(ptr_cast(e), KindError, "terndb_error_retryable")
+    e != null && e.retryable
+
+@export("terndb_error_txn_state")
+error_txn_state(e: *const ErrorH) -> i32
+    expect_handle(ptr_cast(e), KindError, "terndb_error_txn_state")
+    if e == null then return EffectUnaffected
+    e.txn_state
+
+@export("terndb_error_txid")
+error_txid(e: *const ErrorH, txid: *u64) -> bool
+    expect_handle(ptr_cast(e), KindError, "terndb_error_txid")
+    if e == null || !e.has_txid then return false
+    if txid != null then *txid = e.txid
+    true
+
+@export("terndb_error_tuple")
+error_tuple(e: *const ErrorH, tuple: *u64) -> bool
+    expect_handle(ptr_cast(e), KindError, "terndb_error_tuple")
+    if e == null || !e.has_tuple then return false
+    if tuple != null then *tuple = e.tuple
+    true
+
+@export("terndb_error_free")
+error_free(e: *ErrorH)
+    if e == null then return
+    release(e, KindError, "terndb_error_free")
+
+/** Frees handle `p` of kind `kind` and type `T`: marks it freed and, in a release build, gives its
+ * memory back. A debug build keeps the memory for the life of the process, so the address is never
+ * handed out again and a later call on it is `C1001` (§2.4 rule 2); a second free aborts it.
+ */
+release[T](p: *T, kind: u32, function: string)
+    expect_handle(ptr_cast(p), kind, function)
+    if !mark_freed(ptr_cast(p))
+        if DebugChecks then abort_with("C1001", function)
+        return
+    uncounted()
+    if !DebugChecks
+        val r: &T = from_raw(p)
+        ()

@@ -1,0 +1,309 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.threads.{Condvar, Mutex, Thread, spawn}
+
+// The log sink and metrics (`c-api.md` §11).
+//
+// Records are queued without blocking whoever emits them and handed to the sink one at a time on a
+// service thread of the library's own, which runs while a sink is installed. The sink is called with
+// `calling` held, so a setter that has returned has waited out any call to the sink it replaced
+// (§11.1 rule 4).
+
+/** The most records the sink may fall behind by before the oldest are dropped (§11.1 rule 2). */
+const LogBacklog: usize = 65536
+
+struct LogEntry
+    level: i32
+    time: i64
+    target: string
+    message: string
+    fields: Buf[Setting]
+
+struct LogState
+    sink: LogFn
+    ctx: *unit
+    min_level: i32
+    queue: Buf[LogEntry]
+    dropped: u64
+    stop: bool
+    thread: Option[Thread]
+
+struct LogCore
+    m: Mutex[LogState]
+    cv: Condvar
+    calling: Mutex[u8]
+
+var logger: &sync LogCore = LogCore(Mutex.new(LogState(null, null, 0, buf(), 0, false, None)), Condvar.new(), Mutex.new(0))
+
+/** Queues a record with one field, if a sink wants its level. */
+log_emit(level: i32, target: string, message: string, key: string, value: string)
+    val fields = buf[Setting]()
+    fields.push(Setting(key, value))
+    log_queue(level, target, message, fields)
+
+/** Queues a record with two fields, if a sink wants its level. */
+log_emit2(level: i32, target: string, message: string, k1: string, v1: string, k2: string, v2: string)
+    val fields = buf[Setting]()
+    fields.push(Setting(k1, v1))
+    fields.push(Setting(k2, v2))
+    log_queue(level, target, message, fields)
+
+private log_queue(level: i32, target: string, message: string, fields: Buf[Setting])
+    val s = logger.m.lock_raw()
+    if s.sink == null || level > s.min_level
+        logger.m.unlock_raw()
+        return
+    if s.queue.len() >= LogBacklog
+        s.queue.remove(0)
+        s.dropped += 1
+    val copy = buf[Setting]()
+    for f in fields
+        copy.push(Setting(f.key.copy(), f.value.copy()))
+    s.queue.push(LogEntry(level, sysl.time.now().us, target.copy(), message.copy(), copy))
+    logger.m.unlock_raw()
+    logger.cv.notify_all()
+
+/** The service thread: hands each queued record to the sink, in order. */
+private service_main(p: *unit)
+    on_engine_thread = true
+    loop
+        val s = logger.m.lock_raw()
+        while s.queue.len() == 0 && !s.stop
+            logger.cv.wait(&logger.m)
+        if s.stop
+            logger.m.unlock_raw()
+            return
+        val e = s.queue[0]
+        s.queue.remove(0)
+        val dropped = s.dropped
+        s.dropped = 0
+        logger.m.unlock_raw()
+
+        logger.calling.with((_) ->
+            val (sink, ctx) = logger.m.with((st) -> (st.sink, st.ctx))
+            if sink != null then deliver_record(sink, ctx, e, dropped))
+
+private deliver_record(sink: LogFn, ctx: *unit, e: LogEntry, dropped: u64)
+    val fields = buf[DetailText]()
+    val texts = buf[string]()
+    for f in e.fields
+        fields.push(DetailText(lent(f.key), lent(f.value)))
+    if dropped > 0
+        val n = dropped.to_string()
+        texts.push(n)
+        fields.push(DetailText(lent("dropped"), lent(n)))
+    var r = LogRecordH(head(KindLogRecord), e.level, e.time, lent(e.target), lent(e.message), fields, texts)
+    sink(ctx, &r)
+    r.head.state.store(Freed)
+
+@export("terndb_log_record")
+opaque struct LogRecordH
+    head: Head
+    level: i32
+    time: i64
+    target: Lent
+    message: Lent
+    fields: Buf[DetailText]
+    texts: Buf[string]
+
+@export("terndb_set_log_sink")
+set_log_sink(min_level: i32, fn: LogFn, ctx: *unit, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if on_engine_thread then return fail(err, wrong_thread())
+    if min_level < 0 || min_level > LogTrace then return fail(err, bad_argument(s"$min_level is not a log level"))
+
+    var join: Option[Thread] = None
+    logger.calling.with((_) ->
+        val s = logger.m.lock_raw()
+        s.sink = fn
+        s.ctx = ctx
+        s.min_level = min_level
+        if fn == null
+            s.queue = buf()
+            s.dropped = 0
+            s.stop = true
+            join = s.thread
+            s.thread = None
+        elif s.thread.is_none()
+            s.stop = false
+            s.thread = spawn(&service_main, null)
+        logger.m.unlock_raw())
+    logger.cv.notify_all()
+    join match
+        Some(t) -> t.join()
+        None -> ()
+    0
+
+private record_ok(r: *const LogRecordH, function: string) -> bool
+    expect_handle(ptr_cast(r), KindLogRecord, function)
+    r != null
+
+private lend_text(l: Lent, ptr: **const CChar, len: *usize)
+    if ptr != null then *ptr = ptr_cast(l.ptr)
+    if len != null then *len = l.len
+
+@export("terndb_log_record_level")
+log_record_level(r: *const LogRecordH) -> i32 = if record_ok(r, "terndb_log_record_level") then r.level else 0
+
+@export("terndb_log_record_time")
+log_record_time(r: *const LogRecordH) -> i64 = if record_ok(r, "terndb_log_record_time") then r.time else 0
+
+@export("terndb_log_record_target")
+log_record_target(r: *const LogRecordH, ptr: **const CChar, len: *usize)
+    if record_ok(r, "terndb_log_record_target") then lend_text(r.target, ptr, len)
+
+@export("terndb_log_record_message")
+log_record_message(r: *const LogRecordH, ptr: **const CChar, len: *usize)
+    if record_ok(r, "terndb_log_record_message") then lend_text(r.message, ptr, len)
+
+@export("terndb_log_record_field_count")
+log_record_field_count(r: *const LogRecordH) -> usize = if record_ok(r, "terndb_log_record_field_count") then r.fields.len() else 0
+
+@export("terndb_log_record_field")
+log_record_field(r: *const LogRecordH, k: usize, key: **const CChar, key_len: *usize, value: **const CChar,
+        value_len: *usize)
+    if !record_ok(r, "terndb_log_record_field") then return
+    if k >= r.fields.len()
+        if DebugChecks then abort_with("C1002", "terndb_log_record_field")
+        return
+    lend_text(r.fields[k].key, key, key_len)
+    lend_text(r.fields[k].value, value, value_len)
+
+// -- metrics (§11.2) ------------------------------------------------------------------------------
+
+/** One cumulative histogram bucket. */
+struct Bucket
+    upper: u64
+    count: u64
+
+/** One metric of a snapshot; its labels and buckets are ranges of the snapshot's. */
+struct MetricRow
+    name: Lent
+    kind: i32
+    first_label: usize
+    label_count: usize
+    value: i64
+    first_bucket: usize
+    bucket_count: usize
+
+@export("terndb_metrics")
+opaque struct MetricsH
+    head: Head
+    rows: Buf[MetricRow]
+    labels: Buf[DetailText]
+    buckets: Buf[Bucket]
+    texts: Buf[string]
+
+/** The bounds of a latency histogram, in microseconds. */
+val LatencyBounds: []const u64 =[100, 1000, 10000, 100000, 1000000]
+
+@export("terndb_metrics_snapshot")
+metrics_snapshot(db: *DbH, out: **MetricsH, err: **ErrorH) -> CInt
+    val core = db_of_checked(db) match
+        Ok(c) -> c
+        Err(e) -> return fail(err, e)
+    if out == null then return fail(err, bad_argument("out is NULL"))
+
+    val rows = buf[MetricRow]()
+    val labels = buf[DetailText]()
+    val buckets = buf[Bucket]()
+    val texts = buf[string]()
+
+    val add = (name: string, kind: i32, value: i64) ->
+        rows.push(MetricRow(lent(name), kind, labels.len(), 0, value, buckets.len(), 0))
+
+    add("terndb.commits", MetricCounter, i64(core.commits.load()))
+    val aborts = core.aborts.with((a) ->
+        val copy = buf[AbortCount]()
+        for x in *a
+            copy.push(AbortCount(x.code.copy(), x.n))
+        copy)
+    if aborts.len() == 0 then add("terndb.aborts", MetricCounter, 0)
+    for x in aborts
+        texts.push(x.code)
+        rows.push(MetricRow(lent("terndb.aborts"), MetricCounter, labels.len(), 1, i64(x.n), buckets.len(), 0))
+        labels.push(DetailText(lent("code"), lent(x.code)))
+    add("terndb.sessions", MetricGauge, i64(core.sessions.load()))
+    val open = core.txns_open.load()
+    add("terndb.txns.open", MetricGauge, if open < 0 then 0 else open)
+    add("terndb.wal.bytes", MetricCounter, 0)
+    rows.push(MetricRow(lent("terndb.wal.fsync_us"), MetricHistogram, labels.len(), 0, 0, buckets.len(), LatencyBounds.len))
+    for b in LatencyBounds
+        buckets.push(Bucket(b, 0))
+    add("terndb.buffer.hits", MetricCounter, 0)
+    add("terndb.buffer.misses", MetricCounter, 0)
+    add("terndb.undo.bytes", MetricGauge, 0)
+    add("terndb.snapshot.oldest_age_ms", MetricGauge, 0)
+    add("terndb.memory.bytes", MetricGauge, i64(heap_bytes.load()))
+
+    counted()
+    val h: &MetricsH = MetricsH(head(KindMetrics), rows, labels, buckets, texts)
+    *out = h.into_raw()
+    0
+
+/** The database behind `db` for a call that does not wait. */
+private db_of_checked(db: *const DbH) -> Result[&sync DbCore, ErrorData]
+    if !initialized() then return Err(not_initialized())
+    val r = check_handle(ptr_cast(db), KindDb)
+    if r != NoRefusal then return Err(refusal_error(r, "db"))
+    if db.core.is_closed() then return Err(closed_error("the database"))
+    Ok(db.core)
+
+private metric_ok(m: *const MetricsH, i: usize, function: string) -> bool
+    expect_handle(ptr_cast(m), KindMetrics, function)
+    if m == null then return false
+    if i >= m.rows.len()
+        if DebugChecks then abort_with("C1002", function)
+        return false
+    true
+
+@export("terndb_metrics_count")
+metrics_count(m: *const MetricsH) -> usize
+    expect_handle(ptr_cast(m), KindMetrics, "terndb_metrics_count")
+    if m == null then 0 else m.rows.len()
+
+@export("terndb_metrics_name")
+metrics_name(m: *const MetricsH, i: usize, ptr: **const CChar, len: *usize)
+    if metric_ok(m, i, "terndb_metrics_name") then lend_text(m.rows[i].name, ptr, len)
+
+@export("terndb_metrics_kind")
+metrics_kind(m: *const MetricsH, i: usize) -> i32 = if metric_ok(m, i, "terndb_metrics_kind") then m.rows[i].kind else 0
+
+@export("terndb_metrics_label_count")
+metrics_label_count(m: *const MetricsH, i: usize) -> usize =
+    if metric_ok(m, i, "terndb_metrics_label_count") then m.rows[i].label_count else 0
+
+@export("terndb_metrics_label")
+metrics_label(m: *const MetricsH, i: usize, k: usize, key: **const CChar, key_len: *usize, value: **const CChar,
+        value_len: *usize)
+    if !metric_ok(m, i, "terndb_metrics_label") then return
+    val row = m.rows[i]
+    if k >= row.label_count
+        if DebugChecks then abort_with("C1002", "terndb_metrics_label")
+        return
+    lend_text(m.labels[row.first_label + k].key, key, key_len)
+    lend_text(m.labels[row.first_label + k].value, value, value_len)
+
+@export("terndb_metrics_value")
+metrics_value(m: *const MetricsH, i: usize) -> i64 = if metric_ok(m, i, "terndb_metrics_value") then m.rows[i].value else 0
+
+@export("terndb_metrics_bucket_count")
+metrics_bucket_count(m: *const MetricsH, i: usize) -> usize =
+    if metric_ok(m, i, "terndb_metrics_bucket_count") then m.rows[i].bucket_count else 0
+
+@export("terndb_metrics_bucket")
+metrics_bucket(m: *const MetricsH, i: usize, k: usize, upper_bound: *u64, count: *u64)
+    if !metric_ok(m, i, "terndb_metrics_bucket") then return
+    val row = m.rows[i]
+    if k >= row.bucket_count
+        if DebugChecks then abort_with("C1002", "terndb_metrics_bucket")
+        return
+    if upper_bound != null then *upper_bound = m.buckets[row.first_bucket + k].upper
+    if count != null then *count = m.buckets[row.first_bucket + k].count
+
+@export("terndb_metrics_free")
+metrics_free(m: *MetricsH)
+    if m == null then return
+    release(m, KindMetrics, "terndb_metrics_free")

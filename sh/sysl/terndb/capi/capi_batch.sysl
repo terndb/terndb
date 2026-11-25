@@ -1,0 +1,548 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.{from_raw, ptr_cast}
+import sysl.slices.as_ptr
+import sh.sysl.terndb.{Bag, Batch, Bytes, CodecError, ColumnTree, Date, DateTime, Decimal, Fields, Fixed, Float32,
+    Float64, Int128, Int16, Int32, Int64, Int8, Interval, Json, List, Named, Nested, Record, Tagged, Text, Time,
+    Timestamp, Type, UInt16, UInt32, UInt64, UInt8, Union, Unaffected, Uuid, VarBin, WireError, column_tree, decode_batch,
+    decode_type, encode_type, entry_of, nullable}
+
+// Types, batches and columns (`c-api.md` §8.2, §8.3): a batch's octets, and the walk over its
+// column tree from C.
+//
+// A batch, its columns and its types are immutable and may be read by many threads at once, so every
+// node is laid out when the batch is made: kinds, counts, the offsets of its buffers in the batch's
+// own copy of the payload, and raw addresses of its children. A getter reads those and the payload's
+// octets, and touches no counted value. Borrowed nodes live in their anchor's arena, which gives them
+// back when the anchor is freed (§2.2 rule 2).
+
+@export("terndb_type")
+opaque struct TypeRec
+    head: Head
+    /** Made by `terndb_type_decode`, and so freed by `terndb_type_free`; every other type is borrowed. */
+    owned: bool
+    kind: i32
+    nullable: bool
+    /** The type's [QT] §12.3 encoding, its nullable wrapper included. */
+    bytes: Buf[u8]
+    names: Buf[Lent]
+    members: Buf[*TypeRec]
+    elem: *TypeRec
+    precision: u32
+    scale: u32
+    /** An owned type's descendants. */
+    arena: Option[&Arena]
+
+/** One buffer of a column node: where it starts in the payload, and its length. */
+struct Span
+    off: usize
+    len: usize
+
+@export("terndb_column")
+opaque struct ColRec
+    head: Head
+    /** The batch payload's first octet. */
+    base: *const u8
+    kind: i32
+    ty: *TypeRec
+    len: usize
+    null_count: usize
+    nullable: bool
+    /** The node's buffers in [WIRE] §6.2 table order, validity first when nullable. */
+    bufs: Buf[Span]
+    /** The fixed width of a slot, or a union's discriminant width. */
+    width: usize
+    children: Buf[*ColRec]
+
+/** Everything borrowed from one anchor (a batch, a result, a statement or an owned type). */
+struct Arena
+    types: Buf[*TypeRec]
+    cols: Buf[*ColRec]
+    texts: Buf[string]
+
+impl Drop for Arena
+    drop(self)
+        for p in self.types
+            val r: &TypeRec = from_raw(p)
+        for p in self.cols
+            val r: &ColRec = from_raw(p)
+
+new_arena() -> &Arena = Arena(buf(), buf(), buf())
+
+/** The [QT] §12.3 kind of `t` as `terndb_type_kind` answers it. */
+kind_code(t: Type) -> i32 = i32(t.kind())
+
+/** `t` laid out as type nodes in `a`; the root is borrowed from `a` too. */
+type_in(t: Type, a: &Arena) -> *TypeRec
+    val r = type_node(t, a)
+    val p = r.into_raw()
+    a.types.push(p)
+    p
+
+/** `t` as a node of its own, its descendants in `a`. */
+private type_node(t: Type, a: &Arena) -> &TypeRec
+    val base = t.base()
+    val names = buf[Lent]()
+    val members = buf[*TypeRec]()
+    var elem: *TypeRec = null
+    var precision: u32 = 0
+    var scale: u32 = 0
+
+    base match
+        Record(fs) | Union(fs) ->
+            for f in fs
+                a.texts.push(f.name)
+                names.push(lent(f.name))
+                members.push(type_in(f.ty, a))
+        Bag(e) | List(e) -> elem = type_in(*e, a)
+        Decimal(p, s) ->
+            precision = u32(p)
+            scale = u32(s)
+        _ -> ()
+
+    val bytes = buf[u8]()
+    encode_type(t, bytes)
+    TypeRec(head(KindType), false, kind_code(base), t.is_nullable(), bytes, names, members, elem, precision, scale, None)
+
+/** An owned type handle for `t` (`terndb_type_decode`). */
+owned_type(t: Type) -> *TypeRec
+    val a = new_arena()
+    val r = type_node(t, a)
+    r.owned = true
+    r.arena = Some(a)
+    counted()
+    r.into_raw()
+
+/** A [QT] decode failure as an error: its code, path and message, one entry. */
+codec_error(e: CodecError) -> ErrorData
+    val entries = buf[sh.sysl.terndb.ErrorEntry]()
+    entries.push(entry_of(e, None))
+    WireError(entries, false, Unaffected, None, None)
+
+// -- batches --------------------------------------------------------------------------------------
+
+@export("terndb_batch")
+opaque struct BatchH
+    head: Head
+    /** The `Batch` payload, octet for octet; its storage is 8-aligned. */
+    payload: Buf[u8]
+    tuple: u64
+    rows: usize
+    arena: &Arena
+    rtype: *TypeRec
+    cols: Buf[*ColRec]
+
+/** A batch handle over a copy of `octets`, checked against `tree` as [WIRE] §6.4 rule 2 requires
+ * (`W1008` with the offending path), its result type `result_type`.
+ */
+make_batch(result_type: Type, tree: ColumnTree, octets: []const u8) -> Result[*BatchH, ErrorData]
+    val payload = buf[u8]()
+    payload.extend(octets)
+
+    val b = decode_batch(tree, payload.view()) match
+        Ok(b) -> b
+        Err(e) -> return Err(codec_error(e))
+
+    val a = new_arena()
+    val rtype = type_in(result_type, a)
+    val base = as_ptr(payload.view())
+    val cols = buf[*ColRec]()
+
+    for k in 0..<tree.nodes.len()
+        val node = tree.nodes[k]
+        val bufs = buf[Span]()
+        for j in 0..<node.buffer_count()
+            val v = b.buffers[node.first_buffer + j]
+            val off = if v.len == 0 then usize(0) else usize(as_ptr(v) - base)
+            bufs.push(Span(off, v.len))
+
+        val (kind, width) = node.kind match
+            Fixed(w) -> (ColFixed, w)
+            VarBin -> (ColVarbin, usize(0))
+            Fields -> (ColRecord, usize(0))
+            Tagged(w) -> (ColUnion, w)
+            Nested -> (ColRelation, usize(0))
+
+        val ty = type_in(if node.nullable then nullable(node.ty) else node.ty, a)
+        val c: &ColRec = ColRec(head(KindColumn), base, kind, ty, b.lengths[k], b.null_counts[k], node.nullable, bufs, width,
+            buf())
+        val p = c.into_raw()
+        a.cols.push(p)
+        cols.push(p)
+
+    for k in 0..<tree.nodes.len()
+        for child in tree.nodes[k].children
+            cols[k].children.push(cols[child])
+
+    counted()
+    val h: &BatchH = BatchH(head(KindBatch), payload, b.tuple, b.lengths[0], a, rtype, cols)
+    Ok(h.into_raw())
+
+/** The handle check of a getter with no error channel. */
+private batch_ok(b: *const BatchH, function: string) -> bool
+    expect_handle(ptr_cast(b), KindBatch, function)
+    b != null
+
+@export("terndb_batch_decode")
+batch_decode(result_type: *const TypeRec, bytes: *const u8, len: usize, out: **BatchH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val r = check_handle(ptr_cast(result_type), KindType)
+    if r != NoRefusal then return refuse(err, r, "result_type")
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    if bytes == null && len > 0 then return fail(err, bad_argument("bytes is NULL"))
+
+    val t = decode_type(result_type.bytes.view()) match
+        Ok(t) -> t
+        Err(e) -> return fail(err, codec_error(e))
+    if !t.is_relation() || t.is_nullable() then return fail(err, bad_argument("result_type is not a relation type"))
+    val tree = column_tree(t) match
+        Ok(x) -> x
+        Err(e) -> return fail(err, bad_argument("result_type is not a relation type"))
+
+    val octets: []const u8 = if len == 0 then [] else bytes[0..<len]
+    make_batch(t, tree, octets) match
+        Ok(h) ->
+            *out = h
+            0
+        Err(e) -> fail(err, e)
+
+@export("terndb_batch_bytes")
+batch_bytes(b: *const BatchH, ptr: **const u8, len: *usize)
+    if !batch_ok(b, "terndb_batch_bytes") then return
+    if ptr != null then *ptr = as_ptr(b.payload.view())
+    if len != null then *len = b.payload.len()
+
+@export("terndb_batch_tuple")
+batch_tuple(b: *const BatchH) -> u64 = if batch_ok(b, "terndb_batch_tuple") then b.tuple else 0
+
+@export("terndb_batch_rows")
+batch_rows(b: *const BatchH) -> usize = if batch_ok(b, "terndb_batch_rows") then b.rows else 0
+
+@export("terndb_batch_type")
+batch_type(b: *const BatchH) -> *const TypeRec = if batch_ok(b, "terndb_batch_type") then b.rtype else null
+
+@export("terndb_batch_root")
+batch_root(b: *const BatchH) -> *const ColRec = if batch_ok(b, "terndb_batch_root") then b.cols[0] else null
+
+@export("terndb_batch_column_count")
+batch_column_count(b: *const BatchH) -> usize = if batch_ok(b, "terndb_batch_column_count") then b.cols.len() else 0
+
+@export("terndb_batch_column")
+batch_column(b: *const BatchH, preorder_index: usize) -> *const ColRec
+    if !batch_ok(b, "terndb_batch_column") then return null
+    if preorder_index >= b.cols.len()
+        if DebugChecks then abort_with("C1002", "terndb_batch_column")
+        return null
+    b.cols[preorder_index]
+
+@export("terndb_batch_free")
+batch_free(b: *BatchH)
+    if b == null then return
+    release(b, KindBatch, "terndb_batch_free")
+
+// -- columns --------------------------------------------------------------------------------------
+
+/** The handle check of a column getter: aborts a debug build on a violation (§12.1 rule 18). */
+private col_ok(c: *const ColRec, function: string) -> bool
+    expect_handle(ptr_cast(c), KindColumn, function)
+    c != null
+
+/** Checks slot `i` and that the column's type kind is one of `kinds`. */
+private slot_ok(c: *const ColRec, i: usize, kinds: []const i32, function: string) -> bool
+    if !col_ok(c, function) then return false
+    var accepted = false
+    for k in kinds
+        if c.ty.kind == k then accepted = true
+    if !accepted || c.kind != ColFixed && c.kind != ColVarbin || i >= c.len
+        if DebugChecks then abort_with("C1002", function)
+        return false
+    true
+
+/** The address of slot `i` of a fixed column's values. */
+private slot(c: *const ColRec, i: usize) -> *const u8 = &c.base[c.bufs[main_index(c)].off + i * c.width]
+
+/** The address `n` octets into buffer `j` of `c`. */
+private in_buf(c: *const ColRec, j: usize, n: usize) -> *const u8 = &c.base[c.bufs[j].off + n]
+
+/** The index in `bufs` of the node's first buffer after validity. */
+private main_index(c: *const ColRec) -> usize = if c.nullable then 1 else 0
+
+private le(p: *const u8, n: usize) -> u64
+    var v: u64 = 0
+    for k in 0..<n
+        v = v | u64(p[k]) << (8 * k)
+    v
+
+private u32_at(c: *const ColRec, j: usize, i: usize) -> usize = usize(le(in_buf(c, j, 4 * i), 4))
+
+@export("terndb_column_kind")
+column_kind(c: *const ColRec) -> i32 = if col_ok(c, "terndb_column_kind") then c.kind else 0
+
+@export("terndb_column_type")
+column_type(c: *const ColRec) -> *const TypeRec = if col_ok(c, "terndb_column_type") then c.ty else null
+
+@export("terndb_column_len")
+column_len(c: *const ColRec) -> usize = if col_ok(c, "terndb_column_len") then c.len else 0
+
+@export("terndb_column_null_count")
+column_null_count(c: *const ColRec) -> usize = if col_ok(c, "terndb_column_null_count") then c.null_count else 0
+
+@export("terndb_column_is_null")
+column_is_null(c: *const ColRec, i: usize) -> bool
+    if !col_ok(c, "terndb_column_is_null") then return false
+    if i >= c.len
+        if DebugChecks then abort_with("C1002", "terndb_column_is_null")
+        return false
+    if c.null_count == 0 then return false
+    val v = in_buf(c, 0, 0)
+    v[i / 8] & u8(1) << (i % 8) == 0
+
+@export("terndb_column_buffer_count")
+column_buffer_count(c: *const ColRec) -> usize = if col_ok(c, "terndb_column_buffer_count") then c.bufs.len() else 0
+
+@export("terndb_column_buffer")
+column_buffer(c: *const ColRec, j: usize, ptr: **const u8, len: *usize)
+    if !col_ok(c, "terndb_column_buffer") then return
+    if j >= c.bufs.len()
+        if DebugChecks then abort_with("C1002", "terndb_column_buffer")
+        return
+    if ptr != null then *ptr = in_buf(c, j, 0)
+    if len != null then *len = c.bufs[j].len
+
+@export("terndb_column_fixed")
+column_fixed(c: *const ColRec, width: *usize) -> *const u8
+    if !col_ok(c, "terndb_column_fixed") then return null
+    if c.kind != ColFixed
+        if DebugChecks then abort_with("C1002", "terndb_column_fixed")
+        return null
+    if width != null then *width = c.width
+    in_buf(c, main_index(c), 0)
+
+@export("terndb_column_get_bool")
+column_get_bool(c: *const ColRec, i: usize) -> bool =
+    if slot_ok(c, i, [TypeBool], "terndb_column_get_bool") then slot(c, i)[0] == 1 else false
+
+@export("terndb_column_get_i8")
+column_get_i8(c: *const ColRec, i: usize) -> i8 =
+    if slot_ok(c, i, [TypeInt8], "terndb_column_get_i8") then i8.wrap(le(slot(c, i), 1)) else 0
+
+@export("terndb_column_get_i16")
+column_get_i16(c: *const ColRec, i: usize) -> i16 =
+    if slot_ok(c, i, [TypeInt16], "terndb_column_get_i16") then i16.wrap(le(slot(c, i), 2)) else 0
+
+@export("terndb_column_get_i32")
+column_get_i32(c: *const ColRec, i: usize) -> i32 =
+    if slot_ok(c, i, [TypeInt32, TypeDate], "terndb_column_get_i32") then i32.wrap(le(slot(c, i), 4)) else 0
+
+@export("terndb_column_get_i64")
+column_get_i64(c: *const ColRec, i: usize) -> i64 =
+    if slot_ok(c, i, [TypeInt64, TypeTime, TypeDatetime, TypeTimestamp], "terndb_column_get_i64") then
+        i64.wrap(le(slot(c, i), 8))
+    else 0
+
+@export("terndb_column_get_u8")
+column_get_u8(c: *const ColRec, i: usize) -> u8 =
+    if slot_ok(c, i, [TypeUInt8], "terndb_column_get_u8") then u8(le(slot(c, i), 1)) else 0
+
+@export("terndb_column_get_u16")
+column_get_u16(c: *const ColRec, i: usize) -> u16 =
+    if slot_ok(c, i, [TypeUInt16], "terndb_column_get_u16") then u16(le(slot(c, i), 2)) else 0
+
+@export("terndb_column_get_u32")
+column_get_u32(c: *const ColRec, i: usize) -> u32 =
+    if slot_ok(c, i, [TypeUInt32], "terndb_column_get_u32") then u32(le(slot(c, i), 4)) else 0
+
+@export("terndb_column_get_u64")
+column_get_u64(c: *const ColRec, i: usize) -> u64 =
+    if slot_ok(c, i, [TypeUInt64], "terndb_column_get_u64") then le(slot(c, i), 8) else 0
+
+@export("terndb_column_get_f32")
+column_get_f32(c: *const ColRec, i: usize) -> f32 =
+    if slot_ok(c, i, [TypeFloat32], "terndb_column_get_f32") then f32.from_bits(u32(le(slot(c, i), 4))) else 0.0
+
+@export("terndb_column_get_f64")
+column_get_f64(c: *const ColRec, i: usize) -> f64 =
+    if slot_ok(c, i, [TypeFloat64], "terndb_column_get_f64") then f64.from_bits(le(slot(c, i), 8)) else 0.0
+
+@export("terndb_column_get_i128")
+column_get_i128(c: *const ColRec, i: usize, lo: *u64, hi: *i64)
+    if !slot_ok(c, i, [TypeInt128, TypeDecimal], "terndb_column_get_i128") then return
+    val p = slot(c, i)
+    if lo != null then *lo = le(p, 8)
+    if hi != null then *hi = i64.wrap(le(&p[8], 8))
+
+@export("terndb_column_get_interval")
+column_get_interval(c: *const ColRec, i: usize, months: *i32, days: *i32, micros: *i64)
+    if !slot_ok(c, i, [TypeInterval], "terndb_column_get_interval") then return
+    val p = slot(c, i)
+    if months != null then *months = i32.wrap(le(p, 4))
+    if days != null then *days = i32.wrap(le(&p[4], 4))
+    if micros != null then *micros = i64.wrap(le(&p[8], 8))
+
+@export("terndb_column_get_uuid")
+column_get_uuid(c: *const ColRec, i: usize, out: *[16]u8)
+    if !slot_ok(c, i, [TypeUuid], "terndb_column_get_uuid") || out == null then return
+    val p = slot(c, i)
+    for k in 0..<16
+        out[k] = p[k]
+
+@export("terndb_column_bytes")
+column_bytes(c: *const ColRec, i: usize, len: *usize) -> *const u8
+    if !slot_ok(c, i, [TypeText, TypeBytes, TypeJson], "terndb_column_bytes") then return null
+    val m = main_index(c)
+    val start = u32_at(c, m, i)
+    val end = u32_at(c, m, i + 1)
+    if len != null then *len = end - start
+    in_buf(c, m + 1, start)
+
+/** Checks a column is of kind `kind`, for the record, relation and union walks (§12.1 rule 19). */
+private shape_ok(c: *const ColRec, kind: i32, function: string) -> bool
+    if !col_ok(c, function) then return false
+    if c.kind != kind
+        if DebugChecks then abort_with("C1002", function)
+        return false
+    true
+
+@export("terndb_column_field_count")
+column_field_count(c: *const ColRec) -> usize =
+    if shape_ok(c, ColRecord, "terndb_column_field_count") then c.children.len() else 0
+
+@export("terndb_column_field")
+column_field(c: *const ColRec, j: usize) -> *const ColRec
+    if !shape_ok(c, ColRecord, "terndb_column_field") then return null
+    if j >= c.children.len()
+        if DebugChecks then abort_with("C1002", "terndb_column_field")
+        return null
+    c.children[j]
+
+@export("terndb_column_field_by_name")
+column_field_by_name(c: *const ColRec, name: *const CChar, name_len: usize) -> *const ColRec
+    if !shape_ok(c, ColRecord, "terndb_column_field_by_name") then return null
+    if name == null && name_len > 0 then return null
+    val want: *const u8 = ptr_cast(name)
+    for j in 0..<c.ty.names.len()
+        val n = c.ty.names[j]
+        if n.len == name_len
+            var same = true
+            for k in 0..<name_len
+                if n.ptr[k] != want[k] then same = false
+            if same then return c.children[j]
+    null
+
+@export("terndb_column_children")
+column_children(c: *const ColRec) -> *const ColRec =
+    if shape_ok(c, ColRelation, "terndb_column_children") then c.children[0] else null
+
+@export("terndb_column_range")
+column_range(c: *const ColRec, i: usize, start: *usize, end: *usize)
+    if !shape_ok(c, ColRelation, "terndb_column_range") then return
+    if i >= c.len
+        if DebugChecks then abort_with("C1002", "terndb_column_range")
+        return
+    val m = main_index(c)
+    if start != null then *start = u32_at(c, m, i)
+    if end != null then *end = u32_at(c, m, i + 1)
+
+@export("terndb_column_variant_count")
+column_variant_count(c: *const ColRec) -> usize =
+    if shape_ok(c, ColUnion, "terndb_column_variant_count") then c.children.len() else 0
+
+@export("terndb_column_union_tag")
+column_union_tag(c: *const ColRec, i: usize) -> u32
+    if !shape_ok(c, ColUnion, "terndb_column_union_tag") then return 0
+    if i >= c.len
+        if DebugChecks then abort_with("C1002", "terndb_column_union_tag")
+        return 0
+    u32(le(in_buf(c, main_index(c), i * c.width), c.width))
+
+@export("terndb_column_union_offset")
+column_union_offset(c: *const ColRec, i: usize) -> usize
+    if !shape_ok(c, ColUnion, "terndb_column_union_offset") then return 0
+    if i >= c.len
+        if DebugChecks then abort_with("C1002", "terndb_column_union_offset")
+        return 0
+    u32_at(c, main_index(c) + 1, i)
+
+@export("terndb_column_variant")
+column_variant(c: *const ColRec, j: usize) -> *const ColRec
+    if !shape_ok(c, ColUnion, "terndb_column_variant") then return null
+    if j >= c.children.len()
+        if DebugChecks then abort_with("C1002", "terndb_column_variant")
+        return null
+    c.children[j]
+
+// -- types ----------------------------------------------------------------------------------------
+
+private type_ok(t: *const TypeRec, function: string) -> bool
+    expect_handle(ptr_cast(t), KindType, function)
+    t != null
+
+@export("terndb_type_decode")
+type_decode(bytes: *const u8, len: usize, out: **TypeRec, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    if bytes == null && len > 0 then return fail(err, bad_argument("bytes is NULL"))
+    val octets: []const u8 = if len == 0 then [] else bytes[0..<len]
+    val t = decode_type(octets) match
+        Ok(t) -> t
+        Err(e) -> return fail(err, codec_error(named_refused(e)))
+    *out = owned_type(t)
+    0
+
+/** `e` as `terndb_type_decode` reports it. The type decoder refuses a named type reference with the
+ * wire's code for a result type (`W1008`, its one use of that code); this function is not reading a
+ * result, so the refusal is the [QT] code for a kind not allowed there, `Q1002` (§12.1 rule 20).
+ */
+private named_refused(e: CodecError) -> CodecError =
+    if e.code == "W1008" then CodecError("Q1002", e.path, e.message, e.details, e.node) else e
+
+@export("terndb_type_kind")
+type_kind(t: *const TypeRec) -> i32 = if type_ok(t, "terndb_type_kind") then t.kind else 0
+
+@export("terndb_type_nullable")
+type_nullable(t: *const TypeRec) -> bool = type_ok(t, "terndb_type_nullable") && t.nullable
+
+@export("terndb_type_member_count")
+type_member_count(t: *const TypeRec) -> usize = if type_ok(t, "terndb_type_member_count") then t.members.len() else 0
+
+@export("terndb_type_member_name")
+type_member_name(t: *const TypeRec, j: usize, ptr: **const CChar, len: *usize)
+    if !type_ok(t, "terndb_type_member_name") then return
+    if j >= t.names.len()
+        if DebugChecks then abort_with("C1002", "terndb_type_member_name")
+        return
+    if ptr != null then *ptr = ptr_cast(t.names[j].ptr)
+    if len != null then *len = t.names[j].len
+
+@export("terndb_type_member_type")
+type_member_type(t: *const TypeRec, j: usize) -> *const TypeRec
+    if !type_ok(t, "terndb_type_member_type") then return null
+    if j >= t.members.len()
+        if DebugChecks then abort_with("C1002", "terndb_type_member_type")
+        return null
+    t.members[j]
+
+@export("terndb_type_element")
+type_element(t: *const TypeRec) -> *const TypeRec = if type_ok(t, "terndb_type_element") then t.elem else null
+
+@export("terndb_type_decimal")
+type_decimal(t: *const TypeRec, precision: *u32, scale: *u32)
+    if !type_ok(t, "terndb_type_decimal") then return
+    if precision != null then *precision = t.precision
+    if scale != null then *scale = t.scale
+
+@export("terndb_type_bytes")
+type_bytes(t: *const TypeRec, ptr: **const u8, len: *usize)
+    if !type_ok(t, "terndb_type_bytes") then return
+    if ptr != null then *ptr = as_ptr(t.bytes.view())
+    if len != null then *len = t.bytes.len()
+
+@export("terndb_type_free")
+type_free(t: *TypeRec)
+    if t == null then return
+    expect_handle(ptr_cast(t), KindType, "terndb_type_free")
+    if !t.owned
+        if DebugChecks then abort_with("C1001", "terndb_type_free")
+        return
+    release(t, KindType, "terndb_type_free")

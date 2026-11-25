@@ -1,0 +1,450 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.sync.Atomic
+import sysl.threads.Mutex
+import sh.sysl.terndb.{Aborted, Cancel, Closed, Complete, Credit, Detail, ErrorEntry, ErrorReply, Goodbye, Message, OkReply,
+    Prepared, ReadyMsg, ResultHeaderMsg, BatchReply, TxnBegun, TxnCommitted, TxnStatus, Unaffected, WireError, Committed,
+    InProgress, TxnState, encode_payload}
+
+// A connection's shared state (`c-api.md` §5.1): the waiter of every stream it has open, and the
+// routing of what its server session answers. The engine thread delivers; caller threads submit,
+// cancel and close. Locks are taken connection, then operation, then queue, and an operation is
+// completed only once the connection's lock is let go.
+
+/** What a stream's answers go to. */
+enum Sink
+    /** The handshake: `Ready` completes the open. */
+    OpenSink(op: &sync OpCore)
+    /** A request answered by one message (begin, commit, rollback, savepoints, status). */
+    ReplySink(op: &sync OpCore, kind: OpKind, txn: Option[&sync TxnCore])
+    /** A `Prepare`: its handle, and the envelope it carried for the parameter types. */
+    PrepareSink(op: &sync OpCore, handle: u64, envelope: Buf[u8])
+    /** An execute: the header completes the operation, then the result takes the rest. */
+    ExecSink(op: &sync OpCore, txn: Option[&sync TxnCore], res: Option[&sync ResultCore])
+
+struct StreamSink
+    stream: u64
+    sink: Sink
+
+/** One completion to run once the connection's lock is let go. */
+private enum Done
+    Succeed(op: &sync OpCore, out: OpOut)
+    Fail(op: &sync OpCore, err: Buf[u8])
+    Batch(res: &sync ResultCore, payload: Buf[u8])
+    Finish(res: &sync ResultCore, counts: Buf[u64], has_commit: bool, commit: u64)
+    Ended(res: &sync ResultCore, err: Buf[u8])
+
+struct ConnState
+    streams: Buf[StreamSink]
+    next_stream: u64
+    next_handle: u64
+    minor: u64
+    ready: bool
+    closed: bool
+    catalog_version: u64
+
+struct ConnCore
+    id: u64
+    db: &sync DbCore
+    user: string
+    application: string
+    max_in_flight: u64
+    max_open_txns: u64
+    m: Mutex[ConnState]
+    /** Held by the thread inside a call on the connection (§2.3: `C1004`). */
+    busy: Atomic[u32]
+
+    /** Takes the connection for one call; false when another thread holds it. */
+    enter(&sync self) -> bool = self.busy.cas(0, 1) == 0
+
+    leave(&sync self) = self.busy.store(0)
+
+    is_closed(&sync self) -> bool = self.m.with((s) -> s.closed)
+
+    catalog_version(&sync self) -> u64 = self.m.with((s) -> s.catalog_version)
+
+    /** A fresh handle number for a transaction or a prepared statement. */
+    new_handle(&sync self) -> u64 = self.m.with((s) ->
+        s.next_handle += 1
+        s.next_handle)
+
+    /** Sends request `m` on a new stream, its answers going to `sink`, which completes `op`. A closed
+     * connection fails `op` with `C1006`; a full window with `W2008` (§12.1 rule 12).
+     */
+    request(&sync self, m: Message, sink: Sink, op: &sync OpCore)
+        // A request the encoder refuses is refused with the encoder's code, as a server refuses it
+        // (`W2011` for implicit options beside a transaction, §7 rule 2).
+        val payload = encode_payload(m, self.m.with((s) -> s.minor)) match
+            Ok(p) -> p
+            Err(e) -> return op.fail(codec_error(e))
+
+        val s = self.m.lock_raw()
+        if s.closed
+            self.m.unlock_raw()
+            return op.fail(closed_error("the connection"))
+        if u64(s.streams.len()) >= self.max_in_flight
+            self.m.unlock_raw()
+            return op.fail(wire_error_of("W2008", s"at most ${self.max_in_flight} requests may be in flight"))
+        s.next_stream += 2
+        val stream = s.next_stream - 1
+        s.streams.push(StreamSink(stream, sink))
+        self.m.unlock_raw()
+
+        op.m.with((o) ->
+            o.conn = Some(self)
+            o.stream = stream)
+
+        if !self.db.post(ToConn(self.id, stream, Wire(m.type_code(), payload)))
+            self.drop_stream(stream)
+            op.fail(closed_error("the database"))
+
+    /** Sends a message that opens no stream: `Cancel` or `Credit` on `stream`. */
+    signal(&sync self, stream: u64, m: Message)
+        val minor = self.m.with((s) -> if s.closed then u64(0xffff) else s.minor)
+        if minor != 0xffff then self.db.post(ToConn(self.id, stream, wire_of(m, minor)))
+
+    cancel(&sync self, stream: u64) = self.signal(stream, Cancel)
+
+    credit(&sync self, stream: u64, octets: u64) = self.signal(stream, Credit(octets))
+
+    private drop_stream(&sync self, stream: u64) = self.m.with((s) ->
+        var i: usize = 0
+        while i < s.streams.len()
+            if s.streams[i].stream == stream then s.streams.remove(i) else i += 1)
+
+    /** `terndb_conn_close`: rolls back, cancels every running request with `T1007`, and makes every
+     * later call `C1006` (§5.1 rule 4).
+     */
+    close(&sync self)
+        val s = self.m.lock_raw()
+        if s.closed
+            self.m.unlock_raw()
+            return
+        s.closed = true
+        val sinks = s.streams
+        s.streams = buf()
+        self.m.unlock_raw()
+        self.db.post(CloseConn(self.id))
+        fail_sinks(sinks, cancelled_octets(""))
+
+    /** The database closed the connection: its session has already answered what it was running;
+     * anything still waiting ends as cancelled by the shutdown (§4.3 rule 1).
+     */
+    close_by_database(&sync self)
+        val s = self.m.lock_raw()
+        s.closed = true
+        val sinks = s.streams
+        s.streams = buf()
+        self.m.unlock_raw()
+        fail_sinks(sinks, cancelled_octets("shutdown"))
+
+    /** What the session sent on `stream`, routed to its waiter (on the engine thread). */
+    deliver(&sync self, db: &sync DbCore, stream: u64, m: Message, minor: u64)
+        val todo = buf[Done]()
+        val s = self.m.lock_raw()
+
+        if stream == 0
+            m match
+                ReadyMsg(r) ->
+                    s.ready = true
+                    s.minor = minor
+                    s.catalog_version = r.catalog_version
+                    take_sink(s, 0) match
+                        Some(OpenSink(op)) -> todo.push(Succeed(op, ConnOut(self)))
+                        _ -> ()
+                ErrorReply(e) ->
+                    s.closed = true
+                    val all = s.streams
+                    s.streams = buf()
+                    for x in all
+                        fail_sink(todo, x.sink, error_octets(e))
+                Goodbye(code, message, _) ->
+                    s.closed = true
+                _ -> ()
+            self.m.unlock_raw()
+            run(todo)
+            return
+
+        val found = find_sink(s, stream)
+        found match
+            None -> ()
+            Some(OpenSink(_)) -> ()
+            Some(ReplySink(op, kind, txn)) ->
+                take_sink(s, stream)
+                m match
+                    TxnBegun(txid, snapshot, effective) ->
+                        txn match
+                            Some(t) -> t.opened(txid, snapshot, isolation_code(effective))
+                            None -> ()
+                        db.txns_open.add(1)
+                        todo.push(Succeed(op, NoOut))
+                    TxnCommitted(_, commit) ->
+                        txn match
+                            Some(t) -> t.ended()
+                            None -> ()
+                        db.txns_open.sub(1)
+                        db.commits.add(1)
+                        todo.push(Succeed(op, commit match
+                            Some(c) -> SeqOut(true, c)
+                            None -> SeqOut(false, 0)))
+                    OkReply ->
+                        if kind == OpRollback
+                            txn match
+                                Some(t) ->
+                                    if t.ended() then db.txns_open.sub(1)
+                                None -> ()
+                        todo.push(Succeed(op, NoOut))
+                    TxnStatus(state, commit) ->
+                        val code = state match
+                            Committed -> StatusCommitted
+                            TxnState.Aborted -> StatusAborted
+                            InProgress -> StatusInProgress
+                        todo.push(Succeed(op, commit match
+                            Some(c) -> StatusOut(code, true, c)
+                            None -> StatusOut(code, false, 0)))
+                    ErrorReply(e) ->
+                        if kind == OpBegin
+                            txn match
+                                Some(t) -> t.begin_failed(error_octets(e))
+                                None -> ()
+                        todo.push(Fail(op, failure_octets(db, e, txn)))
+                    _ -> todo.push(Fail(op, error_octets(c_error("C1005", "an unexpected answer"))))
+            Some(PrepareSink(op, handle, envelope)) ->
+                take_sink(s, stream)
+                m match
+                    Prepared(_, _, _) -> todo.push(Succeed(op, StmtOut(handle, wire_of(m, minor), envelope.copy())))
+                    ErrorReply(e) -> todo.push(Fail(op, failure_octets(db, e, None)))
+                    _ -> todo.push(Fail(op, error_octets(c_error("C1005", "an unexpected answer"))))
+            Some(ExecSink(op, txn, res)) ->
+                m match
+                    ResultHeaderMsg(_) ->
+                        val r: &sync ResultCore = new_result(self, stream)
+                        set_sink(s, stream, ExecSink(op, txn, Some(r)))
+                        todo.push(Succeed(op, ResultOut(r, wire_of(m, minor))))
+                    BatchReply(payload) -> res match
+                        Some(r) -> todo.push(Batch(r, payload.copy()))
+                        None -> ()
+                    Complete(counts, commit) ->
+                        take_sink(s, stream)
+                        if commit.is_some() then db.commits.add(1)
+                        res match
+                            Some(r) -> todo.push(Finish(r, counts.copy(), commit.is_some(), commit.unwrap_or(0)))
+                            None -> ()
+                    ErrorReply(e) ->
+                        take_sink(s, stream)
+                        val octets = failure_octets(db, e, txn)
+                        res match
+                            Some(r) -> todo.push(Ended(r, octets))
+                            None -> todo.push(Fail(op, octets))
+                    _ -> ()
+
+        self.m.unlock_raw()
+        run(todo)
+end ConnCore
+
+/** A new connection to `db`, not yet open. */
+new_conn(db: &sync DbCore, user: string, application: string, max_in_flight: u64, max_open_txns: u64) -> &sync ConnCore =
+    ConnCore(db.next_conn_id(), db, user, application, max_in_flight, max_open_txns,
+        Mutex.new(ConnState(buf(), 0, 0, 0, false, false, 0)), Atomic(0))
+
+private find_sink(s: *ConnState, stream: u64) -> Option[Sink]
+    for x in s.streams
+        if x.stream == stream then return Some(x.sink)
+    None
+
+private take_sink(s: *ConnState, stream: u64) -> Option[Sink]
+    for i in 0..<s.streams.len()
+        if s.streams[i].stream == stream
+            val x = s.streams[i].sink
+            s.streams.remove(i)
+            return Some(x)
+    None
+
+private set_sink(s: *ConnState, stream: u64, sink: Sink)
+    for i in 0..<s.streams.len()
+        if s.streams[i].stream == stream then s.streams[i] = StreamSink(stream, sink)
+
+/** The `Error` `e` as the caller sees it: a request queued on a transaction whose begin failed
+ * fails with the begin's error (§5.3 rule 2); what aborted or closed a transaction is counted, and
+ * moves the transaction's state.
+ */
+private failure_octets(db: &sync DbCore, e: WireError, txn: Option[&sync TxnCore]) -> Buf[u8]
+    txn match
+        Some(t) ->
+            t.begin_error() match
+                Some(b) -> if e.entries[0].code == "W2001" then return b
+                None -> ()
+            e.txn_state match
+                Aborted -> t.aborted()
+                Closed -> if t.ended() then db.txns_open.sub(1)
+                Unaffected -> ()
+        None -> ()
+    if e.txn_state != Unaffected then db.count_abort(e.entries[0].code)
+    error_octets(e)
+
+private fail_sink(todo: Buf[Done], sink: Sink, err: Buf[u8]) = sink match
+    OpenSink(op) -> todo.push(Fail(op, err))
+    ReplySink(op, _, _) -> todo.push(Fail(op, err))
+    PrepareSink(op, _, _) -> todo.push(Fail(op, err))
+    ExecSink(op, _, res) -> res match
+        Some(r) -> todo.push(Ended(r, err))
+        None -> todo.push(Fail(op, err))
+
+private fail_sinks(sinks: Buf[StreamSink], err: Buf[u8])
+    val todo = buf[Done]()
+    for x in sinks
+        fail_sink(todo, x.sink, err.copy())
+    run(todo)
+
+private run(todo: Buf[Done])
+    for d in todo
+        d match
+            Succeed(op, out) -> op.succeed(out)
+            Fail(op, err) -> op.complete(Some(err), NoOut)
+            Batch(r, p) -> r.push(p)
+            Finish(r, counts, has, c) -> r.finish(counts, has, c)
+            Ended(r, err) -> r.fail(err)
+
+/** An error with a [WIRE] code the library raises for the session (`W2008`). */
+wire_error_of(code: string, message: string) -> ErrorData = c_error(code, message)
+
+/** `T1007` (`cancelled`), with `details.reason` when given, as octets. */
+cancelled_octets(reason: string) -> Buf[u8]
+    val details = buf[Detail]()
+    if reason.len > 0 then details.push(Detail("reason", reason))
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry("T1007", "the request was cancelled", "", details, None))
+    error_octets(WireError(entries, true, Unaffected, None, None))
+
+// -- transactions ---------------------------------------------------------------------------------
+
+struct TxnShared
+    state: i32
+    txid: u64
+    snapshot: u64
+    isolation: i32
+    begin_err: Option[Buf[u8]]
+    committing: bool
+
+/** An explicit transaction (§5.3): its wire handle and the state the answers move it through. */
+struct TxnCore
+    conn: &sync ConnCore
+    handle: u64
+    m: Mutex[TxnShared]
+
+    opened(&sync self, txid: u64, snapshot: u64, isolation: i32) = self.m.with((t) ->
+        if t.state == TxnPending
+            t.state = TxnOpen
+            t.txid = txid
+            t.snapshot = snapshot
+            t.isolation = isolation)
+
+    /** Closed by a commit, a rollback or an error that closed it; true when it was open before. */
+    ended(&sync self) -> bool = self.m.with((t) ->
+        val was = t.state == TxnOpen || t.state == TxnAborted
+        t.state = TxnClosed
+        was)
+
+    aborted(&sync self) = self.m.with((t) -> if t.state == TxnOpen then t.state = TxnAborted)
+
+    begin_failed(&sync self, err: Buf[u8]) = self.m.with((t) ->
+        t.state = TxnClosed
+        t.begin_err = Some(err.copy()))
+
+    begin_error(&sync self) -> Option[Buf[u8]] = self.m.with((t) -> t.begin_err match
+        Some(b) -> Some(b.copy())
+        None -> None)
+
+    state(&sync self) -> i32 = self.m.with((t) -> t.state)
+
+new_txn(conn: &sync ConnCore) -> &sync TxnCore =
+    TxnCore(conn, conn.new_handle(), Mutex.new(TxnShared(TxnPending, 0, 0, -1, None, false)))
+
+// -- results --------------------------------------------------------------------------------------
+
+struct ResultShared
+    batches: Buf[Buf[u8]]
+    /** 0 running, 1 complete, 2 failed. */
+    ended: u8
+    err: Option[Buf[u8]]
+    counts: Buf[u64]
+    has_commit: bool
+    commit: u64
+    /** `result_next` operations waiting for a batch, oldest first. */
+    waiters: Buf[&sync OpCore]
+    /** The caller has been told the result ended: counts and commit are readable from then (§8.1
+     * rule 4).
+     */
+    end_seen: bool
+
+/** One request's stream of batches (§8.1), filled by the engine thread and drained by the caller. */
+struct ResultCore
+    conn: &sync ConnCore
+    stream: u64
+    m: Mutex[ResultShared]
+
+    push(&sync self, payload: Buf[u8])
+        val s = self.m.lock_raw()
+        if s.waiters.len() > 0
+            val w = s.waiters[0]
+            s.waiters.remove(0)
+            self.m.unlock_raw()
+            w.succeed(BatchOut(payload))
+            return
+        s.batches.push(payload.copy())
+        self.m.unlock_raw()
+
+    finish(&sync self, counts: Buf[u64], has_commit: bool, commit: u64)
+        val s = self.m.lock_raw()
+        s.ended = 1
+        s.counts = counts.copy()
+        s.has_commit = has_commit
+        s.commit = commit
+        val ws = s.waiters
+        s.waiters = buf()
+        if ws.len() > 0 then s.end_seen = true
+        self.m.unlock_raw()
+        for w in ws
+            w.succeed(EndOut)
+
+    fail(&sync self, err: Buf[u8])
+        val s = self.m.lock_raw()
+        if s.ended != 0
+            self.m.unlock_raw()
+            return
+        s.ended = 2
+        s.err = Some(err.copy())
+        val ws = s.waiters
+        s.waiters = buf()
+        self.m.unlock_raw()
+        for w in ws
+            w.complete(Some(err.copy()), NoOut)
+
+    /** Completes `op` with the next batch, the end, or the error, now or when one arrives. */
+    next(&sync self, op: &sync OpCore)
+        val s = self.m.lock_raw()
+        if s.batches.len() > 0
+            val p = s.batches[0]
+            s.batches.remove(0)
+            self.m.unlock_raw()
+            return op.succeed(BatchOut(p))
+        if s.ended == 1
+            s.end_seen = true
+            self.m.unlock_raw()
+            return op.succeed(EndOut)
+        if s.ended == 2
+            val e = s.err.unwrap().copy()
+            self.m.unlock_raw()
+            return op.complete(Some(e), NoOut)
+        s.waiters.push(op)
+        self.m.unlock_raw()
+
+    /** Asks the session to stop the request (§8.1 rule 6); an ended result is left as it is. */
+    cancel(&sync self)
+        if self.m.with((s) -> s.ended) == 0 then self.conn.cancel(self.stream)
+
+    ended(&sync self) -> u8 = self.m.with((s) -> s.ended)
+
+new_result(conn: &sync ConnCore, stream: u64) -> &sync ResultCore =
+    ResultCore(conn, stream, Mutex.new(ResultShared(buf(), 0, None, buf(), false, 0, buf(), false)))

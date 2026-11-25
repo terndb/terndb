@@ -1,0 +1,9 @@
+module libterndb
+
+import sh.sysl.terndb.capi.AbiVersion
+
+// The library's one module: reaching `sh.sysl.terndb.capi` is what puts its `@export`s, the whole of
+// `terndb.h`, in the build. The library's ABI version is the module's.
+
+/** The ABI version this build carries. */
+const Abi: u32 = AbiVersion

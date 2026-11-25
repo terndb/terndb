@@ -1,0 +1,412 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.threads.Mutex
+import sh.sysl.terndb.{ExecOptions, Isolation, ReadCommitted, Remote, RemoteApply, Serializable, Snapshot, Synchronous,
+    TxnOptions, no_exec_options, no_txn_options}
+
+// Configuration (`c-api.md` §4.1) and the options objects (§5.2).
+
+/** One `key = value` pair of a configuration. */
+struct Setting
+    key: string
+    value: string
+
+@export("terndb_config")
+opaque struct ConfigH
+    head: Head
+    settings: Mutex[Buf[Setting]]
+
+/** What a key's value must look like. */
+private enum Form
+    Word(choices: []const string)
+    Count(least: u64)
+    Text
+
+/** The form of `key`'s values, or `None` for a key no call knows (§4.1's table). */
+private form_of(key: string) -> Option[Form] = key match
+    "mode" -> Some(Word(["disk", "memory"]))
+    "durability" -> Some(Word(["none", "snapshot", "log"]))
+    "create" -> Some(Word(["never", "if_missing", "always"]))
+    "read_only" -> Some(Word(["true", "false"]))
+    "threads" -> Some(Count(1))
+    "memory_limit" -> Some(Count(0))
+    "snapshot_interval_ms" -> Some(Count(1))
+    "max_snapshot_age_ms" -> Some(Count(0))
+    "isolation" -> Some(Word(["serializable", "snapshot", "read_committed"]))
+    "synchronous" -> Some(Word(["off", "on", "remote", "remote_apply"]))
+    "lock_timeout_ms" -> Some(Count(0))
+    "statement_timeout_ms" -> Some(Count(0))
+    "user" | "application" | "password" | "token" | "auth_methods" | "tls_ca_file" | "tls_server_name" -> Some(Text)
+    "max_in_flight" -> Some(Count(1))
+    "max_open_txns" -> Some(Count(1))
+    _ -> None
+
+/** The keys each call takes (§4.1's "Used by" column). */
+val OpenKeys: []const string = ["mode", "durability", "create", "read_only", "threads", "memory_limit",
+    "snapshot_interval_ms", "max_snapshot_age_ms"]
+val SessionKeys: []const string = ["isolation", "synchronous", "lock_timeout_ms", "statement_timeout_ms", "user",
+    "application", "max_in_flight", "max_open_txns"]
+val ConnectKeys: []const string = ["isolation", "synchronous", "lock_timeout_ms", "statement_timeout_ms", "user",
+    "application", "password", "token", "auth_methods", "tls_ca_file", "tls_server_name"]
+val CloneKeys: []const string = ["mode", "durability", "threads", "memory_limit"]
+
+/** The largest count a value may give: a timeout above 2⁶³ − 1 is refused (§12.1 rule 7). */
+const MaxCount: u64 = 0x7fff_ffff_ffff_ffff
+
+/** A decimal count, if `v` is one no larger than `MaxCount`. */
+parse_count(v: string) -> Option[u64]
+    if v.len == 0 || v.len > 19 then return None
+    var n: u64 = 0
+    for c in v.bytes
+        if c < u8('0') || c > u8('9') then return None
+        n = n * 10 + u64(c - u8('0'))
+    if n > MaxCount then None else Some(n)
+
+/** Whether `value` has the form `key` takes; the refusal says which when it has not. */
+check_setting(key: string, value: string) -> Option[ErrorData]
+    val form = form_of(key) match
+        Some(f) -> f
+        None -> return Some(c_error_with("C1002", s"'$key' is not a configuration key", details1("key", key)))
+
+    val ok = form match
+        Word(choices) ->
+            var found = false
+            for c in choices
+                if c == value then found = true
+            found
+        Count(least) -> parse_count(value) match
+            Some(n) -> n >= least
+            None -> false
+        Text -> true
+
+    if ok then None else Some(c_error_with("C1002", s"'$value' is not a value of '$key'", details1("key", key)))
+
+@export("terndb_config_new")
+config_new(out: **ConfigH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    counted()
+    val h: &ConfigH = ConfigH(head(KindConfig), Mutex.new(buf[Setting]()))
+    *out = h.into_raw()
+    0
+
+@export("terndb_config_set")
+config_set(cfg: *ConfigH, key: *const CChar, key_len: usize, value: *const CChar, value_len: usize, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val r = check_handle(ptr_cast(cfg), KindConfig)
+    if r != NoRefusal then return refuse(err, r, "cfg")
+    if key == null then return fail(err, bad_argument("key is NULL"))
+    if value == null && value_len > 0 then return fail(err, bad_argument("value is NULL"))
+
+    val k = text_of(ptr_cast(key), key_len)
+    val v = text_of(ptr_cast(value), value_len)
+    check_setting(k, v) match
+        Some(e) -> return fail(err, e)
+        None -> ()
+
+    cfg.settings.with((s) ->
+        var i: usize = 0
+        while i < s.len()
+            if s[i].key == k then s.remove(i) else i += 1
+        s.push(Setting(k.copy(), v.copy())))
+    0
+
+@export("terndb_config_free")
+config_free(cfg: *ConfigH)
+    if cfg == null then return
+    release(cfg, KindConfig, "terndb_config_free")
+
+/** A configuration's settings, read once for a call: what the call takes, every key checked against
+ * `keys`. A key the call does not take is `C1002` naming it, with `reason` when the key belongs to
+ * another mode.
+ */
+struct Settings
+    pairs: Buf[Setting]
+
+    get(self, key: string) -> Option[string]
+        for p in self.pairs
+            if p.key == key then return Some(p.value)
+        None
+
+    has(self, key: string) -> bool = self.get(key).is_some()
+
+    count(self, key: string, default: u64) -> u64 = self.get(key) match
+        Some(v) -> parse_count(v).unwrap_or(default)
+        None -> default
+
+    word(self, key: string, default: string) -> string = self.get(key).unwrap_or(default)
+
+/** The settings of `cfg` (none for NULL), checked against the keys a call takes. */
+settings_for(cfg: *const ConfigH, keys: []const string, call: string) -> Result[Settings, ErrorData]
+    if cfg == null then return Ok(Settings(buf()))
+    val r = check_handle(ptr_cast(cfg), KindConfig)
+    if r != NoRefusal then return Err(refusal_error(r, "cfg"))
+
+    val c: *ConfigH = ptr_cast(cfg)
+    val pairs = c.settings.with((s) ->
+        val copy = buf[Setting]()
+        for p in *s
+            copy.push(Setting(p.key.copy(), p.value.copy()))
+        copy)
+
+    for p in pairs
+        var taken = false
+        for k in keys
+            if k == p.key then taken = true
+        if !taken
+            return Err(c_error_with("C1002", s"'${p.key}' does not apply to $call", details1("key", p.key)))
+
+    Ok(Settings(pairs))
+
+/** A `synchronous` setting as its level. */
+sync_of(word: string) -> Option[Synchronous] = word match
+    "off" -> Some(Synchronous.Off)
+    "on" -> Some(Synchronous.On)
+    "remote" -> Some(Remote)
+    "remote_apply" -> Some(RemoteApply)
+    _ -> None
+
+/** An `isolation` setting as its level. */
+isolation_of(word: string) -> Option[Isolation] = word match
+    "serializable" -> Some(Serializable)
+    "snapshot" -> Some(Isolation.Snapshot)
+    "read_committed" -> Some(ReadCommitted)
+    _ -> None
+
+/** An isolation constant as its level. */
+isolation_level(c: i32) -> Option[Isolation] = c match
+    0 -> Some(Serializable)
+    1 -> Some(Isolation.Snapshot)
+    2 -> Some(ReadCommitted)
+    _ -> None
+
+/** A level as its isolation constant. */
+isolation_code(i: Isolation) -> i32 = i match
+    Serializable -> IsoSerializable
+    Isolation.Snapshot -> IsoSnapshot
+    ReadCommitted -> IsoReadCommitted
+
+// -- options objects (§5.2) -----------------------------------------------------------------------
+
+@export("terndb_txn_options")
+opaque struct TxnOptionsH
+    head: Head
+    o: TxnOptions
+
+@export("terndb_exec_options")
+opaque struct ExecOptionsH
+    head: Head
+    o: ExecOptions
+    /** `prefetch_bytes`, absent until set (§5.2 rule 3). */
+    prefetch: Option[u64]
+
+@export("terndb_txn_options_new")
+txn_options_new(out: **TxnOptionsH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    counted()
+    val h: &TxnOptionsH = TxnOptionsH(head(KindTxnOptions), no_txn_options())
+    *out = h.into_raw()
+    0
+
+/** The options object `o` after its handle check, or the refusal. */
+private txn_opts(o: *TxnOptionsH, err: **ErrorH) -> Option[CInt]
+    if !initialized() then return Some(fail(err, not_initialized()))
+    val r = check_handle(ptr_cast(o), KindTxnOptions)
+    if r != NoRefusal then return Some(refuse(err, r, "o"))
+    None
+
+private timeout(ms: u64, err: **ErrorH) -> Option[CInt] =
+    if ms > MaxCount then Some(fail(err, bad_argument("a timeout above 2^63 - 1"))) else None
+
+@export("terndb_txn_options_set_isolation")
+txn_options_set_isolation(o: *TxnOptionsH, isolation: i32, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    val level = isolation_level(isolation) match
+        Some(l) -> l
+        None -> return fail(err, bad_argument(s"$isolation is not an isolation constant"))
+    o.o.isolation = Some(level)
+    0
+
+@export("terndb_txn_options_set_synchronous")
+txn_options_set_synchronous(o: *TxnOptionsH, level: i32, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    val s = level match
+        0 -> Synchronous.Off
+        1 -> Synchronous.On
+        2 -> Remote
+        3 -> RemoteApply
+        _ -> return fail(err, bad_argument(s"$level is not a synchronous level"))
+    o.o.synchronous = Some(s)
+    0
+
+@export("terndb_txn_options_set_read_only")
+txn_options_set_read_only(o: *TxnOptionsH, on: bool, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    o.o.read_only = Some(on)
+    0
+
+@export("terndb_txn_options_set_after")
+txn_options_set_after(o: *TxnOptionsH, commit_seq: u64, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    o.o.after = Some(commit_seq)
+    0
+
+@export("terndb_txn_options_set_lock_timeout_ms")
+txn_options_set_lock_timeout_ms(o: *TxnOptionsH, ms: u64, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    timeout(ms, err) match
+        Some(r) -> return r
+        None -> ()
+    o.o.lock_timeout_ms = Some(ms)
+    0
+
+@export("terndb_txn_options_set_replica_wait_timeout_ms")
+txn_options_set_replica_wait_timeout_ms(o: *TxnOptionsH, ms: u64, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    timeout(ms, err) match
+        Some(r) -> return r
+        None -> ()
+    o.o.replica_wait_timeout_ms = Some(ms)
+    0
+
+@export("terndb_txn_options_set_max_lag_ms")
+txn_options_set_max_lag_ms(o: *TxnOptionsH, ms: u64, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    timeout(ms, err) match
+        Some(r) -> return r
+        None -> ()
+    o.o.max_lag_ms = Some(ms)
+    0
+
+@export("terndb_txn_options_clear")
+txn_options_clear(o: *TxnOptionsH, field: i32, err: **ErrorH) -> CInt
+    txn_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    field match
+        1 -> o.o.isolation = None
+        2 -> o.o.synchronous = None
+        3 -> o.o.read_only = None
+        4 -> o.o.after = None
+        5 -> o.o.lock_timeout_ms = None
+        6 -> o.o.replica_wait_timeout_ms = None
+        7 -> o.o.max_lag_ms = None
+        _ -> return fail(err, bad_argument(s"$field is not a transaction option"))
+    0
+
+@export("terndb_txn_options_free")
+txn_options_free(o: *TxnOptionsH)
+    if o == null then return
+    release(o, KindTxnOptions, "terndb_txn_options_free")
+
+/** The transaction options `o` carries: none for NULL. */
+txn_options_of(o: *const TxnOptionsH) -> Result[TxnOptions, ErrorData]
+    if o == null then return Ok(no_txn_options())
+    val r = check_handle(ptr_cast(o), KindTxnOptions)
+    if r != NoRefusal then return Err(refusal_error(r, "opts"))
+    Ok(o.o)
+
+@export("terndb_exec_options_new")
+exec_options_new(out: **ExecOptionsH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    counted()
+    val h: &ExecOptionsH = ExecOptionsH(head(KindExecOptions), no_exec_options(), None)
+    *out = h.into_raw()
+    0
+
+private exec_opts(o: *ExecOptionsH, err: **ErrorH) -> Option[CInt]
+    if !initialized() then return Some(fail(err, not_initialized()))
+    val r = check_handle(ptr_cast(o), KindExecOptions)
+    if r != NoRefusal then return Some(refuse(err, r, "o"))
+    None
+
+@export("terndb_exec_options_set_prefetch_bytes")
+exec_options_set_prefetch_bytes(o: *ExecOptionsH, octets: usize, err: **ErrorH) -> CInt
+    exec_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    if octets == 0 then return fail(err, bad_argument("prefetch_bytes is at least 1"))
+    o.prefetch = Some(u64(octets))
+    0
+
+@export("terndb_exec_options_set_batch_rows")
+exec_options_set_batch_rows(o: *ExecOptionsH, rows: usize, err: **ErrorH) -> CInt
+    exec_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    if rows == 0 then return fail(err, bad_argument("batch_rows is at least 1"))
+    o.o.batch_rows = Some(u64(rows))
+    0
+
+@export("terndb_exec_options_set_batch_bytes")
+exec_options_set_batch_bytes(o: *ExecOptionsH, octets: usize, err: **ErrorH) -> CInt
+    exec_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    if octets == 0 then return fail(err, bad_argument("batch_bytes is at least 1"))
+    o.o.batch_bytes = Some(u64(octets))
+    0
+
+@export("terndb_exec_options_set_statement_timeout_ms")
+exec_options_set_statement_timeout_ms(o: *ExecOptionsH, ms: u64, err: **ErrorH) -> CInt
+    exec_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    timeout(ms, err) match
+        Some(r) -> return r
+        None -> ()
+    o.o.statement_timeout_ms = Some(ms)
+    0
+
+@export("terndb_exec_options_clear")
+exec_options_clear(o: *ExecOptionsH, field: i32, err: **ErrorH) -> CInt
+    exec_opts(o, err) match
+        Some(r) -> return r
+        None -> ()
+    field match
+        1 -> o.prefetch = None
+        2 -> o.o.batch_rows = None
+        3 -> o.o.batch_bytes = None
+        4 -> o.o.statement_timeout_ms = None
+        _ -> return fail(err, bad_argument(s"$field is not an execution option"))
+    0
+
+@export("terndb_exec_options_free")
+exec_options_free(o: *ExecOptionsH)
+    if o == null then return
+    release(o, KindExecOptions, "terndb_exec_options_free")
+
+/** The default prefetch window, 4 MiB (§5.2 rule 3). */
+const DefaultPrefetch: u64 = 4194304
+
+/** The `ExecOptions` a request carries for `o` (NULL for none): the prefetch window becomes the
+ * request's credit, and `SIZE_MAX` (any window of 2⁶³ octets or more) is unlimited credit.
+ */
+exec_options_of(o: *const ExecOptionsH) -> Result[ExecOptions, ErrorData]
+    var x = no_exec_options()
+    var window = DefaultPrefetch
+    if o != null
+        val r = check_handle(ptr_cast(o), KindExecOptions)
+        if r != NoRefusal then return Err(refusal_error(r, "exec"))
+        x = o.o
+        window = o.prefetch.unwrap_or(DefaultPrefetch)
+    x.credit = if window > MaxCount then None else Some(window)
+    Ok(x)

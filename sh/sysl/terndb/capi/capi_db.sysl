@@ -1,0 +1,284 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sh.sysl.terndb.{ClientHello, ClientHelloMsg, SessionDefaults, server_tree_versions, server_wire_versions}
+
+// Databases (`c-api.md` §4) and sessions (§5.1).
+//
+// This build has the engine's in-memory store and no disk storage, so the one database `terndb_open`
+// opens is an anonymous memory-mode database with `durability = none` (§4.2 rule 3). A disk-mode open,
+// a durable memory-mode open, an open of a directory, and the snapshot, clone and promotion of §4.4
+// are each refused with `C1007` (`not_supported`), `details.reason` saying what is missing.
+
+@export("terndb_db")
+opaque struct DbH
+    head: Head
+    core: &sync DbCore
+
+@export("terndb_conn")
+opaque struct ConnH
+    head: Head
+    core: &sync ConnCore
+
+/** `C1007` for what this build cannot do, `reason` saying what. */
+not_supported(message: string, reason: string) -> ErrorData = c_error_with("C1007", message, details1("reason", reason))
+
+/** The number of online cores, `threads`' default (§4.1). */
+extern "sysconf" c_sysconf(name: i32) -> i64
+
+/** `_SC_NPROCESSORS_ONLN`: 58 on Darwin, 84 on Linux. */
+#if macos
+const ScOnlineCores: i32 = 58
+#else
+const ScOnlineCores: i32 = 84
+#endif
+
+private online_cores() -> u64
+    val n = c_sysconf(ScOnlineCores)
+    if n < 1 then 1 else u64(n)
+
+/** What an open needs: an anonymous memory-mode database, or the refusal (§4.2). */
+open_core(dir: *const CChar, dir_len: usize, cfg: *const ConfigH, call: string) -> Result[&sync DbCore, ErrorData]
+    if dir == null && dir_len > 0 then return Err(bad_argument("dir is NULL"))
+    val s = settings_for(cfg, OpenKeys, call)?
+    val mode = s.word("mode", "disk")
+
+    if mode == "disk"
+        if s.has("durability")
+            return Err(c_error_with("C1002", "durability applies to memory mode only", details1("key", "durability")))
+        return Err(not_supported("disk mode is not in this build of the library", "disk_storage"))
+
+    if s.word("durability", "log") != "none"
+        return Err(not_supported("a durable memory-mode database needs disk storage, which this build lacks", "disk_storage"))
+    if dir_len > 0
+        return Err(not_supported("a database in a directory needs disk storage, which this build lacks", "disk_storage"))
+
+    val core = start_db(s.word("read_only", "false") == "true", s.count("memory_limit", 0), s.count("threads", online_cores()))?
+    log_emit(LogInfo, "db", "database opened", "database", core.id.to_string())
+    Ok(core)
+
+/** A handle for open database `core`. */
+db_handle(core: &sync DbCore) -> *DbH
+    counted()
+    val h: &DbH = DbH(head(KindDb), core)
+    h.into_raw()
+
+@export("terndb_open")
+open(dir: *const CChar, dir_len: usize, cfg: *const ConfigH, out: **DbH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if on_engine_thread then return fail(err, wrong_thread())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    open_core(dir, dir_len, cfg, "terndb_open") match
+        Ok(core) ->
+            *out = db_handle(core)
+            0
+        Err(e) -> fail(err, e)
+
+@export("terndb_open_async")
+open_async(dir: *const CChar, dir_len: usize, cfg: *const ConfigH, q: *QueueH, tag: u64) -> *OpH
+    val op = new_op(OpOpen, queue_of(q), tag)
+    if !initialized() then op.fail(not_initialized())
+    else
+        open_core(dir, dir_len, cfg, "terndb_open_async") match
+            Ok(core) -> op.succeed(DbOut(core))
+            Err(e) -> op.fail(e)
+    op_handle(op, None)
+
+/** The database behind handle `db`, checked; `C1006` once closed. */
+private db_of(db: *const DbH) -> Result[&sync DbCore, ErrorData]
+    if !initialized() then return Err(not_initialized())
+    val r = check_handle(ptr_cast(db), KindDb)
+    if r != NoRefusal then return Err(refusal_error(r, "db"))
+    if db.core.is_closed() then return Err(closed_error("the database"))
+    Ok(db.core)
+
+@export("terndb_close")
+close(db: *DbH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val r = check_handle(ptr_cast(db), KindDb)
+    if r != NoRefusal then return refuse(err, r, "db")
+    if on_engine_thread then return fail(err, wrong_thread())
+    val core = db.core
+    release(db, KindDb, "terndb_close")
+    val op = new_op(OpClose, None, 0)
+    core.stop(op)
+    op.wait(-1)
+    core.join()
+    0
+
+@export("terndb_close_async")
+close_async(db: *DbH, q: *QueueH, tag: u64) -> *OpH
+    val op = new_op(OpClose, queue_of(q), tag)
+    if !initialized() then
+        op.fail(not_initialized())
+        return op_handle(op, None)
+    val r = check_handle(ptr_cast(db), KindDb)
+    if r != NoRefusal
+        op.fail(refusal_error(r, "db"))
+        return op_handle(op, None)
+    val core = db.core
+    release(db, KindDb, "terndb_close_async")
+    core.stop(op)
+    op_handle(op, Some(core))
+
+/** The checks §4.4's three calls share; then `C1007`, since they need disk storage. */
+private disk_call(db: *const DbH, dir: *const CChar, dir_len: usize, cfg: *const ConfigH, keys: []const string,
+        call: string) -> ErrorData
+    db_of(db) match
+        Err(e) -> return e
+        Ok(_) -> ()
+    if dir == null && dir_len > 0 then return bad_argument("dir is NULL")
+    settings_for(cfg, keys, call) match
+        Err(e) -> return e
+        Ok(_) -> ()
+    not_supported(s"$call needs disk storage, which this build lacks", "disk_storage")
+
+@export("terndb_snapshot")
+snapshot(db: *DbH, dir: *const CChar, dir_len: usize, err: **ErrorH) -> CInt =
+    fail(err, disk_call(db, dir, dir_len, null, [], "terndb_snapshot"))
+
+@export("terndb_snapshot_async")
+snapshot_async(db: *DbH, dir: *const CChar, dir_len: usize, q: *QueueH, tag: u64) -> *OpH
+    val op = new_op(OpSnapshot, queue_of(q), tag)
+    op.fail(disk_call(db, dir, dir_len, null, [], "terndb_snapshot"))
+    op_handle(op, None)
+
+@export("terndb_clone")
+clone(src: *DbH, dir: *const CChar, dir_len: usize, cfg: *const ConfigH, out: **DbH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    fail(err, disk_call(src, dir, dir_len, cfg, CloneKeys, "terndb_clone"))
+
+@export("terndb_clone_async")
+clone_async(src: *DbH, dir: *const CChar, dir_len: usize, cfg: *const ConfigH, q: *QueueH, tag: u64) -> *OpH
+    val op = new_op(OpClone, queue_of(q), tag)
+    op.fail(disk_call(src, dir, dir_len, cfg, CloneKeys, "terndb_clone"))
+    op_handle(op, None)
+
+@export("terndb_promote")
+promote(src: *DbH, dir: *const CChar, dir_len: usize, cfg: *const ConfigH, out: **DbH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    fail(err, disk_call(src, dir, dir_len, cfg, CloneKeys, "terndb_promote"))
+
+@export("terndb_promote_async")
+promote_async(src: *DbH, dir: *const CChar, dir_len: usize, cfg: *const ConfigH, q: *QueueH, tag: u64) -> *OpH
+    val op = new_op(OpPromote, queue_of(q), tag)
+    op.fail(disk_call(src, dir, dir_len, cfg, CloneKeys, "terndb_promote"))
+    op_handle(op, None)
+
+@export("terndb_db_is_memory")
+db_is_memory(db: *const DbH) -> bool
+    expect_handle(ptr_cast(db), KindDb, "terndb_db_is_memory")
+    db != null
+
+// -- sessions (§5.1) ------------------------------------------------------------------------------
+
+@export("terndb_session")
+session(db: *DbH, cfg: *const ConfigH, out: **ConnH, err: **ErrorH) -> CInt
+    val core = db_of(db) match
+        Ok(c) -> c
+        Err(e) -> return fail(err, e)
+    if on_engine_thread then return fail(err, wrong_thread())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    val s = settings_for(cfg, SessionKeys, "terndb_session") match
+        Ok(s) -> s
+        Err(e) -> return fail(err, e)
+
+    val user = s.word("user", "terndb")
+    val application = s.word("application", "")
+    val defaults = SessionDefaults(isolation_of(s.word("isolation", "")), sync_of(s.word("synchronous", "")),
+        s.get("lock_timeout_ms").map((v) -> parse_count(v).unwrap()), s.get("statement_timeout_ms").map((v) -> parse_count(v).unwrap()),
+        None)
+    val methods = buf[string]()
+    methods.push("peer")
+    val hello = ClientHello(server_wire_versions(), server_tree_versions(), user, "terndb", application, methods, None,
+        16777216, defaults, buf())
+
+    val conn = new_conn(core, user, application, s.count("max_in_flight", 256), s.count("max_open_txns", 64))
+    val op = new_op(OpConnect, None, 0)
+    conn.m.with((st) -> st.streams.push(StreamSink(0, OpenSink(op))))
+    if !core.post(OpenConn(conn, wire_of(ClientHelloMsg(hello), 0))) then return fail(err, closed_error("the database"))
+
+    op.wait(-1)
+    op.error() match
+        Some(e) -> return fail(err, e)
+        None -> ()
+    op.take()
+    log_emit2(LogDebug, "session", "session opened", "database", core.id.to_string(), "session", conn.id.to_string())
+    counted()
+    val h: &ConnH = ConnH(head(KindConn), conn)
+    *out = h.into_raw()
+    0
+
+/** Whether `url` has one of §5.1 rule 2's forms. */
+url_form_ok(url: string) -> bool
+    if url.starts_with("terndb://")
+        val rest = url.bytes[9..]
+        var slash: usize = 0
+        while slash < rest.len && rest[slash] != u8('/')
+            slash += 1
+        return slash > 0 && slash + 1 < rest.len
+    if url.starts_with("terndb+unix:///")
+        return url.contains("?database=") && !url.ends_with("?database=")
+    false
+
+/** The checks of a connect; then `C1007`, since this build has no network mode. */
+private connect_error(url: *const CChar, url_len: usize, cfg: *const ConfigH) -> ErrorData
+    if !initialized() then return not_initialized()
+    if url == null then return bad_argument("url is NULL")
+    val text = text_of(ptr_cast(url), url_len)
+    if !url_form_ok(text) then return c_error_with("C1002", s"'$text' is not a terndb URL", details1("reason", "url"))
+    settings_for(cfg, ConnectKeys, "terndb_connect") match
+        Err(e) -> return e
+        Ok(_) -> ()
+    not_supported("network mode is not in this build of the library", "network")
+
+@export("terndb_connect")
+connect(url: *const CChar, url_len: usize, cfg: *const ConfigH, out: **ConnH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    fail(err, connect_error(url, url_len, cfg))
+
+@export("terndb_connect_async")
+connect_async(url: *const CChar, url_len: usize, cfg: *const ConfigH, q: *QueueH, tag: u64) -> *OpH
+    val op = new_op(OpConnect, queue_of(q), tag)
+    op.fail(connect_error(url, url_len, cfg))
+    op_handle(op, None)
+
+@export("terndb_conn_close")
+conn_close(conn: *ConnH)
+    if conn == null then return
+    expect_handle(ptr_cast(conn), KindConn, "terndb_conn_close")
+    val core = conn.core
+    release(conn, KindConn, "terndb_conn_close")
+    if !core.is_closed()
+        log_emit2(LogDebug, "session", "session closed", "database", core.db.id.to_string(), "session", core.id.to_string())
+    core.close()
+
+@export("terndb_conn_is_embedded")
+conn_is_embedded(conn: *const ConnH) -> bool
+    expect_handle(ptr_cast(conn), KindConn, "terndb_conn_is_embedded")
+    conn != null
+
+@export("terndb_conn_catalog_version")
+conn_catalog_version(conn: *const ConnH) -> u64
+    expect_handle(ptr_cast(conn), KindConn, "terndb_conn_catalog_version")
+    if conn == null then return 0
+    conn.core.catalog_version()
+
+/** Takes connection `conn` for one call: its checks, `C1006` once it or its database is closed, and
+ * `C1004` while another thread is inside a call on it (§2.3). A blocking call is also refused on an
+ * engine thread (`C1003`). `leave` must follow a success.
+ */
+conn_enter(conn: *const ConnH, blocking: bool) -> Result[&sync ConnCore, ErrorData]
+    if !initialized() then return Err(not_initialized())
+    val r = check_handle(ptr_cast(conn), KindConn)
+    if r != NoRefusal then return Err(refusal_error(r, "conn"))
+    if blocking && on_engine_thread then return Err(wrong_thread())
+    core_enter(conn.core)
+
+/** `conn_enter` for a connection reached through one of its transactions or statements. */
+core_enter(core: &sync ConnCore) -> Result[&sync ConnCore, ErrorData]
+    if core.db.is_closed() then return Err(closed_error("the database"))
+    if core.is_closed() then return Err(closed_error("the connection"))
+    if !core.enter() then return Err(c_error("C1004", "the connection is in use on another thread"))
+    Ok(core)

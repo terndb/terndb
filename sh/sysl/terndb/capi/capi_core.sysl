@@ -1,0 +1,448 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.io.poll.WakeFd
+import sysl.raw.{from_raw, ptr_cast}
+import sysl.sync.Atomic
+import sysl.threads.{Condvar, Mutex, Thread, spawn}
+import sh.sysl.terndb.{Authority, Closed, Engine, ErrorReply, Goodbye, MinMessageSize, MonotonicClock, Message, OverUnix,
+    Primary, RawMessage, ReadyMsg, ScramVerifier, ServerConfig, ServerSession, Step, TxnEffect, Whole, catalog_authority,
+    encode_payload, engine, server_session, server_tree_versions, server_wire_versions, sql_catalog}
+
+// The machinery under every handle that waits (`c-api.md` §2.3, §6): the shared state of a database,
+// a connection, an operation and a completion queue, and the engine thread that runs a database.
+//
+// Each open database runs on one engine thread of its own. Its engine, and the server session that
+// stands behind each of its connections, are made on that thread and never leave it. A caller's
+// request reaches the thread as a native-protocol message without its framing, and what the session
+// answers comes back the same way: the C ABI is [WIRE]'s request model with the framing removed
+// (§0 rule 2). The thread routes each answer to the operation or result waiting for its stream, and
+// a caller blocked in a synchronous call is parked on that operation alone.
+
+/** True on a thread of the library's own: an engine thread or the log sink's service thread. A
+ * caller's thread never becomes one (§2.3 rule 1).
+ */
+@thread_local
+var on_engine_thread: bool = false
+
+/** `C1003`: a blocking call from an engine thread (§2.3 rule 4). */
+wrong_thread() -> ErrorData = c_error("C1003", "a blocking call from an engine thread")
+
+/** A native-protocol message without its framing: its type octet and payload. */
+struct Wire
+    ty: u8
+    payload: Buf[u8]
+
+/** `m` as it would be framed at wire minor `minor`. */
+wire_of(m: Message, minor: u64) -> Wire = Wire(m.type_code(), encode_payload(m, minor).unwrap())
+
+/** The message `w` is, at wire minor `minor`. */
+message_of(w: Wire, minor: u64) -> Message = RawMessage(w.ty, 0, w.payload).decode(minor).unwrap()
+
+// -- the completion queue (§6.2 rules 3–6) --------------------------------------------------------
+
+struct QueueState
+    tags: Buf[u64]
+    /** The queue's handle has been freed: completions are discarded. */
+    freed: bool
+
+struct QueueCore
+    m: Mutex[QueueState]
+    cv: Condvar
+    /** Readable exactly while `tags` holds a tag. */
+    wake: WakeFd
+
+    /** Appends `tag` unless the queue has been freed. */
+    push(&sync self, tag: u64)
+        val s = self.m.lock_raw()
+        if !s.freed
+            if s.tags.len() == 0 then self.wake.wake().unwrap()
+            s.tags.push(tag)
+        self.m.unlock_raw()
+        self.cv.notify_all()
+
+    /** Moves up to `max` tags into `out`, oldest first. */
+    take(&sync self, out: *u64, max: usize) -> usize
+        val s = self.m.lock_raw()
+        var n: usize = 0
+        while n < max && n < s.tags.len()
+            out[n] = s.tags[n]
+            n += 1
+        var i: usize = 0
+        while i < n
+            s.tags.remove(0)
+            i += 1
+        if n > 0 && s.tags.len() == 0 then self.wake.drain().unwrap()
+        self.m.unlock_raw()
+        n
+
+    /** Blocks until a tag is queued or `timeout_ms` passes (−1: never), then takes up to `max`. */
+    wait(&sync self, out: *u64, max: usize, timeout_ms: i64) -> usize
+        if max == 0 then return 0
+        val deadline = sysl.time.monotonic().us + timeout_ms * 1000
+        val s = self.m.lock_raw()
+        while s.tags.len() == 0
+            if timeout_ms < 0
+                self.cv.wait(&self.m)
+            else
+                val left = deadline - sysl.time.monotonic().us
+                if left <= 0 then break
+                self.cv.wait_for(&self.m, left * 1000)
+        self.m.unlock_raw()
+        self.take(out, max)
+
+new_queue() -> Result[&sync QueueCore, ErrorData]
+    val w = WakeFd.open() match
+        Ok(w) -> w
+        Err(e) -> return Err(c_error_with("C2001", "no descriptor for the completion queue", details1("reason", e.message())))
+    val q: &sync QueueCore = QueueCore(Mutex.new(QueueState(buf(), false)), Condvar.new(), w)
+    Ok(q)
+
+// -- operations (§6.2 rules 7–11) -----------------------------------------------------------------
+
+/** What an operation is, for `take` and for what freeing it pending does. */
+enum OpKind
+    OpOpen
+    OpClose
+    OpSnapshot
+    OpClone
+    OpPromote
+    OpConnect
+    OpBegin
+    OpCommit
+    OpRollback
+    OpSavepoint
+    OpStatus
+    OpPrepare
+    OpExecute
+    OpNext
+
+/** What a completed operation yields. */
+enum OpOut
+    NoOut
+    DbOut(core: &sync DbCore)
+    ConnOut(core: &sync ConnCore)
+    StmtOut(handle: u64, prepared: Wire, envelope: Buf[u8])
+    ResultOut(core: &sync ResultCore, header: Wire)
+    BatchOut(payload: Buf[u8])
+    EndOut
+    SeqOut(present: bool, seq: u64)
+    StatusOut(state: i32, present: bool, seq: u64)
+
+struct OpState
+    done: bool
+    /** The error it failed with, as `Error` octets. */
+    err: Option[Buf[u8]]
+    out: OpOut
+    taken: bool
+    queue: Option[&sync QueueCore]
+    tag: u64
+    /** Freed while pending: no tag is appended and the output is disposed of. */
+    discarded: bool
+    /** The connection and stream to cancel it on, where it is a request. */
+    conn: Option[&sync ConnCore]
+    stream: u64
+
+struct OpCore
+    kind: OpKind
+    m: Mutex[OpState]
+    cv: Condvar
+
+    /** Completes the operation once: records its outcome, appends its tag, wakes its waiters. A
+     * completion after a discard disposes of the output instead (§6.2 rule 10).
+     */
+    complete(&sync self, err: Option[Buf[u8]], out: OpOut)
+        val s = self.m.lock_raw()
+        if s.done
+            self.m.unlock_raw()
+            return
+        s.done = true
+        s.err = err
+        s.out = out
+        val discarded = s.discarded
+        val q = if discarded then None else s.queue
+        val tag = s.tag
+        val left = if discarded then s.out else NoOut
+        if discarded then s.out = NoOut
+        self.m.unlock_raw()
+        self.cv.notify_all()
+        q match
+            Some(queue) -> queue.push(tag)
+            None -> ()
+        dispose(left)
+
+    fail(&sync self, e: ErrorData) = self.complete(Some(error_octets(e)), NoOut)
+
+    succeed(&sync self, out: OpOut) = self.complete(None, out)
+
+    is_done(&sync self) -> bool = self.m.with((s) -> s.done)
+
+    /** Blocks until complete or `timeout_ms` passes (−1: never); answers whether it completed. */
+    wait(&sync self, timeout_ms: i64) -> bool
+        val deadline = sysl.time.monotonic().us + timeout_ms * 1000
+        val s = self.m.lock_raw()
+        while !s.done
+            if timeout_ms < 0
+                self.cv.wait(&self.m)
+            else
+                val left = deadline - sysl.time.monotonic().us
+                if left <= 0 then break
+                self.cv.wait_for(&self.m, left * 1000)
+        val done = s.done
+        self.m.unlock_raw()
+        done
+
+    /** The error it failed with; `None` when it succeeded. Call only once complete. */
+    error(&sync self) -> Option[ErrorData] = self.m.with((s) -> s.err match
+        Some(o) -> Some(o.copy())
+        None -> None) match
+        Some(o) -> Some(error_from_octets(o))
+        None -> None
+
+    /** Moves the output to the caller, once; `NoOut` the second time or before completion. */
+    take(&sync self) -> OpOut
+        val s = self.m.lock_raw()
+        var out = NoOut
+        if s.done && !s.taken
+            s.taken = true
+            out = s.out
+            s.out = NoOut
+        self.m.unlock_raw()
+        out
+
+/** A new pending operation of `kind`, appending `tag` to `q` (if any) when it completes. */
+new_op(kind: OpKind, q: Option[&sync QueueCore], tag: u64) -> &sync OpCore =
+    OpCore(kind, Mutex.new(OpState(false, None, NoOut, false, q, tag, false, None, 0)), Condvar.new())
+
+/** Gives back what an output holds when nobody will take it: an opened database is closed, a
+ * connection closed, a result cancelled (§6.2 rule 10).
+ */
+dispose(out: OpOut) = out match
+    DbOut(core) -> core.close_detached()
+    ConnOut(core) -> core.close()
+    ResultOut(core, _) -> core.cancel()
+    _ -> ()
+
+// -- databases ------------------------------------------------------------------------------------
+
+/** A request for a database's engine thread. */
+enum Req
+    /** Open a server session for `conn`, which says `hello` first. */
+    OpenConn(conn: &sync ConnCore, hello: Wire)
+    /** A message of connection `conn` on stream `stream`. */
+    ToConn(conn: u64, stream: u64, w: Wire)
+    /** The connection has been closed: its session rolls everything back. */
+    CloseConn(conn: u64)
+
+struct DbQueue
+    reqs: Buf[Req]
+    /** Close was asked for: the thread ends its sessions and stops. */
+    stop: bool
+    /** The thread has stopped; nothing more is accepted. */
+    stopped: bool
+    /** The close operation to complete once stopped. */
+    close_op: Option[&sync OpCore]
+    thread: Option[Thread]
+    next_conn: u64
+
+/** Per-code abort counts, for `terndb.aborts`. */
+struct AbortCount
+    code: string
+    n: u64
+
+/** An open database: what its handle, its connections and its engine thread share. */
+struct DbCore
+    id: u64
+    m: Mutex[DbQueue]
+    cv: Condvar
+    /** Set once by `terndb_close`: every later call on a dependant is `C1006` (§4.3 rule 3). */
+    closed: Atomic[u32]
+    read_only: bool
+    memory_limit: u64
+    threads: u64
+    opened_ms: u64
+    commits: Atomic[u64]
+    sessions: Atomic[u64]
+    txns_open: Atomic[i64]
+    aborts: Mutex[Buf[AbortCount]]
+
+    is_closed(&sync self) -> bool = self.closed.load() != 0
+
+    /** Hands `r` to the engine thread; false when the database is closed. */
+    post(&sync self, r: Req) -> bool
+        val s = self.m.lock_raw()
+        val ok = !s.stop && !s.stopped
+        if ok then s.reqs.push(r)
+        self.m.unlock_raw()
+        if ok then self.cv.notify_all()
+        ok
+
+    /** Asks the engine thread to stop, completing `op` once it has (§4.3). */
+    stop(&sync self, op: &sync OpCore)
+        self.closed.store(1)
+        val s = self.m.lock_raw()
+        if s.stopped
+            self.m.unlock_raw()
+            op.succeed(NoOut)
+            return
+        s.stop = true
+        s.close_op = Some(op)
+        self.m.unlock_raw()
+        self.cv.notify_all()
+
+    /** Waits for the stopped engine thread to end, once. */
+    join(&sync self)
+        val t = self.m.with((s) ->
+            val t = s.thread
+            s.thread = None
+            t)
+        t match
+            Some(th) -> th.join()
+            None -> ()
+
+    /** Closes a database nobody holds a handle to: an open whose operation was freed (§6.2 rule 10). */
+    close_detached(&sync self)
+        val op = new_op(OpClose, None, 0)
+        self.stop(op)
+        if !on_engine_thread
+            op.wait(-1)
+            self.join()
+
+    count_abort(&sync self, code: string)
+        self.aborts.with((a) ->
+            var found = false
+            for i in 0..<a.len()
+                if a[i].code == code
+                    a[i].n += 1
+                    found = true
+            if !found then a.push(AbortCount(code.copy(), 1)))
+
+    next_conn_id(&sync self) -> u64 = self.m.with((s) ->
+        s.next_conn += 1
+        s.next_conn)
+
+var next_db: Atomic[u64] = Atomic(0)
+
+/** A database whose engine thread is running, or the failure to start one. */
+start_db(read_only: bool, memory_limit: u64, threads: u64) -> Result[&sync DbCore, ErrorData]
+    val core: &sync DbCore = DbCore(next_db.add(1) + 1, Mutex.new(DbQueue(buf(), false, false, None, None, 0)),
+        Condvar.new(), Atomic(0), read_only, memory_limit, threads, u64(sysl.time.monotonic().us / 1000), Atomic(0),
+        Atomic(0), Atomic(0), Mutex.new(buf[AbortCount]()))
+    val p = core.into_raw()
+    val t = spawn(&engine_main, p) match
+        Some(t) -> t
+        None ->
+            val back: &sync DbCore = from_raw(p)
+            return Err(c_error_with("C2001", "the engine thread could not be started", details1("reason", "thread")))
+    core.m.with((s) -> s.thread = Some(t))
+    Ok(core)
+
+/** The server's own credentials for embedded sessions: no password, no token, and a login for any
+ * role the catalog lets log in, since holding the open database is the credential (§5.1 rule 1).
+ * `catalog_authority` narrows it to the roles with `login`.
+ */
+struct EmbeddedCredentials
+end EmbeddedCredentials
+
+impl Authority for EmbeddedCredentials
+    permits(self, user: string, database: string, method: string) -> bool = method == "peer"
+
+    verifier(self, user: string) -> Option[ScramVerifier] = None
+
+    token_user(self, hash: [32]u8) -> Option[string] = None
+
+    peer_permits(self, os_user: string, user: string) -> bool = true
+
+    has_database(self, database: string) -> bool = true
+
+/** One connection's server session, on the engine thread. */
+struct EngSession
+    id: u64
+    s: ServerSession
+    conn: &sync ConnCore
+    gone: bool
+
+/** The engine thread of one database. */
+engine_main(p: *DbCore)
+    on_engine_thread = true
+    val core: &sync DbCore = from_raw(p)
+    val clock: &MonotonicClock = MonotonicClock()
+    val e = engine(sql_catalog(), sysl.time.now().us, clock)
+    val sessions = buf[&EngSession]()
+    var busy = false
+
+    loop
+        val s = core.m.lock_raw()
+        if s.reqs.len() == 0 && !s.stop
+            if busy then core.cv.wait_for(&core.m, 1000000) else core.cv.wait(&core.m)
+        val reqs = s.reqs
+        s.reqs = buf()
+        val stop = s.stop
+        core.m.unlock_raw()
+
+        e.now = sysl.time.now().us
+        val now = e.clock.now_ms()
+
+        for r in reqs
+            r match
+                OpenConn(conn, hello) ->
+                    val cfg = ServerConfig(server_wire_versions(), server_tree_versions(), "terndb 0.0.1", 16777216,
+                        conn.max_in_flight, conn.max_open_txns, MinMessageSize, conn.id, Primary, OverUnix, "", buf(),
+                        Some(conn.user), buf(), 60000, None)
+                    val creds: &EmbeddedCredentials = EmbeddedCredentials()
+                    val ss: &EngSession = EngSession(conn.id, server_session(cfg, e.connect(""), catalog_authority(e, creds), now),
+                        conn, false)
+                    sessions.push(ss)
+                    core.sessions.add(1)
+                    route(core, ss, ss.s.receive(Whole(RawMessage(hello.ty, 0, hello.payload)), now))
+                ToConn(id, stream, w) ->
+                    for ss in sessions
+                        if ss.id == id && !ss.gone
+                            route(core, ss, ss.s.receive(Whole(RawMessage(w.ty, stream, w.payload)), now))
+                CloseConn(id) ->
+                    for ss in sessions
+                        if ss.id == id && !ss.gone
+                            ss.s.lost()
+                            end_session(core, ss)
+
+        if stop
+            for ss in sessions
+                if !ss.gone
+                    route(core, ss, ss.s.shutdown(now, 0))
+                    route(core, ss, ss.s.tick(now))
+                    ss.conn.close_by_database()
+                    end_session(core, ss)
+            break
+
+        busy = false
+        for ss in sessions
+            if !ss.gone && ss.s.in_flight() > 0
+                route(core, ss, ss.s.tick(now))
+                busy = true
+
+        var i: usize = 0
+        while i < sessions.len()
+            if sessions[i].gone then sessions.remove(i) else i += 1
+
+    log_emit(LogInfo, "db", "database closed", "database", core.id.to_string())
+    val op = core.m.with((s) ->
+        s.stopped = true
+        val op = s.close_op
+        s.close_op = None
+        op)
+    op match
+        Some(o) -> o.succeed(NoOut)
+        None -> ()
+
+private end_session(core: &sync DbCore, ss: &EngSession)
+    if !ss.gone
+        ss.gone = true
+        core.sessions.sub(1)
+
+/** Hands what one input to a session produced to its connection. */
+private route(core: &sync DbCore, ss: &EngSession, st: Step)
+    for o in st.out
+        ss.conn.deliver(core, o.stream, o.m, ss.s.minor)
+    if st.close
+        ss.conn.close_by_database()
+        end_session(core, ss)

@@ -1,0 +1,868 @@
+module sh.sysl.terndb.capi
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.slices.as_ptr
+import sh.sysl.terndb.{Begin, ByDigest, ByHandle, ClosePrepared, ColumnTree, Commit, Execute, ExecuteMsg, ExecutePrepared,
+    ExecutePreparedMsg, ExecOptions, PlanRef, Prepare, Prepared, ReleaseSavepoint, ResultHeaderMsg, Rollback,
+    RollbackToSavepoint, Savepoint, TransactionStatus, TxnOptions, Type, column_tree, decode_envelope, encode_type}
+
+// Transactions (`c-api.md` §5.3), statements and execution (§7), results (§8.1), and the completion
+// queue and operations (§6). Each synchronous call is its `_async` form waited on: the same request,
+// the same operation, the same outputs and errors (§6.2 rule 1).
+
+// -- queues and operations ------------------------------------------------------------------------
+
+@export("terndb_queue")
+opaque struct QueueH
+    head: Head
+    core: &sync QueueCore
+
+@export("terndb_op")
+opaque struct OpH
+    head: Head
+    core: &sync OpCore
+    /** A close's database, joined once the operation is done with. */
+    db: Option[&sync DbCore]
+    /** A `result_next`'s result: where its batch is decoded and its credit given back. */
+    res: Option[&sync ResultCore]
+    ty: Option[Type]
+    tree: Option[ColumnTree]
+
+/** The queue behind `q`, NULL for none; a bad handle is treated as none (its operation still fails or
+ * succeeds through `terndb_op_poll`).
+ */
+queue_of(q: *const QueueH) -> Option[&sync QueueCore]
+    if q == null || check_handle(ptr_cast(q), KindQueue) != NoRefusal then return None
+    Some(q.core)
+
+/** A handle for operation `op`. */
+op_handle(op: &sync OpCore, db: Option[&sync DbCore]) -> *OpH
+    counted()
+    val h: &OpH = OpH(head(KindOp), op, db, None, None, None)
+    h.into_raw()
+
+@export("terndb_queue_new")
+queue_new(out: **QueueH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    val core = new_queue() match
+        Ok(c) -> c
+        Err(e) -> return fail(err, e)
+    counted()
+    val h: &QueueH = QueueH(head(KindQueue), core)
+    *out = h.into_raw()
+    0
+
+@export("terndb_queue_fd")
+queue_fd(q: *const QueueH) -> CInt
+    expect_handle(ptr_cast(q), KindQueue, "terndb_queue_fd")
+    if q == null then return CInt(-1)
+    CInt(q.core.wake.fd())
+
+@export("terndb_queue_drain")
+queue_drain(q: *QueueH, tags: *u64, max: usize) -> usize
+    expect_handle(ptr_cast(q), KindQueue, "terndb_queue_drain")
+    if q == null || tags == null then return 0
+    q.core.take(tags, max)
+
+@export("terndb_queue_wait")
+queue_wait(q: *QueueH, tags: *u64, max: usize, timeout_ms: i64) -> usize
+    expect_handle(ptr_cast(q), KindQueue, "terndb_queue_wait")
+    if on_engine_thread
+        if DebugChecks then abort_with("C1003", "terndb_queue_wait")
+        return 0
+    if q == null || tags == null then return 0
+    q.core.wait(tags, max, timeout_ms)
+
+@export("terndb_queue_free")
+queue_free(q: *QueueH)
+    if q == null then return
+    expect_handle(ptr_cast(q), KindQueue, "terndb_queue_free")
+    q.core.m.with((s) -> s.freed = true)
+    release(q, KindQueue, "terndb_queue_free")
+
+private op_ok(op: *const OpH, function: string) -> bool
+    expect_handle(ptr_cast(op), KindOp, function)
+    op != null
+
+@export("terndb_op_poll")
+op_poll(op: *const OpH) -> CInt
+    if !op_ok(op, "terndb_op_poll") then return 0
+    if op.core.is_done() then 1 else 0
+
+@export("terndb_op_wait")
+op_wait(op: *OpH, timeout_ms: i64) -> CInt
+    if !op_ok(op, "terndb_op_wait") then return CInt(-1)
+    if on_engine_thread
+        if DebugChecks then abort_with("C1003", "terndb_op_wait")
+        return CInt(-1)
+    if op.core.wait(timeout_ms) then 1 else 0
+
+@export("terndb_op_error")
+op_error(op: *OpH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val r = check_handle(ptr_cast(op), KindOp)
+    if r != NoRefusal then return refuse(err, r, "op")
+    if !op.core.is_done() then return fail(err, c_error("C1005", "the operation is pending"))
+    op.core.error() match
+        Some(e) -> fail(err, e)
+        None -> 0
+
+/** Checks that `op` is of `kind` for a `take`; the wrong kind is `C1002` (§6.2 rule 8). */
+private take_ok(op: *OpH, kinds: []const OpKind, function: string) -> bool
+    if !op_ok(op, function) then return false
+    var ok = false
+    for k in kinds
+        if op.core.kind == k then ok = true
+    if !ok
+        if DebugChecks then abort_with("C1002", function)
+        return false
+    true
+
+@export("terndb_op_take_db")
+op_take_db(op: *OpH) -> *DbH
+    if !take_ok(op, [OpOpen, OpClone, OpPromote], "terndb_op_take_db") then return null
+    op.core.take() match
+        DbOut(core) -> db_handle(core)
+        _ -> null
+
+@export("terndb_op_take_conn")
+op_take_conn(op: *OpH) -> *ConnH
+    if !take_ok(op, [OpConnect], "terndb_op_take_conn") then return null
+    op.core.take() match
+        ConnOut(core) ->
+            counted()
+            val h: &ConnH = ConnH(head(KindConn), core)
+            h.into_raw()
+        _ -> null
+
+@export("terndb_op_take_stmt")
+op_take_stmt(op: *OpH) -> *StmtH
+    if !take_ok(op, [OpPrepare], "terndb_op_take_stmt") then return null
+    op.core.take() match
+        StmtOut(handle, prepared, envelope) ->
+            op.core.m.with((s) -> s.conn) match
+                Some(conn) -> stmt_handle(conn, handle, prepared, envelope)
+                None -> null
+        _ -> null
+
+@export("terndb_op_take_result")
+op_take_result(op: *OpH) -> *ResultH
+    if !take_ok(op, [OpExecute], "terndb_op_take_result") then return null
+    op.core.take() match
+        ResultOut(core, header) -> result_handle(core, header)
+        _ -> null
+
+@export("terndb_op_take_batch")
+op_take_batch(op: *OpH) -> *BatchH
+    if !take_ok(op, [OpNext], "terndb_op_take_batch") then return null
+    batch_of(op.core.take(), op.res, op.ty, op.tree)
+
+@export("terndb_op_commit_seq")
+op_commit_seq(op: *const OpH, commit_seq: *u64) -> CInt
+    if !op_ok(op, "terndb_op_commit_seq") || op.core.kind != OpCommit then return CInt(-1)
+    op.core.m.with((s) ->
+        if !s.done || s.err.is_some() then return CInt(-1)
+        s.out match
+            SeqOut(present, seq) ->
+                if present && commit_seq != null then *commit_seq = seq
+                if present then CInt(1) else CInt(0)
+            _ -> CInt(-1))
+
+@export("terndb_op_txn_status")
+op_txn_status(op: *const OpH, state: *i32, commit_seq: *u64) -> CInt
+    if !op_ok(op, "terndb_op_txn_status") || op.core.kind != OpStatus then return CInt(-1)
+    op.core.m.with((s) ->
+        if !s.done || s.err.is_some() then return CInt(-1)
+        s.out match
+            StatusOut(st, present, seq) ->
+                if state != null then *state = st
+                if present && commit_seq != null then *commit_seq = seq
+                if present then CInt(1) else CInt(0)
+            _ -> CInt(-1))
+
+@export("terndb_op_cancel")
+op_cancel(op: *OpH)
+    if !op_ok(op, "terndb_op_cancel") then return
+    cancel_op(op.core, op.res)
+
+/** Asks for `op`'s cancellation as [WIRE] §7.3 does; a commit is never cancelled (§6.2 rule 9). */
+private cancel_op(core: &sync OpCore, res: Option[&sync ResultCore])
+    if core.kind == OpCommit || core.is_done() then return
+    res match
+        Some(r) -> return r.cancel()
+        None -> ()
+    val (conn, stream) = core.m.with((s) -> (s.conn, s.stream))
+    conn match
+        Some(c) -> c.cancel(stream)
+        None -> ()
+
+@export("terndb_op_free")
+op_free(op: *OpH)
+    if op == null then return
+    expect_handle(ptr_cast(op), KindOp, "terndb_op_free")
+    val core = op.core
+    val res = op.res
+    val db = op.db
+    release(op, KindOp, "terndb_op_free")
+
+    val pending = core.m.with((s) ->
+        if !s.done then s.discarded = true
+        !s.done)
+    if pending
+        cancel_op(core, res)
+    else
+        dispose(core.take())
+
+    if core.kind == OpClose
+        db match
+            Some(d) ->
+                core.wait(-1)
+                d.join()
+            None -> ()
+
+// -- transactions (§5.3) --------------------------------------------------------------------------
+
+@export("terndb_txn")
+opaque struct TxnH
+    head: Head
+    core: &sync TxnCore
+
+/** The options a begin or an implicit transaction carries: a read-only database makes every
+ * transaction read-only (§4.2 rule 5).
+ */
+private txn_options_for(core: &sync ConnCore, o: TxnOptions) -> TxnOptions
+    var x = o
+    if core.db.read_only then x.read_only = Some(true)
+    x
+
+/** Submits a begin for `conn`, answering the operation and the transaction it begins. */
+private begin_submit(conn: *ConnH, opts: *const TxnOptionsH, q: Option[&sync QueueCore], tag: u64,
+        blocking: bool) -> Result[(&sync OpCore, &sync TxnCore), ErrorData]
+    val core = conn_enter(conn, blocking)?
+    val o = txn_options_of(opts) match
+        Ok(o) -> o
+        Err(e) ->
+            core.leave()
+            return Err(e)
+    val txn = new_txn(core)
+    val op = new_op(OpBegin, q, tag)
+    core.request(Begin(txn.handle, txn_options_for(core, o)), ReplySink(op, OpBegin, Some(txn)), op)
+    if !blocking then core.leave()
+    Ok((op, txn))
+
+private txn_handle(core: &sync TxnCore) -> *TxnH
+    counted()
+    val h: &TxnH = TxnH(head(KindTxn), core)
+    h.into_raw()
+
+@export("terndb_begin")
+begin(conn: *ConnH, opts: *const TxnOptionsH, out: **TxnH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    val (op, txn) = begin_submit(conn, opts, None, 0, true) match
+        Ok(x) -> x
+        Err(e) -> return fail(err, e)
+    op.wait(-1)
+    txn.conn.leave()
+    op.error() match
+        Some(e) -> return fail(err, e)
+        None -> ()
+    *out = txn_handle(txn)
+    0
+
+@export("terndb_begin_async")
+begin_async(conn: *ConnH, opts: *const TxnOptionsH, out: **TxnH, q: *QueueH, tag: u64) -> *OpH
+    val queue = queue_of(q)
+    if out == null
+        val op = new_op(OpBegin, queue, tag)
+        op.fail(bad_argument("out is NULL"))
+        return op_handle(op, None)
+    begin_submit(conn, opts, queue, tag, false) match
+        Ok((op, txn)) ->
+            *out = txn_handle(txn)
+            op_handle(op, None)
+        Err(e) ->
+            val op = new_op(OpBegin, queue, tag)
+            op.fail(e)
+            op_handle(op, None)
+
+/** Takes transaction `txn`'s connection for one call (§2.3: a call on a transaction is a call on its
+ * connection).
+ */
+private txn_enter(txn: *const TxnH, blocking: bool) -> Result[&sync TxnCore, ErrorData]
+    if !initialized() then return Err(not_initialized())
+    val r = check_handle(ptr_cast(txn), KindTxn)
+    if r != NoRefusal then return Err(refusal_error(r, "txn"))
+    if blocking && on_engine_thread then return Err(wrong_thread())
+    core_enter(txn.core.conn)?
+    Ok(txn.core)
+
+/** Submits request `m` on transaction `txn`, its one answer completing an operation of `kind`. */
+private txn_submit(txn: *TxnH, kind: OpKind, m: (u64) -> sh.sysl.terndb.Message, q: Option[&sync QueueCore], tag: u64,
+        blocking: bool) -> Result[&sync OpCore, ErrorData]
+    val t = txn_enter(txn, blocking)?
+    val op = new_op(kind, q, tag)
+    if kind == OpCommit then t.m.with((s) -> s.committing = true)
+    t.conn.request(m(t.handle), ReplySink(op, kind, Some(t)), op)
+    if !blocking then t.conn.leave()
+    Ok(op)
+
+/** The synchronous form of a transaction request: submit, wait, report. */
+private txn_sync(txn: *TxnH, kind: OpKind, m: (u64) -> sh.sysl.terndb.Message, err: **ErrorH) -> Result[OpOut, CInt]
+    val op = txn_submit(txn, kind, m, None, 0, true) match
+        Ok(op) -> op
+        Err(e) -> return Err(fail(err, e))
+    op.wait(-1)
+    txn.core.conn.leave()
+    op.error() match
+        Some(e) -> Err(fail(err, e))
+        None -> Ok(op.take())
+
+private txn_async(txn: *TxnH, kind: OpKind, m: (u64) -> sh.sysl.terndb.Message, q: *QueueH, tag: u64) -> *OpH
+    val queue = queue_of(q)
+    txn_submit(txn, kind, m, queue, tag, false) match
+        Ok(op) -> op_handle(op, None)
+        Err(e) ->
+            val op = new_op(kind, queue, tag)
+            op.fail(e)
+            op_handle(op, None)
+
+@export("terndb_commit")
+commit(txn: *TxnH, commit_seq: *u64, err: **ErrorH) -> CInt
+    txn_sync(txn, OpCommit, (h) -> Commit(h), err) match
+        Ok(SeqOut(present, seq)) ->
+            if present && commit_seq != null then *commit_seq = seq
+            if present then 1 else 0
+        Ok(_) -> 0
+        Err(r) -> r
+
+@export("terndb_commit_async")
+commit_async(txn: *TxnH, q: *QueueH, tag: u64) -> *OpH = txn_async(txn, OpCommit, (h) -> Commit(h), q, tag)
+
+@export("terndb_rollback")
+rollback(txn: *TxnH, err: **ErrorH) -> CInt = txn_sync(txn, OpRollback, (h) -> Rollback(h), err) match
+    Ok(_) -> 0
+    Err(r) -> r
+
+@export("terndb_rollback_async")
+rollback_async(txn: *TxnH, q: *QueueH, tag: u64) -> *OpH = txn_async(txn, OpRollback, (h) -> Rollback(h), q, tag)
+
+/** A savepoint's name, or the refusal of a NULL one. */
+private name_of(name: *const CChar, name_len: usize) -> Result[string, ErrorData]
+    if name == null && name_len > 0 then return Err(bad_argument("name is NULL"))
+    Ok(text_of(ptr_cast(name), name_len))
+
+@export("terndb_savepoint")
+savepoint(txn: *TxnH, name: *const CChar, name_len: usize, err: **ErrorH) -> CInt
+    val n = name_of(name, name_len) match
+        Ok(n) -> n
+        Err(e) -> return fail(err, e)
+    txn_sync(txn, OpSavepoint, (h) -> Savepoint(h, n), err) match
+        Ok(_) -> 0
+        Err(r) -> r
+
+@export("terndb_savepoint_async")
+savepoint_async(txn: *TxnH, name: *const CChar, name_len: usize, q: *QueueH, tag: u64) -> *OpH
+    name_of(name, name_len) match
+        Ok(n) -> txn_async(txn, OpSavepoint, (h) -> Savepoint(h, n), q, tag)
+        Err(e) -> failed_op(OpSavepoint, q, tag, e)
+
+@export("terndb_rollback_to_savepoint")
+rollback_to_savepoint(txn: *TxnH, name: *const CChar, name_len: usize, err: **ErrorH) -> CInt
+    val n = name_of(name, name_len) match
+        Ok(n) -> n
+        Err(e) -> return fail(err, e)
+    txn_sync(txn, OpSavepoint, (h) -> RollbackToSavepoint(h, n), err) match
+        Ok(_) -> 0
+        Err(r) -> r
+
+@export("terndb_rollback_to_savepoint_async")
+rollback_to_savepoint_async(txn: *TxnH, name: *const CChar, name_len: usize, q: *QueueH, tag: u64) -> *OpH
+    name_of(name, name_len) match
+        Ok(n) -> txn_async(txn, OpSavepoint, (h) -> RollbackToSavepoint(h, n), q, tag)
+        Err(e) -> failed_op(OpSavepoint, q, tag, e)
+
+@export("terndb_release_savepoint")
+release_savepoint(txn: *TxnH, name: *const CChar, name_len: usize, err: **ErrorH) -> CInt
+    val n = name_of(name, name_len) match
+        Ok(n) -> n
+        Err(e) -> return fail(err, e)
+    txn_sync(txn, OpSavepoint, (h) -> ReleaseSavepoint(h, n), err) match
+        Ok(_) -> 0
+        Err(r) -> r
+
+@export("terndb_release_savepoint_async")
+release_savepoint_async(txn: *TxnH, name: *const CChar, name_len: usize, q: *QueueH, tag: u64) -> *OpH
+    name_of(name, name_len) match
+        Ok(n) -> txn_async(txn, OpSavepoint, (h) -> ReleaseSavepoint(h, n), q, tag)
+        Err(e) -> failed_op(OpSavepoint, q, tag, e)
+
+/** An operation that has already failed with `e`. */
+failed_op(kind: OpKind, q: *QueueH, tag: u64, e: ErrorData) -> *OpH
+    val op = new_op(kind, queue_of(q), tag)
+    op.fail(e)
+    op_handle(op, None)
+
+private txn_ok(txn: *const TxnH, function: string) -> bool
+    expect_handle(ptr_cast(txn), KindTxn, function)
+    txn != null
+
+@export("terndb_txn_state")
+txn_state(txn: *const TxnH) -> i32 = if txn_ok(txn, "terndb_txn_state") then txn.core.state() else TxnClosed
+
+@export("terndb_txn_id")
+txn_id(txn: *const TxnH) -> u64 = if txn_ok(txn, "terndb_txn_id") then txn.core.m.with((t) -> t.txid) else 0
+
+@export("terndb_txn_snapshot")
+txn_snapshot(txn: *const TxnH) -> u64 = if txn_ok(txn, "terndb_txn_snapshot") then txn.core.m.with((t) -> t.snapshot) else 0
+
+@export("terndb_txn_isolation")
+txn_isolation(txn: *const TxnH) -> i32 = if txn_ok(txn, "terndb_txn_isolation") then txn.core.m.with((t) -> t.isolation) else -1
+
+@export("terndb_txn_free")
+txn_free(txn: *TxnH)
+    if txn == null then return
+    expect_handle(ptr_cast(txn), KindTxn, "terndb_txn_free")
+    val t = txn.core
+    release(txn, KindTxn, "terndb_txn_free")
+    // An open transaction is rolled back; one with a commit in flight is left to it (§5.3 rule 7).
+    val roll = t.m.with((s) -> !s.committing && (s.state == TxnPending || s.state == TxnOpen || s.state == TxnAborted))
+    if roll && !t.conn.is_closed() && !t.conn.db.is_closed()
+        val op = new_op(OpRollback, None, 0)
+        t.conn.request(Rollback(t.handle), ReplySink(op, OpRollback, Some(t)), op)
+
+private status_submit(conn: *ConnH, txid: u64, q: Option[&sync QueueCore], tag: u64,
+        blocking: bool) -> Result[&sync OpCore, ErrorData]
+    val core = conn_enter(conn, blocking)?
+    val op = new_op(OpStatus, q, tag)
+    core.request(TransactionStatus(txid), ReplySink(op, OpStatus, None), op)
+    if !blocking then core.leave()
+    Ok(op)
+
+@export("terndb_transaction_status")
+transaction_status(conn: *ConnH, txid: u64, state: *i32, commit_seq: *u64, err: **ErrorH) -> CInt
+    if state == null && initialized() then return fail(err, bad_argument("state is NULL"))
+    val op = status_submit(conn, txid, None, 0, true) match
+        Ok(op) -> op
+        Err(e) -> return fail(err, e)
+    op.wait(-1)
+    conn.core.leave()
+    op.error() match
+        Some(e) -> return fail(err, e)
+        None -> ()
+    op.take() match
+        StatusOut(st, present, seq) ->
+            *state = st
+            if present && commit_seq != null then *commit_seq = seq
+            0
+        _ -> 0
+
+@export("terndb_transaction_status_async")
+transaction_status_async(conn: *ConnH, txid: u64, q: *QueueH, tag: u64) -> *OpH
+    val queue = queue_of(q)
+    status_submit(conn, txid, queue, tag, false) match
+        Ok(op) -> op_handle(op, None)
+        Err(e) -> failed_op(OpStatus, q, tag, e)
+
+// -- statements (§7) ------------------------------------------------------------------------------
+
+@export("terndb_stmt")
+opaque struct StmtH
+    head: Head
+    conn: &sync ConnCore
+    handle: u64
+    shape: [32]u8
+    catalog_version: u64
+    arena: &Arena
+    rtype: *TypeRec
+    params: Buf[*TypeRec]
+
+/** A statement handle for prepared handle `handle`, from its `Prepared` answer and its envelope. */
+stmt_handle(conn: &sync ConnCore, handle: u64, prepared: Wire, envelope: Buf[u8]) -> *StmtH
+    val a = new_arena()
+    var shape = [0u8; 32]
+    var cv: u64 = 0
+    var rtype: *TypeRec = null
+    message_of(prepared, conn.m.with((s) -> s.minor)) match
+        Prepared(sh, c, rt) ->
+            shape = sh
+            cv = c
+            rt match
+                Some(t) -> rtype = type_in(t, a)
+                None -> ()
+        _ -> ()
+    val params = buf[*TypeRec]()
+    decode_envelope(envelope.view()) match
+        Ok(env) ->
+            for p in env.params
+                params.push(type_in(p.ty, a))
+        Err(_) -> ()
+    counted()
+    val h: &StmtH = StmtH(head(KindStmt), conn, handle, shape, cv, a, rtype, params)
+    h.into_raw()
+
+private prepare_submit(conn: *ConnH, envelope: *const u8, len: usize, q: Option[&sync QueueCore], tag: u64,
+        blocking: bool) -> Result[&sync OpCore, ErrorData]
+    if envelope == null && len > 0 then return Err(bad_argument("envelope is NULL"))
+    val core = conn_enter(conn, blocking)?
+    val env = bytes_of(envelope, len)
+    val handle = core.new_handle()
+    val op = new_op(OpPrepare, q, tag)
+    core.request(Prepare(handle, env), PrepareSink(op, handle, env.copy()), op)
+    if !blocking then core.leave()
+    Ok(op)
+
+@export("terndb_prepare")
+prepare(conn: *ConnH, envelope: *const u8, len: usize, out: **StmtH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    val op = prepare_submit(conn, envelope, len, None, 0, true) match
+        Ok(op) -> op
+        Err(e) -> return fail(err, e)
+    op.wait(-1)
+    conn.core.leave()
+    op.error() match
+        Some(e) -> return fail(err, e)
+        None -> ()
+    op.take() match
+        StmtOut(handle, prepared, env) ->
+            *out = stmt_handle(conn.core, handle, prepared, env)
+            0
+        _ -> fail(err, c_error("C1005", "the prepare produced no statement"))
+
+@export("terndb_prepare_async")
+prepare_async(conn: *ConnH, envelope: *const u8, len: usize, q: *QueueH, tag: u64) -> *OpH
+    prepare_submit(conn, envelope, len, queue_of(q), tag, false) match
+        Ok(op) -> op_handle(op, None)
+        Err(e) -> failed_op(OpPrepare, q, tag, e)
+
+private stmt_ok(stmt: *const StmtH, function: string) -> bool
+    expect_handle(ptr_cast(stmt), KindStmt, function)
+    stmt != null
+
+@export("terndb_stmt_shape")
+stmt_shape(stmt: *const StmtH) -> *const u8 = if stmt_ok(stmt, "terndb_stmt_shape") then ptr_cast(&stmt.shape) else null
+
+@export("terndb_stmt_catalog_version")
+stmt_catalog_version(stmt: *const StmtH) -> u64 = if stmt_ok(stmt, "terndb_stmt_catalog_version") then stmt.catalog_version else 0
+
+@export("terndb_stmt_result_type")
+stmt_result_type(stmt: *const StmtH) -> *const TypeRec = if stmt_ok(stmt, "terndb_stmt_result_type") then stmt.rtype else null
+
+@export("terndb_stmt_param_count")
+stmt_param_count(stmt: *const StmtH) -> usize = if stmt_ok(stmt, "terndb_stmt_param_count") then stmt.params.len() else 0
+
+@export("terndb_stmt_param_type")
+stmt_param_type(stmt: *const StmtH, i: usize) -> *const TypeRec
+    if !stmt_ok(stmt, "terndb_stmt_param_type") then return null
+    if i >= stmt.params.len()
+        if DebugChecks then abort_with("C1002", "terndb_stmt_param_type")
+        return null
+    stmt.params[i]
+
+@export("terndb_stmt_free")
+stmt_free(stmt: *StmtH)
+    if stmt == null then return
+    expect_handle(ptr_cast(stmt), KindStmt, "terndb_stmt_free")
+    val conn = stmt.conn
+    val handle = stmt.handle
+    release(stmt, KindStmt, "terndb_stmt_free")
+    if !conn.is_closed() && !conn.db.is_closed()
+        val op = new_op(OpPrepare, None, 0)
+        conn.request(ClosePrepared(handle), ReplySink(op, OpPrepare, None), op)
+
+// -- execution (§7) -------------------------------------------------------------------------------
+
+/** What an execute runs: a tree, a prepared statement, or a plan-cache digest. */
+private enum Plan
+    Tree(envelope: Buf[u8])
+    ByStmt(handle: u64)
+    ByShape(digest: [32]u8)
+
+/** The empty parameter block of §0 rule 4: one tuple, no columns. */
+private empty_params() -> Buf[u8]
+    val b = buf[u8]()
+    b.push(1)
+    b.push(0)
+    b
+
+/** Submits an execute on `core` (already entered), answering its operation. */
+private exec_submit(core: &sync ConnCore, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH, plan: Plan,
+        params: *const u8, params_len: usize, q: Option[&sync QueueCore], tag: u64) -> Result[&sync OpCore, ErrorData]
+    if params == null && params_len > 0 then return Err(bad_argument("params is NULL"))
+    var t: Option[&sync TxnCore] = None
+    var handle: u64 = 0
+    if txn != null
+        val r = check_handle(ptr_cast(txn), KindTxn)
+        if r != NoRefusal then return Err(refusal_error(r, "txn"))
+        if txn.core.conn.id != core.id then return Err(bad_argument("txn belongs to another connection"))
+        t = Some(txn.core)
+        handle = txn.core.handle
+
+    var imp: Option[TxnOptions] = None
+    if implicit != null
+        imp = Some(txn_options_for(core, txn_options_of(implicit)?))
+    elif txn == null && core.db.read_only
+        imp = Some(txn_options_for(core, sh.sysl.terndb.no_txn_options()))
+
+    val options = exec_options_of(exec)?
+    val block = if params_len == 0 then empty_params() else bytes_of(params, params_len)
+    val m = plan match
+        Tree(env) -> ExecuteMsg(Execute(handle, imp, options, env, block, None))
+        ByStmt(h) -> ExecutePreparedMsg(ExecutePrepared(handle, imp, options, ByHandle(h), block))
+        ByShape(d) -> ExecutePreparedMsg(ExecutePrepared(handle, imp, options, ByDigest(d), block))
+
+    val op = new_op(OpExecute, q, tag)
+    core.request(m, ExecSink(op, t, None), op)
+    Ok(op)
+
+/** The synchronous execute: submit on an entered connection, wait for the header, take the result. */
+private exec_sync(core: &sync ConnCore, sub: Result[&sync OpCore, ErrorData], out: **ResultH, err: **ErrorH) -> CInt
+    val op = sub match
+        Ok(op) -> op
+        Err(e) ->
+            core.leave()
+            return fail(err, e)
+    op.wait(-1)
+    core.leave()
+    op.error() match
+        Some(e) -> return fail(err, e)
+        None -> ()
+    op.take() match
+        ResultOut(r, header) ->
+            *out = result_handle(r, header)
+            0
+        _ -> fail(err, c_error("C1005", "the execute produced no result"))
+
+private exec_async(core: Result[&sync ConnCore, ErrorData], f: (&sync ConnCore) -> Result[&sync OpCore, ErrorData],
+        q: *QueueH, tag: u64) -> *OpH
+    val c = core match
+        Ok(c) -> c
+        Err(e) -> return failed_op(OpExecute, q, tag, e)
+    val sub = f(c)
+    c.leave()
+    sub match
+        Ok(op) -> op_handle(op, None)
+        Err(e) -> failed_op(OpExecute, q, tag, e)
+
+@export("terndb_execute")
+execute(conn: *ConnH, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH, envelope: *const u8,
+        envelope_len: usize, params: *const u8, params_len: usize, out: **ResultH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    if envelope == null && envelope_len > 0 && initialized() then return fail(err, bad_argument("envelope is NULL"))
+    val core = conn_enter(conn, true) match
+        Ok(c) -> c
+        Err(e) -> return fail(err, e)
+    exec_sync(core, exec_submit(core, txn, implicit, exec, Tree(bytes_of(envelope, envelope_len)), params, params_len, None, 0),
+        out, err)
+
+@export("terndb_execute_async")
+execute_async(conn: *ConnH, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH, envelope: *const u8,
+        envelope_len: usize, params: *const u8, params_len: usize, q: *QueueH, tag: u64) -> *OpH
+    if envelope == null && envelope_len > 0 then return failed_op(OpExecute, q, tag, bad_argument("envelope is NULL"))
+    val queue = queue_of(q)
+    exec_async(conn_enter(conn, false), (c) -> exec_submit(c, txn, implicit, exec, Tree(bytes_of(envelope, envelope_len)),
+        params, params_len, queue, tag), q, tag)
+
+/** Takes a statement's connection for one call. */
+private stmt_enter(stmt: *const StmtH, blocking: bool) -> Result[&sync ConnCore, ErrorData]
+    if !initialized() then return Err(not_initialized())
+    val r = check_handle(ptr_cast(stmt), KindStmt)
+    if r != NoRefusal then return Err(refusal_error(r, "stmt"))
+    if blocking && on_engine_thread then return Err(wrong_thread())
+    core_enter(stmt.conn)
+
+@export("terndb_execute_prepared")
+execute_prepared(stmt: *StmtH, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH, params: *const u8,
+        params_len: usize, out: **ResultH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    val core = stmt_enter(stmt, true) match
+        Ok(c) -> c
+        Err(e) -> return fail(err, e)
+    exec_sync(core, exec_submit(core, txn, implicit, exec, ByStmt(stmt.handle), params, params_len, None, 0), out, err)
+
+@export("terndb_execute_prepared_async")
+execute_prepared_async(stmt: *StmtH, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH,
+        params: *const u8, params_len: usize, q: *QueueH, tag: u64) -> *OpH
+    val queue = queue_of(q)
+    val h = if stmt == null then u64(0) else stmt.handle
+    exec_async(stmt_enter(stmt, false), (c) -> exec_submit(c, txn, implicit, exec, ByStmt(h), params, params_len, queue, tag),
+        q, tag)
+
+/** The 32-octet digest at `digest`, or the refusal of a NULL one. */
+private digest_of(digest: *const [32]u8) -> Result[[32]u8, ErrorData]
+    if digest == null then return Err(bad_argument("digest is NULL"))
+    var d = [0u8; 32]
+    for i in 0..<32
+        d[i] = digest[i]
+    Ok(d)
+
+@export("terndb_execute_digest")
+execute_digest(conn: *ConnH, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH, digest: *const [32]u8,
+        params: *const u8, params_len: usize, out: **ResultH, err: **ErrorH) -> CInt
+    if out == null && initialized() then return fail(err, bad_argument("out is NULL"))
+    val d = digest_of(digest) match
+        Ok(d) -> d
+        Err(e) -> return fail(err, if initialized() then e else not_initialized())
+    val core = conn_enter(conn, true) match
+        Ok(c) -> c
+        Err(e) -> return fail(err, e)
+    exec_sync(core, exec_submit(core, txn, implicit, exec, ByShape(d), params, params_len, None, 0), out, err)
+
+@export("terndb_execute_digest_async")
+execute_digest_async(conn: *ConnH, txn: *TxnH, implicit: *const TxnOptionsH, exec: *const ExecOptionsH,
+        digest: *const [32]u8, params: *const u8, params_len: usize, q: *QueueH, tag: u64) -> *OpH
+    val d = digest_of(digest) match
+        Ok(d) -> d
+        Err(e) -> return failed_op(OpExecute, q, tag, e)
+    val queue = queue_of(q)
+    exec_async(conn_enter(conn, false), (c) -> exec_submit(c, txn, implicit, exec, ByShape(d), params, params_len, queue, tag),
+        q, tag)
+
+// -- results (§8.1) -------------------------------------------------------------------------------
+
+@export("terndb_result")
+opaque struct ResultH
+    head: Head
+    core: &sync ResultCore
+    txid: u64
+    snapshot: u64
+    shape: [32]u8
+    type_bytes: Buf[u8]
+    arena: &Arena
+    rtype: *TypeRec
+    ty: Option[Type]
+    tree: Option[ColumnTree]
+    /** `Complete.counts`, copied once the result has ended. */
+    counts: Buf[u64]
+
+/** A result handle for `core`, from its `ResultHeader`. */
+result_handle(core: &sync ResultCore, header: Wire) -> *ResultH
+    val a = new_arena()
+    val minor = core.conn.m.with((s) -> s.minor)
+    var txid: u64 = 0
+    var snapshot: u64 = 0
+    var shape = [0u8; 32]
+    var ty: Option[Type] = None
+    message_of(header, minor) match
+        ResultHeaderMsg(h) ->
+            txid = h.txid
+            snapshot = h.snapshot
+            shape = h.shape
+            ty = h.result_type
+        _ -> ()
+    val bytes = buf[u8]()
+    var rtype: *TypeRec = null
+    var tree: Option[ColumnTree] = None
+    ty match
+        Some(t) ->
+            encode_type(t, bytes)
+            rtype = type_in(t, a)
+            tree = column_tree(t).ok()
+        None -> ()
+    counted()
+    val h: &ResultH = ResultH(head(KindResult), core, txid, snapshot, shape, bytes, a, rtype, ty, tree, buf())
+    h.into_raw()
+
+/** What a `result_next` operation's output comes to: a batch handle, or NULL at the end. The batch's
+ * octets leave the prefetch window as it is taken, so the request may produce more (§5.2 rule 3).
+ */
+batch_of(out: OpOut, res: Option[&sync ResultCore], ty: Option[Type], tree: Option[ColumnTree]) -> *BatchH = out match
+    BatchOut(payload) ->
+        res match
+            Some(r) -> if r.ended() == 0 then r.conn.credit(r.stream, u64(payload.len()))
+            None -> ()
+        (ty, tree) match
+            (Some(t), Some(x)) -> make_batch(t, x, payload.view()).unwrap_or(null)
+            _ -> null
+    _ -> null
+
+private result_ok(r: *const ResultH, function: string) -> bool
+    expect_handle(ptr_cast(r), KindResult, function)
+    r != null
+
+@export("terndb_result_next")
+result_next(r: *ResultH, out: **BatchH, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val rr = check_handle(ptr_cast(r), KindResult)
+    if rr != NoRefusal then return refuse(err, rr, "r")
+    if out == null then return fail(err, bad_argument("out is NULL"))
+    if on_engine_thread then return fail(err, wrong_thread())
+    val op = new_op(OpNext, None, 0)
+    r.core.next(op)
+    op.wait(-1)
+    op.error() match
+        Some(e) -> return fail(err, e)
+        None -> ()
+    val o = op.take()
+    o match
+        BatchOut(_) ->
+            *out = batch_of(o, Some(r.core), r.ty, r.tree)
+            1
+        _ -> 0
+
+@export("terndb_result_next_async")
+result_next_async(r: *ResultH, q: *QueueH, tag: u64) -> *OpH
+    if !initialized() then return failed_op(OpNext, q, tag, not_initialized())
+    val rr = check_handle(ptr_cast(r), KindResult)
+    if rr != NoRefusal then return failed_op(OpNext, q, tag, refusal_error(rr, "r"))
+    val op = new_op(OpNext, queue_of(q), tag)
+    counted()
+    val h: &OpH = OpH(head(KindOp), op, None, Some(r.core), r.ty, r.tree)
+    r.core.next(op)
+    h.into_raw()
+
+@export("terndb_result_txid")
+result_txid(r: *const ResultH) -> u64 = if result_ok(r, "terndb_result_txid") then r.txid else 0
+
+@export("terndb_result_snapshot")
+result_snapshot(r: *const ResultH) -> u64 = if result_ok(r, "terndb_result_snapshot") then r.snapshot else 0
+
+@export("terndb_result_shape")
+result_shape(r: *const ResultH) -> *const u8 = if result_ok(r, "terndb_result_shape") then ptr_cast(&r.shape) else null
+
+@export("terndb_result_type")
+result_type(r: *const ResultH) -> *const TypeRec = if result_ok(r, "terndb_result_type") then r.rtype else null
+
+@export("terndb_result_type_bytes")
+result_type_bytes(r: *const ResultH, ptr: **const u8, len: *usize)
+    if !result_ok(r, "terndb_result_type_bytes") then return
+    if ptr != null then *ptr = as_ptr(r.type_bytes.view())
+    if len != null then *len = r.type_bytes.len()
+
+@export("terndb_result_counts")
+result_counts(r: *const ResultH, ptr: **const u64, len: *usize, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val rr = check_handle(ptr_cast(r), KindResult)
+    if rr != NoRefusal then return refuse(err, rr, "r")
+    val counts = r.core.m.with((s) -> if s.ended == 1 && s.end_seen then Some(s.counts.copy()) else None) match
+        Some(c) -> c
+        None -> return fail(err, c_error("C1005", "the result has not completed"))
+    val w: *ResultH = ptr_cast(r)
+    if w.counts.len() != counts.len() then w.counts = counts
+    if ptr != null then *ptr = as_ptr(w.counts.view())
+    if len != null then *len = w.counts.len()
+    0
+
+@export("terndb_result_commit")
+result_commit(r: *const ResultH, commit_seq: *u64, err: **ErrorH) -> CInt
+    if !initialized() then return fail(err, not_initialized())
+    val rr = check_handle(ptr_cast(r), KindResult)
+    if rr != NoRefusal then return refuse(err, rr, "r")
+    val (ended, has, seq) = r.core.m.with((s) -> (if s.end_seen then s.ended else u8(0), s.has_commit, s.commit))
+    if ended != 1 then return fail(err, c_error("C1005", "the result has not completed"))
+    if !has then return 0
+    if commit_seq != null then *commit_seq = seq
+    1
+
+@export("terndb_result_cancel")
+result_cancel(r: *ResultH)
+    if result_ok(r, "terndb_result_cancel") then r.core.cancel()
+
+@export("terndb_result_free")
+result_free(r: *ResultH)
+    if r == null then return
+    expect_handle(ptr_cast(r), KindResult, "terndb_result_free")
+    val core = r.core
+    release(r, KindResult, "terndb_result_free")
+    core.cancel()
