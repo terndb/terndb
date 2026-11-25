@@ -1,0 +1,136 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf_filled}
+import sysl.fs.{IoError, NotFound, Other, make_temp_dir, remove_dir_all, write_text}
+
+// The block device over a host file (`block_device.sysl`): pages round-trip at their offsets, a
+// synced page survives closing and reopening, and the device's refusals. Each test has a directory
+// of its own, removed at the end.
+
+/** A new directory for one test. */
+private bd_dir(name: string) -> string = make_temp_dir(s"terndb-bd-$name").unwrap()
+
+private bd_raw(d: &FileDevice, n: u64) -> string
+    var b = buf_filled(DbPageSize, u8(0))
+
+    d.read_page(n, b.view_mut()) match
+        Ok(_) -> s"fill ${b[100]}"
+        Err(e) -> s"error ${e.code()}"
+
+@test
+a_new_file_device_is_empty()
+    val dir = bd_dir("empty")
+    val d = create_file_device(s"$dir/data").unwrap()
+    assert_eq(d.page_count(), Ok(u64(0)))
+    assert_eq(bd_raw(d, 0), "error 22")
+    assert_eq(d.sync(), Ok(()))
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_device_reads_back_a_page_it_wrote()
+    val dir = bd_dir("one")
+    val d = create_file_device(s"$dir/data").unwrap()
+    assert_eq(d.write_page(0, sd_sealed(0, 9).view()), Ok(()))
+    assert_eq(d.page_count(), Ok(u64(1)))
+    assert_eq(bd_raw(d, 0), "fill 9")
+    assert_eq(bd_raw(d, 1), "error 22")
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_device_puts_page_n_at_byte_n_times_the_page_size()
+    val dir = bd_dir("offset")
+    val d = create_file_device(s"$dir/data").unwrap()
+    d.write_page(2, sd_sealed(2, 5).view()).unwrap()
+    assert_eq(d.page_count(), Ok(u64(3)))
+    assert_eq(bd_raw(d, 0), "fill 0")
+    assert_eq(bd_raw(d, 1), "fill 0")
+    assert_eq(bd_raw(d, 2), "fill 5")
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_synced_page_is_there_when_the_file_is_opened_again()
+    val dir = bd_dir("reopen")
+    val path = s"$dir/data"
+    val d = create_file_device(path).unwrap()
+    d.write_page(0, sd_sealed(0, 1).view()).unwrap()
+    d.write_page(1, sd_sealed(1, 2).view()).unwrap()
+    assert_eq(d.sync(), Ok(()))
+    d.close().unwrap()
+    val again = open_file_device(path).unwrap()
+    assert_eq(again.page_count(), Ok(u64(2)))
+    val io = page_io(again)
+    var b = buf_filled(DbPageSize, u8(0))
+    assert_eq(io.read(1, b.view_mut()), Ok(()))
+    assert_eq(b[100], u8(2))
+    again.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_device_refuses_a_buffer_that_is_not_one_page()
+    val dir = bd_dir("size")
+    val d = create_file_device(s"$dir/data").unwrap()
+    var small = buf_filled(DbPageSize - 1, u8(0))
+    assert_eq(d.write_page(0, small.view()), Err(Other(22)))
+    d.write_page(0, sd_sealed(0, 1).view()).unwrap()
+    assert_eq(d.read_page(0, small.view_mut()), Err(Other(22)))
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_shorter_than_a_page_holds_no_page()
+    val dir = bd_dir("short")
+    write_text(s"$dir/data", "not a page").unwrap()
+    val d = open_file_device(s"$dir/data").unwrap()
+    assert_eq(d.page_count(), Ok(u64(0)))
+    assert_eq(bd_raw(d, 0), "error 22")
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+opening_a_missing_file_device_is_not_found()
+    val dir = bd_dir("missing")
+    assert(open_file_device(s"$dir/none").is_err())
+    remove_dir_all(dir).unwrap()
+
+@test
+a_file_device_is_named_by_its_path()
+    val dir = bd_dir("name")
+    val d = create_file_device(s"$dir/data").unwrap()
+    assert_eq(d.name(), s"$dir/data")
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+page_io_over_a_file_device_detects_a_corrupted_page()
+    val dir = bd_dir("corrupt")
+    val d = create_file_device(s"$dir/data").unwrap()
+    var p = sd_sealed(0, 1)
+    p[5000] = p[5000] ^ 0x10
+    d.write_page(0, p.view()).unwrap()
+    var b = buf_filled(DbPageSize, u8(0))
+
+    page_io(d).read(0, b.view_mut()) match
+        Ok(_) -> panic("a corrupted page was read")
+        Err(e) -> assert_eq(e.code, "D1001")
+
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()
+
+@test
+page_io_over_a_file_device_names_the_file_in_an_io_error()
+    val dir = bd_dir("ioerr")
+    val d = create_file_device(s"$dir/data").unwrap()
+    var b = buf_filled(DbPageSize, u8(0))
+
+    page_io(d).read(0, b.view_mut()) match
+        Ok(_) -> panic("a page past the end was read")
+        Err(e) ->
+            assert_eq(e.code, "D4004")
+            assert_eq(e.detail("file"), Some(s"$dir/data"))
+
+    d.close().unwrap()
+    remove_dir_all(dir).unwrap()

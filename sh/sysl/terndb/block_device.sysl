@@ -1,0 +1,96 @@
+module sh.sysl.terndb
+
+import sysl.fs.{File, IoError, Other, create_update, open_update}
+import sysl.io.{Positioned, ReadAt, WriteAt}
+
+// The block device: the one seam every page read, page write and sync goes through, so the simulator
+// can stand in for the file (`isolation.md` §7.3). A device holds whole 16 KiB pages, numbered from 0,
+// and is written in 4 KiB sectors, the largest write the storage is assumed to make atomic
+// (`on-disk-format.md` §1 rules 5–7). The device knows nothing of what a page holds: the checksum
+// and the PID are checked a layer up (`page_io.sysl`).
+
+/** The I/O block: the largest write the device makes atomic (§1 rule 6). */
+const DiskSectorSize: usize = 4096
+
+/** Sectors in a page: a page write may tear at any of the boundaries between them (§1 rule 6). */
+const SectorsPerPage: usize = 4
+
+/** `EIO`, what a device answers for a read or a sync that failed. */
+const ErrnoIo: int = 5
+
+/** `EINVAL`, what a device answers for a buffer that is not one page, or a page past its end. */
+const ErrnoInvalid: int = 22
+
+/** A device of whole pages.
+ *
+ * `read_page` fills `into` with page `n`. A page the device has room for and nothing was ever written
+ * to reads as zeros (`on-disk-format.md` §2.3); a page at or past `page_count` is `Other(22)`, as is a
+ * buffer that is not exactly one page. `write_page` writes page `n`, growing the device when `n` is
+ * at or past its end; a write is acknowledged when the device has taken it, which does not make it
+ * durable. `sync` makes every write acknowledged before it durable (§1 rule 7), or fails, and after a
+ * failure nothing says which of those writes survived.
+ */
+trait BlockDevice
+    /** What errors name the device by: its file's path, or the simulated device's name. */
+    name(self) -> string
+
+    /** How many pages the device holds. */
+    page_count(*self) -> Result[u64, IoError]
+
+    read_page(*self, n: u64, into: []u8) -> Result[unit, IoError]
+
+    write_page(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+
+    sync(*self) -> Result[unit, IoError]
+
+/** A device over one file of the host's, page `n` at byte `n × 16384`. */
+struct FileDevice
+    path: string
+    file: File
+
+    /** Closes the file. */
+    close(*self) -> Result[unit, IoError] = self.file.close()
+end FileDevice
+
+/** The sync that makes a write durable: `F_FULLFSYNC` on macOS, where plain `fsync` stops at the
+ * drive's cache, and `fdatasync` elsewhere (§1 rule 7).
+ */
+#if macos
+private durable_sync(f: *File) -> Result[unit, IoError] = f.full_sync()
+#else
+private durable_sync(f: *File) -> Result[unit, IoError] = f.sync_data()
+#endif
+
+impl BlockDevice for FileDevice
+    name(self) -> string = self.path
+
+    page_count(*self) -> Result[u64, IoError] = Ok(self.file.extent()? / u64(DbPageSize))
+
+    read_page(*self, n: u64, into: []u8) -> Result[unit, IoError]
+        if into.len != DbPageSize || n >= self.page_count()? then return Err(Other(ErrnoInvalid))
+        var done: usize = 0
+
+        while done < DbPageSize
+            val got = self.file.read_at(n * u64(DbPageSize) + u64(done), into[done..<DbPageSize])?
+            // The file ended inside a page it said it held: it shrank under us.
+            if got.len == 0 then return Err(Other(ErrnoIo))
+            done += got.len
+
+        Ok(())
+
+    write_page(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+        if bytes.len != DbPageSize then return Err(Other(ErrnoInvalid))
+        var done: usize = 0
+
+        while done < DbPageSize
+            done += self.file.write_at(n * u64(DbPageSize) + u64(done), bytes[done..<DbPageSize])?
+
+        Ok(())
+
+    sync(*self) -> Result[unit, IoError] = durable_sync(&self.file)
+
+/** The device over the existing file at `path`. */
+open_file_device(path: string) -> Result[&FileDevice, IoError] = Ok(FileDevice(path, open_update(path)?))
+
+/** A new, empty device at `path`, emptying any file that was there. */
+create_file_device(path: string) -> Result[&FileDevice, IoError] = Ok(FileDevice(path, create_update(path)?))
