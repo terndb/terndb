@@ -118,6 +118,7 @@ sources() -> Buf[SourceText]
     src(out, "types.sysl", embed("types.sysl"))
     src(out, "undo_check.sysl", embed("undo_check.sysl"))
     src(out, "undo.sysl", embed("undo.sysl"))
+    src(out, "value_hash.sysl", embed("value_hash.sysl"))
     src(out, "value.sysl", embed("value.sysl"))
     src(out, "wire_codec.sysl", embed("wire_codec.sysl"))
     src(out, "wire_decode.sysl", embed("wire_decode.sysl"))
