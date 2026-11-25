@@ -88,6 +88,7 @@ sources() -> Buf[SourceText]
     src(out, "page_io.sysl", embed("page_io.sysl"))
     src(out, "page_map.sysl", embed("page_map.sysl"))
     src(out, "page.sysl", embed("page.sysl"))
+    src(out, "plan_pushdown.sysl", embed("plan_pushdown.sysl"))
     src(out, "plan_unnest.sysl", embed("plan_unnest.sysl"))
     src(out, "primitives.sysl", embed("primitives.sysl"))
     src(out, "qtree_check.sysl", embed("qtree_check.sysl"))

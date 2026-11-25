@@ -506,6 +506,74 @@ Not yet: secondary and unique indexes (`store_index.sysl`) as access paths. A re
 fetch each primary row and check its visibility, and must not use an index whose build has not
 finished; that is a later item.
 
+### 4.7 Predicate pushdown
+
+The code is `plan_pushdown.sysl`. SQL's comma joins and `CROSS JOIN` arrive as a cross join under a
+`Filter`; after unnesting, the tree is rewritten so that each conjunct of a `Filter` over joins, and of
+a join's `on`, is evaluated as low as it may be, and the rewritten tree is type-checked again before it
+is planned. The join itself chooses its keys from its `on` (§4.1), so the rewrite targets "an inner
+join of these inputs with these conjuncts in its `on`", whatever the equi-join's algorithm.
+
+- **Safe conjuncts.** Only a conjunct that can raise no runtime error and draws nothing volatile
+  moves below a join: one built of `Col`, `Row`, `Field`, literals, nulls and parameters with `eq`,
+  `ne`, `lt`, `le`, `gt`, `ge`, `same`, `is_null`, `is_not_null`, `and`, `or`, `not` and `coalesce`
+  (`query-tree.md` §4.1's implicit coercions are lossless, so a comparison's raise nothing). Evaluating it on more
+  rows or fewer changes no error. Any other conjunct — arithmetic, a cast, `next_value`, a
+  subquery — stays where it was written; above a region it is evaluated on the rows the region
+  keeps, which `query-tree.md` §6.4 rule 3 allows, since a safe conjunct is not `true` on the rows
+  removed.
+- **Inner-join regions.** A tree of `inner` joins whose `on` is absent or safe, with the safe
+  `Filter`s directly over or between them, is one region: its leaves (the inputs that are not such
+  joins) and a pool of conjuncts. A `Filter` over a join and the join with those conjuncts in its
+  `on` have one result (§6.4 rule 3, §6.5 rule 8). Each conjunct is placed at the lowest point that
+  sees every binder it reads: a conjunct of one leaf becomes a `Filter` over that leaf (taken into a
+  safe `Filter` already there, so a scan's access path sees it, §4.6); one of several leaves goes into
+  the `on` of the join that first meets them, where an `eq` across its inputs is a key; one reading no
+  leaf (a constant such as `1 = 0`, or an outer row's value) filters the leftmost leaf.
+- **Shape.** The region keeps its own tree unless every leaf is safe to evaluate — a scan of a table
+  (not a view), a `ParamScan`, and filters, projections, `Distinct` and joins of these by safe
+  expressions — since only then can the shape not change which errors are raised. The bracketing of
+  the leaves *in their order* with the fewest joins that no key joins is then taken if it has fewer
+  than the region's own (`a, b, c where a.k = c.k and b.k = c.k` is `a ⋈ (b ⋈ c)`), which keeps the
+  columns in §8.4 order. Where the region's columns are read only by name — under a `Project`,
+  `Aggregate` or `Nest`, through `Filter`, `Sort`, `Limit`, `Distinct`, `Window` and `Unnest` — and
+  that still leaves such a join, a left-deep order joining next the first leaf a key joins to those
+  joined so far is taken if it has fewer still (`a-c, a-d, b-d` is `((a ⋈ c) ⋈ d) ⋈ b`). At the root,
+  in a `SetOp` input or under a `Tag`, the leaves' order is the result's and is never changed.
+- **Empty right inputs.** An `inner` join's empty right input ends it before its left input is read
+  (§4.1, §6.5 rule 10). A conjunct moved into a right input can make it empty, which would leave
+  the left input's errors unraised, so a conjunct moves into a right input only when the left input
+  beside it, at every level of the region, is safe to evaluate; otherwise it waits in the `on` of
+  the join above.
+- **A join whose `on` is not safe** is evaluated on every pair of its inputs: its safe `on`
+  conjuncts reading one input move into it (the rest may go unevaluated on a pair they make not
+  `true`, §6.5 rule 8), into the right input only beside a safe left input, and a `Filter` over it
+  keeps every conjunct, since fewer pairs would leave `on`'s errors unraised.
+- **Outer joins.** A safe `Filter` conjunct that rejects a side's nulls — a comparison, or
+  `is_not_null`, with a bare column of that side as an operand (§3.2: null when an operand is) —
+  removes every row that side was null-extended in, and is not `true` on them, so the rest of the
+  filter may go unevaluated there: `left` with its right side rejected and `right` with its left
+  side rejected are `inner`, and `full` is `right`, `left` or `inner`. It becomes `inner` only when
+  its left input is safe to evaluate, by the rule above. With the join still outer, a safe `Filter`
+  conjunct reading only a `left` or `right` join's preserved side moves into that side when `on` is
+  safe (a row it removes takes all its output rows with it, and `on` would have raised nothing on
+  their pairs); a safe `on` conjunct reading only the null-supplying side moves into it (a row it
+  removes was null-extended either way). Nothing moves past a `full` join that stays one, and a
+  `coalesce` or `is_null` of the null-supplying side is never taken as rejecting.
+- **Result type.** An outer join made `inner` makes the columns it null-extended non-null, so the
+  rewritten tree's result type may be the query's with fewer nullable types; `unnest_plan` accepts it
+  when it coerces to the query's (`query-tree.md` §4.1), and the rows are sent under the query's type. A rewritten
+  tree that does not type is a fallback, and the unnested tree is planned instead.
+- **Errors, as the tests check them.** A division by zero on a row whose key matches nothing is not
+  evaluated, as §6.4 rule 3 allows (as written the filter evaluates it on every pair and raises
+  `R0002`); on a row a key matches it is raised either way; over an empty side nothing is evaluated;
+  and a key lookup chosen by a pushed conjunct never reads the row the division would fail on.
+- **Measured.** `plan_pushdown_tests.sysl` counts the pairs the joins tested (`Work`): a 2-, 3- or
+  4-way comma join of different keys tests only the pairs of equal keys, and a pushed key conjunct
+  is checked by the leaf entries the store's scans visited. A differential test runs random comma,
+  inner, cross and outer joins over random tables with nulls and duplicates pushed down and as
+  written.
+
 ## 5. What this note relies on in `query-tree.md`
 
 §3.1–§3.3 for every comparison and for `Sort` and `Distinct`; §3.1 and §3.4 for the hash join's keys; §4.1–§4.2 for
