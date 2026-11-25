@@ -26,6 +26,15 @@ encode_statement(s: Statement) -> Result[Buf[u8], CodecError]
     w.statement(s, out)
     w.finish(out)
 
+/** Expression `e` alone, as a node in its canonical encoding (§12.4): a definition expression as the
+ * catalog relations report it beside its text form (`ddl.md` §4.2).
+ */
+encode_expr(e: Expr) -> Result[Buf[u8], CodecError]
+    var w = TreeWriter(false, map[string, string](), buf[CteName](), 0, 0, None)
+    val out = buf[u8]()
+    w.expr(e, out)
+    w.finish(out)
+
 /** The shape form of `env` (§10.2):its encoding with every parameter name and the spans absent,
  * every binder renamed `b<i>` and every CTE name `c<i>`, numbered in pre-order of introduction.
  */

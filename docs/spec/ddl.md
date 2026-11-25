@@ -76,14 +76,20 @@ in the same statement, in dependency order (§2.11).
    across renames and retypes), a name, a type, and optionally a default, a generation expression or an identity.
    The order of columns is their **ordinal** in the current schema version; `Scan` outputs them in that order
    ([QT] §6.1).
-2. The type is any type of [QT] §2, including records, unions, relation types and `json`, or a named type reference
-   ([QT] §12.3 kind 32). Nullability is part of it ([QT] §2.2): a column of type `T` is `NOT NULL`, and one of type
-   `T?` is not. A column's stored descriptor is the structure ([DISK] §4.3 rule 2).
+2. The type is any type of [QT] §2, including records, unions, relation types, `json` and every type of [QT]
+   §2.7, or a named type reference ([QT] §12.3 kinds 32–34). Nullability is part of it ([QT] §2.2): a column of
+   type `T` is `NOT NULL`, and one of type `T?` is not. A column's stored descriptor is the structure ([DISK] §4.3
+   rule 2). A length, precision or qualifier is part of the type, so changing one is a retype (§8.5).
 3. A column is in one of three **states**: `ready`, `filling` (being backfilled, §8.2) or `converting` (being
    retyped, §8.5). Only a `ready` column is visible to statements: a `Scan` does not output a column in another
    state, and naming one is `Q2003`. A writer still writes every column of its schema version, whatever its state
    (§5.4). That rule is for queries and definition expressions; what an `AlterTable` action may do to a column
    that is not `ready` is §2.13 rule 11.
+4. A column of a character string type, or of a record, array or domain holding one, MAY declare a **collation**
+   ([QT] §2.21), kept in `sys.columns.collation` (`ucs_basic` when none is declared). The tree does not apply it:
+   the SQL front end writes it onto each comparison of the column by ISO's derivation rules (`sql.md` §4.2), and
+   an index key on the column uses the collation the index declares, the column's by default. Changing it is a
+   metadata-only change unless an index or constraint uses it, when it rebuilds those (§8.9).
 
 ### 2.4 The primary key
 
@@ -233,13 +239,18 @@ Every constraint has a name unique in the table's namespace, and is one of:
 
 ### 2.8 Named types
 
-1. `CreateType` gives a name to a **record** or **union** type ([QT] §2.3–2.4). An **enum** is a named union whose
-   payloads are all `{}`; there is no separate enum type ([QT] §2.4 rule 1), and the catalog reports the kind
-   `enum` for such a union (§4.2). Scalars, relation types and nullable types cannot be named (`Q6005`).
-2. A named type is an **alias**: a reference to it ([QT] §12.3 kind 32) denotes its structure, and type identity
-   compares structures. A value of the named type and a value of the same structure written out are the same
-   type. *Rationale: [QT] keeps every type structural so that results need no catalog to decode; a nominal type
-   would make two clients with the same structure disagree about identity.*
+1. `CreateType` gives a name to a **record** or **union** type ([QT] §2.3–2.4), and, by its `def` (§3.3, tree
+   1.1), defines a **domain**, a **range**, a **distinct** type or a **structured** type ([QT] §2.19–§2.20). An
+   **enum** is a named union whose payloads are all `{}` (PostgreSQL's `CREATE TYPE … AS ENUM`); there is no
+   separate enum type ([QT] §2.4 rule 1), and the catalog reports the kind `enum` for such a union (§4.2).
+   Relation types and nullable types cannot be named, and a scalar only as a domain or a distinct type
+   (`Q6005`).
+2. A record, union, enum, domain or range name is an **alias**: a reference to it ([QT] §12.3 kind 32) denotes its
+   structure, and type identity compares structures. A value of the named type and a value of the same structure
+   written out are the same type. *Rationale: [QT] keeps every type structural so that results need no catalog to
+   decode; a nominal type would make two clients with the same structure disagree about identity.* Distinct and
+   structured types are the exceptions ISO requires: they are **nominal** (kinds 33, 34), and still sent as
+   their structure, so results stay decodable without the catalog.
 3. A column declared with a named type records it (`sys.columns.type_oid`, `catalog.columns.type_name`), so a
    client generator can emit one named class per catalog type. A column declared with the structure written out
    has no type name, even if a named type with that structure exists.
@@ -252,6 +263,31 @@ Every constraint has a name unique in the table's namespace, and is one of:
    type and retype the columns. A name or tag rename conflicts with every running transaction that resolved the
    old name (§6.3).
 6. Dropping a named type that a column, another type or a view uses is `Q6007`.
+7. **Enum values.** PostgreSQL's `ALTER TYPE … ADD VALUE 'v'` is `append_variants` with one `{}` variant, so the
+   new label sorts last; `ADD VALUE … BEFORE`/`AFTER`, which would renumber the discriminants every stored value
+   and key holds, is `Q6018`. `RENAME VALUE` is `rename_member`.
+8. **Domains.** A domain over `T` has an optional default, a `not_null` flag and named checks, each a definition
+   expression (§2.12) over the one binder `value` of type `T`. A column declared with the domain and no default
+   of its own takes the domain's. Every value assigned to something declared with the domain ([QT] §2.20 rule 2)
+   is checked: null against `not_null` (`T3004`), a non-null value against each check (`T3002`, which, as for a
+   table's check, passes when the check is null). `AlterType` may add a check (`domain_add_check`), which is
+   validated over every column declared with the domain by one `validate_constraint` job per table, as §8.7 adds
+   a check; drop a check; set or drop the default; and set `not_null` (validated the same way) or drop it.
+9. **Ranges.** `CREATE TYPE r AS RANGE (SUBTYPE = T)` names `range<T>` and, with it, `r`'s multirange name
+   (`multirange_name`, else PostgreSQL's default: `r` with `range` replaced by `multirange`, or `r_multirange`)
+   for `multirange<T>`. `T` must be orderable and key-encodable (`Q6005`). The PostgreSQL options
+   `subtype_diff`, `canonical` and `collation` are not taken: a range over a discrete type is canonical by
+   [QT] §2.19 rule 1.
+10. **Distinct types.** The source is a predefined type of [QT] §2.1 or §2.7, not a named type (`Q6005`). A
+    distinct type cannot be altered except renamed.
+11. **Structured types.** `type` is the record of the type's own attributes; `under` names a supertype, which
+    must be `NOT FINAL` (`Q6005`), and whose attributes come first. An attribute name that a supertype already
+    has is `Q3015`. A new subtype appends a variant, with the hierarchy's attributes, to the structure of every
+    column declared with the supertype or one of its supertypes: a metadata-only retype (§8.5 rule 1) of each,
+    in the `CreateType`'s transaction. `AlterType` may append an attribute (`add_attribute`, nullable or with a
+    constant fill), appended to every payload, and may set the type's ordering (`set_ordering`; `CREATE ORDERING
+    FOR t EQUALS ONLY BY STATE`). Methods, reference types (`REF`) and typed tables are **deferred**, not
+    refused for good (`docs/decisions.md` Q95); until they land their SQL is `Q8005`.
 
 ### 2.9 Views
 
@@ -459,7 +495,7 @@ These settle what §2 leaves to the catalog; each is checked when the statement 
 | 36 | `AlterTable` | `table: QualName, actions: [AlterAction]` |
 | 37 | `CreateIndex` | `name: str, def: IndexDef, if_not_exists: bool` |
 | 38 | `DropIndex` | `index: QualName, if_exists: bool` |
-| 39 | `CreateType` | `type_name: QualName, type: Type, if_not_exists: bool` |
+| 39 | `CreateType` | `type_name: QualName, type: Type, if_not_exists: bool, def: TypeDef` (`def` from tree 1.1; absent, `alias`) |
 | 40 | `AlterType` | `type_name: QualName, change: TypeChange` |
 | 41 | `DropType` | `type_name: QualName, if_exists: bool` |
 | 42 | `CreateSequence` | `sequence: QualName, def: SequenceDef, if_not_exists: bool` |
@@ -498,7 +534,8 @@ Auxiliary records are encoded inline, as their fields in order ([QT] §12.4).
 
 ```
 ColumnDef     = { name: str, type: Type, default: Expr?, generated: Expr?,
-                  identity: enum { none, always, by_default }, sequence: SequenceDef? }
+                  identity: enum { none, always, by_default }, sequence: SequenceDef?,
+                  collation: opt<str> }                                (collation: tree 1.1, §2.3 rule 4)
 ConstraintDef = { name: str, body: choice {
                     check { expr: Expr },
                     unique { columns: [str] },
@@ -506,13 +543,25 @@ ConstraintDef = { name: str, body: choice {
                                   on_delete: FkAction, on_update: FkAction, deferred: bool } } }
 FkAction      = enum { no_action, restrict, cascade, set_null, set_default }
 IndexDef      = { table: QualName, unique: bool, keys: [IndexKey], predicate: Expr? }
-IndexKey      = { key: choice { column { name: str }, expr { expr: Expr } }, descending: bool }
+IndexKey      = { key: choice { column { name: str }, expr { expr: Expr } }, descending: bool,
+                  collation: opt<str> }                                (collation: tree 1.1)
 SequenceDef   = { type: Type, start: opt<svar>, increment: opt<svar>, min: opt<svar>, max: opt<svar>,
                   cycle: bool, cache: opt<uvar> }
 TypeChange    = choice { append_variants { variants: [(str, Type)] },
                          append_fields { fields: [(str, Type, Expr?)] },
                          rename_member { old: str, new: str },
-                         rename { new_name: str } }
+                         rename { new_name: str },
+                         domain_add_check { name: str, expr: Expr },          (tree 1.1, 4–9)
+                         domain_drop_check { name: str },
+                         domain_set_default { default: Expr? },
+                         domain_set_not_null { not_null: bool },
+                         add_attribute { name: str, type: Type, fill: Expr? },
+                         set_ordering { equals_only_by_state: bool } }
+TypeDef       = choice { alias {},
+                         domain { default: Expr?, not_null: bool, checks: [(str, Expr)] },
+                         range { multirange_name: opt<str> },
+                         distinct {},
+                         structured { under: opt<QualName>, instantiable: bool, final: bool } }
 RoleDef       = { login: bool, superuser: bool, member_of: [str] }
 Privilege     = enum { select, insert, update, delete, references, usage, create }
 ObjectRef     = choice { table { name: QualName }, namespace { name: str },
@@ -571,7 +620,7 @@ changes in one statement.
   :constraints [(constraint :name users_email_key :unique [email])])
 
 (alter_table :table app.users
-  :actions [(add_column :def (column :name created_at :type timestamp?))
+  :actions [(add_column :def (column :name created_at :type timestamptz?))
             (add_constraint :def (constraint :name email_has_at
                :check (call contains row.email '@'::text)))])
 ```
@@ -633,7 +682,7 @@ The `alter_table` is these 83 octets:
   03 61 70 70  05 75 73 65 72 73           table app.users
   02                                       two actions
     00                                     add_column (0)
-      0a 63 72 65 61 74 65 64 5f 61 74  14 02 0d 00  00 00 00 00   created_at timestamp?
+      0a 63 72 65 61 74 65 64 5f 61 74  14 02 0d 00  00 00 00 00   created_at timestamptz?
     06                                     add_constraint (6)
       0c 65 6d 61 69 6c 5f 68 61 73 5f 61 74             email_has_at
       00                                                 check (0)
@@ -656,8 +705,10 @@ each phase in pre-order. They need nothing but the tree, so a client library MAY
 1. **Names** (`Q2…`, `Q6002`). The binders of a view query and of each definition expression follow [QT] §8, a
    definition expression seeing only `row` (§2.12 rule 1); two `ColumnDef`s, or two `ConstraintDef`s, of one
    `CreateTable` with the same name are `Q6002`.
-2. **Types** (`Q6005`). A `CreateType` whose type is not a record, a union or a named reference, or whose type
-   refers to the name it creates; an identity column (§2.7 rule 3), or a `SequenceDef`, whose type is not
+2. **Types** (`Q6005`). A `CreateType` whose type is not what its `def` allows (`alias`: a record, a union or a
+   named reference; `domain`: any type; `range`: an orderable, key-encodable scalar, the subtype; `distinct`: a
+   predefined scalar; `structured`: a record), or whose type refers to the name it creates, or a structured
+   type `under` a `FINAL` type; an identity column (§2.7 rule 3), or a `SequenceDef`, whose type is not
    `int16`, `int32` or `int64`.
 3. **Parameters** (`Q6001`). A DDL envelope that declares any parameter.
 4. **Structure**:
@@ -700,7 +751,9 @@ each phase in pre-order. They need nothing but the tree, so a client library MAY
 4. A type is reported twice: `type` is its canonical [QT] §12.3 encoding (structural, with the nullable wrapper,
    never a named reference), which a client decodes with the decoder it already has; `type_text` is the [QT] §15
    text form of the same structural type, so it names no named type either (`type_name` does, where there is one).
-   An expression is reported as its [QT] §15 text form, its row binder `row` (§2.12).
+   An expression is reported twice as well, its row binder `row` (§2.12): as its [QT] §15 text form, and in a
+   column named after that one with `_tree` appended, as the canonical [QT] §12.4 encoding of the expression node
+   alone, which a client decodes into the tree (the `terndb` shell prints it back as SQL).
 5. Objects not yet visible to the reader's snapshot are absent; objects in a non-`ready` state are present with
    their state, so a tool can watch a change in progress. A generator SHOULD use only `ready` columns.
 
@@ -719,23 +772,30 @@ uint32}`.
 **`catalog.columns`** — `table_oid`, `column_id: uint32`, `ordinal: uint16`, `name: text`, `type: bytes`,
 `type_text: text`, `type_name: QualName?`, `nullable: bool`, `in_primary_key: bool`, `default: text?`,
 `generated: text?`, `identity: union<always: {}, by_default: {}>?`, `state: union<ready: {}, filling: {job:
-uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`. One row per column of the table's current
+uint64}, converting: {job: uint64, to_type: bytes, to_type_text: text}>`, `default_tree: bytes?`, `generated_tree:
+bytes?`, `collation: text` (§2.3 rule 4; `ucs_basic` when none was declared). One row per column of the table's
+current
 schema version, in every state, including the columns of views (`table_oid` the view's oid, no key, no default,
 `ready`). `ordinal` counts from 0 in the current schema version; a view's column has `column_id` its ordinal plus 1.
 
 **`catalog.indexes`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `unique: bool`, `keys:
-list<{column: text?, expr: text, descending: bool}>` (`column` set when the component is a plain column),
-`predicate: text?`, `state: union<building: {job: uint64}, ready: {}, failed: {job: uint64}>`.
+list<{column: text?, expr: text, descending: bool, expr_tree: bytes, collation: text}>` (`column` set when the
+component is a plain column, whose `expr` is then `Col(row, column)`; `collation` `ucs_basic` for a binary or
+non-text component), `predicate: text?`, `state: union<building: {job: uint64}, ready: {}, failed: {job:
+uint64}>`, `predicate_tree: bytes?`.
 
 **`catalog.constraints`** — `oid`, `table_oid`, `namespace: text`, `name: text`, `validated: bool`, `kind:
 union<primary_key: {columns: list<text>}, unique: {columns: list<text>, index_oid: uint64}, not_null: {column:
-text}, check: {expr: text}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
+text}, check: {expr: text, expr_tree: bytes}, foreign_key: {columns: list<text>, ref_table_oid: uint64, ref_columns: list<text>,
 on_delete: FkAction, on_update: FkAction, deferred: bool}>`, where `FkAction` is `union<no_action: {}, restrict:
 {}, cascade: {}, set_null: {}, set_default: {}>`. A `not_null` row is listed for each column whose type is not
 nullable; it is no object (§2.6), so its `oid` is 0, its name `<table>_<column>_not_null`, and it is validated.
 
 **`catalog.types`** — `oid`, `namespace: text`, `name: text`, `owner: text`, `kind: union<record: {}, union: {},
-enum: {}>` (`enum` for a union whose payloads are all `{}`), `type: bytes`, `type_text: text`, `members:
+enum: {}, domain: {default: text?, not_null: bool, checks: list<{name: text, expr: text}>}, range:
+{multirange_name: text}, distinct: {}, structured: {under: QualName?, instantiable: bool, final: bool, ordering:
+union<none: {}, equals_only_by_state: {}>}>` (`enum` for a union whose payloads are all `{}`; the members after
+`enum` from tree 1.1), `type: bytes`, `type_text: text`, `members:
 list<{name: text, type: bytes, type_text: text, type_name: QualName?}>` (the fields of a record or the variants of
 a union, with each variant's payload record as its type, in declared order; `type_name` set where the member was
 declared with a named type).
@@ -757,7 +817,7 @@ uint32}?`. The current value is not reported, since it is not transactional.
 **`catalog.jobs`** — `job: uint64`, `txid: uint64` (the transaction whose DDL started it), `kind: text` (one of
 `build_index`, `validate_constraint`, `fill_column`, `convert_column`, `rebuild_table`), `object_oid`, `table_oid`,
 `state: union<queued: {}, running: {}, succeeded: {}, failed: {code: text, message: text}, cancelled: {}>`,
-`progress: {done: uint64, total: uint64?}` (rows), `started: timestamp?`, `finished: timestamp?`. A finished job's
+`progress: {done: uint64, total: uint64?}` (rows), `started: timestamptz?`, `finished: timestamptz?`. A finished job's
 row is kept for at least 7 days (`job_retention`).
 
 **`catalog.schema_versions`** — `table_oid`, `schema_version: uint16`, `committed: uint64` (the commit sequence
@@ -803,7 +863,11 @@ each column of `v` that the statement reads, matched by **column id**:
    `intN`, `uintN` → `decimal(p, 0)` when `p` holds every value (3, 5, 10, 19 digits for 8–64 bits signed; 3, 5,
    10, 20 unsigned); `decimal(p, s) → decimal(p', s')` when `s' ≥ s` and `p' − s' ≥ p − s`; `float32 → float64`;
    `int8`, `int16`, `uint8`, `uint16` → `float32`; `int8` … `int32`, `uint8` … `uint32` → `float64`; `json → text`;
-   `T → T?`; `list<E> → bag<E>`; and, recursively, a record whose fields convert losslessly, with fields appended
+   the widenings of [QT] §4.1 rules 8–14 (`varchar(n)` to a longer `varchar` or `text`; `char(n)` to a longer
+   `char` or `varchar`, or `text`; the binary and bit widenings; every integer and `decimal` to `numeric`; the
+   `decfloat` widenings; a larger datetime precision; an interval qualifier that holds every value, and either
+   interval family to `interval`; a larger or no array bound; `cidr → inet`; `macaddr → macaddr8`); a domain to
+   its base type; `T → T?`; `list<E> → bag<E>`; and, recursively, a record whose fields convert losslessly, with fields appended
    that are nullable or have a constant fill; a union whose payloads convert losslessly, with variants appended at
    the end; a relation whose element converts losslessly; renames of fields and tags (by position, which the
    encoding keys on). Nothing else is lossless.
@@ -812,7 +876,10 @@ each column of `v` that the statement reads, matched by **column id**:
    `Cast` of [QT] §7.6 does, which no lossless conversion makes round or fail: an integer keeps its value as a
    wider integer, a `decimal(p, 0)` or a float; a `decimal` keeps its value at the larger scale (its unscaled
    integer multiplied by 10^(s' − s)); `float32 → float64` keeps the number; `json → text` is the value's canonical
-   text ([QT] §3.5), which is how a `json` value is held. A record converts field by field, a union its variant's
+   text ([QT] §3.5), which is how a `json` value is held. A `char(n)` value read as `char(m)`, `varchar` or `text`
+   is padded to `n` (rows hold it unpadded, [DISK] §4.4) and, for `char(m)`, then to `m`; a `decimal` read as
+   `numeric` keeps its scale as its display scale; `macaddr → macaddr8` inserts FF:FE after the third octet;
+   the interval conversions are [QT] §2.12 rule 3's. A record converts field by field, a union its variant's
    payload and a relation each element, members matched by position; a record value lacking fields its type has
    since gained reads each one's fill (§2.13 rule 7), or null. A stored value that is not of its version's type, or
    that does not convert (a `decimal` holding more digits than its precision allows), is `D1001`.
@@ -1085,6 +1152,23 @@ its old type and at its new one (`Q6022`, nothing recorded), whether the retype 
    `Q6023` says the column is being *retyped* and a fill is not a retype, and a client's remedy differs (wait for
    the `fill_column` job). The column can be retyped once the job has made it `ready`. A column added by the same
    `AlterTable` is not retyped in it either, but that is `Q6016` (§3.3 rule 3), not this code.
+6. **The types of [QT] §2.7.** Which retypes are metadata-only (rule 1) follows from §5.3 rule 3 and the key
+   encodings of [DISK] §4.6:
+   - **Metadata-only even when indexed** (the key encoding is unchanged): `varchar(n)` to a longer `varchar` or
+     `text`; `varbinary(n)` to a longer one or `bytes`; `varbit(n)` to a longer one; a larger precision of
+     `time`, `timestamp`, `timestamptz` or `timetz`; an interval qualifier widening within a family; a larger or
+     no array bound; `cidr → inet`; a domain to its base; and a type to a distinct type over it, or back (the
+     encodings are one).
+   - **Metadata-only only when not indexed** (lossless, but the key changes): `char(n)` to a longer `char`, to
+     `varchar` or to `text` (the key pads to the length); an integer or `decimal(p ≤ 38)` to `numeric` or a
+     `decimal(p > 38)`; the `decfloat` widenings; `macaddr → macaddr8`; an interval family to `interval`.
+   - **Rule 2, a `convert_column` job**: every narrowing — a shorter `varchar(n)`, `char(n)`, `varbinary(n)`,
+     `binary(n)` or `varbit(n)`, or a smaller array bound, whose guard is the store assignment of [QT] §4.1 rule
+     15 and fails with `R0009`, `R0010` or `R0012`; a smaller datetime precision (the guard always passes, the
+     values round); a type to a domain over it, or to another domain (the guard is the target domain's
+     constraints, `T3002`/`T3004`); and every retype with a `using`.
+   - `timestamp ↔ timestamptz` has no conversion ([QT] §7.6): `Q6008` unless `using` names the zone
+     (`from_zone(c, 'UTC')`).
 
 ### 8.6 Set or drop a default; drop or set not null
 

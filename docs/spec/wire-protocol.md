@@ -710,11 +710,20 @@ The column tree of a type is built by `Col(T)`, which yields one **column node**
 | `int8`, `int16`, `int32`, `int64`, `int128` | fixed, width 1, 2, 4, 8, 16 | `values` | — |
 | `uint8`, `uint16`, `uint32`, `uint64` | fixed, width 1, 2, 4, 8 | `values` | — |
 | `float32`, `float64` | fixed, width 4, 8 | `values` | — |
-| `decimal(p, s)` | fixed, width 16 | `values` | — |
-| `date` | fixed, width 4 | `values` | — |
-| `time`, `datetime`, `timestamp` | fixed, width 8 | `values` | — |
+| `decimal(p, s)`, `p ≤ 38` | fixed, width 16 | `values` | — |
+| `date`, `interval_ym` | fixed, width 4 | `values` | — |
+| `time`, `timestamp`, `timestamptz` (any precision), `interval_dt`, `money` | fixed, width 8 | `values` | — |
+| `timetz` | fixed, width 12 | `values` | — |
 | `interval`, `uuid` | fixed, width 16 | `values` | — |
-| `text`, `bytes`, `json` | varbin | `offsets`, `data` | — |
+| `decfloat(16)`, `decfloat(34)` | fixed, width 8, 16 | `values` | — |
+| `inet`, `cidr` | fixed, width 18 | `values` | — |
+| `macaddr`, `macaddr8` | fixed, width 6, 8 | `values` | — |
+| `text`, `bytes`, `json`, `varchar`, `char`, `varbinary`, `binary`, `xml`, `jsonb`, `numeric`, `decimal(p > 38)`, `bit`, `varbit` | varbin | `offsets`, `data` | — |
+| `array<E>` | relation | `offsets` | `Col(E)` |
+| `range<T>` | record | — | `Col(uint8)` (the flags), `Col(T?)`, `Col(T?)` (the bounds; null when infinite or empty) |
+| `multirange<T>` | relation | `offsets` | `Col(range<T>)` |
+| a domain, a distinct type | as its base or source | | |
+| a structured type | as its structure, a union ([QT] §2.20) | | |
 | `{n₁: T₁, …, nₖ: Tₖ}` | record | — | `Col(T₁)`, …, `Col(Tₖ)` |
 | `union<t₀: R₀, …, tₖ₋₁: Rₖ₋₁>` | union | `discriminants`, `offsets` | `Col(R₀)`, …, `Col(Rₖ₋₁)` |
 | `bag<E>`, `list<E>` | relation | `offsets` | `Col(E)` |
@@ -739,8 +748,12 @@ child `j` has as many slots as there are non-null slots with discriminant `j`.
    length 0) and every slot is valid; otherwise it MUST be present. A non-nullable node's `null_count` MUST be 0.
 2. **values** (fixed): `n × width` octets; slot `i` occupies octets `[i·width, (i+1)·width)` and holds the value
    encoded exactly as [QT] §12.6 encodes that scalar (`bool` one octet `00`/`01`; integers, `decimal`'s unscaled
-   `int128`, floats, `date`, the 64-bit time types and `interval`'s three fields little-endian; `uuid` in RFC 9562
-   order).
+   `int128`, floats, `date`, the 64-bit time types, `interval`'s three fields, `timetz`'s two, `interval_ym`,
+   `interval_dt`, `money` and `decfloat`'s BID bits little-endian; `uuid` in RFC 9562 order; `inet`, `cidr` and
+   the MAC types as their octets). A `date` slot holding −2³¹ or 2³¹ − 1, and a `timestamp` or `timestamptz` slot
+   holding −2⁶³ or 2⁶³ − 1, is `-infinity` or `infinity` ([QT] §2.11 rule 9); a client MUST NOT convert it to a
+   calendar date. A varbin slot of a type of [QT] §2.7 holds the bytes [QT] §12.6 gives it after
+   its `uvar` length: `char(n)` padded, `numeric` and `jsonb` their text forms, `bit` its count and bits.
 3. **offsets** (varbin): `(n + 1) × 4` octets of `u32`, with `offsets[0] = 0`, non-decreasing; slot `i` is
    `data[offsets[i] .. offsets[i+1])`. **data** is `offsets[n]` octets. `text` data MUST be valid UTF-8 per slot.
    The buffer is `(n + 1) × 4` octets even when `n = 0` (one zero offset).
@@ -961,9 +974,12 @@ The encoding is **Arrow-shaped but not Arrow IPC**.
      variant).
    - Arrow type ids are `int8` (at most 128 variants); TernDB uses `u8` and, above 256 variants, `u16`.
    - `int8`/`uintN` ↔ `Int8`/`UIntN`, `json` ↔ `Utf8` (or the `arrow.json` extension),
-     `date` ↔ `Date32`, `time` ↔ `Time64(us)`, `datetime` ↔ `Timestamp(us)` without zone, `timestamp` ↔
-     `Timestamp(us, "UTC")`, `decimal(p, s)` ↔ `Decimal128(p, s)`, `uuid` ↔ `FixedSizeBinary(16)` (or the
-     `arrow.uuid` extension) map without conversion.
+     `date` ↔ `Date32`, `time` ↔ `Time64(us)`, `timestamp` ↔ `Timestamp(us)` without zone, `timestamptz` ↔
+     `Timestamp(us, "UTC")`, `decimal(p ≤ 38, s)` ↔ `Decimal128(p, s)`, `uuid` ↔ `FixedSizeBinary(16)` (or the
+     `arrow.uuid` extension), `varchar`/`char` ↔ `Utf8`, `varbinary`/`binary` ↔ `Binary`, `interval_ym` ↔
+     `Interval(YEAR_MONTH)`, `array<E>` ↔ `List` map without conversion; `interval_dt` ↔ `Duration(us)` is the
+     same `int64`. `numeric`, `decfloat`, `timetz`, `jsonb`, the network, bit and range types have no Arrow type
+     and travel as `Utf8` or `FixedSizeBinary`.
 2. *Rationale for not using Arrow IPC itself.* Arrow IPC carries its schema as Flatbuffers, so a client would need
    a Flatbuffers implementation (there is none for avin); its type system lacks TernDB's distinctions (nullability
    is in the type, `bag` versus `list`, union tags and record field order as part of identity), so the schema would

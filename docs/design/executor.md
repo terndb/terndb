@@ -27,7 +27,7 @@ node, with each buffer held as a typed `Buf` instead of raw octets:
 | `int8` … `int64`, `uint8` … `uint64` | `I8s` … `I64s`, `U8s` … `U64s` | `values` |
 | `int128`, `decimal(p, s)` | `I128s` (a decimal's unscaled value) | `values` |
 | `date` | `I32s` (days) | `values` |
-| `time`, `datetime`, `timestamp` | `I64s` (microseconds) | `values` |
+| `time`, `timestamp` (`datetime`), `timestamptz` | `I64s` (microseconds) | `values` |
 | `float32`, `float64` | `F32s`, `F64s` | `values` |
 | `interval` | `Intervals(Buf[Ival])` | `values`, 16 octets |
 | `uuid` | `Uuids(Buf[u128])` | `values` (RFC 9562 order on the wire) |
@@ -505,8 +505,9 @@ conflict check, and the columns `C` a read uses.
 ## 6. Where the survey's sysl gaps cost speed
 
 The survey (`docs/phase0/sysl-survey/FINDINGS.md`, row 6) found no SIMD mask → bits, no gather and
-no compress. Every kernel is a plain loop the compiler may auto-vectorise; these are the ones the
-gaps hold back:
+no compress; sysl 0.13.5 has `mask.bits()`, `gather`, `compress` and `table.lookup`, and `hash64` and `crc32c`
+(see its 0.13.5 status), so the gaps named in this document are now closed in sysl and open only in this code. Every
+kernel is a plain loop the compiler may auto-vectorise; these are the ones the gaps held back:
 
 - **mask → bits**: building a validity bitmap from a kernel's per-row result (every comparison,
   `is_null`, `Field` of a nullable record); `Filter`'s row list.
