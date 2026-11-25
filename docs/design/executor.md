@@ -27,7 +27,7 @@ node, with each buffer held as a typed `Buf` instead of raw octets:
 | `int8` … `int64`, `uint8` … `uint64` | `I8s` … `I64s`, `U8s` … `U64s` | `values` |
 | `int128`, `decimal(p, s)` | `I128s` (a decimal's unscaled value) | `values` |
 | `date` | `I32s` (days) | `values` |
-| `time`, `datetime`, `timestamp` | `I64s` (microseconds) | `values` |
+| `time`, `timestamp` (`datetime`), `timestamptz` | `I64s` (microseconds) | `values` |
 | `float32`, `float64` | `F32s`, `F64s` | `values` |
 | `interval` | `Intervals(Buf[Ival])` | `values`, 16 octets |
 | `uuid` | `Uuids(Buf[u128])` | `values` (RFC 9562 order on the wire) |

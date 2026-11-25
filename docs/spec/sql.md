@@ -94,9 +94,23 @@ other character outside a string, identifier or comment (`^ & | ! ? [ ] { } : @ 
 ### 2.5 Typed constants
 
 `type 'text'`, a type name of §4 followed by a string constant, is a constant of that type read from its text form
-([QT] §3.5): `DATE '2024-02-29'`, `TIMESTAMP '2024-01-01T00:00:00Z'`, `INTERVAL 'P1D'`, `UUID '…'`. The text forms are the tree's, not
-PostgreSQL's: an interval is written `P1D`, not `1 day`. It is
-`Literal(type, value)`. A text that is not a value of the type is `Q8004`, at the type name.
+([QT] §3.5): `DATE '2024-02-29'`, `TIMESTAMP '2024-01-01 09:00:00'`, `INTERVAL 'P1D'`, `UUID '…'`. The text forms are the tree's, not
+PostgreSQL's: an unqualified interval is written `P1D`, not `1 day`. It is
+`Literal(type, value)`. A text that is not a value of the type is `Q8004`, at the type name. These follow ISO/IEC
+9075-2 §5.3 `<literal>`:
+
+1. A `TIME` or `TIMESTAMP` literal whose text ends in an offset (`±HH:MM`) or `Z` is `WITH TIME ZONE`:
+   `TIMESTAMP '2024-01-01T00:00:00Z'` is a `timestamptz`, `TIMESTAMP '2024-01-01 00:00:00'` a `timestamp`. Its
+   precision is the number of fraction digits written (`TIME '10:00:00.25'` is a `time(2)`).
+2. `INTERVAL 'text' qualifier` reads ISO's interval string for the qualifier ([QT] §2.12): `'[-]Y-M'` for `YEAR
+   TO MONTH`, `'[-]D H:M:S.F'` for `DAY TO SECOND`, the fields the qualifier names and no others, the leading one
+   at most its precision's digits (`INTERVAL '100' DAY(3)`). The qualifier's leading precision defaults to 9.
+3. `X'…'` (an even number of hexadecimal digits, white space between pairs allowed) is a `bytes` constant, as ISO
+   reads it (PostgreSQL reads it as a bit string); `B'…'` (binary digits) is a `varbit` constant.
+4. `N'…'` is a national character constant, the same as `'…'`. `U&'…'` reads `\XXXX` and `\+XXXXXX` escapes
+   (Unicode scalar values) and `\\`; `UESCAPE 'c'` names another escape character. A bad escape is `Q8003`.
+5. `ARRAY[e, …]` is `array_of(e, …)`, its elements typed as `CASE` results are (§5.9 rule 2); `ARRAY[]` needs a
+   cast. `MULTISET[e, …]` is a `bag` built from `Values`. `ROW(e, …)` is a `Record` with fields `f1`, `f2`, ….
 
 ### 2.6 Numbers
 
@@ -293,36 +307,72 @@ and `ALTER TABLE IF EXISTS` are `Q8005`.
 | SQL | Query-tree type |
 |---|---|
 | `bool`, `boolean` | `bool` |
-| `int8` | `int8` (8 bits: TernDB's name, **not** PostgreSQL's `bigint`) |
-| `int16`, `smallint` | `int16` |
-| `int32`, `int`, `integer` | `int32` |
+| `int8`, `tinyint`, `int1` | `int8` (8 bits: TernDB's name, **not** PostgreSQL's `bigint`; rule 2) |
+| `int2`, `int16`, `smallint` | `int16` |
+| `int4`, `int32`, `int`, `integer` | `int32` |
 | `int64`, `bigint` | `int64` |
 | `int128` | `int128` |
 | `uint8`, `uint16`, `uint32`, `uint64` | the unsigned integers |
-| `decimal(p)`, `decimal(p, s)`, `numeric(…)` | `decimal(p, s)`, `s` 0 when absent; outside `1 ≤ p ≤ 38`, `0 ≤ s ≤ p` is `Q8006` |
-| `float32`, `real` | `float32` |
-| `float64`, `float`, `double precision`, `double` | `float64` |
-| `text` | `text` |
-| `bytes`, `bytea` | `bytes` |
-| `json` | `json` |
+| `decimal(p)`, `decimal(p, s)`, `numeric(…)`, `dec(…)` | `decimal(p, s)`, `s` 0 when absent; outside `1 ≤ p ≤ 1000`, `0 ≤ s ≤ p` is `Q8006` |
+| `numeric`, `decimal`, `dec` without a precision | `numeric` |
+| `decfloat`, `decfloat(p)` | `decfloat(16)` for `p ≤ 16`, else `decfloat(34)`; `decfloat` alone is `decfloat(34)`; `p` outside 1–34 is `Q8006` |
+| `float32`, `real`, `float4` | `float32` |
+| `float64`, `float`, `double precision`, `double`, `float8` | `float64` |
+| `float(p)` | `float32` for `1 ≤ p ≤ 24`, `float64` for `25 ≤ p ≤ 53`, else `Q8006` |
+| `money` | `money` |
+| `text`; `varchar`, `character varying`, `clob`, `character large object`, `nclob`, `national character large object` without a length | `text` |
+| `varchar(n)`, `character varying(n)`, `char varying(n)`, `nvarchar(n)`, `national character varying(n)`, `nchar varying(n)`, `clob(n)` and the other large-object spellings with a length | `varchar(n)` |
+| `char(n)`, `character(n)`, `nchar(n)`, `national character(n)`, `bpchar(n)`; without `(n)`, `n` is 1 | `char(n)` |
+| `bytes`, `bytea`, `blob`, `binary large object` without a length | `bytes` |
+| `varbinary(n)`, `binary varying(n)`, `blob(n)` | `varbinary(n)` |
+| `binary(n)`; `binary` is `binary(1)` | `binary(n)` |
+| `json`, `jsonb`, `xml`, `uuid`, `inet`, `cidr`, `macaddr`, `macaddr8` | the type of that name |
 | `date` | `date` |
-| `time`, `time without time zone` | `time` |
-| `datetime`, `timestamp without time zone` | `datetime` |
-| `timestamp`, `timestamptz`, `timestamp with time zone` | `timestamp` |
+| `time(p)`, `time(p) without time zone`; `time` | `time(p)`; `time` |
+| `time(p) with time zone`, `timetz(p)`; without `(p)` | `timetz(p)`; `timetz(6)` |
+| `timestamp(p)`, `timestamp(p) without time zone`, `datetime`; without `(p)` | `timestamp(p)`; `timestamp` |
+| `timestamp(p) with time zone`, `timestamptz(p)`; without `(p)` | `timestamptz(p)`; `timestamptz` |
 | `interval` | `interval` |
-| `uuid` | `uuid` |
+| `interval` *qualifier*, e.g. `interval year to month`, `interval day(3) to second(2)` | `interval_ym(q, l)` or `interval_dt(q, l, p)`; `l` defaults to 9, `p` to 6 |
+| `bit(n)`; `bit` is `bit(1)` | `bit(n)` |
+| `bit varying(n)`, `varbit(n)`; without `(n)` | `varbit(n)`; unbounded |
+| `T array[m]`; `T array` | `array<T?, m>`; `array<T?>` |
+| `T[]`, `T[m]`, `T[][]` | `array<T?>`, as PostgreSQL ignores the size; `T[][]` is `array<array<T?>?>` |
+| `T multiset` | `bag<T?>` |
+| `row(f T, …)` | `{f: T?, …}` |
+| `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange`, and each with `multirange` in place of `range` | `range<int32>` … `range<date>`, `multirange<…>` |
+| a name the resolver reports as a catalog type (§1 rule 4) | its reference ([QT] §12.3 kinds 32–34) |
 
-1. `decimal` and `numeric` without a precision are `Q8006`: TernDB has no arbitrary-precision decimal ([QT] §2.1
-   rule 1). `varchar`, `char` and `character` are `Q8006` (a length limit is a `CHECK`); a modifier on any other
-   type (`timestamp(3)`), `time with time zone` and an unknown name are `Q8006`; array types are `Q8005`.
-2. `int2`, `int4`, `float4`, `float8` and `jsonb` are not type names. `double` alone is `double precision`
-   (Q76), so `double` followed by `precision` is one type name: `x::double precision` is a cast, never a cast
-   to `double` with an output name `precision`.
+1. A precision outside 0–6, a zero length, or a length past 2³¹ − 1 is `Q8006`. A large-object length may end in
+   `K`, `M` or `G` (×1024, ×1024², ×1024³). `CHARACTER SET` is accepted only as `UTF8`, `UTF-8`, `SQL_TEXT` or
+   `UCS` (every string is UTF-8, [QT] §2.8); another name is `Q8006`. A `COLLATE` clause after a column's type is
+   its collation ([DDL] §2.3 rule 4). `time` without a precision is precision 6, as PostgreSQL makes it; ISO's
+   default for `TIME` is 0.
+2. **`int8` is TernDB's 8-bit integer, not PostgreSQL's `bigint`** (the user's decision, Q81); `tinyint` and
+   `int1` are further names of it. PostgreSQL's other numbered names (`int2`, `int4`, `float4`, `float8`) are
+   accepted, since they mean the same in both dialects; `int8range` keeps PostgreSQL's meaning, `range<int64>`,
+   because it is a name of its own. `double` alone is `double precision` (Q76), so `double` followed by
+   `precision` is one type name: `x::double precision` is a cast, never a cast to `double` with an output name
+   `precision`.
    *Rationale: the dialect is TernDB's own, and its type names are the tree's. PostgreSQL's `int8` is a 64-bit
-   integer and TernDB's an 8-bit one; accepting PostgreSQL's numbered names beside it would make `int8` mean the
-   one thing in a dialect that otherwise reads like the other. `timestamp` names the instant, as in the tree,
-   because `datetime` exists for the reading without a zone.*
-3. Records, unions, relation types and named types have no SQL spelling in this version.
+   integer and TernDB's an 8-bit one; TernDB keeps its own, as the tree's bit-width names (`int8` … `int128`)
+   read, and a PostgreSQL schema that writes `int8` is translated by the compatibility layer, which knows the
+   type by its OID, not its name.*
+3. `timestamp` is the standard's zoneless type and `timestamptz` the instant (Q79); `datetime` remains a name of
+   the zoneless type.
+4. Unions other than enums and relation types other than multisets still have no SQL spelling.
+
+### 4.2 Collations
+
+A character string expression has a collation and a **derivation**, as ISO/IEC 9075-2 and PostgreSQL 17 §24.2.1
+define them: a column reference is **implicit** with its column's collation; `x COLLATE c` is **explicit**; a
+constant or parameter is **default** (`ucs_basic`). An operator's or function's string result, and a comparison,
+takes the explicit collation of its operands (two different explicit ones are `Q8014`), else their common implicit
+one (two different implicit ones make the result **indeterminate**), else the default. A comparison, `LIKE`,
+`ORDER BY` key, `GROUP BY` key, `DISTINCT` or set operation whose collation is indeterminate is `Q8014`. The
+front end writes the collation it decided on each of these ([QT] §2.21 rule 2), and writes none for `ucs_basic`.
+An unknown name is `Q3021`. Without a resolver (§1 rule 4) a column's collation is unknown and taken as
+`ucs_basic`.
 
 ## 5. Queries and expressions
 
@@ -529,6 +579,17 @@ the aggregates of §5.5; `now()` and `current_timestamp` (no parentheses), which
 `coalesce`, whose constants are typed by §5.9. `DISTINCT`, `ORDER BY` and `FILTER` on a function that is not an
 aggregate are `Q8001`. A schema-qualified function name, `OVER` (window functions) and `WITHIN GROUP` are `Q8005`.
 
+The datetime keywords of ISO/IEC 9075-2 read the front end's **session time zone** (`UTC` unless the caller sets
+one) and pass it as the zone argument ([QT] §2.11 rule 7), so the tree stays free of session state:
+`current_date`, `current_time[(p)]`, `localtime[(p)]` and `localtimestamp[(p)]` are `current_date(zone)`,
+`current_time(p, zone)`, `localtime(p, zone)`, `localtimestamp(p, zone)`; `current_timestamp(p)` is
+`current_timestamp(p)`. `x AT TIME ZONE z` is `at_zone(x, z)` for a `timestamptz` or `timetz` `x` and
+`from_zone(x, z)` for a `timestamp`; `x AT LOCAL` uses the session zone. The ISO forms `EXTRACT(f FROM x)`,
+`POSITION(s IN t)`, `SUBSTRING(s FROM i FOR n)`, `OVERLAY(s PLACING r FROM i FOR n)`, `TRIM([LEADING | TRAILING |
+BOTH] [c] FROM s)`, `x IS [NOT] DOCUMENT`, `x IS [NOT] JSON …`, `x MEMBER OF m`, `m SUBMULTISET OF n`, `m IS A SET`,
+`CARDINALITY(a)`, `UNNEST(a)`, `TREAT(x AS t)`, `x IS OF (t)` and `NEW t(…)` are the [QT] §2.8–§2.20 functions of
+those names; each is `Q8005` until its plan item (`docs/design/sql-types-plan.md`) lands.
+
 ### 5.11 Set operations and WITH
 
 1. `UNION`, `INTERSECT` and `EXCEPT` are `SetOp(op, all, select, inputs)` ([QT] §6.12); `INTERSECT` binds tighter.
@@ -603,3 +664,7 @@ Each of these is refused with `Q8005` (or `Q8006` for a type), so a script that 
 
 These are features the tree or engine has (or will have) that the dialect does not spell yet; none needs a change
 to the tree to add.
+
+The types of §4.1, the constants of §2.5 and the ISO forms of §5.10 are specified, and arrive item by item as
+`docs/design/sql-types-plan.md` orders them; a type name whose item has not landed is `Q8006`, and an array or row
+constructor, `ROW(…)` or one of those ISO forms is `Q8005`, as this list says, until then.
