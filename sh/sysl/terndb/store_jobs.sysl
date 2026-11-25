@@ -6,9 +6,10 @@ import sysl.slices.sort_by
 // The jobs a DDL statement starts (`ddl.md` §7), as the in-memory store runs them. A job runs to its
 // end right after the commit that started it, before that commit returns, as one batch whose
 // internal transaction commits under a number of its own: the store is single-threaded, so no
-// statement of another transaction runs while a job does (Q71). The kind it runs is `build_index`
-// (§8.9), for a created index and for the index of a `unique` constraint being validated (§8.7);
-// the other kinds do not run yet (`docs/design/engine.md`).
+// statement of another transaction runs while a job does (Q71). The kinds it runs are `build_index`
+// (§8.9), for a created index and for the index of a `unique` constraint being validated (§8.7), and
+// `convert_column` (§8.5 rule 2), for a column left `converting`; the other kinds do not run yet
+// (`docs/design/engine.md`).
 
 /** How a job ended (`ddl.md` §3.2 rule 4): it succeeded, or failed with an error code and message. */
 enum JobEnd derives Eq
@@ -39,8 +40,10 @@ impl Store
 
     /** Runs the jobs the commit of transaction `txid` started (`ddl.md` §7 rule 1): a `build_index`
      * for every index of the newest committed catalog that is `building` and backs no constraint,
-     * and for the index of every `unique` constraint whose validation is due (§8.7). A constraint
-     * added with `defer_validation` is not due, and its index stays `building`.
+     * and for the index of every `unique` constraint whose validation is due (§8.7); then a
+     * `convert_column` for every column that is `converting`, except a primary-key column, whose
+     * retype is a table rebuild (§8.11) that does not run yet. A constraint added with
+     * `defer_validation` is not due, and its index stays `building`.
      */
     private[terndb] run_jobs(*self, txid: u64)
         val c = self.latest_catalog()
@@ -57,7 +60,102 @@ impl Store
 
         for oid in due
             self.build_index(txid, oid)
+
+        val tables = buf[u64]()
+        val columns = buf[u32]()
+
+        for t in self.latest_catalog().tables
+            for col in t.columns
+                if col.state == ColumnConverting && !contains_u32(t.primary_key, col.id)
+                    tables.push(t.oid)
+                    columns.push(col.id)
+
+        for n in 0..<tables.len()
+            self.convert_column(txid, tables[n], columns[n])
     end run_jobs
+
+    /** The `convert_column` job of column `id` of table `oid` (`ddl.md` §8.5 rule 2, step 2), in an
+     * internal read committed transaction whose snapshot is the newest commit. It proves the
+     * column's guard — that its recorded conversion succeeds — on every row that snapshot sees, by
+     * translating each through the schema version its final transaction would add, and checks that
+     * the table's unique keys still hold no value twice once the column is converted, which is the
+     * build of their replacements (§8.9). Its final transaction then adds that version, with the
+     * column `ready` in its target type, and every later read converts an older row by the recorded
+     * conversion (§5.3); a row is not rewritten. On failure — a conversion's error (`R0006`,
+     * `R0001`, ...), whose message names the row's key, or `unique_violation` — the final transaction
+     * instead returns the column to `ready` in its old type. A column dropped before the job runs
+     * leaves it nothing to do, and it records nothing (§8.3).
+     */
+    private convert_column(*self, txid: u64, oid: u64, id: u32)
+        val before = self.latest_catalog()
+
+        val ti = before.table_by_oid(oid) match
+            Some(i) -> i
+            None -> return
+
+        var converting = false
+
+        for c in before.tables[ti].columns
+            if c.id == id && c.state == ColumnConverting then converting = true
+
+        if !converting then return
+        val j = self.begin(ReadCommitted)
+        j.snapshot = self.horizon
+        var done = before.clone()
+        var end = JobSucceeded
+        var checked = done.end_conversion(ti, id, true)
+        if checked.is_ok() then checked = self.conversion_holds(j, done, oid)
+
+        if checked.is_err()
+            val e = checked.unwrap_err()
+            end = JobFailed(e.code, e.message)
+            done = before.clone()
+            val _ = done.end_conversion(ti, id, false)
+
+        self.install(before, false)
+        val c = self.rows.commit(j.id).unwrap()
+        self.publish_job(before, done, c)
+        self.horizon = c
+        j.state = CommittedAt(c)
+        self.retire(j)
+        self.jobs.push(JobRecord(u64(self.jobs.len()) + 1, txid, "convert_column", oid, end))
+    end convert_column
+
+    // Whether table `oid`'s rows visible to job `j` read in `after`, the catalog with the column's
+    // conversion complete: each translates (the guard), and no unique key of the table holds one
+    // value twice. The error of the first row that does not translate names its key.
+    private conversion_holds(*self, j: &Txn, after: MemCatalog, oid: u64) -> Result[unit, CodecError]
+        self.install(after, false)
+        val d = self.table_data(oid)?
+        val keys = buf[Value]()
+        val rows = buf[StoredRow]()
+
+        for s in self.slots_of(d)?
+            self.visible(d, s, j.snapshot, j.id)? match
+                Some(r) ->
+                    keys.push(s.key)
+                    rows.push(r)
+                None -> ()
+
+        val t = after.tables[after.table_by_oid(oid).unwrap()]
+
+        val all = translated_rows(after, t, rows)
+
+        if all.is_err()
+            for n in 0..<rows.len()
+                self.converted(oid, rows[n]) match
+                    Ok(_) -> ()
+                    Err(e) -> return fail(e.code, s"the conversion fails on the row keyed (${key_text(d.key_type, keys[n])}): ${e.message}")
+
+            return Err(all.unwrap_err())
+
+        self.sync_uniques(d)?
+
+        for ix in d.uniques
+            self.unique_holds(j, d, ix)?
+
+        Ok(())
+    end conversion_holds
 
     /** The `build_index` job of index `oid` (`ddl.md` §8.9), in an internal read committed
      * transaction whose snapshot is the newest commit. The index's entries are those of every row
@@ -81,7 +179,7 @@ impl Store
             Ok(_) -> JobSucceeded
             Err(e) -> JobFailed(e.code, e.message)
 
-        var m = before
+        var m = before.clone()
         val i = m.index_by_oid(oid).unwrap()
 
         val k = m.constraint_by_oid(x.constraint) match
@@ -124,7 +222,12 @@ impl Store
             if d.uniques[n].oid == x.oid then at = n
 
         if at == d.uniques.len() then return Ok(())
-        val ix = d.uniques[at]
+        self.unique_holds(j, d, d.uniques[at])
+    end index_duplicates
+
+    // Whether the rows visible to job `j` hold two equal entries of unique key `ix` of `d`:
+    // `unique_violation` if so.
+    private unique_holds(*self, j: &Txn, d: &TableData, ix: &UniqueIx) -> Result[unit, CodecError]
         val rows = buf[StoredRow]()
 
         for s in self.slots_of(d)?
@@ -147,10 +250,32 @@ impl Store
 
         while n < held.len()
             if cmp(ty, held[n - 1], held[n]) == 0
-                return fail("T3001", s"two rows hold the same value of unique index '${x.name}'")
+                return fail("T3001", s"two rows hold the same value of unique index '${ix.name}'")
 
             n += 1
 
         Ok(())
-    end index_duplicates
+    end unique_holds
 end Store
+
+/** A primary key `key`, a record of type `ty`, as the text form of each component, comma-separated. */
+private key_text(ty: Type, key: Value) -> string
+    val fs = ty match
+        Record(fs) -> fs
+        _ -> return ""
+
+    val vs = key match
+        Record(vs) -> vs
+        _ -> return ""
+
+    var out = ""
+
+    for i in 0..<vs.len()
+        if i > 0 then out = out + ", "
+        val t = if i < fs.len() then to_text(fs[i].ty, vs[i]) else to_text(Text, vs[i])
+
+        out = out + (t match
+            Ok(s) -> s
+            Err(_) -> "?")
+
+    out

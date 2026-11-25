@@ -52,10 +52,14 @@ struct CatColumn derives Eq
     target: Option[Type]
     using: Option[Expr]
 
-/** One schema version of a table (§5.1 rule 1): its number and its columns at that version. */
+/** One schema version of a table (§5.1 rule 1): its number, its columns at that version, and the ids
+ * of the columns whose conversion this version completes (§8.5 rule 2, step 2): a row of an older
+ * version reads each of them through the conversion recorded in the version before, not a cast.
+ */
 struct SchemaVersion derives Eq
     number: u64
     columns: Buf[CatColumn]
+    completes: Buf[u32]
 
 /** A table (§2.2): its columns in ordinal order, its primary key by column id, the next column id
  * to hand out, and every schema version it has had, the current one last.

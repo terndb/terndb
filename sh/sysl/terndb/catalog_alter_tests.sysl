@@ -64,7 +64,7 @@ a_statement_that_changes_only_constraints_keeps_the_schema_version()
 @test
 the_sixty_five_thousand_five_hundred_thirty_sixth_version_is_refused()
     var c = cat_base()
-    c.tables[c.table_at(cat_q("t")).unwrap()].versions.push(SchemaVersion(65535, cat_table_of(c, "t").columns.copy()))
+    c.tables[c.table_at(cat_q("t")).unwrap()].versions.push(SchemaVersion(65535, cat_table_of(c, "t").columns.copy(), buf[u32]()))
     assert_eq(cat_code(c, cat_alter("t", [AddColumn(cat_col("n", nullable(Int64)))])), "Q6012")
     assert_eq(cat_code(c, cat_alter("t", [AddConstraint(cat_unique("t_b", ["b"]), false)])), "ok")
 
