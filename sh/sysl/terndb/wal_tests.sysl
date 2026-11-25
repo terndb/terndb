@@ -1,0 +1,1017 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.encoding.put_u16_le
+
+// The WAL writer and reader over the simulated directory (`wal.sysl`, `wal_reader.sysl`,
+// `on-disk-format.md` §6.2–§6.9, §9 D6, D12, D14). Segments here are 64 KiB (`wt_cfg`): a header
+// block and fifteen record blocks, so rollover and recycling take a few records rather than 64 MiB.
+
+/** The test log: 64 KiB segments on timeline 1. */
+wt_cfg() -> WalConfig = wal_config_sized(ws_uuid().view(), 1, 16)
+
+/** The size of a test segment. */
+const WtSeg: u64 = 65536
+
+/** A 64-byte commit record of transaction `txn`. */
+wt_commit(txn: u64) -> WalRecord = wal_record(txn, WbTxnCommit(i64(txn), txn, txn, 0))
+
+/** An overflow write of `n` payload bytes: 52 + `n` bytes, rounded up to 8. */
+wt_overflow(txn: u64, n: usize) -> WalRecord = wal_record(txn, WbOverflowWrite(txn, 0, wr_bytes(n, u8(txn % 200))))
+
+/** A record exactly one 4 KiB block long. */
+wt_block(txn: u64) -> WalRecord = wt_overflow(txn, 4044)
+
+/** A new log in a new simulated directory. */
+wt_new(seed: u64) -> (&SimWalDir, &Wal)
+    val d = sim_wal_dir(seed)
+    (d, wal_create(d, wt_cfg()).unwrap())
+
+/** Every record of the log from its first, to its end. */
+wt_read(d: &WalDir) -> Buf[WalRecord] = wal_reader(d, wt_cfg(), WalFirstLsn, 0).rest().unwrap()
+
+/** The transactions of `recs`, in order. */
+wt_txns(recs: Buf[WalRecord]) -> Buf[u64]
+    val out = buf[u64]()
+
+    for r in recs
+        out.push(r.txn)
+
+    out
+
+/** The simulated device of segment `k` of the test log. */
+wt_seg(d: &SimWalDir, k: u64) -> &SimDisk = d.disk(wal_segment_name(1, k * WtSeg)).unwrap()
+
+/** The process dies with every cache resolved as `keep` says; the log is opened again. */
+wt_crash_reopen(d: &SimWalDir, keep: CrashKeep) -> &Wal
+    d.crash(keep)
+    d.restart()
+    wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+
+/** `rec` as the log holds it: at `lsn` with `flags`. */
+wt_at(rec: WalRecord, lsn: u64, flags: u8) -> WalRecord = WalRecord(lsn, rec.txn, flags, rec.undo_next, rec.body)
+
+/** Fills what is left of the current segment with block-sized records numbered from `txn`. */
+wt_fill(w: &Wal, txn: u64) -> u64
+    w.append(wt_block(txn)).unwrap()
+    var t = txn + 1
+
+    while wal_segment_offset(w.end_lsn(), 16) != WalSegmentHeaderSize
+        w.append(wt_block(t)).unwrap()
+        t += 1
+
+    t
+
+// -- a new log -------------------------------------------------------------------------------------
+
+@test
+a_new_log_has_one_segment_named_for_lsn_0()
+    val (d, w) = wt_new(1)
+    val names = d.list().unwrap()
+    assert_eq(names.len(), usize(1))
+    assert_eq(names[0], "00000001-0000000000000000.twal")
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+    assert_eq(w.end_lsn(), WalFirstLsn)
+
+@test
+a_new_segment_is_preallocated_whole_and_synced()
+    val (d, _) = wt_new(1)
+    val s = wt_seg(d, 0)
+    assert_eq(s.durable_count(), WtSeg / u64(DbPageSize))
+    assert_eq(s.unsynced(), usize(0))
+    assert_eq(wal_check_segment_header(s.durable_page(0).view()[0..<4096], wt_cfg(), 0), Ok(true))
+
+@test
+a_new_log_reads_as_empty()
+    val (d, _) = wt_new(1)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(r.next(), Ok(None))
+    assert_eq(r.end(), WalFirstLsn)
+    assert_eq(r.next(), Ok(None))
+
+@test
+an_empty_log_reopens_empty_and_takes_records_after()
+    val (d, _) = wt_new(1)
+    val w = wt_crash_reopen(d, KeepAll)
+    assert_eq(wt_read(d).len(), usize(0))
+    w.commit(wt_commit(1)).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+
+@test
+a_directory_with_no_segment_reads_as_empty()
+    val d = sim_wal_dir(1)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(r.next(), Ok(None))
+    assert_eq(r.end(), WalFirstLsn)
+
+@test
+a_directory_with_no_segment_short_of_must_reach_is_corruption()
+    val d = sim_wal_dir(1)
+    assert_eq(wr_code(wal_reader(d, wt_cfg(), WalFirstLsn, 8192).rest()), "D1001")
+
+@test
+creating_a_log_where_one_is_refuses()
+    val (d, _) = wt_new(1)
+    assert_eq(wr_code(wal_create(d, wt_cfg())), "D4003")
+
+@test
+a_log_of_another_timeline_beside_it_is_no_obstacle()
+    val d = sim_wal_dir(1)
+    wal_create(d, wt_cfg()).unwrap()
+    val other = wal_config_sized(ws_uuid().view(), 2, 16)
+    val w2 = wal_create(d, other).unwrap()
+    w2.commit(wt_commit(9)).unwrap()
+    assert_eq(wt_read(d).len(), usize(0))
+    assert_eq(wal_reader(d, other, WalFirstLsn, 0).rest().unwrap().len(), usize(1))
+
+// -- appending -------------------------------------------------------------------------------------
+
+@test
+the_first_record_goes_at_4096_and_the_next_where_it_ends()
+    val (_, w) = wt_new(1)
+    val a = w.append(wt_commit(1)).unwrap()
+    val b = w.append(wt_overflow(2, 10)).unwrap()
+    assert_eq(a, WalAppended(wr_buf([u64(4096)]), 4160))
+    assert_eq(b, WalAppended(wr_buf([u64(4160)]), 4160 + 64))
+    assert_eq(w.end_lsn(), u64(4224))
+
+@test
+an_append_is_not_durable_and_not_on_the_device_until_a_flush()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+    assert_eq(wt_read(d).len(), usize(0))
+    assert_eq(w.flushes(), u64(0))
+
+@test
+a_flush_makes_the_records_durable_and_readable()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    w.append(wt_commit(2)).unwrap()
+    w.flush().unwrap()
+    assert_eq(w.flushes(), u64(1))
+    assert_eq(wt_seg(d, 0).unsynced(), usize(0))
+    assert_eq(wt_read(d), wr_buf([wt_at(wt_commit(1), 4096, 0), wt_at(wt_commit(2), 4160, 0)]))
+
+@test
+a_commit_returns_once_its_record_is_durable()
+    val (d, w) = wt_new(1)
+    val a = w.commit(wt_commit(1)).unwrap()
+    assert(w.durable_lsn() >= a.end)
+    val again = wt_crash_reopen(d, KeepNone)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+
+@test
+a_flush_pads_to_the_block_boundary_and_the_pad_is_not_handed_out()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    assert_eq(w.durable_lsn(), u64(8192))
+    assert_eq(w.end_lsn(), u64(8192))
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(r.rest().unwrap().len(), usize(1))
+    assert_eq(r.end(), u64(8192))
+
+@test
+a_flush_ending_on_a_block_boundary_needs_no_pad()
+    val (_, w) = wt_new(1)
+    w.append(wt_block(1)).unwrap()
+    w.flush().unwrap()
+    assert_eq(w.durable_lsn(), u64(8192))
+
+@test
+a_flush_ending_less_than_a_header_before_the_boundary_pads_through_the_next_block()
+    val (d, w) = wt_new(1)
+    // 52 + 4020 = 4072 bytes: 24 left in the block, too few for a pad's header.
+    w.append(wt_overflow(1, 4020)).unwrap()
+    w.flush().unwrap()
+    assert_eq(w.durable_lsn(), u64(12288))
+    val a = w.commit(wt_commit(2)).unwrap()
+    assert_eq(a.lsns[0], u64(12288))
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_flush_ending_exactly_a_header_before_the_boundary_pads_with_an_empty_pad()
+    val (d, w) = wt_new(1)
+    // 52 + 4012 = 4064 bytes: 32 left, a pad of no payload.
+    w.append(wt_overflow(1, 4012)).unwrap()
+    w.flush().unwrap()
+    assert_eq(w.durable_lsn(), u64(8192))
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+
+@test
+the_next_flush_starts_in_a_fresh_block()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    val b = w.commit(wt_commit(2)).unwrap()
+    assert_eq(b.lsns[0], u64(8192))
+    assert_eq(w.durable_lsn(), u64(12288))
+    assert_eq(w.flushes(), u64(2))
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_flush_with_nothing_appended_does_no_io()
+    val (d, w) = wt_new(1)
+    val ops = wt_seg(d, 0).next_op()
+    w.flush().unwrap()
+    w.commit(wt_commit(1)).unwrap()
+    val after = wt_seg(d, 0).next_op()
+    w.flush().unwrap()
+    w.wait_durable(4096).unwrap()
+    assert_eq(wt_seg(d, 0).next_op(), after)
+    assert(after > ops)
+    assert_eq(w.flushes(), u64(1))
+
+@test
+waiting_past_the_end_waits_for_everything_appended()
+    val (_, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    w.wait_durable(0xffffffffffff).unwrap()
+    assert_eq(w.durable_lsn(), u64(8192))
+
+@test
+no_flush_rewrites_a_block_already_durable()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    // Spoil the durable block on the media: a later flush that wrote it again would mend it.
+    val s = wt_seg(d, 0)
+    val before = s.durable_page(0)[4096 + 40]
+    s.flip_bit(0, u64(4096 + 40) * 8)
+    w.commit(wt_commit(2)).unwrap()
+    w.commit(wt_commit(3)).unwrap()
+    assert(s.durable_page(0)[4096 + 40] != before)
+    assert_eq(s.durable_page(0)[8192 + 24], WkTxnCommit)
+
+// -- mini-transactions -------------------------------------------------------------------------------
+
+@test
+a_mini_transaction_s_records_are_contiguous_and_all_but_the_last_continue()
+    val (d, w) = wt_new(1)
+    val a = w.append_mtr(wr_buf([wt_commit(1), wt_overflow(2, 7), wt_commit(3)]).view()).unwrap()
+    assert_eq(a.lsns, wr_buf([u64(4096), u64(4160), u64(4224)]))
+    assert_eq(a.end, u64(4288))
+    w.flush().unwrap()
+    assert_eq(wt_read(d), wr_buf([wt_at(wt_commit(1), 4096, WalMtrCont), wt_at(wt_overflow(2, 7), 4160, WalMtrCont), wt_at(wt_commit(3), 4224, 0)]))
+
+@test
+the_mtr_cont_a_caller_sets_is_ignored()
+    val (d, w) = wt_new(1)
+    val c = WalRecord(77, 5, WalMtrCont, 0, WbNodeCompact(3))
+    w.append_mtr(wr_buf([c, c]).view()).unwrap()
+    w.flush().unwrap()
+    val got = wt_read(d)
+    assert_eq(got[0].flags, WalMtrCont)
+    assert_eq(got[1].flags, u8(0))
+    assert_eq(got[0].lsn, u64(4096))
+
+@test
+a_compensation_record_keeps_its_flag_and_undo_next_in_a_mini_transaction()
+    val (d, w) = wt_new(1)
+    val c = WalRecord(0, 5, WalCompensation, 0x1000000000000042, WbNodeDelete(3, 1))
+    w.append_mtr(wr_buf([c, c]).view()).unwrap()
+    w.flush().unwrap()
+    val got = wt_read(d)
+    assert_eq(got[0].flags, WalMtrCont | WalCompensation)
+    assert_eq(got[1].flags, WalCompensation)
+    assert_eq(got[1].undo_next, u64(0x1000000000000042))
+
+@test
+a_one_record_mini_transaction_has_no_mtr_cont()
+    val (d, w) = wt_new(1)
+    w.append_mtr(wr_buf([wt_commit(1)]).view()).unwrap()
+    w.flush().unwrap()
+    assert_eq(wt_read(d)[0].flags, u8(0))
+
+@test
+an_empty_mini_transaction_is_refused()
+    val (_, w) = wt_new(1)
+    assert_eq(wr_code(w.append_mtr(buf[WalRecord]().view())), "D2003")
+    assert_eq(w.end_lsn(), WalFirstLsn)
+
+@test
+a_pad_from_the_caller_is_refused()
+    val (_, w) = wt_new(1)
+    assert_eq(wr_code(w.append(wal_record(0, WbPad(8)))), "D2003")
+    assert_eq(wr_code(w.append_mtr(wr_buf([wt_commit(1), wal_record(0, WbPad(0))]).view())), "D2003")
+    assert_eq(w.end_lsn(), WalFirstLsn)
+
+@test
+a_record_the_encoder_refuses_leaves_the_log_as_it_was()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    assert_eq(wr_code(w.append_mtr(wr_buf([wt_commit(2), wal_record(0, WbFpi(1, 9, buf[u8]()))]).view())), "D2003")
+    w.flush().unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+
+@test
+a_mini_transaction_that_does_not_fit_the_segment_starts_the_next_after_a_pad()
+    val (d, w) = wt_new(1)
+    // 52 + 61284 = 61336 bytes: 104 left in segment 0, too few for two 64-byte commits.
+    w.append(wt_overflow(1, 61284)).unwrap()
+    assert_eq(w.end_lsn(), WtSeg - 104)
+    val a = w.append_mtr(wr_buf([wt_commit(2), wt_commit(3)]).view()).unwrap()
+    assert_eq(a.lsns, wr_buf([WtSeg + 4096, WtSeg + 4160]))
+    w.flush().unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2), u64(3)]))
+
+@test
+a_mini_transaction_that_just_fits_stays_in_the_segment()
+    val (d, w) = wt_new(1)
+    w.append(wt_overflow(1, 61284)).unwrap()
+    // 104 bytes left: a 64-byte commit and a 40-byte undo truncate fill them exactly.
+    val a = w.append_mtr(wr_buf([wt_commit(2), wal_record(3, WbUndoTruncate(5))]).view()).unwrap()
+    assert_eq(a.lsns, wr_buf([WtSeg - 104, WtSeg - 40]))
+    assert_eq(a.end, WtSeg)
+    assert_eq(w.end_lsn(), WtSeg + 4096)
+    w.flush().unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2), u64(3)]))
+
+@test
+a_record_never_spans_segments()
+    val (d, w) = wt_new(1)
+    w.append(wt_overflow(1, 61284)).unwrap()
+    val a = w.append(wt_overflow(2, 100)).unwrap()
+    assert_eq(a.lsns[0], WtSeg + 4096)
+    w.flush().unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_record_that_ends_at_the_segment_s_end_is_followed_past_the_next_header()
+    val (d, w) = wt_new(1)
+    w.append(wt_overflow(1, 61388)).unwrap()
+    assert_eq(w.end_lsn(), WtSeg + 4096)
+    assert_eq(w.append(wt_commit(2)).unwrap().lsns[0], WtSeg + 4096)
+    w.flush().unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_record_that_leaves_less_than_a_header_at_the_segment_s_end_is_followed_in_the_next()
+    val (d, w) = wt_new(1)
+    // 52 + 61364 = 61416 bytes: 24 bytes left at the end of segment 0, left as zeros.
+    w.append(wt_overflow(1, 61364)).unwrap()
+    assert_eq(w.end_lsn(), WtSeg + 4096)
+    w.commit(wt_commit(2)).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+the_largest_record_fills_a_segment_of_its_own()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    val big = wt_overflow(2, 61388)
+    val a = w.append(big).unwrap()
+    assert_eq(a.lsns[0], WtSeg + 4096)
+    assert_eq(a.end, 2 * WtSeg)
+    w.commit(wt_commit(3)).unwrap()
+    val got = wt_read(d)
+    assert_eq(got.len(), usize(3))
+    assert_eq(got[1], wt_at(big, WtSeg + 4096, 0))
+    assert_eq(got[2].lsn, 2 * WtSeg + 4096)
+
+@test
+a_record_longer_than_a_segment_holds_is_refused()
+    val (d, w) = wt_new(1)
+    assert_eq(wr_code(w.append(wt_overflow(1, 61389))), "D2003")
+    assert_eq(w.end_lsn(), WalFirstLsn)
+    w.commit(wt_commit(2)).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(2)]))
+
+@test
+a_mini_transaction_longer_than_a_segment_holds_is_refused()
+    val (_, w) = wt_new(1)
+    assert_eq(wr_code(w.append_mtr(wr_buf([wt_overflow(1, 30000), wt_overflow(2, 31400)]).view())), "D2003")
+    assert_eq(w.end_lsn(), WalFirstLsn)
+
+@test
+a_timeline_switch_names_the_lsn_it_was_given()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    val a = w.commit(wal_record(0, WbTimelineSwitch(1, 2, 7, wr_bytes(16, 3)))).unwrap()
+    val got = wt_read(d)
+    assert_eq(got[1], WalRecord(a.lsns[0], 0, 0, 0, WbTimelineSwitch(1, 2, 7, wr_bytes(16, 3))))
+
+@test
+the_lsn_a_caller_gives_is_ignored()
+    val (d, w) = wt_new(1)
+    w.commit(WalRecord(0xdead, 1, 0, 0, WbTxnAbort)).unwrap()
+    assert_eq(wt_read(d)[0].lsn, WalFirstLsn)
+
+// -- segments: rollover, chaining, recycling --------------------------------------------------------
+
+@test
+the_log_rolls_over_into_new_segments_named_for_their_first_lsn()
+    val (d, w) = wt_new(1)
+    val t = wt_fill(w, 1)
+    val t2 = wt_fill(w, t)
+    w.commit(wt_commit(100)).unwrap()
+    assert_eq(t, u64(16))
+    assert_eq(t2, u64(31))
+    assert(d.has("00000001-0000000000000000.twal").unwrap())
+    assert(d.has("00000001-0000000000010000.twal").unwrap())
+    assert(d.has("00000001-0000000000020000.twal").unwrap())
+    assert_eq(d.list().unwrap().len(), usize(3))
+    val got = wt_read(d)
+    assert_eq(got.len(), usize(31))
+    assert_eq(got[15].lsn, WtSeg + 4096)
+    assert_eq(got[30].lsn, 2 * WtSeg + 4096)
+
+@test
+each_segment_names_the_previous_one_s_header_crc()
+    val (d, w) = wt_new(1)
+    wt_fill(w, 1)
+    w.commit(wt_commit(100)).unwrap()
+    val h0 = wt_seg(d, 0).durable_page(0)
+    val h1 = wt_seg(d, 1).durable_page(0)
+    assert_eq(get_u64(h0, 48), u64(0))
+    assert_eq(get_u64(h1, 48), u64(wal_header_crc(h0.view())))
+    assert_eq(wal_check_segment_header(h1.view()[0..<4096], wt_cfg(), WtSeg), Ok(true))
+
+/** The u64 at `at` of `b`. */
+private get_u64(b: Buf[u8], at: usize) -> u64
+    var v: u64 = 0
+
+    for i in 0..<8
+        v = v | (u64(b[at + i]) << u64(8 * i))
+
+    v
+
+@test
+a_segment_created_during_a_flush_is_preallocated_and_synced()
+    val (d, w) = wt_new(1)
+    wt_fill(w, 1)
+    w.commit(wt_commit(100)).unwrap()
+    assert_eq(wt_seg(d, 1).durable_count(), WtSeg / u64(DbPageSize))
+    assert_eq(wt_seg(d, 1).unsynced(), usize(0))
+
+@test
+recycling_renames_the_segments_below_the_bound_past_the_last()
+    val (d, w) = wt_new(1)
+    var t = wt_fill(w, 1)
+    t = wt_fill(w, t)
+    t = wt_fill(w, t)
+    w.flush().unwrap()
+    assert_eq(w.recycle(2 * WtSeg), Ok(u64(2)))
+    assert(!d.has(wal_segment_name(1, 0)).unwrap())
+    assert(!d.has(wal_segment_name(1, WtSeg)).unwrap())
+    assert(d.has(wal_segment_name(1, 2 * WtSeg)).unwrap())
+    assert(d.has(wal_segment_name(1, 3 * WtSeg)).unwrap())
+    assert(d.has(wal_segment_name(1, 4 * WtSeg)).unwrap())
+    val got = wal_reader(d, wt_cfg(), 2 * WtSeg + 4096, 0).rest().unwrap()
+    assert_eq(got.len(), usize(15))
+
+@test
+a_recycled_segment_s_stale_records_are_not_read_as_the_log_s()
+    val (d, w) = wt_new(1)
+    var t = wt_fill(w, 1)
+    t = wt_fill(w, t)
+    t = wt_fill(w, t)
+    w.flush().unwrap()
+    w.recycle(2 * WtSeg).unwrap()
+    // Segment 3 is segment 0's file: every block of it holds a stale record whose CRC holds.
+    w.commit(wt_commit(500)).unwrap()
+    val from = 2 * WtSeg + 4096
+    val r = wal_reader(d, wt_cfg(), from, 0)
+    val got = r.rest().unwrap()
+    assert_eq(got.len(), usize(16))
+    assert_eq(got[15], wt_at(wt_commit(500), 3 * WtSeg + 4096, 0))
+    assert_eq(r.end(), 3 * WtSeg + 8192)
+
+@test
+a_recycled_segment_the_log_has_not_reached_counts_as_missing()
+    val (d, w) = wt_new(1)
+    var t = wt_fill(w, 1)
+    t = wt_fill(w, t)
+    w.commit(wt_commit(7)).unwrap()
+    w.recycle(WtSeg).unwrap()
+    // Segment 0's file is now segment 3's name, its header still segment 0's.
+    assert(d.has(wal_segment_name(1, 3 * WtSeg)).unwrap())
+    val r = wal_reader(d, wt_cfg(), WtSeg + 4096, 0)
+    assert_eq(r.rest().unwrap().len(), usize(16))
+    assert_eq(r.end(), 2 * WtSeg + 8192)
+
+@test
+a_taken_over_spare_is_written_its_own_header()
+    val (d, w) = wt_new(1)
+    var t = wt_fill(w, 1)
+    t = wt_fill(w, t)
+    w.flush().unwrap()
+    w.recycle(WtSeg).unwrap()
+    // Segment 0's file now bears segment 2's name; the next commit goes into it.
+    w.commit(wt_commit(9)).unwrap()
+    val h = wt_seg(d, 2).durable_page(0)
+    assert_eq(wal_check_segment_header(h.view()[0..<4096], wt_cfg(), 2 * WtSeg), Ok(true))
+    assert_eq(get_u64(h, 48), u64(wal_header_crc(wt_seg(d, 1).durable_page(0).view())))
+    assert_eq(wt_txns(wal_reader(d, wt_cfg(), WtSeg + 4096, 0).rest().unwrap()).len(), usize(16))
+
+@test
+recycling_spares_the_segment_being_written_and_those_at_the_bound()
+    val (d, w) = wt_new(1)
+    wt_fill(w, 1)
+    w.commit(wt_commit(9)).unwrap()
+    assert_eq(w.recycle(WtSeg - 1), Ok(u64(0)))
+    assert_eq(w.recycle(0xffffffffffff), Ok(u64(1)))
+    assert(d.has(wal_segment_name(1, WtSeg)).unwrap())
+    assert(d.has(wal_segment_name(1, 2 * WtSeg)).unwrap())
+    assert_eq(d.list().unwrap().len(), usize(2))
+
+@test
+recycling_with_nothing_below_the_bound_does_nothing()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    assert_eq(w.recycle(0), Ok(u64(0)))
+    assert_eq(w.recycle(0xffffffffffff), Ok(u64(0)))
+    assert_eq(d.list().unwrap().len(), usize(1))
+
+@test
+recycling_twice_numbers_the_spares_on()
+    val (d, w) = wt_new(1)
+    var t = wt_fill(w, 1)
+    t = wt_fill(w, t)
+    w.flush().unwrap()
+    assert_eq(w.recycle(WtSeg), Ok(u64(1)))
+    t = wt_fill(w, t)
+    w.commit(wt_commit(9)).unwrap()
+    assert_eq(w.recycle(2 * WtSeg), Ok(u64(1)))
+    assert(d.has(wal_segment_name(1, 4 * WtSeg)).unwrap())
+    assert_eq(wal_reader(d, wt_cfg(), 2 * WtSeg + 4096, 0).rest().unwrap().len(), usize(16))
+
+// -- the reader's end of the log -------------------------------------------------------------------------
+
+/** Three commits in block 1, flushed: at 4096, 4160 and 4224. */
+private wt_three(seed: u64) -> (&SimWalDir, &Wal)
+    val (d, w) = wt_new(seed)
+    w.append(wt_commit(1)).unwrap()
+    w.append(wt_commit(2)).unwrap()
+    w.commit(wt_commit(3)).unwrap()
+    (d, w)
+
+private wt_flip(d: &SimWalDir, byte: u64)
+    wt_seg(d, 0).flip_bit(byte / u64(DbPageSize), (byte % u64(DbPageSize)) * 8 + 3)
+
+@test
+a_bit_flip_in_the_last_record_s_header_ends_the_log_before_it()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4224 + 20)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_bit_flip_in_the_last_record_s_length_ends_the_log_before_it()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4224 + 4)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_bit_flip_in_the_last_record_s_lsn_ends_the_log_before_it()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4224 + 9)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_bit_flip_in_the_last_record_s_body_ends_the_log_before_it()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4224 + 50)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_bit_flip_in_the_last_record_s_crc_ends_the_log_before_it()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4224 + 1)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_bit_flip_in_a_middle_record_ends_the_log_there_and_nothing_after_is_handed_out()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4160 + 50)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(wt_txns(r.rest().unwrap()), wr_buf([u64(1)]))
+    assert_eq(r.end(), u64(4160))
+
+@test
+a_bit_flip_in_the_first_record_leaves_an_empty_log()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 4096 + 33)
+    assert_eq(wt_read(d).len(), usize(0))
+
+@test
+a_bit_flip_in_the_header_before_must_reach_is_corruption()
+    val (d, w) = wt_three(1)
+    wt_flip(d, 4224 + 20)
+    val e = wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn()).rest().unwrap_err()
+    assert_eq(e.code, "D1001")
+    assert_eq(e.detail("lsn"), Some("4224"))
+
+@test
+a_bit_flip_in_the_body_before_must_reach_is_corruption()
+    val (d, w) = wt_three(1)
+    wt_flip(d, 4160 + 50)
+    assert_eq(wr_code(wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn()).rest()), "D1001")
+
+@test
+a_bit_flip_in_the_crc_before_must_reach_is_corruption()
+    val (d, w) = wt_three(1)
+    wt_flip(d, 4096 + 2)
+    assert_eq(wr_code(wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn()).rest()), "D1001")
+
+@test
+the_records_before_a_mid_log_corruption_are_handed_out_first()
+    val (d, w) = wt_three(1)
+    wt_flip(d, 4224 + 50)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn())
+    assert_eq(r.next().unwrap().unwrap().txn, u64(1))
+    assert_eq(r.next().unwrap().unwrap().txn, u64(2))
+    assert_eq(wr_code(r.next()), "D1001")
+
+@test
+an_end_exactly_at_must_reach_is_the_end()
+    val (d, w) = wt_three(1)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn())
+    assert_eq(r.rest().unwrap().len(), usize(3))
+    assert_eq(r.end(), w.durable_lsn())
+
+@test
+a_bit_flip_in_the_segment_header_makes_the_segment_missing()
+    val (d, _) = wt_three(1)
+    wt_flip(d, 40)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(r.rest().unwrap().len(), usize(0))
+    assert_eq(r.end(), WalFirstLsn)
+
+@test
+a_bit_flip_in_the_segment_header_before_must_reach_is_corruption()
+    val (d, w) = wt_three(1)
+    wt_flip(d, 40)
+    assert_eq(wr_code(wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn()).rest()), "D1001")
+
+/** A log over segments 0 and 1, segment 0 full of block records and segment 1 holding three commits. */
+private wt_two_segments(seed: u64) -> (&SimWalDir, &Wal)
+    val (d, w) = wt_new(seed)
+    wt_fill(w, 1)
+    w.append(wt_commit(16)).unwrap()
+    w.append(wt_commit(17)).unwrap()
+    w.commit(wt_commit(18)).unwrap()
+    (d, w)
+
+@test
+a_missing_segment_ends_the_log_at_its_first_record()
+    val (d, _) = wt_two_segments(1)
+    d.remove(wal_segment_name(1, WtSeg)).unwrap()
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(r.rest().unwrap().len(), usize(15))
+    assert_eq(r.end(), WtSeg + 4096)
+
+@test
+a_missing_segment_before_must_reach_is_corruption()
+    val (d, w) = wt_two_segments(1)
+    d.remove(wal_segment_name(1, WtSeg)).unwrap()
+    assert_eq(wr_code(wal_reader(d, wt_cfg(), WalFirstLsn, w.durable_lsn()).rest()), "D1001")
+
+@test
+an_empty_segment_file_counts_as_missing()
+    val (d, _) = wt_two_segments(1)
+    d.create(wal_segment_name(1, WtSeg)).unwrap()
+    assert_eq(wt_read(d).len(), usize(15))
+
+@test
+a_segment_file_too_short_for_the_next_record_ends_the_log()
+    val (d, w) = wt_new(1)
+    w.append(wt_block(1)).unwrap()
+    w.append(wt_block(2)).unwrap()
+    w.append(wt_block(3)).unwrap()
+    w.commit(wt_commit(4)).unwrap()
+    // The file cut back to its first page: the commit, on page 1, is past its end.
+    val name = wal_segment_name(1, 0)
+    val page = wt_seg(d, 0).durable_page(0)
+    d.create(name).unwrap().write_page(0, page.view()).unwrap()
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(wt_txns(r.rest().unwrap()), wr_buf([u64(1), u64(2), u64(3)]))
+    assert_eq(r.end(), u64(16384))
+
+@test
+a_segment_of_another_database_counts_as_missing()
+    val (d, _) = wt_two_segments(1)
+    val other = wal_config_sized(wr_bytes(16, 99).view(), 1, 16)
+    val s = wt_seg(d, 1)
+    s.write_blocks(0, wal_segment_header(other, WtSeg, 0).view()).unwrap()
+    s.sync().unwrap()
+    assert_eq(wt_read(d).len(), usize(15))
+
+@test
+a_segment_of_another_timeline_counts_as_missing()
+    val (d, _) = wt_two_segments(1)
+    val other = wal_config_sized(ws_uuid().view(), 2, 16)
+    val s = wt_seg(d, 1)
+    s.write_blocks(0, wal_segment_header(other, WtSeg, 0).view()).unwrap()
+    assert_eq(wt_read(d).len(), usize(15))
+
+@test
+a_segment_whose_header_names_another_first_lsn_counts_as_missing()
+    val (d, _) = wt_two_segments(1)
+    val s = wt_seg(d, 1)
+    s.write_blocks(0, wal_segment_header(wt_cfg(), 2 * WtSeg, 0).view()).unwrap()
+    assert_eq(wt_read(d).len(), usize(15))
+
+@test
+a_segment_of_a_newer_wal_format_is_unsupported()
+    val (d, _) = wt_two_segments(1)
+    var h = wal_segment_header(wt_cfg(), WtSeg, 0)
+    put_u16_le(h.view_mut()[12..<14], 2)
+    ws_reseal(h.view_mut())
+    wt_seg(d, 1).write_blocks(0, h.view()).unwrap()
+    assert_eq(wr_code(wal_reader(d, wt_cfg(), WalFirstLsn, 0).rest()), "D3001")
+
+@test
+a_read_error_is_an_io_error_and_a_second_scan_reads_the_log()
+    val (d, _) = wt_three(1)
+    val s = wt_seg(d, 0)
+    s.schedule(s.next_op(), DkReadError)
+    val e = wal_reader(d, wt_cfg(), WalFirstLsn, 0).rest().unwrap_err()
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("file"), Some(wal_segment_name(1, 0)))
+    assert_eq(wt_read(d).len(), usize(3))
+
+@test
+a_scan_from_a_later_record_starts_there()
+    val (d, _) = wt_three(1)
+    assert_eq(wt_txns(wal_reader(d, wt_cfg(), 4160, 0).rest().unwrap()), wr_buf([u64(2), u64(3)]))
+
+@test
+a_scan_from_the_end_is_empty()
+    val (d, w) = wt_three(1)
+    val r = wal_reader(d, wt_cfg(), w.durable_lsn(), w.durable_lsn())
+    assert_eq(r.rest().unwrap().len(), usize(0))
+    assert_eq(r.end(), w.durable_lsn())
+
+@test
+a_scan_from_a_later_segment_reads_on_from_there()
+    val (d, _) = wt_two_segments(1)
+    assert_eq(wt_txns(wal_reader(d, wt_cfg(), WtSeg + 4096, 0).rest().unwrap()), wr_buf([u64(16), u64(17), u64(18)]))
+
+@test
+the_reader_ends_once_and_stays_ended()
+    val (d, _) = wt_three(1)
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    r.rest().unwrap()
+    assert_eq(r.next(), Ok(None))
+    assert_eq(r.next(), Ok(None))
+
+// -- torn, lost and failed writes -----------------------------------------------------------------------
+
+/** Appends two block records and a three-block one, at blocks 1, 2 and 3–5, unflushed: a flush
+ * writes page 0 (blocks 1–3) and page 1 (blocks 4–5), then syncs.
+ */
+private wt_spanning(w: &Wal)
+    w.append(wt_block(1)).unwrap()
+    w.append(wt_block(2)).unwrap()
+    w.append(wt_overflow(3, 12236)).unwrap()
+
+@test
+a_torn_final_record_is_not_read()
+    val (d, w) = wt_new(1)
+    wt_spanning(w)
+    val s = wt_seg(d, 0)
+    val op = s.next_op()
+    s.schedule(op + 1, DkTornWrite(wr_buf([u8(0), u8(1), u8(2), u8(3)]), 1, KeepAll))
+    assert_eq(wr_code(w.flush()), "D4004")
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+    d.crash(KeepAll)
+    d.restart()
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(wt_txns(r.rest().unwrap()), wr_buf([u64(1), u64(2)]))
+    assert_eq(r.end(), u64(12288))
+
+@test
+a_torn_write_keeping_a_later_block_but_not_an_earlier_reads_only_before_the_gap()
+    val (d, w) = wt_new(1)
+    wt_spanning(w)
+    val s = wt_seg(d, 0)
+    // Page 0's write keeps sector 2 (block 2) and loses sector 1 (block 1).
+    s.schedule(s.next_op(), DkTornWrite(wr_buf([u8(2), u8(1), u8(0), u8(3)]), 1, KeepAll))
+    assert_eq(wr_code(w.flush()), "D4004")
+    d.crash(KeepAll)
+    d.restart()
+    assert_eq(wt_read(d).len(), usize(0))
+
+@test
+a_lost_write_leaves_a_gap_and_nothing_after_it_is_read()
+    val (d, w) = wt_new(1)
+    wt_spanning(w)
+    w.append(wt_block(4)).unwrap()
+    val s = wt_seg(d, 0)
+    val op = s.next_op()
+    // Page 0's write is lost; page 1, holding a whole record at block 6, reaches the media.
+    s.schedule(op, DkLostWrite)
+    s.schedule(op + 2, DkCrash(KeepAll))
+    assert_eq(wr_code(w.flush()), "D4004")
+    d.crash(KeepAll)
+    d.restart()
+    assert_eq(wt_read(d).len(), usize(0))
+
+@test
+a_lost_log_write_a_sync_covers_is_durable()
+    val (d, w) = wt_new(1)
+    wt_spanning(w)
+    val s = wt_seg(d, 0)
+    s.schedule(s.next_op(), DkLostWrite)
+    w.flush().unwrap()
+    d.crash(KeepNone)
+    d.restart()
+    assert_eq(wt_read(d).len(), usize(3))
+
+@test
+a_failed_sync_leaves_durable_lsn_where_it_was_and_refuses_everything_after()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    val durable = w.durable_lsn()
+    w.append(wt_commit(2)).unwrap()
+    val s = wt_seg(d, 0)
+    s.schedule(s.next_op() + 1, DkSyncFail(KeepAll))
+    val e = w.flush().unwrap_err()
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("errno"), Some("5"))
+    assert_eq(e.detail("file"), Some(wal_segment_name(1, 0)))
+    assert_eq(w.durable_lsn(), durable)
+    assert(w.failed())
+    assert_eq(wr_code(w.append(wt_commit(3))), "D4004")
+    assert_eq(wr_code(w.commit(wt_commit(3))), "D4004")
+    assert_eq(wr_code(w.flush()), "D4004")
+    assert_eq(wr_code(w.wait_durable(durable)), "D4004")
+    assert_eq(wr_code(w.recycle(0xffffffffffff)), "D4004")
+    assert_eq(w.durable_lsn(), durable)
+
+@test
+a_failed_sync_is_not_retried()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    val s = wt_seg(d, 0)
+    val op = s.next_op()
+    s.schedule(op + 1, DkSyncFail(KeepNone))
+    w.flush().unwrap_err()
+    val after = s.next_op()
+    w.flush().unwrap_err()
+    assert_eq(s.next_op(), after)
+
+@test
+after_a_failed_sync_reopening_finds_at_most_what_was_appended()
+    for keep in [KeepNone, KeepAll]
+        val (d, w) = wt_new(1)
+        w.commit(wt_commit(1)).unwrap()
+        w.append(wt_commit(2)).unwrap()
+        val s = wt_seg(d, 0)
+        s.schedule(s.next_op() + 1, DkSyncFail(keep))
+        w.flush().unwrap_err()
+        val again = wt_crash_reopen(d, KeepNone)
+        val got = wt_txns(wt_read(d))
+        assert(got == wr_buf([u64(1)]) || got == wr_buf([u64(1), u64(2)]))
+        again.commit(wt_commit(3)).unwrap()
+        assert_eq(wt_read(d).len(), got.len() + 1)
+
+@test
+a_crash_during_a_flush_s_write_fails_the_flush()
+    val (d, w) = wt_new(1)
+    w.append(wt_commit(1)).unwrap()
+    val s = wt_seg(d, 0)
+    s.schedule(s.next_op(), DkCrash(KeepAll))
+    assert_eq(wr_code(w.flush()), "D4004")
+    assert(w.failed())
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+
+@test
+a_failed_sync_of_a_segment_being_taken_over_fails_the_flush()
+    val (d, w) = wt_new(1)
+    wt_fill(w, 1)
+    w.append(wt_commit(20)).unwrap()
+    // A spare already holds segment 1's name and its whole size: taking it over writes its header
+    // and syncs it, and that sync fails.
+    val spare = d.create(wal_segment_name(1, WtSeg)).unwrap()
+
+    for p in 0..<4
+        spare.write_page(u64(p), buf_filled(DbPageSize, u8(0)).view()).unwrap()
+
+    spare.sync().unwrap()
+    val s1 = wt_seg(d, 1)
+    s1.schedule(s1.next_op() + 1, DkSyncFail(KeepAll))
+    assert_eq(wr_code(w.flush()), "D4004")
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+    assert(w.failed())
+
+// -- reopening --------------------------------------------------------------------------------------
+
+@test
+a_reopened_log_keeps_its_records_and_appends_in_the_next_segment()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    val again = wt_crash_reopen(d, KeepNone)
+    assert_eq(again.durable_lsn(), WtSeg + 4096)
+    val a = again.commit(wt_commit(2)).unwrap()
+    assert_eq(a.lsns[0], WtSeg + 4096)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2)]))
+
+@test
+a_crash_loses_what_was_not_flushed()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    w.append(wt_commit(2)).unwrap()
+    wt_crash_reopen(d, KeepAll)
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+
+@test
+reopening_with_must_reach_past_the_end_is_corruption()
+    val (d, w) = wt_three(1)
+    d.crash(KeepAll)
+    d.restart()
+    assert_eq(wr_code(wal_open(d, wt_cfg(), WalFirstLsn, 0x100000)), "D1001")
+
+@test
+reopening_removes_every_segment_past_the_end_s()
+    val (d, w) = wt_two_segments(1)
+    // Spoil segment 0's last record: the end moves into segment 0, and segment 1's records,
+    // which would still validate, must never be read as the log's.
+    wt_flip(d, 15 * 4096 + 50)
+    d.crash(KeepAll)
+    d.restart()
+    val again = wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+    assert(!d.has(wal_segment_name(1, WtSeg)).unwrap())
+    again.commit(wt_commit(99)).unwrap()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(15))
+    assert_eq(got[13], u64(14))
+    assert_eq(got[14], u64(99))
+
+@test
+reopening_where_the_end_s_segment_header_is_spoiled_makes_the_segment_afresh()
+    val (d, w) = wt_three(1)
+    wt_flip(d, 40)
+    d.crash(KeepAll)
+    d.restart()
+    val again = wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+    assert_eq(again.durable_lsn(), WalFirstLsn)
+    assert(!d.has(wal_segment_name(1, 0)).unwrap())
+    again.commit(wt_commit(9)).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(9)]))
+    assert_eq(wal_check_segment_header(wt_seg(d, 0).durable_page(0).view()[0..<4096], wt_cfg(), 0), Ok(true))
+
+@test
+reopening_where_the_end_s_segment_is_missing_creates_it_when_the_log_reaches_it()
+    val (d, w) = wt_new(1)
+    wt_fill(w, 1)
+    w.flush().unwrap()
+    val again = wt_crash_reopen(d, KeepAll)
+    assert_eq(again.durable_lsn(), WtSeg + 4096)
+    assert(!d.has(wal_segment_name(1, WtSeg)).unwrap())
+    again.commit(wt_commit(9)).unwrap()
+    val h = wt_seg(d, 1).durable_page(0)
+    assert_eq(get_u64(h, 48), u64(wal_header_crc(wt_seg(d, 0).durable_page(0).view())))
+    assert_eq(wt_read(d).len(), usize(16))
+
+@test
+a_torn_mini_transaction_is_dropped_whole_and_the_log_resumes_where_it_began()
+    val (d, w) = wt_new(1)
+    w.commit(wt_commit(1)).unwrap()
+    // Blocks 2, 3 and 4: the mini-transaction's first two records on page 0, its last on page 1.
+    w.append_mtr(wr_buf([wt_block(2), wt_block(3), wt_block(4)]).view()).unwrap()
+    val s = wt_seg(d, 0)
+    s.schedule(s.next_op() + 1, DkCrash(KeepAll))
+    w.flush().unwrap_err()
+    d.restart()
+    val r = wal_reader(d, wt_cfg(), WalFirstLsn, 0)
+    assert_eq(wt_txns(r.rest().unwrap()), wr_buf([u64(1)]))
+    assert_eq(r.end(), u64(8192))
+    val again = wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+    again.commit(wt_commit(5)).unwrap()
+    val got = wt_read(d)
+    assert_eq(wt_txns(got), wr_buf([u64(1), u64(5)]))
+    assert_eq(got[1].flags, u8(0))
+
+@test
+a_whole_record_past_a_gap_is_never_read_even_after_the_log_reopens()
+    val (d, w) = wt_new(1)
+    w.append(wt_block(1)).unwrap()
+    w.append(wt_block(2)).unwrap()
+    w.append(wt_block(3)).unwrap()
+    val s = wt_seg(d, 0)
+    // The flush's one write, page 0 blocks 1–3, keeps blocks 1 and 3: block 3's record is whole
+    // and at its own LSN, but lies past the gap at block 2.
+    s.schedule(s.next_op() + 1, DkCrash(KeepSectors(wr_buf([u8(0b1010)]))))
+    w.flush().unwrap_err()
+    d.restart()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+    val again = wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1)]))
+    again.commit(wt_commit(7)).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(7)]))
+
+@test
+a_crash_while_reopening_leaves_a_log_that_reopens()
+    val (d, w) = wt_three(1)
+    d.crash(KeepAll)
+    d.restart()
+    val s = wt_seg(d, 0)
+    // Three reads (the scan's header page, the open's header page, the end's page), then the pad's
+    // four page writes: the process dies at the third of them, before the sync.
+    s.schedule(s.next_op() + 5, DkCrash(KeepDrawn))
+    assert(wal_open(d, wt_cfg(), WalFirstLsn, 0).is_err())
+    d.crash(KeepDrawn)
+    d.restart()
+    val again = wal_open(d, wt_cfg(), WalFirstLsn, 0).unwrap()
+    assert_eq(wt_txns(wt_read(d)), wr_buf([u64(1), u64(2), u64(3)]))
+    again.commit(wt_commit(4)).unwrap()
+    assert_eq(wt_read(d).len(), usize(4))
