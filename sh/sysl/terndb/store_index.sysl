@@ -128,7 +128,7 @@ private keys_type(c: MemCatalog, oid: u64, keys: Buf[CatKey]) -> Result[Type, Co
  * `rows`, records of type `row`: one value per row for each expression. A definition is
  * deterministic, so it needs no clock and draws from no sequence.
  */
-private def_values(c: MemCatalog, row: Type, rows: Buf[Value], exprs: Buf[Expr]) -> Result[Buf[Buf[Value]], CodecError]
+private[terndb] def_values(c: MemCatalog, row: Type, rows: Buf[Value], exprs: Buf[Expr]) -> Result[Buf[Buf[Value]], CodecError]
     val out = buf[Buf[Value]]()
 
     if rows.len() == 0
@@ -1076,7 +1076,7 @@ impl Store
 
         Ok(out)
 
-    private holds_in(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
+    private[terndb] holds_in(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
         live(t)?
         val d = self.table_data(table)?
         self.sync_indexes(d)?

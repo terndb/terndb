@@ -6,9 +6,10 @@ import sysl.slices.sort_by
 // The jobs a DDL statement starts (`ddl.md` §7), as the in-memory store runs them. A job runs to its
 // end right after the commit that started it, before that commit returns, as one batch whose
 // internal transaction commits under a number of its own: the store is single-threaded, so no
-// statement of another transaction runs while a job does (Q71). The kind it runs is `build_index`
-// (§8.9), for a created index and for the index of a `unique` constraint being validated (§8.7);
-// the other kinds do not run yet (`docs/design/engine.md`).
+// statement of another transaction runs while a job does (Q71). The kinds it runs are `build_index`
+// (§8.9), for a created index and for the index of a `unique` constraint being validated (§8.7), and
+// `validate_constraint` (§8.7), for a check or foreign-key constraint and for the check `set_nullable`
+// false adds (§8.6); the others do not run yet (`docs/design/engine.md`).
 
 /** How a job ended (`ddl.md` §3.2 rule 4): it succeeded, or failed with an error code and message. */
 enum JobEnd derives Eq
@@ -39,26 +40,221 @@ impl Store
 
     /** Runs the jobs the commit of transaction `txid` started (`ddl.md` §7 rule 1): a `build_index`
      * for every index of the newest committed catalog that is `building` and backs no constraint,
-     * and for the index of every `unique` constraint whose validation is due (§8.7). A constraint
-     * added with `defer_validation` is not due, and its index stays `building`.
+     * and for the index of every `unique` constraint whose validation is due (§8.7); then a
+     * `validate_constraint` for every check and foreign-key constraint whose validation is due. A
+     * constraint added with `defer_validation` is not due, and a `unique` one's index stays
+     * `building`. A constraint the transaction added and dropped again is not in the catalog, and
+     * has no job.
      */
     private[terndb] run_jobs(*self, txid: u64)
         val c = self.latest_catalog()
         val due = buf[u64]()
+        val checks = buf[u64]()
 
         for x in c.indexes
             if x.state == IndexBuilding && x.constraint == 0 then due.push(x.oid)
 
         for k in c.constraints
-            if k.job && k.index != 0
+            if k.job
                 k.kind match
-                    ConUnique(_) -> due.push(k.index)
-                    _ -> ()
+                    ConUnique(_) -> if k.index != 0 then due.push(k.index)
+                    ConPrimaryKey(_) -> ()
+                    _ -> checks.push(k.oid)
 
         for oid in due
             self.build_index(txid, oid)
+
+        for oid in checks
+            self.validate_constraint(txid, oid)
     end run_jobs
 
+    /** The `validate_constraint` job of check or foreign-key constraint `oid` (`ddl.md` §8.7), in an
+     * internal read committed transaction whose snapshot is the newest commit: every row visible to
+     * it is checked, a check by evaluating its expression over the row (null passes, §2.6), a
+     * foreign key by looking up the referenced row at the same snapshot (a referencing value with a
+     * null component is not checked). It takes no row locks. In its final transaction it marks the
+     * constraint validated, or on failure leaves it not validated and enforced, its job no longer
+     * due. The check `set_nullable` false added (§8.6) is dropped either way, and on success the
+     * column becomes non-null in a new schema version.
+     */
+    private validate_constraint(*self, txid: u64, oid: u64)
+        val before = self.latest_catalog()
+
+        val k = before.constraint_by_oid(oid) match
+            Some(i) -> before.constraints[i]
+            None -> return
+
+        val j = self.begin(ReadCommitted)
+        j.snapshot = self.horizon
+        self.install(before, false)
+
+        var end = self.violation(j, k) match
+            Ok(_) -> JobSucceeded
+            Err(e) -> JobFailed(e.code, e.message)
+
+        // The catalog `before` stays as it committed: `m` is a copy, since a `Buf` is shared.
+        var m = before.clone()
+        val i = m.constraint_by_oid(oid).unwrap()
+
+        k.not_null match
+            Some(column) ->
+                if end == JobSucceeded
+                    m.make_non_null(k.table, column) match
+                        Ok(_) -> ()
+                        Err(e) ->
+                            m = before.clone()
+                            end = JobFailed(e.code, e.message)
+
+                val _ = m.drop_object(Obj(KindConstraint, oid), false)
+            None ->
+                m.constraints[i].job = false
+                if end == JobSucceeded then m.constraints[i].validated = true
+
+        val c = self.rows.commit(j.id).unwrap()
+        self.publish_job(before, m, c)
+        self.horizon = c
+        j.state = CommittedAt(c)
+        self.retire(j)
+        self.jobs.push(JobRecord(u64(self.jobs.len()) + 1, txid, "validate_constraint", oid, end))
+    end validate_constraint
+
+    // The first row visible to job `j` that check or foreign-key constraint `k` fails, in key order:
+    // `check_violation` or `foreign_key_violation`, naming the row's key; or the error evaluating a
+    // check over a row raised, naming it too.
+    private violation(*self, j: &Txn, k: CatConstraint) -> Result[unit, CodecError]
+        val d = self.table_data(k.table)?
+        val keys = buf[Value]()
+        val rows = buf[StoredRow]()
+
+        for s in self.slots_of(d)?
+            self.visible(d, s, j.snapshot, j.id)? match
+                Some(r) ->
+                    keys.push(s.key)
+                    rows.push(r)
+                None -> ()
+
+        k.kind match
+            ConCheck(e) -> self.check_violation(d, k.name, e, keys, rows)
+            ConForeignKey(cols, ref_table, ref_cols, _, _, _) ->
+                val versions = table_versions(self.catalog, k.table)
+
+                for n in 0..<rows.len()
+                    image_values(versions, rows[n], cols) match
+                        Some(v) ->
+                            if !self.holds_in(j, ref_table, ref_cols, v)?
+                                return fail("T3003", s"the row keyed ${key_text(d, keys[n])} references no row of the referenced table through foreign key '${k.name}'")
+                        None -> ()
+
+                Ok(())
+            _ -> Ok(())
+    end violation
+
+    // `violation` for check `name`, expression `e`, over `rows` of `d` keyed `keys`: evaluated over
+    // every row together, and one row at a time when that fails, to name the first row at fault.
+    private check_violation(*self, d: &TableData, name: string, e: Expr, keys: Buf[Value], rows: Buf[StoredRow]) -> Result[unit, CodecError]
+        val ti = self.catalog.table_by_oid(d.oid) match
+            Some(i) -> i
+            None -> return Ok(())
+
+        val fs = buf[Field]()
+
+        for c in self.catalog.tables[ti].columns
+            fs.push(Field(c.name, resolve_type(self.catalog, c.ty)?))
+
+        val row = record(fs.view())
+        val values = buf[Value]()
+
+        for r in rows
+            values.push(self.translated(d.oid, r)?.value)
+
+        val exprs = buf[Expr]()
+        exprs.push(e)
+
+        def_values(self.catalog, row, values, exprs) match
+            Ok(cols) ->
+                for n in 0..<values.len()
+                    if cols[0][n] == Bool(false) then return check_fail(d, name, keys[n])
+
+                return Ok(())
+            Err(_) -> ()
+
+        for n in 0..<values.len()
+            val one = buf[Value]()
+            one.push(values[n])
+
+            def_values(self.catalog, row, one, exprs) match
+                Ok(cols) -> if cols[0][0] == Bool(false) then return check_fail(d, name, keys[n])
+                Err(x) -> return Err(CodecError(x.code, "", s"the row keyed ${key_text(d, keys[n])}: ${x.message}", x.details, 0))
+
+        Ok(())
+    end check_violation
+
+    /** The `AwaitJobs(txid)` relation (`ddl.md` §3.2 rule 4): one row per job the commit of `txid`
+     * started, oldest first, every one finished, since a job runs before the commit that started it
+     * returns. Unknown, rolled back, or with no jobs: empty.
+     */
+    await_jobs(self, txid: u64) -> Buf[Value]
+        val out = buf[Value]()
+
+        for j in self.jobs_of(txid)
+            val state = j.end match
+                JobSucceeded -> variant(0, rec([]))
+                JobFailed(code, message) -> variant(1, rec([Value.Text(code), Value.Text(message)]))
+
+            out.push(rec([UInt(j.id), Value.Text(j.kind), UInt(j.object), state]))
+
+        out
+end Store
+
+/** The type of the relation `AwaitJobs` returns (`ddl.md` §3.2 rule 4). */
+await_jobs_type() -> Type =
+    val failed = record([Field("code", Text), Field("message", Text)])
+    val state = union_of([Field("succeeded", record([])), Field("failed", failed), Field("cancelled", record([]))])
+    bag(record([Field("job", UInt64), Field("kind", Text), Field("object", UInt64), Field("state", state)]))
+
+// The text of key `key` of a row of `d`, for a job's failure message: its components' text forms,
+// in parentheses.
+private key_text(d: &TableData, key: Value) -> string
+    val fs = fields_of_type(d.key_type)
+
+    val vs = key match
+        Record(xs) -> xs
+        _ -> return "?"
+
+    var out = ""
+
+    for n in 0..<vs.len()
+        var part = "?"
+
+        if n < fs.len()
+            to_text(fs[n].ty, vs[n]) match
+                Ok(t) -> part = t
+                Err(_) -> ()
+
+        out = if n == 0 then part else s"$out, $part"
+
+    s"($out)"
+
+private check_fail(d: &TableData, name: string, key: Value) -> Result[unit, CodecError] =
+    fail("T3002", s"the row keyed ${key_text(d, key)} fails check constraint '$name'")
+
+impl MemCatalog
+    /** Column `column` of table `table` made non-null in a new schema version (§8.6), when the check
+     * `set_nullable` false added has validated: `Q6012` past the last schema version.
+     */
+    make_non_null(*self, table: u64, column: u32) -> Result[unit, CodecError]
+        val ti = self.table_by_oid(table) match
+            Some(i) -> i
+            None -> return Ok(())
+
+        for ci in 0..<self.tables[ti].columns.len()
+            if self.tables[ti].columns[ci].id == column
+                self.tables[ti].columns[ci].ty = self.tables[ti].columns[ci].ty.base()
+
+        self.new_version(ti)
+end MemCatalog
+
+impl Store
     /** The `build_index` job of index `oid` (`ddl.md` §8.9), in an internal read committed
      * transaction whose snapshot is the newest commit. The index's entries are those of every row
      * already (`sync_indexes`), so the job checks that no two rows it sees hold one value of a unique
@@ -81,7 +277,8 @@ impl Store
             Ok(_) -> JobSucceeded
             Err(e) -> JobFailed(e.code, e.message)
 
-        var m = before
+        // The catalog `before` stays as it committed: `m` is a copy, since a `Buf` is shared.
+        var m = before.clone()
         val i = m.index_by_oid(oid).unwrap()
 
         val k = m.constraint_by_oid(x.constraint) match
