@@ -39,14 +39,22 @@ struct Ctx
  *
  * - `pairs`: the pairs of rows a join tested `on` on (`exec_join.sysl`), including those a mark join
  *   tests only to learn whether its mark is null;
- * - `sorted`: the rows a join sorted by its keys, each side counted once per sort.
+ * - `built`: the rows a hash join put in a hash table, a row counted once per table;
+ * - `probed`: the rows a hash join looked up in a hash table, once per lookup;
+ * - `compared`: the times a hash join compared two rows' keys because their hashes agreed.
+ *
+ * `hash` is the hash the joins bucket keys by: `key_hash()`, except where a test narrows it to make
+ * keys collide.
  */
 struct Work
     pairs: u64
-    sorted: u64
+    built: u64
+    probed: u64
+    compared: u64
+    hash: KeyHash
 
 /** Counts at zero, for a new execution. */
-no_work() -> &Work = Work(0, 0)
+no_work() -> &Work = Work(0, 0, 0, 0, key_hash())
 
 /** A binder visible to an expression, with its rows: a vector of the binder's element type. */
 struct Binder

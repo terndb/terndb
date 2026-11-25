@@ -1,0 +1,828 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// A table scan read straight into column vectors (`store_scan.sysl`, `docs/design/executor.md` §4.5,
+// `docs/design/store.md` "What the executor calls"). Each case checks the rows against the reference
+// the scan used to be: every visible row read by `scan_range` as a `StoredRow` and made into vectors
+// by `vector_of`. It also counts the store's `ReadWork`, so the per-row cost is pinned: a row the
+// reader sees in its current image copies nothing out of its page and builds no image and no record,
+// decodes its key components as values and each column the statement reads straight into its lane,
+// and leaves every other column undecoded.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+/** `t(id int64, v int64, note text?)` keyed by `id`; `u(k int64, w int64)` keyed by `k`;
+ * `e(id int64, v int64)` keyed by `id`, never written.
+ */
+private rs_catalog() -> MemCatalog
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("v", Int64), cat_col("note", nullable(Text))], ["id"]))
+    c = cat_ok(c, cat_table("u", [cat_col("k", Int64), cat_col("w", Int64)], ["k"]))
+    cat_ok(c, cat_table("e", [cat_col("id", Int64), cat_col("v", Int64)], ["id"]))
+
+private rs_store() -> &Store = mem_store(rs_catalog())
+
+private rs_env(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope
+    sql_statements(text, "app", s.latest_catalog()) match
+        Ok(sts) -> sts[0].action match
+            SqlTree(env) -> return env
+            SqlControl(_) -> ()
+        Err(e) -> print(s"\n$text\n  -> ${e.code} ${e.message}\n")
+
+    assert(false, "the statement translates", file, line)
+    panic("untranslated")
+
+/** Runs `text` in `t`. */
+private rs_run(s: &Store, t: &Txn, text: string, file: string = __FILE__, line: long = __LINE__) -> Executed =
+    xd_ran(s, t, rs_env(s, text, file, line), [], file, line)
+
+/** Runs `text` in a transaction of its own, which commits. */
+private rs_ok(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    val _ = rs_run(s, t, text, file, line)
+    assert(s.commit(t).is_ok(), "the transaction commits", file, line)
+
+/** The rows of the result of `text` run in `t`. */
+private rs_rows(s: &Store, t: &Txn, text: string, file: string = __FILE__, line: long = __LINE__) -> Buf[Value] =
+    xd_rows(rs_run(s, t, text, file, line))
+
+/** `t` holding ids `1..=n`, each with `v = id * 10` and `note` null for an odd id, else `n<id>`. */
+private rs_seed(s: &Store, n: i128)
+    var text = "INSERT INTO t (id, v, note) VALUES "
+
+    for i in 1..<n + 1
+        if i > 1 then text = text + ", "
+        val note = if i % 2 == 1 then "NULL" else s"'n$i'"
+        text = text + s"($i, ${i * 10}, $note)"
+
+    rs_ok(s, text)
+
+private rs_oid(s: &Store, name: string) -> u64 = s.catalog.tables[s.catalog.table_at(cat_q(name)).unwrap()].oid
+
+/** Table `oid`'s row type: its columns' types, in ordinal order. */
+private rs_elem(s: &Store, oid: u64) -> Type
+    val ct = s.catalog.tables[s.catalog.table_by_oid(oid).unwrap()]
+    val fs = buf[Field]()
+
+    for c in ct.columns
+        fs.push(Field(c.name, resolve_type(s.catalog, c.ty).unwrap()))
+
+    record(fs.view())
+
+/** The work counted so far. */
+private rs_now(s: &Store) -> ReadWork = ReadWork(s.reads.copied, s.reads.images, s.reads.rows, s.reads.values, s.reads.columns, s.reads.skipped)
+
+/** The work counted since `a`. */
+private rs_since(s: &Store, a: ReadWork) -> ReadWork =
+    ReadWork(s.reads.copied - a.copied, s.reads.images - a.images, s.reads.rows - a.rows, s.reads.values - a.values,
+        s.reads.columns - a.columns, s.reads.skipped - a.skipped)
+
+/** Asserts the work `w` is what the counts say. */
+private rs_work(w: ReadWork, copied: u64, rows: u64, values: u64, columns: u64, skipped: u64, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(w.copied, copied, "leaf entries copied", file, line)
+    assert_eq(w.images, copied, "row images built", file, line)
+    assert_eq(w.rows, rows, "stored rows built", file, line)
+    assert_eq(w.values, values, "values decoded", file, line)
+    assert_eq(w.columns, columns, "columns decoded into lanes", file, line)
+    assert_eq(w.skipped, skipped, "columns not decoded", file, line)
+
+/** The rows of `vs`, each slot read back as a value. */
+private rs_values(vs: Buf[ColumnVector]) -> Buf[Value]
+    val out = buf[Value]()
+
+    for v in vs
+        assert(v.len > 0, "no batch is empty")
+        assert(v.len <= BatchSize, "no batch is over BatchSize")
+
+        for i in 0..<v.len
+            out.push(value_at(v, i))
+
+    out
+
+/** Table `oid` read by `scan_vectors` in `t`, decoding `columns` (every column when none). */
+private rs_scan(s: &Store, t: &Txn, oid: u64, columns: Option[Buf[u32]] = None) -> Buf[ColumnVector] =
+    s.scan_vectors(t, oid, KeyAny, KeyAny, all_rows(), rs_elem(s, oid), columns).unwrap()
+
+/** The reference: table `oid`'s visible rows read as `StoredRow`s and made into a vector. */
+private rs_reference(s: &Store, t: &Txn, oid: u64) -> Buf[Value]
+    val rows = buf[Value]()
+
+    for h in s.scan_range(t, oid, KeyAny, KeyAny, all_rows()).unwrap()
+        rows.push(h.row.value)
+
+    val v = vector_of(rs_elem(s, oid), rows.view())
+    val out = buf[Value]()
+
+    for i in 0..<v.len
+        out.push(value_at(v, i))
+
+    out
+
+/** Asserts a scan of every column of `oid` in `t` reads what the reference reads. */
+private rs_agrees(s: &Store, t: &Txn, oid: u64, file: string = __FILE__, line: long = __LINE__)
+    val want = rs_reference(s, t, oid)
+    val got = rs_values(rs_scan(s, t, oid))
+    assert_eq(got.len(), want.len(), "row count", file, line)
+
+    for i in 0..<want.len()
+        if i < got.len() then assert(got[i] == want[i], s"row $i", file, line)
+
+/** The ids of `t`'s rows, in key order, read through `select id, v, note from t` in `t`. */
+private rs_ids(s: &Store, tx: &Txn) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in rs_rows(s, tx, "SELECT id, v, note FROM t")
+        r match
+            Record(fs) -> out.push(st_int(fs[0]))
+            _ -> out.push(-1)
+
+    out
+
+private rs_ints(rows: Buf[Value], j: usize) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in rows
+        r match
+            Record(fs) -> out.push(if fs[j].is_null() then -1 else st_int(fs[j]))
+            _ -> out.push(-2)
+
+    out
+
+private rs_column_ids(s: &Store, oid: u64, names: []const string) -> Buf[u32]
+    val ct = s.catalog.tables[s.catalog.table_by_oid(oid).unwrap()]
+    val out = buf[u32]()
+
+    for c in ct.columns
+        for n in names
+            if c.name == n then out.push(c.id)
+
+    out
+
+// -- the cost per row ------------------------------------------------------------------------------
+
+@test
+a_scan_of_every_column_copies_no_row_and_builds_no_record()
+    val s = rs_store()
+    rs_seed(s, 100)
+    val t = s.begin(Snapshot)
+    val a = rs_now(s)
+    val rows = rs_rows(s, t, "SELECT id, v, note FROM t")
+    assert_eq(rows.len(), 100)
+    assert(rows[1] == rec([Int(2), Int(20), Text("n2")]))
+    assert(rows[2] == rec([Int(3), Int(30), Null]))
+    // Per row: the key decoded as one value, `v` into its lane, `note` into its lane where not null.
+    rs_work(rs_since(s, a), 0, 0, 100, 150, 0)
+
+@test
+a_projection_decodes_only_the_columns_it_names()
+    val s = rs_store()
+    rs_seed(s, 100)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT v FROM t")
+    assert_eq(rs_ints(rows, 0)[99], 1000)
+    rs_work(rs_since(s, a), 0, 0, 100, 100, 100)
+
+@test
+a_projection_of_the_key_alone_decodes_no_other_column()
+    val s = rs_store()
+    rs_seed(s, 50)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT id FROM t")
+    assert_eq(rs_ints(rows, 0)[49], 50)
+    rs_work(rs_since(s, a), 0, 0, 50, 0, 100)
+
+@test
+a_projection_of_zero_columns_decodes_nothing_but_the_key()
+    val s = rs_store()
+    rs_seed(s, 40)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT 1 FROM t")
+    assert_eq(rows.len(), 40)
+    rs_work(rs_since(s, a), 0, 0, 40, 0, 80)
+
+@test
+a_count_of_every_row_decodes_nothing_but_the_key()
+    val s = rs_store()
+    rs_seed(s, 40)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT count(*) FROM t")
+    assert_eq(rs_ints(rows, 0)[0], 40)
+    rs_work(rs_since(s, a), 0, 0, 40, 0, 80)
+
+@test
+a_filter_decodes_the_columns_it_reads_for_every_row()
+    val s = rs_store()
+    rs_seed(s, 100)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT id FROM t WHERE v > 500")
+    assert_eq(rows.len(), 50)
+    assert_eq(rs_ints(rows, 0)[0], 51)
+    rs_work(rs_since(s, a), 0, 0, 100, 100, 100)
+
+@test
+a_filter_rejecting_every_row_builds_no_row()
+    val s = rs_store()
+    rs_seed(s, 100)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT id, note FROM t WHERE v < 0")
+    assert_eq(rows.len(), 0)
+    rs_work(rs_since(s, a), 0, 0, 100, 150, 0)
+
+@test
+an_aggregate_decodes_only_the_column_it_sums()
+    val s = rs_store()
+    rs_seed(s, 100)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT sum(v) FROM t")
+    assert_eq(rs_ints(rows, 0)[0], 50500)
+    rs_work(rs_since(s, a), 0, 0, 100, 100, 100)
+
+@test
+a_grouped_aggregate_decodes_its_keys_and_its_arguments()
+    val s = rs_store()
+    rs_seed(s, 10)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT note, count(*) FROM t GROUP BY note")
+    assert_eq(rows.len(), 6)
+    // `note` is read where not null; `v` is not read.
+    rs_work(rs_since(s, a), 0, 0, 10, 5, 10)
+
+@test
+a_join_decodes_on_each_side_only_the_columns_it_reads()
+    val s = rs_store()
+    rs_seed(s, 20)
+    rs_ok(s, "INSERT INTO u (k, w) VALUES (2, 7), (4, 8), (40, 9)")
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT t.v, u.w FROM t JOIN u ON t.id = u.k")
+    assert_eq(rows.len(), 2)
+    // `t`: 20 keys, 20 of `v`, 20 of `note` skipped. `u`: 3 keys, 3 of `w`.
+    rs_work(rs_since(s, a), 0, 0, 23, 23, 20)
+
+@test
+a_set_operation_reads_every_column_of_its_inputs()
+    val s = rs_store()
+    rs_seed(s, 10)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT id, v FROM t UNION SELECT id, v FROM t")
+    assert_eq(rows.len(), 10)
+    // The union compares its inputs' rows whole, which are the projections': `note` is still unread.
+    rs_work(rs_since(s, a), 0, 0, 20, 20, 20)
+
+@test
+the_old_path_s_cost_is_what_the_counters_count()
+    // `scan_range`, every other read's path, copies each row out, builds its image and its record,
+    // and decodes every non-null column into a value.
+    val s = rs_store()
+    rs_seed(s, 10)
+    val a = rs_now(s)
+    assert_eq(s.scan_range(s.begin(Snapshot), rs_oid(s, "t"), KeyAny, KeyAny, all_rows()).unwrap().len(), 10)
+    rs_work(rs_since(s, a), 10, 10, 10 + 10 + 5, 0, 0)
+
+// -- sizes -----------------------------------------------------------------------------------------
+
+@test
+a_scan_of_an_empty_table_reads_nothing()
+    val s = rs_store()
+    val e = rs_oid(s, "e")
+    val a = rs_now(s)
+    val slots = s.slots_read
+    assert_eq(rs_scan(s, s.begin(Snapshot), e).len(), 0)
+    assert_eq(rs_rows(s, s.begin(Snapshot), "SELECT id, v FROM e").len(), 0)
+    assert_eq(s.slots_read, slots)
+    rs_work(rs_since(s, a), 0, 0, 0, 0, 0)
+
+@test
+a_scan_of_a_table_whose_rows_are_all_deleted_reads_none()
+    val s = rs_store()
+    rs_seed(s, 5)
+    rs_ok(s, "DELETE FROM t WHERE id > 0")
+    val a = rs_now(s)
+    assert_eq(rs_scan(s, s.begin(Snapshot), rs_oid(s, "t")).len(), 0)
+    rs_work(rs_since(s, a), 0, 0, 0, 0, 0)
+
+@test
+a_scan_of_one_row_is_one_batch_of_one()
+    val s = rs_store()
+    rs_seed(s, 1)
+    val t = s.begin(Snapshot)
+    val vs = rs_scan(s, t, rs_oid(s, "t"))
+    assert_eq(vs.len(), 1)
+    assert_eq(vs[0].len, 1)
+    assert(value_at(vs[0], 0) == rec([Int(1), Int(10), Null]))
+    rs_agrees(s, t, rs_oid(s, "t"))
+
+@test
+a_scan_fills_whole_batches_and_then_the_rest()
+    val sizes: [5]usize = [1023, 1024, 1025, 2048, 2049]
+
+    for n in sizes
+        val s = rs_store()
+        rs_seed(s, i128(n))
+        val t = s.begin(Snapshot)
+        val vs = rs_scan(s, t, rs_oid(s, "t"))
+        assert_eq(vs.len(), (n + BatchSize - 1) / BatchSize, s"$n rows")
+
+        for i in 0..<vs.len()
+            val want = if i + 1 < vs.len() then BatchSize else n - BatchSize * i
+            assert_eq(vs[i].len, want, s"$n rows, batch $i")
+
+        rs_agrees(s, t, rs_oid(s, "t"))
+
+@test
+a_key_range_reads_only_its_rows_into_vectors()
+    val s = rs_store()
+    rs_seed(s, 100)
+    val a = rs_now(s)
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT id, v FROM t WHERE id >= 10 AND id < 20")
+    assert_eq(rs_ints(rows, 0).len(), 10)
+    rs_work(rs_since(s, a), 0, 0, 10, 10, 10)
+
+// -- column types ----------------------------------------------------------------------------------
+
+/** `w`: an `int64` key and a nullable column of every type a row stores. */
+private rs_typed_store() -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    val cols = buf[ColumnDef]()
+    cols.push(cat_col("id", Int64))
+
+    for p in rs_types()
+        cols.push(cat_col(p.0, nullable(p.1)))
+
+    mem_store(cat_ok(c, cat_table("w", cols.view(), ["id"])))
+
+private rs_types() -> Buf[(string, Type)]
+    val out = buf[(string, Type)]()
+    out.push(("b", Bool))
+    out.push(("i8", Int8))
+    out.push(("i16", Int16))
+    out.push(("i32", Int32))
+    out.push(("i64", Int64))
+    out.push(("i128", Int128))
+    out.push(("u8", UInt8))
+    out.push(("u16", UInt16))
+    out.push(("u32", UInt32))
+    out.push(("u64", UInt64))
+    out.push(("f32", Float32))
+    out.push(("f64", Float64))
+    out.push(("dec", Decimal(10, 2)))
+    out.push(("big", Decimal(30, 4)))
+    out.push(("d", Date))
+    out.push(("tm", Time))
+    out.push(("dt", DateTime))
+    out.push(("ts", Timestamp))
+    out.push(("iv", Interval))
+    out.push(("uu", Uuid))
+    out.push(("tx", Text))
+    out.push(("by", Bytes))
+    out.push(("js", Json))
+    out.push(("r", xd_item()))
+    out.push(("g", bag(xd_item())))
+    out
+
+/** How many of `rs_types` decode straight into their lanes: all but the record and the bag. */
+const RsDirect: u64 = 23
+
+private rs_i(k: usize, a: i128, b: i128, c: i128) -> i128 = if k == 0 then a elif k == 1 then b else c
+
+private rs_u(k: usize, a: u64, b: u64, c: u64) -> u64 = if k == 0 then a elif k == 1 then b else c
+
+private rs_f(k: usize, a: real, b: real, c: real) -> real = if k == 0 then a elif k == 1 then b else c
+
+private rs_s(k: usize, a: string, b: string, c: string) -> string = if k == 0 then a elif k == 1 then b else c
+
+/** Row `id` of `w`, each column the `k`th (0, 1 or 2) of its kind's samples: the least, a middling and
+ * the greatest value where the type has bounds.
+ */
+private rs_typed_row(id: i128, k: usize) -> Value
+    val octets = buf[u8]()
+    for i in 0..<k * 2
+        octets.push(u8(255 - i))
+
+    val items = buf[Value]()
+    for i in 0..<k
+        items.push(rec([Int(i128(i)), Int(i128(i) * 10)]))
+
+    val uu: u128 = if k == 0 then 0 elif k == 1 then 1 else 340282366920938463463374607431768211455
+
+    rec([Int(id), Bool(k == 1), Int(rs_i(k, -128, 0, 127)), Int(rs_i(k, -32768, 1, 32767)), Int(rs_i(k, -2147483648, 2, 2147483647)),
+        Int(rs_i(k, -9223372036854775808, 3, 9223372036854775807)),
+        Int(rs_i(k, -100000000000000000000000000000000000000, 4, 100000000000000000000000000000000000000)),
+        UInt(rs_u(k, 0, 5, 255)), UInt(rs_u(k, 0, 6, 65535)), UInt(rs_u(k, 0, 7, 4294967295)), UInt(rs_u(k, 0, 8, 18446744073709551615)),
+        Float(rs_f(k, 1.5, -0.25, 1048576.0)), Float(rs_f(k, 2.5, -1.0e300, 0.0)), Int(rs_i(k, -9999999999, 0, 9999999999)),
+        Int(rs_i(k, -999999999999999999999999999999, 12345, 1)), Int(rs_i(k, -1, 0, 20000)), Int(rs_i(k, 0, 1, 86399999999)),
+        Int(rs_i(k, -1, 0, 1700000000000000)), Int(rs_i(k, -1, 0, 1700000000000000)),
+        Interval(i32(rs_i(k, -1, 0, 13)), i32(rs_i(k, -2, 0, 400)), i64(rs_i(k, -3, 0, 99999999))),
+        Uuid(uu), Text(rs_s(k, "", "plain", "ünïcödé ✓")), bytes_value(octets.view()),
+        Text(rs_s(k, "{}", "[1, 2]", "\"x\"")), rec([Int(i128(k)), Int(-i128(k))]), rel(items.view())])
+
+private rs_null_row(id: i128) -> Value
+    val out = buf[Value]()
+    out.push(Int(id))
+
+    for _ in 0..<rs_types().len()
+        out.push(Null)
+
+    rec(out.view())
+
+private rs_put(s: &Store, oid: u64, rows: []const Value)
+    val t = s.begin(Snapshot)
+
+    for r in rows
+        assert(s.insert(t, oid, store_row(s, oid, r)).is_ok(), "the row is inserted")
+
+    assert(s.commit(t).is_ok())
+
+@test
+rows_of_every_column_type_read_as_the_reference_reads_them()
+    val s = rs_typed_store()
+    val w = rs_oid(s, "w")
+    rs_put(s, w, [rs_typed_row(1, 0), rs_typed_row(2, 1), rs_typed_row(3, 2)])
+    val t = s.begin(Snapshot)
+    val a = rs_now(s)
+    rs_agrees(s, t, w)
+    val got = rs_since(s, a)
+    // The reference's own cost first: 3 rows copied, built and decoded whole (the key, 25 columns).
+    assert_eq(got.rows, 3)
+    // The scan: 3 keys and the record and bag of each as values, the rest into lanes.
+    assert_eq(got.values, 3 + 3 * 25 + 3 + 3 * 2)
+    assert_eq(got.columns, 3 * RsDirect)
+    assert(rs_typed_row(2, 1) == rs_values(rs_scan(s, t, w))[1])
+
+@test
+nulls_of_every_column_type_read_as_nulls()
+    val s = rs_typed_store()
+    val w = rs_oid(s, "w")
+    rs_put(s, w, [rs_null_row(1), rs_typed_row(2, 2), rs_null_row(3)])
+    val t = s.begin(Snapshot)
+    rs_agrees(s, t, w)
+    val a = rs_now(s)
+    val got = rs_values(rs_scan(s, t, w))
+    assert(got[0] == rs_null_row(1))
+    assert(got[2] == rs_null_row(3))
+    // A null column is decoded neither into a value nor into a lane.
+    rs_work(rs_since(s, a), 0, 0, 3 + 2, RsDirect, 0)
+
+@test
+a_column_of_every_type_left_unread_is_not_decoded()
+    val s = rs_typed_store()
+    val w = rs_oid(s, "w")
+    rs_put(s, w, [rs_typed_row(1, 0), rs_typed_row(2, 1)])
+    val t = s.begin(Snapshot)
+    val a = rs_now(s)
+    val vs = rs_scan(s, t, w, Some(rs_column_ids(s, w, ["tx", "r"])))
+    rs_work(rs_since(s, a), 0, 0, 2 + 2, 2, 2 * 23)
+    val want = rs_reference(s, t, w)
+    val got = rs_values(vs)
+    assert_eq(got.len(), 2)
+
+    for i in 0..<2
+        got[i] match
+            Record(gs) -> want[i] match
+                Record(rs) ->
+                    // The key, `tx` (21) and `r` (24) are the reference's.
+                    assert(gs[0] == rs[0])
+                    assert(gs[21] == rs[21])
+                    assert(gs[24] == rs[24])
+                _ -> assert(false)
+            _ -> assert(false)
+
+@test
+a_wide_row_reads_every_column()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    val cols = buf[ColumnDef]()
+
+    for j in 0..<120
+        cols.push(cat_col(s"c$j", if j % 3 == 2 then nullable(Text) else Int64))
+
+    val s = mem_store(cat_ok(c, cat_table("wide", cols.view(), ["c0", "c1"])))
+    val wide = rs_oid(s, "wide")
+    val rows = buf[Value]()
+
+    for i in 0..<30
+        val vals = buf[Value]()
+
+        for j in 0..<120
+            vals.push(if j % 3 == 2 then (if (i + j) % 4 == 0 then Null else Text(s"r${i}c$j")) else Int(i128(i * 1000 + j)))
+
+        rows.push(rec(vals.view()))
+
+    rs_put(s, wide, rows.view())
+    val t = s.begin(Snapshot)
+    rs_agrees(s, t, wide)
+    val a = rs_now(s)
+    assert_eq(rs_values(rs_scan(s, t, wide)).len(), 30)
+    val w = rs_since(s, a)
+    rs_work(w, 0, 0, 60, w.columns, 0)
+    // 78 non-key int64 columns and the text ones that are not null.
+    assert(w.columns >= 30 * 78)
+
+@test
+rows_spread_over_many_leaves_read_in_key_order()
+    val s = rs_store()
+    val t0 = rs_oid(s, "t")
+    var pad = ""
+
+    for _ in 0..<900
+        pad = pad + "x"
+
+    val rows = buf[Value]()
+
+    for i in 0..<300
+        rows.push(rec([Int(i128(i)), Int(i128(i)), if i % 7 == 0 then Null else Text(s"$i$pad")]))
+
+    rs_put(s, t0, rows.view())
+    assert(!node_is_leaf(s.rows.tree_of(t0).unwrap().root_frame()), "the rows span leaves")
+    val t = s.begin(Snapshot)
+    rs_agrees(s, t, t0)
+    val a = rs_now(s)
+    val got = rs_values(rs_scan(s, t, t0))
+    assert_eq(got.len(), 300)
+    assert(got[299] == rows[299])
+    rs_work(rs_since(s, a), 0, 0, 300, 300 + 300 - 43, 0)
+
+// -- versions --------------------------------------------------------------------------------------
+
+@test
+a_scan_reads_its_snapshot_s_versions_of_rows_written_since()
+    val s = rs_store()
+    rs_seed(s, 10)
+    val reader = s.begin(Snapshot)
+    rs_ok(s, "UPDATE t SET v = 0 WHERE id = 3 OR id = 4")
+    rs_ok(s, "DELETE FROM t WHERE id = 5")
+    val pending = s.begin(Snapshot)
+    val _ = rs_run(s, pending, "INSERT INTO t (id, v) VALUES (11, 110)")
+    rs_ok(s, "INSERT INTO t (id, v) VALUES (12, 120)")
+
+    val a = rs_now(s)
+    val rows = rs_rows(s, reader, "SELECT id, v FROM t")
+    assert_eq(rs_ints(rows, 0).len(), 10)
+    assert_eq(rs_ints(rows, 1)[2], 30)
+    assert_eq(rs_ints(rows, 1)[4], 50)
+    // Rows 3, 4 and 5 are rebuilt through the undo log; 11 and 12 are not the reader's. The other
+    // seven are read from their leaf entries.
+    val w = rs_since(s, a)
+    assert_eq(w.copied, 5)
+    assert_eq(w.rows, 3)
+    assert_eq(w.columns, 7)
+    rs_agrees(s, reader, rs_oid(s, "t"))
+
+@test
+a_scan_reads_its_own_uncommitted_writes_from_the_leaf()
+    val s = rs_store()
+    rs_seed(s, 10)
+    val t = s.begin(Snapshot)
+    val _ = rs_run(s, t, "UPDATE t SET v = v + 1 WHERE id > 5")
+    val _ = rs_run(s, t, "INSERT INTO t (id, v) VALUES (20, 200)")
+    val a = rs_now(s)
+    val rows = rs_rows(s, t, "SELECT id, v FROM t")
+    assert_eq(rs_ints(rows, 1)[9], 101)
+    assert_eq(rs_ints(rows, 0)[10], 20)
+    rs_work(rs_since(s, a), 0, 0, 11, 11, 11)
+    rs_agrees(s, t, rs_oid(s, "t"))
+
+@test
+a_scan_skips_its_own_deletes_without_building_them()
+    val s = rs_store()
+    rs_seed(s, 10)
+    val t = s.begin(Snapshot)
+    val _ = rs_run(s, t, "DELETE FROM t WHERE id <= 3")
+    val a = rs_now(s)
+    assert_eq(rs_ids(s, t)[0], 4)
+    rs_work(rs_since(s, a), 0, 0, 7, 7 + 4, 0)
+    rs_agrees(s, t, rs_oid(s, "t"))
+
+@test
+an_update_of_every_row_keeps_the_columns_it_does_not_set()
+    // The target of an update is decoded whole: a column the statement never names is written back.
+    val s = rs_store()
+    rs_seed(s, 10)
+    rs_ok(s, "UPDATE t SET v = v + 1")
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT id, v, note FROM t")
+    assert(rows[1] == rec([Int(2), Int(21), Text("n2")]))
+    assert(rows[2] == rec([Int(3), Int(31), Null]))
+
+@test
+an_update_filtered_on_one_column_keeps_the_others()
+    val s = rs_store()
+    rs_seed(s, 10)
+    rs_ok(s, "UPDATE t SET v = 0 WHERE v > 50")
+    val rows = rs_rows(s, s.begin(Snapshot), "SELECT note, v FROM t WHERE id = 8")
+    assert(rows[0] == rec([Text("n8"), Int(0)]))
+
+@test
+a_delete_during_a_reader_s_scan_leaves_the_reader_its_rows()
+    val s = rs_store()
+    rs_seed(s, 6)
+    val reader = s.begin(Snapshot)
+    rs_ok(s, "DELETE FROM t WHERE id > 3")
+    assert_eq(rs_ids(s, reader).len(), 6)
+    assert_eq(rs_ids(s, s.begin(Snapshot)).len(), 3)
+
+@test
+an_update_reading_its_own_table_reads_each_row_once()
+    val s = rs_store()
+    rs_seed(s, 10)
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(rs_run(s, t, "UPDATE t SET v = v + 1 WHERE id IN (SELECT id FROM t WHERE v >= 50)")), 6)
+    assert_eq(rs_ints(rs_rows(s, t, "SELECT v FROM t"), 0)[9], 101)
+
+@test
+a_row_locked_lock_only_by_another_transaction_is_read_through_its_version()
+    val s = rs_store()
+    rs_seed(s, 4)
+    val oid = rs_oid(s, "t")
+    val locker = s.begin(Snapshot)
+    val (_, spec) = s.key_of_table(oid).unwrap()
+    val kb = encode_key(spec.view(), [Int(2)]).unwrap()
+    val _ = s.rows.lock(locker.id, oid, kb.view()).unwrap()
+    val t = s.begin(Snapshot)
+    val a = rs_now(s)
+    assert_eq(rs_ids(s, t).len(), 4)
+    assert_eq(rs_since(s, a).copied, 1)
+    rs_agrees(s, t, oid)
+
+@test
+a_row_of_an_older_schema_version_is_translated()
+    val s = rs_store()
+    rs_seed(s, 4)
+    s.catalog = cat_ok(s.catalog, cat_alter("t", [AddColumn(cat_col("x", nullable(Int64)))]))
+    val oid = rs_oid(s, "t")
+    rs_put(s, oid, [rec([Int(5), Int(50), Null, Int(7)])])
+    val t = s.begin(Snapshot)
+    val a = rs_now(s)
+    val got = rs_values(rs_scan(s, t, oid))
+    assert(got[0] == rec([Int(1), Int(10), Null, Null]))
+    assert(got[4] == rec([Int(5), Int(50), Null, Int(7)]))
+    // The four rows of version 1 take the general path; the one of version 2 is read from its leaf.
+    val w = rs_since(s, a)
+    assert_eq(w.copied, 4)
+    assert_eq(w.rows, 4)
+    assert_eq(w.columns, 2)
+    rs_agrees(s, t, oid)
+
+// -- building vectors from stored octets -----------------------------------------------------------
+
+private rs_err_code(r: Result[unit, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+@test
+a_stored_bool_other_than_0_or_1_is_corrupt()
+    assert_eq(rs_err_code(vector_builder(Bool).push_stored(Bool, [2])), "D1001")
+
+@test
+a_stored_fixed_width_value_of_another_width_is_corrupt()
+    assert_eq(rs_err_code(vector_builder(Int64).push_stored(Int64, [1, 2, 3])), "D1001")
+    assert_eq(rs_err_code(vector_builder(nullable(Int32)).push_stored(nullable(Int32), [1, 2, 3, 4, 5])), "D1001")
+
+@test
+stored_text_that_is_not_utf8_is_corrupt_and_bytes_are_not_checked()
+    assert_eq(rs_err_code(vector_builder(Text).push_stored(Text, [0xFF])), "D1001")
+    assert_eq(rs_err_code(vector_builder(Json).push_stored(Json, [0xC0])), "D1001")
+    assert_eq(rs_err_code(vector_builder(Bytes).push_stored(Bytes, [0xFF])), "ok")
+
+@test
+a_stored_decimal_past_its_precision_is_corrupt()
+    val b = vector_builder(Decimal(2, 0))
+    val raw = encode_value(Decimal(4, 0), Int(1000)).unwrap()
+    assert_eq(rs_err_code(b.push_stored(Decimal(2, 0), raw.view())), "D1001")
+
+@test
+a_builder_s_vector_is_vector_of_its_values()
+    val types = rs_types()
+
+    for j in 0..<types.len()
+        val t = nullable(types[j].1)
+        val vals = buf[Value]()
+
+        for k in 0..<3
+            rs_typed_row(0, k) match
+                Record(fs) -> vals.push(fs[j + 1])
+                _ -> ()
+
+            if k == 1 then vals.push(Null)
+
+        val b = vector_builder(t)
+
+        for v in vals
+            b.push_value(v)
+
+        val got = b.finish()
+        val want = vector_of(t, vals.view())
+        assert_eq(got.len, want.len)
+
+        for i in 0..<want.len
+            assert(value_at(got, i) == value_at(want, i))
+
+@test
+a_stored_value_of_every_type_reads_as_its_decoded_value()
+    val types = rs_types()
+
+    for k in 0..<3
+        rs_typed_row(0, k) match
+            Record(fs) ->
+                for j in 0..<types.len()
+                    val ty = types[j].1
+                    val v = fs[j + 1]
+                    val b = vector_builder(nullable(ty))
+                    assert_eq(rs_err_code(b.push_stored(nullable(ty), encode_value(ty, v).unwrap().view())), "ok")
+                    b.push_null()
+                    b.push_value(v)
+                    val got = b.finish()
+                    assert_eq(got.len, 3)
+                    assert(value_at(got, 0) == value_at(vector_of(nullable(ty), [v]), 0), s"${types[j].0} sample $k")
+                    assert(!got.is_valid(1))
+                    assert(value_at(got, 2) == value_at(got, 0))
+            _ -> assert(false)
+
+@test
+a_finished_builder_begins_again_empty()
+    val b = vector_builder(Int64)
+    b.push_value(Int(1))
+    b.push_null()
+    assert_eq(b.finish().len, 2)
+    b.push_value(Int(2))
+    val v = b.finish()
+    assert_eq(v.len, 1)
+    assert(!v.has_nulls())
+    assert(value_at(v, 0) == Int(2))
+    assert_eq(b.finish().len, 0)
+
+@test
+an_unread_slot_is_valid_and_holds_its_type_s_placeholder()
+    for ty in [Int64, Text, xd_item(), nullable(Int64)]
+        val b = vector_builder(ty)
+        b.push_unread()
+        val v = b.finish()
+        assert_eq(v.len, 1)
+        assert(value_at(v, 0) == value_at(vector_of(ty, [placeholder(ty.base())]), 0))
+
+@test
+a_builder_with_no_null_slot_has_no_validity_bitmap()
+    val b = vector_builder(nullable(Text))
+    b.push_value(Text("a"))
+    b.push_unread()
+    assert(!b.finish().has_nulls())
+
+// -- against the reference -------------------------------------------------------------------------
+
+@test
+random_writes_and_column_choices_agree_with_the_reference()
+    for seed in 0..<10
+        var g = rng(u64(seed), 77)
+        val s = rs_store()
+        val oid = rs_oid(s, "t")
+        val open = buf[&Txn]()
+
+        for step in 0..<60
+            val id = i128(g.below(40))
+            val note = if step % 3 == 0 then "NULL" else s"'s$step'"
+
+            val text = g.below(4) match
+                0 -> s"DELETE FROM t WHERE id = $id"
+                1 -> s"UPDATE t SET v = v + 1, note = NULL WHERE id = $id"
+                2 -> s"UPDATE t SET note = 'u$step' WHERE id = $id"
+                _ -> s"INSERT INTO t (id, v, note) VALUES (${id + 100 * i128(step)}, $step, $note)"
+
+            // One in five is left open: its writes stay uncommitted for every other reader.
+            val keep = g.below(5) == 0
+            val t = s.begin(Snapshot)
+            val ran = xd_code(s, t, rs_env(s, text)) == "ok"
+
+            if ran && keep
+                open.push(t)
+            elif ran
+                val _ = s.commit(t)
+            else
+                val _ = s.abort(t)
+
+            if step % 10 == 9
+                val readers = buf[&Txn]()
+                readers.push(s.begin(Snapshot))
+
+                for o in open
+                    readers.push(o)
+
+                for r in readers
+                    rs_agrees(s, r, oid)
+                    val want = rs_reference(s, r, oid)
+                    val names = buf[string]()
+                    val pick = g.below(4)
+                    if pick == 0 || pick == 3 then names.push("v")
+                    if pick == 1 || pick == 3 then names.push("note")
+                    val got = rs_values(rs_scan(s, r, oid, Some(rs_column_ids(s, oid, names.view()))))
+                    assert_eq(got.len(), want.len())
+
+                    for i in 0..<want.len()
+                        got[i] match
+                            Record(gs) -> want[i] match
+                                Record(ws) ->
+                                    assert(gs[0] == ws[0], s"seed $seed step $step key")
+                                    for n in names
+                                        val j: usize = if n == "v" then 1 else 2
+                                        assert(gs[j] == ws[j], s"seed $seed step $step column $n")
+                                _ -> assert(false)
+                            _ -> assert(false)

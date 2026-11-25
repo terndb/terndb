@@ -45,12 +45,17 @@ end type_envelope
  */
 type_errors(env: Envelope, catalog: &Catalog) -> Buf[CodecError] = type_phases(env, catalog).0.errors(env)
 
+/** The result type of DDL statement `s`: none, but for `AwaitJobs`'s relation (`ddl.md` §3.1 rule 3). */
+ddl_result(s: Statement) -> Option[Type] = s match
+    AwaitJobs(_) -> Some(await_jobs_type())
+    _ -> None
+
 // What the structural checks and the type checks find, merged; the statement's result type, and the
 // type of each node, which are whole only when nothing is found.
 private type_phases(env: Envelope, catalog: &Catalog) -> (Phases, Option[Type], Buf[Option[Type]])
     val structural = structural_phases(env)
 
-    if is_ddl(env.statement) then return (structural, None, buf[Option[Type]]())
+    if is_ddl(env.statement) then return (structural, ddl_result(env.statement), buf[Option[Type]]())
 
     var t = Typer(catalog, buf[Option[Type]](), no_phases(), FirstNode + 1, FirstNode, buf[Option[Type]](), buf[Cte]())
 

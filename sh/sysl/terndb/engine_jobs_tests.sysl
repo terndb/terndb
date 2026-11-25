@@ -1,0 +1,300 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Jobs through the wire (`ddl.md` §3.2 rule 4, §7, §8.7): `AwaitJobs` for a transaction with no
+// jobs, with several, an unknown one, one that rolled back, and inside an explicit transaction; a
+// not-validated check or foreign key enforced on every write after its job failed; and the writers
+// that overlap the job, which either meet the constraint or abort (property L3).
+
+/** `alter table app.doc add constraint <def>` (`defer_validation` when `defer`). */
+private ej_add(def: ConstraintDef, deferring: bool = false) -> Envelope = envelope([], AlterTable(cat_q("doc"), items_of([AddConstraint(def, deferring)])))
+
+/** `doc_on_gt_<n>`: `on > n`. */
+private ej_on_gt(n: i128) -> ConstraintDef = cat_check(s"doc_on_gt_$n", call("gt", [cat_row("on"), ew_lit(n)]))
+
+private ej_await(txid: u64) -> Envelope = envelope([], AwaitJobs(txid))
+
+/** The server's id of the transaction a `Begin` answered with `ms` began. */
+private ej_txid(ms: Buf[Message]) -> u64
+    for m in ms
+        m match
+            TxnBegun(txid, _, _) -> return txid
+            _ -> ()
+
+    assert(false, "a TxnBegun")
+    0
+
+private ej_begin_msg() -> Message = Begin(1, ew_level(Snapshot))
+
+/** The job rows `AwaitJobs(txid)` answers on a connection of its own, which must succeed. */
+private ej_jobs(e: &Engine, txid: u64, file: string = __FILE__, line: long = __LINE__) -> Buf[Value]
+    var d = ew_duo(e)
+    val ms = d.seen(d.send(ew_exec(0, ej_await(txid))))
+    val kinds = ew_kinds(ms)
+    assert(kinds == "header complete" || kinds == "header batch complete", kinds, file, line)
+    assert(ew_type(ms) == Some(await_jobs_type()), "the AwaitJobs type", file, line)
+    val rows = ew_rows(ms)
+    assert(ew_complete(ms).0[0] == u64(rows.len()), "Complete counts the rows", file, line)
+    rows
+
+/** A job row's kind, then its state: `succeeded`, or `failed <code>`. */
+private ej_row(v: Value) -> string = v match
+    Record(fs) ->
+        val kind = fs[1] match
+            Value.Text(k) -> k
+            _ -> "?"
+
+        val state = fs[3] match
+            Variant(tag, p) -> ej_state(tag, *p)
+            _ -> "?"
+
+        s"$kind $state"
+    _ -> "?"
+
+private ej_state(tag: usize, payload: Value) -> string
+    if tag == 0 then return "succeeded"
+    if tag == 2 then return "cancelled"
+
+    payload match
+        Record(xs) -> xs[0] match
+            Value.Text(code) -> s"failed $code"
+            _ -> "failed"
+        _ -> "failed"
+
+/** `ej_row` of every row, separated by `; `. */
+private ej_rows(rows: Buf[Value]) -> string
+    var out = ""
+
+    for r in rows
+        out = if out.len == 0 then ej_row(r) else s"$out; ${ej_row(r)}"
+
+    out
+
+// -- AwaitJobs ----------------------------------------------------------------------------------
+
+@test
+await_jobs_for_a_transaction_with_no_jobs_returns_the_empty_relation()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(4))), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    assert_eq(ej_jobs(e, txid).len(), 0)
+
+@test
+await_jobs_for_an_unknown_transaction_returns_the_empty_relation()
+    val e = ew_doctors()
+    assert_eq(ej_jobs(e, 987654).len(), 0)
+    assert_eq(ej_jobs(e, 0).len(), 0)
+
+@test
+await_jobs_for_a_rolled_back_transaction_returns_the_empty_relation()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    assert_eq(a.kinds_of(1, ej_add(ej_on_gt(0))), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Rollback(1)))), "ok")
+    assert_eq(ej_jobs(e, txid).len(), 0)
+
+@test
+await_jobs_for_a_transaction_with_several_jobs_returns_one_row_each()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    assert_eq(a.kinds_of(1, envelope([], cat_index("doc_on", "doc", ["on"]))), "header complete")
+    assert_eq(a.kinds_of(1, ej_add(ej_on_gt(0))), "header complete")
+    assert_eq(a.kinds_of(1, ej_add(ej_on_gt(5))), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+
+    val rows = ej_jobs(e, txid)
+    assert_eq(ej_rows(rows), "build_index succeeded; validate_constraint succeeded; validate_constraint failed T3002")
+
+    // Each row names its job and the object it worked on, as the store recorded them.
+    val js = e.store.jobs_of(txid)
+
+    for n in 0..<rows.len()
+        rows[n] match
+            Record(fs) ->
+                assert(fs[0] == UInt(js[n].id), "the job's id")
+                assert(fs[2] == UInt(js[n].object), "the job's object")
+            _ -> assert(false, "a record")
+
+@test
+await_jobs_answers_the_same_rows_when_asked_again()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    a.kinds_of(1, ej_add(ej_on_gt(5)))
+    a.seen(a.send(Commit(1)))
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3002")
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3002")
+
+@test
+await_jobs_inside_an_explicit_transaction_is_refused()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    val _ = ej_txid(a.seen(a.send(ej_begin_msg())))
+    assert_eq(a.kinds_of(1, ej_await(1)), "Q6010")
+
+@test
+await_jobs_changes_no_catalog_version()
+    val e = ew_doctors()
+    val version = e.catalog_version()
+    ej_jobs(e, 1)
+    assert_eq(e.catalog_version(), version)
+
+// -- a not-validated constraint is enforced (§2.6 rule 1, §8.7 "Failure") -------------------------
+
+@test
+a_check_whose_job_failed_is_still_enforced_on_every_write()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    a.kinds_of(1, ej_add(ej_on_gt(5)))
+    a.seen(a.send(Commit(1)))
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3002")
+
+    var b = ew_duo(e)
+    assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(2))), "header T3002")
+    assert_eq(b.kinds_of(0, ew_set_on(1, ew_lit(9))), "header complete")
+    assert_eq(ew_on_of(e, 1), 9)
+
+@test
+a_validated_check_is_enforced_on_every_write()
+    val e = ew_doctors()
+    ew_setup(e, [ej_add(ej_on_gt(0))])
+    var b = ew_duo(e)
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(0))), "header T3002")
+    assert_eq(ew_on_of(e, 2), 1)
+
+@test
+a_deferred_check_is_enforced_on_every_write_before_it_is_validated()
+    val e = ew_doctors()
+    ew_setup(e, [ej_add(ej_on_gt(0), true)])
+    var b = ew_duo(e)
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(-1))), "header T3002")
+
+private ej_ref_fields() -> [2]Field = [Field("id", Int64), Field("doc", nullable(Int64))]
+
+private ej_ins_fields() -> [2]Field = [Field("id", Int64), Field("doc", Int64)]
+
+/** `ref(id, doc int64?)` holding `(1, 99)`, which references no doctor, and `(2, 1)`. */
+private ej_refs(e: &Engine)
+    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id"), ew_insert("ref", ej_ins_fields(), [rec([Int(1), Int(99)]), rec([Int(2), Int(1)])])])
+
+private ej_ref_fk() -> Envelope = envelope([], AlterTable(cat_q("ref"), items_of([AddConstraint(cat_fk("ref_doc", ["doc"], "doc", ["id"]), false)])))
+
+@test
+a_foreign_key_whose_job_failed_is_still_enforced_on_every_write()
+    val e = ew_doctors()
+    ej_refs(e)
+    var a = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    assert_eq(a.kinds_of(1, ej_ref_fk()), "header complete")
+    a.seen(a.send(Commit(1)))
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3003")
+
+    var b = ew_duo(e)
+    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ins_fields(), [rec([Int(3), Int(98)])])), "header T3003")
+    assert_eq(b.kinds_of(0, ew_insert("ref", ej_ins_fields(), [rec([Int(3), Int(2)])])), "header complete")
+    assert_eq(b.kinds_of(0, ew_insert("ref", [Field("id", Int64)], [rec([Int(4)])])), "header complete")
+
+    // Doctor 1 is referenced, so it cannot go.
+    val gone = envelope([], Delete(cat_q("doc"), "d", None, None, Some(eq(col("d", "id"), ew_lit(1))), buf[Item]()))
+    assert_eq(b.kinds_of(0, gone), "header T3003")
+
+// -- writers overlapping the job (§7 rule 2, §8.7, L3) ------------------------------------------
+
+@test
+a_writer_that_broke_a_check_before_its_ddl_committed_aborts_at_its_commit()
+    for level in [Serializable, Snapshot, ReadCommitted]
+        val e = ew_doctors()
+        var a = ew_duo(e)
+        var b = ew_duo(e)
+
+        a.send(Begin(1, ew_level(level)))
+        assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-7))), "header complete")
+
+        // The job does not see a's row and succeeds; a did not see the check, and cannot commit.
+        assert_eq(b.kinds_of(0, ej_add(ej_on_gt(0))), "header complete")
+        assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T1004")
+        assert_eq(ew_on_of(e, 1), 1)
+
+@test
+a_writer_that_kept_a_check_before_its_ddl_committed_aborts_at_its_commit_too()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, ew_level(Snapshot)))
+    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(7))), "header complete")
+    assert_eq(b.kinds_of(0, ej_add(ej_on_gt(0))), "header complete")
+
+    // This store does not reconcile a writer with an added check (`docs/design/engine.md`).
+    assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T1004")
+
+@test
+a_read_committed_writer_s_statement_after_the_ddl_meets_the_check()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, ew_level(ReadCommitted)))
+    assert_eq(b.kinds_of(0, ej_add(ej_on_gt(0))), "header complete")
+    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-2))), "header T3002")
+
+@test
+a_writer_that_begins_after_the_job_meets_the_check()
+    val e = ew_doctors()
+    ew_setup(e, [ej_add(ej_on_gt(0))])
+    var a = ew_duo(e)
+    a.send(Begin(1, ew_level(Serializable)))
+    assert_eq(a.kinds_of(1, ew_set_on(1, ew_lit(-2))), "header T3002")
+
+@test
+a_row_committed_while_the_ddl_was_uncommitted_fails_the_job()
+    val e = ew_doctors()
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    val txid = ej_txid(a.seen(a.send(ej_begin_msg())))
+    assert_eq(a.kinds_of(1, ej_add(ej_on_gt(0))), "header complete")
+
+    // b does not see the uncommitted check, and commits a row that breaks it.
+    assert_eq(b.kinds_of(0, ew_set_on(2, ew_lit(0))), "header complete")
+    assert_eq(ew_kinds(a.seen(a.send(Commit(1)))), "committed")
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint failed T3002")
+
+@test
+a_delete_of_a_referenced_row_uncommitted_when_the_job_ran_aborts_at_its_commit()
+    val e = ew_doctors()
+    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id"), ew_insert("ref", ej_ins_fields(), [rec([Int(2), Int(2)])])])
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, ew_level(ReadCommitted)))
+    val gone = envelope([], Delete(cat_q("doc"), "d", None, None, Some(eq(col("d", "id"), ew_lit(2))), buf[Item]()))
+    assert_eq(a.kinds_of(1, gone), "header complete")
+
+    // The job reads doctor 2 at its snapshot, where it still is.
+    val txid = ej_txid(b.seen(b.send(ej_begin_msg())))
+    assert_eq(b.kinds_of(1, ej_ref_fk()), "header complete")
+    b.seen(b.send(Commit(1)))
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint succeeded")
+
+    // a deleted a row the new foreign key references (§6.4 rule 3).
+    assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T1004")
+
+@test
+a_dangling_row_uncommitted_when_the_foreign_key_s_job_ran_aborts_at_its_commit()
+    val e = ew_doctors()
+    ew_setup(e, [ew_table("ref", ej_ref_fields(), "id")])
+    var a = ew_duo(e)
+    var b = ew_duo(e)
+    a.send(Begin(1, ew_level(Snapshot)))
+    assert_eq(a.kinds_of(1, ew_insert("ref", ej_ins_fields(), [rec([Int(1), Int(99)])])), "header complete")
+
+    // The job does not see a's row and succeeds; a did not see the foreign key, and cannot commit.
+    val txid = ej_txid(b.seen(b.send(ej_begin_msg())))
+    assert_eq(b.kinds_of(1, ej_ref_fk()), "header complete")
+    b.seen(b.send(Commit(1)))
+    assert_eq(ej_rows(ej_jobs(e, txid)), "validate_constraint succeeded")
+    assert_eq(ew_error(a.seen(a.send(Commit(1)))).entries[0].code, "T1004")

@@ -239,7 +239,7 @@ impl MemCatalog
         for c in columns
             self.check_generated(columns, c)?
 
-        self.tables.push(CatTable(oid, ns, name.name, who, columns, buf[u32](), u32(defs.len() + 1), items_of([SchemaVersion(1, columns.copy())])))
+        self.tables.push(CatTable(oid, ns, name.name, who, columns, buf[u32](), u32(defs.len() + 1), items_of([SchemaVersion(1, columns.copy(), buf[u32]())])))
         val ti = self.tables.len() - 1
         val ids = self.column_ids(ti, pk)?
         self.check_key_columns(ti, ids, true)?
@@ -248,7 +248,7 @@ impl MemCatalog
         val pkey = s"${name.name}_pkey"
         if !self.name_free(ns, pkey) then return fail("Q6002", s"'$pkey', the primary key's name, is already used")
         val coid = self.oid()
-        self.constraints.push(CatConstraint(coid, oid, pkey, ConPrimaryKey(ids), true, false, 0))
+        self.constraints.push(CatConstraint(coid, oid, pkey, ConPrimaryKey(ids), true, false, 0, None))
 
         for c in cons
             c.body match
@@ -276,7 +276,7 @@ impl MemCatalog
                 check_condition(*self, t.columns, e)?
                 self.usable_sequences(e, who)?
                 val coid = self.oid()
-                self.constraints.push(CatConstraint(coid, t.oid, def.name, ConCheck(e), created, !created && !deferring, 0))
+                self.constraints.push(CatConstraint(coid, t.oid, def.name, ConCheck(e), created, !created && !deferring, 0, None))
             Unique(names) ->
                 val ids = self.column_ids(ti, names)?
                 self.check_key_columns(ti, ids, false)?
@@ -288,7 +288,7 @@ impl MemCatalog
                     keys.push(CatKey(KeyOn(id), false))
 
                 self.indexes.push(CatIndex(ioid, t.oid, def.name, true, keys, None, if created then IndexReady else IndexBuilding, coid))
-                self.constraints.push(CatConstraint(coid, t.oid, def.name, ConUnique(ids), created, !created && !deferring, ioid))
+                self.constraints.push(CatConstraint(coid, t.oid, def.name, ConUnique(ids), created, !created && !deferring, ioid, None))
             ForeignKey(names, target, ref_names, on_delete, on_update, deferred) ->
                 val ids = self.column_ids(ti, names)?
                 val ri = self.referenced_table(ti, target, who)?
@@ -307,7 +307,7 @@ impl MemCatalog
 
                 val coid = self.oid()
                 val kind = ConForeignKey(ids, self.tables[ri].oid, ref_ids, on_delete, on_update, deferred)
-                self.constraints.push(CatConstraint(coid, t.oid, def.name, kind, created, !created && !deferring, 0))
+                self.constraints.push(CatConstraint(coid, t.oid, def.name, kind, created, !created && !deferring, 0, None))
 
         Ok(())
     end add_constraint

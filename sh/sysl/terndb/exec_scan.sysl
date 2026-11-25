@@ -155,14 +155,24 @@ private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filt
         None -> return view_op(d, table, elem, ctx)
 
     val ct = d.store.catalog.tables[i]
-    store_scan(d, ct.oid, elem, read_pred(d, ct, items_of([binder]), elem, filter, ctx), access_of(d, ct, binder, kept, ctx))
+    val logged = read_pred(d, ct, items_of([binder]), elem, filter, ctx)
+    // The rows reach nothing but the operators above the scan, so the columns the statement reads
+    // through the binder are all of them it needs decoded.
+    val columns = if logged.every then None else Some(logged.columns)
+    store_scan(d, ct.oid, elem, logged, access_of(d, ct, binder, kept, ctx), columns)
 
-/** A `ScanOp` of table `oid` reading the keys `access` allows, its read logged as `logged`. */
-private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access) -> &Operator =
-    ScanOp(d.store, d.txn, oid, elem, logged, access, buf[ColumnVector](), false, 0)
+/** A `ScanOp` of table `oid` reading the keys `access` allows, or an `IndexScanOp` reading the rows
+ * its range of a secondary index names (`exec_access.sysl`), its read logged as `logged`. Either
+ * decodes only the non-key columns `columns` names by id (every column when none).
+ */
+private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access, columns: Option[Buf[u32]]) -> &Operator
+    if access.path == IndexRange then return index_scan_op(d, oid, elem, logged, access, columns)
+    ScanOp(d.store, d.txn, oid, elem, logged, access, columns, buf[ColumnVector](), false, 0)
 
 /** A table's rows visible to `txn` in the key range of its access path, read from the store on the
- * first pull, all at once and in key order, and handed up in batches of `BatchSize`.
+ * first pull, all at once and in key order, straight into vectors (`Store.scan_vectors`), and handed
+ * up in batches of `BatchSize`. A non-key column `columns` does not name is not decoded: its slots
+ * hold its type's placeholder.
  */
 struct ScanOp
     store: &Store
@@ -171,6 +181,7 @@ struct ScanOp
     elem: Type
     logged: Pred
     access: Access
+    columns: Option[Buf[u32]]
     batches: Buf[ColumnVector]
     read: bool
     at: usize
@@ -179,13 +190,7 @@ impl Operator for ScanOp
     next_batch(*self) -> Result[Option[ColumnVector], CodecError]
         if !self.read
             self.read = true
-            val hits = self.store.scan_range(self.txn, self.oid, self.access.lo, self.access.hi, self.logged)?
-            val rows = buf[Value]()
-
-            for h in hits
-                rows.push(h.row.value)
-
-            self.batches = batches_of(vector_of(self.elem, rows.view()))
+            self.batches = self.store.scan_vectors(self.txn, self.oid, self.access.lo, self.access.hi, self.logged, self.elem, self.columns)?
 
         while self.at < self.batches.len()
             val b = self.batches[self.at]

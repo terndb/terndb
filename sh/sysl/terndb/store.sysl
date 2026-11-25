@@ -82,7 +82,7 @@ struct SchemaCodec
 
 /** A table's place in the store: its oid, its primary key's columns (every table has one, `Q6009`)
  * and their record type, the key's encoding (§4.6, each component ascending), the codec of each
- * schema version a row has been written in, and its secondary unique keys. Its rows are the
+ * schema version a row has been written in, and its secondary indexes. Its rows are the
  * table's B+tree in the store's `UndoRows`.
  */
 struct TableData
@@ -91,7 +91,7 @@ struct TableData
     key_type: Type
     key_spec: Buf[KeyColumn]
     codecs: Buf[SchemaCodec]
-    uniques: Buf[&UniqueIx]
+    indexes: Buf[&SecIndex]
 
 /** One row a transaction wrote: its key, the newest committed image it replaced and the image it
  * installed (§4.3 `before(w)` and `after(w)`); `None` is absent or deleted.
@@ -218,10 +218,21 @@ struct Store
     released: u64
     /** Every job a commit started, oldest first, with how it ended (`store_jobs.sysl`). */
     jobs: Buf[JobRecord]
-    /** How many leaf entries the executor's scans have visited (`scan_range`): what a test reads to
-     * know a scan read only the key range its filter allows.
+    /** How many leaf entries the executor's scans have visited (`scan_range`), and the referencing
+     * check's passes over a whole table (`referencing`): what a test reads to know a scan read only
+     * the key range its filter allows, and that a read through an index made no pass at all.
      */
     slots_read: u64
+    /** What the reads have built and decoded (`store_scan.sysl`): what a test reads to know a scan's
+     * cost per row.
+     */
+    reads: &ReadWork
+    /** How many secondary-index entries reads through an index have visited (`scan_index`,
+     * `referencing`).
+     */
+    entries_read: u64
+    /** How many rows reads through an index have fetched by their keys. */
+    rows_fetched: u64
 
     /** A transaction at `level`, with its snapshot `s = h` (§4.1). */
     begin(*self, level: Isolation, read_only: bool = false) -> &Txn
@@ -413,11 +424,11 @@ struct Store
 
         for s in self.slots_of(d)?
             self.visible(d, s, t.snapshot, t.id)? match
-                Some(r) -> if f(r) then out.push(Hit(s.key, self.translated(table, r)?))
+                Some(r) -> if f(r) then out.push(Hit(s.key, r))
                 None -> ()
 
         self.log_read(t, table, p, None)
-        Ok(out)
+        self.translated_hits(table, out)
 
     private[terndb] get_in(*self, t: &Txn, table: u64, key: Value) -> Result[Option[StoredRow], CodecError]
         live(t)?
@@ -432,21 +443,23 @@ struct Store
             Some(r) -> Ok(Some(self.translated(table, r)?))
             None -> Ok(None)
 
-    private scan_range_in(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred) -> Result[Buf[Hit], CodecError]
+    private[terndb] scan_range_in(*self, t: &Txn, table: u64, lo: KeyBound, hi: KeyBound, logged: Pred) -> Result[Buf[Hit], CodecError]
         live(t)?
         val d = self.table_data(table)?
         val out = buf[Hit]()
 
         for r in self.rows.table_rows(d.oid, lo, hi)?
             self.slots_read += 1
+            self.reads.copied += 1
+            self.reads.images += 1
             val s = Slot(self.key_value(d, r.key.view())?, r.key, r.row)
 
             self.visible(d, s, t.snapshot, t.id)? match
-                Some(r) -> out.push(Hit(s.key, self.translated(table, r)?))
+                Some(r) -> out.push(Hit(s.key, r))
                 None -> ()
 
         self.log_read(t, table, logged, None)
-        Ok(out)
+        self.translated_hits(table, out)
 
     // A read is logged only by a serializable transaction not declared read-only (§4.3, §5.5).
     private[terndb] log_read(*self, t: &Txn, table: u64, p: Pred, key: Option[Value])
@@ -742,7 +755,8 @@ struct Store
         Ok(kb)
 
     /** The key a tree entry's key bytes `kb` encode, as a record. */
-    private key_value(self, d: &TableData, kb: []const u8) -> Result[Value, CodecError] =
+    private[terndb] key_value(self, d: &TableData, kb: []const u8) -> Result[Value, CodecError]
+        self.reads.values += u64(d.key_spec.len())
         Ok(Record(decode_key(d.key_spec.view(), kb)?))
 
     /** The codec of schema version `schema` of `d`, made from the installed catalog's column list the
@@ -841,9 +855,11 @@ struct Store
                 Some(i) -> out.push(parts[i])
                 None ->
                     val col = img.cols[k]
+                    if !col.is_null then self.reads.values += 1
                     out.push(if col.is_null then Value.Null else decode_value(c.types[k], col.bytes.view())?)
                     k += 1
 
+        self.reads.rows += 1
         Ok(Some(StoredRow(u64(img.header.schema_version), Record(out))))
 
     /** Every row of `d` in key order, ghosts included, as the leaf holds it now. */
@@ -937,16 +953,22 @@ struct Store
 
         self.rows.purge(low)
 
-    private current_version(self, oid: u64) -> u64 = self.catalog.table_by_oid(oid) match
+    private[terndb] current_version(self, oid: u64) -> u64 = self.catalog.table_by_oid(oid) match
         Some(i) -> self.catalog.tables[i].schema_version()
         None -> 0
 
     /** `r` as a row of the current schema version of table `oid` in the installed catalog (`ddl.md`
      * §5.3), each column matched by id: one present in `r`'s version converted through every retype
-     * since (`translate.sysl`); one added since reads its fill (a literal, else null); one dropped
-     * since is skipped. A value that does not convert is `data_corrupted` (`D1001`).
+     * since, by the conversion a retype recorded where a version completes one (`translate.sysl`);
+     * one added since reads its fill (a literal, else null); one dropped since is skipped. A value
+     * that does not convert is `data_corrupted` (`D1001`), whatever the conversion raised.
      */
-    private[terndb] translated(self, oid: u64, r: StoredRow) -> Result[StoredRow, CodecError]
+    private[terndb] translated(self, oid: u64, r: StoredRow) -> Result[StoredRow, CodecError] = as_read(self.converted(oid, r))
+
+    /** `translated`, with a recorded conversion that fails answering its own error: what a
+     * `convert_column` job and reconciliation report (`ddl.md` §8.5 "Failure", §6.4 rule 2).
+     */
+    private[terndb] converted(self, oid: u64, r: StoredRow) -> Result[StoredRow, CodecError]
         val now = self.current_version(oid)
         if r.schema == now || now == 0 then return Ok(r)
 
@@ -954,32 +976,40 @@ struct Store
             Some(i) -> i
             None -> return Ok(r)
 
-        val from = self.columns_at(oid, r.schema) match
-            Some(c) -> c
-            None -> return fail("D1001", "the row is not encoded in a schema version of its table")
+        val one = buf[StoredRow]()
+        one.push(r)
+        Ok(StoredRow(now, translated_rows(self.catalog, self.catalog.tables[i], one)?[0]))
 
-        val fields = r.value match
-            Record(fs) -> fs
-            _ -> return fail("D1001", "a stored row is not a record")
+    /** `hits`, rows of table `oid`, each `translated`, together: a recorded conversion is evaluated
+     * once over every row of one version.
+     */
+    private translated_hits(self, oid: u64, hits: Buf[Hit]) -> Result[Buf[Hit], CodecError]
+        val now = self.current_version(oid)
+        var old = false
 
-        val to = self.columns_at(oid, now) match
-            Some(c) -> c
-            None -> return Ok(r)
+        for h in hits
+            if h.row.schema != now then old = true
 
-        val out = buf[Value]()
+        if !old || now == 0 then return Ok(hits)
 
-        for c in to
-            var v = fill_of(c.fill)
+        val i = self.catalog.table_by_oid(oid) match
+            Some(i) -> i
+            None -> return Ok(hits)
 
-            for j in 0..<from.len()
-                if from[j].id == c.id && j < fields.len() then v = translated_column(self.catalog, self.catalog.tables[i], c.id, r.schema, fields[j])?
+        val rows = buf[StoredRow]()
 
-            out.push(v)
+        for h in hits
+            rows.push(h.row)
 
-        Ok(StoredRow(now, Record(out)))
-    end translated
+        val vs = as_read(translated_rows(self.catalog, self.catalog.tables[i], rows))?
+        val out = buf[Hit]()
 
-    private columns_at(self, oid: u64, schema: u64) -> Option[Buf[CatColumn]]
+        for n in 0..<hits.len()
+            out.push(Hit(hits[n].key, StoredRow(now, vs[n])))
+
+        Ok(out)
+
+    private[terndb] columns_at(self, oid: u64, schema: u64) -> Option[Buf[CatColumn]]
         val i = self.catalog.table_by_oid(oid)?
 
         for v in self.catalog.tables[i].versions
@@ -1058,14 +1088,16 @@ struct Store
         self.history = kept
 end Store
 
-/** The value a row of an older version reads for a column added since: its fill. */
-private fill_of(fill: Option[Expr]) -> Value = fill match
-    Some(Literal(_, v)) -> v
-    _ -> Null
+/** `r`, a translation, as a reader takes it: translation does not fail on a row its job proved, so a
+ * conversion that fails is `data_corrupted` (`D1001`, `ddl.md` §5.3 rule 1).
+ */
+private as_read[T](r: Result[T, CodecError]) -> Result[T, CodecError] = r match
+    Ok(v) -> Ok(v)
+    Err(e) -> if e.code == "D1001" then Err(e) else fail("D1001", s"a stored value does not convert to its column's type (${e.code}: ${e.message})")
 
 /** A store over `catalog`'s tables, empty. */
 mem_store(catalog: MemCatalog) -> &Store =
-    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf(), 0)
+    Store(catalog, Faults(false, false, false, false), 1, 0, buf(), undo_rows(), buf(), buf(), catalog_versions(catalog), 0, buf(), 0, no_reads(), 0, 0)
 
 /** `value` as a row of `table` in its current schema version. */
 store_row(s: &Store, table: u64, value: Value) -> StoredRow

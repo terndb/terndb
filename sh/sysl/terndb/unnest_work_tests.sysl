@@ -88,7 +88,7 @@ private uw_tables(n: i128) -> [3]XnTable
 struct UwRun
     result: Result[(Type, Buf[Value]), CodecError]
     pairs: u64
-    sorted: u64
+    hashed: u64
     fallbacks: usize
 
 /** `q` over `ts`, unnested or per row. */
@@ -116,7 +116,7 @@ private uw_run(q: Envelope, ts: []const XnTable, unnest: bool) -> UwRun
             Ok((typing.result.unwrap(), out))
         Err(e) -> Err(e)
 
-    UwRun(result, ctx.work.pairs, ctx.work.sorted, fallbacks)
+    UwRun(result, ctx.work.pairs, ctx.work.built + ctx.work.probed, fallbacks)
 
 /** `q` over `ts` unnested, with nothing kept per row, agreeing with its per-row run; the unnested run. */
 private uw_agree(q: Envelope, ts: []const XnTable, what: string, file: string = __FILE__, line: long = __LINE__) -> UwRun
@@ -183,9 +183,13 @@ private uw_shape(name: string) -> Envelope
 /** How many pairs a shape may test per row its tables hold. */
 private const UwPairsPerRow: u64 = 4
 
+/** How many rows a shape's joins may hash, built or probed, per row its tables hold. */
+private const UwHashedPerRow: u64 = 8
+
 private uw_bounded(name: string, n: u64, r: UwRun, file: string, line: long)
     val rows = 31 * n
     assert(r.pairs <= UwPairsPerRow * rows, s"$name over $n users: ${r.pairs} pairs for $rows rows", file, line)
+    assert(r.hashed <= UwHashedPerRow * rows, s"$name over $n users: ${r.hashed} rows hashed for $rows rows", file, line)
 
 /** `name` over 100 and 1000 users (31 times as many rows): the result agrees with the per-row run at
  * the smaller size, and at both the pairs tested stay under `UwPairsPerRow` per table row and grow at

@@ -416,10 +416,11 @@ impl Store
     end commit_catalog
 
     /** Reconciliation (`ddl.md` §6.4): for each table `t` wrote whose definition a commit changed after
-     * `t`'s oldest statement planned, the unique keys added since are checked for `t`'s rows. The
-     * other work of §6.4 — checking a check, not-null or referencing foreign-key constraint added
-     * since, or computing a column added since whose default is not its fill — is not done by this
-     * store, which aborts such a transaction with `schema_changed` instead (`docs/design/engine.md`).
+     * `t`'s oldest statement planned, the guard of every conversion completed since is checked on
+     * `t`'s rows, and then the unique keys added since. The other work of §6.4 — checking a check,
+     * not-null or referencing foreign-key constraint added since, or computing a column added since
+     * whose default is not its fill — is not done by this store, which aborts such a transaction with
+     * `schema_changed` instead (`docs/design/engine.md`).
      */
     private reconcile(*self, t: &Txn, c: &TxnCatalog, newest: MemCatalog) -> Result[unit, CodecError]
         val old = self.base_at(c.low).catalog
@@ -442,10 +443,26 @@ impl Store
                 if !reconcilable(old, newest, newest.tables[i], changed) then
                     return fail("T1004", "a DDL statement committed during the transaction changed a table it wrote in a way this store does not reconcile")
 
+                self.reconcile_conversions(t, oid)?
                 self.reconcile_uniques(t, oid)?
 
         Ok(())
     end reconcile
+
+    /** The guards of the conversions of `table` completed since `t` planned (`ddl.md` §6.4 rule 2,
+     * §8.5 rule 2): every row `t` inserted or updated there, in a version older than one that
+     * completes a conversion, must read through it, as the job proved of every committed row. A
+     * conversion that fails aborts `t` with its own code.
+     */
+    private reconcile_conversions(*self, t: &Txn, table: u64) -> Result[unit, CodecError]
+        for w in t.writes
+            if w.table == table
+                w.after match
+                    Some(r) ->
+                        val _ = self.converted(table, r).map_err(e -> refusal(e.code, s"a row the transaction wrote fails the conversion of a column retyped during it: ${e.message}", []))?
+                    None -> ()
+
+        Ok(())
 
     /** The catalog side of `t`'s commit at `c`: its merged catalog is published at `c`, and every key
      * it locked is recorded as changed at `c`.

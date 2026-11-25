@@ -35,23 +35,49 @@ and the undo check over everything the store holds; `store_pages_tests.sysl` exe
 - **Limits.** A key over 1,024 bytes is `key_too_long` (`D2001`). A row whose key and value exceed 4,000 bytes
   would need columns out of line in overflow chains (§4.7–§4.8), which wait on sysl 0.12 (CRC32C), so it is
   refused with `entry_too_large` (`D2002`) before any undo record is written; nothing is approximated.
-- **`UniqueIx`** (`store_index.sysl`) is one secondary unique key of a table — a `unique` constraint, or a unique
-  index `building` or `ready`, partial or over expressions (`enforced_keys`): a `Buf[IxEntry]` sorted by the key's
-  value (then by primary key), each entry a value with no null component that some version of a row holds, and the
-  row's primary key. A value with a null component, or a version the predicate is not true of, never conflicts and
-  has no entry (Q48; on disk such an entry takes the non-unique form, §4.9 rule 1). An entry is added whenever a
-  version is installed and never removed; a lookup fetches the row and reads its versions to decide whether the
-  value is still there, as §4.9 rule 2 has a reader do. A plain key (columns only, no predicate) reads a version's
-  entry from its image; any other evaluates its predicate and expression components over the version as a row of
-  the current schema version (`ix_values`), the versions installed since the last check together. `sync_uniques`
-  brings a table's indexes in line with the catalog before each check, building a key added since from every
-  version of every row still reachable, so a `building` index holds every row's entry from its creation (Q71).
-- **Jobs** (`store_jobs.sysl`, `ddl.md` §7): the commit of a transaction that ran DDL runs the `build_index` jobs it
-  started before it returns — one per index left `building` that backs no constraint, and one per `unique`
-  constraint whose validation is due — each in an internal read committed transaction at the newest snapshot that
-  checks no two visible rows share a value and commits the index `ready` (and the constraint validated), or
-  `failed`: a failed index is dropped, a failed constraint's index kept with the constraint not validated. Each
-  job's `JobRecord` (`Store.jobs_of`) holds how it ended.
+- **`SecIndex`** (`store_index.sysl`) is one secondary index of a table — a `unique` constraint's, or an index
+  `building` or `ready`, unique or not, partial or over expressions (`maintained_indexes`): a `Buf[IxEntry]` sorted
+  by the components' value (then by primary key), each entry a value some version of a row holds, null components
+  included, and the row's primary key. A version the predicate is not true of has no entry; a value with a null
+  component has one but never conflicts (Q48; on disk such an entry takes the non-unique form, §4.9 rule 1). An
+  entry is added whenever a version is installed and never removed; a lookup fetches the row and reads its
+  versions to decide whether the value is still there, as §4.9 rule 2 has a reader do. A plain index (columns
+  only, no predicate) reads a version's entry from its image; any other evaluates its predicate and expression
+  components over the version as a row of the current schema version (`ix_values`), the versions installed since
+  the last check together, and a row one of whose versions they cannot be evaluated over joins `unindexed`, which
+  every read through the index fetches. `sync_indexes` brings a table's indexes in line with the catalog before
+  each check and read, building an index added since from every version of every row still reachable, so a
+  `building` index holds every row's entry from its creation (Q71), and records whether each is `ready`: only a
+  ready one answers a read (`ddl.md` §2.5 rule 5). Only a unique one is checked by writers. A column whose
+  conversion a later schema version completed (`SchemaVersion.completes`) is read for an entry from the row
+  translated to the current version, so every entry is of the column's current type; `SecIndex.converted` records
+  the newest such version when the entries were computed, and `sync_indexes` computes an index again, unique or
+  not, once a conversion completes or is undone.
+- **Jobs** (`store_jobs.sysl`, `ddl.md` §7): the commit of a transaction that ran DDL runs the jobs it started
+  before it returns (§7 rule 7), each in an internal read committed transaction at the newest snapshot that
+  commits under a number of its own. First the `build_index` jobs — one per index left `building` that backs no
+  constraint, and one per `unique` constraint whose validation is due — each checking that no two visible rows
+  share a value and committing the index `ready` (and the constraint validated), or `failed`: a failed index is
+  dropped, a failed constraint's index kept with the constraint not validated. Then a `validate_constraint` job per
+  check or foreign-key constraint whose validation is due (§8.7): it reads every row visible at its snapshot in key
+  order, evaluates a check over it as a definition expression (null passes) or looks up a foreign key's referenced
+  row at the same snapshot (a value with a null component is not checked), takes no row locks, and commits the
+  constraint validated, or on the first violating row fails with `T3002`/`T3003` (or the error a check raised)
+  naming that row's key, the constraint left not validated and enforced. The check `set_nullable` false adds
+  (`CatConstraint.not_null`, §8.6) is dropped either way, and on success its column becomes non-null in a new
+  schema version. A writer the job did not see is the reconciliation's (§6.4), which for a check or foreign key
+  is `schema_changed`. Last, one **`convert_column`** job (`ddl.md` §8.5 rule 2) runs per column left
+  `converting`, other than a primary-key column: in an internal read committed transaction at the newest snapshot
+  it builds the catalog its final transaction would publish — the column `ready` in its target type, in a new
+  schema version whose `SchemaVersion.completes` names the column — and, with that catalog installed, translates
+  every row it sees through it (the guard) and checks every unique index of the table for a value held twice (the
+  replacement indexes). If both hold it publishes that catalog; else it publishes the column `ready` in its old
+  type in a new version that completes nothing, and records the failure: the conversion's own code with a message
+  naming the first failing row's key, or `unique_violation`. Rows are never rewritten. The job's object is the
+  table. A job's final catalog is a clone of the one the DDL committed, which stays as it was. Each job's
+  `JobRecord` (`Store.jobs_of`) holds how it ended, and `Store.await_jobs` makes the `AwaitJobs` relation of them
+  (`ddl.md` §3.2 rule 4); since every job has ended when its commit returns, `AwaitJobs` never waits, and no job
+  is ever `queued`, `running` or `cancelled`.
 
 ## Version chains and visibility
 
@@ -83,7 +109,22 @@ version older than the newest committed image's aborts with `schema_changed` (`d
   and `hi`, and logs `logged` whatever the range, even an empty one; `scan_rows(t, table, logged)` is the whole
   range. The executor chooses the range from its filter (`executor.md` §4.6) and filters the rows itself,
   vectorised, so the predicate's closure runs only in validation. `slots_read` counts the leaf entries these
-  scans visit, for the tests that an access path reads only its range.
+  scans visit (and the referencing check's whole-table passes), for the tests that an access path reads only its
+  range.
+- **`scan_vectors(t, table, lo, hi, logged, elem, columns)`** is the same read, logged the same way, answered
+  as vectors of `elem` of at most `BatchSize` rows, decoding only the non-key columns `columns` names (all when
+  none): what `ScanOp` calls (`executor.md` §4.5). `reads` (`ReadWork`) counts what the reads build and
+  decode — leaf entries copied, images, `StoredRow`s, values, columns decoded into lanes, columns skipped —
+  for the tests that pin a scan's cost per row.
+- **`scan_index(t, table, index, lo, hi, logged)`** answers the rows visible to `t` that the entries of secondary
+  index `index` between `lo` and `hi` name (`IxBound`: the leading components compared as values, inclusive or
+  not), in key order, each once, and logs `logged` as `scan_range` does. Each row is fetched by its key and read at
+  `t`'s snapshot; one whose visible version's own entry lies outside the range is dropped, one whose visible
+  version has no entry, and every `unindexed` row, is left to the executor's filter (`executor.md` §4.6).
+  `entries_read` and `rows_fetched` count the entries visited and the rows fetched by key.
+  **`scan_index_vectors(t, table, index, lo, hi, logged, elem, columns)`** is the same read answered as
+  `scan_vectors` answers its rows, decoding only the non-key columns `columns` names: what `IndexScanOp`
+  calls (`executor.md` §4.6 "Decoding").
 - **`write_rows(t, table, changes)`** applies one statement's writes, each a `RowChange`: `Put` a new row (an
   insert, under §4.2 rule 4), `Replace` or `Remove` the row of a key the statement read. It answers `Wait`
   before writing any of them if one key is locked, so a waited statement leaves no trace. The executor orders
@@ -134,7 +175,11 @@ the statement or a cascade wrote, the referencing values it wrote are checked (o
 values it removed or changed run their key's action — `restrict` at once, `cascade`, `set_null` and
 `set_default` as writes of the referencing rows (their generated columns recomputed and constraints checked) that
 join the work list, so a cascade reaches any depth; `no_action` is checked once every action has run. The
-referencing scan is one pass over the referencing table for all of a batch's values, binary-searched.
+referencing rows of a batch's values are found through a `ready` index with no predicate whose leading components
+are the referencing columns in order, when there is one: its entries for each value name every row some version of
+which holds it, and each row is fetched by key, once, in key order, and judged exactly as the pass judges it.
+Without such an index the referencing scan is one pass over the referencing table for all of the values,
+binary-searched.
 
 `update_where` and `delete_where`, which take the change as a closure, serve the store's own tests: a closure
 cannot fail, and the executor's changes can.
@@ -215,7 +260,17 @@ anomaly check is shown able to fail; a real store has both on.
   null), one dropped since skipped, and one present converted through each retype between, in order
   (`translate.sysl`; tests `translate_tests.sysl`). A scalar step is the strict cast of `exec_functions.sysl`; a
   record, union or relation converts by position, a record value short of its named type's fields reading the
-  fills the type keeps (`CatType.fills`). A value that does not convert is `D1001`.
+  fills the type keeps (`CatType.fills`). A version that completes a column's conversion is the one step that is
+  no cast: the column takes the conversion the version before records (`using`, or the strict cast its retype
+  recorded), evaluated as a definition expression over the row as that version holds it, once for all the rows
+  of one version a scan returns. A value that does not convert is `D1001`. The unique keys and foreign keys read
+  a row's key columns straight from its image unless a later version completed the conversion of one of them,
+  when they read it translated (`image_values`); a unique key is computed again whenever the newest version that
+  completes a conversion changes (`UniqueIx.converted`).
+- **Reconciliation of conversions.** A writer committing after a conversion it did not see completed has each row
+  it inserted or updated translated through it; a row the conversion fails on aborts the writer with the
+  conversion's code (`ddl.md` §6.4 rule 2). The executor checks the guard of a `converting` column on every write
+  of the retyping transaction itself (`exec_dml.sysl` `check_rows`), with the conversion's code.
 - **Ending.** Commit publishes the transaction's merged catalog at its commit number and records each key it
   locked as changed there; any end releases its keys. A version older than the one the oldest live transaction
   sees is dropped, and with it the rows of every table no retained catalog, no live view and the installed
@@ -237,7 +292,8 @@ per-row latches and a real wait) is the next slice of this work.
 
 ## Deferred
 
-- Disk, WAL, the buffer manager and recovery (waiting on sysl's CRC32C and io_uring gaps); `transaction_status`.
+- Disk, WAL and recovery (waiting on sysl's io_uring gap); `transaction_status`. The buffer pool exists as a
+  component (`buffer.md`) and is not yet under the store.
 - `max_predicate_log` coarsening, `max_snapshot_age` and `undo_retention_limit`.
 - Overflow chains (§4.7–§4.8, waiting on sysl 0.12's CRC32C): until then a row over the inline limit is refused
   with `entry_too_large`.
@@ -248,9 +304,6 @@ per-row latches and a real wait) is the next slice of this work.
 - Translation of a value whose representation a lossless retype changes other than integer to float (to
   `decimal`, `json` to `text`); the commit latch of `ddl.md` §6.1 rule 3, which a single-threaded store does not
   need.
-- Non-unique secondary indexes, and unique indexes with a predicate or an expression component: those need the
-  executor's evaluator inside the store, so such an index enforces nothing in the in-memory store yet. A
-  referencing scan is therefore a full scan of the referencing table. Check and NOT NULL constraints are checked
-  by the executor (`executor.md` §4.5).
+- Check and NOT NULL constraints are checked by the executor (`executor.md` §4.5), not by the store.
 - A shared `LOCK_ONLY` mode (`ddl.md` §11 question 2): concurrent inserts referencing one row serialize on it.
 - Term bits in transaction ids and commit numbers (`replication.md` §1.4).

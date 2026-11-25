@@ -23,12 +23,27 @@ struct UnnestPlan
     typing: Typing
     fallbacks: Buf[string]
 
-/** `env`, typed by `typing`, unnested and type-checked again against `catalog`; `params` are the
- * values a `Limit` reads its count from. If the unnested tree does not type to the original's result
- * type, the original is kept whole and the reason is among the fallbacks.
+/** `env`, typed by `typing`, unnested, its conjuncts pushed down (`plan_pushdown.sysl`), and type-checked
+ * again against `catalog`; `params` are the values a `Limit` reads its count from. If the pushed-down
+ * tree does not type to the original's result type, the unnested one is tried, and if that does not
+ * either, the original is kept whole; each reason is among the fallbacks.
  */
 unnest_plan(env: Envelope, typing: Typing, catalog: &Catalog, params: Buf[Value]) -> UnnestPlan
     val (out, fallbacks) = unnest_query(env, typing, params)
+    val pushed = push_query(out, catalog)
+
+    // An outer join made inner makes the columns it null-extended non-null, so the pushed tree's type may
+    // be the query's with fewer nullable types; its rows are the query's, sent under the query's type.
+    if pushed.statement != out.statement
+        type_envelope(pushed, catalog) match
+            Ok(t) ->
+                if t.result == typing.result then return UnnestPlan(pushed, t, fallbacks)
+
+                if t.result.is_some() && typing.result.is_some() && coerces(t.result.unwrap(), typing.result.unwrap())
+                    return UnnestPlan(pushed, Typing(typing.result, t.nodes), fallbacks)
+
+                fallbacks.push("the pushed-down tree's type differs from the query's")
+            Err(e) -> fallbacks.push(s"the pushed-down tree is refused: ${e.code} ${e.message}")
 
     if out.statement == env.statement then return UnnestPlan(env, typing, fallbacks)
 
