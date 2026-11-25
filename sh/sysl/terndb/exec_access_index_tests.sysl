@@ -1,0 +1,892 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// Secondary indexes as access paths (`exec_access.sysl`, `Store.scan_index`, `docs/design/executor.md`
+// §4.6): a filter's comparisons of an index's leading components with fixed values narrow a scan to a
+// range of the index's entries, whose rows are fetched by key and read at the snapshot. Each case
+// checks the rows against what a full scan returns and counts what the read did — leaf entries visited
+// (`Store.slots_read`), index entries visited (`entries_read`) and rows fetched by key
+// (`rows_fetched`) — so a read that quietly fell back to a full scan fails. The differential test at
+// the end compares random predicates with the same predicate made unusable for narrowing.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+/** A store whose catalog holds the namespace `app` and nothing else. */
+private ax_empty() -> &Store = mem_store(cat_ok(mem_catalog(), CreateNamespace("app", false)))
+
+/** The tree of SQL statement `text`, over the store's newest catalog with `app` as the default schema. */
+private ax_env(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope
+    sql_statements(text, "app", s.latest_catalog()) match
+        Ok(sts) -> sts[0].action match
+            SqlTree(env) -> return env
+            SqlControl(_) -> ()
+        Err(e) -> print(s"\n$text\n  -> ${e.code} ${e.message}\n")
+
+    assert(false, "the statement translates", file, line)
+    panic("untranslated")
+
+/** Runs DDL statement `text` in `t`, which must accept it. */
+private ax_ddl_in(s: &Store, t: &Txn, text: string, file: string = __FILE__, line: long = __LINE__)
+    s.enter(t).unwrap()
+
+    s.ddl(t, ax_env(s, text, file, line), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+/** Runs DDL statement `text` in a transaction of its own, which commits and so runs its jobs. */
+private ax_ddl(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    ax_ddl_in(s, t, text, file, line)
+    val _ = st_commit(s, t, file, line)
+
+/** The outcome of `text` in `t`, run over `t`'s catalog; it must run. */
+private ax_run(s: &Store, t: &Txn, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Executed
+    s.enter(t).unwrap()
+    xd_ran(s, t, ax_env(s, text, file, line), params, file, line)
+
+/** The code `text` fails with in `t`, "ok" when it runs. */
+private ax_code(s: &Store, t: &Txn, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> string
+    s.enter(t).unwrap()
+    xd_code(s, t, ax_env(s, text, file, line), params)
+
+/** Runs `text` in a transaction of its own, which commits. */
+private ax_ok(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    val _ = ax_run(s, t, text, [], file, line)
+    assert(s.commit(t).is_ok(), "the transaction commits", file, line)
+
+/** The first column of each row of `o`, in order. */
+private ax_first(o: Executed) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in xd_rows(o)
+        r match
+            Record(fs) -> out.push(ax_int(fs[0]))
+            _ -> out.push(-997)
+
+    out
+
+private ax_int(v: Value) -> i128 = v match
+    Int(n) -> n
+    UInt(n) -> i128(n)
+    Null -> -999
+    _ -> -998
+
+/** The first column of each row `text` answers in `t`. */
+private ax_read(s: &Store, t: &Txn, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Buf[i128] =
+    ax_first(ax_run(s, t, text, params, file, line))
+
+/** `ax_read` in a snapshot transaction of its own. */
+private ax_sel(s: &Store, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> Buf[i128] =
+    ax_read(s, s.begin(Snapshot), text, params, file, line)
+
+/** What one read did: the leaf entries it visited, the index entries it visited, the rows it fetched. */
+private struct AxWork
+    slots: u64
+    entries: u64
+    fetched: u64
+
+/** What `text` did, run in `t`. */
+private ax_work_in(s: &Store, t: &Txn, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> AxWork
+    val a = s.slots_read
+    val b = s.entries_read
+    val c = s.rows_fetched
+    val _ = ax_run(s, t, text, params, file, line)
+    AxWork(s.slots_read - a, s.entries_read - b, s.rows_fetched - c)
+
+/** What `text` did, run in a snapshot transaction of its own. */
+private ax_work(s: &Store, text: string, params: []const Value = [], file: string = __FILE__, line: long = __LINE__) -> AxWork =
+    ax_work_in(s, s.begin(Snapshot), text, params, file, line)
+
+/** `text`'s rows must be `want`, read through an index: no leaf entry visited, `entries` index
+ * entries visited and `fetched` rows fetched.
+ */
+private ax_through(s: &Store, text: string, want: []const i128, entries: u64, fetched: u64, params: []const Value = [], file: string = __FILE__,
+        line: long = __LINE__)
+    xd_ids_are(ax_sel(s, text, params, file, line), want, file, line)
+    val w = ax_work(s, text, params, file, line)
+    assert_eq(w.slots, 0, s"leaf entries visited by: $text", file, line)
+    assert_eq(w.entries, entries, s"index entries visited by: $text", file, line)
+    assert_eq(w.fetched, fetched, s"rows fetched by: $text", file, line)
+
+/** `text`'s rows must be `want`, read by a full scan of `n` rows and through no index. */
+private ax_scanned(s: &Store, text: string, want: []const i128, n: u64, params: []const Value = [], file: string = __FILE__, line: long = __LINE__)
+    xd_ids_are(ax_sel(s, text, params, file, line), want, file, line)
+    val w = ax_work(s, text, params, file, line)
+    assert_eq(w.slots, n, s"leaf entries visited by: $text", file, line)
+    assert_eq(w.entries, 0, s"index entries visited by: $text", file, line)
+    assert_eq(w.fetched, 0, s"rows fetched by: $text", file, line)
+
+/** `p(id, b text?, c int64?, n text?)` keyed by `id`, with the index `p_bc (b, c)` and the unique
+ * index `p_n (n)`, both ready, and no rows.
+ */
+private ax_p_empty() -> &Store
+    val s = ax_empty()
+    ax_ddl(s, "CREATE TABLE p (id int64 PRIMARY KEY, b text, c int64, n text)")
+    ax_ddl(s, "CREATE INDEX p_bc ON p (b, c)")
+    ax_ddl(s, "CREATE UNIQUE INDEX p_n ON p (n)")
+    s
+
+/** Rows of `p` in a full scan of `ax_p()`. */
+private ax_p_rows() -> u64 = 47
+
+/** `ax_p_empty()` holding seven rows of interest and forty fillers (ids 100..=139, `b = 'f'`):
+ *
+ * | id | b    | c    | n    |
+ * |----|------|------|------|
+ * | 1  | x    | 1    | n1   |
+ * | 2  | y    | 2    | n2   |
+ * | 3  | x    | 3    | null |
+ * | 4  | null | 4    | n4   |
+ * | 5  | x    | null | n5   |
+ * | 6  | z    | 1    | null |
+ * | 7  | y    | 7    | n7   |
+ */
+private ax_p() -> &Store
+    val s = ax_p_empty()
+    ax_ok(s, "INSERT INTO p VALUES (1, 'x', 1, 'n1'), (2, 'y', 2, 'n2'), (3, 'x', 3, NULL), (4, NULL, 4, 'n4'), (5, 'x', NULL, 'n5'), (6, 'z', 1, NULL), (7, 'y', 7, 'n7')")
+    var text = "INSERT INTO p (id, b, c) VALUES "
+
+    for i in 100..<140
+        if i > 100 then text = text + ", "
+        text = text + s"($i, 'f', $i)"
+
+    ax_ok(s, text)
+    s
+
+/** The oid of index `name` in the newest catalog. */
+private ax_index(s: &Store, name: string) -> u64
+    for x in s.latest_catalog().indexes
+        if x.name == name then return x.oid
+
+    0
+
+// -- the plan chosen ---------------------------------------------------------------------------------
+
+private ax_col(name: string, ty: Type) -> TExpr = TExpr(Col("x", name), ty, buf[TExpr](), None, 0)
+
+private ax_int_lit(n: i128) -> TExpr = TExpr(Literal(Int64, Int(n)), Int64, buf[TExpr](), None, 0)
+
+private ax_text_lit(v: string) -> TExpr = TExpr(Literal(Text, Value.Text(v)), Text, buf[TExpr](), None, 0)
+
+private ax_fn(f: string, args: []const TExpr, ty: Type) -> TExpr = TExpr(Call(f, buf[Expr]()), ty, items_of(args), None, 0)
+
+private ax_cmp(f: string, a: TExpr, b: TExpr) -> TExpr = ax_fn(f, [a, b], nullable(Bool))
+
+private ax_and(a: TExpr, b: TExpr) -> TExpr = ax_fn("and", [a, b], nullable(Bool))
+
+private ax_b() -> TExpr = ax_col("b", nullable(Text))
+
+private ax_c() -> TExpr = ax_col("c", nullable(Int64))
+
+private ax_id() -> TExpr = ax_col("id", Int64)
+
+/** The access path a scan of `table` through `x` filtered by `p` takes in a new snapshot transaction. */
+private ax_access(s: &Store, table: string, p: TExpr) -> Access
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val ct = s.catalog.tables[s.catalog.table_at(cat_q(table)).unwrap()]
+    access_of(no_uses().db(s, t), ct, "x", Some(p), xe_ctx([]))
+
+@test
+an_equality_on_an_indexed_column_reads_through_its_index()
+    val s = ax_p()
+    val a = ax_access(s, "p", ax_cmp("eq", ax_b(), ax_text_lit("x")))
+    assert(a.path == IndexRange, "where b = 'x' reads p_bc")
+    assert_eq(a.index, ax_index(s, "p_bc"))
+    // From the far side of the comparison too.
+    assert(ax_access(s, "p", ax_cmp("eq", ax_text_lit("x"), ax_b())).path == IndexRange, "where 'x' = b reads p_bc")
+
+@test
+a_condition_on_a_column_no_index_leads_with_is_not_an_index_path()
+    val s = ax_p()
+    assert(ax_access(s, "p", ax_cmp("eq", ax_c(), ax_int_lit(1))).path == FullScan, "c is p_bc's second component")
+    assert(ax_access(s, "p", ax_cmp("ne", ax_b(), ax_text_lit("x"))).path == FullScan, "ne")
+    assert(ax_access(s, "p", ax_cmp("eq", ax_b(), ax_col("n", nullable(Text)))).path == FullScan, "a column is not fixed")
+
+@test
+a_whole_primary_key_lookup_is_chosen_over_every_index()
+    val s = ax_p()
+    val p = ax_and(ax_cmp("eq", ax_col("n", nullable(Text)), ax_text_lit("n1")), ax_cmp("eq", ax_id(), ax_int_lit(1)))
+    assert(ax_access(s, "p", p).path == KeyLookup, "id = 1 and n = 'n1'")
+
+@test
+a_fully_fixed_unique_index_is_chosen_over_a_primary_key_range()
+    val s = ax_p()
+    val p = ax_and(ax_cmp("gt", ax_id(), ax_int_lit(0)), ax_cmp("eq", ax_col("n", nullable(Text)), ax_text_lit("n4")))
+    val a = ax_access(s, "p", p)
+    assert(a.path == IndexRange, "id > 0 and n = 'n4'")
+    assert_eq(a.index, ax_index(s, "p_n"))
+
+@test
+the_path_fixing_more_components_is_chosen()
+    val s = ax_p()
+    // p_bc fixes two components; the primary key only bounds its one.
+    val p = ax_and(ax_cmp("gt", ax_id(), ax_int_lit(0)), ax_and(ax_cmp("eq", ax_b(), ax_text_lit("x")), ax_cmp("eq", ax_c(), ax_int_lit(1))))
+    assert_eq(ax_access(s, "p", p).index, ax_index(s, "p_bc"))
+    // One fixed component beats one bounded.
+    val q = ax_and(ax_cmp("gt", ax_id(), ax_int_lit(0)), ax_cmp("eq", ax_b(), ax_text_lit("x")))
+    assert(ax_access(s, "p", q).path == IndexRange, "b = 'x' fixes p_bc's first component")
+
+@test
+a_tie_goes_to_the_primary_key()
+    val s = ax_p()
+    val p = ax_and(ax_cmp("gt", ax_b(), ax_text_lit("a")), ax_cmp("gt", ax_id(), ax_int_lit(0)))
+    assert(ax_access(s, "p", p).path == KeyRange, "a bound on each is a tie")
+
+@test
+a_bound_on_an_index_is_chosen_over_no_primary_key_condition()
+    val s = ax_p()
+    assert(ax_access(s, "p", ax_cmp("lt", ax_b(), ax_text_lit("g"))).path == IndexRange, "b < 'g'")
+
+@test
+a_null_comparand_on_any_column_reads_nothing()
+    val s = ax_p()
+    val null_text = TExpr(Null(Text), Text, buf[TExpr](), None, 0)
+    assert(ax_access(s, "p", ax_cmp("eq", ax_b(), null_text)).path == NoRows, "b = null")
+    assert(ax_access(s, "p", ax_cmp("lt", ax_c(), TExpr(Null(Int64), Int64, buf[TExpr](), None, 0))).path == NoRows, "c < null, no index")
+
+// -- reading through the index -------------------------------------------------------------------------
+
+@test
+an_equality_on_the_first_component_returns_its_rows_in_key_order()
+    // Row 5's second component is null: a prefix lookup still finds it.
+    ax_through(ax_p(), "SELECT id FROM p WHERE b = 'x'", [1, 3, 5], 3, 3)
+
+@test
+a_range_on_the_first_component_reads_only_its_entries()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE b > 'x'", [2, 6, 7], 3, 3)
+    ax_through(s, "SELECT id FROM p WHERE b >= 'x' AND b < 'y'", [1, 3, 5], 3, 3)
+    ax_through(s, "SELECT id FROM p WHERE b BETWEEN 'y' AND 'y'", [2, 7], 2, 2)
+    ax_through(s, "SELECT id FROM p WHERE b > 'z'", [], 0, 0)
+
+@test
+an_equality_on_a_two_component_prefix_is_a_lookup_of_both()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c = 3", [3], 1, 1)
+    ax_through(s, "SELECT id FROM p WHERE c = 1 AND b = 'z'", [6], 1, 1)
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c = 2", [], 0, 0)
+
+@test
+a_bound_after_an_equality_prefix_narrows_the_range()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c > 1", [3], 1, 1)
+    // An upper bound alone leaves out the null that sorts first.
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c <= 3", [1, 3], 2, 2)
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c >= 1 AND c < 3", [1], 1, 1)
+
+@test
+a_condition_on_a_later_component_alone_is_a_full_scan()
+    ax_scanned(ax_p(), "SELECT id FROM p WHERE c = 1", [1, 6], ax_p_rows())
+
+@test
+the_filter_still_runs_over_the_rows_read_through_an_index()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND n IS NOT NULL", [1, 5], 3, 3)
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c IS NULL", [5], 3, 3)
+
+@test
+a_null_comparand_on_an_indexed_column_reads_nothing_and_logs_its_read()
+    val s = ax_p()
+    xd_ids_are(ax_sel(s, "SELECT id FROM p WHERE b = $1::text", [Null]), [])
+    val w = ax_work(s, "SELECT id FROM p WHERE b = $1::text", [Null])
+    assert_eq(w.slots + w.entries + w.fetched, 0)
+    val t = s.begin(Serializable)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = $1::text", [Null]), [])
+    assert_eq(s.logged(t), 1)
+
+@test
+is_null_is_left_to_a_full_scan()
+    ax_scanned(ax_p(), "SELECT id FROM p WHERE b IS NULL", [4], ax_p_rows())
+
+@test
+a_range_leaves_out_the_null_entries_of_its_component()
+    val s = ax_p()
+    val fillers = buf[i128]()
+
+    for i in 100..<140
+        fillers.push(i128(i))
+
+    // Row 4's null `b` sorts before every value and is not visited.
+    ax_through(s, "SELECT id FROM p WHERE b < 'g'", fillers.view(), 40, 40)
+
+@test
+a_unique_index_lookup_reads_one_entry()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE n = 'n4'", [4], 1, 1)
+    ax_through(s, "SELECT id FROM p WHERE n = 'none'", [], 0, 0)
+
+@test
+duplicates_in_a_non_unique_index_are_each_returned_once_in_key_order()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE b = 'y'", [2, 7], 2, 2)
+    // Row 2's versions leave it three entries under 'y'; it is fetched and returned once.
+    ax_ok(s, "UPDATE p SET c = 20 WHERE id = 2")
+    ax_ok(s, "UPDATE p SET c = 2 WHERE id = 2")
+    ax_ok(s, "UPDATE p SET c = 21 WHERE id = 2")
+    ax_through(s, "SELECT id FROM p WHERE b = 'y'", [2, 7], 4, 2)
+    ax_through(s, "SELECT c FROM p WHERE b = 'y' AND c = 2", [], 1, 1)
+    ax_through(s, "SELECT c FROM p WHERE b = 'y' AND c = 21", [21], 1, 1)
+
+@test
+parameters_fix_an_index_lookup()
+    val s = ax_p()
+    ax_through(s, "SELECT id FROM p WHERE b = $1::text AND c = $2::int64", [1], 1, 1, [Value.Text("x"), Int(1)])
+
+@test
+a_narrower_integer_comparand_is_converted_to_the_component_s_type()
+    ax_through(ax_p(), "SELECT id FROM p WHERE b = 'x' AND c = $1::int32", [3], 1, 1, [Int(3)])
+
+@test
+an_empty_table_read_through_an_index_returns_nothing()
+    val s = ax_p_empty()
+    ax_through(s, "SELECT id FROM p WHERE b = 'x'", [], 0, 0)
+    ax_through(s, "SELECT id FROM p WHERE b < 'x'", [], 0, 0)
+    ax_through(s, "SELECT id FROM p WHERE n = 'n1'", [], 0, 0)
+
+@test
+a_table_of_one_row_read_through_an_index()
+    val s = ax_p_empty()
+    ax_ok(s, "INSERT INTO p VALUES (1, 'x', 1, 'n1')")
+    ax_through(s, "SELECT id FROM p WHERE b = 'x'", [1], 1, 1)
+    ax_through(s, "SELECT id FROM p WHERE b = 'w'", [], 0, 0)
+    ax_through(s, "SELECT id FROM p WHERE b > 'x'", [], 0, 0)
+    ax_through(s, "SELECT id FROM p WHERE b <= 'x'", [1], 1, 1)
+
+@test
+an_index_created_on_existing_rows_is_read_through()
+    val s = ax_p()
+    ax_scanned(s, "SELECT id FROM p WHERE c = 4", [4], ax_p_rows())
+    ax_ddl(s, "CREATE INDEX p_c ON p (c)")
+    ax_through(s, "SELECT id FROM p WHERE c = 4", [4], 1, 1)
+
+@test
+a_dropped_index_is_no_longer_read_through()
+    val s = ax_p()
+    ax_ddl(s, "DROP INDEX p_bc")
+    ax_scanned(s, "SELECT id FROM p WHERE b = 'x'", [1, 3, 5], ax_p_rows())
+
+@test
+an_index_still_building_is_not_read_through()
+    val s = ax_p()
+    val t = s.begin(Snapshot)
+    ax_ddl_in(s, t, "CREATE INDEX p_c ON p (c)")
+    // The creating transaction sees its index building: its reads scan the table.
+    val ct = s.catalog.tables[s.catalog.table_at(cat_q("p")).unwrap()]
+    assert(access_of(no_uses().db(s, t), ct, "x", Some(ax_cmp("eq", ax_c(), ax_int_lit(4))), xe_ctx([])).path == FullScan, "building")
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE c = 4"), [4])
+    assert_eq(ax_work_in(s, t, "SELECT id FROM p WHERE c = 4").slots, ax_p_rows())
+    val _ = st_commit(s, t)
+    // Its commit runs the job, which makes it ready.
+    ax_through(s, "SELECT id FROM p WHERE c = 4", [4], 1, 1)
+
+// -- writing through the index ----------------------------------------------------------------------------
+
+@test
+an_update_by_an_indexed_column_writes_only_its_rows()
+    val s = ax_p()
+    val t = s.begin(Snapshot)
+    val w = ax_work_in(s, t, "UPDATE p SET n = 'zz' WHERE b = 'z'")
+    assert_eq(w.slots, 0)
+    assert(s.commit(t).is_ok())
+    ax_through(s, "SELECT id FROM p WHERE n = 'zz'", [6], 1, 1)
+
+@test
+a_delete_by_an_indexed_column_removes_only_its_rows()
+    val s = ax_p()
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(ax_run(s, t, "DELETE FROM p WHERE b = 'y'")), 2)
+    assert(s.commit(t).is_ok())
+    xd_ids_are(ax_sel(s, "SELECT id FROM p WHERE id < 10"), [1, 3, 4, 5, 6])
+    ax_through(s, "SELECT id FROM p WHERE b = 'y'", [], 2, 2)
+
+@test
+an_update_of_the_indexed_column_moves_the_row_in_the_index()
+    val s = ax_p()
+    ax_ok(s, "UPDATE p SET b = 'w' WHERE id = 1")
+    ax_through(s, "SELECT id FROM p WHERE b = 'w'", [1], 1, 1)
+    // The entry under 'x' is still there; the row's version no longer holds it.
+    ax_through(s, "SELECT id FROM p WHERE b = 'x'", [3, 5], 3, 3)
+
+@test
+an_update_through_an_index_of_the_column_it_reads_by_writes_each_row_once()
+    val s = ax_p()
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(ax_run(s, t, "UPDATE p SET b = 'xx' WHERE b >= 'x' AND b < 'y'")), 3)
+    assert(s.commit(t).is_ok())
+    xd_ids_are(ax_sel(s, "SELECT id FROM p WHERE b = 'xx'"), [1, 3, 5])
+
+// -- concurrency and visibility -------------------------------------------------------------------------
+
+private ax_levels() -> []const Isolation = [ReadCommitted, Snapshot, Serializable]
+
+/** `committed` at read committed, whose statements see what committed before them, else `snapshot`. */
+private ax_seen(level: Isolation, committed: []const i128, snapshot: []const i128) -> Buf[i128] =
+    items_of(if level == ReadCommitted then committed else snapshot)
+
+@test
+a_concurrent_insert_is_seen_through_an_index_as_by_a_scan()
+    for level in ax_levels()
+        val s = ax_p()
+        val r = s.begin(level)
+        val w = s.begin(Snapshot)
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+        assert_eq(xd_count(ax_run(s, w, "INSERT INTO p VALUES (9, 'x', 9, NULL)")), 1)
+        // Uncommitted: its entry is there, but only its writer sees the row.
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+        xd_ids_are(ax_read(s, w, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5, 9])
+        assert(s.commit(w).is_ok())
+        val want = ax_seen(level, [1, 3, 5, 9], [1, 3, 5])
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x'"), want.view())
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x' OR false"), want.view())
+
+@test
+a_concurrent_update_of_the_indexed_column_is_seen_through_an_index_as_by_a_scan()
+    for level in ax_levels()
+        val s = ax_p()
+        val r = s.begin(level)
+        val w = s.begin(Snapshot)
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+        assert_eq(xd_count(ax_run(s, w, "UPDATE p SET b = 'q' WHERE id = 3")), 1)
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'q'"), [])
+        xd_ids_are(ax_read(s, w, "SELECT id FROM p WHERE b = 'x'"), [1, 5])
+        xd_ids_are(ax_read(s, w, "SELECT id FROM p WHERE b = 'q'"), [3])
+        assert(s.commit(w).is_ok())
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'x'"), ax_seen(level, [1, 5], [1, 3, 5]).view())
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'q'"), ax_seen(level, [3], []).view())
+
+@test
+a_concurrent_delete_is_seen_through_an_index_as_by_a_scan()
+    for level in ax_levels()
+        val s = ax_p()
+        val r = s.begin(level)
+        val w = s.begin(Snapshot)
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'y'"), [2, 7])
+        assert_eq(xd_count(ax_run(s, w, "DELETE FROM p WHERE id = 7")), 1)
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'y'"), [2, 7])
+        xd_ids_are(ax_read(s, w, "SELECT id FROM p WHERE b = 'y'"), [2])
+        assert(s.commit(w).is_ok())
+        xd_ids_are(ax_read(s, r, "SELECT id FROM p WHERE b = 'y'"), ax_seen(level, [2], [2, 7]).view())
+
+@test
+an_aborted_insert_leaves_an_entry_whose_row_no_one_sees()
+    val s = ax_p()
+    val w = s.begin(Snapshot)
+    assert_eq(xd_count(ax_run(s, w, "INSERT INTO p VALUES (9, 'x', 9, 'n9')")), 1)
+    assert(s.abort(w).is_ok())
+    // The entry is visited and its key fetched, but the row is gone.
+    ax_through(s, "SELECT id FROM p WHERE b = 'x'", [1, 3, 5], 4, 4)
+    ax_through(s, "SELECT id FROM p WHERE n = 'n9'", [], 1, 1)
+    // The value is free again in the unique index.
+    ax_ok(s, "INSERT INTO p VALUES (10, 'x', 10, 'n9')")
+    ax_through(s, "SELECT id FROM p WHERE n = 'n9'", [10], 2, 2)
+
+@test
+a_key_updated_away_and_back_is_seen_at_each_snapshot_once()
+    val s = ax_p()
+    val before = s.begin(Snapshot)
+    xd_ids_are(ax_read(s, before, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+    ax_ok(s, "UPDATE p SET b = 'q' WHERE id = 1")
+    val away = s.begin(Snapshot)
+    ax_ok(s, "UPDATE p SET b = 'x' WHERE id = 1")
+    val back = s.begin(Snapshot)
+
+    xd_ids_are(ax_read(s, before, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+    xd_ids_are(ax_read(s, before, "SELECT id FROM p WHERE b = 'q'"), [])
+    xd_ids_are(ax_read(s, away, "SELECT id FROM p WHERE b = 'x'"), [3, 5])
+    xd_ids_are(ax_read(s, away, "SELECT id FROM p WHERE b = 'q'"), [1])
+    xd_ids_are(ax_read(s, back, "SELECT id FROM p WHERE b = 'x'"), [1, 3, 5])
+    xd_ids_are(ax_read(s, back, "SELECT id FROM p WHERE b = 'q'"), [])
+    // Two versions held ('x', 1): one entry, one fetch, one row.
+    ax_through(s, "SELECT id FROM p WHERE b = 'x' AND c = 1", [1], 1, 1)
+
+@test
+a_row_written_by_its_own_transaction_is_read_through_an_index()
+    val s = ax_p()
+    val t = s.begin(Snapshot)
+    assert_eq(xd_count(ax_run(s, t, "UPDATE p SET b = 'own' WHERE id = 4")), 1)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = 'own'"), [4])
+    assert_eq(ax_work_in(s, t, "SELECT id FROM p WHERE b = 'own'").slots, 0)
+    xd_ids_are(ax_sel(s, "SELECT id FROM p WHERE b = 'own'"), [])
+
+// -- serializable: the predicate log ---------------------------------------------------------------------
+
+@test
+a_phantom_inserted_into_a_read_index_range_fails_the_serializable_commit()
+    val s = ax_p()
+    val t = s.begin(Serializable)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = 'x' AND c > 5"), [])
+    assert_eq(xd_count(ax_run(s, t, "INSERT INTO p VALUES (1000, 'k', 0, NULL)")), 1)
+    ax_ok(s, "INSERT INTO p VALUES (50, 'x', 6, NULL)")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+an_insert_outside_a_read_index_range_lets_the_serializable_commit_through()
+    val s = ax_p()
+    val t = s.begin(Serializable)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = 'x' AND c > 5"), [])
+    assert_eq(xd_count(ax_run(s, t, "INSERT INTO p VALUES (1000, 'k', 0, NULL)")), 1)
+    ax_ok(s, "INSERT INTO p VALUES (50, 'x', 4, NULL)")
+    ax_ok(s, "INSERT INTO p VALUES (51, 'y', 9, NULL)")
+    assert(s.commit(t).is_ok())
+
+@test
+a_row_updated_into_a_read_index_range_fails_the_serializable_commit()
+    val s = ax_p()
+    val t = s.begin(Serializable)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = 'w'"), [])
+    assert_eq(xd_count(ax_run(s, t, "INSERT INTO p VALUES (1000, 'k', 0, NULL)")), 1)
+    ax_ok(s, "UPDATE p SET b = 'w' WHERE id = 6")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+write_skew_through_an_index_range_fails_the_second_serializable_commit()
+    val s = ax_p_empty()
+    ax_ok(s, "INSERT INTO p VALUES (1, 'on', 1, NULL), (2, 'on', 2, NULL), (3, 'off', 3, NULL)")
+    val a = s.begin(Serializable)
+    val b = s.begin(Serializable)
+    // Each sees two on call and takes one off; serially the second would see one and keep it.
+    xd_ids_are(ax_read(s, a, "SELECT id FROM p WHERE b = 'on'"), [1, 2])
+    xd_ids_are(ax_read(s, b, "SELECT id FROM p WHERE b = 'on'"), [1, 2])
+    assert_eq(ax_work_in(s, a, "SELECT id FROM p WHERE b = 'on'").slots, 0)
+    assert_eq(xd_count(ax_run(s, a, "UPDATE p SET b = 'off' WHERE id = 1")), 1)
+    assert_eq(xd_count(ax_run(s, b, "UPDATE p SET b = 'off' WHERE id = 2")), 1)
+    assert(s.commit(a).is_ok())
+    assert_eq(st_code(s.commit(b)), "T1001")
+
+@test
+a_row_moved_between_values_outside_a_read_index_range_lets_the_serializable_commit_through()
+    val s = ax_p()
+    val t = s.begin(Serializable)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = 'y'"), [2, 7])
+    assert_eq(xd_count(ax_run(s, t, "INSERT INTO p VALUES (1000, 'k', 0, NULL)")), 1)
+    // Neither the image before nor the one after holds 'y'.
+    ax_ok(s, "UPDATE p SET b = 'zz' WHERE id = 6")
+    assert(s.commit(t).is_ok())
+
+@test
+a_row_moved_out_of_a_read_index_range_fails_the_serializable_commit()
+    val s = ax_p()
+    val t = s.begin(Serializable)
+    xd_ids_are(ax_read(s, t, "SELECT id FROM p WHERE b = 'y'"), [2, 7])
+    assert_eq(xd_count(ax_run(s, t, "INSERT INTO p VALUES (1000, 'k', 0, NULL)")), 1)
+    ax_ok(s, "UPDATE p SET b = 'zz' WHERE id = 7")
+    assert_eq(st_code(s.commit(t)), "T1001")
+
+@test
+disjoint_index_ranges_let_both_serializable_commits_through()
+    val s = ax_p()
+    val a = s.begin(Serializable)
+    val b = s.begin(Serializable)
+    xd_ids_are(ax_read(s, a, "SELECT id FROM p WHERE b = 'y'"), [2, 7])
+    xd_ids_are(ax_read(s, b, "SELECT id FROM p WHERE b = 'z'"), [6])
+    assert_eq(xd_count(ax_run(s, a, "UPDATE p SET c = 30 WHERE id = 3")), 1)
+    assert_eq(xd_count(ax_run(s, b, "UPDATE p SET c = 50 WHERE id = 5")), 1)
+    assert(s.commit(a).is_ok())
+    assert(s.commit(b).is_ok())
+
+// -- partial and expression indexes ---------------------------------------------------------------------
+
+/** `q(id, k int64?, live bool?)` with the partial index `q_k (k) where k > 0 and live`, and rows
+ * (1, 5, true), (2, 5, false), (3, -5, true), (4, 5, true), (5, 6, true), (6, null, true).
+ */
+private ax_q() -> &Store
+    val s = ax_empty()
+    ax_ddl(s, "CREATE TABLE q (id int64 PRIMARY KEY, k int64, live bool)")
+    ax_ddl(s, "CREATE INDEX q_k ON q (k) WHERE k > 0 AND live")
+    ax_ok(s, "INSERT INTO q VALUES (1, 5, true), (2, 5, false), (3, -5, true), (4, 5, true), (5, 6, true), (6, NULL, true)")
+    s
+
+@test
+a_partial_index_is_read_through_when_the_filter_holds_its_predicate()
+    val s = ax_q()
+    ax_through(s, "SELECT id FROM q WHERE k = 5 AND k > 0 AND live", [1, 4], 2, 2)
+    // In any order and nesting of the filter's conjuncts.
+    ax_through(s, "SELECT id FROM q WHERE live AND (k > 0 AND k >= 5)", [1, 4, 5], 3, 3)
+
+@test
+a_partial_index_is_not_read_through_when_the_filter_lacks_a_conjunct_of_its_predicate()
+    val s = ax_q()
+    ax_scanned(s, "SELECT id FROM q WHERE k = 5", [1, 2, 4], 6)
+    ax_scanned(s, "SELECT id FROM q WHERE k = 5 AND live", [1, 4], 6)
+    ax_scanned(s, "SELECT id FROM q WHERE k = 5 AND k > 0", [1, 2, 4], 6)
+
+@test
+a_partial_index_is_not_read_through_when_the_filter_only_implies_its_predicate()
+    // `k > 1` implies `k > 0`, but implication is decided by matching conjuncts only.
+    ax_scanned(ax_q(), "SELECT id FROM q WHERE k = 5 AND k > 1 AND live", [1, 4], 6)
+
+@test
+a_row_leaving_a_partial_index_s_predicate_is_not_returned()
+    val s = ax_q()
+    ax_ok(s, "UPDATE q SET live = false WHERE id = 4")
+    ax_through(s, "SELECT id FROM q WHERE k = 5 AND k > 0 AND live", [1], 2, 2)
+    ax_ok(s, "UPDATE q SET live = true WHERE id = 2")
+    ax_through(s, "SELECT id FROM q WHERE k = 5 AND k > 0 AND live", [1, 2], 3, 3)
+
+/** `e(id, s text?, d int64?)` with the expression indexes `e_low (lower(s))` and `e_div (100 / d)`,
+ * and rows (1, 'Abc', 5), (2, 'abc', 4), (3, 'ABD', 20), (4, null, 50).
+ */
+private ax_e() -> &Store
+    val s = ax_empty()
+    ax_ddl(s, "CREATE TABLE e (id int64 PRIMARY KEY, s text, d int64)")
+    ax_ddl(s, "CREATE INDEX e_low ON e ((lower(s)))")
+    ax_ddl(s, "CREATE INDEX e_div ON e ((100 / d))")
+    ax_ok(s, "INSERT INTO e VALUES (1, 'Abc', 5), (2, 'abc', 4), (3, 'ABD', 20), (4, NULL, 50)")
+    s
+
+@test
+an_expression_index_is_read_through_on_an_exact_match()
+    val s = ax_e()
+    ax_through(s, "SELECT id FROM e WHERE lower(s) = 'abc'", [1, 2], 2, 2)
+    ax_through(s, "SELECT id FROM e WHERE lower(s) > 'abc'", [3], 1, 1)
+    ax_through(s, "SELECT id FROM e WHERE 100 / d = 5", [3], 1, 1)
+
+@test
+an_expression_index_is_not_read_through_for_another_expression()
+    val s = ax_e()
+    ax_scanned(s, "SELECT id FROM e WHERE upper(s) = 'ABC'", [1, 2], 4)
+    ax_scanned(s, "SELECT id FROM e WHERE s = 'abc'", [2], 4)
+    ax_scanned(s, "SELECT id FROM e WHERE lower(lower(s)) = 'abc'", [1, 2], 4)
+    ax_scanned(s, "SELECT id FROM e WHERE 200 / d = 10", [3], 4)
+
+@test
+a_row_its_index_expression_fails_on_is_read_through_the_index_and_fails_the_filter_as_a_scan_does()
+    val s = ax_e()
+    ax_ok(s, "INSERT INTO e VALUES (5, 'x', 0)")
+    // Row 5 has no entry in e_div; the read through it fetches the row, and the filter raises the
+    // division by zero the full scan raises.
+    assert_eq(ax_code(s, s.begin(Snapshot), "SELECT id FROM e WHERE 100 / d = 5"), "R0002")
+    assert_eq(ax_code(s, s.begin(Snapshot), "SELECT id FROM e WHERE 100 / d = 5 OR false"), "R0002")
+    // Another index's read is not disturbed by it.
+    ax_through(s, "SELECT id FROM e WHERE lower(s) = 'x'", [5], 1, 1)
+
+// -- foreign keys --------------------------------------------------------------------------------------
+
+/** `parent(id)` holding ids 1..=10, and `child(id, pid -> parent, note text?)` holding 40 rows, each
+ * referencing parent `id % 5 + 1` (so parents 6..=10 are unreferenced); the index `child_pid (pid)`
+ * when `indexed`.
+ */
+private ax_fk(indexed: bool, action: string = "") -> &Store
+    val s = ax_empty()
+    ax_ddl(s, "CREATE TABLE parent (id int64 PRIMARY KEY)")
+    ax_ddl(s, s"CREATE TABLE child (id int64 PRIMARY KEY, pid int64 REFERENCES parent $action, note text)")
+    if indexed then ax_ddl(s, "CREATE INDEX child_pid ON child (pid)")
+    ax_ok(s, "INSERT INTO parent VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)")
+    var text = "INSERT INTO child VALUES "
+
+    for i in 0..<40
+        if i > 0 then text = text + ", "
+        text = text + s"($i, ${i % 5 + 1}, NULL)"
+
+    ax_ok(s, text)
+    s
+
+@test
+deleting_an_unreferenced_parent_checks_its_children_through_an_index()
+    val s = ax_fk(true)
+    val t = s.begin(Snapshot)
+    val w = ax_work_in(s, t, "DELETE FROM parent WHERE id = 7")
+    // One leaf entry for the parent's own key lookup; no pass over the children.
+    assert_eq(w.slots, 1)
+    assert_eq(w.entries, 0)
+    assert(s.commit(t).is_ok())
+
+@test
+without_an_index_the_referencing_check_scans_every_child()
+    val s = ax_fk(false)
+    val t = s.begin(Snapshot)
+    val w = ax_work_in(s, t, "DELETE FROM parent WHERE id = 7")
+    assert_eq(w.slots, 41)
+    assert_eq(w.entries, 0)
+    assert(s.commit(t).is_ok())
+
+@test
+deleting_a_referenced_parent_fails_through_an_index()
+    val s = ax_fk(true)
+    val t = s.begin(Snapshot)
+    val before = s.slots_read
+    assert_eq(ax_code(s, t, "DELETE FROM parent WHERE id = 2"), "T3003")
+    assert_eq(s.slots_read - before, 1)
+
+@test
+changing_a_referenced_parent_key_fails_through_an_index()
+    val s = ax_fk(true)
+    assert_eq(ax_code(s, s.begin(Snapshot), "UPDATE parent SET id = 20 WHERE id = 3"), "T3003")
+    val t = s.begin(Snapshot)
+    val w = ax_work_in(s, t, "UPDATE parent SET id = 21 WHERE id = 8")
+    assert_eq(w.slots, 1)
+    assert(s.commit(t).is_ok())
+
+@test
+a_cascade_finds_its_children_through_an_index()
+    val s = ax_fk(true, "ON DELETE CASCADE")
+    val t = s.begin(Snapshot)
+    val w = ax_work_in(s, t, "DELETE FROM parent WHERE id = 1")
+    // Children 0, 5, .., 35 reference parent 1: found through their entries, never by a pass.
+    assert_eq(w.slots, 1)
+    assert(w.entries >= 8, "the eight children's entries are read")
+    assert(s.commit(t).is_ok())
+    xd_ids_are(ax_sel(s, "SELECT id FROM child WHERE pid = 1"), [])
+    assert_eq(ax_sel(s, "SELECT id FROM child").len(), 32)
+
+@test
+a_child_moved_away_and_back_is_found_once_through_the_index()
+    val s = ax_fk(true)
+    ax_ok(s, "UPDATE child SET pid = 9 WHERE id = 3")
+    ax_ok(s, "UPDATE child SET pid = 4 WHERE id = 3")
+    // Parent 9's only entry is stale; the row now references 4.
+    val t = s.begin(Snapshot)
+    assert_eq(ax_code(s, t, "DELETE FROM parent WHERE id = 9"), "ok")
+    assert(s.commit(t).is_ok())
+    assert_eq(ax_code(s, s.begin(Snapshot), "DELETE FROM parent WHERE id = 4"), "T3003")
+
+@test
+an_index_whose_leading_column_is_the_foreign_key_serves_the_check()
+    val s = ax_fk(false)
+    ax_ddl(s, "CREATE INDEX child_pid_note ON child (pid, note)")
+    val t = s.begin(Snapshot)
+    assert_eq(ax_work_in(s, t, "DELETE FROM parent WHERE id = 7").slots, 1)
+
+@test
+an_index_not_led_by_the_foreign_key_or_partial_does_not_serve_the_check()
+    val s = ax_fk(false)
+    ax_ddl(s, "CREATE INDEX child_note_pid ON child (note, pid)")
+    ax_ddl(s, "CREATE INDEX child_pid_some ON child (pid) WHERE pid > 0")
+    val t = s.begin(Snapshot)
+    assert_eq(ax_work_in(s, t, "DELETE FROM parent WHERE id = 7").slots, 41)
+
+@test
+a_child_inserted_concurrently_is_found_through_the_index()
+    val s = ax_fk(true)
+    val w = s.begin(Snapshot)
+    assert_eq(xd_count(ax_run(s, w, "INSERT INTO child VALUES (100, 7, NULL)")), 1)
+    assert(s.commit(w).is_ok())
+    assert_eq(ax_code(s, s.begin(Snapshot), "DELETE FROM parent WHERE id = 7"), "T3003")
+
+// -- differential: the index path against the full scan ------------------------------------------------
+
+/** `r(id, b text?, c int64?)` with the indexes `r_bc (b, c)` and `r_c (c)`, filled with random rows,
+ * `b` and `c` from small ranges so that values repeat, now and then null, and some rows updated so
+ * that stale entries remain.
+ */
+private ax_random_table(g: *Rng) -> &Store
+    val s = ax_empty()
+    ax_ddl(s, "CREATE TABLE r (id int64 PRIMARY KEY, b text, c int64)")
+    ax_ddl(s, "CREATE INDEX r_bc ON r (b, c)")
+    ax_ddl(s, "CREATE INDEX r_c ON r (c)")
+    val n = g.below(40)
+
+    if n > 0
+        var text = "INSERT INTO r VALUES "
+
+        for i in 0..<n
+            if i > 0 then text = text + ", "
+            text = text + s"($i, ${ax_text_value(g)}, ${ax_int_value(g)})"
+
+        ax_ok(s, text)
+
+        for _ in 0..<g.below(6)
+            ax_ok(s, s"UPDATE r SET b = ${ax_text_value(g)}, c = ${ax_int_value(g)} WHERE id = ${g.below(n)}")
+
+    s
+
+private ax_text_value(g: *Rng) -> string
+    val vs = ["'a'", "'b'", "'c'", "'d'", "NULL"]
+    vs[usize(g.below(5))]
+
+private ax_int_value(g: *Rng) -> string = if g.below(6) == 0 then "NULL" else s"${i128(g.below(8)) - 2}"
+
+/** A random comparand of column `col`: a small value, a parameter of one, or now and then a null. */
+private ax_operand(g: *Rng, col: string, params: Buf[Value]) -> string
+    if col == "b"
+        g.below(10) match
+            0 -> return "CAST(NULL AS text)"
+            1 ->
+                val vs = ["a", "b", "c", "d", "e"]
+                params.push(Value.Text(vs[usize(g.below(5))]))
+                return s"$$${params.len()}::text"
+            _ ->
+                val vs = ["'a'", "'b'", "'bb'", "'c'", "'d'", "'0'"]
+                return vs[usize(g.below(6))]
+
+    val n = i128(g.below(10)) - 3
+
+    g.below(10) match
+        0 -> "CAST(NULL AS int64)"
+        1 ->
+            params.push(Int(n))
+            s"$$${params.len()}::int64"
+        _ -> s"$n"
+
+private ax_conjunct(g: *Rng, params: Buf[Value]) -> string
+    val cols = ["b", "c", "id"]
+    val ops = ["=", "<", "<=", ">", ">="]
+    val c = cols[usize(g.below(3))]
+
+    g.below(10) match
+        0 -> s"$c BETWEEN ${ax_operand(g, c, params)} AND ${ax_operand(g, c, params)}"
+        1 -> s"($c = ${ax_operand(g, c, params)} OR $c = ${ax_operand(g, c, params)})"
+        2 -> s"$c IS NULL"
+        _ -> s"$c ${ops[usize(g.below(5))]} ${ax_operand(g, c, params)}"
+
+private ax_predicate(g: *Rng, params: Buf[Value]) -> string
+    var p = ax_conjunct(g, params)
+
+    for _ in 0..<g.below(4)
+        p = p + " AND " + ax_conjunct(g, params)
+
+    p
+
+private ax_rows(s: &Store, t: &Txn, text: string, params: Buf[Value]) -> Buf[Value] =
+    xd_rows(ax_run(s, t, text, params.view()))
+
+@test
+random_predicates_through_an_index_agree_with_the_full_scan_row_for_row()
+    var used: u64 = 0
+
+    for seed in 0..<12
+        var g = rng(u64(seed), 7171)
+        val s = ax_random_table(&g)
+
+        for q in 0..<40
+            val params = buf[Value]()
+            val p = ax_predicate(&g, params)
+            val t = s.begin(Snapshot)
+            val e = s.entries_read
+            val narrowed = ax_rows(s, t, s"SELECT id, b, c FROM r WHERE $p", params)
+            used += s.entries_read - e
+            // An `or` of the whole predicate cannot be narrowed: this is the full scan.
+            val full = ax_rows(s, t, s"SELECT id, b, c FROM r WHERE ($p) OR false", params)
+
+            assert(narrowed == full, s"seed $seed query $q: $p")
+
+    // The generator does reach the index paths.
+    assert(used > 0, "some predicate read through an index")
+
+@test
+random_writes_and_predicates_through_an_index_agree_with_the_full_scan_in_each_transaction()
+    for seed in 0..<6
+        var g = rng(u64(seed), 9393)
+        val s = ax_random_table(&g)
+        val r = s.begin(Snapshot)
+        val w = s.begin(Snapshot)
+
+        // `w` writes without committing; `r` sees none of it, `w` all of it.
+        for _ in 0..<5
+            val _ = ax_run(s, w, s"UPDATE r SET b = ${ax_text_value(&g)} WHERE c = ${ax_int_value(&g)}")
+
+        for q in 0..<20
+            val params = buf[Value]()
+            val p = ax_predicate(&g, params)
+
+            for t in [r, w]
+                val narrowed = ax_rows(s, t, s"SELECT id, b, c FROM r WHERE $p", params)
+                val full = ax_rows(s, t, s"SELECT id, b, c FROM r WHERE ($p) OR false", params)
+                assert(narrowed == full, s"seed $seed query $q: $p")

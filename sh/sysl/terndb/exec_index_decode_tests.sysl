@@ -1,0 +1,347 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// A read through a secondary index built into vectors the way a table scan's rows are
+// (`Store.scan_index_vectors`, `docs/design/executor.md` §4.6 "Decoding"). Each case checks the rows
+// the statement answers and counts the store's `ReadWork`: a row fetched by key is one leaf entry
+// copied into an image; a row the reader sees in that image, in the current schema version, through a
+// plain index, has its index columns decoded as values for its entry, its key taken from the entry,
+// each other column the statement reads decoded into its lane, and every other one left undecoded;
+// any other row is rebuilt as a `StoredRow`.
+
+// -- fixtures --------------------------------------------------------------------------------------
+
+private ixd_empty() -> &Store = mem_store(cat_ok(mem_catalog(), CreateNamespace("app", false)))
+
+private ixd_env(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__) -> Envelope
+    sql_statements(text, "app", s.latest_catalog()) match
+        Ok(sts) -> sts[0].action match
+            SqlTree(env) -> return env
+            SqlControl(_) -> ()
+        Err(e) -> print(s"\n$text\n  -> ${e.code} ${e.message}\n")
+
+    assert(false, "the statement translates", file, line)
+    panic("untranslated")
+
+/** Runs DDL statement `text` in a transaction of its own, which commits and so runs its jobs. */
+private ixd_ddl(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+
+    s.ddl(t, ixd_env(s, text, file, line), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+    val _ = st_commit(s, t, file, line)
+
+private ixd_run(s: &Store, t: &Txn, text: string, file: string = __FILE__, line: long = __LINE__) -> Executed
+    s.enter(t).unwrap()
+    xd_ran(s, t, ixd_env(s, text, file, line), [], file, line)
+
+/** Runs `text` in a transaction of its own, which commits. */
+private ixd_ok(s: &Store, text: string, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    val _ = ixd_run(s, t, text, file, line)
+    assert(s.commit(t).is_ok(), "the transaction commits", file, line)
+
+private ixd_rows(s: &Store, t: &Txn, text: string, file: string = __FILE__, line: long = __LINE__) -> Buf[Value] =
+    xd_rows(ixd_run(s, t, text, file, line))
+
+/** Column `j` of each row, a null read as -1. */
+private ixd_ints(rows: Buf[Value], j: usize) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in rows
+        r match
+            Record(fs) -> out.push(if fs[j].is_null() then -1 else st_int(fs[j]))
+            _ -> out.push(-2)
+
+    out
+
+/** `q(id int64, k int64?, v int64?, note text?)` keyed by `id`, with the plain index `q_k (k)`,
+ * holding ids `1..=40`, each with `k = id % 10`, `v = id * 10` and `note` null for an odd id, else
+ * `n<id>`: every `k` names four rows.
+ */
+private ixd_q() -> &Store
+    val s = ixd_empty()
+    ixd_ddl(s, "CREATE TABLE q (id int64 PRIMARY KEY, k int64, v int64, note text)")
+    ixd_ddl(s, "CREATE INDEX q_k ON q (k)")
+    var text = "INSERT INTO q (id, k, v, note) VALUES "
+
+    for i in 1..<41
+        if i > 1 then text = text + ", "
+        val note = if i % 2 == 1 then "NULL" else s"'n$i'"
+        text = text + s"($i, ${i % 10}, ${i * 10}, $note)"
+
+    ixd_ok(s, text)
+    s
+
+/** What the reads did, and through the index: the counters at one moment. */
+private struct IxdAt
+    work: ReadWork
+    slots: u64
+    entries: u64
+    fetched: u64
+
+private ixd_now(s: &Store) -> IxdAt =
+    IxdAt(ReadWork(s.reads.copied, s.reads.images, s.reads.rows, s.reads.values, s.reads.columns, s.reads.skipped), s.slots_read, s.entries_read,
+        s.rows_fetched)
+
+/** Asserts the work since `a` is what the counts say, and that the read went through the index
+ * fetching `fetched` rows and visiting no leaf entry.
+ */
+private ixd_work(s: &Store, a: IxdAt, fetched: u64, rows: u64, values: u64, columns: u64, skipped: u64, file: string = __FILE__, line: long = __LINE__)
+    assert_eq(s.slots_read - a.slots, 0, "leaf entries visited", file, line)
+    assert_eq(s.rows_fetched - a.fetched, fetched, "rows fetched", file, line)
+    assert_eq(s.reads.copied - a.work.copied, fetched, "leaf entries copied", file, line)
+    assert_eq(s.reads.images - a.work.images, fetched, "row images built", file, line)
+    assert_eq(s.reads.rows - a.work.rows, rows, "stored rows built", file, line)
+    assert_eq(s.reads.values - a.work.values, values, "values decoded", file, line)
+    assert_eq(s.reads.columns - a.work.columns, columns, "columns decoded into lanes", file, line)
+    assert_eq(s.reads.skipped - a.work.skipped, skipped, "columns not decoded", file, line)
+
+// -- the cost per row ------------------------------------------------------------------------------
+
+@test
+an_index_scan_decodes_only_the_index_column_when_it_reads_the_key_alone()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE k = 3")
+    xd_ids_are(ixd_ints(rows, 0), [3, 13, 23, 33])
+    // Per row: `k` decoded for its entry; `v` and `note` not at all.
+    ixd_work(s, a, 4, 0, 4, 0, 8)
+
+@test
+an_index_scan_decodes_the_columns_it_projects()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id, v FROM q WHERE k = 3")
+    assert_eq(ixd_ints(rows, 1)[1], 130)
+    ixd_work(s, a, 4, 0, 4, 4, 4)
+
+@test
+an_index_scan_of_every_column_builds_no_record()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id, k, v, note FROM q WHERE k = 4")
+    assert(rows[0] == rec([Int(4), Int(4), Int(40), Text("n4")]))
+    assert(rows[3] == rec([Int(34), Int(4), Int(340), Text("n34")]))
+    ixd_work(s, a, 4, 0, 4, 8, 0)
+
+@test
+an_index_scan_hands_the_index_column_up_as_decoded()
+    val s = ixd_q()
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT k, id FROM q WHERE k >= 8")
+    xd_ids_are(ixd_ints(rows, 1), [8, 9, 18, 19, 28, 29, 38, 39])
+    assert_eq(ixd_ints(rows, 0)[1], 9)
+
+@test
+a_count_through_an_index_decodes_nothing_but_the_index_column()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT count(*) FROM q WHERE k = 3")
+    assert_eq(ixd_ints(rows, 0)[0], 4)
+    ixd_work(s, a, 4, 0, 4, 0, 8)
+
+@test
+a_count_through_an_index_of_an_empty_range_reads_nothing()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT count(*) FROM q WHERE k = 77")
+    assert_eq(ixd_ints(rows, 0)[0], 0)
+    ixd_work(s, a, 0, 0, 0, 0, 0)
+
+@test
+an_aggregate_through_an_index_decodes_only_its_argument()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT sum(v) FROM q WHERE k = 3")
+    assert_eq(ixd_ints(rows, 0)[0], 30 + 130 + 230 + 330)
+    ixd_work(s, a, 4, 0, 4, 4, 4)
+
+@test
+an_index_scan_filtering_on_another_column_decodes_it()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE k = 3 AND v > 200")
+    xd_ids_are(ixd_ints(rows, 0), [23, 33])
+    ixd_work(s, a, 4, 0, 4, 4, 4)
+
+@test
+an_index_scan_fills_whole_batches_and_then_the_rest()
+    val s = ixd_empty()
+    ixd_ddl(s, "CREATE TABLE w (id int64 PRIMARY KEY, k int64, v int64)")
+    ixd_ddl(s, "CREATE INDEX w_k ON w (k)")
+    val n = BatchSize + BatchSize / 2
+    var text = "INSERT INTO w VALUES "
+
+    for i in 0..<n
+        if i > 0 then text = text + ", "
+        text = text + s"($i, 1, $i)"
+
+    ixd_ok(s, text)
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id FROM w WHERE k = 1")
+    assert_eq(rows.len(), n)
+    assert_eq(ixd_ints(rows, 0)[n - 1], i128(n - 1))
+    ixd_work(s, a, u64(n), 0, u64(n), 0, u64(n))
+
+// -- nulls ---------------------------------------------------------------------------------------
+
+@test
+a_null_column_read_through_an_index_is_null_and_not_decoded()
+    val s = ixd_q()
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id, note FROM q WHERE k = 3")
+    assert(rows[0] == rec([Int(3), Null]))
+    assert(rows[3] == rec([Int(33), Null]))
+    ixd_work(s, a, 4, 0, 4, 0, 4)
+
+@test
+a_null_index_column_is_left_out_of_a_bounded_range()
+    val s = ixd_q()
+    ixd_ok(s, "INSERT INTO q (id, k, v) VALUES (100, NULL, 1000), (101, NULL, NULL)")
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE k < 2")
+    xd_ids_are(ixd_ints(rows, 0), [1, 10, 11, 20, 21, 30, 31, 40])
+    ixd_work(s, a, 8, 0, 8, 0, 16)
+
+@test
+a_null_index_column_read_by_is_null_is_null()
+    val s = ixd_q()
+    ixd_ok(s, "INSERT INTO q (id, k, v) VALUES (100, NULL, 1000), (101, NULL, NULL)")
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id, k, v FROM q WHERE k IS NULL")
+    assert(rows[0] == rec([Int(100), Null, Int(1000)]))
+    assert(rows[1] == rec([Int(101), Null, Null]))
+
+// -- versions ------------------------------------------------------------------------------------
+
+@test
+an_index_scan_reads_its_own_uncommitted_rows_from_their_images()
+    val s = ixd_q()
+    val t = s.begin(Snapshot)
+    val _ = ixd_run(s, t, "INSERT INTO q (id, k, v) VALUES (43, 3, 430)")
+    val _ = ixd_run(s, t, "UPDATE q SET v = 1 WHERE id = 13")
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, t, "SELECT id, v FROM q WHERE k = 3")
+    xd_ids_are(ixd_ints(rows, 0), [3, 13, 23, 33, 43])
+    assert_eq(ixd_ints(rows, 1)[1], 1)
+    assert_eq(ixd_ints(rows, 1)[4], 430)
+    ixd_work(s, a, 5, 0, 5, 5, 5)
+
+@test
+an_index_scan_drops_its_own_row_moved_out_of_the_range()
+    val s = ixd_q()
+    val t = s.begin(Snapshot)
+    val _ = ixd_run(s, t, "UPDATE q SET k = 5 WHERE id = 23")
+    val a = ixd_now(s)
+    xd_ids_are(ixd_ints(ixd_rows(s, t, "SELECT id FROM q WHERE k = 3"), 0), [3, 13, 33])
+    // The entry `k = 3` still names row 23, whose image now holds `k = 5`.
+    ixd_work(s, a, 4, 0, 4, 0, 6)
+    xd_ids_are(ixd_ints(ixd_rows(s, t, "SELECT id FROM q WHERE k = 5"), 0), [5, 15, 23, 25, 35])
+
+@test
+an_index_scan_skips_its_own_deleted_rows()
+    val s = ixd_q()
+    val t = s.begin(Snapshot)
+    val _ = ixd_run(s, t, "DELETE FROM q WHERE id = 13")
+    val a = ixd_now(s)
+    xd_ids_are(ixd_ints(ixd_rows(s, t, "SELECT id FROM q WHERE k = 3"), 0), [3, 23, 33])
+    ixd_work(s, a, 4, 0, 3, 0, 6)
+
+@test
+another_transaction_s_uncommitted_row_is_not_read_through_an_index()
+    val s = ixd_q()
+    val other = s.begin(Snapshot)
+    val _ = ixd_run(s, other, "INSERT INTO q (id, k, v) VALUES (43, 3, 430)")
+    val _ = ixd_run(s, other, "UPDATE q SET v = 1 WHERE id = 13")
+    val t = s.begin(Snapshot)
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, t, "SELECT id, v FROM q WHERE k = 3")
+    xd_ids_are(ixd_ints(rows, 0), [3, 13, 23, 33])
+    assert_eq(ixd_ints(rows, 1)[1], 130)
+    // Rows 13 and 43 hold the other transaction's versions: 13 is rebuilt, 43 has none to read.
+    ixd_work(s, a, 5, 1, 3 + 2, 3, 3)
+
+@test
+an_index_scan_reads_its_snapshot_s_version_of_a_row_moved_since()
+    val s = ixd_q()
+    val reader = s.begin(Snapshot)
+    ixd_ok(s, "UPDATE q SET k = 5, v = 0 WHERE id = 13")
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, reader, "SELECT id, v FROM q WHERE k = 3")
+    xd_ids_are(ixd_ints(rows, 0), [3, 13, 23, 33])
+    assert_eq(ixd_ints(rows, 1)[1], 130)
+    ixd_work(s, a, 4, 1, 3 + 2, 3, 3)
+    xd_ids_are(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE k = 3"), 0), [3, 23, 33])
+
+@test
+a_row_locked_lock_only_is_read_through_an_index_by_its_version()
+    val s = ixd_q()
+    val oid = s.catalog.tables[s.catalog.table_at(cat_q("q")).unwrap()].oid
+    val locker = s.begin(Snapshot)
+    val (_, spec) = s.key_of_table(oid).unwrap()
+    val kb = encode_key(spec.view(), [Int(13)]).unwrap()
+    val _ = s.rows.lock(locker.id, oid, kb.view()).unwrap()
+    val t = s.begin(Snapshot)
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, t, "SELECT id, v FROM q WHERE k = 3")
+    xd_ids_are(ixd_ints(rows, 0), [3, 13, 23, 33])
+    assert_eq(ixd_ints(rows, 1)[1], 130)
+    ixd_work(s, a, 4, 1, 3 + 2, 3, 3)
+
+@test
+rows_of_an_older_schema_version_are_translated_through_an_index()
+    val s = ixd_q()
+    ixd_ddl(s, "ALTER TABLE q ADD x int64")
+    ixd_ok(s, "INSERT INTO q (id, k, v, x) VALUES (43, 3, 430, 7)")
+    val a = ixd_now(s)
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id, x, v FROM q WHERE k = 3")
+    assert(rows[0] == rec([Int(3), Null, Int(30)]))
+    assert(rows[4] == rec([Int(43), Int(7), Int(430)]))
+    // The four rows of the first version are rebuilt whole (key, `k`, `v`, and `note` where not
+    // null); the one of the second is read from its image.
+    ixd_work(s, a, 5, 4, 4 * 2 + 1, 2, 1)
+
+// -- other indexes and targets -------------------------------------------------------------------
+
+@test
+an_index_over_an_expression_reads_its_rows_as_values()
+    val s = ixd_q()
+    ixd_ddl(s, "CREATE INDEX q_kv ON q ((k + v))")
+    // The first read computes the entries of the versions pending since the index was built.
+    xd_ids_are(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE k + v = 133"), 0), [13])
+    val a = ixd_now(s)
+    xd_ids_are(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE k + v = 133"), 0), [13])
+    val w = s.reads.rows - a.work.rows
+    assert_eq(w, 1)
+    assert_eq(s.slots_read - a.slots, 0)
+
+@test
+a_partial_index_reads_its_rows_as_values()
+    val s = ixd_q()
+    ixd_ddl(s, "CREATE INDEX q_kp ON q (v) WHERE k > 5")
+    xd_ids_are(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE v = 170 AND k > 5"), 0), [17])
+    val a = ixd_now(s)
+    xd_ids_are(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT id FROM q WHERE v = 170 AND k > 5"), 0), [17])
+    assert_eq(s.slots_read - a.slots, 0)
+    assert_eq(s.reads.rows - a.work.rows, 1)
+
+@test
+an_update_through_an_index_keeps_the_columns_it_does_not_set()
+    // The target of an update is decoded whole, through an index as through the primary key.
+    val s = ixd_q()
+    ixd_ok(s, "UPDATE q SET v = 0 WHERE k = 4")
+    val rows = ixd_rows(s, s.begin(Snapshot), "SELECT id, k, v, note FROM q WHERE k = 4")
+    assert(rows[0] == rec([Int(4), Int(4), Int(0), Text("n4")]))
+    assert(rows[2] == rec([Int(24), Int(4), Int(0), Text("n24")]))
+
+@test
+a_delete_through_an_index_removes_only_its_rows()
+    val s = ixd_q()
+    ixd_ok(s, "DELETE FROM q WHERE k = 4")
+    assert_eq(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT count(*) FROM q"), 0)[0], 36)
+    assert_eq(ixd_ints(ixd_rows(s, s.begin(Snapshot), "SELECT count(*) FROM q WHERE k = 4"), 0)[0], 0)

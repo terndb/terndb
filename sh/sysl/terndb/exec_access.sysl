@@ -9,27 +9,53 @@ import sysl.buf.{Buf, buf}
 // its encoding (§4.6 rule 3), and one bound on the column after them limits the range further. The
 // filter itself still runs over every row the range holds, so the range only has to hold every row
 // the filter keeps; a conjunct that cannot narrow the range exactly is left out of it.
+//
+// The same conjuncts may instead narrow the scan to a range of a `ready` secondary index's entries,
+// compared as values (§3.3) rather than encodings: equalities on a leading run of its components,
+// each a column or an expression matched exactly, and bounds on the component after them. The rows
+// those entries name are fetched by their keys (`Store.scan_index`). A partial index is used only
+// when each conjunct of its predicate is one of the filter's. One rule chooses among the paths
+// (`access_of`); there is no cost model.
 
-/** How a scan reads its table: every row, the one row of a key, a range of keys, or no row at all
- * because a conjunct compares a key column with null.
+/** How a scan reads its table: every row, the one row of a key, a range of keys, a range of a
+ * secondary index's entries, or no row at all because a conjunct compares a column with null.
  */
 enum AccessPath
     FullScan
     KeyLookup
     KeyRange
     NoRows
+    IndexRange
 
-/** A scan's access path and the encoded keys it reads between. */
+/** A scan's access path: the encoded keys it reads between, or for an `IndexRange` the secondary
+ * index it reads through (`index`, 0 otherwise) and the bounds of that index's entries it reads.
+ */
 struct Access
     path: AccessPath
     lo: KeyBound
     hi: KeyBound
+    index: u64
+    ilo: IxBound
+    ihi: IxBound
 
 /** Every row of the table. */
-full_access() -> Access = Access(FullScan, KeyAny, KeyAny)
+full_access() -> Access = Access(FullScan, KeyAny, KeyAny, 0, IxAny, IxAny)
 
 /** No row: every key is at or above the empty key, so none is below it. */
-private no_rows() -> Access = Access(NoRows, KeyAny, KeyExcl(buf[u8]()))
+private no_rows() -> Access = Access(NoRows, KeyAny, KeyExcl(buf[u8]()), 0, IxAny, IxAny)
+
+/** A primary-key access path between encoded keys `lo` and `hi`. */
+private key_access(path: AccessPath, lo: KeyBound, hi: KeyBound) -> Access = Access(path, lo, hi, 0, IxAny, IxAny)
+
+/** How a candidate access path ranks (`access_of`): how many leading components its equalities fix,
+ * and whether the component after them is bounded too.
+ */
+private struct Rank
+    fixed: usize
+    bounded: bool
+
+/** Whether `a` ranks above `b`: more components fixed, or as many and the next one bounded. */
+private ranks_above(a: Rank, b: Rank) -> bool = a.fixed > b.fixed || (a.fixed == b.fixed && a.bounded && !b.bounded)
 
 /** One end of a key column's range: the column's encoding of the value, and whether it is included. */
 private struct ColBound
@@ -42,15 +68,70 @@ private struct ColLimits
     lo: Option[ColBound]
     hi: Option[ColBound]
 
-/** The access path of a scan of `table` through `binder` whose rows are filtered by `filter`. */
+/** The access path of a scan of `table` through `binder` whose rows are filtered by `filter`, by one
+ * rule (`docs/design/executor.md` §4.6):
+ *
+ * 1. a conjunct comparing a column with null reads no row;
+ * 2. else a lookup of the whole primary key;
+ * 3. else a `ready` unique index with every component fixed by an equality, the first in catalog
+ *    order;
+ * 4. else the primary-key range or `ready` index range that fixes the most leading components,
+ *    then whose next component is bounded, ties going to the primary key and then to the earlier
+ *    index; a path that fixes and bounds nothing is no path, and with none the scan reads every row.
+ */
 private[terndb] access_of(d: Db, ct: CatTable, binder: string, filter: Option[TExpr], ctx: Ctx) -> Access
     val p = filter match
         Some(p) -> p
         None -> return full_access()
 
+    val conjuncts = buf[TExpr]()
+    conjuncts_of(p, conjuncts)
+
+    // A comparison with null is never true, so neither is the filter.
+    if null_compared(conjuncts, binder, ctx) then return no_rows()
+
+    val (key, key_rank) = key_path(d, ct, binder, conjuncts, ctx)
+    if key.path == KeyLookup || key.path == NoRows then return key
+
+    var best = key
+    var rank = key_rank
+
+    for x in d.store.catalog.indexes
+        if x.table == ct.oid && x.state == IndexReady
+            index_path(d, ct, x, binder, conjuncts, ctx) match
+                Some(c) ->
+                    val (a, r) = c
+                    if x.unique && r.fixed == x.keys.len() then return a
+
+                    if ranks_above(r, rank)
+                        best = a
+                        rank = r
+                None -> ()
+
+    best
+end access_of
+
+/** Whether one of `conjuncts` compares a column of `binder` with a fixed operand that is null. */
+private null_compared(conjuncts: Buf[TExpr], binder: string, ctx: Ctx) -> bool
+    for c in conjuncts
+        key_comparison(c, binder) match
+            Some(k) ->
+                val (_, _, other) = k
+
+                constant_value(other, ctx) match
+                    Some(v) -> if v.is_null() then return true
+                    None -> ()
+            None -> ()
+
+    false
+
+/** The primary-key access path `conjuncts` allow, and its rank. */
+private key_path(d: Db, ct: CatTable, binder: string, conjuncts: Buf[TExpr], ctx: Ctx) -> (Access, Rank)
+    val none = (full_access(), Rank(0, false))
+
     val (ids, spec) = d.store.key_of_table(ct.oid) match
         Ok(k) -> k
-        Err(_) -> return full_access()
+        Err(_) -> return none
 
     val names = buf[string]()
     val types = buf[Type]()
@@ -60,15 +141,12 @@ private[terndb] access_of(d: Db, ct: CatTable, binder: string, filter: Option[TE
             Some(c) ->
                 names.push(c.name)
                 types.push(c.ty)
-            None -> return full_access()
+            None -> return none
 
     val limits = buf[ColLimits]()
 
     for _ in ids
         limits.push(ColLimits(None, None, None))
-
-    val conjuncts = buf[TExpr]()
-    conjuncts_of(p, conjuncts)
 
     for c in conjuncts
         val (f, col, other) = key_comparison(c, binder) match
@@ -86,7 +164,7 @@ private[terndb] access_of(d: Db, ct: CatTable, binder: string, filter: Option[TE
             None -> continue
 
         // A comparison with null is never true, so neither is the filter.
-        if v.is_null() then return no_rows()
+        if v.is_null() then return (no_rows(), Rank(0, false))
 
         val enc = key_component(d.store.catalog, spec[i], types[i], other.ty, v) match
             Some(e) -> e
@@ -100,12 +178,12 @@ private[terndb] access_of(d: Db, ct: CatTable, binder: string, filter: Option[TE
             _ -> limits[i] = ColLimits(l.eq, l.lo, Some(lower_hi(l.hi, ColBound(enc, f == "le"))))
 
     bounds_of(limits)
-end access_of
+end key_path
 
-/** The access path `limits` allow: equalities on the leading columns fix a prefix of the key, and
- * the bounds of the column after them narrow the range below and above it.
+/** The access path `limits` allow, and its rank: equalities on the leading columns fix a prefix of
+ * the key, and the bounds of the column after them narrow the range below and above it.
  */
-private bounds_of(limits: Buf[ColLimits]) -> Access
+private bounds_of(limits: Buf[ColLimits]) -> (Access, Rank)
     val prefix = buf[u8]()
     var k: usize = 0
 
@@ -116,10 +194,11 @@ private bounds_of(limits: Buf[ColLimits]) -> Access
 
         k += 1
 
-    if k == limits.len() then return Access(KeyLookup, KeyIncl(prefix), above_all(prefix))
+    if k == limits.len() then return (key_access(KeyLookup, KeyIncl(prefix), above_all(prefix)), Rank(k, false))
 
     val l = limits[k]
-    if k == 0 && l.lo.is_none() && l.hi.is_none() then return full_access()
+    val bounded = l.lo.is_some() || l.hi.is_some()
+    if k == 0 && !bounded then return (full_access(), Rank(0, false))
 
     // `> v` starts after every key holding `v` there; `>= v` at the first of them.
     val lo = l.lo match
@@ -131,8 +210,273 @@ private bounds_of(limits: Buf[ColLimits]) -> Access
         Some(b) -> upper_bound(joined(prefix, b.enc), b.inclusive, prefix)
         None -> above_all(prefix)
 
-    Access(KeyRange, lo, hi)
+    (key_access(KeyRange, lo, hi), Rank(k, bounded))
 end bounds_of
+
+// -- secondary indexes -------------------------------------------------------------------------------
+
+/** What the conjuncts say of one component of a secondary index: the value it equals, and its
+ * bounds, each a value of `ty`, the component's type as the comparisons type it.
+ */
+private struct ValLimits
+    eq: Option[Value]
+    lo: Option[ValBound]
+    hi: Option[ValBound]
+    ty: Option[Type]
+
+/** One end of a component's range: a value, and whether it is included. */
+private struct ValBound
+    v: Value
+    inclusive: bool
+
+/** The access path through index `x` of table `ct` that `conjuncts` allow, and its rank: none when
+ * they fix and bound none of its leading components, or when `x` is partial and not every conjunct
+ * of its predicate is one of `conjuncts` (`ddl.md` §2.5 rule 3 lets implication be decided this
+ * conservatively).
+ */
+private index_path(d: Db, ct: CatTable, x: CatIndex, binder: string, conjuncts: Buf[TExpr], ctx: Ctx) -> Option[(Access, Rank)]
+    x.predicate match
+        Some(pr) -> if !implied(pr, conjuncts, binder) then return None
+        None -> ()
+
+    val limits = buf[ValLimits]()
+
+    for _ in x.keys
+        limits.push(ValLimits(None, None, None, None))
+
+    for c in conjuncts
+        val (f, side, other) = fixed_comparison(c) match
+            Some(k) -> k
+            None -> continue
+
+        val i = component_of(ct, x, side, binder) match
+            Some(i) -> i
+            None -> continue
+
+        val v = constant_value(other, ctx) match
+            Some(v) -> v
+            None -> continue
+
+        // A null compared with a column has made the scan read nothing already; one compared with
+        // an expression is left to the filter.
+        if v.is_null() then continue
+
+        val (cv, ty) = component_value(d.store.catalog, side.ty, other.ty, v) match
+            Some(k) -> k
+            None -> continue
+
+        val l = limits[i]
+
+        f match
+            "eq" -> if l.eq.is_none() then limits[i] = ValLimits(Some(cv), l.lo, l.hi, Some(ty))
+            "gt" | "ge" -> limits[i] = ValLimits(l.eq, Some(higher_val(ty, l.lo, ValBound(cv, f == "ge"))), l.hi, Some(ty))
+            _ -> limits[i] = ValLimits(l.eq, l.lo, Some(lower_val(ty, l.hi, ValBound(cv, f == "le"))), Some(ty))
+
+    index_bounds(x.oid, limits)
+end index_path
+
+/** The range of index `oid`'s entries `limits` allow, and its rank: equalities on the leading
+ * components fix a prefix of the entry's value, and the bounds of the component after them narrow
+ * it. A bound on that component also leaves out its nulls, which sort first (§3.3) and which no
+ * comparison is true of.
+ */
+private index_bounds(oid: u64, limits: Buf[ValLimits]) -> Option[(Access, Rank)]
+    val prefix = buf[Value]()
+    var k: usize = 0
+
+    while k < limits.len()
+        limits[k].eq match
+            Some(v) -> prefix.push(v)
+            None -> break
+
+        k += 1
+
+    if k == limits.len() then return Some((index_access(oid, IxAt(prefix, true), IxAt(prefix.copy(), true)), Rank(k, false)))
+
+    val l = limits[k]
+    val bounded = l.lo.is_some() || l.hi.is_some()
+    if k == 0 && !bounded then return None
+
+    val lo = l.lo match
+        Some(b) -> IxAt(pushed(prefix, b.v), b.inclusive)
+        None -> if l.hi.is_some() then IxAt(pushed(prefix, Value.Null), false) else IxAt(prefix.copy(), true)
+
+    val hi = l.hi match
+        Some(b) -> IxAt(pushed(prefix, b.v), b.inclusive)
+        None -> if k == 0 then IxAny else IxAt(prefix.copy(), true)
+
+    Some((index_access(oid, lo, hi), Rank(k, bounded)))
+end index_bounds
+
+/** An access path reading index `oid`'s entries between `lo` and `hi`. */
+private index_access(oid: u64, lo: IxBound, hi: IxBound) -> Access = Access(IndexRange, KeyAny, KeyAny, oid, lo, hi)
+
+private pushed(xs: Buf[Value], v: Value) -> Buf[Value]
+    val out = xs.copy()
+    out.push(v)
+    out
+
+/** The tighter of two lower bounds of type `ty`: the higher, and at an equal value the exclusive one. */
+private higher_val(ty: Type, a: Option[ValBound], b: ValBound) -> ValBound = a match
+    Some(x) ->
+        val c = cmp(ty, x.v, b.v)
+        if c > 0 || (c == 0 && !x.inclusive) then x else b
+    None -> b
+
+/** The tighter of two upper bounds of type `ty`: the lower, and at an equal value the exclusive one. */
+private lower_val(ty: Type, a: Option[ValBound], b: ValBound) -> ValBound = a match
+    Some(x) ->
+        val c = cmp(ty, x.v, b.v)
+        if c < 0 || (c == 0 && !x.inclusive) then x else b
+    None -> b
+
+/** A comparison of an operand that is not fixed for the statement with one that is, as
+ * `side f fixed`: the comparison turned round when the fixed operand is on the left.
+ */
+private fixed_comparison(c: TExpr) -> Option[(string, TExpr, TExpr)]
+    val f = c.e match
+        Call(f, _) -> f
+        _ -> return None
+
+    if c.kids.len() != 2 then return None
+    if f != "eq" && f != "lt" && f != "le" && f != "gt" && f != "ge" then return None
+
+    val a = is_constant(c.kids[0])
+    val b = is_constant(c.kids[1])
+
+    if b && !a then return Some((f, c.kids[0], c.kids[1]))
+    if a && !b then return Some((turned(f), c.kids[1], c.kids[0]))
+
+    None
+
+/** The component of index `x` that `side` is: a column component when `side` is that column of
+ * `binder`, an expression component when `side` is that expression exactly (`matches_def`).
+ */
+private component_of(ct: CatTable, x: CatIndex, side: TExpr, binder: string) -> Option[usize]
+    for i in 0..<x.keys.len()
+        x.keys[i].key match
+            KeyOn(id) -> ct.column_by_id(id) match
+                Some(col) -> if is_col_of(side, binder) && side.e == Col(binder, col.name) then return Some(i)
+                None -> ()
+            KeyOver(e) -> if matches_def(side, binder, e) then return Some(i)
+
+    None
+
+/** Whether every conjunct of definition expression `pr` (`ddl.md` §2.12) is one of `conjuncts`. */
+private implied(pr: Expr, conjuncts: Buf[TExpr], binder: string) -> bool
+    val parts = buf[Expr]()
+    def_conjuncts(pr, parts)
+
+    for q in parts
+        var found = false
+
+        for c in conjuncts
+            if !found && matches_def(c, binder, q) then found = true
+
+        if !found then return false
+
+    true
+
+/** The conjuncts of definition expression `e`: the operands of its `and`s at any nesting. */
+private def_conjuncts(e: Expr, out: Buf[Expr])
+    e match
+        Call(f, args) -> if f == "and" && args.len() == 2
+            def_conjuncts(args[0], out)
+            def_conjuncts(args[1], out)
+            return
+        _ -> ()
+
+    out.push(e)
+
+/** Whether `x`, an expression of a query over `binder`, is definition expression `e` exactly, the
+ * definition's row binder standing for `binder`: the same columns, literals, calls, casts and field
+ * accesses, node for node. Anything else in `e` never matches.
+ */
+private matches_def(x: TExpr, binder: string, e: Expr) -> bool
+    if x.sub.is_some() then return false
+
+    e match
+        Col(_, n) -> x.e match
+            Col(b, m) -> b == binder && m == n
+            _ -> false
+        Literal(_, _) | Null(_) -> x.e == e
+        Call(f, args) -> x.e match
+            Call(g, _) ->
+                if g != f || x.kids.len() != args.len() then return false
+
+                for i in 0..<args.len()
+                    if !matches_def(x.kids[i], binder, args[i]) then return false
+
+                true
+            _ -> false
+        Cast(inner, ty, mode) -> x.e match
+            Cast(_, t2, m2) -> t2 == ty && m2 == mode && x.kids.len() == 1 && matches_def(x.kids[0], binder, *inner)
+            _ -> false
+        Field(inner, name) -> x.e match
+            Field(_, n2) -> n2 == name && x.kids.len() == 1 && matches_def(x.kids[0], binder, *inner)
+            _ -> false
+        _ -> false
+end matches_def
+
+/** Fixed value `v`, of type `ty`, as a value of the component of type `col` it is compared with, and
+ * that type resolved: `v` itself when the two types are one, and `v` as the component's own integer
+ * when both are integers (§4.2: integers compare by value). None for any other pair, and for a value
+ * the component's type cannot hold.
+ */
+private component_value(c: MemCatalog, col: Type, ty: Type, v: Value) -> Option[(Value, Type)]
+    val ct = resolve_type(c, col) match
+        Ok(t) -> t.base()
+        Err(_) -> return None
+
+    val vt = resolve_type(c, ty) match
+        Ok(t) -> t.base()
+        Err(_) -> return None
+
+    if vt != ct && !(is_integer(vt) && is_integer(ct)) then return None
+    val kv = if vt == ct then Some(v) else as_integer(v, ct)
+
+    kv match
+        Some(k) -> Some((k, ct))
+        None -> None
+
+/** The operator reading the rows of table `oid` that index range `access` names, its read logged
+ * as `logged`, decoding the non-key columns `columns` names by id (every column when none).
+ */
+private[terndb] index_scan_op(d: Db, oid: u64, elem: Type, logged: Pred, access: Access, columns: Option[Buf[u32]]) -> &Operator =
+    IndexScanOp(d.store, d.txn, oid, elem, logged, access, columns, buf[ColumnVector](), false, 0)
+
+/** A table's rows visible to `txn` that its access path's range of a secondary index names, read
+ * through the index on the first pull, all at once and in key order, straight into vectors
+ * (`Store.scan_index_vectors`), and handed up in batches of `BatchSize`. A non-key column `columns`
+ * does not name is not decoded: its slots hold its type's placeholder.
+ */
+struct IndexScanOp
+    store: &Store
+    txn: &Txn
+    oid: u64
+    elem: Type
+    logged: Pred
+    access: Access
+    columns: Option[Buf[u32]]
+    batches: Buf[ColumnVector]
+    read: bool
+    at: usize
+
+impl Operator for IndexScanOp
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if !self.read
+            self.read = true
+            val a = self.access
+            self.batches = self.store.scan_index_vectors(self.txn, self.oid, a.index, a.ilo, a.ihi, self.logged, self.elem, self.columns)?
+
+        while self.at < self.batches.len()
+            val b = self.batches[self.at]
+            self.at += 1
+
+            if b.len > 0 then return Ok(Some(b))
+
+        Ok(None)
+end IndexScanOp
 
 /** The lower bound of the keys that begin with `at` (inclusive) or follow all of them. When nothing
  * follows them (`at` is all 0xFF), the keys above `at` itself, of which only those that begin with

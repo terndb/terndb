@@ -3,62 +3,73 @@ module sh.sysl.terndb
 import sysl.buf.{Buf, buf}
 import sysl.slices.sort_by
 
-// The store's constraint machinery beyond the primary key (`ddl.md` §2.5–§2.6, `isolation.md`
-// §4.2–§4.4): a secondary unique index per unique key of a table, kept as a sorted buffer of entries
-// and checked once a batch of a statement's writes is applied; the lookups a foreign key needs (the
+// The store's secondary indexes and its constraint machinery beyond the primary key (`ddl.md`
+// §2.5–§2.6, `isolation.md` §4.2–§4.4): every secondary index of a table, unique or not, kept as a
+// sorted buffer of entries, its unique keys checked once a batch of a statement's writes is applied,
+// and read through by `scan_index` (`docs/design/executor.md` §4.6); the lookups a foreign key needs (the
 // referenced row of a referencing value, under a `LOCK_ONLY` lock, and the referencing rows of a
 // referenced value); the foreign-key checks deferred to commit; and the statement undo log that lets
 // a statement wait part-way and leave no trace (`docs/design/store.md`).
 
-// -- unique indexes ---------------------------------------------------------------------------------
+// -- secondary indexes ------------------------------------------------------------------------------
 
-/** One entry of a unique index: a key value with no null component that some version of the row
- * keyed `key` holds (a value with a null component, or a version the index's predicate does not
- * cover, has no entry here: it never conflicts, Q48). Entries are sorted by value, then by primary
- * key, and never removed: a lookup reads the row's versions to decide whether the value is still
- * there, as `on-disk-format.md` §4.9 rule 2 has a reader do.
+/** One entry of a secondary index: the value of its components that some version of the row keyed
+ * `key` holds, null components included (`ddl.md` §2.5 rule 1; a value with one never conflicts in a
+ * unique index, Q48). A version the index's predicate is not true of has no entry. Entries are
+ * sorted by value, then by primary key, and never removed: a reader fetches the row and reads its
+ * version to decide whether the value is still there, as `on-disk-format.md` §4.9 rule 2 has it do.
  */
 struct IxEntry
     value: Value
     key: Value
 
-/** A secondary unique key of a table as the store enforces it (`ddl.md` §2.5 rules 2–5): a `unique`
- * constraint, or a unique index `building` or `ready`. `oid` is the index's (the constraint's own
- * when it has none); `keys` and `predicate` its definition; `columns` the column of each component
- * and `plain` whether every component is a column and there is no predicate, so that a version's
- * entry is read straight from its image. A version of any other index has its entry computed by
- * evaluating the definition over the row (`ix_values`); the versions installed since the last check
- * wait in `pending` to be computed together. `ty` is the record type of the key's components.
+/** A secondary index of a table as the store keeps it (`ddl.md` §2.5): a `unique` constraint's, or an
+ * index `building` or `ready`, unique or not, partial or over expressions. `oid` is the index's (the
+ * constraint's own when it has none); `keys` and `predicate` its definition; `columns` the column of
+ * each component and `plain` whether every component is a column and there is no predicate, so that
+ * a version's entry is read straight from its image. A version of any other index has its entry
+ * computed by evaluating the definition over the row (`ix_values`); the versions installed since the
+ * last check wait in `pending` to be computed together, and `unindexed` holds the keys of the rows
+ * one of whose versions the definition could not be evaluated over, which a read through the index
+ * fetches as well, so that the filter above it meets them as a full scan's would. `unique` is whether
+ * it enforces uniqueness (rule 2), `ready` whether it may answer a read (rule 5): its catalog state
+ * is `ready`, or it is a `unique` constraint's with no index object of its own. `ty` is the record
+ * type of the components.
  */
-struct UniqueIx
+struct SecIndex
     oid: u64
     name: string
     keys: Buf[CatKey]
     predicate: Option[Expr]
     columns: Buf[u32]
     plain: bool
+    unique: bool
+    ready: bool
     ty: Type
     entries: Buf[IxEntry]
     pending: Buf[Hit]
+    unindexed: Buf[Value]
 
 /** A unique key as the catalog defines it: its name and its columns. */
 struct KeyColumns
     name: string
     columns: Buf[u32]
 
-/** A unique key the store enforces, as the catalog defines it (`UniqueIx`). */
+/** A secondary index the store keeps, as the catalog defines it (`SecIndex`). */
 struct IxDef
     oid: u64
     name: string
     keys: Buf[CatKey]
     predicate: Option[Expr]
+    unique: bool
+    ready: bool
 
-/** The secondary unique keys table `oid`'s writers check (`ddl.md` §2.5 rule 5, §8.9): every `unique`
- * constraint, and every unique index that backs none and is `building` or `ready`, partial or over
- * expressions. A `building` index is checked against the entries present, which in this store are
- * those of every row from the moment it is created (Q71).
+/** The secondary indexes of table `oid` the store keeps (`ddl.md` §2.5, §8.9): every `unique`
+ * constraint's, and every index that backs none and is `building` or `ready`, unique or not, partial
+ * or over expressions. A unique one's writers check it; a `building` one is checked against the
+ * entries present, which in this store are those of every row from the moment it is created (Q71).
  */
-enforced_keys(c: MemCatalog, oid: u64) -> Buf[IxDef]
+maintained_indexes(c: MemCatalog, oid: u64) -> Buf[IxDef]
     val out = buf[IxDef]()
 
     for k in c.constraints
@@ -70,15 +81,19 @@ enforced_keys(c: MemCatalog, oid: u64) -> Buf[IxDef]
                     for id in ids
                         keys.push(CatKey(KeyOn(id), false))
 
-                    out.push(IxDef(if k.index != 0 then k.index else k.oid, k.name, keys, None))
+                    val ready = if k.index == 0 then true else c.index_by_oid(k.index) match
+                        Some(i) -> c.indexes[i].state == IndexReady
+                        None -> false
+
+                    out.push(IxDef(if k.index != 0 then k.index else k.oid, k.name, keys, None, true, ready))
                 _ -> ()
 
     for x in c.indexes
-        if x.table == oid && x.unique && x.constraint == 0 && x.state != IndexFailed
-            out.push(IxDef(x.oid, x.name, x.keys, x.predicate))
+        if x.table == oid && x.constraint == 0 && x.state != IndexFailed
+            out.push(IxDef(x.oid, x.name, x.keys, x.predicate, x.unique, x.state == IndexReady))
 
     out
-end enforced_keys
+end maintained_indexes
 
 /** The column of each of `keys`' components, and whether every one is a column. */
 private key_columns(keys: Buf[CatKey]) -> (Buf[u32], bool)
@@ -141,9 +156,9 @@ end def_values
 
 /** The entry in `ix` of `row`, the `n`th of the rows `cols` was evaluated over (`def_values`, the
  * predicate first if `ix` has one, then each expression component), a row of table `t` in its
- * current schema version: none where the predicate is not true or a component is null.
+ * current schema version: none where the predicate is not true. A null component stays in it.
  */
-private index_entry(t: CatTable, ix: &UniqueIx, row: Value, cols: Buf[Buf[Value]], n: usize) -> Option[Value]
+private index_entry(t: CatTable, ix: &SecIndex, row: Value, cols: Buf[Buf[Value]], n: usize) -> Option[Value]
     var at: usize = 0
 
     if ix.predicate.is_some()
@@ -167,7 +182,6 @@ private index_entry(t: CatTable, ix: &UniqueIx, row: Value, cols: Buf[Buf[Value]
                 v = cols[at][n]
                 at += 1
 
-        if v.is_null() then return None
         parts.push(v)
 
     Some(Record(parts))
@@ -224,7 +238,15 @@ columns_type(c: MemCatalog, oid: u64, ids: Buf[u32]) -> Type
  * or absent, since a key with a null component never conflicts (`ddl.md` §2.5 rule 2) and a
  * referencing value with one is not checked (§2.6 rule 2).
  */
-image_values(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32]) -> Option[Value]
+image_values(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32]) -> Option[Value] = columns_of(versions, r, ids, false)
+
+/** Columns `ids` of `r`, read through `r`'s own schema version, as a record, null ones included: a
+ * version's entry in a plain index. None when one is absent.
+ */
+private entry_values(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32]) -> Option[Value] = columns_of(versions, r, ids, true)
+
+// Columns `ids` of `r` as a record; none when one is absent, or null and `nulls` is false.
+private columns_of(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32], nulls: bool) -> Option[Value]
     val fields = r.value match
         Record(fs) -> fs
         _ -> return None
@@ -238,7 +260,7 @@ image_values(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32]) -> Optio
 
                 for j in 0..<v.columns.len()
                     if v.columns[j].id == id && j < fields.len()
-                        if fields[j].is_null() then return None
+                        if fields[j].is_null() && !nulls then return None
                         parts.push(fields[j])
                         found = true
 
@@ -247,7 +269,17 @@ image_values(versions: Buf[SchemaVersion], r: StoredRow, ids: Buf[u32]) -> Optio
             return Some(Record(parts))
 
     None
-end image_values
+end columns_of
+
+/** Whether entry value `u` has a null component: such a value never conflicts (`ddl.md` §2.5 rule 2). */
+private[terndb] has_null_part(u: Value) -> bool
+    u match
+        Record(fs) ->
+            for f in fs
+                if f.is_null() then return true
+        _ -> ()
+
+    false
 
 /** Whether `r` holds `u` in columns `ids` (compared by `same`, through `cmp`). */
 row_holds(versions: Buf[SchemaVersion], ids: Buf[u32], ty: Type, u: Value, r: StoredRow) -> bool = image_values(versions, r, ids) match
@@ -260,7 +292,7 @@ image_holds(versions: Buf[SchemaVersion], ids: Buf[u32], ty: Type, u: Value, img
     None -> false
 
 // The first entry of `ix` whose value is not below `u`.
-private ix_first(ix: &UniqueIx, u: Value) -> usize
+private ix_first(ix: &SecIndex, u: Value) -> usize
     var lo: usize = 0
     var hi = ix.entries.len()
 
@@ -271,7 +303,7 @@ private ix_first(ix: &UniqueIx, u: Value) -> usize
     lo
 
 // Adds the entry `(u, key)` to `ix` unless it is there already.
-private ix_add(ix: &UniqueIx, key_type: Type, u: Value, key: Value)
+private ix_add(ix: &SecIndex, key_type: Type, u: Value, key: Value)
     var lo: usize = 0
     var hi = ix.entries.len()
 
@@ -285,11 +317,106 @@ private ix_add(ix: &UniqueIx, key_type: Type, u: Value, key: Value)
 
     ix.entries.insert(lo, IxEntry(u, key))
 
-/** Enters the image `img` of the row keyed `key` in every unique index of `d`: at once in a plain
+/** One end of a read of a secondary index (`Store.scan_index`): no end (`IxAny`), or the entries
+ * whose leading components, as many as `values` holds, compare with `values` (by `cmp`, in order)
+ * at or beyond it — inclusive or not — on that end's side.
+ */
+enum IxBound
+    IxAny
+    IxAt(values: Buf[Value], inclusive: bool)
+
+/** The leading components of entry value `v`, of record type `ty`, compared with `bound` (§3.3): the
+ * first component that differs decides, and a value equal on every one of them compares as 0.
+ */
+private prefix_cmp(ty: Type, v: Value, bound: Buf[Value]) -> int
+    val fs = ty.base() match
+        Record(fs) -> fs
+        _ -> return 0
+
+    val xs = v match
+        Record(xs) -> xs
+        _ -> return 0
+
+    for i in 0..<bound.len()
+        if i >= xs.len() || i >= fs.len() then return 0
+        val c = cmp(fs[i].ty, xs[i], bound[i])
+        if c != 0 then return c
+
+    0
+
+/** Whether entry value `u` of `ix` lies before lower bound `lo`. */
+private before_lo(ix: &SecIndex, u: Value, lo: IxBound) -> bool = lo match
+    IxAny -> false
+    IxAt(vs, inclusive) ->
+        val c = prefix_cmp(ix.ty, u, vs)
+        c < 0 || (c == 0 && !inclusive)
+
+/** Whether entry value `u` of `ix` lies past upper bound `hi`. */
+private past_hi(ix: &SecIndex, u: Value, hi: IxBound) -> bool = hi match
+    IxAny -> false
+    IxAt(vs, inclusive) ->
+        val c = prefix_cmp(ix.ty, u, vs)
+        c > 0 || (c == 0 && !inclusive)
+
+/** Whether a version whose entry in `ix` is `entry` lies between `lo` and `hi`: one with no entry is
+ * left to the filter above the read, and so counts as inside.
+ */
+private[terndb] in_ix_range(ix: &SecIndex, entry: Option[Value], lo: IxBound, hi: IxBound) -> bool = entry match
+    Some(u) -> !before_lo(ix, u, lo) && !past_hi(ix, u, hi)
+    None -> true
+
+/** The first entry of `ix` not before `lo`: the entries are sorted, so those before it form a prefix. */
+private ix_from(ix: &SecIndex, lo: IxBound) -> usize
+    var a: usize = 0
+    var b = ix.entries.len()
+
+    while a < b
+        val mid = a + (b - a) / 2
+        if before_lo(ix, ix.entries[mid].value, lo) then a = mid + 1 else b = mid
+
+    a
+
+/** The index of `d` whose oid is `oid`, if the store keeps it. */
+private[terndb] index_of_oid(d: &TableData, oid: u64) -> Option[&SecIndex]
+    for ix in d.indexes
+        if ix.oid == oid then return Some(ix)
+
+    None
+
+/** A `ready` index of `d` with no predicate whose leading components are columns `ids` in order:
+ * one the referencing rows of a foreign key over `ids` can be found through.
+ */
+private leading_index(d: &TableData, ids: Buf[u32]) -> Option[&SecIndex]
+    for ix in d.indexes
+        if ix.ready && ix.predicate.is_none() && ix.keys.len() >= ids.len() && ids.len() > 0
+            var ok = true
+
+            for i in 0..<ids.len()
+                ix.keys[i].key match
+                    KeyOn(id) -> if id != ids[i] then ok = false
+                    KeyOver(_) -> ok = false
+
+            if ok then return Some(ix)
+
+    None
+
+/** Whether `xs` holds `x`. */
+private holds_value(xs: Buf[Value], x: Value) -> bool
+    for v in xs
+        if v == x then return true
+
+    false
+
+/** A row's encoded key and its key: what the rows read through an index are sorted by. */
+private struct KeyAt
+    kb: Buf[u8]
+    key: Value
+
+/** Enters the image `img` of the row keyed `key` in every secondary index of `d`: at once in a plain
  * index, and in any other once its entry is computed (`Store.settle`).
  */
 private[terndb] index_image(c: MemCatalog, d: &TableData, key: Value, img: Option[StoredRow])
-    if d.uniques.len() == 0 then return
+    if d.indexes.len() == 0 then return
 
     val r = img match
         Some(r) -> r
@@ -297,16 +424,17 @@ private[terndb] index_image(c: MemCatalog, d: &TableData, key: Value, img: Optio
 
     val versions = table_versions(c, d.oid)
 
-    for ix in d.uniques
+    for ix in d.indexes
         if ix.plain
-            image_values(versions, r, ix.columns) match
+            entry_values(versions, r, ix.columns) match
                 Some(u) -> ix_add(ix, d.key_type, u, key)
                 None -> ()
         else
             ix.pending.push(Hit(key, r))
 
 /** The keys of the rows whose versions may hold `value` in columns `ids` of `d`: that key itself
- * when `ids` is the primary key, else those of the entries of the unique index over `ids`.
+ * when `ids` is the primary key, else those of the entries of a plain index over exactly `ids`, which
+ * a unique key always has.
  */
 private keys_holding(d: &TableData, ids: Buf[u32], value: Value) -> Result[Buf[Value], CodecError]
     val out = buf[Value]()
@@ -315,7 +443,7 @@ private keys_holding(d: &TableData, ids: Buf[u32], value: Value) -> Result[Buf[V
         out.push(value)
         return Ok(out)
 
-    for ix in d.uniques
+    for ix in d.indexes
         if ix.plain && same_ids(ix.columns, ids)
             var i = ix_first(ix, value)
 
@@ -445,6 +573,21 @@ impl Store
         val r = self.referencing_in(t, fk, values)
         self.guard(t, r)
 
+    /** The rows of `table` visible to `t` whose visible version's entry in secondary index `index`
+     * lies between `lo` and `hi`, in key order, the read logged as `logged` under serializable
+     * (§4.4) whatever it finds: a scan narrowed through an index (`exec_access.sysl`). Each entry in
+     * the range names a row some version of which held the value; the row is fetched by its key and
+     * its version visible to `t` read, and kept unless that version's own entry lies outside the
+     * range. A row whose visible version has no entry, because the index's predicate is not true of
+     * it or its definition cannot be evaluated over it, is kept too, and so is every row one of whose
+     * versions the definition could not be evaluated over: the filter above decides them. `logged`
+     * must hold for every row the statement's result depends on, and the range must hold every such
+     * row's entry. An index the store does not keep reads the whole table.
+     */
+    scan_index(*self, t: &Txn, table: u64, index: u64, lo: IxBound, hi: IxBound, logged: Pred) -> Result[Buf[Hit], CodecError]
+        val r = self.scan_index_in(t, table, index, lo, hi, logged)
+        self.guard(t, r)
+
     /** Whether a row `t` sees holds `value` in columns `ids` of `table`. */
     holds_key(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
         val r = self.holds_in(t, table, ids, value)
@@ -462,8 +605,8 @@ impl Store
             Done(n) -> n
 
         val d = self.table_data(table)?
-        self.sync_uniques(d)?
-        if d.uniques.len() == 0 then return Ok(Done(n))
+        self.sync_indexes(d)?
+        if d.indexes.len() == 0 then return Ok(Done(n))
         val keys = buf[Value]()
 
         for i in m.undo..<t.undo.len()
@@ -478,28 +621,30 @@ impl Store
         t.waits_for = 0
         Ok(Done(n))
 
-    // Brings `d`'s unique indexes in line with the catalog: a key added since is built from every
-    // version of every row still reachable, a key dropped is forgotten, and a key renamed keeps its
-    // entries under its new name.
-    private[terndb] sync_uniques(*self, d: &TableData) -> Result[unit, CodecError]
-        val defs = enforced_keys(self.catalog, d.oid)
-        if defs.len() == 0 && d.uniques.len() == 0 then return Ok(())
+    // Brings `d`'s secondary indexes in line with the catalog: an index added since is built from
+    // every version of every row still reachable, an index dropped is forgotten, and one renamed or
+    // made ready keeps its entries.
+    private[terndb] sync_indexes(*self, d: &TableData) -> Result[unit, CodecError]
+        val defs = maintained_indexes(self.catalog, d.oid)
+        if defs.len() == 0 && d.indexes.len() == 0 then return Ok(())
 
-        val kept = buf[&UniqueIx]()
+        val kept = buf[&SecIndex]()
 
         for k in defs
             var found = false
 
-            for ix in d.uniques
-                if !found && ix.oid == k.oid && ix.keys == k.keys && ix.predicate == k.predicate
+            for ix in d.indexes
+                if !found && ix.oid == k.oid && ix.keys == k.keys && ix.predicate == k.predicate && ix.unique == k.unique
                     ix.name = k.name
+                    ix.ready = k.ready
                     kept.push(ix)
                     found = true
 
             if !found
                 val (ids, columns_only) = key_columns(k.keys)
                 val plain = columns_only && k.predicate.is_none()
-                val ix: &UniqueIx = UniqueIx(k.oid, k.name, k.keys, k.predicate, ids, plain, keys_type(self.catalog, d.oid, k.keys)?, buf(), buf())
+                val ty = keys_type(self.catalog, d.oid, k.keys)?
+                val ix: &SecIndex = SecIndex(k.oid, k.name, k.keys, k.predicate, ids, plain, k.unique, k.ready, ty, buf(), buf(), buf())
 
                 for s in self.slots_of(d)?
                     for r in self.all_versions(d, s)?
@@ -507,28 +652,50 @@ impl Store
 
                 kept.push(ix)
 
-        d.uniques = kept
+        d.indexes = kept
         self.settle(d)
-    end sync_uniques
+    end sync_indexes
 
-    /** Enters in each unique index of `d` the versions waiting for their entries (`UniqueIx.pending`),
-     * computed together. A version the index's definition cannot be evaluated over has no entry: it
-     * holds no value of the key.
+    /** Enters in each secondary index of `d` the versions waiting for their entries
+     * (`SecIndex.pending`), computed together. A version the index's definition cannot be evaluated
+     * over has no entry: it holds no value of the key, and its row's key joins `unindexed`.
      */
     private settle(*self, d: &TableData) -> Result[unit, CodecError]
-        for ix in d.uniques
+        for ix in d.indexes
             if ix.pending.len() > 0
                 val rows = buf[StoredRow]()
 
                 for h in ix.pending
                     rows.push(h.row)
 
-                val vs = self.ix_values(d, ix, rows, false)?
+                if ix.plain
+                    val vs = self.ix_values(d, ix, rows, false)?
 
-                for i in 0..<vs.len()
-                    vs[i] match
-                        Some(u) -> ix_add(ix, d.key_type, u, ix.pending[i].key)
-                        None -> ()
+                    for i in 0..<vs.len()
+                        vs[i] match
+                            Some(u) -> ix_add(ix, d.key_type, u, ix.pending[i].key)
+                            None -> ()
+
+                    ix.pending.clear()
+                    continue
+
+                // The definition over all of them at once; over each alone only when that fails.
+                self.evaluated(d, ix, rows) match
+                    Ok(vs) ->
+                        for i in 0..<vs.len()
+                            vs[i] match
+                                Some(u) -> ix_add(ix, d.key_type, u, ix.pending[i].key)
+                                None -> ()
+                    Err(_) ->
+                        for h in ix.pending
+                            val one = buf[StoredRow]()
+                            one.push(h.row)
+
+                            self.evaluated(d, ix, one) match
+                                Ok(vs) -> vs[0] match
+                                    Some(u) -> ix_add(ix, d.key_type, u, h.key)
+                                    None -> ()
+                                Err(_) -> if !holds_value(ix.unindexed, h.key) then ix.unindexed.push(h.key)
 
                 ix.pending.clear()
 
@@ -536,19 +703,20 @@ impl Store
     end settle
 
     /** The entry of each of `rows`, versions of rows of `d`, in `ix`: the key's components as a
-     * record, or none where `ix`'s predicate is not true of the version or a component is null
-     * (`ddl.md` §2.5 rules 2–3, Q48). An index that is not plain has its definition evaluated over
-     * each version as a row of the current schema version (§8.9 "old rows"); a version it cannot be
-     * evaluated over is the evaluation's error when `strict`, else has no entry.
+     * record, null components included, or none where `ix`'s predicate is not true of the version
+     * (`ddl.md` §2.5 rules 1–3; a value with a null component never conflicts, Q48). An index that is
+     * not plain has its definition evaluated over each version as a row of the current schema version
+     * (§8.9 "old rows"); a version it cannot be evaluated over is the evaluation's error when
+     * `strict`, else has no entry.
      */
-    private[terndb] ix_values(*self, d: &TableData, ix: &UniqueIx, rows: Buf[StoredRow], strict: bool) -> Result[Buf[Option[Value]], CodecError]
+    private[terndb] ix_values(*self, d: &TableData, ix: &SecIndex, rows: Buf[StoredRow], strict: bool) -> Result[Buf[Option[Value]], CodecError]
         val out = buf[Option[Value]]()
 
         if ix.plain
             val versions = table_versions(self.catalog, d.oid)
 
             for r in rows
-                out.push(image_values(versions, r, ix.columns))
+                out.push(entry_values(versions, r, ix.columns))
 
             return Ok(out)
 
@@ -568,7 +736,7 @@ impl Store
 
     // `ix_values` of an index that is not plain: its predicate and expression components evaluated
     // over `rows` together.
-    private evaluated(*self, d: &TableData, ix: &UniqueIx, rows: Buf[StoredRow]) -> Result[Buf[Option[Value]], CodecError]
+    private evaluated(*self, d: &TableData, ix: &SecIndex, rows: Buf[StoredRow]) -> Result[Buf[Option[Value]], CodecError]
         val out = buf[Option[Value]]()
 
         val ti = self.catalog.table_by_oid(d.oid) match
@@ -611,7 +779,7 @@ impl Store
 
     // Whether the version `img` of a row of `d` holds `u` in `ix`; an absent or deleted one holds
     // nothing, and so does one the index's definition cannot be evaluated over.
-    private ix_holds(*self, d: &TableData, ix: &UniqueIx, u: Value, img: Option[StoredRow]) -> Result[bool, CodecError]
+    private ix_holds(*self, d: &TableData, ix: &SecIndex, u: Value, img: Option[StoredRow]) -> Result[bool, CodecError]
         val r = img match
             Some(r) -> r
             None -> return Ok(false)
@@ -630,7 +798,7 @@ impl Store
      */
     private[terndb] reconcile_uniques(*self, t: &Txn, table: u64) -> Result[unit, CodecError]
         val d = self.table_data(table)?
-        self.sync_uniques(d)?
+        self.sync_indexes(d)?
         val keys = buf[Value]()
 
         for w in t.writes
@@ -645,8 +813,9 @@ impl Store
     // Whether `t`'s versions of the rows keyed `keys` conflict on a secondary unique key of `d` with
     // other rows (`isolation.md` §4.2 rules 1 and 4, applied to the key's value): an error, the id
     // of a live transaction writing a row that holds the value (`Some`, to wait for), or none. The
-    // rows are taken in order, each against every key. A version with no entry in a key — a null
-    // component (Q48), or a predicate not true of it — is not checked against that key.
+    // rows are taken in order, each against every key. A version whose entry in a key has a null
+    // component (Q48), or that has none because a predicate is not true of it, is not checked against
+    // that key. An index that is not unique checks nothing.
     private unique_checks(*self, t: &Txn, d: &TableData, keys: Buf[Value]) -> Result[Option[u64], CodecError]
         self.settle(d)?
         val slots = buf[Slot]()
@@ -665,23 +834,25 @@ impl Store
         if rows.len() == 0 then return Ok(None)
         val values = buf[Buf[Option[Value]]]()
 
-        for ix in d.uniques
-            values.push(self.ix_values(d, ix, rows, true)?)
+        for ix in d.indexes
+            values.push(if ix.unique then self.ix_values(d, ix, rows, true)? else buf[Option[Value]]())
 
         for n in 0..<rows.len()
-            for x in 0..<d.uniques.len()
-                values[x][n] match
-                    Some(u) -> self.conflict_on(t, d, d.uniques[x], slots[n], u)? match
-                        Some(h) -> return Ok(Some(h))
+            for x in 0..<d.indexes.len()
+                if d.indexes[x].unique
+                    values[x][n] match
+                        Some(u) -> if !has_null_part(u)
+                            self.conflict_on(t, d, d.indexes[x], slots[n], u)? match
+                                Some(h) -> return Ok(Some(h))
+                                None -> ()
                         None -> ()
-                    None -> ()
 
         Ok(None)
     end unique_checks
 
     // Whether a row other than `s` whose entry in `ix` is `u` conflicts with `t`'s version of `s`
     // (`unique_conflict`).
-    private conflict_on(*self, t: &Txn, d: &TableData, ix: &UniqueIx, s: Slot, u: Value) -> Result[Option[u64], CodecError]
+    private conflict_on(*self, t: &Txn, d: &TableData, ix: &SecIndex, s: Slot, u: Value) -> Result[Option[u64], CodecError]
         var i = ix_first(ix, u)
 
         while i < ix.entries.len() && cmp(ix.ty, ix.entries[i].value, u) == 0
@@ -704,7 +875,7 @@ impl Store
         if same_ids(ids, d.key_columns)
             return Ok(self.get_in(t, table, value)?.map(r -> Hit(value, r)))
 
-        self.sync_uniques(d)?
+        self.sync_indexes(d)?
         val versions = table_versions(self.catalog, table)
         val ty = columns_type(self.catalog, table, ids)
         self.log_read(t, table, pred_all(r -> row_holds(versions, ids, ty, value, r)), None)
@@ -723,7 +894,7 @@ impl Store
     private reference_in(*self, t: &Txn, fk: ForeignKey, value: Value, at_commit: bool) -> Result[Option[u64], CodecError]
         live(t)?
         val d = self.table_data(fk.ref_table)?
-        self.sync_uniques(d)?
+        self.sync_indexes(d)?
         val ids = fk.ref_columns
         val versions = table_versions(self.catalog, fk.ref_table)
         val ty = columns_type(self.catalog, fk.ref_table, ids)
@@ -792,7 +963,34 @@ impl Store
         self.log_read(t, fk.table, pred(ids.view(), r -> within(versions, ids, ty, sorted, Some(r))), None)
         val out = buf[Hit]()
 
-        for s in self.slots_of(d)?
+        // Through an index whose leading components are the referencing columns when there is one,
+        // which names every row some version of which holds one of the values; else every row.
+        self.sync_indexes(d)?
+
+        val slots = leading_index(d, ids) match
+            Some(ix) ->
+                val keys = buf[Value]()
+
+                for v in sorted
+                    val at = v match
+                        Record(xs) -> IxAt(xs, true)
+                        _ -> IxAny
+
+                    var i = ix_from(ix, at)
+
+                    while i < ix.entries.len() && !past_hi(ix, ix.entries[i].value, at)
+                        self.entries_read += 1
+                        keys.push(ix.entries[i].key)
+                        i += 1
+
+                keys.extend(ix.unindexed.view())
+                self.fetched(d, keys)?
+            None ->
+                val all = self.slots_of(d)?
+                self.slots_read += u64(all.len())
+                all
+
+        for s in slots
             if owns(s, t.id)
                 val top = self.image_row(d, s.key, s.img)?
                 if within(versions, ids, ty, sorted, top) then out.push(Hit(s.key, top.unwrap()))
@@ -808,10 +1006,80 @@ impl Store
         Ok(out)
     end referencing_in
 
+    private[terndb] scan_index_in(*self, t: &Txn, table: u64, index: u64, lo: IxBound, hi: IxBound, logged: Pred) -> Result[Buf[Hit], CodecError]
+        live(t)?
+        val d = self.table_data(table)?
+        self.sync_indexes(d)?
+
+        val ix = index_of_oid(d, index) match
+            Some(ix) -> ix
+            None -> return self.scan_range_in(t, table, KeyAny, KeyAny, logged)
+
+        val slots = buf[Slot]()
+        val rows = buf[StoredRow]()
+
+        for s in self.index_slots(d, ix, lo, hi)?
+            self.visible(d, s, t.snapshot, t.id)? match
+                Some(r) ->
+                    slots.push(s)
+                    rows.push(r)
+                None -> ()
+
+        // The entry of each version read: one outside the range is of a row that has left it.
+        val vs = self.ix_values(d, ix, rows, false)?
+        val out = buf[Hit]()
+
+        for n in 0..<rows.len()
+            if in_ix_range(ix, vs[n], lo, hi) then out.push(Hit(slots[n].key, self.translated(table, rows[n])?))
+
+        self.log_read(t, table, logged, None)
+        Ok(out)
+    end scan_index_in
+
+    /** The rows the entries of `ix` between `lo` and `hi` name, and its `unindexed` rows, as the leaf
+     * holds them now, each once and in key order. Each entry visited counts in `entries_read`.
+     */
+    private[terndb] index_slots(*self, d: &TableData, ix: &SecIndex, lo: IxBound, hi: IxBound) -> Result[Buf[Slot], CodecError]
+        val keys = buf[Value]()
+        var i = ix_from(ix, lo)
+
+        while i < ix.entries.len() && !past_hi(ix, ix.entries[i].value, hi)
+            self.entries_read += 1
+            keys.push(ix.entries[i].key)
+            i += 1
+
+        keys.extend(ix.unindexed.view())
+        self.fetched(d, keys)
+
+    // The rows of `d` keyed `keys` as the leaf holds them now, each once and in key order; a key no
+    // row holds any more is skipped. Each row fetched counts in `rows_fetched`, and each one found as
+    // a leaf entry copied into an image (`reads`).
+    private fetched(*self, d: &TableData, keys: Buf[Value]) -> Result[Buf[Slot], CodecError]
+        var at = buf[KeyAt]()
+
+        for k in keys
+            at.push(KeyAt(self.key_bytes(d, k)?, k))
+
+        sort_by(at.view_mut(), (a, b) -> a.kb.view() < b.kb.view())
+        val out = buf[Slot]()
+
+        for n in 0..<at.len()
+            if n > 0 && at[n].kb.view() == at[n - 1].kb.view() then continue
+            self.rows_fetched += 1
+
+            self.slot_at(d, at[n].key)? match
+                Some(s) ->
+                    self.reads.copied += 1
+                    self.reads.images += 1
+                    out.push(s)
+                None -> ()
+
+        Ok(out)
+
     private holds_in(*self, t: &Txn, table: u64, ids: Buf[u32], value: Value) -> Result[bool, CodecError]
         live(t)?
         val d = self.table_data(table)?
-        self.sync_uniques(d)?
+        self.sync_indexes(d)?
         val versions = table_versions(self.catalog, table)
         val ty = columns_type(self.catalog, table, ids)
 
@@ -853,7 +1121,7 @@ impl Store
     // newest committed one holding it is a race (`serialization_failure`) at snapshot and
     // serializable and `unique_violation` at read committed (rule 4). A row another transaction only
     // holds `LOCK_ONLY` is judged by its committed version, which that lock does not change.
-    private unique_conflict(*self, t: &Txn, d: &TableData, ix: &UniqueIx, o: Slot, u: Value) -> Result[Option[u64], CodecError]
+    private unique_conflict(*self, t: &Txn, d: &TableData, ix: &SecIndex, o: Slot, u: Value) -> Result[Option[u64], CodecError]
         val top = self.top_version(d, o)? match
             Some(v) -> v
             None -> return Ok(None)

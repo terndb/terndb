@@ -61,7 +61,7 @@ impl Store
 
     /** The `build_index` job of index `oid` (`ddl.md` §8.9), in an internal read committed
      * transaction whose snapshot is the newest commit. The index's entries are those of every row
-     * already (`sync_uniques`), so the job checks that no two rows it sees hold one value of a unique
+     * already (`sync_indexes`), so the job checks that no two rows it sees hold one value of a unique
      * index. In its final transaction it sets the index `ready`, and a constraint the index backs
      * validated; or, on failure, sets the index `failed` and drops it, but keeps the failed index of
      * a constraint, which stays not validated and enforced (§8.7 "Failure").
@@ -116,15 +116,15 @@ impl Store
     private index_duplicates(*self, j: &Txn, x: CatIndex) -> Result[unit, CodecError]
         if !x.unique then return Ok(())
         val d = self.table_data(x.table)?
-        self.sync_uniques(d)?
+        self.sync_indexes(d)?
 
-        var at = d.uniques.len()
+        var at = d.indexes.len()
 
-        for n in 0..<d.uniques.len()
-            if d.uniques[n].oid == x.oid then at = n
+        for n in 0..<d.indexes.len()
+            if d.indexes[n].oid == x.oid then at = n
 
-        if at == d.uniques.len() then return Ok(())
-        val ix = d.uniques[at]
+        if at == d.indexes.len() then return Ok(())
+        val ix = d.indexes[at]
         val rows = buf[StoredRow]()
 
         for s in self.slots_of(d)?
@@ -137,7 +137,7 @@ impl Store
 
         for v in vs
             v match
-                Some(u) -> held.push(u)
+                Some(u) -> if !has_null_part(u) then held.push(u)
                 None -> ()
 
         val ty = ix.ty

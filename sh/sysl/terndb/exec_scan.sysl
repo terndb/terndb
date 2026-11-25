@@ -161,10 +161,12 @@ private[terndb] scan_op(d: Db, table: QualName, binder: string, elem: Type, filt
     val columns = if logged.every then None else Some(logged.columns)
     store_scan(d, ct.oid, elem, logged, access_of(d, ct, binder, kept, ctx), columns)
 
-/** A `ScanOp` of table `oid` reading the keys `access` allows, its read logged as `logged`, decoding
- * the non-key columns `columns` names by id (every column when none).
+/** A `ScanOp` of table `oid` reading the keys `access` allows, or an `IndexScanOp` reading the rows
+ * its range of a secondary index names (`exec_access.sysl`), its read logged as `logged`. Either
+ * decodes only the non-key columns `columns` names by id (every column when none).
  */
-private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access, columns: Option[Buf[u32]]) -> &Operator =
+private[terndb] store_scan(d: Db, oid: u64, elem: Type, logged: Pred, access: Access, columns: Option[Buf[u32]]) -> &Operator
+    if access.path == IndexRange then return index_scan_op(d, oid, elem, logged, access, columns)
     ScanOp(d.store, d.txn, oid, elem, logged, access, columns, buf[ColumnVector](), false, 0)
 
 /** A table's rows visible to `txn` in the key range of its access path, read from the store on the

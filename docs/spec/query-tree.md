@@ -941,7 +941,8 @@ rows (§10.4).
    not occur; this relaxes §7.12 rule 1 for a `Filter`'s predicate, and for an `Update`'s or
    `Delete`'s `filter` (§9.4). If every row's predicate evaluates without error, the `Filter` raises
    no error from it. *Rationale: a scan that reads only the key range a conjunct on the primary key
-   allows never evaluates the predicate on the rows outside it.*
+   allows, or the range of a secondary index's entries, never evaluates the predicate on the rows
+   outside it.*
 
 ### 6.5 Join
 
