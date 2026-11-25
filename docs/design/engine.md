@@ -66,6 +66,12 @@ for a statement of `t`, `enter_latest` for `Prepare` and for a statement that wi
 transaction. `catalog_version` (in `Ready` and `Prepared`) is the newest committed catalog's. Tests:
 `engine_ddl_txn_tests.sysl`.
 
+The jobs a commit starts have ended when it returns (`store.md` § Jobs). `AwaitJobs { txid }` therefore answers at
+once with the store's record of them, one row per job in the `ddl.md` §3.2 rule 4 shape, its result type in its
+`ResultHeader` and its row count in `Complete`; it changes no catalog, and inside an explicit transaction it is
+`Q6010`, which aborts that transaction like any refusal. Tests: `engine_jobs_tests.sysl`, and the jobs
+themselves `store_validate_tests.sysl` and `store_index_build_tests.sysl`.
+
 The **plan cache** keys an entry by the version of the catalog it was validated against; no two catalogs share a
 version, a transaction's own view included. A lookup by digest (`cached(shape, txid)`) installs the catalog
 `txid` sees and validates an entry of another version again, dropping it if it fails or its result type
@@ -140,8 +146,10 @@ connection against a server in the same process, turning its loop by hand on a `
   (or a generated or filling column), or a foreign key referencing a table it removed or changed rows of, aborts
   with `schema_changed` instead of being reconciled. An added unique key is reconciled whatever its kind: over
   columns, partial, or over expressions, which the store evaluates as definition expressions (`store.md`).
-- **Jobs other than `build_index`** do not run (`store.md` § Jobs): a check or foreign-key constraint stays not
-  validated, and `AwaitJobs` returns no relation yet, although the store records how each build ended.
+- **Jobs other than `build_index` and `validate_constraint`** do not run (`store.md` § Jobs): `fill_column`,
+  `convert_column` and `rebuild_table` (below and §8.2, §8.11). Jobs run to their end before the commit that
+  started them returns (`ddl.md` §7 rule 7), so `CancelJob` finds none to cancel (`Q6003`), and `catalog.jobs` is
+  not served.
 - **The `convert_column` job** (`ddl.md` §8.5 rule 2) does not run: a retype that is not metadata-only leaves the
   column `converting` in its old type, so every reader sees the old type and no stored row needs a `using`
   expression applied on read. Translation (`store.md`) applies the lossless conversions only.

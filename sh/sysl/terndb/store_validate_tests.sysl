@@ -1,0 +1,642 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The `validate_constraint` job (`ddl.md` §7, §8.6, §8.7) as the store runs it: a check and a
+// foreign key over empty, one-row and many-row tables, with the violating row first, in the middle
+// and last; NULLs, which satisfy a check and leave a foreign key unchecked; composite and
+// self-referencing foreign keys; writers committing or still live when the job runs (property L3);
+// a rollback of the creating transaction; `defer_validation` and a later `validate_constraint`; a
+// drop while the job is due; and the check `set_nullable` false adds.
+
+const VcNull: i128 = -999
+
+/** 1…10. */
+private vc_tens() -> Buf[i128]
+    val out = buf[i128]()
+    var i: i128 = 1
+
+    while i <= 10
+        out.push(i)
+        i += 1
+
+    out
+
+/** `p(id, a int64?, b int64?)`, unique on `(a, b)`; `c(id, v?, pid?, a?, b?, up?)`. */
+private vc_store() -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("p", [cat_col("id", Int64), cat_col("a", nullable(Int64)), cat_col("b", nullable(Int64))], ["id"], [cat_unique("p_ab", ["a", "b"])]))
+    c = cat_ok(c, cat_table("c", [cat_col("id", Int64), cat_col("v", nullable(Int64)), cat_col("pid", nullable(Int64)), cat_col("a", nullable(Int64)),
+        cat_col("b", nullable(Int64)), cat_col("up", nullable(Int64))], ["id"]))
+    mem_store(c)
+
+private vc_int(n: i128) -> Value = if n == VcNull then Null else Int(n)
+
+/** The row `(id, v, pid, a, b, up)` of `c`; `VcNull` stands for null. */
+private vc_c(s: &Store, id: i128, v: i128 = 1, pid: i128 = VcNull, a: i128 = VcNull, b: i128 = VcNull, up: i128 = VcNull) -> StoredRow =
+    store_row(s, st_oid(s, "c"), rec([Int(id), vc_int(v), vc_int(pid), vc_int(a), vc_int(b), vc_int(up)]))
+
+/** The row `(id, a, b)` of `p`. */
+private vc_p(s: &Store, id: i128, a: i128 = VcNull, b: i128 = VcNull) -> StoredRow =
+    store_row(s, st_oid(s, "p"), rec([Int(id), vc_int(a), vc_int(b)]))
+
+/** `c_v_pos`: `v > 0`. */
+private vc_check() -> ConstraintDef = cat_check("c_v_pos", call("gt", [cat_row("v"), cat_int(0)]))
+
+private vc_fk() -> ConstraintDef = cat_fk("c_pid", ["pid"], "p", ["id"])
+
+private vc_fk_ab() -> ConstraintDef = cat_fk("c_ab", ["a", "b"], "p", ["a", "b"])
+
+private vc_fk_up() -> ConstraintDef = cat_fk("c_up", ["up"], "c", ["id"])
+
+private vc_add(def: ConstraintDef, deferring: bool = false) -> Statement = cat_alter("c", [AddConstraint(def, deferring)])
+
+private vc_validate(name: string) -> Statement = cat_alter("c", [ValidateConstraint(name)])
+
+private vc_drop(name: string) -> Statement = cat_alter("c", [DropConstraint(name, false)])
+
+/** Runs `st` in live transaction `t`, which must accept it. */
+private vc_run(s: &Store, t: &Txn, st: Statement, file: string = __FILE__, line: long = __LINE__)
+    s.enter(t).unwrap()
+
+    s.ddl(t, envelope([], st), BootstrapRole) match
+        Ok(Done(_)) -> ()
+        Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+        Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+/** Runs each of `sts` in one transaction of its own, which must commit; the transaction's id. */
+private vc_ddl(s: &Store, sts: []const Statement, file: string = __FILE__, line: long = __LINE__) -> u64
+    val t = s.begin(Snapshot)
+
+    for st in sts
+        vc_run(s, t, st, file, line)
+
+    st_commit(s, t, file, line)
+    t.id
+
+/** Inserts `rows` into `table` in one transaction of its own, which must commit. */
+private vc_put(s: &Store, table: string, rows: []const StoredRow, file: string = __FILE__, line: long = __LINE__)
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+
+    for r in rows
+        assert_eq(st_done(s.insert(t, st_oid(s, table), r), file, line), 1)
+
+    st_commit(s, t, file, line)
+
+/** Applies `changes` to `table` in live transaction `t`, which must not wait. */
+private vc_write(s: &Store, t: &Txn, table: string, changes: []const RowChange, file: string = __FILE__, line: long = __LINE__)
+    s.enter(t).unwrap()
+    val cs = buf[RowChange]()
+    cs.extend(changes)
+    assert(st_done(s.write_rows(t, st_oid(s, table), cs), file, line) > 0, "a row changed", file, line)
+
+/** The one job transaction `txid` started: a `validate_constraint` of constraint `name`. */
+private vc_record(s: &Store, txid: u64, file: string = __FILE__, line: long = __LINE__) -> JobRecord
+    val js = s.jobs_of(txid)
+    assert(js.len() == 1, s"one job, not ${js.len()}", file, line)
+    assert(js[0].kind == "validate_constraint", s"a validate_constraint job, not ${js[0].kind}", file, line)
+    js[0]
+
+/** How a job ended: "succeeded", or its code. */
+private vc_end(e: JobEnd) -> string = e match
+    JobSucceeded -> "succeeded"
+    JobFailed(code, _) -> code
+
+/** How the one job of `txid` ended: "succeeded", or its code. */
+private vc_job(s: &Store, txid: u64, file: string = __FILE__, line: long = __LINE__) -> string = vc_end(vc_record(s, txid, file, line).end)
+
+/** The message the one job of `txid` failed with ("" if it succeeded). */
+private vc_message(s: &Store, txid: u64) -> string = vc_record(s, txid).end match
+    JobSucceeded -> ""
+    JobFailed(_, m) -> m
+
+/** Constraint `name` of the newest committed catalog. */
+private vc_con(s: &Store, name: string) -> Option[CatConstraint]
+    for k in s.latest_catalog().constraints
+        if k.name == name then return Some(k)
+
+    None
+
+/** "validated", "not validated" or "absent", and whether a job is still due. */
+private vc_state(s: &Store, name: string) -> string = vc_con(s, name) match
+    Some(k) ->
+        val v = if k.validated then "validated" else "not validated"
+        if k.job then s"$v, due" else v
+    None -> "absent"
+
+private vc_ten(s: &Store) -> Buf[StoredRow]
+    val rows = buf[StoredRow]()
+
+    for i in vc_tens()
+        rows.push(vc_c(s, i * 10, i))
+
+    rows
+
+/** `c`'s rows 10…100, every `v` positive but row `bad`'s, which is `v`. */
+private vc_ten_but(s: &Store, bad: i128, v: i128) -> Buf[StoredRow]
+    val rows = buf[StoredRow]()
+
+    for i in vc_tens()
+        rows.push(vc_c(s, i * 10, if i * 10 == bad then v else i))
+
+    rows
+
+// -- a check ----------------------------------------------------------------------------------
+
+@test
+a_check_over_an_empty_table_is_validated()
+    val s = vc_store()
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert_eq(vc_record(s, txid).object, vc_con(s, "c_v_pos").unwrap().oid)
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+a_check_over_one_valid_row_is_validated()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 5)])
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+a_check_over_one_invalid_row_fails_and_stays_not_validated()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "T3002")
+    assert_eq(vc_state(s, "c_v_pos"), "not validated")
+
+@test
+a_check_over_many_valid_rows_is_validated()
+    val s = vc_store()
+    vc_put(s, "c", vc_ten(s).view())
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+a_check_fails_on_an_invalid_first_row_and_names_its_key()
+    val s = vc_store()
+    vc_put(s, "c", vc_ten_but(s, 10, -3).view())
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "T3002")
+    val m = vc_message(s, txid)
+    assert(m.contains("10") && m.contains("c_v_pos"), m)
+    assert_eq(vc_state(s, "c_v_pos"), "not validated")
+
+@test
+a_check_fails_on_an_invalid_middle_row_and_names_its_key()
+    val s = vc_store()
+    vc_put(s, "c", vc_ten_but(s, 50, 0).view())
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "T3002")
+    val m = vc_message(s, txid)
+    assert(m.contains("50") && !m.contains("10"), m)
+
+@test
+a_check_fails_on_an_invalid_last_row_and_names_its_key()
+    val s = vc_store()
+    vc_put(s, "c", vc_ten_but(s, 100, -1).view())
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "T3002")
+    assert(vc_message(s, txid).contains("100"), vc_message(s, txid))
+
+@test
+a_check_with_several_invalid_rows_names_the_first_in_key_order()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 30, 0), vc_c(s, 20, 0), vc_c(s, 40, 1)])
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    val m = vc_message(s, txid)
+    assert(m.contains("20") && !m.contains("30"), m)
+
+@test
+a_check_on_a_null_is_satisfied()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, VcNull), vc_c(s, 2, 3), vc_c(s, 3, VcNull)])
+    val txid = vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+a_check_that_raises_an_error_on_a_row_fails_with_that_error_naming_the_row()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 2), vc_c(s, 7, 0), vc_c(s, 9, 3)])
+    val e = call("gt", [call("mod", [cat_int(10), cat_row("v")]), cat_int(-1)])
+    val txid = vc_ddl(s, [vc_add(cat_check("c_mod", e))])
+    val code = vc_job(s, txid)
+    assert(code.len > 0 && code != "succeeded" && code != "T3002", code)
+    assert(vc_message(s, txid).contains("7"), vc_message(s, txid))
+    assert_eq(vc_state(s, "c_mod"), "not validated")
+
+@test
+a_check_ignores_a_deleted_invalid_row()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0), vc_c(s, 2, 1)])
+    val t = s.begin(Snapshot)
+    vc_write(s, t, "c", [Remove(st_key(1))])
+    st_commit(s, t)
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "succeeded")
+
+@test
+a_check_reads_an_invalid_row_s_newest_committed_version()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    val t = s.begin(Snapshot)
+    vc_write(s, t, "c", [Replace(st_key(1), vc_c(s, 1, 4))])
+    st_commit(s, t)
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "succeeded")
+
+// -- a foreign key ----------------------------------------------------------------------------
+
+@test
+a_foreign_key_over_an_empty_table_is_validated()
+    val s = vc_store()
+    val txid = vc_ddl(s, [vc_add(vc_fk())])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert_eq(vc_state(s, "c_pid"), "validated")
+
+@test
+a_foreign_key_over_one_row_with_its_referenced_row_is_validated()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 7)])
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "succeeded")
+    assert_eq(vc_state(s, "c_pid"), "validated")
+
+@test
+a_foreign_key_over_one_dangling_row_fails_and_stays_not_validated()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    val txid = vc_ddl(s, [vc_add(vc_fk())])
+    assert_eq(vc_job(s, txid), "T3003")
+    assert(vc_message(s, txid).contains("c_pid"), vc_message(s, txid))
+    assert_eq(vc_state(s, "c_pid"), "not validated")
+
+/** `p`'s rows 1…10, and `c`'s rows 10…100 each referencing one, but row `bad`, referencing 99. */
+private vc_refs(s: &Store, bad: i128)
+    val ps = buf[StoredRow]()
+    val cs = buf[StoredRow]()
+
+    for i in vc_tens()
+        ps.push(vc_p(s, i))
+        cs.push(vc_c(s, i * 10, 1, if i * 10 == bad then 99 else i))
+
+    vc_put(s, "p", ps.view())
+    vc_put(s, "c", cs.view())
+
+@test
+a_foreign_key_over_many_rows_with_their_referenced_rows_is_validated()
+    val s = vc_store()
+    vc_refs(s, 0)
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "succeeded")
+
+@test
+a_foreign_key_fails_on_a_dangling_first_row()
+    val s = vc_store()
+    vc_refs(s, 10)
+    val txid = vc_ddl(s, [vc_add(vc_fk())])
+    assert_eq(vc_job(s, txid), "T3003")
+    assert(vc_message(s, txid).contains("10"), vc_message(s, txid))
+
+@test
+a_foreign_key_fails_on_a_dangling_middle_row()
+    val s = vc_store()
+    vc_refs(s, 60)
+    val txid = vc_ddl(s, [vc_add(vc_fk())])
+    assert_eq(vc_job(s, txid), "T3003")
+    val m = vc_message(s, txid)
+    assert(m.contains("60") && !m.contains("10"), m)
+
+@test
+a_foreign_key_fails_on_a_dangling_last_row()
+    val s = vc_store()
+    vc_refs(s, 100)
+    val txid = vc_ddl(s, [vc_add(vc_fk())])
+    assert_eq(vc_job(s, txid), "T3003")
+    assert(vc_message(s, txid).contains("100"), vc_message(s, txid))
+
+@test
+a_foreign_key_does_not_check_a_null_referencing_value()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 7)])
+    vc_put(s, "c", [vc_c(s, 1, 1, VcNull), vc_c(s, 2, 1, 7), vc_c(s, 3, 1, VcNull)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "succeeded")
+
+@test
+a_foreign_key_fails_when_its_referenced_row_was_deleted_before()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 7)])
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    val t = s.begin(Snapshot)
+    vc_write(s, t, "p", [Remove(st_key(7))])
+    st_commit(s, t)
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "T3003")
+
+@test
+a_composite_foreign_key_over_matching_rows_is_validated()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 1, 1, 1), vc_p(s, 2, 1, 2)])
+    vc_put(s, "c", [vc_c(s, 1, 1, VcNull, 1, 1), vc_c(s, 2, 1, VcNull, 1, 2), vc_c(s, 3, 1, VcNull, 1, 2)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk_ab())])), "succeeded")
+    assert_eq(vc_state(s, "c_ab"), "validated")
+
+@test
+a_composite_foreign_key_fails_when_only_one_component_matches()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 1, 1, 1), vc_p(s, 2, 2, 2)])
+    vc_put(s, "c", [vc_c(s, 1, 1, VcNull, 1, 2)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk_ab())])), "T3003")
+
+@test
+a_composite_foreign_key_does_not_check_a_value_with_one_null_component()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 1, 1, 1)])
+    vc_put(s, "c", [vc_c(s, 1, 1, VcNull, 5, VcNull), vc_c(s, 2, 1, VcNull, VcNull, 5), vc_c(s, 3, 1, VcNull, 1, 1)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk_ab())])), "succeeded")
+
+@test
+a_self_referencing_foreign_key_over_a_chain_and_a_self_loop_is_validated()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1), vc_c(s, 2, 1, VcNull, VcNull, VcNull, 1), vc_c(s, 3, 1, VcNull, VcNull, VcNull, 2),
+        vc_c(s, 4, 1, VcNull, VcNull, VcNull, 4)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk_up())])), "succeeded")
+    assert_eq(vc_state(s, "c_up"), "validated")
+
+@test
+a_self_referencing_foreign_key_fails_on_a_row_referencing_a_missing_row()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1), vc_c(s, 2, 1, VcNull, VcNull, VcNull, 3)])
+    val txid = vc_ddl(s, [vc_add(vc_fk_up())])
+    assert_eq(vc_job(s, txid), "T3003")
+    assert(vc_message(s, txid).contains("2"), vc_message(s, txid))
+
+// -- writers around the job (§7 rule 2, §8.7, L3) ---------------------------------------------
+
+@test
+an_invalid_row_committed_before_the_ddl_commits_fails_the_job()
+    val s = vc_store()
+    val t = s.begin(Snapshot)
+    vc_run(s, t, vc_add(vc_check()))
+
+    // Another writer, which does not see the uncommitted constraint, commits an invalid row first.
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    st_commit(s, t)
+    assert_eq(vc_job(s, t.id), "T3002")
+    assert_eq(vc_state(s, "c_v_pos"), "not validated")
+
+@test
+an_invalid_row_still_uncommitted_when_the_job_runs_is_not_seen_by_it()
+    val s = vc_store()
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "c", [Put(vc_c(s, 1, 0))])
+
+    // The job reads its snapshot only; the writer's commit is reconciliation's (`engine_jobs_tests.sysl`).
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "succeeded")
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+    assert(s.abort(w).is_ok())
+
+@test
+an_update_making_a_row_invalid_still_uncommitted_when_the_job_runs_is_not_seen_by_it()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1)])
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "c", [Replace(st_key(1), vc_c(s, 1, -5))])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "succeeded")
+    assert(s.abort(w).is_ok())
+
+@test
+an_uncommitted_delete_of_an_invalid_row_does_not_hide_it_from_the_job()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "c", [Remove(st_key(1))])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "T3002")
+    assert(s.abort(w).is_ok())
+
+@test
+an_uncommitted_fix_of_an_invalid_row_does_not_hide_it_from_the_job()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "c", [Replace(st_key(1), vc_c(s, 1, 3))])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "T3002")
+    assert(s.abort(w).is_ok())
+
+@test
+a_dangling_row_still_uncommitted_when_the_foreign_key_s_job_runs_is_not_seen_by_it()
+    val s = vc_store()
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "c", [Put(vc_c(s, 1, 1, 7))])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "succeeded")
+    assert(s.abort(w).is_ok())
+
+@test
+a_referenced_row_deleted_but_uncommitted_when_the_job_runs_is_still_seen()
+    val s = vc_store()
+    vc_put(s, "p", [vc_p(s, 7)])
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "p", [Remove(st_key(7))])
+
+    // The job takes no row lock and reads the snapshot, where the row is still there (§8.7 "Locks").
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "succeeded")
+    assert_eq(vc_state(s, "c_pid"), "validated")
+    assert(s.abort(w).is_ok())
+
+@test
+a_referenced_row_inserted_but_uncommitted_when_the_job_runs_is_not_seen()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    val w = s.begin(Snapshot)
+    vc_write(s, w, "p", [Put(vc_p(s, 7))])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "T3003")
+    st_commit(s, w)
+
+@test
+a_referenced_row_committed_before_the_ddl_commits_is_seen()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    val t = s.begin(Snapshot)
+    vc_run(s, t, vc_add(vc_fk()))
+    vc_put(s, "p", [vc_p(s, 7)])
+    st_commit(s, t)
+    assert_eq(vc_job(s, t.id), "succeeded")
+
+@test
+the_creating_transaction_s_own_rows_are_checked_at_its_commit()
+    val s = vc_store()
+    val t = s.begin(Snapshot)
+    vc_write(s, t, "c", [Put(vc_c(s, 1, 0))])
+    vc_run(s, t, vc_add(vc_check()))
+    st_commit(s, t)
+    assert_eq(vc_job(s, t.id), "T3002")
+
+@test
+the_job_commits_under_a_number_of_its_own()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1)])
+    val t = s.begin(Snapshot)
+    vc_run(s, t, vc_add(vc_check()))
+    val c = st_commit(s, t)
+    assert_eq(s.horizon, c + 1)
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+two_constraints_added_in_one_transaction_get_a_job_each()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0, 7)])
+    vc_put(s, "p", [vc_p(s, 7)])
+    val txid = vc_ddl(s, [vc_add(vc_check()), vc_add(vc_fk())])
+    val js = s.jobs_of(txid)
+    assert_eq(js.len(), 2)
+    assert_eq(js[0].object, vc_con(s, "c_v_pos").unwrap().oid)
+    assert_eq(vc_end(js[0].end), "T3002")
+    assert_eq(vc_end(js[1].end), "succeeded")
+    assert(js[0].id < js[1].id, "ids in order")
+    assert_eq(vc_state(s, "c_v_pos"), "not validated")
+    assert_eq(vc_state(s, "c_pid"), "validated")
+
+// -- rollback, defer, validate and drop ---------------------------------------------------------
+
+@test
+a_rolled_back_add_constraint_starts_no_job()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    val t = s.begin(Snapshot)
+    vc_run(s, t, vc_add(vc_check()))
+    assert(s.abort(t).is_ok())
+    assert_eq(s.jobs_of(t.id).len(), 0)
+    assert_eq(vc_state(s, "c_v_pos"), "absent")
+
+@test
+an_add_constraint_rolled_back_to_a_savepoint_starts_no_job()
+    val s = vc_store()
+    val t = s.begin(Snapshot)
+    assert(s.savepoint(t, "sp").is_ok())
+    vc_run(s, t, vc_add(vc_fk()))
+    assert(s.rollback_to(t, "sp").is_ok())
+    vc_write(s, t, "c", [Put(vc_c(s, 1, 1, 7))])
+    st_commit(s, t)
+    assert_eq(s.jobs_of(t.id).len(), 0)
+    assert_eq(vc_state(s, "c_pid"), "absent")
+
+@test
+a_deferred_constraint_starts_no_job_and_stays_not_validated()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1)])
+    val txid = vc_ddl(s, [vc_add(vc_check(), true), vc_add(vc_fk(), true)])
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert_eq(vc_state(s, "c_v_pos"), "not validated")
+    assert_eq(vc_state(s, "c_pid"), "not validated")
+
+@test
+validate_constraint_starts_the_job_of_a_deferred_constraint()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1)])
+    vc_ddl(s, [vc_add(vc_check(), true)])
+    val txid = vc_ddl(s, [vc_validate("c_v_pos")])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+validate_constraint_on_a_validated_constraint_does_nothing()
+    val s = vc_store()
+    vc_ddl(s, [vc_add(vc_check())])
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+    val txid = vc_ddl(s, [vc_validate("c_v_pos")])
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+validating_a_failed_check_after_fixing_the_data_validates_it()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_check())])), "T3002")
+    val t = s.begin(Snapshot)
+    vc_write(s, t, "c", [Replace(st_key(1), vc_c(s, 1, 2))])
+    st_commit(s, t)
+    assert_eq(vc_job(s, vc_ddl(s, [vc_validate("c_v_pos")])), "succeeded")
+    assert_eq(vc_state(s, "c_v_pos"), "validated")
+
+@test
+validating_a_failed_foreign_key_again_without_fixing_the_data_fails_again()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    assert_eq(vc_job(s, vc_ddl(s, [vc_add(vc_fk())])), "T3003")
+    assert_eq(vc_job(s, vc_ddl(s, [vc_validate("c_pid")])), "T3003")
+    assert_eq(vc_state(s, "c_pid"), "not validated")
+
+@test
+a_rolled_back_validate_constraint_starts_no_job()
+    val s = vc_store()
+    vc_ddl(s, [vc_add(vc_check(), true)])
+    val t = s.begin(Snapshot)
+    vc_run(s, t, vc_validate("c_v_pos"))
+    assert(s.abort(t).is_ok())
+    assert_eq(s.jobs_of(t.id).len(), 0)
+    assert_eq(vc_state(s, "c_v_pos"), "not validated")
+
+@test
+a_constraint_dropped_while_its_job_is_due_has_no_job()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    val txid = vc_ddl(s, [vc_add(vc_check()), vc_drop("c_v_pos")])
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert_eq(vc_state(s, "c_v_pos"), "absent")
+
+@test
+a_constraint_dropped_after_validate_constraint_made_its_job_due_has_no_job()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 1, 7)])
+    vc_ddl(s, [vc_add(vc_fk(), true)])
+    val txid = vc_ddl(s, [vc_validate("c_pid"), vc_drop("c_pid")])
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert_eq(vc_state(s, "c_pid"), "absent")
+
+@test
+a_failed_constraint_can_be_dropped()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 0)])
+    vc_ddl(s, [vc_add(vc_check())])
+    val txid = vc_ddl(s, [vc_drop("c_v_pos")])
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert_eq(vc_state(s, "c_v_pos"), "absent")
+
+// -- set not null (§8.6) ------------------------------------------------------------------------
+
+private vc_type_of(s: &Store, column: string) -> Type = cat_table_of(s.latest_catalog(), "c").column_named(column).unwrap().ty
+
+@test
+set_not_null_over_rows_without_nulls_makes_the_column_non_null_and_drops_the_check()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 4), vc_c(s, 2, 5)])
+    val version = cat_table_of(s.latest_catalog(), "c").schema_version()
+    val txid = vc_ddl(s, [cat_alter("c", [SetNullable("v", false)])])
+    assert_eq(vc_job(s, txid), "succeeded")
+    assert(vc_type_of(s, "v") == Int64, "non-null")
+    assert_eq(vc_state(s, "v_not_null"), "absent")
+    assert_eq(cat_table_of(s.latest_catalog(), "c").schema_version(), version + 1)
+
+    // A row stored in the nullable version reads in the new one.
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    assert_eq(st_read(s, t, st_oid(s, "c"), 2, 1), 5)
+
+@test
+set_not_null_over_an_empty_table_makes_the_column_non_null()
+    val s = vc_store()
+    assert_eq(vc_job(s, vc_ddl(s, [cat_alter("c", [SetNullable("v", false)])])), "succeeded")
+    assert(vc_type_of(s, "v") == Int64, "non-null")
+
+@test
+set_not_null_over_a_null_fails_leaving_the_column_nullable_and_dropping_the_check()
+    val s = vc_store()
+    vc_put(s, "c", [vc_c(s, 1, 4), vc_c(s, 2, VcNull)])
+    val txid = vc_ddl(s, [cat_alter("c", [SetNullable("v", false)])])
+    assert_eq(vc_job(s, txid), "T3002")
+    assert(vc_message(s, txid).contains("2"), vc_message(s, txid))
+    assert(vc_type_of(s, "v") == nullable(Int64), "still nullable")
+    assert_eq(vc_state(s, "v_not_null"), "absent")

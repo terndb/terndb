@@ -10,9 +10,10 @@ import sysl.buf.{Buf, buf}
 // `text_tree.sysl`). They are read-only: the type checker sees them as views, which DML refuses
 // (`Q5003`).
 //
-// `catalog.jobs` and `catalog.schema_versions` are not served: no background job is run or recorded,
-// so no job row exists, and a schema version keeps neither the commit that created it nor whether a
-// stored row may still carry it. A `job` inside a state is reported as 0 for the same reason.
+// `catalog.jobs` and `catalog.schema_versions` are not served: a job runs to its end inside the
+// commit that started it and is recorded by the store, not as a catalog row (`store_jobs.sysl`), and
+// a schema version keeps neither the commit that created it nor whether a stored row may still carry
+// it. A `job` inside a state is reported as 0, since no job is ever queued or running.
 
 /** The column list of relation `name` of namespace `catalog`, or `None` where §4.2 serves none. */
 catalog_relation(name: string) -> Option[Buf[Field]]

@@ -46,12 +46,23 @@ and the undo check over everything the store holds; `store_pages_tests.sysl` exe
   the current schema version (`ix_values`), the versions installed since the last check together. `sync_uniques`
   brings a table's indexes in line with the catalog before each check, building a key added since from every
   version of every row still reachable, so a `building` index holds every row's entry from its creation (Q71).
-- **Jobs** (`store_jobs.sysl`, `ddl.md` §7): the commit of a transaction that ran DDL runs the `build_index` jobs it
-  started before it returns — one per index left `building` that backs no constraint, and one per `unique`
-  constraint whose validation is due — each in an internal read committed transaction at the newest snapshot that
-  checks no two visible rows share a value and commits the index `ready` (and the constraint validated), or
-  `failed`: a failed index is dropped, a failed constraint's index kept with the constraint not validated. Each
-  job's `JobRecord` (`Store.jobs_of`) holds how it ended.
+- **Jobs** (`store_jobs.sysl`, `ddl.md` §7): the commit of a transaction that ran DDL runs the jobs it started
+  before it returns (§7 rule 7), each in an internal read committed transaction at the newest snapshot that
+  commits under a number of its own. First the `build_index` jobs — one per index left `building` that backs no
+  constraint, and one per `unique` constraint whose validation is due — each checking that no two visible rows
+  share a value and committing the index `ready` (and the constraint validated), or `failed`: a failed index is
+  dropped, a failed constraint's index kept with the constraint not validated. Then a `validate_constraint` job per
+  check or foreign-key constraint whose validation is due (§8.7): it reads every row visible at its snapshot in key
+  order, evaluates a check over it as a definition expression (null passes) or looks up a foreign key's referenced
+  row at the same snapshot (a value with a null component is not checked), takes no row locks, and commits the
+  constraint validated, or on the first violating row fails with `T3002`/`T3003` (or the error a check raised)
+  naming that row's key, the constraint left not validated and enforced. The check `set_nullable` false adds
+  (`CatConstraint.not_null`, §8.6) is dropped either way, and on success its column becomes non-null in a new
+  schema version. A writer the job did not see is the reconciliation's (§6.4), which for a check or foreign key
+  is `schema_changed`. A job's final catalog is a clone of the one the DDL committed, which stays as it was. Each
+  job's `JobRecord` (`Store.jobs_of`) holds how it ended, and `Store.await_jobs` makes the `AwaitJobs` relation
+  of them (`ddl.md` §3.2 rule 4); since every job has ended when its commit returns, `AwaitJobs` never waits, and
+  no job is ever `queued`, `running` or `cancelled`.
 
 ## Version chains and visibility
 

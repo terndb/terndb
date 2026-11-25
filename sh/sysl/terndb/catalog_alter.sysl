@@ -401,7 +401,7 @@ impl MemCatalog
         if !self.name_free(self.tables[ti].ns, check) then return fail("Q6002", s"'$check' is already used")
         val oid = self.oid()
         val e = Call("is_not_null", items_of([Col("row", name)]))
-        self.constraints.push(CatConstraint(oid, self.tables[ti].oid, check, ConCheck(e), false, true, 0))
+        self.constraints.push(CatConstraint(oid, self.tables[ti].oid, check, ConCheck(e), false, true, 0, Some(c.id)))
         Ok(false)
 
     // -- named types, §2.8 rule 5 -----------------------------------------------------------------

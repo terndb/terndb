@@ -100,7 +100,8 @@ enum ConKind derives Eq
     ConForeignKey(columns: Buf[u32], ref_table: u64, ref_columns: Buf[u32], on_delete: FkAction, on_update: FkAction, deferred: bool)
 
 /** A constraint of a table: whether it is validated (§2.6 rule 1), whether a validation job is due at
- * commit (§8.7), and the unique index backing a `unique` constraint (0 for none).
+ * commit (§8.7), the unique index backing a `unique` constraint (0 for none), and, for the check
+ * `set_nullable` false adds (§8.6), the id of the column it makes non-null when its job succeeds.
  */
 struct CatConstraint derives Eq
     oid: u64
@@ -110,6 +111,7 @@ struct CatConstraint derives Eq
     validated: bool
     job: bool
     index: u64
+    not_null: Option[u32]
 
 /** An index key component: a column by id, or a definition expression over the row (§2.5 rule 4). */
 enum KeyRef derives Eq
