@@ -418,10 +418,10 @@ memo starts from. The optimizer then costs the alternatives that tree admits:
    forbids executing an `Apply` per row where unnesting can remove it, so the optimizer never chooses the per-row
    form; what the per-row form does well (one outer row, an index on the correlated key) is exactly what an index
    nested-loop join from the domain into `R` does, batched (§9.3). The memo therefore has both the hash join of
-   `D` with `R'` and the index nested-loop from `D` into `R`'s index, and costs them. Whether an index
-   nested-loop join counts as "an operator that re-evaluates a subtree once per outer row" under §6.6 rule 2 is
-   question Q3 of §16; this design reads the rule as being about `Apply` and arbitrary subtrees, not about a
-   probe of one access path, which `isolation.md` §4.4 already lists among reads ("an index-nested-loop probe
+   `D` with `R'` and the index nested-loop from `D` into `R`'s index, and costs them. An index
+   nested-loop join does not count as "an operator that re-evaluates a subtree once per outer row" under §6.6
+   rule 2 (decided, Q3 of §16; item S3 writes the clarification): the rule is about `Apply` and arbitrary
+   subtrees, not about a probe of one access path, which `isolation.md` §4.4 already lists among reads ("an index-nested-loop probe
    logs each probe key").
 4. **Mark joins**: `Exists` and `In` become mark joins whose `on` is keys alone (`unnesting.md` §4); a `Filter`
    reading only the mark (`where exists (…)`) is normalised into a `semi` join (or `anti` for `not exists`, and
@@ -522,9 +522,9 @@ high (§8.4). It is recomputed with the histograms.
   - `dependencies`: the degree of each functional dependency `a → b` among the columns (Postgres's `d(a→b)`,
     the fraction of sample rows consistent with it), from the sample;
   - `mcv`: a multi-column MCV list over the combination, from the sample.
-  Expressions are allowed as members (as in Postgres 14+). Q5 (§16) asks whether TernDB should also create such
-  objects automatically for column groups the feedback of §11.3 finds misestimated, as Oracle's "column group
-  usage" does; the design recommends yes, behind a setting off by default.
+  Expressions are allowed as members (as in Postgres 14+). TernDB also creates such objects automatically for
+  column groups the feedback of §11.3 finds misestimated, as Oracle's "column group usage" does, behind a
+  setting off by default (decided, Q5 of §16).
 
 ### 6.6 ANALYZE, auto-analyze and staleness
 
@@ -889,7 +889,8 @@ the path it picked before when the statistics make that path cheapest, and the c
 (`store.md`), so whether the row still holds the value can only be learned by fetching it. An index-only scan
 needs either versioned entries (each entry carrying its creating and deleting commit, as the on-disk §4.9 entries
 partly do) or a per-page all-visible map that purge maintains (Postgres). Both are storage work beyond this note;
-item P11 records the design choice for the user (Q8), and the optimizer's access-path enumeration has the slot
+the choice between them is deferred until the on-disk secondary indexes are built (decided, Q8 of §16; item
+P11), and the optimizer's access-path enumeration has the slot
 for it. A PK scan is already covering: the table is clustered on its key.
 
 ### 9.2 Hash join build side: plan time, with a run-time guard
@@ -1031,8 +1032,8 @@ the same filter, so the two yield the same result and raise the same errors.
 memo group's **logical signature** (the relation set, the canonical predicate set, the grouping keys — not the
 plan): the actual rows of every operator whose q-error exceeded 4. The estimator consults it first for a group of
 the same signature (LEO, Stillger et al. 2001, in its simplest form: an observed count overrides an estimate, as
-long as the statistics epoch of every table involved is unchanged). It also triggers auto-analyze (§6.6) and, with
-Q5, suggests extended statistics.
+long as the statistics epoch of every table involved is unchanged). It also triggers auto-analyze (§6.6) and, with the
+setting of §6.5 on, creates extended statistics.
 
 ## 12. What parallel execution needs from the optimizer
 
@@ -1211,7 +1212,7 @@ have landed first. Items in one phase with no dependency between them can run in
 | S0 | `Explain` statement: `query-tree.md` §5, §12.5, §15 (result type of §13.2), `sql.md`; decode, check, encode, text form; the statement runs the existing lowering and prints the operator tree without estimates | — |
 | S1 | `sys.statistics` in `on-disk-format.md` §3.9; `catalog.statistics` in `ddl.md` §4.2 | — |
 | S2 | `Analyze` and `CreateStatistics`/`DropStatistics` statements: `ddl.md` §2.14, §3.2, `sql.md`; catalog objects for declared statistics | S1 |
-| S3 | `query-tree.md` §6.6 rule 2 clarified for index nested-loop probes (per Q3's answer) | Q3 |
+| S3 | `query-tree.md` §6.6 rule 2 clarified to permit index nested-loop probes of one access path (Q3, decided) | — |
 | **Phase 1 — counters** | | |
 | C1 | Per-operator actuals: rows, batches, loops, and exclusive counter attribution | `hashjoin`, `rowscan`, `secidx` |
 | C2 | New counters: `Work.evals` (per type class), `sorted`, `sort_cmps`, `agg_rows`, `groups`, `batches`, `peak_bytes` | C1 |
@@ -1261,7 +1262,7 @@ have landed first. Items in one phase with no dependency between them can run in
 | P8 | Grace-hash, external-sort and partitioned-aggregate costing; "would spill" (§8.5) | K1 |
 | P9 | `OrderedIndexScan` (§9.5), if the benchmarks call for it | P5 |
 | P10 | Group join (E2) | P4, E1 |
-| P11 | Covering scans: the storage design question Q8, then the scan | Q8 |
+| P11 | Covering scans: the storage choice deferred by Q8, then the scan | the on-disk secondary indexes |
 | P12 | Executor spilling for hash join, sort and hash aggregate (an executor item the costing of P8 anticipates) | P8, the buffer manager |
 | **Phase 7 — caching, stability and adaptivity** | | |
 | A1 | Generic plans with validity ranges, custom plans by bucket (§10.2) | P1, H2 |
@@ -1426,23 +1427,26 @@ re-optimisation and the result is unchanged; no re-optimisation once the plan ab
 
 S0, S1, S2 and M1 can start at once; C1 and ST1 as soon as `hashjoin`, `rowscan` and `secidx` land.
 
-## 16. Decisions for the user
+## 16. Decisions
 
-Each question has the recommendation this design is written to; answering otherwise changes the sections named.
+Every choice this design left open is **decided** (2026-11-25), as recorded in `docs/decisions.md` § Optimizer
+(rows O1–O11, which keep these numbers). Q1, Q2, Q4 and Q6 are the user's decisions; the rest are the director's,
+following this design's recommendation. Each decision is the design the sections named describe; reverting one
+changes them.
 
-| # | Question | Recommendation | Changes |
-|---|---|---|---|
-| Q1 | Search framework: a Cascades memo with DPhyp filling join groups (§3.2), or pure bottom-up DPhyp plus heuristics as the plan's "in the style of Umbra and DuckDB" reads? | The hybrid: DPhyp's speed and completeness for join order, the memo's properties for everything else | §3, §4, M3, H2 |
-| Q2 | Statistics: incremental maintenance as the primary mechanism (the plan's Decided list) with `ANALYZE` and auto-analyze for what cannot be maintained (§6.1)? | Yes, both, as §6 has them | §6 |
-| Q3 | Does `query-tree.md` §6.6 rule 2's "no operator that re-evaluates a subtree once per outer row" forbid an index nested-loop join, whose inner is one access path probed per outer key? | No: clarify the rule to permit a probe of one access path with safe filters (S3), as `isolation.md` §4.4 already assumes | §5.3, §9.3, P3, A6 |
-| Q4 | Statistics outside the versioned catalog's definitions (§6.7), so that `ANALYZE` is not DDL and bumps no catalog version? | Yes | §6.7, S1 |
-| Q5 | Create extended statistics automatically for column groups the feedback finds misestimated? | Yes, behind a setting, off by default | §6.5, §11.3 |
-| Q6 | Plan caching: generic plans with validity ranges and up to three custom plans per statement (§10.2), replacing planning on every execution? | Yes | §10 |
-| Q7 | `EXPLAIN` as a statement kind of the tree (§13.1) returning a relation, rather than a flag on `Execute` in the wire protocol? | A statement kind: it then works through the C API, the wire and SQL alike | §13, S0 |
-| Q8 | Index-only scans: versioned index entries, or an all-visible map maintained by purge? | Defer; decide when the on-disk secondary indexes (`store.md` "Deferred") are built, since both are storage format | §9.1, P11 |
-| Q9 | Re-optimisation at pipeline breakers (§11.1) and adaptive joins (§11.2): build both, or rely on robust costing (§8.6) and feedback alone? | Build both, after the static optimizer is measured on JOB (T5); they are the defence against the misestimates no statistic fixes | §11, A5, A6 |
-| Q10 | Plan pinning and automatic regression revert (§10.3): revert automatically, or only report? | Report by default; revert behind `plan_regression_revert` | §10.3, A4 |
-| Q11 | The plan-regression suite's JOB data (3.6 GB, downloaded): keep it outside the repository, read from a path, skipped when absent? | Yes | §14.7, T5 |
+| # | Question | Decided | By | Changes |
+|---|---|---|---|---|
+| Q1 | Search framework: a Cascades memo with DPhyp filling join groups (§3.2), or pure bottom-up DPhyp plus heuristics? | The hybrid: a Cascades memo whose join groups DPhyp fills | the user | §3, §4, M3, H1–H3 |
+| Q2 | Statistics: incremental maintenance (the plan's Decided list), `ANALYZE` and auto-analyze, or one of them? | Both, as §6 has them | the user | §6, ST4, ST5 |
+| Q3 | Does `query-tree.md` §6.6 rule 2's "no operator that re-evaluates a subtree once per outer row" forbid an index nested-loop join, whose inner is one access path probed per outer key? | No: the rule is clarified to permit a probe of one access path with safe filters (S3), as `isolation.md` §4.4 already assumes | the director | §5.3, §9.3, S3, P3, A6 |
+| Q4 | Statistics inside or outside the versioned catalog's definitions (§6.7)? | Outside: `ANALYZE` is not DDL and changes no catalog version | the user | §6.7, S1, ST3 |
+| Q5 | Create extended statistics automatically for column groups the feedback finds misestimated? | Yes, behind a setting, off by default | the director | §6.5, §11.3 |
+| Q6 | Plan caching for parameterised statements? | Generic plans with validity ranges, and up to three custom plans per statement by selectivity bucket (§10.2), replacing planning on every execution | the user | §10, A1 |
+| Q7 | `EXPLAIN` as a statement kind of the tree (§13.1), or a flag on `Execute` in the wire protocol? | A statement kind returning a relation, so the C API, the wire and SQL all have it | the director | §13, S0 |
+| Q8 | Index-only scans: versioned index entries, or an all-visible map maintained by purge? | Deferred until the on-disk secondary indexes (`store.md` "Deferred") are built, since both are storage format | the director | §9.1, P11 |
+| Q9 | Re-optimisation at pipeline breakers (§11.1) and adaptive joins (§11.2), or robust costing (§8.6) and feedback alone? | Build both, after the static optimizer is measured on JOB (T5) | the director | §11, A5, A6 |
+| Q10 | On a plan regression (§10.3): revert automatically, or report? | Report by default; revert only with `plan_regression_revert` on | the director | §10.3, A4 |
+| Q11 | Where does the plan-regression suite's JOB data (3.6 GB, downloaded) live? | Outside the repository, read from a path given to the suite, which skips JOB when it is absent | the director | §14.7, T5 |
 
 ## 17. References
 
