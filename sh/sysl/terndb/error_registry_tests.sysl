@@ -41,6 +41,7 @@ sources() -> Buf[SourceText]
     src(out, "block_device.sysl", embed("block_device.sysl"))
     src(out, "btree_check.sysl", embed("btree_check.sysl"))
     src(out, "btree.sysl", embed("btree.sysl"))
+    src(out, "buffer_pool.sysl", embed("buffer_pool.sysl"))
     src(out, "catalog_alter.sysl", embed("catalog_alter.sysl"))
     src(out, "catalog_apply.sysl", embed("catalog_apply.sysl"))
     src(out, "catalog_drop.sysl", embed("catalog_drop.sysl"))

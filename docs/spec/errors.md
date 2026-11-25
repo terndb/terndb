@@ -170,7 +170,7 @@ Raised under the rules of `isolation.md` §5. Levels: SER serializable, SI snaps
 | `T1005` | `replica_lag_timeout` | `after` or `max_lag` not satisfied within `replica_wait_timeout` (§3.6) | replica | yes |
 | `T1006` | `replica_conflict` | WAL replay needed to remove a structure or undo this replica transaction uses (§5.6) | replica | yes |
 | `T1007` | `cancelled` | the client, an administrator or a shutdown cancelled it before commit | all | yes |
-| `T1008` | `resource_exhausted` | memory, undo space or disk full, or a snapshot past `max_snapshot_age` or `undo_retention_limit` (§5.5); the transaction is aborted | all | yes, after back-off |
+| `T1008` | `resource_exhausted` | memory (including every buffer-pool frame fixed, `details.frames`), undo space or disk full, or a snapshot past `max_snapshot_age` or `undo_retention_limit` (§5.5); the transaction is aborted | all | yes, after back-off |
 | `T2001` | `commit_unknown` | the server cannot say whether the commit happened (e.g. it lost the WAL device mid-commit) | all | **no**: resolve first (§5.4) |
 | `T2002` | `commit_not_confirmed` | a commit at `remote` or `remote_apply` waited `synchronous_commit_timeout` for its quorum; the transaction **is committed** on the primary (`replication.md` §6.4) | all | no |
 | `T2003` | `token_not_in_history` | `after` names a commit this server's history does not contain, because a failover lost it (§3.6 R3, `replication.md` §8.3) | all | no |

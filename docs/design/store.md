@@ -292,7 +292,8 @@ per-row latches and a real wait) is the next slice of this work.
 
 ## Deferred
 
-- Disk, WAL, the buffer manager and recovery (waiting on sysl's CRC32C and io_uring gaps); `transaction_status`.
+- Disk, WAL and recovery (waiting on sysl's io_uring gap); `transaction_status`. The buffer pool exists as a
+  component (`buffer.md`) and is not yet under the store.
 - `max_predicate_log` coarsening, `max_snapshot_age` and `undo_retention_limit`.
 - Overflow chains (§4.7–§4.8, waiting on sysl 0.12's CRC32C): until then a row over the inline limit is refused
   with `entry_too_large`.
