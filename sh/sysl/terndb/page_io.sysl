@@ -1,0 +1,122 @@
+module sh.sysl.terndb
+
+import sysl.checksum.crc32c
+import sysl.encoding.{get_u32_le, get_u64_le, put_u32_le}
+import sysl.fs.IoError
+
+// Page I/O with its checks (`on-disk-format.md` §3.1, §9 D11, D14, D15): every page written through a
+// `PageIo` carries the CRC32C of its bytes [4, 16384) in its first four, and every page read through
+// one is refused, before any field of it is used, unless that checksum matches and the page names the
+// PID it was read as. The device is one segment of a page space (§2.1), so a PID's page sits at its
+// page number within its segment.
+
+/** Pages in an undo segment (§2.3). */
+const UndoSegmentPages: u64 = 4096
+
+/** The CRC32C of a page (§3.1 `crc`): over its bytes [4, 16384). */
+page_checksum(page: []const u8) -> u32 = crc32c(page[4..<DbPageSize])
+
+/** Writes `page`'s checksum into its first four bytes. */
+seal_page(page: []u8) = put_u32_le(page[0..<4], page_checksum(page))
+
+/** The PID a page's header names (§3.1 `pid`). */
+private header_pid(page: []const u8) -> u64 = get_u64_le(page[16..<24]).unwrap()
+
+private pid_detail(pid: u64) -> Detail = Detail("pid", s"$pid")
+
+private corrupted(pid: u64, message: string) -> CodecError =
+    refusal("D1001", s"page $pid: $message", [pid_detail(pid)])
+
+/** Whether `page`, read as `pid`, may be used: its checksum matches and it names `pid` (§3.1 rule 1).
+ * A torn page fails one or the other (D11); a page written to the wrong place fails the second.
+ */
+check_page(pid: u64, page: []const u8) -> Result[unit, CodecError]
+    if page.len != DbPageSize then return Err(corrupted(pid, s"a page is ${page.len} bytes"))
+    val stored = get_u32_le(page[0..<4]).unwrap()
+    val computed = page_checksum(page)
+
+    if stored != computed then return Err(corrupted(pid, s"checksum ${stored} does not match the page's ${computed}"))
+    val named = header_pid(page)
+    if named != pid then return Err(corrupted(pid, s"the page names page $named"))
+    Ok(())
+
+/** The page of the device `pid` sits at: its page number within its segment (§2.1). A PID with the
+ * swizzle tag or a reserved space is no page of any device.
+ */
+pid_slot(pid: u64) -> Result[u64, CodecError]
+    if pid & SwizzleTag != 0 then return Err(corrupted(pid, "a swizzled reference is not a page id"))
+    val space = (pid >> 60) & 0x7
+    val number = pid & 0x0fffffffffffffff
+
+    space match
+        0 -> Ok(number % SegmentPages)
+        1 -> Ok(number % UndoSegmentPages)
+        _ -> Err(corrupted(pid, s"space $space is reserved"))
+
+/** Page I/O over one device. After a sync fails it refuses everything, since a retried sync may
+ * report success over writes the system has already dropped (D14): the engine stops and recovers
+ * from storage instead.
+ */
+struct PageIo
+    dev: &BlockDevice
+    sync_failed: bool
+
+    private io_error(self, pid: Option[u64], e: IoError) -> CodecError
+        val what = pid match
+            Some(p) -> s"page $p"
+            None -> "sync"
+
+        pid match
+            Some(p) -> refusal("D4004", s"$what of ${self.dev.name()}: ${e.message()}", [Detail("errno", s"${e.code()}"), Detail("file", self.dev.name()), pid_detail(p)])
+            None -> refusal("D4004", s"$what of ${self.dev.name()}: ${e.message()}", [Detail("errno", s"${e.code()}"), Detail("file", self.dev.name())])
+
+    private refuse_after_failed_sync(self) -> Result[unit, CodecError]
+        if !self.sync_failed then return Ok(())
+
+        Err(refusal("D4004", s"a sync of ${self.dev.name()} failed: the database must be recovered from storage", [
+            Detail("errno", s"$ErrnoIo"), Detail("file", self.dev.name())]))
+
+    /** Reads page `pid` into `into` and checks it (D11, D15): a read that fails is `io_error`, a page
+     * that fails its checks `data_corrupted`, and either names the PID.
+     */
+    read(*self, pid: u64, into: []u8) -> Result[unit, CodecError]
+        self.refuse_after_failed_sync()?
+        val slot = pid_slot(pid)?
+
+        self.dev.read_page(slot, into) match
+            Err(e) -> return Err(self.io_error(Some(pid), e))
+            Ok(_) -> ()
+
+        check_page(pid, into)
+
+    /** Seals `page` with its checksum and writes it as page `pid`, which its header must name. */
+    write(*self, pid: u64, page: []u8) -> Result[unit, CodecError]
+        self.refuse_after_failed_sync()?
+        val slot = pid_slot(pid)?
+
+        if page.len != DbPageSize then return Err(corrupted(pid, s"a page is ${page.len} bytes"))
+        if header_pid(page) != pid then return Err(corrupted(pid, s"the page names page ${header_pid(page)}"))
+        seal_page(page)
+
+        self.dev.write_page(slot, page) match
+            Err(e) -> Err(self.io_error(Some(pid), e))
+            Ok(_) -> Ok(())
+
+    /** Makes every page written so far durable. A failure is fatal (D14): this and every later call
+     * is `io_error`.
+     */
+    sync(*self) -> Result[unit, CodecError]
+        self.refuse_after_failed_sync()?
+
+        self.dev.sync() match
+            Err(e) ->
+                self.sync_failed = true
+                Err(self.io_error(None, e))
+            Ok(_) -> Ok(())
+
+    /** Whether a sync has failed, which leaves recovery from storage as the only way on. */
+    failed(self) -> bool = self.sync_failed
+end PageIo
+
+/** Page I/O over `dev`. */
+page_io(dev: &BlockDevice) -> &PageIo = PageIo(dev, false)

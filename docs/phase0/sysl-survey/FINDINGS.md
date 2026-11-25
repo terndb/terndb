@@ -29,3 +29,24 @@ Probed on aarch64-macos, every run through marshal, on 2026-11-14. The tally is 
 6. `mask.bits()`, `gather` and `compress`: language or `sysl.vectors`.
 7. `int` vs `usize` in layout arithmetic.
 8. New packages (`uring`, `llvm`) and library additions (`sysl.fs` sync, uncached and map; `threads.pin`; `crc32c`; a fast hash).
+
+## Status at sysl 0.13.5 (2026-11-24)
+
+Rechecked against the library docs and re-probed on aarch64-macos, every run through marshal. New probes: `p11-simd013`, `p12-hash013`, `p13-io013`, `p14-text013`, `p15-misc013` (`rerun-old.zsh` reruns the B1 and seqlock probes), `p16-capi013` (`run.zsh` builds an archive and a shared library and runs a C driver on each). The rows above keep the 0.11.0 wording; this table is the current state.
+
+| # | Need | At 0.13.5 | Evidence |
+|---|---|---|---|
+| 1 | Atomics | closed (was already expressible) | unchanged |
+| 2 | Seqlock / optimistic read | closed | `sysl.sync.SeqLock[T]` (read retries, reader writes nothing) and `load_relaxed`/`store_relaxed` (a `Plain` value copied word by word with relaxed atomics) are in the library (`library/sync.md`); p15-misc013 `seqlock 1 2`. A plain write through `&sync` is still refused (p02-seqlock/refused), so a page-sized racy copy goes through `load_relaxed`, and `T` must be `Plain` |
+| 3 | Page memory, `int` vs `usize` | unchanged: friction remains | not re-probed; no doc change found |
+| 4 | Thread pinning | still open | no affinity call in `sysl.threads` or `sysl.cpu` (api/ and library/ docs searched); `cpu_count`, `scope`, `Poller`, `Channel` as before |
+| 5 | I/O: durability, uncached, writable map | closed | `File.sync_data`, `File.full_sync` (F_FULLFSYNC on macOS), `open_uncached` (O_DIRECT on Linux, which wants 4096-aligned buffer, offset and length), `File.map_mut` with `MappedMut.flush`/`flush_async` (p13-io013: all succeeded, a store through the map read back through `open_uncached`) |
+| 5 | I/O: io_uring | **still open** | no `uring` package or repo under `~/dev/sysl-lang/`, no mention in the sysl docs. `sysl.io.poll` (kqueue/epoll) is the readiness API that exists |
+| 6 | SIMD mask, lookup, gather, compress | closed | `mask.bits()` (a `<16>bool` is a `u16`; lane 3 and 15 give 32776), `table.lookup(idx)` (run-time lane picks, out of range gives 0, `tbl`/`pshufb`), `xs.gather(idx)` (traps like `xs[idx[k]]`), `v.compress(m)` (packs kept lanes low, zero fill). No hardware compress or gather instruction is used by default: each is a lane move per lane. p11-simd013. Still absent: a masked load or store (`reference/vectors.md` § "What a vector does not have") |
+| 7 | JIT | unchanged: not a gap | not re-probed |
+| 8 | Borrowing `for` | B1 fixed | `p08-nested/ref-for` compiles and prints `4`. The `arc.copy` per element of `for x in items` was not re-measured |
+| 9 | C ABI | closed for every item of `spec/c-api.md` §14 probed | p16-capi013: `Buf`-free handles through `into_raw()` / `from_raw` (`sysl.raw`); `*unit` prints `void *`, `*const T` prints `const T *`, `usize` prints `size_t`, `*[N]T` parameter prints `T name[N]`; `@export` on a `const` emits a `#define`; `--header-guard TERNDB_H` names the guard (B3 gone); `build-c --shared` makes a `.dylib`/`.so` whose `nm -gU` lists exactly the `@export` symbols (3 of 3 here), and a C driver ran against both archive and library. Unwinding, allocator size/alignment and the wake descriptor were not re-probed; `reference/errors.md` states a trap aborts with no unwinding |
+| 10 | CRC32C, fast hash | closed | `sysl.checksum.crc32c`, incremental `new_crc32c()`/`update`/`finish` (check value 0xe3069283; the instruction on AArch64 `crc` and SSE 4.2, a slice-by-8 table elsewhere, same answer); `hash64(bytes, seed = 0)` is rapidhash V3, stable across targets and releases, so it may be persisted. p12-hash013. B2 (inline assembly operand width) no longer matters for CRC |
+| new | UTF-8 validation | closed | `sysl.text.is_utf8(bytes)` and `validate_utf8(bytes) -> Option[int]` (index of the first bad byte), no string built. p14-text013 |
+
+Open at 0.13.5: io_uring (no package), thread pinning, a masked vector load/store, and the `int`/`usize` conversion friction. Everything else the engine design waits on is available.

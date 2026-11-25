@@ -505,8 +505,9 @@ conflict check, and the columns `C` a read uses.
 ## 6. Where the survey's sysl gaps cost speed
 
 The survey (`docs/phase0/sysl-survey/FINDINGS.md`, row 6) found no SIMD mask → bits, no gather and
-no compress. Every kernel is a plain loop the compiler may auto-vectorise; these are the ones the
-gaps hold back:
+no compress; sysl 0.13.5 has `mask.bits()`, `gather`, `compress` and `table.lookup`, and `hash64` and `crc32c`
+(see its 0.13.5 status), so the gaps named in this document are now closed in sysl and open only in this code. Every
+kernel is a plain loop the compiler may auto-vectorise; these are the ones the gaps held back:
 
 - **mask → bits**: building a validity bitmap from a kernel's per-row result (every comparison,
   `is_null`, `Field` of a nullable record); `Filter`'s row list.
