@@ -977,7 +977,8 @@ private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
     val none = buf[TKey]()
     // The rows `filter` keeps, or whose pairs an inner join's `on` keeps, lie in the key range its
     // comparisons of the target's primary key allow (`exec_access.sysl`).
-    val scan = store_scan(db, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), access_of(db, tg.table, binder, f, c))
+    // Every column is decoded: an updated row is written back whole.
+    val scan = store_scan(db, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), access_of(db, tg.table, binder, f, c), None)
     val target = Lowered(scan, binder, tg.row, none)
 
     val input = joined match

@@ -399,7 +399,17 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
 
 - **Scan** (§6.1): `ScanOp` reads the rows visible at the snapshot in its access path's key range
   (§4.6) from the store on its first pull, in key order, and hands them up in `BatchSize` batches. A
-  correlated scan is planned again per outer row (§4.2) and so read and logged once per row.
+  correlated scan is planned again per outer row (§4.2) and so read and logged once per row. The
+  store decodes the rows straight into the batches' vectors (`Store.scan_vectors`,
+  `store_scan.sysl`): a row whose current image the reader sees, in the table's current schema
+  version, is read where its page holds it, its key components decoded as values and each scalar or
+  octet-string column from its stored octets into its lane, with no image, record or per-column
+  value built; every other row (rebuilt through the undo log, `LOCK_ONLY`, an older schema version)
+  takes the general path and is appended as values. A non-key column the statement does not read
+  through the scan's binder (the logged predicate's columns, below) is not decoded at all, and its
+  slots hold its type's placeholder; so a damaged value in an unread column is found by the first
+  read that decodes it, while the row's layout is checked on every read. A DML target decodes every
+  column, since an updated row is written back whole. `Store.reads` counts the work (`ReadWork`).
 - **The logged predicate** (`isolation.md` §4.4). A `Filter` directly over a `Scan` is the scan's
   logged predicate unless it holds a subquery: the store keeps it as a closure that evaluates the
   typed filter on a one-row vector of a write image, counting an error or an image of another schema

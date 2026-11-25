@@ -84,6 +84,11 @@ version older than the newest committed image's aborts with `schema_changed` (`d
   range. The executor chooses the range from its filter (`executor.md` §4.6) and filters the rows itself,
   vectorised, so the predicate's closure runs only in validation. `slots_read` counts the leaf entries these
   scans visit, for the tests that an access path reads only its range.
+- **`scan_vectors(t, table, lo, hi, logged, elem, columns)`** is the same read, logged the same way, answered
+  as vectors of `elem` of at most `BatchSize` rows, decoding only the non-key columns `columns` names (all when
+  none): what `ScanOp` calls (`executor.md` §4.5). `reads` (`ReadWork`) counts what the reads build and
+  decode — leaf entries copied, images, `StoredRow`s, values, columns decoded into lanes, columns skipped —
+  for the tests that pin a scan's cost per row.
 - **`write_rows(t, table, changes)`** applies one statement's writes, each a `RowChange`: `Put` a new row (an
   insert, under §4.2 rule 4), `Replace` or `Remove` the row of a key the statement read. It answers `Wait`
   before writing any of them if one key is locked, so a waited statement leaves no trace. The executor orders
