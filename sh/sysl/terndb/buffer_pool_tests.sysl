@@ -55,6 +55,9 @@ impl BlockDevice for WalCheckedDisk
         assert(lsn <= self.wal.durable, s"page $n reached ${self.disk.name()} at LSN $lsn, the log durable only to ${self.wal.durable}")
         self.disk.write_page(n, bytes)
 
+    /** The pool writes whole pages only, so block writes are the log's and pass straight through. */
+    write_blocks(*self, n: u64, bytes: []const u8) -> Result[unit, IoError] = self.disk.write_blocks(n, bytes)
+
     sync(*self) -> Result[unit, IoError] = self.disk.sync()
 
 /** Simulated segments, one device each, made on first use and kept across pools, so a second pool
