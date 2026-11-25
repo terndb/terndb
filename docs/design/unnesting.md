@@ -117,8 +117,8 @@ domain once more. Each list kept in order costs a row number and a sort. All of 
 rows (each sort `n log n`), where the per-row form re-plans and re-runs the correlated side for every
 outer row.
 
-The joins back to the outer side are merge joins on the `same` keys, and an uncorrelated subquery's
-one-row domain is joined back on `same(true, d.k)`, a constant beside a column, which is a merge key
+The joins back to the outer side are hash joins on the `same` keys, and an uncorrelated subquery's
+one-row domain is joined back on `same(true, d.k)`, a constant beside a column, which is a hash key
 too. `Exists` and `In` become mark joins whose `on` is keys alone, so no pair is tested (§4.1); `In`'s
 null mark is found by lookup. What is left that grows with the product of two sides is a correlation
 that is not an equality (`o.day > u.age` alone), whose pairs are those of one binding, and a mark

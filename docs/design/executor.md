@@ -84,8 +84,8 @@ Operators are **pulled**: `trait Operator { next_batch(*self) -> Result[Option[C
 CodecError] }`. `Some` is a batch of at least one row — an operator never hands up an empty batch,
 which matches §6.4 rule 1 for the result — and `None` is the end. An operator holds its input as an
 `&Operator`, so a tree is built from trait objects and dispatches once per batch. `Sort`,
-`Distinct` and a merge join drain their input on their first call, and every join its right input;
-the rest stream.
+`Distinct` drain their input on their first call, and every join its right input (a hash join its
+left input too when that is the smaller); the rest stream.
 
 Expressions are evaluated over a batch against an `Env`: the binders visible at the node (§8.3),
 each a name and a vector, and the execution's context — the parameter values (§10.1) and the
@@ -217,18 +217,30 @@ of every binder's columns in §8.4 order instead, which `flatten` builds: the re
 `CompositeDistinctOp` compares rows by their flat columns but hands up composites, so the binders
 stay visible above it.
 
-**Merge join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
+**Hash join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
 of `and`) with `a` reading only left binders and `b` only right ones; one of the two may instead be
 a literal or a parameter, one value on every row (`same(true, d.k)` joins an uncorrelated subquery
-back to its one-row domain). Both inputs are drained. Each
-key is evaluated over each side, coerced to the two operands' common type, and both sides sorted by
-the keys with `cmp` (§3.3) through one vector of both sides' keys, so that a left and a right row
-compare as two rows of it. Runs of equal keys on the two sides are a group, and every pair of a
-group is a candidate. **`cmp` orders nulls, but `eq` never matches them**: under `eq`, a row whose
-key holds a null at any depth (a null field of a record key, a null payload of a union key) never
-enters a group, since `eq` of it is null or `false` and never `true` (§3.2); under `same` nulls are
-ordinary values and match each other (§3.1). The other conjuncts of `on`, the residual, are tested
-on the candidates only.
+back to its one-row domain). Each key is evaluated over each side and coerced to the two operands'
+common type, and each column of keys is hashed a vector at a time (`value_hash.sysl`, §3.4): rapidhash
+(`sysl.checksum.hash64`) over each scalar slot's canonical words — every NaN alike, `-0.0` as
+`+0.0`, a number by its value with trailing decimal zeros dropped, so that the integer widths and the
+decimal scales agree — a record's fields in order, a union's discriminant and payload, a list's
+elements in order and a bag's as a wrapping sum, which no order changes. A row's hash combines its
+keys'. **The table goes on the smaller side**: the right input is drained, and the left read ahead
+until it holds as many rows; the right rows are then built on and the left input probes the table a
+batch at a time as it streams, or, when the left input ended with fewer rows, the left rows are built
+on and each right row probes them. A table groups its rows by `same` keys (open addressing on the
+hash; keys whose hashes agree are compared with `same_slots`, so a collision costs a comparison and
+never a wrong match), and every pair of a probing row and the group it finds is a candidate. **`eq`
+never matches a null**: under `eq`, a row whose key holds a null at any depth (a null field of a
+record key, a null payload of a union key) is neither built on nor looked up, since `eq` of it is null
+or `false` and never `true` (§3.2); under `same` nulls are ordinary values and match each other
+(§3.1). The other conjuncts of `on`, the residual, are tested on the candidates only.
+
+**There is no merge join.** One would sort both sides by their keys only to find the runs of equal
+keys, draining both inputs to do it, where the hash join finds the same pairs with no sort and drains
+one side; and a join's output is a bag (§6.5 rule 7), so no consumer could use the order a merge
+leaves.
 
 **Block nested-loop join**, for every other `on` (and an absent one, a cross join). The right input
 is drained; each left batch is paired with every right row, row-major.
@@ -237,35 +249,39 @@ is drained; each left batch is paired with every right row, row-major.
 into one composite with `take` and `on` (or the residual) is evaluated over it like any expression.
 Per left row the operator counts matches (to two) and notes whether `on` was null for some pair; per
 right row it notes a match. Once a left row's pairs are all tested — at the end of its batch for the
-nested loop, after the last group for the merge — it is finished: null-extended (`left`, `full`,
+nested loop and for a hash join probing with the left rows, after the last right row has probed when
+the left rows are built on — it is finished: null-extended (`left`, `full`,
 `single` with no match), kept or dropped (`semi`, `anti`), or marked. A second match for one left
 row under `single` is `R0003` at once. After the last left row, `right` and `full` null-extend the
 right rows nothing matched. Output is queued as pieces of at most `BatchSize` rows and handed up in
 batches of exactly `BatchSize` until the last, never empty.
 
-**Semi, anti and mark joins whose `on` is keys alone** test no pair: a left row in a group of equal
-keys has a right row making `on` `true`, which is all they ask, so the group answers every left row
-in it at once.
+**Semi, anti and mark joins whose `on` is keys alone** test no pair: a left row whose keys find a
+group of right rows has a right row making `on` `true`, which is all they ask; built on the left, a
+group a right row finds answers each of its left rows at once.
 
-**A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a merge
+**A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a hash
 join's keys do not say for a left row they did not match. When `on` is `bool` it never is. Otherwise
 a pair can have `on` null only where its `same` keys agree (`same` is never null), some `eq` key
 holds a null on one side, and the `eq` keys holding none on either side agree (two non-null keys that
-differ are `false`; a pair whose keys all agree was a candidate and was tested). So both sides are
-partitioned by the `same` keys; a partition's right rows are grouped by which `eq` keys hold a null
-(a mask), and each unmatched left row looks up, in each group, the rows agreeing with it on the keys
-neither holds a null in, sorted by those keys once per pair of masks. With scalar keys and no residual
-a row found decides the mark (null); otherwise `on` is evaluated on the pairs found. A `not in` over a
-subquery with nulls is therefore a sort and a search per row, not a pair per right row.
+differ are `false`; a pair whose keys all agree was a candidate and was tested). So the right rows
+are grouped by which `eq` keys hold a null (a mask), and each unmatched left row looks up, in each
+group, the rows agreeing with it on the `same` keys and on the `eq` keys neither holds a null in, in a
+hash table of the group by those keys, built once per pair of masks and kept for every later left
+batch. With scalar keys and no residual a row found decides the mark (null); otherwise `on` is
+evaluated on the pairs found. A `not in` over a subquery with nulls is therefore a lookup per row and
+mask, not a pair per right row.
 
 **Work counts.** Every operator of an execution shares one `Work` (`exec_eval.sysl`, in `Ctx`): the
-pairs a join tested `on` on and the rows it sorted by its keys. They depend only on the plan and the
-rows, so a test bounds them to catch a plan that does quadratic work, whatever the machine's speed
-(`unnest_work_tests.sysl`).
+pairs a join tested `on` on, the rows a hash join built tables of and looked up, and the key
+comparisons agreeing hashes cost. They depend only on the plan and the rows, so a test bounds them to
+catch a plan that does quadratic work, whatever the machine's speed (`unnest_work_tests.sysl`,
+`exec_hash_join_tests.sysl`). `Work` also carries the hash the joins use, `key_hash()`, which a test
+narrows to force collisions and prove that the keys are re-checked.
 
 **When `on` is evaluated** is §6.5 rule 8, written into the spec by this work: only on pairs, so
-never when a side is empty (the merge join evaluates no key then), and a conjunct may go unevaluated
-on a pair another conjunct already makes not `true` — which is what lets the merge join skip the
+never when a side is empty (the hash join evaluates no key then), and a conjunct may go unevaluated
+on a pair another conjunct already makes not `true` — which is what lets the hash join skip the
 pairs whose keys differ.
 
 **An empty right input ends an `inner` or `semi` join** before its left input is read, since neither
@@ -273,10 +289,9 @@ can emit a row (§6.5 rule 10). The unnester relies on it: it joins each uncorre
 outer side's domain with the domain on the right, so over an empty outer side the subtree is never
 evaluated and raises nothing (§6.6 rule 4).
 
-**Hash join is the intended equi-join** once sysl has a fast seeded hash (the survey's gap, §6):
-build on the smaller side, probe streaming, with the same composite batches and the same per-row
-bookkeeping. Until then the merge join is the equi-join; it is blocking on both sides, where a hash
-join would block on the build side only.
+**A hash join built on the right streams its left input**: it reads ahead only as many left rows as
+the right has, and hands up output as each left batch is probed. Built on the left, it has read the
+left input whole, which then held fewer rows than the right.
 
 ### 4.2 Nested relations and correlation
 
@@ -493,7 +508,7 @@ finished; that is a later item.
 
 ## 5. What this note relies on in `query-tree.md`
 
-§3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
+§3.1–§3.3 for every comparison and for `Sort` and `Distinct`; §3.1 and §3.4 for the hash join's keys; §4.1–§4.2 for
 the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.15 for
 the operators; §7.1–§7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
 its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of

@@ -1,0 +1,548 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// The hash join (`exec_join.sysl`, `docs/design/executor.md` §4.1) through the planner, over the
+// tables of `exec_join_tests.sysl`: every kind against the oracle at the edges of each side, keys of
+// every scalar type and of several columns, the choice of the side built on, collisions forced by a
+// narrowed hash, a differential run against the nested loop on random inputs, and the work counts
+// that show pairs are formed only for keys that match and the left input streams.
+
+// -- running ----------------------------------------------------------------------------------------
+
+/** A run's rows, as a client sees them, and its work counts; `h` is the hash the joins use. */
+private xh_exec(d: XjData, r: Rel, h: KeyHash) -> (Result[Buf[Value], CodecError], &Work)
+    val q = envelope([], Query(r))
+    val typing = type_envelope(q, xj_catalog(d)).unwrap()
+    val ctx = xe_ctx([])
+    ctx.work.hash = h
+    val root = plan_query(q, typing, ctx, xj_tables(d))
+    val out = buf[Value]()
+
+    val result: Result[Buf[Value], CodecError] = drain(root.op) match
+        Ok(bs) ->
+            for b in bs
+                assert(b.len > 0 && b.len <= BatchSize)
+                out.extend(values_of(if root.binder == Composite then flatten(b) else b).view())
+
+            Ok(out)
+        Err(e) -> Err(e)
+
+    (result, ctx.work)
+
+private xh_work(d: XjData, r: Rel) -> &Work
+    val (res, w) = xh_exec(d, r, key_hash())
+    assert(res.is_ok(), xj_code(res))
+    w
+
+/** `kind` with `on` over `d` under the hash `h`, against the oracle. */
+private xh_check_with(kind: JoinKind, d: XjData, on: Expr, oracle: (Value, Value) -> Option[bool], h: KeyHash, what: string)
+    val want = xj_oracle(kind, d, oracle)
+    val (got, _) = xh_exec(d, xj_join(kind, Some(on)), h)
+
+    want match
+        Ok(rows) ->
+            assert(got.is_ok(), s"$what, ${xj_kind_name(kind)}: ${xj_code(got)}")
+            assert(xj_bag_eq(xj_row_type(kind, d), got.unwrap(), rows), s"$what, ${xj_kind_name(kind)}: the rows differ")
+        Err(code) -> assert_eq(xj_code(got), code, s"$what, ${xj_kind_name(kind)}")
+
+/** Every kind on `a.ak = b.bk` over `d` and over `d` with its sides' sizes swapped, so that each side
+ * is built on in turn; hashed, and as a nested loop.
+ */
+private xh_every_kind(arows: []const i128, brows: []const i128)
+    for (l, r) in [(arows, brows), (brows, arows)]
+        val d = xj_data(xj_rows("a", l), xj_rows("b", r), [2], [3])
+
+        for kind in xj_kinds()
+            xj_check(kind, d, xj_on_eq(), xj_eq_k)
+
+        // With a residual, so that the pairs are tested rather than answered by the keys.
+        for kind in xj_kinds()
+            xj_check(kind, d, xh_on_residual(), xh_residual_oracle)
+
+private xh_on_residual() -> Expr = call("and", [xj_on_eq(), call("lt", [col("a", "v"), col("b", "w")])])
+
+private xh_v(row: Value) -> Value = xj_fields(row)[1]
+
+private xh_residual_oracle(a: Value, b: Value) -> Option[bool] = xj_kleene_and(xj_eq_k(a, b), lt(Text, xh_v(a), xh_v(b)).unwrap())
+
+// -- every kind at the edges ------------------------------------------------------------------------
+
+@test
+every_kind_with_an_empty_right_side()
+    xh_every_kind([1, 2, -1], [])
+
+@test
+every_kind_with_an_empty_left_side()
+    xh_every_kind([], [1, 2, -1])
+
+@test
+every_kind_with_both_sides_empty()
+    xh_every_kind([], [])
+
+@test
+every_kind_with_one_row_each_matching()
+    xh_every_kind([4], [4])
+
+@test
+every_kind_with_one_row_each_not_matching()
+    xh_every_kind([4], [5])
+
+@test
+every_kind_with_one_null_row_each()
+    xh_every_kind([-1], [-1])
+
+@test
+every_kind_with_every_key_duplicate()
+    xh_every_kind([7, 7, 7], [7, 7, 7, 7, 7])
+
+@test
+every_kind_with_every_key_null()
+    xh_every_kind([-1, -1, -1], [-1, -1, -1, -1])
+
+@test
+every_kind_with_nulls_mixed_among_keys()
+    xh_every_kind([1, -1, 2, 2, -1, 3], [-1, 2, 4, 1, -1])
+
+@test
+every_kind_with_null_keys_on_one_side_only()
+    xh_every_kind([1, 2, 3], [-1, 2, -1])
+
+private xh_same_case(l: []const i128, r: []const i128)
+    val on = call("same", [col("a", "ak"), col("b", "bk")])
+
+    for (x, y) in [(l, r), (r, l)]
+        val d = xj_data(xj_rows("a", x), xj_rows("b", y), [1], [2])
+
+        for kind in xj_kinds()
+            xj_check(kind, d, on, (a: Value, b: Value) -> Some(same(nullable(Int64), xj_k(a), xj_k(b))))
+
+@test
+every_kind_under_same_with_nulls_and_duplicates()
+    xh_same_case([1, -1, 2, -1], [-1, 2, 2])
+
+@test
+every_kind_under_same_with_every_key_null()
+    xh_same_case([-1, -1], [-1, -1, -1])
+
+@test
+every_kind_under_same_with_one_side_empty()
+    xh_same_case([5, -1], [])
+
+@test
+a_single_join_with_duplicate_keys_on_the_built_left_side_is_r0003()
+    // The left side is the smaller and is built on; a right row matching two left rows is fine, a
+    // left row matching two right rows is R0003.
+    val ok = xj_data(xj_rows("a", [1, 1]), xj_rows("b", [1, 2, 3]), [], [])
+    xj_check(SingleJoin, ok, xj_on_eq(), xj_eq_k)
+    val bad = xj_data(xj_rows("a", [1]), xj_rows("b", [1, 1, 3]), [], [])
+    assert_eq(xj_code(xj_run(bad, xj_join(SingleJoin, Some(xj_on_eq())))), "R0003")
+
+// -- keys of every scalar type ----------------------------------------------------------------------
+
+private xh_typed(t: Type, ak: Buf[Value], bk: Buf[Value]) -> XjData
+    val arows = buf[Value]()
+    val brows = buf[Value]()
+
+    for i in 0..<ak.len()
+        arows.push(rec([ak[i], Text(s"a$i")]))
+
+    for i in 0..<bk.len()
+        brows.push(rec([bk[i], Text(s"b$i")]))
+
+    XjData(items_of([Field("ak", nullable(t)), Field("v", Text)]), items_of([Field("bk", nullable(t)), Field("w", Text)]), arows, brows,
+        items_of([3]), items_of([2]))
+
+/** Three values of `t`, edges among them; for a float, a NaN, both zeros and 1.5. */
+private xh_pool(r: *Rng, t: Type) -> Buf[Value] = t match
+    Float32 | Float64 -> items_of([Float(real.from_bits(0x7ff8_0000_0000_0000)), Float(real.from_bits(0x8000_0000_0000_0000)), Float(0.0), Float(1.5)])
+    _ -> items_of([rf_scalar_value(r, t), rf_scalar_value(r, t), rf_scalar_value(r, t)])
+
+@test
+a_key_of_every_scalar_type_matches_by_eq()
+    var r = rng(0x4a01, 1)
+    val types = [Type.Bool, Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Decimal(10, 2), Decimal(38, 0),
+        Type.Text, Type.Bytes, Json, Date, Time, DateTime, Timestamp, Type.Interval, Type.Uuid]
+
+    for t in types
+        val pool = xh_pool(&r, t)
+        pool.push(Null)
+
+        for round in 0..<3
+            val ak = buf[Value]()
+            val bk = buf[Value]()
+
+            for _ in 0..<usize(r.below(7))
+                ak.push(pool[usize(r.below(u64(pool.len())))])
+
+            for _ in 0..<usize(r.below(7))
+                bk.push(pool[usize(r.below(u64(pool.len())))])
+
+            val d = xh_typed(t, ak, bk)
+            val tt = nullable(t)
+
+            for kind in xj_kinds()
+                xj_check(kind, d, xj_on_eq(), (a: Value, b: Value) -> eq(tt, xj_k(a), xj_k(b)).unwrap())
+
+@test
+a_nan_key_matches_every_nan_and_minus_zero_matches_plus_zero()
+    for t in [Float32, Float64]
+        val d = xh_typed(t, items_of([Float(real.from_bits(0x7ff8_0000_0000_0001)), Float(real.from_bits(0x8000_0000_0000_0000))]),
+            items_of([Float(real.from_bits(0xfff8_0000_0000_0000)), Float(0.0)]))
+        assert_eq(xj_run(d, xj_join(Inner, Some(xj_on_eq()))).unwrap().len(), 2)
+
+@test
+decimal_keys_of_different_scales_match_by_value()
+    // 1.50 and 2.00 at scale 2 against 1.5, 2.0 and 2.5 at scale 1: two pairs.
+    val d = XjData(items_of([Field("ak", Decimal(10, 2)), Field("v", Text)]), items_of([Field("bk", Decimal(8, 1)), Field("w", Text)]),
+        items_of([rec([Int(150), Text("a0")]), rec([Int(200), Text("a1")])]), items_of([rec([Int(15), Text("b0")]), rec([Int(20), Text("b1")]), rec([Int(25), Text("b2")])]),
+        buf[usize](), buf[usize]())
+
+    for kind in [Inner, Semi]
+        assert_eq(xj_run(d, xj_join(kind, Some(xj_on_eq()))).unwrap().len(), 2)
+
+    assert_eq(xj_run(d, xj_join(Right, Some(xj_on_eq()))).unwrap().len(), 3)
+
+@test
+an_integer_key_matches_a_decimal_key_of_the_same_value()
+    val d = XjData(items_of([Field("ak", Int64), Field("v", Text)]), items_of([Field("bk", Decimal(8, 2)), Field("w", Text)]),
+        items_of([rec([Int(1), Text("a0")]), rec([Int(2), Text("a1")])]), items_of([rec([Int(100), Text("b0")]), rec([Int(150), Text("b1")])]),
+        buf[usize](), buf[usize]())
+    assert_eq(xj_run(d, xj_join(Inner, Some(xj_on_eq()))).unwrap().len(), 1)
+    assert_eq(xj_run(d, xj_join(Anti, Some(xj_on_eq()))).unwrap().len(), 1)
+
+// -- several key columns ----------------------------------------------------------------------------
+
+private xh_three() -> Buf[Field] = items_of([Field("k1", nullable(Int64)), Field("k2", nullable(Text)), Field("k3", nullable(Float64))])
+
+private xh_three_row(r: *Rng) -> Value
+    val k1: Value = if r.below(5) == 0 then Null else Int(i128(r.below(2)))
+    val k2: Value = if r.below(5) == 0 then Null else Text(if r.below(2) == 0 then "x" else "y")
+    val k3: Value = if r.below(5) == 0 then Null else Float(if r.below(2) == 0 then 0.0 else 1.0)
+    rec([k1, k2, k3])
+
+private xh_three_data(r: *Rng) -> XjData
+    val a = buf[Value]()
+    val b = buf[Value]()
+
+    for _ in 0..<usize(r.below(10))
+        a.push(xh_three_row(r))
+
+    for _ in 0..<usize(r.below(10))
+        b.push(xh_three_row(r))
+
+    val bcols = buf[Field]()
+
+    for f in xh_three()
+        bcols.push(Field(s"r${f.name}", f.ty))
+
+    XjData(xh_three(), bcols, a, b, items_of([1 + usize(r.below(3))]), items_of([1 + usize(r.below(3))]))
+
+private xh_col(row: Value, i: usize) -> Value = xj_fields(row)[i]
+
+@test
+three_key_columns_of_three_types_under_eq_and_same()
+    // `eq` on the integer and the float, `same` on the text: nulls of the text match each other.
+    val on = call("and", [call("eq", [col("a", "k1"), col("b", "rk1")]),
+        call("and", [call("same", [col("a", "k2"), col("b", "rk2")]), call("eq", [col("a", "k3"), col("b", "rk3")])])])
+    val oracle = (a: Value, b: Value) -> xj_kleene_and(eq(nullable(Int64), xh_col(a, 0), xh_col(b, 0)).unwrap(),
+        xj_kleene_and(Some(same(nullable(Text), xh_col(a, 1), xh_col(b, 1))), eq(nullable(Float64), xh_col(a, 2), xh_col(b, 2)).unwrap()))
+    var r = rng(0x4a02, 3)
+
+    for _ in 0..<25
+        val d = xh_three_data(&r)
+
+        for kind in xj_kinds()
+            xj_check(kind, d, on, oracle)
+
+@test
+three_eq_key_columns_give_every_kind_its_three_valued_result()
+    val on = call("and", [call("eq", [col("a", "k1"), col("b", "rk1")]),
+        call("and", [call("eq", [col("a", "k2"), col("b", "rk2")]), call("eq", [col("a", "k3"), col("b", "rk3")])])])
+    val oracle = (a: Value, b: Value) -> xj_kleene_and(eq(nullable(Int64), xh_col(a, 0), xh_col(b, 0)).unwrap(),
+        xj_kleene_and(eq(nullable(Text), xh_col(a, 1), xh_col(b, 1)).unwrap(), eq(nullable(Float64), xh_col(a, 2), xh_col(b, 2)).unwrap()))
+    var r = rng(0x4a03, 5)
+
+    for _ in 0..<25
+        val d = xh_three_data(&r)
+
+        for kind in xj_kinds()
+            xj_check(kind, d, on, oracle)
+
+// -- the side built on ------------------------------------------------------------------------------
+
+@test
+a_right_side_no_larger_than_the_left_is_built_on()
+    val d = xj_data(xj_rows("a", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), xj_rows("b", [2, 4, 6]), [4], [4])
+    val w = xh_work(d, xj_join(Inner, Some(xj_on_eq())))
+    assert_eq(w.built, 3u64)
+    assert_eq(w.probed, 10u64)
+    assert_eq(w.pairs, 3u64)
+
+@test
+a_right_side_larger_than_the_left_swaps_the_build_to_the_left()
+    val d = xj_data(xj_rows("a", [2, 4, 6]), xj_rows("b", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), [2], [4])
+    val w = xh_work(d, xj_join(Inner, Some(xj_on_eq())))
+    assert_eq(w.built, 3u64)
+    assert_eq(w.probed, 10u64)
+    assert_eq(w.pairs, 3u64)
+
+    // And every kind still answers as the oracle says, built on the left.
+    for kind in xj_kinds()
+        xj_check(kind, d, xj_on_eq(), xj_eq_k)
+
+@test
+sides_of_equal_size_build_on_the_right()
+    val d = xj_data(xj_rows("a", [1, 2, 3]), xj_rows("b", [3, 4, 5]), [1], [1])
+    val w = xh_work(d, xj_join(Left, Some(xj_on_eq())))
+    assert_eq(w.built, 3u64)
+    assert_eq(w.probed, 3u64)
+
+@test
+null_keys_are_neither_built_nor_probed_under_eq()
+    // Two of four right rows and one of three left rows hold a null key.
+    val d = xj_data(xj_rows("a", [1, -1, 2]), xj_rows("b", [-1, 1, -1, 5]), [], [])
+    val w = xh_work(d, xj_join(Left, Some(xj_on_eq())))
+    assert_eq(w.built, 2u64)
+    assert_eq(w.probed, 2u64)
+
+// -- collisions -------------------------------------------------------------------------------------
+
+/** Every row hashes alike under mask 0, and into one of two buckets under mask 1. */
+private xh_weak() -> [3]KeyHash = [KeyHash(0, 0), KeyHash(0, 1), KeyHash(0x5eed, 0)]
+
+@test
+keys_that_collide_are_told_apart_by_their_equality_for_every_kind()
+    for h in xh_weak()
+        for kind in xj_kinds()
+            xh_check_with(kind, xj_mixed(), xj_on_eq(), xj_eq_k, h, "mixed")
+            xh_check_with(kind, xj_mixed(), xh_on_residual(), xh_residual_oracle, h, "residual")
+            xh_check_with(kind, xj_mixed(), call("same", [col("a", "ak"), col("b", "bk")]),
+                (a: Value, b: Value) -> Some(same(nullable(Int64), xj_k(a), xj_k(b))), h, "same")
+
+@test
+colliding_keys_are_compared_and_still_form_no_pair()
+    // Distinct keys on both sides, none shared: under a hash that makes them all collide every lookup
+    // compares keys, and not one pair is formed.
+    val ks = buf[i128]()
+    val ls = buf[i128]()
+
+    for i in 0..<40
+        ks.push(i128(2 * i))
+        ls.push(i128(2 * i + 1))
+
+    val d = xj_data(xj_rows("a", ks.view()), xj_rows("b", ls.view()), [], [])
+    val (res, w) = xh_exec(d, xj_join(Inner, Some(xj_on_eq())), KeyHash(0, 0))
+    assert_eq(res.unwrap().len(), 0)
+    assert_eq(w.pairs, 0u64)
+    assert(w.compared >= 40u64 * 40u64, s"${w.compared} comparisons")
+
+    val good = xh_work(d, xj_join(Inner, Some(xj_on_eq())))
+    assert_eq(good.pairs, 0u64)
+    assert(good.compared < 5u64, s"${good.compared} comparisons under the real hash")
+
+@test
+a_mark_join_finds_its_null_marks_under_colliding_hashes()
+    var r = rng(0x4a04, 7)
+
+    for h in xh_weak()
+        for _ in 0..<10
+            val d = xh_three_data(&r)
+            val on = call("and", [call("eq", [col("a", "k1"), col("b", "rk1")]), call("eq", [col("a", "k3"), col("b", "rk3")])])
+            val oracle = (a: Value, b: Value) -> xj_kleene_and(eq(nullable(Int64), xh_col(a, 0), xh_col(b, 0)).unwrap(),
+                eq(nullable(Float64), xh_col(a, 2), xh_col(b, 2)).unwrap())
+            xh_check_with(MarkJoin, d, on, oracle, h, "two eq keys")
+
+// -- differential -----------------------------------------------------------------------------------
+
+private xh_keys(r: *Rng, n: u64) -> Buf[i128]
+    val out = buf[i128]()
+
+    for _ in 0..<usize(r.below(n))
+        out.push(if r.below(4) == 0 then -1 else i128(r.below(5)))
+
+    out
+
+@test
+the_hash_join_agrees_with_the_nested_loop_on_random_inputs()
+    // `xj_check` runs each case hashed and as a nested loop, both against the oracle.
+    var r = rng(0x4a05, 9)
+
+    for _ in 0..<60
+        val a = xh_keys(&r, 14)
+        val b = xh_keys(&r, 14)
+        val d = xj_data(xj_rows("a", a.view()), xj_rows("b", b.view()), [1 + usize(r.below(4))], [1 + usize(r.below(4))])
+        val kind = xj_kinds()[usize(r.below(8))]
+        val residual = r.below(2) == 0
+
+        if residual then xj_check(kind, d, xh_on_residual(), xh_residual_oracle) else xj_check(kind, d, xj_on_eq(), xj_eq_k)
+
+@test
+the_hash_join_agrees_with_the_nested_loop_across_batch_boundaries()
+    // More rows than a batch on the probing side, so that pairs and output cross `BatchSize`.
+    val a = buf[i128]()
+    val b = buf[i128]()
+
+    for i in 0..<2500
+        a.push(if i % 7 == 0 then -1 else i128(i % 300))
+
+    for i in 0..<400
+        b.push(if i % 11 == 0 then -1 else i128(i % 350))
+
+    for (x, y) in [(a, b), (b, a)]
+        val d = xj_data(xj_rows("a", x.view()), xj_rows("b", y.view()), [700], [1000])
+
+        for kind in [Inner, Left, Full, Anti, MarkJoin]
+            xh_check_with(kind, d, xj_on_eq(), xj_eq_k, key_hash(), "large")
+
+// -- work -------------------------------------------------------------------------------------------
+
+@test
+an_equi_join_forms_a_pair_only_for_keys_that_match()
+    // 1000 left rows and 500 right rows with distinct keys, 250 of them shared: 250 pairs, where a
+    // nested loop forms 500000.
+    val a = buf[i128]()
+    val b = buf[i128]()
+
+    for i in 0..<1000
+        a.push(i128(i))
+
+    for i in 0..<500
+        b.push(i128(750 + i))
+
+    val d = xj_data(xj_rows("a", a.view()), xj_rows("b", b.view()), [256], [256])
+
+    for kind in [Inner, Left, Right, Full, SingleJoin]
+        val w = xh_work(d, xj_join(kind, Some(xj_on_eq())))
+        assert_eq(w.pairs, 250u64, xj_kind_name(kind))
+        assert_eq(w.built + w.probed, 1500u64, xj_kind_name(kind))
+
+    for kind in [Semi, Anti, MarkJoin]
+        val w = xh_work(d, xj_join(kind, Some(xj_on_eq())))
+        assert_eq(w.pairs, 0u64, xj_kind_name(kind))
+
+    assert_eq(xh_work(d, xj_join(Inner, Some(xj_hidden(xj_on_eq())))).pairs, 500000u64)
+
+@test
+the_work_of_an_equi_join_grows_linearly()
+    var last: u64 = 0
+
+    for n in [1000, 4000]
+        val a = buf[i128]()
+        val b = buf[i128]()
+
+        for i in 0..<n
+            a.push(i128(i))
+            b.push(i128(i + n / 2))
+
+        val d = xj_data(xj_rows("a", a.view()), xj_rows("b", b.view()), [1024], [1024])
+        val w = xh_work(d, xj_join(Full, Some(xj_on_eq())))
+        assert_eq(w.pairs, u64(n / 2))
+        assert_eq(w.built + w.probed, u64(2 * n))
+        assert(w.compared <= u64(n), s"${w.compared} comparisons over $n rows a side")
+        last = w.pairs
+
+    assert_eq(last, 2000u64)
+
+/** Counts the batches a source hands out. */
+struct XhPulls
+    n: usize
+
+struct XhSource
+    batches: Buf[ColumnVector]
+    at: usize
+    pulls: &XhPulls
+
+impl Operator for XhSource
+    next_batch(*self) -> Result[Option[ColumnVector], CodecError]
+        if self.at == self.batches.len() then return Ok(None)
+
+        self.pulls.n += 1
+        val b = self.batches[self.at]
+        self.at += 1
+        Ok(Some(b))
+
+private xh_elem(key: string, name: string) -> Type = record([Field(key, nullable(Int64)), Field(name, Text)])
+
+private xh_source(elem: Type, rows: Buf[Value], size: usize, pulls: &XhPulls) -> &Operator
+    val bs = buf[ColumnVector]()
+    var at: usize = 0
+
+    while at < rows.len()
+        val end = if at + size < rows.len() then at + size else rows.len()
+        bs.push(vector_of(elem, rows.view()[at..<end]))
+        at = end
+
+    XhSource(bs, 0, pulls)
+
+private xh_col_expr(b: string, c: string) -> TExpr = TExpr(Col(b, c), nullable(Int64), buf[TExpr](), None, 0)
+
+private xh_eq_expr() -> TExpr =
+    TExpr(Call("eq", items_of([Col("a", "ak"), Col("b", "bk")])), nullable(Bool), items_of([xh_col_expr("a", "ak"), xh_col_expr("b", "bk")]), None, 0)
+
+/** A join of `kind` on `a.ak = b.bk` over sources counting their pulls. */
+private xh_streaming(kind: JoinKind, arows: Buf[Value], brows: Buf[Value], lp: &XhPulls, rp: &XhPulls) -> &Operator
+    val l = Lowered(xh_source(xh_elem("ak", "v"), arows, BatchSize, lp), "a", xh_elem("ak", "v"), buf[TKey]())
+    val r = Lowered(xh_source(xh_elem("bk", "w"), brows, BatchSize, rp), "b", xh_elem("bk", "w"), buf[TKey]())
+    val (mark, binder): (Option[string], Option[string]) = if kind == MarkJoin then (Some("mark"), Some("m")) else (None, None)
+    plan_join(kind, l, r, Some(xh_eq_expr()), mark, binder, xe_ctx([]), true).op
+
+private xh_seq(p: string, n: usize) -> Buf[Value]
+    val ks = buf[i128]()
+
+    for i in 0..<n
+        ks.push(i128(i))
+
+    xj_rows(p, ks.view())
+
+@test
+the_left_input_streams_past_a_table_built_on_the_right()
+    // Ten left batches and five right rows: the first output batch is handed up after two left
+    // batches have been read, where a join draining both sides reads all ten first.
+    val lp: &XhPulls = XhPulls(0)
+    val rp: &XhPulls = XhPulls(0)
+    val op = xh_streaming(Left, xh_seq("a", 10 * BatchSize), xh_seq("b", 5), lp, rp)
+    val first = op.next_batch().unwrap().unwrap()
+    assert_eq(first.len, BatchSize)
+    assert(lp.n <= 2, s"${lp.n} left batches read")
+    assert_eq(rp.n, 1)
+
+    var n = first.len
+
+    loop
+        op.next_batch().unwrap() match
+            Some(b) -> n += b.len
+            None -> break
+
+    assert_eq(n, 10 * BatchSize)
+    assert_eq(lp.n, 10)
+
+@test
+an_empty_right_input_leaves_an_inner_or_semi_join_s_left_input_unread()
+    for kind in [Inner, Semi]
+        val lp: &XhPulls = XhPulls(0)
+        val rp: &XhPulls = XhPulls(0)
+        val op = xh_streaming(kind, xh_seq("a", 3), buf[Value](), lp, rp)
+        assert(op.next_batch().unwrap().is_none())
+        assert_eq(lp.n, 0, xj_kind_name(kind))
+
+    // Every other kind reads it: their left rows are output, unmatched.
+    for kind in [Left, Anti, MarkJoin, SingleJoin, Full]
+        val lp: &XhPulls = XhPulls(0)
+        val rp: &XhPulls = XhPulls(0)
+        val op = xh_streaming(kind, xh_seq("a", 3), buf[Value](), lp, rp)
+        assert(op.next_batch().unwrap().is_some(), xj_kind_name(kind))
+        assert_eq(lp.n, 1, xj_kind_name(kind))
+
+@test
+a_left_input_smaller_than_the_right_is_read_whole_and_built_on()
+    val lp: &XhPulls = XhPulls(0)
+    val rp: &XhPulls = XhPulls(0)
+    val op = xh_streaming(Inner, xh_seq("a", 3), xh_seq("b", 2 * BatchSize), lp, rp)
+    val b = op.next_batch().unwrap().unwrap()
+    assert_eq(b.len, 3)
+    assert_eq(lp.n, 1)
+    assert_eq(rp.n, 2)
+    assert(op.next_batch().unwrap().is_none())
