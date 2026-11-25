@@ -193,19 +193,43 @@ impl Shell
                 val indexes = self.catalog(catalog_indexes_query(oid))?
                 val constraints = self.catalog(catalog_constraints_query(oid))?
                 val title = s"Table \"${cat_text(tables.at(i, "namespace"))}.${cat_text(tables.at(i, "name"))}\""
+                // The ready columns type the constants of the definition expressions as the front end would.
+                val row = self.look_up(QualName(cat_text(tables.at(i, "namespace")), cat_text(tables.at(i, "name")))) match
+                    TableFound(t) -> Some(t.columns)
+                    _ -> None
                 self.say(describe_table_text(title, cat_texts(tables.at(i, "primary_key")), columns, indexes, constraints, names,
-                    self.expanded))
+                    self.expanded, row))
 
         for i in 0..<views.rows.len()
             if matches(ns, rel, cat_text(views.at(i, "namespace")), cat_text(views.at(i, "name")))
                 found = true
                 val columns = self.catalog(catalog_columns_query(cat_u64(views.at(i, "oid"))))?
                 val title = s"View \"${cat_text(views.at(i, "namespace"))}.${cat_text(views.at(i, "name"))}\""
-                self.say(describe_view_text(title, columns, cat_text(views.at(i, "query")), self.expanded))
+                val query = self.view_sql(views.at(i, "query_tree")).unwrap_or(cat_text(views.at(i, "query")))
+                self.say(describe_view_text(title, columns, query, self.expanded))
 
         if !found then self.fail(s"Did not find any relation named \"$name\".\n")
         Some(())
     end describe
+
+    /** A view's query as SQL, from its `query_tree`, the tables it scans looked up as the front end
+     * would look them up; `None` when there is no tree to read.
+     */
+    private view_sql(*self, tree: Value) -> Option[string]
+        val r = tree match
+            Bytes(b) -> decode_statement(b.view()) match
+                Ok(Query(x)) -> x
+                _ -> return None
+            _ -> return None
+        val tables: &ShellTables = ShellTables(buf(), buf())
+        loop
+            val text = sql_query_text(r, tables)
+            var asked = false
+            for n in tables.asked
+                if tables.answer(n).is_none()
+                    tables.known.push(KnownTable(n, self.look_up(n)))
+                    asked = true
+            if !asked then return Some(text)
 end Shell
 
 /** What `\conninfo` prints. */
@@ -233,16 +257,16 @@ private cat_items(binder: string, names: []const string) -> Buf[Item]
 catalog_tables_query() -> Envelope =
     envelope([], Query(Project(scan("catalog", "tables", "t"), "r", cat_items("t", ["oid", "namespace", "name", "owner", "primary_key"]))))
 
-/** `catalog.views`: every view's oid, namespace, name, owner and query text. */
+/** `catalog.views`: every view's oid, namespace, name, owner, and query as text and as a tree. */
 catalog_views_query() -> Envelope =
-    envelope([], Query(Project(scan("catalog", "views", "v"), "r", cat_items("v", ["oid", "namespace", "name", "owner", "query"]))))
+    envelope([], Query(Project(scan("catalog", "views", "v"), "r", cat_items("v", ["oid", "namespace", "name", "owner", "query", "query_tree"]))))
 
 private of_table(binder: string, oid: u64) -> Expr = call("eq", [col(binder, "table_oid"), Literal(UInt64, UInt(oid))])
 
 /** `catalog.columns` of the table or view `oid`. */
 catalog_columns_query(oid: u64) -> Envelope =
     envelope([], Query(Project(Filter(scan("catalog", "columns", "c"), of_table("c", oid)), "r",
-        cat_items("c", ["ordinal", "name", "type_text", "nullable", "default", "generated", "identity"]))))
+        cat_items("c", ["ordinal", "name", "type_text", "nullable", "default", "generated", "identity", "default_tree", "generated_tree"]))))
 
 /** `catalog.columns` of the table or view `oid` as the SQL front end needs them: each column's
  * structural type and its state.
@@ -254,7 +278,7 @@ column_types_query(oid: u64) -> Envelope =
 /** `catalog.indexes` of table `oid`. */
 catalog_indexes_query(oid: u64) -> Envelope =
     envelope([], Query(Project(Filter(scan("catalog", "indexes", "i"), of_table("i", oid)), "r",
-        cat_items("i", ["name", "unique", "keys", "predicate", "state"]))))
+        cat_items("i", ["name", "unique", "keys", "predicate", "state", "predicate_tree"]))))
 
 /** `catalog.constraints` of table `oid`. */
 catalog_constraints_query(oid: u64) -> Envelope =
@@ -371,8 +395,29 @@ private table_name(tables: Buf[RelEntry], oid: u64) -> string
         if t.oid == oid then return t.namespace + "." + t.name
     s"oid $oid"
 
+/** A definition expression as `\d` shows it: its tree (`tree`, `ddl.md` §4.1 rule 4) printed as SQL,
+ * its constants typed by `row`, the table's ready columns, and a constant at its top by `ty`; its
+ * text form where the row carries no tree that decodes.
+ */
+private[terndb] definition_text(text: Value, tree: Value, row: Option[Buf[Field]], ty: Option[Type]) -> string
+    tree match
+        Bytes(b) -> decode_expr(b.view()) match
+            Ok(e) -> return sql_definition_text(e, row, ty)
+            Err(_) -> ()
+        _ -> ()
+    cat_text(text)
+
+/** The type of column `name` among `row`, if it is there. */
+private row_type(row: Option[Buf[Field]], name: string) -> Option[Type]
+    row match
+        Some(fs) ->
+            for f in fs
+                if f.name == name then return Some(f.ty)
+            None
+        None -> None
+
 /** The columns of a table or view as `\d` shows them. */
-private columns_grid(columns: CatRows, with_details: bool) -> Grid
+private columns_grid(columns: CatRows, with_details: bool, fields: Option[Buf[Field]] = None) -> Grid
     var order = buf[usize]()
     for i in 0..<columns.rows.len()
         order.push(i)
@@ -390,18 +435,19 @@ private columns_grid(columns: CatRows, with_details: bool) -> Grid
             row.push(if nullable then "" else "not null")
             val generated = columns.at(i, "generated")
             val identity = variant_name(columns.type_of("identity"), columns.at(i, "identity"))
+            val ty = row_type(fields, cat_text(columns.at(i, "name")))
             row.push(
-                if !generated.is_null() then s"generated always as (${cat_text(generated)})"
+                if !generated.is_null() then s"generated always as (${definition_text(generated, columns.at(i, "generated_tree"), fields, ty)})"
                 elif identity == "always" then "generated always as identity"
                 elif identity == "by_default" then "generated by default as identity"
-                else cat_text(columns.at(i, "default")))
+                else definition_text(columns.at(i, "default"), columns.at(i, "default_tree"), fields, ty))
         g.rows.push(row)
     g
 
 /** What `\d` prints for a table: its columns, then its primary key, indexes and constraints. */
 describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, indexes: CatRows, constraints: CatRows,
-        tables: Buf[RelEntry], expanded: bool) -> string
-    val g = columns_grid(columns, true)
+        tables: Buf[RelEntry], expanded: bool, row: Option[Buf[Field]] = None) -> string
+    val g = columns_grid(columns, true, row)
     var out = if expanded then render_expanded(g, title) else render_aligned(g, title, false)
 
     if primary_key.len() > 0 then out = out + s"Primary key: (${joined(primary_key)})\n"
@@ -419,10 +465,11 @@ describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, i
                 Relation(elems) ->
                     for k in elems
                         val kr = cat_rows(Bag(et), items_of([k]))
-                        // A plain column key names its column; `expr` is its tree text (`row.c`), shown only for an
-                        // expression key, whose `column` is null (ddl.md §4.2).
+                        // A plain column key names its column; an expression key, whose `column` is null
+                        // (ddl.md §4.2), is its expression printed as SQL.
                         val column = kr.at(0, "column")
-                        var text = if column.is_null() then cat_text(kr.at(0, "expr")) else cat_text(column)
+                        var text = sql_ident(cat_text(column))
+                        if column.is_null() then text = definition_text(kr.at(0, "expr"), kr.at(0, "expr_tree"), row, None)
                         if cat_bool(kr.at(0, "descending")) then text = text + " DESC"
                         keys.push(text)
                 _ -> ()
@@ -430,7 +477,7 @@ describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, i
             if cat_bool(indexes.at(i, "unique")) then line = line + " UNIQUE"
             line = line + s" (${joined(keys)})"
             val pred = indexes.at(i, "predicate")
-            if !pred.is_null() then line = line + s" WHERE ${cat_text(pred)}"
+            if !pred.is_null() then line = line + s" WHERE ${definition_text(pred, indexes.at(i, "predicate_tree"), row, None)}"
             val state = variant_name(indexes.type_of("state"), indexes.at(i, "state"))
             if state == "building" then line = line + " BUILDING"
             elif state == "failed" then line = line + " INVALID"
@@ -450,7 +497,8 @@ describe_table_text(title: string, primary_key: Buf[string], columns: CatRows, i
         val invalid = if cat_bool(constraints.at(i, "validated")) then "" else " NOT VALID"
         val k = variant_name(kt, kind)
         if k == "check"
-            checks.push(s"$name CHECK (${cat_text(variant_field(kt, kind, "expr").1)})$invalid")
+            val text = definition_text(variant_field(kt, kind, "expr").1, variant_field(kt, kind, "expr_tree").1, row, None)
+            checks.push(s"$name CHECK ($text)$invalid")
         elif k == "unique"
             uniques.push(s"$name UNIQUE (${joined(cat_texts(variant_field(kt, kind, "columns").1))})$invalid")
         elif k == "foreign_key"
