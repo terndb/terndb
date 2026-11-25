@@ -1,0 +1,24 @@
+module terndb
+import sysl.raw.from_raw
+
+@export("terndb_alloc_fn")
+type AllocFn = *extern(usize) -> *unit
+
+@export("terndb_digest")
+digest(alloc: AllocFn, text: *const u8, len: usize, out: *[32]u8) -> isize = 0
+
+@export("TERNDB_DIGEST_LEN")
+const DIGEST_LEN: usize = 32
+
+@export("terndb_open")
+open() -> *Db
+    val d: &Db = Db(5)
+    d.into_raw()
+
+@export("terndb_value")
+value(p: *Db) -> int
+    val d: &Db = from_raw(p)
+    d.n
+
+struct Db
+    n: int
