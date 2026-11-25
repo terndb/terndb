@@ -441,7 +441,7 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 | 0x1B | `money` | |
 | 0x1C, 0x1D | `inet`, `cidr` | |
 | 0x1E, 0x1F | `macaddr`, `macaddr8` | |
-| 0x20 | relation, `bag<E>` or `list<E>` | `ordered` u8 (0 = bag, 1 = list), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor: a record (0x23), a union (0x21) or a scalar |
+| 0x20 | relation, `bag<E>` or `list<E>` | `ordered` u8 (0 = bag, 1 = list), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor: a record (0x23), a union (0x21), a scalar, an array (0x30) or a relation (0x20) |
 | 0x21 | union `union<t₁: R₁, …>` | `n` u32 (1–65,536), then n × (`name_len` u16, tag UTF-8, the payload's record descriptor, tag 0x23) |
 | 0x22 | reserved; never assigned | |
 | 0x23 | record `{n₁: T₁, …}` | `n` u16 (0–65,535), then n × (`name_len` u16, name UTF-8, `nullable` u8, the field's descriptor) |
@@ -461,8 +461,9 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 1. **Nullability.** A column's own nullability is `sys.columns.nullable`, and its descriptor is of the non-null
    type. Inside a descriptor, nullability is the `nullable` octet of a record field, a relation element or an
    array element. These are every place a type can occur in a stored type, because a union payload is a non-null
-   record (`query-tree.md` §2.4), a relation's element is not a relation (§2.5), and a range's subtype is a
-   non-null scalar (§2.19). The nullable wrapper (kind 20 of
+   record (`query-tree.md` §2.4), a relation or array element's own nullability is that octet (§2.5, §2.13),
+   and a range's subtype is a non-null scalar (§2.19). A relation whose element is a relation stores each
+   element as a nested relation value (§4.5 rule 3). The nullable wrapper (kind 20 of
    `query-tree.md` §12.3) therefore has no tag of its own.
 2. **Structural.** A descriptor never names a catalog object. A column declared with a named type (`ddl.md`
    §2.8) stores the structure the name denotes, and the name is kept beside it in `sys.columns.type_oid`.
@@ -490,7 +491,7 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 | `text` | variable | UTF-8. A writer MUST store valid UTF-8 and a reader MAY verify it |
 | `json` | variable | its canonical form (`query-tree.md` §3.5), UTF-8 |
 | `bytes` | variable | raw |
-| `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian) |
+| `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian); `i32` min and max are `-infinity` and `infinity`, as `i64` min and max are for every timestamp type below (`query-tree.md` §2.11 rule 9), so keys order them first and last with no special case |
 | `time` | 8 | `i64` microseconds since midnight |
 | `timestamp` | 8 | `i64` microseconds since 1970-01-01T00:00:00 civil time, with no zone |
 | `timestamptz` | 8 | `i64` microseconds since the Unix epoch, 1970-01-01T00:00:00Z |
@@ -531,7 +532,8 @@ A **relation value** (a column of type `relation`, at any depth):
 | 1 | 3 | reserved |
 | 4 | 4 | `count` (u32) |
 | 8 | 4 × count | end offset of each element (u32), relative to the first element |
-| … | … | the elements, each the encoding of the element type: a **record** (§4.2) for a record element, a union value (below) for a union element, the §4.4 encoding for a scalar element. When the element type is nullable, each element is preceded by one byte, 0 = null or 1 = value, and a null element has nothing after that byte |
+| … | … | the elements, each the encoding of the element type: a **record** (§4.2) for a record element, a union value (below) for a union element, a relation value for a relation or array element, the §4.4
+encoding for a scalar element. When the element type is nullable, each element is preceded by one byte, 0 = null or 1 = value, and a null element has nothing after that byte |
 
 1. A `list` relation keeps its elements in order. A `bag` relation stores them in insertion order and promises no
    order.

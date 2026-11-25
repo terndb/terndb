@@ -50,7 +50,7 @@ rule. Text marked *Informative* has no force.
 | `float32`, `float64` | IEEE 754 binary32/binary64, including ±0, ±∞ and NaN | Measurements, scores, vectors' components. |
 | `text` | any sequence of Unicode scalar values, encoded UTF-8; NUL is allowed | Strings. Length-prefixed everywhere, so NUL needs no exclusion. |
 | `bytes` | any octet sequence | Opaque data. |
-| `date` | a proleptic Gregorian calendar day, years −4713 … 294276 | Calendar dates. |
+| `date` | a proleptic Gregorian calendar day, years −4713 … 294276, and `-infinity`, `infinity` (§2.11 rule 9) | Calendar dates. |
 | `time` | a time of day with microsecond precision, `00:00:00` … `23:59:59.999999` | Wall-clock time without a date. |
 | `timestamp` (alias `datetime`) | a civil date and time with microsecond precision and **no** zone | A local reading ("the meeting is at 09:00"); SQL's `TIMESTAMP WITHOUT TIME ZONE`. |
 | `timestamptz` | an instant: microseconds since 1970-01-01T00:00:00Z | A point on the global timeline; SQL's `TIMESTAMP WITH TIME ZONE`. |
@@ -105,13 +105,15 @@ rule. Text marked *Informative* has no force.
 
 1. A relation type is `bag<E>` (a multiset: no order, duplicates counted) or `list<E>` (a sequence:
    order is part of the value).
-2. The element type `E` MUST be a record type, a union whose payloads are records, or a scalar
-   (§2.1), and MAY be nullable (§2.2); it MUST NOT itself be a relation type (`Q3014`). A null element
+2. The element type `E` MUST be a record type, a union whose payloads are records, a scalar
+   (§2.1, §2.7), an array, or itself a relation type — so ISO's multiset of multisets is
+   `bag<bag<T>>` — and MAY be nullable (§2.2); anything else is `Q3014`. A null element
    is one element whose value is null: it counts in the relation's length, and the wire marks it in the
    element column's validity (`wire-protocol.md` §6.2). Relation types may nest to any depth through
    record fields: `bag<{id: int64, posts: list<{id: int64}>}>` is legal.
-   A relation whose element is a scalar, such as `list<int64>`, is a **scalar relation**: under its
-   binder it exposes one column, `value`, of the element type, and `Row(binder)` is that value.
+   A relation whose element is a scalar, such as `list<int64>`, an array or a relation, is a **scalar
+   relation**: under its binder it exposes one column, `value`, of the element type, and `Row(binder)`
+   is that value; so `Unnest` of a `bag<bag<T>>` yields rows whose `value` is a `bag<T>`.
 3. Relation-valued columns are values like any other: they can be stored in a table column, passed as
    parameters, compared (§3), hashed, grouped on and indexed.
 4. A relation value is never null unless its type is `bag<E>?`/`list<E>?`; the absence of rows is the
@@ -292,7 +294,27 @@ and edge behaviour; the encodings are fixed by §12.6 (parameters and literals),
    `localtimestamp(p, zone) → timestamp(p)`, all stable within a statement and computed from
    `statement_timestamp()`; the SQL front end supplies the zone from its session (`sql.md` §5.10).
 8. **Nulls and edges.** Strict. A result outside the type's range is `R0001`. A zone that is not one is `R0006`.
-9. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<datetime type>` (`DATE`, `TIME`, `TIMESTAMP`, each `WITH` and
+9. **Infinity.** `date`, `timestamp` and `timestamptz` (at every precision) also hold `-infinity` and
+   `infinity`, PostgreSQL's special values, held as the least and greatest values of their integer: `date`'s
+   `int32` −2³¹ and 2³¹ − 1, the timestamps' `int64` −2⁶³ and 2⁶³ − 1. No finite value uses those two
+   integers, so the finite range of `timestamptz` ends at `+294247-01-10T04:00:54.775806Z`. The encodings are
+   unchanged (§12.6, `on-disk-format.md` §4.4 and §4.6, `wire-protocol.md` §6.3): every encoding of these types
+   is its integer, so the infinities sort below and above every finite value in `cmp`, the orderings, keys and
+   `memcmp` alike, and `same(infinity, infinity)` is true. A decoder MUST read those integers as the
+   infinities, never as dates.
+   - **Text.** `infinity` and `-infinity` print so; `+infinity` and every case are parsed (`sql.md`
+     `DATE 'infinity'`).
+   - **Arithmetic** (PostgreSQL's). An infinity plus or minus any interval or day count is itself;
+     a finite result that would reach either reserved integer is `R0001`. A difference with an infinite
+     operand (`sub(date, date)`, `sub(timestamp, timestamp)`, `sub(timestamptz, timestamptz)`, `age`) is
+     `R0001` (SQLSTATE 22008), since no interval is infinite; so is `infinity − infinity`.
+   - **Casts.** `date ↔ timestamp`, the zone functions and precision changes keep an infinity; an infinite
+     `timestamp` or `timestamptz` cast to `time` or `timetz`, or an infinity into a type that has none, is
+     `R0006`.
+   - **Functions.** `extract` of `year`, `isoyear`, `decade`, `century`, `millennium`, `epoch` and `julian` is
+     the `numeric` `Infinity` or `-Infinity`; of any other field, null. `date_trunc` and `date_bin` keep an
+     infinity; `isfinite` is false. A window `range` offset (§6.8) moves an infinite key nowhere.
+10. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<datetime type>` (`DATE`, `TIME`, `TIMESTAMP`, each `WITH` and
    `WITHOUT TIME ZONE`, with `<time precision>` and `<timestamp precision>`; features F051, F411, F555);
    PostgreSQL 17 §8.5.
 
@@ -361,16 +383,17 @@ and edge behaviour; the encodings are fixed by §12.6 (parameters and literals),
    `x = ANY (a)` and `x op ALL (a)` read an array as the relation `Unnest` gives (`sql.md` §5.8).
 7. **Encoding.** As a relation of `T` (DISK §4.5, WIRE §6.2 relation node); the key form is in DISK §4.6.
 8. **Nulls and edges.** A null array and an empty array differ: `cardinality(null)` is null, of `{}` 0.
-   PostgreSQL's multi-dimensional arrays are arrays of arrays here, and their non-1 lower bounds are refused by
-   the compatibility layer (`R0006`); SQL's `T[m]` does not bound the array, as in PostgreSQL, while
+   PostgreSQL's multi-dimensional arrays (one value of fixed rank and rectangular shape) and its non-1 lower
+   bounds are **deferred** (decision Q95): an array of arrays holds a matrix meanwhile, and the compatibility
+   layer cannot yet carry a PostgreSQL array value of rank above 1 or a lower bound other than 1 (`R0006`); SQL's `T[m]` does not bound the array, as in PostgreSQL, while
    `T ARRAY[m]` does, as in ISO.
 9. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<array type>` (features S091, S092, S094–S098); PostgreSQL 17 §8.15.
 
 ### 2.14 Multisets
 
 1. SQL's `T MULTISET` is `bag<T?>` (§2.5): the existing relation type, so a multiset can be stored, nested,
-   unnested and grouped like any bag. Its element is any type §2.5 rule 2 allows; a multiset of multisets needs
-   the element rule relaxed (open; `bag<{value: bag<T>}>` holds one today).
+   unnested and grouped like any bag. Its element is any type §2.5 rule 2 allows, a multiset included:
+   `T MULTISET MULTISET` is `bag<bag<T?>?>` (decision Q94).
 2. **Operators.** `cardinality → int64`, `set(m)` (duplicates removed by `same`), `element(m)` (the one element;
    null for an empty multiset, `R0003` for more than one), `member_of(x, m)`, `submultiset_of(m₁, m₂)`,
    `is_a_set(m)`, `multiset_union`, `multiset_intersect` and `multiset_except`, each with `all` or `distinct`,
@@ -439,7 +462,7 @@ and edge behaviour; the encodings are fixed by §12.6 (parameters and literals),
 4. **Operators.** ISO/IEC 9075-14's `xmlparse(document | content, …)`, `xmlserialize`, `xmlelement`,
    `xmlattributes`, `xmlforest`, `xmlconcat`, `xmlagg`, `xmlcomment`, `xmlpi`, `xmltext`, `xmlexists`, `xmlquery`,
    `xmltable` and `is_document`, and PostgreSQL's `xpath`, `xpath_exists` and `xml_is_well_formed`. Path
-   expressions are XPath 1.0, as PostgreSQL's are, not ISO's XQuery.
+   expressions are XPath 1.0, as PostgreSQL's are; ISO's full XQuery is **deferred** (decision Q95).
 5. **Encoding.** Its text everywhere.
 6. *Required by:* ISO/IEC 9075-14:2023 (SQL/XML) `<XML type>` (features X010 onward); PostgreSQL 17 §8.13.
 
@@ -525,7 +548,8 @@ These are named in the catalog (`ddl.md` §2.8).
    (`with_field(x, name, value)`, SQL `SET x.a = v`), `treat(x, s)` (`R0006` when the most specific type is not
    `s` or below it), `is_of(x, [types], only)`, `specifictype(x) → text`. Comparison: none (`Q3018`) unless an
    ordering is defined; `CREATE ORDERING FOR t EQUALS ONLY BY STATE` gives `eq` as the same most specific type
-   with `eq` attributes. `same` is always structural.
+   with `eq` attributes. `same` is always structural. Methods, `REF` types and typed tables are deferred
+   (decision Q95).
 5. *Required by:* ISO/IEC 9075-2:2023 `<domain definition>` (feature F251), `<user-defined type
    definition>` (features S011 distinct types, S023 and S024 structured types), `<user-defined ordering
    definition>`; PostgreSQL 17 §8.7 (enums), §8.18 (domains).
@@ -540,7 +564,9 @@ These are named in the catalog (`ddl.md` §2.8).
    collations, case-insensitive (nondeterministic) ones among them (PostgreSQL 17 §24.2). TernDB provides:
    - collations `ucs_basic` (binary, the default), `unicode` (the Unicode Collation Algorithm with the DUCET and
      CLDR root order) and BCP 47 locale names with CLDR tailorings and `-u-` keywords (`de-DE`,
-     `und-u-ks-level2` for case-insensitive); an unknown name is `Q3021`;
+     `und-u-ks-level2` for case-insensitive); an unknown name is `Q3021`. TernDB implements the UCA and the
+     CLDR tailorings itself, in sysl, at the Unicode and CLDR versions the on-disk format pins; it uses no
+     host collation library (decision Q92);
    - an optional trailing `collation: text` argument on `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `same`, `like`,
      `position`, `min`, `max`, and an optional `collation` field on `SortKey`, on `Aggregate` and `Distinct`
      keys, on `SetOp` and on `Join` keys, appended in a minor version (§13.2) whose absence means binary;
@@ -624,7 +650,8 @@ null.
 3. Floats: −∞ < negative < −0 = +0 < positive < +∞ < NaN.
 4. `text`, `bytes` and `json` (canonical form): unsigned octet-lexicographic (for valid UTF-8 this is
    code point order); a proper prefix sorts first.
-5. `date`, `time`, `timestamp`, `timestamptz`: chronologically. `uuid`: as a 128-bit big-endian unsigned
+5. `date`, `time`, `timestamp`, `timestamptz`: chronologically, `-infinity` first and `infinity` last
+   (§2.11 rule 9). `uuid`: as a 128-bit big-endian unsigned
    number. `interval`: lexicographically on (`months`, `days`, `micros`).
 6. Records: lexicographic by field. Unions: by discriminant, then payload.
 7. `list<E>`: lexicographic by element; a proper prefix sorts first.
@@ -700,8 +727,10 @@ The table is made exact by these rules:
    zeros allowed, and exactly the six names `inf`, `-inf`, `nan`, `Infinity`, `-Infinity`, `NaN`. A
    finite text whose value rounds past the type's largest finite value is `R0006`, not an infinity.
 4. **Dates.** The parsable range is `-04713-01-01` through `+294276-12-31`. A `timestamp` or
-   `timestamptz` must also fit the `int64` of microseconds it is held in, so the latest `timestamptz` is
-   `+294247-01-10T04:00:54.775807Z`. A date or interval text is accepted only where it is exactly the
+   `timestamptz` must also fit the `int64` of microseconds it is held in, short of the two integers
+   reserved for the infinities, so the latest finite `timestamptz` is `+294247-01-10T04:00:54.775806Z`.
+   `date`, `timestamp` and `timestamptz` also print and parse `infinity` and `-infinity` (§2.11 rule 9;
+   `+infinity` and any case parsed). A date or interval text is accepted only where it is exactly the
    printed form of the value it reads as: no redundant sign or zero in the year, no zero component,
    no day past its month's end.
 5. **Offsets.** A `timestamptz` offset is `+` or `-`, then hours `00`–`23`, `:` and minutes `00`–`59`.
@@ -1238,8 +1267,8 @@ fixed offset written `+HH:MM` or `-HH:MM`; the database is the host's, so its ve
 text is `R0006`. `at_zone` reads the instant on the zone's wall clocks at the offset in force then. `from_zone`
 finds the instant the reading names there: a reading the zone shows twice (its clocks set back) is the **earlier**
 of the two instants, and a reading the zone skips (its clocks set forward) is read at the offset in force before
-the gap, so `02:30` in a skipped hour is `03:30` in the hour after. A value within two days of either end of the
-`int64` range is `R0001`.
+the gap, so `02:30` in a skipped hour is `03:30` in the hour after. A finite value within two days of either end of
+the `int64` range is `R0001`; an infinity converts to itself (§2.11 rule 9).
 
 ### 7.7 Match
 
@@ -1322,7 +1351,8 @@ How the functions evaluate, where the tables above leave it open:
 4. The calendar `add(t, interval)` adds the months first, keeping the day of the month but clamping
    it to the last day of the month reached (`2024-01-31` plus one month is `2024-02-29`), then the
    days, then the microseconds. A `date` is midnight of its day. A result beyond `int64`
-   microseconds is `R0001`.
+   microseconds, or on one of the two integers reserved for the infinities, is `R0001`; an infinite
+   operand gives itself (§2.11 rule 9).
 The core functions resolve before a catalog's own; a name no catalog has is `Q2007`. A function the
 catalog has that is not an aggregate, written as an `AggCall`, is `Q3002`.
 
@@ -1678,7 +1708,7 @@ A parameter value is encoded by its declared type, with no tags (the type is kno
 | `decimal(p ≤ 38, s)` | 16 octets, little-endian unscaled `int128` |
 | `float32`/`float64` | IEEE 754, little-endian |
 | `text`, `bytes`, `json` | `uvar` length, octets (`json`: its canonical form, §3.5) |
-| `date` | `int32` LE, days since 1970-01-01 |
+| `date` | `int32` LE, days since 1970-01-01; −2³¹ and 2³¹ − 1 are `-infinity` and `infinity` (§2.11 rule 9), as −2⁶³ and 2⁶³ − 1 are for the timestamps below |
 | `time`, `timestamp`, `timestamptz`, any precision | `int64` LE microseconds (since midnight; since 1970-01-01T00:00 civil; since the Unix epoch) |
 | `timetz` | `int64` LE microseconds since midnight, then `int32` LE offset in seconds east of UTC |
 | `interval` | `int32` months, `int32` days, `int64` micros, each LE |

@@ -307,10 +307,10 @@ and `ALTER TABLE IF EXISTS` are `Q8005`.
 | SQL | Query-tree type |
 |---|---|
 | `bool`, `boolean` | `bool` |
-| `tinyint`, `int1` | `int8` (8 bits) |
+| `int8`, `tinyint`, `int1` | `int8` (8 bits: TernDB's name, **not** PostgreSQL's `bigint`; rule 2) |
 | `int2`, `int16`, `smallint` | `int16` |
 | `int4`, `int32`, `int`, `integer` | `int32` |
-| `int8`, `int64`, `bigint` | `int64` (`int8` is PostgreSQL's `bigint`: see rule 2) |
+| `int64`, `bigint` | `int64` |
 | `int128` | `int128` |
 | `uint8`, `uint16`, `uint32`, `uint64` | the unsigned integers |
 | `decimal(p)`, `decimal(p, s)`, `numeric(…)`, `dec(…)` | `decimal(p, s)`, `s` 0 when absent; outside `1 ≤ p ≤ 1000`, `0 ≤ s ≤ p` is `Q8006` |
@@ -348,14 +348,16 @@ and `ALTER TABLE IF EXISTS` are `Q8005`.
    `UCS` (every string is UTF-8, [QT] §2.8); another name is `Q8006`. A `COLLATE` clause after a column's type is
    its collation ([DDL] §2.3 rule 4). `time` without a precision is precision 6, as PostgreSQL makes it; ISO's
    default for `TIME` is 0.
-2. **`int8` is PostgreSQL's `bigint`, and TernDB's 8-bit integer is spelt `tinyint` or `int1`** — the
-   recommended resolution of the one name the two dialects share, **pending the user's decision**
-   (`docs/decisions.md` Q81). The tree keeps its bit-width names (`int8` is 8 bits there), which no SQL text
-   reaches. `double` alone is `double precision` (Q76), so `double` followed by `precision` is one type name:
-   `x::double precision` is a cast, never a cast to `double` with an output name `precision`.
-   *Rationale: the user chose on 2026-11-25 to accept the PostgreSQL aliases (Q78). DuckDB, whose naming
-   TernDB follows, makes the same choice: `INT8` is `BIGINT` and `TINYINT`/`INT1` the 8-bit integer. A
-   PostgreSQL client's `int8` therefore means what its author meant.*
+2. **`int8` is TernDB's 8-bit integer, not PostgreSQL's `bigint`** (the user's decision, Q81); `tinyint` and
+   `int1` are further names of it. PostgreSQL's other numbered names (`int2`, `int4`, `float4`, `float8`) are
+   accepted, since they mean the same in both dialects; `int8range` keeps PostgreSQL's meaning, `range<int64>`,
+   because it is a name of its own. `double` alone is `double precision` (Q76), so `double` followed by
+   `precision` is one type name: `x::double precision` is a cast, never a cast to `double` with an output name
+   `precision`.
+   *Rationale: the dialect is TernDB's own, and its type names are the tree's. PostgreSQL's `int8` is a 64-bit
+   integer and TernDB's an 8-bit one; TernDB keeps its own, as the tree's bit-width names (`int8` … `int128`)
+   read, and a PostgreSQL schema that writes `int8` is translated by the compatibility layer, which knows the
+   type by its OID, not its name.*
 3. `timestamp` is the standard's zoneless type and `timestamptz` the instant (Q79); `datetime` remains a name of
    the zoneless type.
 4. Unions other than enums and relation types other than multisets still have no SQL spelling.

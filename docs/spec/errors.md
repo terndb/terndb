@@ -69,7 +69,7 @@ during the handshake.
 | `Q3011` | `decimal_out_of_range` | Decimal precision or scale out of range, or a decimal literal with more than `p` digits (`query-tree.md` §7.3). |
 | `Q3012` | `cast_not_permitted` | Cast not permitted. |
 | `Q3013` | `misplaced_aggregate` | Aggregate or window function outside `Aggregate`/`Window`. |
-| `Q3014` | `invalid_member_type` | Union payload not a record, or relation element not a record, union or scalar. |
+| `Q3014` | `invalid_member_type` | Union payload not a record, or relation element not a record, union, scalar, array or relation (`query-tree.md` §2.5 rule 2); a range subtype that is not an orderable scalar (§2.19). |
 | `Q3015` | `duplicate_member_name` | Duplicate or empty field or tag name in a type (`query-tree.md` §2.3, §2.4). |
 | `Q3016` | `union_too_wide` | A union with no variants or more than 65,536 (`query-tree.md` §2.4: `1 ≤ k ≤ 65,536`). |
 | `Q3017` | `invalid_literal` | A `Literal` whose type is not a non-null scalar (`query-tree.md` §7.3). |

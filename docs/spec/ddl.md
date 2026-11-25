@@ -286,7 +286,8 @@ Every constraint has a name unique in the table's namespace, and is one of:
     column declared with the supertype or one of its supertypes: a metadata-only retype (§8.5 rule 1) of each,
     in the `CreateType`'s transaction. `AlterType` may append an attribute (`add_attribute`, nullable or with a
     constant fill), appended to every payload, and may set the type's ordering (`set_ordering`; `CREATE ORDERING
-    FOR t EQUALS ONLY BY STATE`). Methods, reference types (`REF`) and typed tables are not defined.
+    FOR t EQUALS ONLY BY STATE`). Methods, reference types (`REF`) and typed tables are **deferred**, not
+    refused for good (`docs/decisions.md` Q95); until they land their SQL is `Q8005`.
 
 ### 2.9 Views
 

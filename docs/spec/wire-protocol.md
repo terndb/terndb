@@ -750,7 +750,9 @@ child `j` has as many slots as there are non-null slots with discriminant `j`.
    encoded exactly as [QT] §12.6 encodes that scalar (`bool` one octet `00`/`01`; integers, `decimal`'s unscaled
    `int128`, floats, `date`, the 64-bit time types, `interval`'s three fields, `timetz`'s two, `interval_ym`,
    `interval_dt`, `money` and `decfloat`'s BID bits little-endian; `uuid` in RFC 9562 order; `inet`, `cidr` and
-   the MAC types as their octets). A varbin slot of a type of [QT] §2.7 holds the bytes [QT] §12.6 gives it after
+   the MAC types as their octets). A `date` slot holding −2³¹ or 2³¹ − 1, and a `timestamp` or `timestamptz` slot
+   holding −2⁶³ or 2⁶³ − 1, is `-infinity` or `infinity` ([QT] §2.11 rule 9); a client MUST NOT convert it to a
+   calendar date. A varbin slot of a type of [QT] §2.7 holds the bytes [QT] §12.6 gives it after
    its `uvar` length: `char(n)` padded, `numeric` and `jsonb` their text forms, `bit` its count and bits.
 3. **offsets** (varbin): `(n + 1) × 4` octets of `u32`, with `offsets[0] = 0`, non-decreasing; slot `i` is
    `data[offsets[i] .. offsets[i+1])`. **data** is `offsets[n]` octets. `text` data MUST be valid UTF-8 per slot.

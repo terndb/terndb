@@ -2,7 +2,7 @@
 
 The specification is `query-tree.md` §2.7–§2.21 with the sections they cite (`sql.md` §2.5, §4, §5.10;
 `on-disk-format.md` §4.3–§4.6; `wire-protocol.md` §6.2–§6.3; `ddl.md` §2.3, §2.8, §3.3, §5.3, §8.5; `errors.md`
-`Q3018`–`Q3021`, `Q4006`, `Q8014`, `R0009`–`R0016`), decided in `docs/decisions.md` Q78–Q90. This file cuts it into
+`Q3018`–`Q3021`, `Q4006`, `Q8014`, `R0009`–`R0016`), decided in `docs/decisions.md` Q78–Q95. This file cuts it into
 items. Each item is one agent's deliverable: it implements its part of the spec exactly, with a test for every rule
 it implements and every edge case its section names, and it ends READY for the merge train. An item that finds the
 spec wrong or silent changes the spec in the same commit, or stops and asks.
@@ -32,6 +32,16 @@ spec wrong or silent changes the spec in the same commit, or stops and asks.
 ## The items
 
 ### Foundation (sequential)
+
+**A0. Infinite dates and timestamps (Q93).** `infinity`/`-infinity` for `date`, `timestamp` and `timestamptz`
+(`query-tree.md` §2.11 rule 9): the reserved integers read and printed as the infinities, parsing, ordering (free:
+the encodings are unchanged), calendar `add`/`sub` keeping an infinity, `R0001` for a difference with an infinite
+operand and for a finite result landing on a reserved integer, the casts and zone functions, `extract` and
+window `range` offsets. Files: `text_form.sysl`, `exec_functions.sysl`, `exec_zone.sysl`, `exec_window.sysl`.
+Tests: `datetime_infinity_tests.sysl` (each type and sign; the last finite value and one past it; infinity ±
+every interval kind; `infinity − infinity`, `infinity − finite`, `date − date`; every `extract` field; casts to
+`time`; a key range spanning an infinity; sort with nulls first and last). Depends: none. Parallel with A1 and the
+libraries. Contended: none (the row, key and wire encodings do not change).
 
 **A1. `timestamp` and `timestamptz` renamed (Q79).** Kind 12 is `timestamp` (alias `datetime`), kind 13
 `timestamptz`, in the type model, the text tree and `EXPLAIN`, the catalog relations (`jobs.started`,
@@ -76,11 +86,17 @@ arithmetic with round-half-even, `quantize`, `normalize`, `totalorder`, to-scien
 `decfloat_tests.sysl`, including the General Decimal Arithmetic test vectors (`dectest`) for the operations
 implemented.
 
-**L3. Unicode Collation Algorithm** (`collation.sysl`, plus a generated data module from the DUCET `allkeys.txt` and
-the CLDR root): sort keys at strengths 1–4, comparison, BCP 47 tag parsing with `ks`, CLDR tailorings for the
-locales the item lists. Tests: `collation_tests.sysl`, including the UCA conformance test files
-(`CollationTest_*.txt`). Its size may need a split (DUCET first, tailorings second); the agent says so before
-starting.
+**L3. Unicode Collation Algorithm, in sysl** (decision Q92: no ICU, no FFI). `collation.sysl`, plus data modules
+generated from the DUCET `allkeys.txt` and from the CLDR root collation and locale tailorings (the CLDR `collation/`
+rule files, parsed at generation time into the tailored element tables): sort keys at strengths 1–4 with the
+`ks`, `ka` (alternate shifted), `kc`, `kf` and `kn` keywords, comparison, BCP 47 tag parsing and locale fallback.
+The Unicode and CLDR versions are pinned by the on-disk format (`on-disk-format.md` §4.6 rule 4), so a version
+change is a format change with an index rebuild. It is cut into three items, in order: **L3a** the DUCET root
+with conformance tests (`CollationTest_NON_IGNORABLE.txt`, `CollationTest_SHIFTED.txt`); **L3b** the CLDR root
+order and the tailoring engine (CLDR rule syntax: resets, `<`, `<<`, `<<<`, `=`, expansions, contractions),
+tested against CLDR's tailoring examples; **L3c** the generated tailorings for every CLDR locale and the BCP 47
+`-u-` keywords, tested per locale against CLDR's published sort examples. Tests: `collation_tests.sysl`,
+`collation_tailoring_tests.sysl`, `collation_locale_tests.sysl`.
 
 **L4. Unicode normalization** (`unicode_norm.sysl`): NFC, NFD, NFKC, NFKD and the quick checks, from
 `UnicodeData.txt`/`DerivedNormalizationProps.txt`. Tests: `NormalizationTest.txt`.
@@ -123,7 +139,7 @@ the shared-files note above.
 | F9 | `bit(n)`, `varbit(n)`, `B'…'` and their operators | — | `bit_types_tests.sysl` | A3 |
 | F10 | `array<T, m>`: values, codecs, wire relation node, `eq`/`cmp`/key, text form, `array_of`, `element`, `try_element`, `slice`, `cardinality`, `concat`, `R0011`/`R0012` | — | `array_type_tests.sysl` | A3 |
 | F11 | Array functions and SQL: `ARRAY[…]`, `ARRAY(query)`, `T[]`, `T ARRAY[m]`, `UNNEST(a) [WITH ORDINALITY]`, `= ANY`/`ALL`, `array_agg` and the rest of §2.13 rule 6 | `plan_unnest.sysl` (**contended: `predpush`**), `exec_agg.sysl` | `array_sql_tests.sysl` | F10 |
-| F12 | Multisets: `T MULTISET`, `MULTISET[…]`, the §2.14 functions and aggregates, `multiset_eq` | `plan_unnest.sysl` (**contended: `predpush`**), `exec_agg.sysl`, `exec_setop.sysl` | `multiset_tests.sysl` | A2 |
+| F12 | Multisets: relation elements that are relations or arrays (§2.5 rule 2, Q94) through validation, rows, the wire and `Unnest`; `T MULTISET`, `MULTISET[…]`, the §2.14 functions and aggregates, `multiset_eq` | `plan_unnest.sysl` (**contended: `predpush`**), `exec_agg.sysl`, `exec_setop.sysl` | `multiset_tests.sysl` | A2 |
 | F13 | Rows: `ROW(…)` types and constructors, composite text form, record key components, `IS [NOT] DISTINCT FROM` | `store_index.sysl` (**contended: `secidx`**) | `row_type_tests.sysl` | A2 |
 | F14 | `jsonb`: binary row form, text form, order and key, casts, PostgreSQL's operators and functions of §2.16 rule 5 | `json.sysl` | `jsonb_tests.sysl` | F5 |
 | F15 | ISO SQL/JSON functions over `json` and `jsonb` (`json_value`, `json_query`, `json_exists`, `json_table`, the constructors and aggregates, `IS JSON`) | `json.sysl`, `exec_agg.sysl` | `sql_json_tests.sysl` | F14, L8 |
@@ -143,7 +159,7 @@ the shared-files note above.
 | N4 | Distinct types: nominal identity, casts both ways, comparison only within the type, results sent as the source | `qtree_check.sysl` | `distinct_type_tests.sysl` | N1 |
 | N5 | Structured types: hierarchy unions, constructors, observers, mutators, `treat`, `is_of`, `specifictype`, subtype coercion, appending a subtype or attribute as a metadata-only retype, `EQUALS ONLY BY STATE` | `catalog_alter.sysl`, `qtree_check.sysl` | `structured_type_tests.sysl` | N1 |
 | N6 | Named range types (`CREATE TYPE … AS RANGE`) and their multirange names | `catalog_objects.sysl` | `range_ddl_tests.sysl` | N1, F19 |
-| C1 | Collations in the tree: the optional `collation` arguments and fields (tree 1.1), `Q3021`, deterministic comparison and sort under a collation | `qtree_check.sysl`, `exec_ops.sysl` | `collation_tree_tests.sysl` | A2, F1, L3 |
+| C1 | Collations in the tree: the optional `collation` arguments and fields (tree 1.1), `Q3021`, deterministic comparison and sort under a collation (`unicode` first; locale names as L3c lands) | `qtree_check.sysl`, `exec_ops.sysl` | `collation_tree_tests.sysl` | A2, F1, L3a |
 | C2 | Collated keys and nondeterministic collations: sort-key index components (`key_spec` bit 2), unique indexes under a collation, `same`/hash by sort key, index range scans under a collation | `store_index.sysl`, `exec_access.sysl` (**contended: `secidx`**), `exec_join.sysl` (**contended: `hashjoin`**) | `collation_index_tests.sysl` | C1, N1 |
 | C3 | SQL collation derivation (`sql.md` §4.2, `Q8014`), `COLLATE` clauses, column collations through the resolver | `sql_parser.sysl`, `sql_translate.sysl` | `sql_collation_tests.sysl` | C1, N1 |
 
@@ -152,17 +168,17 @@ the shared-files note above.
 | Item | Scope | Depends |
 |---|---|---|
 | Z1 | Substrait type mapping (`query-tree.md` §14.1–§14.2) | F1, F2, F3, F4 |
-| Z2 | The PostgreSQL integer and float aliases and the `int8` reading, once the user decides Q81 | A2 |
+| Z2 | The PostgreSQL aliases `int2`, `int4`, `float4`, `float8` and the extra 8-bit names `tinyint`, `int1`; `int8` stays 8 bits (Q81), with a test that it does | A2 |
 | Z3 | Benchmark rows for the new types (`CLAUDE.md` § Every release ships a benchmark): string and numeric kernels, `jsonb` access, range containment, collated sort, against PostgreSQL and DuckDB where they have the type | the items measured |
 
 ## Order and parallelism
 
-1. **Now:** A1, then A2; in parallel with them, every library L1–L8 (no contended files, no shared dispatch
+1. **Now:** A0; A1, then A2; in parallel with them, every library L1–L8 (no contended files, no shared dispatch
    points).
 2. **After A2:** A3, N1, F3, F8, F12, F13, F16, F18 can start; F3, F8, F16 and F18 are value items and wait for
    `rowscan`, `hashjoin` and `secidx`; F12 also waits for `predpush`, F13 for `secidx`.
 3. **After A3:** F1, F2, F9, F10, N3.
 4. **Chains:** L1 → F5 → F6, F7, F14 → F15; F3 → F4; F10 → F11; F18 → F19 → N6; L6 → F16 → F17 (with L7);
-   N1 → N2, N4, N5; L3 + F1 → C1 → C2, C3; F1 + L4 + L5 → F20.
+   N1 → N2, N4, N5; L3a → L3b → L3c; L3a + F1 → C1 → C2, C3; F1 + L4 + L5 → F20. A0 runs beside A1; F3 builds on both.
 5. **Contended items** (F11, F12, F13, F19, C2, and every value item through `exec_scan.sysl`, `key_encoding.sysl`
    and `value_hash.sysl`) start only once the branch they name has landed on `dev`.
