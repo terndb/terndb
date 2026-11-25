@@ -769,7 +769,9 @@ each segment are its header, so records start at offset 4,096 and the first LSN 
 
 1. Records are 8-byte aligned, padded at the end with zeros that are counted in `len`.
 2. A record MUST NOT span WAL segments. A record that does not fit in what remains of a segment is preceded by a
-   PAD record that fills the segment.
+   PAD record that fills the segment. Where fewer than 32 bytes remain, too few for a PAD's header, they are left
+   zeros and are not a record: the next record is the next segment's first, at offset 4,096, and a reader skips
+   them the same way. A record is therefore at most 2²⁶ − 4,096 bytes.
 3. The `lsn` field lets a reader reject a stale record left in a recycled segment, whose position does not match
    its stored LSN.
 
@@ -778,7 +780,10 @@ each segment are its header, so records start at offset 4,096 and the first LSN 
 1. **Every redo record modifies at most one page**, and names it in its payload's first 8 bytes (`pid`).
 2. A change that touches several pages (a split, an insert plus its allocation, an overflow chain) is a
    **mini-transaction**: its records are reserved contiguously in the WAL buffer, every record but the last has
-   `MTR_CONT`, and recovery applies a mini-transaction only when its last record is present and valid.
+   `MTR_CONT`, and recovery applies a mini-transaction only when its last record is present and valid. Its
+   records lie in one segment with no other record, PAD included, between them: one that does not fit in what
+   remains of a segment starts the next, after a PAD (§6.2 rule 2), so a mini-transaction is at most 2²⁶ − 4,096
+   bytes. A PAD inside a mini-transaction is corruption (`data_corrupted`).
 3. Latches held for a mini-transaction are released only after its records are in the WAL buffer.
 
 *Rationale:* the one-page rule is what makes redo partitionable by page (§6.9). Grouping is what makes a structure
@@ -790,7 +795,7 @@ Page records (payload starts with `pid` u64):
 
 | kind | name | payload after `pid` |
 |-----:|------|---------------------|
-| 1  | `PAGE_INIT` | `type` u8, `flags` u8, `owner` u64, `format` u16, `level` u16, plus the fences for a node |
+| 1  | `PAGE_INIT` | `type` u8, `flags` u8, `owner` u64, `format` u16, `level` u16, then the lower and the upper fence of a node, each `len` u16 and its bytes; both are empty (`len` 0) for a page that is not a node |
 | 2  | `FPI` | `codec` u8 (0 none, 1 LZ4), `len` u16, the image: the full page **before** the change that follows it |
 | 3  | `NODE_INSERT` | `slot` u16, `slot_flags` u16, `key_len` u16, `value_len` u16, key suffix, value |
 | 4  | `NODE_DELETE` | `slot` u16 |
@@ -863,6 +868,10 @@ Segment files are named `<timeline:08x>-<first lsn:016x>.twal` and are exactly 6
 | 48 | 8  | `prev_segment_crc`: the CRC of the previous segment's header (0 for the first) |
 | 56 | 4040 | reserved |
 
+`first_lsn` is the segment's own first LSN, k × 2²⁶, the one its name carries. v1 writes `wal_format` 1 and
+`rec_format` 1; a header whose CRC holds but whose `wal_format` or `key_version` this release does not read, or a
+record of a newer `rec_format`, is `format_unsupported`, not the end of the log.
+
 A segment MAY be recycled (renamed and rewritten) only once it is below every retention bound: the checkpoint's
 `redo_lsn`, the archiver, every replication slot and any running backup.
 
@@ -875,7 +884,8 @@ A segment MAY be recycled (renamed and rewritten) only once it is below every re
    `synchronous = off`, which is TernDB's asynchronous commit (`isolation.md` §6), it MAY be acknowledged before;
    the flush rule is otherwise unchanged, so a crash loses only a WAL suffix.
 3. **No flush rewrites a durable block.** A flush that ends in the middle of a 4 KiB block MUST first pad to the
-   block boundary with a PAD record, and the next flush starts in a fresh block. *Rationale:* a torn rewrite of a
+   block boundary with a PAD record, and the next flush starts in a fresh block. Where fewer than 32 bytes
+   remain before the boundary, the PAD runs through the following block as well. *Rationale:* a torn rewrite of a
    partly durable block would destroy commits already acknowledged, which Postgres and InnoDB risk by rewriting
    their last log page. Padding costs at most 4 KiB per sync, which a group amortizes.
 4. Several in-flight writes of one flush MAY complete in any order. `durable_lsn` advances only over a prefix whose
@@ -904,8 +914,12 @@ Recovery runs on open whenever CONTROL `state` is not 0 (clean). It has three ph
 Load its transaction table. Scan forward from `redo_lsn`, maintaining for each transaction its `last_undo` (from
 `UNDO_APPEND`) and its `undo_next` (from COMPENSATION records), removing a transaction at its COMMIT or ABORT, and
 raising `next_txn_id`, `next_oid` and `undo_high` over every value seen. **The end of the log** is the first
-position where any of these holds: the CRC fails; `lsn` ≠ the position; `len` is 0, not a multiple of 8, or runs
-past the segment; the segment file is missing; or its header's `db_uuid` or `timeline` is wrong. A trailing
+position where any of these holds: the CRC fails; `lsn` ≠ the position; `len` is less than 32 (0 included), not
+a multiple of 8, or runs past the segment; the segment file is missing or too short to hold the record; or its
+header fails its CRC, or its `magic`, `db_uuid`, `timeline`, `term` or `first_lsn` is wrong. These are a torn or
+unwritten tail, not corruption, except before a position the reader knows was durable (the end of the
+`CHECKPOINT_END` it starts from, or a restore's `min_recovery_lsn`): an end before that is `data_corrupted`. A
+record whose CRC and `lsn` hold but that does not parse as its kind is `data_corrupted` wherever it lies. A trailing
 mini-transaction whose last record lies past the end is discarded whole. Records beyond the end MUST NOT be
 applied, even if some of them would validate.
 
@@ -927,8 +941,13 @@ their `txn` throughout, so the database MAY open for new transactions as soon as
 in the background (as InnoDB does). A crash during undo leaves COMPENSATION records whose `undo_next` keeps undo
 from being repeated (ARIES's CLRs).
 
-After recovery the engine MUST write a PAD from the end of the log to the next block boundary before it appends,
-MUST delete or ignore every later segment, and MUST take a checkpoint before CONTROL's `state` reads 1 again.
+After recovery the engine MUST delete every later segment, and then MUST write a PAD from the end of the log to
+the end of its segment and make it durable before it appends, and MUST take a checkpoint before CONTROL's `state`
+reads 1 again. The end here is the start of a trailing mini-transaction that was discarded. *Rationale:* a block
+a crashed flush wrote can survive past one it lost, whole and at its own LSN; a PAD only to the next block
+boundary would leave it to be read as the log's once new records reach it, and one to the segment's end
+overwrites every such block. A later segment may hold such records too, which is why it is deleted rather than
+ignored. When the end's segment is itself missing or not this log's, it is deleted and made afresh instead.
 
 ### 6.10 Rollback at run time
 

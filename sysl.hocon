@@ -18,7 +18,8 @@
 // is `cli/`, a project of its own; and the interactive shell it runs (`docs/design/shell.md`); and
 // the block-device seam with its simulated device, which injects every disk fault of
 // `docs/spec/isolation.md` §7.3, and the page checksum checked on every read through it
-// (`docs/spec/on-disk-format.md` §3.1, §9 D11, D14, D15).
+// (`docs/spec/on-disk-format.md` §3.1, §9 D11, D14, D15); and the write-ahead log's records, segments,
+// writer with group commit, and reader (`docs/spec/on-disk-format.md` §6, `docs/design/wal.md`).
 
 package {
   name    = "terndb"
@@ -33,7 +34,8 @@ exclude = ["docs"]
 // A result's size is not known until it is built or read, so buffers grow on the heap. The one file
 // read is the host's time zone database, which `at_zone` and `from_zone` look a zone up in
 // (`exec_zone.sysl`). Sockets are opened only by the server (`server.sysl`). A page file is opened
-// only by the block device over the host's files (`block_device.sysl`).
+// only by the block device over the host's files (`block_device.sysl`), and a WAL directory is listed,
+// renamed in and synced only by `wal_segment.sysl`.
 requires {
   heap  = true
   posix = true
