@@ -1,0 +1,1504 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.container.{Map, map}
+import sysl.encoding.{get_u64_le, put_u64_le}
+import sysl.fs.{IoError, NotOpen, make_dir_all, make_temp_dir, remove_dir_all}
+import sysl.path.join
+import sysl.slices.fill
+
+// The buffer pool (`buffer_pool.sysl`, `docs/design/buffer.md`), each behaviour and edge case by
+// name: fixing and latching, the clock, dirty tracking with page LSNs, the WAL rule on every write
+// (`on-disk-format.md` §6.5 rule 1; every device here checks D5 on each write it takes), read-through
+// and write-back, segment selection (§2.1), every device fault reaching the caller as the error the
+// spec names (§9 D11, D14, D15), and crashes in the middle of a flush.
+
+// -- the rig ---------------------------------------------------------------------------------------
+
+/** A log whose durable end a test sets. `refuse` makes a flush fail; `lie` makes one succeed without
+ * moving the durable end. `flushes` is every LSN a flush was asked for.
+ */
+struct TestWal
+    durable: u64
+    refuse: bool
+    lie: bool
+    flushes: Buf[u64]
+
+impl WalHorizon for TestWal
+    durable_lsn(self) -> u64 = self.durable
+
+    flush_to(*self, lsn: u64) -> Result[unit, CodecError]
+        self.flushes.push(lsn)
+        if self.refuse then return Err(refusal("D4004", s"the log could not be synced to $lsn", [Detail("errno", "5"), Detail("file", "wal")]))
+        if !self.lie && lsn > self.durable then self.durable = lsn
+        Ok(())
+
+private test_wal(durable: u64) -> &TestWal = TestWal(durable, false, false, buf[u64]())
+
+/** A simulated device that holds every write to the WAL rule (§9 D5): no page reaches it with a
+ * `page_lsn` above the log's durable end.
+ */
+struct WalCheckedDisk
+    disk: &SimDisk
+    wal: &TestWal
+
+impl BlockDevice for WalCheckedDisk
+    name(self) -> string = self.disk.name()
+
+    page_count(*self) -> Result[u64, IoError] = self.disk.page_count()
+
+    read_page(*self, n: u64, into: []u8) -> Result[unit, IoError] = self.disk.read_page(n, into)
+
+    write_page(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+        val lsn = get_u64_le(bytes[8..<16]).unwrap()
+        assert(lsn <= self.wal.durable, s"page $n reached ${self.disk.name()} at LSN $lsn, the log durable only to ${self.wal.durable}")
+        self.disk.write_page(n, bytes)
+
+    sync(*self) -> Result[unit, IoError] = self.disk.sync()
+
+/** Simulated segments, one device each, made on first use and kept across pools, so a second pool
+ * over the same source is a reopen. `opens` lists every segment key opened, in order; `refuse` makes
+ * an open fail.
+ */
+struct SimSegments
+    seed: u64
+    rates: FaultRates
+    wal: &TestWal
+    disks: Map[u64, &SimDisk]
+    opens: Buf[u64]
+    refuse: bool
+
+    /** The device of segment `key`. */
+    disk(*self, key: u64) -> &SimDisk
+        self.disks.get(key) match
+            Some(d) -> return d
+            None -> ()
+
+        val d = sim_disk_with(self.seed * 1000 + segment_space(key) * 100 + segment_number(key), self.rates)
+        self.disks.put(key, d)
+        d
+
+    /** The device page `pid` lives on. */
+    disk_of(*self, pid: u64) -> &SimDisk = self.disk(segment_of(pid).unwrap())
+end SimSegments
+
+impl SegmentSource for SimSegments
+    open_segment(*self, space: u64, number: u64) -> Result[&BlockDevice, CodecError]
+        val key = (space << 60) | number
+        self.opens.push(key)
+        if self.refuse then return Err(refusal("D4004", s"segment $key cannot be opened", [Detail("errno", "2"), Detail("file", s"seg-$key")]))
+        val dev: &BlockDevice = WalCheckedDisk(self.disk(key), self.wal)
+        Ok(dev)
+
+/** A pool, its segments and its log. */
+struct BpRig
+    pool: &BufferPool
+    src: &SimSegments
+    wal: &TestWal
+
+private bp_rig(capacity: usize) -> BpRig = bp_rig_seeded(capacity, 1)
+
+/** A rig whose devices are seeded from `seed`. */
+private bp_rig_seeded(capacity: usize, seed: u64) -> BpRig = bp_rig_with(capacity, seed, no_disk_faults(), 1000)
+
+/** A rig whose devices are seeded from `seed` and draw faults at `rates`, its log durable to
+ * `durable`.
+ */
+bp_rig_with(capacity: usize, seed: u64, rates: FaultRates, durable: u64) -> BpRig
+    val wal = test_wal(durable)
+    val src: &SimSegments = SimSegments(seed, rates, wal, map(), buf[u64](), false)
+    val s: &SegmentSource = src
+    val w: &WalHorizon = wal
+    BpRig(buffer_pool(capacity, s, w), src, wal)
+
+/** A second pool over the rig's segments and log: what a new process opening the database finds. */
+bp_reopen(r: BpRig, capacity: usize) -> BpRig
+    val s: &SegmentSource = r.src
+    val w: &WalHorizon = r.wal
+    BpRig(buffer_pool(capacity, s, w), r.src, r.wal)
+
+/** Page `pid` with version `stamp` at body offset 32 and `page_lsn` 0. */
+private bp_page(pid: u64, stamp: u64) -> Buf[u8]
+    var p = sd_page(pid, u8(stamp % 251))
+    put_u64_le(p.view_mut()[32..<40], stamp)
+    p
+
+/** Writes page `pid` at version `stamp` straight to its device, synced. */
+private bp_seed(r: BpRig, pid: u64, stamp: u64)
+    val d = r.src.disk_of(pid)
+    var p = bp_page(pid, stamp)
+    seal_page(p.view_mut())
+    assert_eq(d.write_page(pid_slot(pid).unwrap(), p.view()), Ok(()))
+    assert_eq(d.sync(), Ok(()))
+
+/** The version a page holds. */
+bp_stamp_of(page: []const u8) -> u64 = get_u64_le(page[32..<40]).unwrap()
+
+/** What fixing `pid` shared gives: "stamp N", or the error's code; the fix is handed back. */
+private bp_read(r: BpRig, pid: u64) -> string
+    r.pool.fix(pid, LatchShared) match
+        Ok(h) ->
+            val s = bp_stamp_of(r.pool.page(h))
+            r.pool.unfix(h)
+            s"stamp $s"
+        Err(e) -> e.code
+
+/** The error fixing `pid` gives; stops the test if it succeeds. */
+private bp_error(r: BpRig, pid: u64) -> CodecError
+    r.pool.fix(pid, LatchShared) match
+        Ok(_) -> panic(s"page $pid was fixed")
+        Err(e) -> e
+
+/** Fixes `pid` exclusively, sets its version to `stamp`, and hands it back as changed at `lsn`. */
+private bp_modify(r: BpRig, pid: u64, stamp: u64, lsn: u64)
+    val h = r.pool.fix(pid, LatchExclusive).unwrap()
+    bp_stamp(r.pool.page_mut(h), stamp)
+    r.pool.unfix_dirty(h, lsn)
+
+/** Creates `pid` as a new page at version `stamp`, changed at `lsn`. */
+private bp_create(r: BpRig, pid: u64, stamp: u64, lsn: u64)
+    val h = r.pool.fix_new(pid).unwrap()
+    bp_stamp(r.pool.page_mut(h), stamp)
+    r.pool.unfix_dirty(h, lsn)
+
+/** Sets a page's version to `stamp` and its body past the stamp to `stamp`'s fill, as `bp_page`
+ * makes it, so two versions differ in every sector and a torn mix of them fails its checksum.
+ */
+bp_stamp(page: []u8, stamp: u64)
+    put_u64_le(page[32..<40], stamp)
+    fill(page[40..<DbPageSize], u8(stamp % 251))
+
+private bp_code(r: Result[unit, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** What page `pid` reads as straight off the media of its device: "stamp N", or "D1001" when it
+ * fails its checks — exactly what a reopened pool must give.
+ */
+private bp_media(r: BpRig, pid: u64) -> string
+    val p = r.src.disk_of(pid).durable_page(pid_slot(pid).unwrap())
+
+    check_page(pid, p.view()) match
+        Ok(_) -> s"stamp ${bp_stamp_of(p.view())}"
+        Err(e) -> e.code
+
+// -- building a pool -------------------------------------------------------------------------------
+
+@test(should_trap: "a buffer pool has at least one frame")
+a_pool_of_no_frames_traps()
+    val r = bp_rig(0)
+    assert_eq(r.pool.capacity(), 0)
+
+@test
+a_new_pool_holds_nothing()
+    val r = bp_rig(4)
+    assert_eq(r.pool.capacity(), 4)
+    assert(!r.pool.resident(1))
+    assert_eq(r.pool.dirty_count(), 0)
+    assert_eq(r.pool.counts(), BufStats(0, 0, 0, 0, 0, 0))
+    assert(!r.pool.failed())
+
+// -- a pool of one frame ---------------------------------------------------------------------------
+
+@test
+a_pool_of_one_frame_reads_a_page()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert(r.pool.resident(1))
+    assert_eq(r.pool.pins(1), 0)
+
+@test
+a_pool_of_one_frame_evicts_its_page_for_the_next()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(bp_read(r, 2), "stamp 8")
+    assert(!r.pool.resident(1))
+    assert(r.pool.resident(2))
+    assert_eq(r.pool.counts().evictions, 1)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(r.pool.counts().evictions, 2)
+
+@test
+a_pool_of_one_frame_refuses_a_second_page_while_the_first_is_fixed()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    val e = bp_error(r, 2)
+    assert_eq(e.code, "T1008")
+    assert_eq(e.detail("frames"), Some("1"))
+    assert_eq(bp_stamp_of(r.pool.page(h)), 7)
+    r.pool.unfix(h)
+
+@test
+a_pool_of_one_frame_fixes_its_one_page_again_while_it_is_fixed()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    val a = r.pool.fix(1, LatchShared).unwrap()
+    val b = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(r.pool.pins(1), 2)
+    r.pool.unfix(a)
+    r.pool.unfix(b)
+    assert_eq(r.pool.pins(1), 0)
+
+@test
+a_pool_of_one_frame_writes_its_dirty_page_back_before_reading_the_next()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    bp_modify(r, 1, 17, 5)
+    assert_eq(bp_read(r, 2), "stamp 8")
+    assert_eq(r.pool.counts().writes, 1)
+    assert_eq(bp_read(r, 1), "stamp 17")
+
+// -- every frame fixed -----------------------------------------------------------------------------
+
+@test
+a_fix_with_every_frame_fixed_is_resource_exhausted()
+    val r = bp_rig(3)
+
+    for p in 1..<5
+        bp_seed(r, u64(p), u64(p))
+
+    val held = buf[PageFix]()
+
+    for p in 1..<4
+        held.push(r.pool.fix(u64(p), LatchShared).unwrap())
+
+    val e = bp_error(r, 4)
+    assert_eq(e.code, "T1008")
+    assert_eq(e.detail("frames"), Some("3"))
+
+    for h in held
+        r.pool.unfix(h)
+
+@test
+a_fix_refused_for_want_of_a_frame_reads_and_evicts_nothing()
+    val r = bp_rig(2)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    val a = r.pool.fix(1, LatchShared).unwrap()
+    val b = r.pool.fix(2, LatchExclusive).unwrap()
+    val before = r.pool.counts()
+    val ops = r.src.disk_of(3).next_op()
+    assert_eq(bp_read(r, 3), "T1008")
+    assert_eq(r.pool.counts(), before)
+    assert_eq(r.src.disk_of(3).next_op(), ops)
+    assert(r.pool.resident(1) && r.pool.resident(2))
+    r.pool.unfix(a)
+    r.pool.unfix(b)
+
+@test
+a_fix_succeeds_once_a_frame_is_unfixed_after_every_frame_was_fixed()
+    val r = bp_rig(2)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    val a = r.pool.fix(1, LatchShared).unwrap()
+    val b = r.pool.fix(2, LatchShared).unwrap()
+    assert_eq(bp_read(r, 3), "T1008")
+    r.pool.unfix(b)
+    assert_eq(bp_read(r, 3), "stamp 3")
+    assert(!r.pool.resident(2))
+    assert(r.pool.resident(1))
+    r.pool.unfix(a)
+
+@test
+a_new_page_with_every_frame_fixed_is_resource_exhausted()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 1)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+
+    r.pool.fix_new(9) match
+        Ok(_) -> panic("a new page was fixed with every frame fixed")
+        Err(e) -> assert_eq(e.code, "T1008")
+
+    assert(!r.pool.resident(9))
+    r.pool.unfix(h)
+
+@test
+a_hit_needs_no_free_frame()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 1)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(bp_read(r, 1), "stamp 1")
+    assert_eq(r.pool.counts().hits, 1)
+    r.pool.unfix(h)
+
+// -- the same page fixed twice ---------------------------------------------------------------------
+
+@test
+a_page_fixed_twice_shared_is_read_once()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val a = r.pool.fix(1, LatchShared).unwrap()
+    val b = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(a, b)
+    assert_eq(r.pool.counts().reads, 1)
+    assert_eq(r.pool.counts().hits, 1)
+    assert_eq(r.pool.counts().misses, 1)
+    assert_eq(r.pool.pins(1), 2)
+    r.pool.unfix(a)
+    assert_eq(r.pool.pins(1), 1)
+    r.pool.unfix(b)
+    assert_eq(r.pool.pins(1), 0)
+
+@test
+a_page_fixed_twice_one_after_the_other_exclusively_sees_the_first_change()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 3)
+    bp_modify(r, 1, 9, 4)
+    assert_eq(bp_read(r, 1), "stamp 9")
+    assert_eq(r.pool.counts().reads, 1)
+
+@test(should_trap: "a second fix would wait for ever")
+a_shared_fix_of_a_page_fixed_exclusively_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val a = r.pool.fix(1, LatchExclusive).unwrap()
+    val b = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(a, b)
+
+@test(should_trap: "a second fix would wait for ever")
+an_exclusive_fix_of_a_page_fixed_exclusively_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val a = r.pool.fix(1, LatchExclusive).unwrap()
+    val b = r.pool.fix(1, LatchExclusive).unwrap()
+    assert_eq(a, b)
+
+@test(should_trap: "an exclusive fix would wait for ever")
+an_exclusive_fix_of_a_page_fixed_shared_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val a = r.pool.fix(1, LatchShared).unwrap()
+    val b = r.pool.fix(1, LatchExclusive).unwrap()
+    assert_eq(a, b)
+
+@test
+an_exclusive_fix_after_every_shared_fix_is_handed_back_is_granted()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val a = r.pool.fix(1, LatchShared).unwrap()
+    val b = r.pool.fix(1, LatchShared).unwrap()
+    r.pool.unfix(a)
+    r.pool.unfix(b)
+    val x = r.pool.fix(1, LatchExclusive).unwrap()
+    assert_eq(x.mode, LatchExclusive)
+    r.pool.unfix(x)
+    assert_eq(bp_read(r, 1), "stamp 7")
+
+// -- handing a fix back ----------------------------------------------------------------------------
+
+@test(should_trap: "which no fix holds")
+an_unfix_without_a_fix_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    r.pool.unfix(PageFix(1, 0, LatchShared))
+
+@test(should_trap: "which no fix holds")
+an_unfix_of_a_page_never_fixed_traps()
+    val r = bp_rig(4)
+    r.pool.unfix(PageFix(1, 0, LatchShared))
+
+@test(should_trap: "is not one of the pool's")
+an_unfix_naming_a_frame_past_the_pool_traps()
+    val r = bp_rig(4)
+    r.pool.unfix(PageFix(1, 4, LatchShared))
+
+@test(should_trap: "which no fix holds")
+a_second_unfix_of_an_exclusive_fix_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+    r.pool.unfix(h)
+    r.pool.unfix(h)
+
+@test(should_trap: "which no fix holds")
+an_unfix_of_a_fix_whose_page_was_evicted_traps()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    r.pool.unfix(h)
+    assert_eq(bp_read(r, 2), "stamp 8")
+    r.pool.unfix(h)
+
+@test(should_trap: "under a latch its fix does not hold")
+an_unfix_claiming_an_exclusive_latch_held_shared_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    r.pool.unfix(PageFix(h.pid, h.frame, LatchExclusive))
+
+@test(should_trap: "under a latch its fix does not hold")
+an_unfix_claiming_a_shared_latch_held_exclusively_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+    r.pool.unfix(PageFix(h.pid, h.frame, LatchShared))
+
+@test(should_trap: "which no fix holds")
+reading_a_page_through_a_handed_back_fix_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    r.pool.unfix(h)
+    assert_eq(bp_stamp_of(r.pool.page(h)), 7)
+
+@test(should_trap: "is changed under a shared latch")
+changing_a_page_fixed_shared_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    r.pool.page_mut(h)[40] = 1
+
+@test(should_trap: "is marked changed under a shared latch")
+marking_a_page_fixed_shared_changed_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    r.pool.unfix_dirty(h, 5)
+
+@test(should_trap: "which no fix holds")
+an_unfix_dirty_without_a_fix_traps()
+    val r = bp_rig(4)
+    r.pool.unfix_dirty(PageFix(1, 0, LatchExclusive), 5)
+
+// -- dirty pages and their LSNs --------------------------------------------------------------------
+
+@test
+a_clean_unfix_leaves_the_page_clean()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+    r.pool.unfix(h)
+    assert(!r.pool.is_dirty(1))
+    assert_eq(r.pool.rec_lsn(1), None)
+
+@test
+a_dirty_unfix_sets_the_page_lsn_in_the_header()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 42)
+    assert(r.pool.is_dirty(1))
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(get_u64_le(r.pool.page(h)[8..<16]).unwrap(), 42)
+    r.pool.unfix(h)
+
+@test
+the_rec_lsn_is_the_lsn_that_first_dirtied_the_page()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 5)
+    bp_modify(r, 1, 9, 9)
+    assert_eq(r.pool.rec_lsn(1), Some(u64(5)))
+
+@test
+a_write_back_clears_the_rec_lsn_and_the_next_change_sets_it_again()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 5)
+    assert_eq(bp_code(r.pool.flush_page(1)), "ok")
+    assert_eq(r.pool.rec_lsn(1), None)
+    assert(!r.pool.is_dirty(1))
+    bp_modify(r, 1, 9, 12)
+    assert_eq(r.pool.rec_lsn(1), Some(u64(12)))
+
+@test
+a_dirty_unfix_at_the_page_s_own_lsn_is_accepted()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 5)
+    bp_modify(r, 1, 9, 5)
+    assert_eq(bp_read(r, 1), "stamp 9")
+
+@test(should_trap: "is at LSN 5 and a record at 4 is applied to it")
+a_dirty_unfix_below_the_page_s_lsn_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 5)
+    bp_modify(r, 1, 9, 4)
+
+@test
+the_dirty_count_counts_dirty_resident_pages()
+    val r = bp_rig(4)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    bp_modify(r, 1, 11, 1)
+    bp_modify(r, 3, 13, 2)
+    assert_eq(bp_read(r, 2), "stamp 2")
+    assert_eq(r.pool.dirty_count(), 2)
+
+@test
+a_write_back_leaves_the_frame_s_own_bytes_unsealed()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+    put_u64_le(r.pool.page_mut(h)[0..<8], 0)
+    put_u64_le(r.pool.page_mut(h)[32..<40], 8)
+    r.pool.unfix_dirty(h, 3)
+    assert_eq(bp_code(r.pool.flush_page(1)), "ok")
+    val g = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(get_u64_le(r.pool.page(g)[0..<8]).unwrap() & 0xFFFFFFFF, 0)
+    r.pool.unfix(g)
+    assert_eq(bp_code(r.pool.sync()), "ok")
+    assert_eq(bp_media(r, 1), "stamp 8")
+
+// -- the WAL rule ----------------------------------------------------------------------------------
+
+@test
+a_flush_asks_the_log_to_be_durable_up_to_the_page_lsn_first()
+    val r = bp_rig(4)
+    r.wal.durable = 10
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 25)
+    assert_eq(bp_code(r.pool.flush_page(1)), "ok")
+    assert_eq(r.wal.flushes, buf_of_u64([25]))
+    assert_eq(r.wal.durable, 25)
+
+@test
+a_flush_of_a_page_already_covered_by_the_log_asks_nothing_of_it()
+    val r = bp_rig(4)
+    r.wal.durable = 30
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 30)
+    assert_eq(bp_code(r.pool.flush_page(1)), "ok")
+    assert_eq(r.wal.flushes.len(), 0)
+
+@test
+a_flush_blocked_by_the_log_writes_nothing_and_keeps_the_page_dirty()
+    val r = bp_rig(4)
+    r.wal.durable = 10
+    r.wal.refuse = true
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 25)
+    val d = r.src.disk_of(1)
+    val ops = d.next_op()
+
+    r.pool.flush_page(1) match
+        Ok(_) -> panic("a page was flushed past the durable log")
+        Err(e) ->
+            assert_eq(e.code, "D4004")
+            assert_eq(e.detail("file"), Some("wal"))
+
+    assert_eq(d.next_op(), ops)
+    assert_eq(d.unsynced(), 0)
+    assert(r.pool.is_dirty(1))
+    assert_eq(r.pool.rec_lsn(1), Some(u64(25)))
+    assert_eq(r.pool.counts().writes, 0)
+    assert_eq(r.pool.unsynced_segments(), 0)
+
+@test
+a_flush_blocked_by_the_log_succeeds_once_the_log_flushes()
+    val r = bp_rig(4)
+    r.wal.durable = 10
+    r.wal.refuse = true
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 25)
+    assert_eq(bp_code(r.pool.flush_page(1)), "D4004")
+    r.wal.refuse = false
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(bp_media(r, 1), "stamp 8")
+
+@test
+an_eviction_blocked_by_the_log_fails_the_fix_and_keeps_the_victim()
+    val r = bp_rig(1)
+    r.wal.durable = 10
+    r.wal.refuse = true
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 9)
+    bp_modify(r, 1, 8, 25)
+    assert_eq(bp_read(r, 2), "D4004")
+    assert(r.pool.resident(1))
+    assert(r.pool.is_dirty(1))
+    assert(!r.pool.resident(2))
+    assert_eq(r.pool.counts().evictions, 0)
+    assert_eq(bp_read(r, 1), "stamp 8")
+
+@test
+an_eviction_of_a_dirty_page_forces_the_log_to_its_lsn()
+    val r = bp_rig(1)
+    r.wal.durable = 0
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 9)
+    bp_modify(r, 1, 8, 40)
+    assert_eq(bp_read(r, 2), "stamp 9")
+    assert_eq(r.wal.flushes, buf_of_u64([40]))
+
+@test
+a_flush_of_everything_forces_the_log_once_to_the_highest_page_lsn()
+    val r = bp_rig(4)
+    r.wal.durable = 0
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    bp_modify(r, 1, 11, 30)
+    bp_modify(r, 2, 12, 50)
+    bp_modify(r, 3, 13, 40)
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(r.wal.flushes, buf_of_u64([50]))
+
+@test
+a_flush_of_everything_blocked_by_the_log_writes_no_page()
+    val r = bp_rig(4)
+    r.wal.durable = 0
+    r.wal.refuse = true
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    bp_modify(r, 1, 11, 30)
+    bp_modify(r, 2, 12, 50)
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    assert_eq(r.pool.counts().writes, 0)
+    assert_eq(r.pool.dirty_count(), 2)
+
+@test(should_trap: "is durable only to")
+a_log_that_says_it_flushed_and_did_not_traps()
+    val r = bp_rig(4)
+    r.wal.durable = 10
+    r.wal.lie = true
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 25)
+    val _ = r.pool.flush_page(1)
+
+@test
+a_page_never_changed_since_its_read_is_never_written()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(bp_read(r, 2), "stamp 8")
+    assert_eq(r.pool.counts().writes, 0)
+    assert_eq(r.wal.flushes.len(), 0)
+
+// -- flushing --------------------------------------------------------------------------------------
+
+@test
+a_flush_of_everything_leaves_nothing_dirty_and_everything_durable()
+    val r = bp_rig(4)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    bp_modify(r, 1, 11, 1)
+    bp_modify(r, 3, 13, 2)
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(r.pool.dirty_count(), 0)
+    assert_eq(r.pool.unsynced_segments(), 0)
+    assert_eq(r.src.disk_of(1).unsynced(), 0)
+    assert_eq(bp_media(r, 1), "stamp 11")
+    assert_eq(bp_media(r, 2), "stamp 2")
+    assert_eq(bp_media(r, 3), "stamp 13")
+    assert_eq(r.pool.counts().writes, 2)
+    assert_eq(r.pool.counts().syncs, 1)
+
+@test
+a_flush_of_a_clean_pool_does_no_io()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    val ops = r.src.disk_of(1).next_op()
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(r.src.disk_of(1).next_op(), ops)
+    assert_eq(r.pool.counts().syncs, 0)
+
+@test
+a_flush_of_everything_syncs_what_evictions_wrote()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    bp_modify(r, 1, 17, 3)
+    assert_eq(bp_read(r, 2), "stamp 8")
+    assert_eq(r.pool.unsynced_segments(), 1)
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(r.pool.unsynced_segments(), 0)
+    assert_eq(bp_media(r, 1), "stamp 17")
+
+@test
+a_flush_of_a_page_not_resident_does_nothing()
+    val r = bp_rig(4)
+    assert_eq(bp_code(r.pool.flush_page(5)), "ok")
+    assert_eq(r.pool.counts(), BufStats(0, 0, 0, 0, 0, 0))
+
+@test
+a_flush_of_a_clean_page_does_nothing()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(bp_code(r.pool.flush_page(1)), "ok")
+    assert_eq(r.pool.counts().writes, 0)
+
+@test
+a_flush_of_one_page_writes_it_and_leaves_it_unsynced()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 1)
+    assert_eq(bp_code(r.pool.flush_page(1)), "ok")
+    assert_eq(r.src.disk_of(1).unsynced(), 1)
+    assert_eq(bp_media(r, 1), "stamp 7")
+    assert_eq(bp_code(r.pool.sync()), "ok")
+    assert_eq(bp_media(r, 1), "stamp 8")
+
+@test
+a_page_fixed_shared_may_be_flushed()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    bp_modify(r, 1, 8, 1)
+    val h = r.pool.fix(1, LatchShared).unwrap()
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(bp_media(r, 1), "stamp 8")
+    r.pool.unfix(h)
+
+@test(should_trap: "is flushed while it is fixed exclusively")
+a_flush_of_a_page_fixed_exclusively_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+    val _ = r.pool.flush_page(1)
+    r.pool.unfix(h)
+
+@test(should_trap: "is flushed while it is fixed exclusively")
+a_flush_of_everything_with_a_page_fixed_exclusively_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+    val _ = r.pool.flush_all()
+    r.pool.unfix(h)
+
+@test
+a_sync_with_nothing_written_does_no_io()
+    val r = bp_rig(4)
+    assert_eq(bp_code(r.pool.sync()), "ok")
+    assert_eq(r.pool.counts().syncs, 0)
+
+// -- the clock -------------------------------------------------------------------------------------
+
+@test
+a_free_frame_is_taken_before_any_page_is_evicted()
+    val r = bp_rig(3)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+        assert_eq(bp_read(r, u64(p)), s"stamp $p")
+
+    assert_eq(r.pool.counts().evictions, 0)
+
+@test
+a_page_used_again_gets_a_second_chance()
+    val r = bp_rig(3)
+
+    for p in 1..<6
+        bp_seed(r, u64(p), u64(p))
+
+    // Pages 1, 2 and 3 fill the pool; 4 clears every reference bit and evicts 1.
+    for p in 1..<5
+        assert_eq(bp_read(r, u64(p)), s"stamp $p")
+
+    assert(!r.pool.resident(1))
+    // Page 2 is used again; 5 then passes it over and evicts 3.
+    assert_eq(bp_read(r, 2), "stamp 2")
+    assert_eq(bp_read(r, 5), "stamp 5")
+    assert(r.pool.resident(2))
+    assert(!r.pool.resident(3))
+    assert(r.pool.resident(4))
+
+@test
+a_fixed_page_is_never_evicted()
+    val r = bp_rig(2)
+
+    for p in 1..<10
+        bp_seed(r, u64(p), u64(p))
+
+    val h = r.pool.fix(1, LatchShared).unwrap()
+
+    for p in 2..<10
+        assert_eq(bp_read(r, u64(p)), s"stamp $p")
+        assert(r.pool.resident(1))
+
+    r.pool.unfix(h)
+
+@test
+a_page_fixed_exclusively_is_never_evicted()
+    val r = bp_rig(2)
+
+    for p in 1..<10
+        bp_seed(r, u64(p), u64(p))
+
+    val h = r.pool.fix(1, LatchExclusive).unwrap()
+
+    for p in 2..<10
+        assert_eq(bp_read(r, u64(p)), s"stamp $p")
+        assert(r.pool.resident(1))
+
+    r.pool.unfix(h)
+
+@test
+an_evicted_dirty_page_is_written_before_its_frame_is_reused()
+    val r = bp_rig(2)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    bp_modify(r, 1, 11, 4)
+    bp_modify(r, 2, 12, 5)
+    assert_eq(bp_read(r, 3), "stamp 3")
+    assert_eq(r.pool.counts().writes, 1)
+    assert_eq(r.src.disk_of(1).unsynced(), 1)
+    assert(!r.pool.resident(1))
+    assert_eq(bp_read(r, 1), "stamp 11")
+
+@test
+an_evicted_clean_page_is_dropped_unwritten()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 1)
+    bp_seed(r, 2, 2)
+    assert_eq(bp_read(r, 1), "stamp 1")
+    val ops = r.src.disk_of(1).next_op()
+    assert_eq(bp_read(r, 2), "stamp 2")
+    assert_eq(r.src.disk_of(1).next_op(), ops + 1)
+    assert_eq(r.pool.counts().writes, 0)
+
+@test
+an_eviction_whose_write_fails_fails_the_fix_and_keeps_the_page_dirty()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 1)
+    bp_seed(r, 2, 2)
+    bp_modify(r, 1, 11, 3)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op(), DkCrash(KeepNone))
+    assert_eq(bp_read(r, 2), "D4004")
+    assert(r.pool.resident(1))
+    assert(r.pool.is_dirty(1))
+    assert_eq(bp_read(r, 1), "stamp 11")
+
+// -- new pages -------------------------------------------------------------------------------------
+
+@test
+a_new_page_is_fixed_exclusively_without_a_read()
+    val r = bp_rig(4)
+    val h = r.pool.fix_new(9).unwrap()
+    assert_eq(h.mode, LatchExclusive)
+    assert_eq(r.pool.counts().reads, 0)
+    assert_eq(r.src.opens.len(), 0)
+    val p = r.pool.page(h)
+    assert_eq(get_u64_le(p[16..<24]).unwrap(), 9)
+    var zero = true
+
+    for i in 0..<DbPageSize
+        if i < 16 || i >= 24
+            if p[i] != 0 then zero = false
+
+    assert(zero, "a new page is zeros but for its pid")
+    r.pool.unfix(h)
+
+@test
+a_new_page_in_a_reused_frame_is_zeros()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    val h = r.pool.fix_new(2).unwrap()
+    assert_eq(bp_stamp_of(r.pool.page(h)), 0)
+    r.pool.unfix(h)
+
+@test
+a_new_page_written_back_reads_again()
+    val r = bp_rig(1)
+    bp_create(r, 9, 99, 3)
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    bp_create(r, 10, 100, 4)
+    assert_eq(bp_read(r, 9), "stamp 99")
+    assert_eq(bp_read(r, 10), "stamp 100")
+
+@test
+a_new_page_handed_back_clean_and_evicted_was_never_written()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    val h = r.pool.fix_new(9).unwrap()
+    r.pool.unfix(h)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(r.pool.counts().writes, 0)
+    assert_eq(bp_read(r, 9), "D4004")
+
+@test(should_trap: "is new and is already resident")
+a_new_page_that_is_resident_traps()
+    val r = bp_rig(4)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    val _ = r.pool.fix_new(1)
+
+@test
+a_new_page_with_a_swizzled_pid_is_data_corrupted()
+    val r = bp_rig(4)
+
+    r.pool.fix_new(SwizzleTag | 3) match
+        Ok(_) -> panic("a swizzled reference was fixed as a page")
+        Err(e) -> assert_eq(e.code, "D1001")
+
+// -- read errors and corrupt pages -----------------------------------------------------------------
+
+@test
+a_read_error_is_io_error_naming_the_pid_and_the_file()
+    val r = bp_rig(4)
+    bp_seed(r, 3, 7)
+    val d = r.src.disk_of(3)
+    d.schedule(d.next_op(), DkReadError)
+    val e = bp_error(r, 3)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("errno"), Some("5"))
+    assert_eq(e.detail("pid"), Some("3"))
+    assert_eq(e.detail("file"), Some(d.name()))
+
+@test
+a_read_error_leaves_the_page_unresident_and_its_frame_free()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op(), DkReadError)
+    assert_eq(bp_read(r, 1), "D4004")
+    assert(!r.pool.resident(1))
+    assert_eq(r.pool.pins(1), 0)
+    assert_eq(bp_read(r, 2), "stamp 8")
+    assert_eq(r.pool.counts().evictions, 0)
+
+@test
+a_page_whose_read_failed_reads_on_a_second_try()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op(), DkReadError)
+    assert_eq(bp_read(r, 1), "D4004")
+    assert_eq(bp_read(r, 1), "stamp 7")
+
+@test
+a_read_error_after_an_eviction_keeps_what_the_eviction_wrote()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    bp_modify(r, 1, 17, 2)
+    val d = r.src.disk_of(1)
+    // I/O next is the write of page 1, and then the read of page 2.
+    d.schedule(d.next_op() + 1, DkReadError)
+    assert_eq(bp_read(r, 2), "D4004")
+    assert(!r.pool.resident(1))
+    assert_eq(bp_read(r, 1), "stamp 17")
+
+@test
+a_checksum_failure_is_data_corrupted_naming_the_pid()
+    val r = bp_rig(4)
+    bp_seed(r, 3, 7)
+    val d = r.src.disk_of(3)
+    d.schedule(d.next_op(), DkBitFlip(3, 8 * 100))
+    val e = bp_error(r, 3)
+    assert_eq(e.code, "D1001")
+    assert_eq(e.detail("pid"), Some("3"))
+
+@test
+a_checksum_failure_leaves_the_frame_free()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    bp_seed(r, 2, 8)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op(), DkBitFlip(1, 8 * 100))
+    assert_eq(bp_read(r, 1), "D1001")
+    assert(!r.pool.resident(1))
+    assert_eq(bp_read(r, 2), "stamp 8")
+    assert_eq(bp_read(r, 1), "D1001")
+
+@test
+a_page_naming_another_pid_is_data_corrupted()
+    val r = bp_rig(4)
+    val d = r.src.disk_of(5)
+    var p = bp_page(6, 7)
+    seal_page(p.view_mut())
+    assert_eq(d.write_page(5, p.view()), Ok(()))
+    val e = bp_error(r, 5)
+    assert_eq(e.code, "D1001")
+    assert_eq(e.detail("pid"), Some("5"))
+
+@test
+a_page_never_written_inside_the_segment_is_data_corrupted()
+    val r = bp_rig(4)
+    bp_seed(r, 5, 7)
+    assert_eq(bp_read(r, 2), "D1001")
+
+@test
+a_page_past_the_end_of_its_segment_is_io_error()
+    val r = bp_rig(4)
+    bp_seed(r, 3, 7)
+    val e = bp_error(r, 40)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("errno"), Some("22"))
+
+@test
+a_swizzled_pid_is_refused_before_anything_is_evicted()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(bp_read(r, SwizzleTag | 1), "D1001")
+    assert(r.pool.resident(1))
+    assert_eq(r.pool.counts().evictions, 0)
+
+@test
+a_pid_of_a_reserved_space_is_refused_before_anything_is_evicted()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 7)
+    assert_eq(bp_read(r, 1), "stamp 7")
+    assert_eq(bp_read(r, (u64(2) << 60) | 1), "D1001")
+    assert_eq(bp_read(r, (u64(7) << 60) | 1), "D1001")
+    assert(r.pool.resident(1))
+
+// -- a failed sync ---------------------------------------------------------------------------------
+
+/** A rig of pages 1, 2 and 3 at versions 1, 2 and 3, synced, then changed to 11, 12 and 13 and not
+ * yet written: the start of every crash and sync-failure test.
+ */
+private bp_three_dirty(capacity: usize) -> BpRig = bp_three_dirty_seeded(capacity, 1)
+
+private bp_three_dirty_seeded(capacity: usize, seed: u64) -> BpRig
+    val r = bp_rig_seeded(capacity, seed)
+
+    for p in 1..<4
+        bp_seed(r, u64(p), u64(p))
+
+    for p in 1..<4
+        bp_modify(r, u64(p), u64(p + 10), u64(p))
+
+    r
+
+@test
+a_failed_sync_fails_the_flush_with_io_error()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    assert(r.pool.failed())
+
+@test
+after_a_failed_sync_a_miss_is_refused_without_io()
+    val r = bp_three_dirty(4)
+    bp_seed(r, 5, 5)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    val ops = d.next_op()
+    val e = bp_error(r, 5)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("file"), Some(d.name()))
+    assert_eq(d.next_op(), ops)
+
+@test
+after_a_failed_sync_every_flush_and_sync_is_refused()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    bp_modify(r, 1, 21, 9)
+    val ops = d.next_op()
+    assert_eq(bp_code(r.pool.flush_page(1)), "D4004")
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    assert_eq(bp_code(r.pool.sync()), "D4004")
+    assert_eq(d.next_op(), ops)
+
+@test
+after_a_failed_sync_an_eviction_that_must_write_is_refused()
+    val r = bp_three_dirty(3)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    bp_modify(r, 1, 21, 9)
+    bp_modify(r, 2, 22, 10)
+    bp_modify(r, 3, 23, 11)
+    val ops = d.next_op()
+
+    r.pool.fix_new(9) match
+        Ok(_) -> panic("a dirty page was evicted after a failed sync")
+        Err(e) -> assert_eq(e.code, "D4004")
+
+    assert_eq(d.next_op(), ops)
+    assert_eq(r.pool.dirty_count(), 3)
+
+@test
+after_a_failed_sync_a_new_page_in_a_free_frame_is_granted()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    bp_create(r, 9, 99, 20)
+    assert_eq(bp_read(r, 9), "stamp 99")
+
+@test
+after_a_failed_sync_a_resident_page_still_reads()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    assert_eq(bp_read(r, 2), "stamp 12")
+
+@test
+a_failed_sync_of_one_segment_refuses_io_on_every_other()
+    val r = bp_rig(4)
+    val far = SegmentPages + 4
+    bp_seed(r, 1, 1)
+    bp_seed(r, far, 2)
+    bp_seed(r, far + 1, 3)
+    bp_modify(r, 1, 11, 1)
+    bp_modify(r, far, 12, 2)
+    val d0 = r.src.disk_of(1)
+    val d1 = r.src.disk_of(far)
+    // Segment 0 is synced first, after the two writes.
+    d0.schedule(d0.next_op() + 1, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    val ops = d1.next_op()
+    assert_eq(bp_read(r, far + 1), "D4004")
+    assert_eq(d1.next_op(), ops)
+
+@test
+a_pool_reopened_after_a_failed_sync_reads_what_the_device_kept()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    val again = bp_reopen(r, 4)
+
+    for p in 1..<4
+        assert_eq(bp_read(again, u64(p)), s"stamp $p")
+
+@test
+a_pool_reopened_after_a_failed_sync_that_kept_everything_reads_the_new_versions()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + 3, DkSyncFail(KeepAll))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    val again = bp_reopen(r, 4)
+
+    for p in 1..<4
+        assert_eq(bp_read(again, u64(p)), s"stamp ${p + 10}")
+
+// -- a crash in the middle of a flush --------------------------------------------------------------
+
+/** Runs `flush_all` over three dirty pages with `fault` at I/O `at` of the flush (0, 1 and 2 are the
+ * writes, 3 the sync), crashes, and answers what a reopened pool reads of pages 1, 2 and 3. Each one
+ * must be exactly what the device's media kept.
+ */
+private bp_crash_flush(at: u64, fault: DiskFault) -> string
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op() + at, fault)
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    assert(d.is_down())
+    d.restart()
+    val again = bp_reopen(r, 4)
+    var out = ""
+
+    for p in 1..<4
+        val got = bp_read(again, u64(p))
+        assert_eq(got, bp_media(r, u64(p)), s"page $p")
+        out = if out == "" then got else s"$out, $got"
+
+    out
+
+@test
+a_crash_at_the_second_write_keeping_nothing_reopens_to_the_old_versions()
+    assert_eq(bp_crash_flush(1, DkCrash(KeepNone)), "stamp 1, stamp 2, stamp 3")
+
+@test
+a_crash_at_the_second_write_keeping_everything_reopens_with_the_first_written()
+    assert_eq(bp_crash_flush(1, DkCrash(KeepAll)), "stamp 11, stamp 2, stamp 3")
+
+@test
+a_crash_at_the_first_write_reopens_to_the_old_versions()
+    assert_eq(bp_crash_flush(0, DkCrash(KeepAll)), "stamp 1, stamp 2, stamp 3")
+
+@test
+a_crash_at_the_last_write_keeping_everything_reopens_with_two_written()
+    assert_eq(bp_crash_flush(2, DkCrash(KeepAll)), "stamp 11, stamp 12, stamp 3")
+
+@test
+a_crash_at_the_sync_keeping_everything_reopens_to_the_new_versions()
+    assert_eq(bp_crash_flush(3, DkCrash(KeepAll)), "stamp 11, stamp 12, stamp 13")
+
+@test
+a_crash_at_the_sync_keeping_nothing_reopens_to_the_old_versions()
+    assert_eq(bp_crash_flush(3, DkCrash(KeepNone)), "stamp 1, stamp 2, stamp 3")
+
+@test
+a_crash_keeping_part_of_a_write_reopens_to_a_detected_torn_page()
+    val masks = buf[u8]()
+    masks.push(0x3)
+    masks.push(0xf)
+    assert_eq(bp_crash_flush(3, DkCrash(KeepSectors(masks))), "D1001, stamp 12, stamp 3")
+
+@test
+a_crash_keeping_every_sector_of_each_write_reopens_to_the_new_versions()
+    val masks = buf[u8]()
+
+    for i in 0..<3
+        masks.push(0xf)
+
+    assert_eq(bp_crash_flush(3, DkCrash(KeepSectors(masks))), "stamp 11, stamp 12, stamp 13")
+
+@test
+a_crash_keeping_no_sector_of_any_write_reopens_to_the_old_versions()
+    val masks = buf[u8]()
+
+    for i in 0..<3
+        masks.push(0)
+
+    assert_eq(bp_crash_flush(3, DkCrash(KeepSectors(masks))), "stamp 1, stamp 2, stamp 3")
+
+@test
+a_torn_write_mid_flush_reopens_to_a_detected_torn_page()
+    val order = buf[u8]()
+
+    for s in 0..<4
+        order.push(u8(s))
+
+    assert_eq(bp_crash_flush(1, DkTornWrite(order, 2, KeepAll)), "stamp 11, D1001, stamp 3")
+
+@test
+a_torn_write_that_reached_no_sector_reopens_to_the_old_page()
+    val order = buf[u8]()
+
+    for s in 0..<4
+        order.push(u8(s))
+
+    assert_eq(bp_crash_flush(1, DkTornWrite(order, 0, KeepNone)), "stamp 1, stamp 2, stamp 3")
+
+@test
+a_torn_write_that_reached_every_sector_reopens_to_the_new_page()
+    val order = buf[u8]()
+
+    for s in 0..<4
+        order.push(u8(3 - s))
+
+    assert_eq(bp_crash_flush(1, DkTornWrite(order, 4, KeepNone)), "stamp 1, stamp 12, stamp 3")
+
+@test
+a_lost_write_then_a_crash_before_the_sync_reopens_without_it()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op(), DkLostWrite)
+    d.schedule(d.next_op() + 3, DkCrash(KeepAll))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    d.restart()
+    val again = bp_reopen(r, 4)
+    assert_eq(bp_read(again, 1), "stamp 1")
+    assert_eq(bp_read(again, 2), "stamp 12")
+    assert_eq(bp_read(again, 3), "stamp 13")
+
+@test
+a_lost_write_covered_by_a_sync_survives_the_crash()
+    val r = bp_three_dirty(4)
+    val d = r.src.disk_of(1)
+    d.schedule(d.next_op(), DkLostWrite)
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    d.schedule(d.next_op(), DkCrash(KeepNone))
+    assert_eq(d.sync(), Err(NotOpen))
+    d.restart()
+    val again = bp_reopen(r, 4)
+
+    for p in 1..<4
+        assert_eq(bp_read(again, u64(p)), s"stamp ${p + 10}")
+
+@test
+crashes_keeping_drawn_sectors_reopen_to_what_the_media_kept()
+    for seed in 0..<40
+        val r = bp_three_dirty_seeded(4, u64(seed + 1))
+        val d = r.src.disk_of(1)
+        // A device drawing nothing at random still draws which sectors a crash keeps.
+        d.schedule(d.next_op() + u64(seed % 4), DkCrash(KeepDrawn))
+        assert_eq(bp_code(r.pool.flush_all()), "D4004")
+        d.restart()
+        val again = bp_reopen(r, 4)
+
+        for p in 1..<4
+            assert_eq(bp_read(again, u64(p)), bp_media(r, u64(p)), s"crash at ${seed % 4}, page $p")
+
+// -- segments --------------------------------------------------------------------------------------
+
+@test
+a_data_page_is_in_segment_its_number_over_65536()
+    assert_eq(segment_of(0), Ok(u64(0)))
+    assert_eq(segment_of(65535), Ok(u64(0)))
+    assert_eq(segment_of(65536), Ok(u64(1)))
+    assert_eq(segment_of(3 * 65536 + 17), Ok(u64(3)))
+
+@test
+an_undo_page_is_in_undo_segment_its_number_over_4096()
+    val undo = u64(1) << 60
+    assert_eq(segment_of(undo), Ok(undo))
+    assert_eq(segment_of(undo | 4095), Ok(undo))
+    assert_eq(segment_of(undo | 4096), Ok(undo | 1))
+    assert_eq(segment_space(segment_of(undo | 9000).unwrap()), UndoSpace)
+    assert_eq(segment_number(segment_of(undo | 9000).unwrap()), 2)
+
+@test
+the_highest_page_numbers_have_segments()
+    assert_eq(segment_of(PidNumberMask), Ok(PidNumberMask >> 16))
+    assert_eq(segment_of((u64(1) << 60) | PidNumberMask), Ok((u64(1) << 60) | (PidNumberMask >> 12)))
+
+@test
+a_pid_of_no_page_space_has_no_segment()
+    assert_eq(bp_segment_code(u64(2) << 60), "D1001")
+    assert_eq(bp_segment_code((u64(7) << 60) | 5), "D1001")
+    assert_eq(bp_segment_code(SwizzleTag), "D1001")
+    assert_eq(bp_segment_code(SwizzleTag | 5), "D1001")
+
+@test
+a_segment_s_file_is_named_in_lowercase_hex_at_the_spec_s_widths()
+    assert_eq(segment_path(1, DataSpace, 0), "data.1/00000000.tseg")
+    assert_eq(segment_path(26, DataSpace, 0x1a), "data.1a/0000001a.tseg")
+    assert_eq(segment_path(1, UndoSpace, 2), "undo.1/000000000002.tund")
+    assert_eq(segment_path(0xff, UndoSpace, 0xabc), "undo.ff/000000000abc.tund")
+    assert_eq(segment_path(1, DataSpace, 0xffffffff), "data.1/ffffffff.tseg")
+
+@test(should_trap: "a segment is of the data or the undo space")
+a_segment_of_a_reserved_space_has_no_file()
+    val _ = segment_path(1, 2, 0)
+
+@test
+a_page_is_read_from_its_own_segment_at_its_slot()
+    val r = bp_rig(4)
+    val far = 2 * SegmentPages + 7
+    val undo = (u64(1) << 60) | (UndoSegmentPages + 3)
+    bp_seed(r, 7, 1)
+    bp_seed(r, far, 2)
+    bp_seed(r, undo, 3)
+    assert_eq(r.src.disk_of(far).durable_count(), 8)
+    assert_eq(bp_read(r, 7), "stamp 1")
+    assert_eq(bp_read(r, far), "stamp 2")
+    assert_eq(bp_read(r, undo), "stamp 3")
+
+@test
+a_page_is_written_to_its_own_segment_at_its_slot()
+    val r = bp_rig(4)
+    val far = SegmentPages + 2
+    val undo = (u64(1) << 60) | (3 * UndoSegmentPages + 1)
+    bp_create(r, far, 5, 1)
+    bp_create(r, undo, 6, 2)
+    assert_eq(bp_code(r.pool.flush_all()), "ok")
+    assert_eq(r.src.disk(1).durable_count(), 3)
+    assert_eq(r.src.disk((u64(1) << 60) | 3).durable_count(), 2)
+    assert_eq(bp_media(r, far), "stamp 5")
+    assert_eq(bp_media(r, undo), "stamp 6")
+    assert_eq(r.src.disk(0).durable_count(), 0)
+    assert_eq(r.pool.counts().syncs, 2)
+
+@test
+each_segment_is_opened_once()
+    val r = bp_rig(1)
+    val far = SegmentPages + 2
+    bp_seed(r, 1, 1)
+    bp_seed(r, 2, 2)
+    bp_seed(r, far, 3)
+
+    for i in 0..<3
+        assert_eq(bp_read(r, 1), "stamp 1")
+        assert_eq(bp_read(r, far), "stamp 3")
+        assert_eq(bp_read(r, 2), "stamp 2")
+
+    assert_eq(r.src.opens, buf_of_u64([0, 1]))
+
+@test
+a_segment_that_cannot_be_opened_fails_the_fix_and_leaves_the_frame_free()
+    val r = bp_rig(1)
+    bp_seed(r, 1, 1)
+    r.src.refuse = true
+    val e = bp_error(r, 1)
+    assert_eq(e.code, "D4004")
+    assert_eq(e.detail("file"), Some("seg-0"))
+    assert(!r.pool.resident(1))
+    r.src.refuse = false
+    assert_eq(bp_read(r, 1), "stamp 1")
+
+@test
+pages_of_two_segments_are_flushed_and_both_segments_synced_in_order()
+    val r = bp_rig(4)
+    val far = SegmentPages + 2
+    bp_create(r, far, 5, 1)
+    bp_create(r, 3, 6, 2)
+    val d0 = r.src.disk(0)
+    val d1 = r.src.disk(1)
+    // Segment 1's sync fails: segment 0, synced first, is durable already.
+    d1.schedule(d1.next_op() + 1, DkSyncFail(KeepNone))
+    assert_eq(bp_code(r.pool.flush_all()), "D4004")
+    assert_eq(d0.unsynced(), 0)
+    assert_eq(bp_media(r, 3), "stamp 6")
+    assert_eq(r.src.disk(1).durable_count(), 0)
+
+// -- segments on the host's files ------------------------------------------------------------------
+
+@test
+a_pool_over_files_writes_and_reopens_its_pages()
+    val dir = make_temp_dir("terndb-bp-files").unwrap()
+    make_dir_all(join(dir, "data.1")).unwrap()
+    make_dir_all(join(dir, "undo.1")).unwrap()
+    create_file_device(join(dir, "data.1/00000000.tseg")).unwrap().close().unwrap()
+    create_file_device(join(dir, "undo.1/000000000000.tund")).unwrap().close().unwrap()
+    val wal = test_wal(100)
+    val w: &WalHorizon = wal
+    val s1: &SegmentSource = FileSegments(dir, 1)
+    val pool = buffer_pool(2, s1, w)
+    val undo = (u64(1) << 60) | 5
+
+    for p in [u64(3), undo]
+        val h = pool.fix_new(p).unwrap()
+        put_u64_le(pool.page_mut(h)[32..<40], p + 1)
+        pool.unfix_dirty(h, 7)
+
+    assert_eq(bp_code(pool.flush_all()), "ok")
+    val s2: &SegmentSource = FileSegments(dir, 1)
+    val again = buffer_pool(2, s2, w)
+
+    for p in [u64(3), undo]
+        val h = again.fix(p, LatchShared).unwrap()
+        assert_eq(bp_stamp_of(again.page(h)), p + 1)
+        again.unfix(h)
+
+    remove_dir_all(dir).unwrap()
+
+@test
+a_segment_file_that_does_not_exist_is_io_error_naming_it()
+    val dir = make_temp_dir("terndb-bp-missing").unwrap()
+    val wal = test_wal(100)
+    val w: &WalHorizon = wal
+    val s: &SegmentSource = FileSegments(dir, 2)
+    val pool = buffer_pool(2, s, w)
+
+    pool.fix(SegmentPages + 1, LatchShared) match
+        Ok(_) -> panic("a page of a missing segment was fixed")
+        Err(e) ->
+            assert_eq(e.code, "D4004")
+            assert_eq(e.detail("file"), Some(join(dir, "data.2/00000001.tseg")))
+            assert_eq(e.detail("errno"), Some("2"))
+
+    remove_dir_all(dir).unwrap()
+
+// -- helpers ---------------------------------------------------------------------------------------
+
+private bp_segment_code(pid: u64) -> string = segment_of(pid) match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+private buf_of_u64(xs: []const u64) -> Buf[u64]
+    val out = buf[u64]()
+
+    for x in xs
+        out.push(x)
+
+    out

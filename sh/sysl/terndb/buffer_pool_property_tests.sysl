@@ -1,0 +1,283 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// A seeded property test of the buffer pool: random fixes, changes, new pages, held pins, page
+// flushes, full flushes and log flushes over a small pool and pages spread across two data segments
+// and an undo segment, while every device draws crashes, torn writes, lost writes, sync failures and
+// read errors and the log sometimes refuses to flush. It is checked against a reference model of
+// each page: the version the pool must show, the version known durable, and the versions that may
+// have reached the device since. In normal running a fix must show the newest version and a held
+// page is never evicted; every device checks on each write that the log is durable up to the page's
+// LSN (§6.5 rule 1, D5). After a crash or a failed sync every device crashes, a new pool opens, and
+// each page must read as its durable version, as one written since, or as `data_corrupted` when a
+// write of it was in flight, and never as anything else (`on-disk-format.md` §9 D11, D14, D15).
+// Every assertion names its seed.
+
+const BmPages: u64 = 9
+
+/** The PID of model page `k`: three in data segment 0, three in data segment 1, three in undo
+ * segment 0.
+ */
+private bm_pid(k: u64) -> u64 =
+    if k < 3 then k + 1 elif k < 6 then SegmentPages + k - 3 else (u64(1) << 60) | (k - 6)
+
+/** The segment keys the model's pages live in. */
+private bm_segments() -> Buf[u64]
+    val out = buf[u64]()
+    out.push(0)
+    out.push(1)
+    out.push(u64(1) << 60)
+    out
+
+/** What the model knows is on the media for a page. */
+enum BmDurable derives Eq
+    BmNever
+    BmStamp(stamp: u64)
+
+struct BmPage
+    /** Whether the page exists for the pool: created and not lost to a crash since. */
+    live: bool
+    /** The version a fix must show while `live`. */
+    latest: u64
+    durable: BmDurable
+    /** Every version the page has had since its last full flush: any of them may be on the device. */
+    since: Buf[u64]
+
+/** What the run has met, for the test to show each path was exercised. */
+struct BmCounts
+    recoveries: u64
+    corrupt: u64
+    read_errors: u64
+    log_refusals: u64
+    evictions: u64
+    flushes: u64
+
+/** Crashes every device not already down, then restarts each: the process died. */
+private bm_crash_all(r: BpRig)
+    for key in bm_segments()
+        val d = r.src.disk(key)
+
+        if !d.is_down()
+            d.schedule(d.next_op(), DkCrash(KeepDrawn))
+            val _ = d.sync()
+
+        d.restart()
+
+/** After a crash or a failed sync: crashes every device, opens a new pool, reads every page back and
+ * checks each against the model, then makes what was read the durable version. A crash or a read
+ * error during the reads is met by reading again.
+ */
+private bm_recover(r: BpRig, pages: Buf[BmPage], counts: *BmCounts, what: string) -> BpRig
+    counts.recoveries += 1
+    counts.evictions += r.pool.counts().evictions
+    r.wal.refuse = false
+    bm_crash_all(r)
+    var p = bp_reopen(r, r.pool.capacity())
+
+    for k in 0..<BmPages
+        val m = pages[usize(k)]
+        if m.durable == BmNever && m.since.len() == 0 then continue
+        val pid = bm_pid(k)
+        var code = ""
+        var errno = ""
+        var stamp: u64 = 0
+
+        while true
+            p.pool.fix(pid, LatchShared) match
+                Ok(h) ->
+                    stamp = bp_stamp_of(p.pool.page(h))
+                    p.pool.unfix(h)
+                    code = "ok"
+                Err(e) ->
+                    code = e.code
+                    errno = e.detail("errno").unwrap_or("")
+
+            if bm_any_down(r)
+                bm_crash_all(r)
+                p = bp_reopen(r, r.pool.capacity())
+            elif !(code == "D4004" && errno == "5")
+                break
+
+        val where = s"$what, recovering page $k (durable ${m.durable}, since ${m.since})"
+
+        if code == "ok"
+            var known = m.durable == BmStamp(stamp)
+
+            for s in m.since
+                if s == stamp then known = true
+
+            assert(known, s"$where: read version $stamp, which was never written there")
+            pages[usize(k)] = BmPage(true, stamp, BmStamp(stamp), buf[u64]())
+        elif code == "D1001"
+            assert(m.since.len() > 0 || m.durable == BmNever, s"$where: a page no write was in flight for is corrupted")
+            counts.corrupt += 1
+            pages[usize(k)] = BmPage(false, 0, BmNever, buf[u64]())
+        else
+            assert(code == "D4004" && errno == "22" && m.durable == BmNever, s"$where: $code $errno")
+            pages[usize(k)] = BmPage(false, 0, BmNever, buf[u64]())
+
+    p
+
+private bm_any_down(r: BpRig) -> bool
+    for key in bm_segments()
+        if r.src.disk(key).is_down() then return true
+
+    false
+
+/** Whether the run must recover: a device went down or a sync failed. */
+private bm_must_recover(r: BpRig) -> bool = bm_any_down(r) || r.pool.failed()
+
+/** Whether `e`, met in normal running with no crash and no failed sync, is one the faults explain: a
+ * read error, or the log refusing to flush.
+ */
+private bm_explained(e: CodecError) -> bool =
+    e.code == "D4004" && (e.detail("errno") == Some("5"))
+
+private bm_held_has(held: Buf[PageFix], pid: u64) -> bool
+    for h in held
+        if h.pid == pid then return true
+
+    false
+
+/** One seeded run of `ops` operations over a pool of `capacity` frames; answers what it met. */
+private bm_run(seed: u64, ops: usize, capacity: usize) -> BmCounts
+    val rates = FaultRates(3000, 4000, 20000, 15000, 20000, 0)
+    var r = bp_rig_with(capacity, seed, rates, 0)
+    var g = rng(seed, 0x424d)
+    val pages = buf[BmPage]()
+    val held = buf[PageFix]()
+    var counts = BmCounts(0, 0, 0, 0, 0, 0)
+    var stamp: u64 = 0
+    var lsn: u64 = 0
+
+    for k in 0..<BmPages
+        pages.push(BmPage(false, 0, BmNever, buf[u64]()))
+
+    for i in 0..<ops
+        val what = s"seed $seed, op $i"
+        val k = g.below(BmPages)
+        val pid = bm_pid(k)
+        val m = pages[usize(k)]
+        val choice = g.below(100)
+        r.wal.refuse = g.below(100) < 8
+        var failed: Option[CodecError] = None
+
+        if choice < 28
+            if !m.live then continue
+
+            r.pool.fix(pid, LatchShared) match
+                Ok(h) ->
+                    assert_eq(bp_stamp_of(r.pool.page(h)), m.latest, s"$what: page $k")
+                    r.pool.unfix(h)
+                Err(e) -> failed = Some(e)
+        elif choice < 52
+            if !m.live || bm_held_has(held, pid) then continue
+
+            r.pool.fix(pid, LatchExclusive) match
+                Ok(h) ->
+                    assert_eq(bp_stamp_of(r.pool.page(h)), m.latest, s"$what: page $k")
+                    stamp += 1
+                    lsn += 1
+                    bp_stamp(r.pool.page_mut(h), stamp)
+                    r.pool.unfix_dirty(h, lsn)
+                    pages[usize(k)].latest = stamp
+                    pages[usize(k)].since.push(stamp)
+                Err(e) -> failed = Some(e)
+        elif choice < 60
+            if m.live then continue
+
+            r.pool.fix_new(pid) match
+                Ok(h) ->
+                    stamp += 1
+                    lsn += 1
+                    bp_stamp(r.pool.page_mut(h), stamp)
+                    r.pool.unfix_dirty(h, lsn)
+                    pages[usize(k)].live = true
+                    pages[usize(k)].latest = stamp
+                    pages[usize(k)].since.push(stamp)
+                Err(e) -> failed = Some(e)
+        elif choice < 68
+            if !m.live || bm_held_has(held, pid) || held.len() + 1 >= capacity then continue
+
+            r.pool.fix(pid, LatchShared) match
+                Ok(h) -> held.push(h)
+                Err(e) -> failed = Some(e)
+        elif choice < 76
+            if held.len() == 0 then continue
+            r.pool.unfix(held.remove(usize(g.below(u64(held.len())))))
+        elif choice < 84
+            r.pool.flush_page(pid) match
+                Ok(_) -> assert(!r.pool.is_dirty(pid), s"$what: page $k is dirty after its flush")
+                Err(e) -> failed = Some(e)
+        elif choice < 92
+            r.pool.flush_all() match
+                Ok(_) ->
+                    counts.flushes += 1
+                    assert_eq(r.pool.dirty_count(), 0, what)
+
+                    for j in 0..<BmPages
+                        val q = pages[usize(j)]
+                        if q.live && q.since.len() > 0 then pages[usize(j)] = BmPage(true, q.latest, BmStamp(q.latest), buf[u64]())
+                Err(e) -> failed = Some(e)
+        else
+            // The log flushes on its own, for a commit, up to some LSN it has.
+            if !r.wal.refuse && lsn > r.wal.durable then r.wal.durable = r.wal.durable + g.below(lsn - r.wal.durable + 1)
+
+        failed match
+            Some(e) ->
+                if bm_must_recover(r)
+                    held.clear()
+                    r = bm_recover(r, pages, &counts, what)
+                elif e.detail("file") == Some("wal")
+                    counts.log_refusals += 1
+                else
+                    assert(bm_explained(e), s"$what: page $k failed with ${e.code} ${e.message}")
+                    counts.read_errors += 1
+            None ->
+                if bm_must_recover(r)
+                    held.clear()
+                    r = bm_recover(r, pages, &counts, what)
+
+        for h in held
+            assert(r.pool.resident(h.pid), s"$what: held page ${h.pid} was evicted")
+            assert(r.pool.pins(h.pid) >= 1, s"$what: held page ${h.pid} lost its pin")
+
+    counts.evictions += r.pool.counts().evictions
+    counts
+
+private bm_total(capacity: usize) -> BmCounts
+    var total = BmCounts(0, 0, 0, 0, 0, 0)
+
+    for seed in 1..<201
+        val c = bm_run(u64(seed), 300, capacity)
+        total.recoveries += c.recoveries
+        total.corrupt += c.corrupt
+        total.read_errors += c.read_errors
+        total.log_refusals += c.log_refusals
+        total.evictions += c.evictions
+        total.flushes += c.flushes
+
+    total
+
+private bm_show(t: BmCounts) -> string =
+    s"recoveries ${t.recoveries}, corrupt ${t.corrupt}, read errors ${t.read_errors}, log refusals ${t.log_refusals}, evictions ${t.evictions}, flushes ${t.flushes}"
+
+@test
+fixes_changes_and_flushes_under_faults_agree_with_the_model_over_many_seeds()
+    val t = bm_total(3)
+    val seen = bm_show(t)
+    assert(t.recoveries > 100, s"too few recoveries: $seen")
+    assert(t.corrupt > 10, s"too few torn pages detected: $seen")
+    assert(t.read_errors > 100, s"too few read errors: $seen")
+    assert(t.log_refusals > 100, s"too few log refusals: $seen")
+    assert(t.evictions > 1000, s"too few evictions: $seen")
+    assert(t.flushes > 100, s"too few full flushes: $seen")
+
+@test
+a_pool_of_one_frame_agrees_with_the_model_over_many_seeds()
+    val t = bm_total(1)
+    assert(t.recoveries > 100, s"too few recoveries: ${bm_show(t)}")
+    assert(t.evictions > 1000, s"too few evictions: ${bm_show(t)}")

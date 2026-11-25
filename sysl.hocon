@@ -18,7 +18,8 @@
 // is `cli/`, a project of its own; and the interactive shell it runs (`docs/design/shell.md`); and
 // the block-device seam with its simulated device, which injects every disk fault of
 // `docs/spec/isolation.md` §7.3, and the page checksum checked on every read through it
-// (`docs/spec/on-disk-format.md` §3.1, §9 D11, D14, D15).
+// (`docs/spec/on-disk-format.md` §3.1, §9 D11, D14, D15); and the buffer pool over it: fixed frames,
+// latches, the clock, and write-back under the WAL rule (§2.1, §6.5, `docs/design/buffer.md`).
 
 package {
   name    = "terndb"
