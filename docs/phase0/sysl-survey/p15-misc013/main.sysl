@@ -1,0 +1,24 @@
+// Counted &T handed to C and back, and a read-only racy copy, on 0.13.5.
+import sysl.raw.from_raw
+import sysl.sync.{load_relaxed, SeqLock}
+
+struct Db
+    n: int
+
+open() -> *Db
+    val d: &Db = Db(5)
+    d.into_raw()
+
+value(p: *Db) -> int
+    val d: &Db = from_raw(p)
+    d.n
+
+struct Pos
+    x: int
+    y: int
+
+print("into_raw", value(open()))
+
+var l = SeqLock.new(Pos(1, 2))
+val p = l.read()
+print("seqlock", p.x, p.y)

@@ -1,0 +1,30 @@
+// Need 5 on 0.13.5: durability calls, an uncached open and a writable shared mapping, all in sysl.fs.
+import sysl.fs.{create_update, open_update, open_uncached, map_file, remove_file}
+import sysl.process.pid
+
+val name = s"/tmp/dbsurvey-p13-${pid()}.db"
+var f = create_update(name).unwrap()
+
+var page: [16384]u8 = [0; 16384]
+page[0] = 0xDB
+page[16383] = 0x5A
+print("wrote", f.write_at(3 * 16384, page[..]).unwrap())
+print("sync_data", f.sync_data().is_ok())
+print("full_sync", f.full_sync().is_ok())
+
+val m = f.map_mut().unwrap()
+print("mapped", m.len())
+m.bytes()[3 * 16384 + 1] = 0x77
+print("flush", m.flush().is_ok())
+print("sync_data after flush", f.sync_data().is_ok())
+_ = f.close()
+
+var u = open_uncached(name).unwrap()
+var back: [16384]u8 = [0; 16384]
+val got = u.read_at(3 * 16384, back[..]).unwrap()
+print("uncached read", got.len, got[0], got[1], got[16383])
+_ = u.close()
+
+val r = map_file(name).unwrap()
+print("read map", r.bytes()[3 * 16384 + 1])
+remove_file(name).unwrap()

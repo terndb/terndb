@@ -33,6 +33,34 @@ read_envelope(bytes: []const u8) -> Result[Envelope, CodecError]
         Ok(env) -> Ok(env)
         Err(e) -> Err(e.at(w.position()))
 
+/** The statement node that is the whole of `bytes`, as `encode_statement` writes it: a view's
+ * `query_tree` in `catalog.views` (`ddl.md` §4.2). Decoded only, as `read_envelope` decodes.
+ */
+decode_statement(bytes: []const u8) -> Result[Statement, CodecError]
+    var w = walk(false)
+    var r = Reader(bytes, 0)
+
+    val s = read_statement(&r, &w) match
+        Ok(x) -> x
+        Err(err) -> return Err(err.at(w.position()))
+
+    if r.left() != 0 then return fail("Q1001", "octets follow the statement")
+    Ok(s)
+
+/** The expression node that is the whole of `bytes`, as `encode_expr` writes it: a definition
+ * expression's `…_tree` in the catalog relations (`ddl.md` §4.2). Decoded only.
+ */
+decode_expr(bytes: []const u8) -> Result[Expr, CodecError]
+    var w = walk(false)
+    var r = Reader(bytes, 0)
+
+    val e = read_expr(&r, &w, named("expr"), 0) match
+        Ok(x) -> x
+        Err(err) -> return Err(err.at(w.position()))
+
+    if r.left() != 0 then return fail("Q1001", "octets follow the expression")
+    Ok(e)
+
 /** The §11.1 path of every `Statement`, `Rel` and `Expr` node of `env`, by the pre-order index that
  * spans use (§12.2): the statement is index 0. Empty for a tree that has no encoding.
  */

@@ -265,7 +265,7 @@ struct Shell
      * then the committed catalog is read, outside it: the statement is translated, and the server
      * refuses it as it refuses any statement of a failed transaction.
      */
-    private look_up(*self, name: QualName) -> TableAnswer
+    private[terndb] look_up(*self, name: QualName) -> TableAnswer
         if name.schema == "catalog"
             return catalog_relation(name.name) match
                 Some(fields) -> TableFound(SqlTable(fields, buf()))

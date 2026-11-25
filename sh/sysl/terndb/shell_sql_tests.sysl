@@ -69,9 +69,9 @@ d_describes_a_table_sql_made()
     assert_eq(sq_out(&s), "CREATE INDEX\n")
     s.feed_line("\\d posts")
     val got = sq_out(&s)
-    assert(got.starts_with(" ".repeat(10) + "Table \"public.posts\"\n Column | Type  | Nullable |  Default\n" +
-        "--------+-------+----------+------------\n id     | int64 | not null |\n author | int64 | not null |\n" +
-        " title  | text  | not null |\n score  | int32 |          | '0'::int32\nPrimary key: (id)\nIndexes:\n    \"posts_by_author\" (author)\n"), got)
+    assert(got.starts_with(" ".repeat(8) + "Table \"public.posts\"\n Column | Type  | Nullable | Default\n" +
+        "--------+-------+----------+---------\n id     | int64 | not null |\n author | int64 | not null |\n" +
+        " title  | text  | not null |\n score  | int32 |          | 0\nPrimary key: (id)\nIndexes:\n    \"posts_by_author\" (author)\n"), got)
     assert(got.ends_with("Foreign-key constraints:\n    \"posts_author_fkey\" FOREIGN KEY (author) REFERENCES public.users(id)\n"), got)
 
 @test
