@@ -15,9 +15,44 @@ import sh.sysl.terndb.{BootstrapRole, Expr, Field, Int32, Int64, Item, Literal, 
 main(args: []string)
     if args.len == 5 && args[1] == "header" then header_main(args[2], args[3], args[4])
     elif args.len == 4 && args[1] == "inputs" then inputs_main(args[2], args[3])
+    elif args.len == 4 && args[1] == "codes" then codes_main(args[2], args[3])
     else
-        eprints("usage: tools header <c-api.md> <terndb.h> <nm.txt> | tools inputs <vectors> <out.h>\n")
+        eprints("usage: tools header <c-api.md> <terndb.h> <nm.txt> | inputs <vectors> <out.h> | codes <errors.md> <out.sysl>\n")
         exit(2)
+
+// -- the static registry --------------------------------------------------------------------------
+
+/** Writes `sh/sysl/terndb/capi/capi_codes.sysl` from `errors.md`: every live code and its name, in the
+ * registry's order. `capi_tests.sysl` holds the file to the registry, and fails until it is rewritten.
+ */
+codes_main(errors_path: string, out_path: string)
+    val rows = buf[(string, string)]()
+    var in_area = false
+    for line in read_text(errors_path).unwrap().split("\n")
+        if line.starts_with("## ") then in_area = line.ends_with("`)")
+        elif in_area && line.starts_with("| `") && !line.contains("*Withdrawn*")
+            val cells = line.split("|")
+            val code = cells[1].trim().trim_matches("`")
+            val name = cells[2].trim().trim_matches("`")
+            if code.len == 5 then rows.push((code, name))
+
+    var text = "module sh.sysl.terndb.capi\n\n"
+    text = text + "// The registry of `docs/spec/errors.md` as static C strings, for `terndb_error_code`,\n"
+    text = text + "// `terndb_error_name` and `terndb_code_name` (`c-api.md` §10.2): every live code, its name, in the\n"
+    text = text + "// registry's order. Written by `sysl run tests/capi/tools -- codes docs/spec/errors.md <this file>`;\n"
+    text = text + "// `capi_tests.sysl` holds it to the registry row for row.\n\n"
+    text = text + "/** A registered code and its name, NUL-terminated and static. */\n"
+    text = text + "struct CodeName\n    code: *u8\n    name: *u8\n    code_text: string\n    name_text: string\n\n"
+    text = text + "/** How many live codes the registry holds. */\n"
+    text = text + s"const CodeCount: usize = ${rows.len()}\n\n"
+    text = text + "/** Live code `i` of the registry, in its order; `i` < `CodeCount`. */\n"
+    text = text + "code_at(i: usize) -> CodeName = i match\n"
+    for i in 0..<rows.len()
+        val (c, n) = rows[i]
+        text = text + s"    $i -> CodeName(c\"$c\", c\"$n\", \"$c\", \"$n\")\n"
+    text = text + "    _ -> CodeName(c\"\", c\"\", \"\", \"\")\n"
+    write_text(out_path, text).unwrap()
+    print(s"codes: ${rows.len()} written to $out_path")
 
 // -- the header check -----------------------------------------------------------------------------
 

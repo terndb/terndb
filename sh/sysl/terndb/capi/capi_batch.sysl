@@ -337,7 +337,8 @@ column_get_i32(c: *const ColRec, i: usize) -> i32 =
 
 @export("terndb_column_get_i64")
 column_get_i64(c: *const ColRec, i: usize) -> i64 =
-    if slot_ok(c, i, [TypeInt64, TypeTime, TypeDatetime, TypeTimestamp], "terndb_column_get_i64") then
+    if slot_ok(c, i, [TypeInt64, TypeTime, TypeTimestamp, TypeTimestamptz, TypeTimeP, TypeTimestampP, TypeTimestamptzP,
+            TypeIntervalDt, TypeMoney], "terndb_column_get_i64") then
         i64.wrap(le(slot(c, i), 8))
     else 0
 

@@ -270,7 +270,7 @@ static void test_allocator_null_fails_cleanly(void) {
     /* TODO: un-ignore when sysl gives an allocation failure back to the program: an allocator that
      * answers NULL stops a sysl program at the allocation (sysl packages.md "One heap"), so C2001 and
      * T1008 (c-api.md §3 rule 3) cannot be raised. */
-    SKIP("sysl 0.13.6 stops the process when its allocator answers NULL; C2001 cannot be raised");
+    SKIP("sysl (0.13.6, 0.13.7) stops the process when its allocator answers NULL; C2001 cannot be raised");
 }
 
 /* ---- §2.4 handles ----------------------------------------------------------------------------- */

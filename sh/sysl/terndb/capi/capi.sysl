@@ -108,10 +108,13 @@ const TypeBytes: i32 = 9
 const TypeDate: i32 = 10
 @export("TERNDB_TYPE_TIME")
 const TypeTime: i32 = 11
+/** Zoneless: the same kind as `TERNDB_TYPE_DATETIME`. */
+@export("TERNDB_TYPE_TIMESTAMP")
+const TypeTimestamp: i32 = 12
 @export("TERNDB_TYPE_DATETIME")
 const TypeDatetime: i32 = 12
-@export("TERNDB_TYPE_TIMESTAMP")
-const TypeTimestamp: i32 = 13
+@export("TERNDB_TYPE_TIMESTAMPTZ")
+const TypeTimestamptz: i32 = 13
 @export("TERNDB_TYPE_INTERVAL")
 const TypeInterval: i32 = 14
 @export("TERNDB_TYPE_UUID")
@@ -136,6 +139,55 @@ const TypeUInt32: i32 = 24
 const TypeUInt64: i32 = 25
 @export("TERNDB_TYPE_JSON")
 const TypeJson: i32 = 26
+// Tree 1.1 (`query-tree.md` §2.7).
+@export("TERNDB_TYPE_NUMERIC")
+const TypeNumeric: i32 = 27
+@export("TERNDB_TYPE_JSONB")
+const TypeJsonb: i32 = 28
+@export("TERNDB_TYPE_XML")
+const TypeXml: i32 = 29
+@export("TERNDB_TYPE_MONEY")
+const TypeMoney: i32 = 30
+@export("TERNDB_TYPE_INET")
+const TypeInet: i32 = 31
+@export("TERNDB_TYPE_VARCHAR")
+const TypeVarchar: i32 = 64
+@export("TERNDB_TYPE_CHAR")
+const TypeChar: i32 = 65
+@export("TERNDB_TYPE_VARBINARY")
+const TypeVarbinary: i32 = 66
+@export("TERNDB_TYPE_BINARY")
+const TypeBinary: i32 = 67
+@export("TERNDB_TYPE_DECFLOAT")
+const TypeDecfloat: i32 = 68
+@export("TERNDB_TYPE_TIME_P")
+const TypeTimeP: i32 = 69
+@export("TERNDB_TYPE_TIMESTAMP_P")
+const TypeTimestampP: i32 = 70
+@export("TERNDB_TYPE_TIMESTAMPTZ_P")
+const TypeTimestamptzP: i32 = 71
+@export("TERNDB_TYPE_TIMETZ")
+const TypeTimetz: i32 = 72
+@export("TERNDB_TYPE_INTERVAL_YM")
+const TypeIntervalYm: i32 = 73
+@export("TERNDB_TYPE_INTERVAL_DT")
+const TypeIntervalDt: i32 = 74
+@export("TERNDB_TYPE_ARRAY")
+const TypeArray: i32 = 75
+@export("TERNDB_TYPE_RANGE")
+const TypeRange: i32 = 76
+@export("TERNDB_TYPE_MULTIRANGE")
+const TypeMultirange: i32 = 77
+@export("TERNDB_TYPE_CIDR")
+const TypeCidr: i32 = 78
+@export("TERNDB_TYPE_MACADDR")
+const TypeMacaddr: i32 = 79
+@export("TERNDB_TYPE_MACADDR8")
+const TypeMacaddr8: i32 = 80
+@export("TERNDB_TYPE_BIT")
+const TypeBit: i32 = 81
+@export("TERNDB_TYPE_VARBIT")
+const TypeVarbit: i32 = 82
 
 @export("TERNDB_LOG_ERROR")
 const LogError: i32 = 1
