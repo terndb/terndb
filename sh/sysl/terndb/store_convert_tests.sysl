@@ -1,0 +1,786 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The `convert_column` job (`ddl.md` §8.5 rule 2) as the in-memory store runs it, at the commit of the
+// retype: an empty and a one-row table; every lossless retype of §5.3 rule 3, with and without
+// `using`, and retypes that can fail; NULLs; a conversion failing on the first, a middle and the last
+// row; writers the job did not see, committing before and after it, with each interleaving forced; the
+// creating transaction rolling back; a drop, rename or new default of the column in the transaction
+// that retyped it; two retypes in turn; the column under a unique index; a snapshot older than the
+// conversion; and a primary-key column, whose retype is a rebuild that does not run.
+
+/** `app.t(id int64, a <ty>, b int64?)`, keyed by `id`. */
+private cv_store(ty: Type) -> &Store
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("a", ty), cat_col("b", nullable(Int64))], ["id"]))
+    mem_store(c)
+
+private cv_t(s: &Store) -> u64 = st_oid(s, "t")
+
+/** `create unique index <name> on app.t (a)`. */
+private cv_unique(name: string = "t_a") -> Statement
+    val keys = buf[IndexKey]()
+    keys.push(IndexKey(KeyColumn("a"), false))
+    CreateIndex(name, IndexDef(cat_q("t"), true, keys, None), false)
+
+/** Each of `sts` run in one transaction, which must commit; the transaction's id. */
+private cv_ddls(s: &Store, sts: []const Statement, file: string = __FILE__, line: long = __LINE__) -> u64
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+
+    for st in sts
+        s.ddl(t, envelope([], st), BootstrapRole) match
+            Ok(Done(_)) -> ()
+            Ok(Wait(h)) -> assert(false, s"the statement waits for $h", file, line)
+            Err(e) -> assert(false, s"the statement is refused with ${e.code}: ${e.message}", file, line)
+
+    st_commit(s, t, file, line)
+    t.id
+
+private cv_retype(s: &Store, to: Type, using: Option[Expr] = None, file: string = __FILE__, line: long = __LINE__) -> u64 =
+    cv_ddls(s, [cat_alter("t", [RetypeColumn("a", to, using)])], file, line)
+
+/** The `convert_column` jobs transaction `txid` started: "none", "succeeded", or the failed one's code. */
+private cv_job(s: &Store, txid: u64, file: string = __FILE__, line: long = __LINE__) -> string
+    var out = "none"
+    var n = 0
+
+    for j in s.jobs_of(txid)
+        if j.kind == "convert_column"
+            n += 1
+            assert(j.object == cv_t(s), "the job's object is the table", file, line)
+
+            out = j.end match
+                JobSucceeded -> "succeeded"
+                JobFailed(code, _) -> code
+
+    assert(n <= 1, s"one convert job, not $n", file, line)
+    out
+
+/** The message of the failed `convert_column` job of `txid`. */
+private cv_message(s: &Store, txid: u64) -> string
+    for j in s.jobs_of(txid)
+        if j.kind == "convert_column"
+            j.end match
+                JobFailed(_, m) -> return m
+                JobSucceeded -> ()
+
+    ""
+
+/** Column `name` of `t` in the newest committed catalog. */
+private cv_col(s: &Store, name: string = "a") -> CatColumn = cat_table_of(s.latest_catalog(), "t").column_named(name).unwrap()
+
+/** Inserts `(id, a, b)` in a transaction of its own: "ok", or the code that refused it. */
+private cv_put(s: &Store, id: i128, a: Value, b: Value = Null) -> string
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val r = st_code(s.insert(t, cv_t(s), store_row(s, cv_t(s), rec([Int(id), a, b]))))
+    if r != "ok" then return r
+    st_code(s.commit(t))
+
+/** The row keyed `id` as a new transaction reads it, or null for none. */
+private cv_row(s: &Store, id: i128, file: string = __FILE__, line: long = __LINE__) -> Value
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+
+    s.get(t, cv_t(s), st_key(id)) match
+        Ok(Some(r)) ->
+            assert_eq(r.schema, cat_table_of(s.catalog, "t").schema_version(), "read in the current version", file, line)
+            r.value
+        Ok(None) -> Null
+        Err(e) ->
+            assert(false, s"the read fails with ${e.code}: ${e.message}", file, line)
+            Null
+
+/** Column `a` of the row keyed `id`, as a new transaction reads it. */
+private cv_a(s: &Store, id: i128, file: string = __FILE__, line: long = __LINE__) -> Value = cv_row(s, id, file, line) match
+    Record(fs) -> fs[1]
+    _ -> Null
+
+/** Every row of `t` a new transaction scans, column `a` of each in key order. */
+private cv_scan_a(s: &Store) -> Buf[Value]
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val out = buf[Value]()
+
+    for h in s.scan(t, cv_t(s), all_rows()).unwrap()
+        out.push(h.row.at(1))
+
+    out
+
+private cv_vals(xs: []const Value) -> Buf[Value]
+    val b = buf[Value]()
+    b.extend(xs)
+    b
+
+/** A strict cast of `a` to `to`: the conversion a retype with no `using` records. */
+private cv_cast(to: Type) -> Expr = Cast(cat_row("a"), to, Strict)
+
+/** The column converts from `from` to `to` by `using` (none: the strict cast) and reads `want` for
+ * each of `values`: with a unique index over it when `indexed`, so that a lossless retype runs a job.
+ */
+private cv_converts(from: Type, to: Type, values: []const Value, want: []const Value, using: Option[Expr], indexed: bool,
+        file: string = __FILE__, line: long = __LINE__)
+    val s = cv_store(from)
+    if indexed then cv_ddls(s, [cv_unique()], file, line)
+
+    val vs = cv_vals(values)
+    val ws = cv_vals(want)
+
+    for i in 0..<vs.len()
+        assert_eq(cv_put(s, i128(i) + 1, vs[i]), "ok", "the row is written", file, line)
+
+    val txid = cv_retype(s, to, using, file, line)
+    assert_eq(cv_job(s, txid, file, line), "succeeded", "the job", file, line)
+    val c = cv_col(s)
+    assert(c.state == ColumnReady && c.ty == to && c.target.is_none() && c.using.is_none(), "the column is ready in its new type", file, line)
+    val t = cat_table_of(s.latest_catalog(), "t")
+    assert(t.versions[t.versions.len() - 1].completes == items_of([c.id]), "the version completes the conversion", file, line)
+
+    for i in 0..<vs.len()
+        assert(cv_a(s, i128(i) + 1, file, line) == ws[i], s"row ${i + 1} reads converted", file, line)
+
+    assert(cv_scan_a(s) == cv_vals(want), "a scan reads every row converted", file, line)
+
+/** The lossless retype `from` → `to`: through a job under a unique index with no `using`, and
+ * through a job with `using` without one.
+ */
+private cv_lossless(from: Type, to: Type, values: []const Value, want: []const Value, file: string = __FILE__, line: long = __LINE__)
+    cv_converts(from, to, values, want, None, true, file, line)
+    cv_converts(from, to, values, want, Some(cv_cast(to)), false, file, line)
+
+// -- the job over empty and one-row tables -------------------------------------------------------
+
+@test
+a_conversion_of_an_empty_table_completes()
+    val s = cv_store(nullable(Text))
+    val txid = cv_retype(s, nullable(Int64))
+    assert_eq(cv_job(s, txid), "succeeded")
+    assert(cv_col(s).state == ColumnReady && cv_col(s).ty == nullable(Int64), "ready in its new type")
+    assert_eq(cv_put(s, 1, Int(5)), "ok")
+    assert(cv_a(s, 1) == Int(5), "a row written since reads as written")
+
+@test
+a_conversion_of_one_row_completes_and_the_row_reads_converted()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("42")), "ok")
+    val txid = cv_retype(s, nullable(Int64))
+    assert_eq(cv_job(s, txid), "succeeded")
+    assert(cv_a(s, 1) == Int(42), "converted")
+
+@test
+a_conversion_of_one_row_that_fails_leaves_the_column_in_its_old_type()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("x")), "ok")
+    val before = cv_col(s)
+    val txid = cv_retype(s, nullable(Int64))
+    assert_eq(cv_job(s, txid), st_code(cast_value(Text("x"), Text, Int64)))
+    val c = cv_col(s)
+    assert(c.state == ColumnReady && c.ty == before.ty && c.target.is_none() && c.using.is_none(), "ready in its old type")
+    assert(cv_a(s, 1) == Text("x"), "the row reads as it was")
+    val t = cat_table_of(s.latest_catalog(), "t")
+    assert_eq(t.versions[t.versions.len() - 1].completes.len(), 0, "the version completes nothing")
+
+@test
+a_retype_that_is_metadata_only_runs_no_job()
+    val s = cv_store(nullable(Int32))
+    assert_eq(cv_put(s, 1, Int(7)), "ok")
+    val txid = cv_retype(s, nullable(Int64))
+    assert_eq(cv_job(s, txid), "none")
+    assert(cv_a(s, 1) == Int(7), "converted on read")
+
+@test
+the_job_records_its_kind_object_and_transaction()
+    val s = cv_store(nullable(Text))
+    val txid = cv_retype(s, nullable(Int64))
+    val js = s.jobs_of(txid)
+    assert_eq(js.len(), 1)
+    assert_eq(js[0].kind, "convert_column")
+    assert_eq(js[0].object, cv_t(s))
+    assert_eq(js[0].txid, txid)
+
+/** `st` committed in a transaction of its own; its commit number. A reader left live from before it
+ * keeps that commit's catalog retained.
+ */
+private cv_commit_of(s: &Store, st: Statement) -> u64
+    val _ = s.begin(Snapshot)
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    st_done(s.ddl(t, envelope([], st), BootstrapRole))
+    st_commit(s, t)
+
+@test
+a_conversion_leaves_the_catalog_its_retype_committed_as_it_was()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("5")), "ok")
+    val c = cv_commit_of(s, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)]))
+    val at = cat_table_of(s.base_at(c).catalog, "t").column_named("a").unwrap()
+    assert(at.state == ColumnConverting && at.ty == nullable(Text), "the retype's own catalog still has the column converting")
+    assert(cv_col(s).state == ColumnReady && cv_col(s).ty == nullable(Int64), "the job's catalog has it converted")
+
+@test
+a_failed_conversion_leaves_the_catalog_its_retype_committed_as_it_was()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("x")), "ok")
+    val c = cv_commit_of(s, cat_alter("t", [RetypeColumn("a", nullable(Int64), None)]))
+    val at = cat_table_of(s.base_at(c).catalog, "t")
+    assert(at.column_named("a").unwrap().state == ColumnConverting, "still converting there")
+    assert_eq(at.versions[at.versions.len() - 1].completes.len(), 0)
+
+@test
+an_index_build_leaves_the_catalog_its_create_committed_as_it_was()
+    val s = cv_store(nullable(Text))
+    val c = cv_commit_of(s, cv_unique())
+    var state = "absent"
+
+    for x in s.base_at(c).catalog.indexes
+        if x.name == "t_a" then state = if x.state == IndexBuilding then "building" else "other"
+
+    assert_eq(state, "building", "the create's own catalog still has the index building")
+
+    for x in s.latest_catalog().indexes
+        if x.name == "t_a" then assert(x.state == IndexReady, "the job's catalog has it ready")
+
+// -- the lossless retypes of §5.3 rule 3 ---------------------------------------------------------
+
+@test
+a_job_converts_an_integer_that_widens()
+    cv_lossless(nullable(Int8), nullable(Int16), [Int(-128), Int(127), Null], [Int(-128), Int(127), Null])
+    cv_lossless(nullable(Int16), nullable(Int64), [Int(-32768), Int(32767)], [Int(-32768), Int(32767)])
+    cv_lossless(nullable(Int64), nullable(Int128), [Int(-9223372036854775808), Int(9223372036854775807)], [Int(-9223372036854775808), Int(9223372036854775807)])
+
+@test
+a_job_converts_an_unsigned_integer_that_widens()
+    cv_lossless(nullable(UInt8), nullable(UInt32), [UInt(0), UInt(255)], [UInt(0), UInt(255)])
+    cv_lossless(nullable(UInt32), nullable(UInt64), [UInt(4294967295)], [UInt(4294967295)])
+
+@test
+a_job_converts_an_unsigned_integer_to_a_wider_signed_one()
+    cv_lossless(nullable(UInt16), nullable(Int32), [UInt(0), UInt(65535)], [Int(0), Int(65535)])
+    cv_lossless(nullable(UInt32), nullable(Int64), [UInt(4294967295)], [Int(4294967295)])
+
+@test
+a_job_converts_an_integer_to_a_decimal_that_holds_every_value()
+    cv_lossless(nullable(Int32), nullable(Decimal(10, 0)), [Int(-2147483648), Int(0)], [Int(-2147483648), Int(0)])
+    cv_lossless(nullable(UInt8), nullable(Decimal(3, 0)), [UInt(255)], [Int(255)])
+
+@test
+a_job_converts_a_decimal_that_gains_scale_and_integer_digits()
+    cv_lossless(nullable(Decimal(5, 2)), nullable(Decimal(8, 3)), [Int(12345), Int(-1)], [Int(123450), Int(-10)])
+
+@test
+a_job_converts_a_float32_to_a_float64()
+    cv_lossless(nullable(Float32), nullable(Float64), [Float(1.5), Float(-0.25)], [Float(1.5), Float(-0.25)])
+
+@test
+a_job_converts_a_small_integer_to_a_float()
+    cv_lossless(nullable(Int16), nullable(Float32), [Int(-7), Int(300)], [Float(-7.0), Float(300.0)])
+    cv_lossless(nullable(UInt8), nullable(Float32), [UInt(9)], [Float(9.0)])
+    cv_lossless(nullable(Int32), nullable(Float64), [Int(2147483647)], [Float(2147483647.0)])
+    cv_lossless(nullable(UInt32), nullable(Float64), [UInt(4294967295)], [Float(4294967295.0)])
+
+@test
+json_becomes_text_through_a_job_with_using_and_at_once_without()
+    // `json` is no key component, so without `using` the retype is metadata-only and reads on the fly.
+    cv_converts(nullable(Json), nullable(Text), [Text("{\"k\":1}"), Null], [Text("{\"k\":1}"), Null], Some(cv_cast(nullable(Text))), false)
+    val s = cv_store(nullable(Json))
+    assert_eq(cv_put(s, 1, Text("[1,2]")), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Text))), "none")
+    assert(cv_a(s, 1) == Text("[1,2]"), "read as text")
+
+@test
+a_column_becomes_nullable_through_a_job_with_using_and_at_once_without()
+    cv_converts(Int64, nullable(Int64), [Int(3)], [Int(3)], Some(cv_cast(nullable(Int64))), false)
+    val s = cv_store(Int64)
+    cv_ddls(s, [cv_unique()])
+    assert_eq(cv_put(s, 1, Int(4)), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "none", "the key encoding is unchanged")
+    assert(cv_a(s, 1) == Int(4), "read as it was")
+
+@test
+a_list_becomes_a_bag_through_a_job_with_using_and_at_once_without()
+    val l = nullable(list(Int32))
+    val b = nullable(bag(Int32))
+    cv_converts(l, b, [rel([Int(1), Int(2)]), rel([]), Null], [rel([Int(1), Int(2)]), rel([]), Null], Some(cv_cast(b)), false)
+    val s = cv_store(l)
+    assert_eq(cv_put(s, 1, rel([Int(5)])), "ok")
+    assert_eq(cv_job(s, cv_retype(s, b)), "none")
+    assert(cv_a(s, 1) == rel([Int(5)]), "read as a bag")
+
+@test
+a_record_with_a_widened_field_converts_through_a_job_with_using()
+    val from = nullable(record([Field("x", Int16)]))
+    val to = nullable(record([Field("x", Int64)]))
+    cv_converts(from, to, [rec([Int(-3)]), Null], [rec([Int(-3)]), Null], Some(cv_cast(to)), false)
+
+// -- `using` expressions, retypes that can fail, and NULLs ---------------------------------------
+
+@test
+a_using_expression_computes_each_rows_new_value()
+    cv_converts(nullable(Text), nullable(Int64), [Text("abc"), Text(""), Text("hello")], [Int(3), Int(0), Int(5)], Some(call("length", [cat_row("a")])), false)
+
+@test
+a_using_expression_may_read_another_column()
+    val s = cv_store(nullable(Int32))
+    assert_eq(cv_put(s, 1, Int(2), Int(10)), "ok")
+    assert_eq(cv_put(s, 2, Int(3), Null), "ok")
+    val using = call("add", [Cast(cat_row("a"), nullable(Int64), Strict), cat_row("b")])
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(using))), "succeeded")
+    assert(cv_a(s, 1) == Int(12), "a + b")
+    assert(cv_a(s, 2) == Null, "a + null")
+
+@test
+a_using_expression_of_the_same_type_still_converts()
+    val s = cv_store(nullable(Int64))
+    assert_eq(cv_put(s, 1, Int(2)), "ok")
+    val using = call("mul", [cat_row("a"), Literal(Int64, Int(10))])
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(using))), "succeeded")
+    assert(cv_a(s, 1) == Int(20), "the conversion, not the identity")
+
+@test
+a_narrowing_retype_converts_every_value_that_fits()
+    cv_converts(nullable(Int64), nullable(Int16), [Int(-32768), Int(32767), Null], [Int(-32768), Int(32767), Null], None, false)
+
+@test
+a_text_retype_parses_every_value()
+    cv_converts(nullable(Text), nullable(Int32), [Text("-5"), Text("17")], [Int(-5), Int(17)], None, false)
+
+@test
+nulls_convert_to_null_and_a_using_may_replace_them()
+    cv_converts(nullable(Text), nullable(Int64), [Null, Null], [Null, Null], None, false)
+    val using = call("coalesce", [Cast(cat_row("a"), nullable(Int64), Strict), Literal(Int64, Int(0))])
+    cv_converts(nullable(Text), Int64, [Null, Text("4")], [Int(0), Int(4)], Some(using), false)
+
+/** `t` holding `values` at ids 1.., retyped `text` → `int64`: the job's code and message. */
+private cv_failing(values: []const Value) -> (&Store, string, string)
+    val s = cv_store(nullable(Text))
+
+    val vs = cv_vals(values)
+
+    for i in 0..<vs.len()
+        assert_eq(cv_put(s, i128(i) + 1, vs[i]), "ok")
+
+    val txid = cv_retype(s, nullable(Int64))
+    (s, cv_job(s, txid), cv_message(s, txid))
+
+private cv_unchanged(s: &Store, values: []const Value, file: string = __FILE__, line: long = __LINE__)
+    val c = cv_col(s)
+    assert(c.state == ColumnReady && c.ty == nullable(Text) && c.using.is_none(), "ready in its old type", file, line)
+    assert(cv_scan_a(s) == cv_vals(values), "every row reads as it was", file, line)
+
+@test
+a_conversion_failing_on_the_first_row_fails_the_job_naming_it()
+    val values = [Text("x"), Text("2"), Text("3")]
+    val (s, code, message) = cv_failing(values)
+    assert_eq(code, st_code(cast_value(Text("x"), Text, Int64)))
+    assert(message.contains("keyed (1)"), s"the message names the key: $message")
+    cv_unchanged(s, values)
+
+@test
+a_conversion_failing_on_a_middle_row_fails_the_job_naming_it()
+    val values = [Text("1"), Text("2"), Text("y"), Text("4"), Text("5")]
+    val (s, code, message) = cv_failing(values)
+    assert_eq(code, st_code(cast_value(Text("y"), Text, Int64)))
+    assert(message.contains("keyed (3)"), s"the message names the key: $message")
+    cv_unchanged(s, values)
+
+@test
+a_conversion_failing_on_the_last_row_fails_the_job_naming_it()
+    val values = [Text("1"), Text("2"), Text("z")]
+    val (s, code, message) = cv_failing(values)
+    assert_eq(code, st_code(cast_value(Text("z"), Text, Int64)))
+    assert(message.contains("keyed (3)"), s"the message names the key: $message")
+    cv_unchanged(s, values)
+
+@test
+an_overflowing_narrowing_fails_the_job_with_the_casts_code()
+    val s = cv_store(nullable(Int64))
+    assert_eq(cv_put(s, 1, Int(1)), "ok")
+    assert_eq(cv_put(s, 2, Int(40000)), "ok")
+    val code = cv_job(s, cv_retype(s, nullable(Int16)))
+    assert_eq(code, st_code(cast_value(Int(40000), Int64, Int16)))
+    assert(code == "R0001" || code == "R0006", s"a conversion code, not $code")
+    assert(cv_a(s, 2) == Int(40000), "unchanged")
+
+@test
+a_using_that_raises_fails_the_job_with_its_code()
+    val s = cv_store(nullable(Int64))
+    assert_eq(cv_put(s, 1, Int(9223372036854775807)), "ok")
+    val using = call("add", [cat_row("a"), Literal(Int64, Int(1))])
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(using))), "R0001")
+    assert(cv_a(s, 1) == Int(9223372036854775807), "unchanged")
+
+@test
+a_column_whose_conversion_failed_converts_again()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("x")), "ok")
+    assert(cv_job(s, cv_retype(s, nullable(Int64))) != "succeeded", "the first fails")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(call("length", [cat_row("a")])))), "succeeded")
+    assert(cv_a(s, 1) == Int(1), "the second converts")
+
+// -- writers the job did not see -------------------------------------------------------------------
+
+/** A snapshot transaction that has entered the store's catalog and holds a catalog read of its own,
+ * reading no definition, as a writer whose statements never name column `a` does, so that its commit
+ * reconciles with the DDL committed during it.
+ */
+private cv_writer(s: &Store) -> &Txn
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val _ = s.txn_catalog_of(t)
+    t
+
+/** Inserts `(id, a, null)` as `t`, encoded in the schema version `t`'s catalog holds. */
+private cv_insert(s: &Store, t: &Txn, id: i128, a: Value)
+    s.enter(t).unwrap()
+    assert_eq(st_code(s.insert(t, cv_t(s), store_row(s, cv_t(s), rec([Int(id), a, Null])))), "ok")
+
+private cv_replace(s: &Store, t: &Txn, id: i128, a: Value, b: Value = Null)
+    s.enter(t).unwrap()
+    val changes = buf[RowChange]()
+    changes.push(Replace(st_key(id), store_row(s, cv_t(s), rec([Int(id), a, b]))))
+    assert_eq(st_code(s.write_rows(t, cv_t(s), changes)), "ok")
+
+private cv_remove(s: &Store, t: &Txn, id: i128)
+    s.enter(t).unwrap()
+    val changes = buf[RowChange]()
+    changes.push(Remove(st_key(id)))
+    assert_eq(st_code(s.write_rows(t, cv_t(s), changes)), "ok")
+
+@test
+an_insert_uncommitted_during_the_job_that_converts_commits_and_reads_converted()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("1")), "ok")
+    val w = cv_writer(s)
+    cv_insert(s, w, 2, Text("22"))
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded", "the job does not see the insert")
+    st_commit(s, w)
+    assert(cv_a(s, 2) == Int(22), "the writer's row reads converted")
+
+@test
+an_insert_uncommitted_during_the_job_that_does_not_convert_aborts_at_commit()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("1")), "ok")
+    val w = cv_writer(s)
+    cv_insert(s, w, 2, Text("bad"))
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    assert_eq(st_code(s.commit(w)), st_code(cast_value(Text("bad"), Text, Int64)))
+    assert(cv_row(s, 2) == Null, "the row is gone")
+    assert(cv_a(s, 1) == Int(1), "the committed row reads converted")
+
+@test
+an_insert_after_the_job_by_a_writer_that_began_before_it_is_reconciled()
+    for (value, want) in [(Text("5"), "ok"), (Text("five"), st_code(cast_value(Text("five"), Text, Int64)))]
+        val s = cv_store(nullable(Text))
+        val w = cv_writer(s)
+        assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+        cv_insert(s, w, 1, value)
+        assert_eq(st_code(s.commit(w)), want)
+        assert(cv_row(s, 1) == if want == "ok" then rec([Int(1), Int(5), Null]) else Null, "the row")
+
+@test
+an_update_uncommitted_during_the_job_to_a_value_that_does_not_convert_aborts_at_commit()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("1")), "ok")
+    val w = cv_writer(s)
+    cv_replace(s, w, 1, Text("one"))
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded", "the job reads the committed value")
+    assert_eq(st_code(s.commit(w)), st_code(cast_value(Text("one"), Text, Int64)))
+    assert(cv_a(s, 1) == Int(1), "the committed value, converted")
+
+@test
+an_update_of_another_column_during_the_job_commits_and_reads_converted()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("8")), "ok")
+    val w = cv_writer(s)
+    cv_replace(s, w, 1, Text("8"), Int(99))
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    st_commit(s, w)
+    assert(cv_row(s, 1) == rec([Int(1), Int(8), Int(99)]), "both columns")
+
+@test
+a_delete_uncommitted_during_the_job_does_not_hide_the_row_from_it()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("bad")), "ok")
+    val w = cv_writer(s)
+    cv_remove(s, w, 1)
+    assert(cv_job(s, cv_retype(s, nullable(Int64))) != "succeeded", "the job sees the committed row")
+    st_commit(s, w)
+    assert(cv_row(s, 1) == Null, "the delete commits")
+    assert(cv_col(s).ty == nullable(Text), "the column keeps its old type")
+
+@test
+a_delete_committed_before_the_job_removes_the_row_from_it()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("bad")), "ok")
+    assert_eq(cv_put(s, 2, Text("2")), "ok")
+    val w = cv_writer(s)
+    cv_remove(s, w, 1)
+    st_commit(s, w)
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    assert(cv_scan_a(s) == cv_vals([Int(2)]), "the one row left")
+
+@test
+a_delete_after_the_job_by_a_writer_that_began_before_it_commits()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("3")), "ok")
+    val w = cv_writer(s)
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    cv_remove(s, w, 1)
+    st_commit(s, w)
+    assert(cv_row(s, 1) == Null, "deleted")
+
+@test
+a_snapshot_older_than_the_conversion_reads_the_old_type()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("12")), "ok")
+    val r = cv_writer(s)
+    assert(s.get(r, cv_t(s), st_key(1)).unwrap().unwrap().at(1) == Text("12"), "before")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    s.enter(r).unwrap()
+    assert(s.get(r, cv_t(s), st_key(1)).unwrap().unwrap().at(1) == Text("12"), "the old snapshot reads the old type")
+    assert(cv_a(s, 1) == Int(12), "a new one reads the new type")
+    st_commit(s, r)
+
+// -- the creating transaction, and other changes of the column in it -----------------------------
+
+@test
+a_retype_rolled_back_runs_no_job_and_changes_nothing()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("1")), "ok")
+    val before = cv_col(s)
+    val versions = cat_table_of(s.latest_catalog(), "t").versions.len()
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    st_done(s.ddl(t, envelope([], cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), BootstrapRole))
+    s.abort(t).unwrap()
+    assert_eq(s.jobs.len(), 0)
+    assert(cv_col(s) == before, "the column is as it was")
+    assert_eq(cat_table_of(s.latest_catalog(), "t").versions.len(), versions)
+    assert(cv_a(s, 1) == Text("1"), "the row reads as it was")
+
+@test
+a_row_the_retyping_transaction_writes_after_the_retype_is_proved_by_the_job()
+    for (value, ok) in [(Text("6"), true), (Text("six"), false)]
+        val s = cv_store(nullable(Text))
+        val t = s.begin(Snapshot)
+        s.enter(t).unwrap()
+        st_done(s.ddl(t, envelope([], cat_alter("t", [RetypeColumn("a", nullable(Int64), None)])), BootstrapRole))
+        s.enter(t).unwrap()
+        cv_insert(s, t, 1, value)
+        st_commit(s, t)
+        assert_eq(cv_job(s, t.id) == "succeeded", ok)
+        assert(cv_a(s, 1) == if ok then Int(6) else value, "the row")
+
+@test
+a_column_dropped_after_its_retype_in_one_transaction_runs_no_job()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("bad")), "ok")
+    val txid = cv_ddls(s, [cat_alter("t", [RetypeColumn("a", nullable(Int64), None)]), cat_alter("t", [DropColumn("a", false)])])
+    assert_eq(cv_job(s, txid), "none")
+    assert(cat_table_of(s.latest_catalog(), "t").column_named("a").is_none(), "dropped")
+    assert(cv_row(s, 1) == rec([Int(1), Null]), "the row without it")
+
+@test
+a_column_renamed_after_its_retype_in_one_transaction_converts_under_its_new_name()
+    val s = cv_store(nullable(Text))
+    assert_eq(cv_put(s, 1, Text("abcd")), "ok")
+    val using = Some(call("length", [cat_row("a")]))
+    val txid = cv_ddls(s, [cat_alter("t", [RetypeColumn("a", nullable(Int64), using)]), cat_alter("t", [RenameColumn("a", "alpha")])])
+    assert_eq(cv_job(s, txid), "succeeded")
+    val c = cv_col(s, "alpha")
+    assert(c.state == ColumnReady && c.ty == nullable(Int64), "ready under its new name")
+    assert(cv_a(s, 1) == Int(4), "converted by the rewritten conversion")
+
+@test
+a_default_set_after_the_retype_in_one_transaction_survives_the_conversion()
+    val s = cv_store(nullable(Int64))
+    assert_eq(cv_put(s, 1, Int(3)), "ok")
+    val d = Literal(Int16, Int(7))
+    val txid = cv_ddls(s, [cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]), cat_alter("t", [SetColumnDefault("a", Some(d))])])
+    assert_eq(cv_job(s, txid), "succeeded")
+    assert(cv_col(s).default == Some(d) && cv_col(s).ty == nullable(Int16), "the default stays")
+    assert(cv_a(s, 1) == Int(3), "converted")
+
+@test
+a_default_set_after_the_retype_survives_a_failed_conversion()
+    val s = cv_store(nullable(Int64))
+    assert_eq(cv_put(s, 1, Int(70000)), "ok")
+    val d = Literal(Int16, Int(7))
+    val txid = cv_ddls(s, [cat_alter("t", [RetypeColumn("a", nullable(Int16), None)]), cat_alter("t", [SetColumnDefault("a", Some(d))])])
+    assert(cv_job(s, txid) != "succeeded", "fails")
+    assert(cv_col(s).default == Some(d) && cv_col(s).ty == nullable(Int64), "the default stays on the old type")
+
+@test
+two_retypes_of_one_column_in_turn_compose()
+    val s = cv_store(nullable(Int32))
+    assert_eq(cv_put(s, 1, Int(12345)), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Text), Some(cv_cast(nullable(Text))))), "succeeded")
+    assert_eq(cv_put(s, 2, Text("hello")), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(call("length", [cat_row("a")])))), "succeeded")
+    assert(cv_a(s, 1) == Int(5), "a row of the first version goes through both conversions")
+    assert(cv_a(s, 2) == Int(5), "a row of the middle version goes through the second")
+    assert_eq(cv_put(s, 3, Int(1)), "ok")
+    assert(cv_scan_a(s) == cv_vals([Int(5), Int(5), Int(1)]), "a scan")
+
+@test
+two_columns_retyped_in_one_statement_each_run_a_job()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("a", nullable(Text)), cat_col("b", nullable(Text))], ["id"]))
+    val s = mem_store(c)
+    assert_eq(cv_put(s, 1, Text("1"), Text("22")), "ok")
+    val txid = cv_ddls(s, [cat_alter("t", [RetypeColumn("a", nullable(Int64), None), RetypeColumn("b", nullable(Int64), None)])])
+    assert_eq(s.jobs_of(txid).len(), 2)
+    assert(cv_row(s, 1) == rec([Int(1), Int(1), Int(22)]), "both converted")
+
+// -- indexes and keys --------------------------------------------------------------------------------
+
+@test
+a_column_under_a_unique_index_converts_and_the_index_holds_the_new_values()
+    val s = cv_store(nullable(Text))
+    cv_ddls(s, [cv_unique()])
+    assert_eq(cv_put(s, 1, Text("10")), "ok")
+    assert_eq(cv_put(s, 2, Text("20")), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    assert_eq(cv_put(s, 3, Int(10)), "T3001", "a new value equal to an old row's converted one")
+    assert_eq(cv_put(s, 4, Int(30)), "ok")
+    assert_eq(cv_put(s, 5, Int(30)), "T3001", "a new value equal to a new row's")
+
+@test
+a_conversion_that_makes_two_values_of_a_unique_index_equal_fails_the_job()
+    val s = cv_store(nullable(Text))
+    cv_ddls(s, [cv_unique()])
+    assert_eq(cv_put(s, 1, Text("ab")), "ok")
+    assert_eq(cv_put(s, 2, Text("cd")), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(call("length", [cat_row("a")])))), "T3001")
+    assert(cv_col(s).ty == nullable(Text), "the old type")
+    assert_eq(cv_put(s, 3, Text("cd")), "T3001", "the index still holds the old values")
+    assert_eq(cv_put(s, 4, Text("ef")), "ok")
+
+@test
+a_unique_index_over_a_column_converted_twice_is_computed_again_each_time()
+    val s = cv_store(nullable(Int64))
+    cv_ddls(s, [cv_unique()])
+    assert_eq(cv_put(s, 1, Int(2)), "ok")
+    val double = call("mul", [cat_row("a"), Literal(Int64, Int(10))])
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(double))), "succeeded")
+    assert_eq(cv_put(s, 2, Int(2)), "ok", "2 is free once the row holds 20")
+    assert_eq(cv_put(s, 3, Int(20)), "T3001")
+
+    // Row 1 holds 20 and row 2 holds 2: a second conversion makes them 200 and 20.
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(double))), "succeeded")
+    assert_eq(cv_put(s, 4, Int(20)), "T3001")
+    assert_eq(cv_put(s, 5, Int(200)), "T3001")
+    assert_eq(cv_put(s, 6, Int(2)), "ok")
+
+/** `create index <name> on app.t (a)`, not unique. */
+private cv_plain(name: string = "t_a_any") -> Statement
+    val keys = buf[IndexKey]()
+    keys.push(IndexKey(KeyColumn("a"), false))
+    CreateIndex(name, IndexDef(cat_q("t"), false, keys, None), false)
+
+private cv_index_oid(s: &Store, name: string) -> u64
+    for x in s.latest_catalog().indexes
+        if x.name == name then return x.oid
+
+    0
+
+/** The ids of the rows of `t` whose entries in index `name` lie between `lo` and `hi`, both
+ * inclusive, read through the index by a new transaction both as rows (`scan_index`) and as vectors
+ * (`scan_index_vectors`), which must agree.
+ */
+private cv_through(s: &Store, name: string, lo: Value, hi: Value, file: string = __FILE__, line: long = __LINE__) -> Buf[i128]
+    val t = s.begin(Snapshot)
+    s.enter(t).unwrap()
+    val ix = cv_index_oid(s, name)
+    assert(ix != 0, s"index $name exists", file, line)
+    val from = IxAt(cv_vals([lo]), true)
+    val to = IxAt(cv_vals([hi]), true)
+    val out = buf[i128]()
+    val rows = buf[Value]()
+
+    for h in s.scan_index(t, cv_t(s), ix, from, to, all_rows()).unwrap()
+        out.push(st_int(h.row.at(0)))
+        rows.push(h.row.value)
+
+    val ct = cat_table_of(s.catalog, "t")
+    val fs = buf[Field]()
+
+    for c in ct.columns
+        fs.push(Field(c.name, resolve_type(s.catalog, c.ty).unwrap()))
+
+    val got = buf[Value]()
+
+    for v in s.scan_index_vectors(t, cv_t(s), ix, from, to, all_rows(), record(fs.view()), None).unwrap()
+        for i in 0..<v.len
+            got.push(value_at(v, i))
+
+    assert_eq(got.len(), rows.len(), "the vectors hold the rows", file, line)
+
+    for i in 0..<rows.len()
+        if i < got.len() then assert(got[i] == rows[i], s"row $i read as vectors", file, line)
+
+    out
+
+@test
+a_column_under_a_non_unique_index_converts_and_the_index_holds_the_new_values()
+    val s = cv_store(nullable(Text))
+    cv_ddls(s, [cv_plain()])
+    assert_eq(cv_put(s, 1, Text("10")), "ok")
+    assert_eq(cv_put(s, 2, Text("20")), "ok")
+    assert_eq(cv_put(s, 3, Text("10")), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    xd_ids_are(cv_through(s, "t_a_any", Int(10), Int(10)), [1, 3])
+    xd_ids_are(cv_through(s, "t_a_any", Int(11), Int(20)), [2])
+    assert_eq(cv_put(s, 4, Int(10)), "ok", "a non-unique index takes a value twice")
+    xd_ids_are(cv_through(s, "t_a_any", Int(10), Int(10)), [1, 3, 4])
+    xd_ids_are(cv_through(s, "t_a_any", Int(0), Int(100)), [1, 2, 3, 4])
+
+@test
+a_non_unique_index_over_a_column_converted_with_using_holds_the_computed_values()
+    val s = cv_store(nullable(Int64))
+    cv_ddls(s, [cv_plain()])
+    assert_eq(cv_put(s, 1, Int(2)), "ok")
+    assert_eq(cv_put(s, 2, Int(3)), "ok")
+    val double = call("mul", [cat_row("a"), Literal(Int64, Int(10))])
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64), Some(double))), "succeeded")
+    assert_eq(cv_through(s, "t_a_any", Int(2), Int(3)).len(), 0, "no row holds an old value")
+    xd_ids_are(cv_through(s, "t_a_any", Int(20), Int(20)), [1])
+    xd_ids_are(cv_through(s, "t_a_any", Int(20), Int(30)), [1, 2])
+
+@test
+a_non_unique_index_over_a_failed_conversion_keeps_the_old_values()
+    val s = cv_store(nullable(Text))
+    cv_ddls(s, [cv_plain()])
+    assert_eq(cv_put(s, 1, Text("10")), "ok")
+    assert_eq(cv_put(s, 2, Text("x")), "ok")
+    assert(cv_job(s, cv_retype(s, nullable(Int64))) != "succeeded", "the conversion fails")
+    xd_ids_are(cv_through(s, "t_a_any", Text("10"), Text("10")), [1])
+    xd_ids_are(cv_through(s, "t_a_any", Text("x"), Text("x")), [2])
+
+@test
+a_non_unique_index_keeps_null_entries_through_a_conversion()
+    val s = cv_store(nullable(Text))
+    cv_ddls(s, [cv_plain()])
+    assert_eq(cv_put(s, 1, Text("10")), "ok")
+    assert_eq(cv_put(s, 2, Null), "ok")
+    assert_eq(cv_job(s, cv_retype(s, nullable(Int64))), "succeeded")
+    xd_ids_are(cv_through(s, "t_a_any", Int(10), Int(10)), [1])
+    assert(cv_a(s, 2) == Null, "the null row reads null")
+
+@test
+a_converting_primary_key_column_runs_no_job()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int32), cat_col("a", nullable(Int64))], ["id"]))
+    val s = mem_store(c)
+    val txid = cv_ddls(s, [cat_alter("t", [RetypeColumn("id", Int64, None)])])
+    assert_eq(s.jobs_of(txid).len(), 0)
+    assert(cat_table_of(s.latest_catalog(), "t").column_named("id").unwrap().state == ColumnConverting, "still converting")
+
+@test
+a_retype_of_a_column_under_a_check_is_refused()
+    var c = cat_ok(mem_catalog(), CreateNamespace("app", false))
+    c = cat_ok(c, cat_table("t", [cat_col("id", Int64), cat_col("a", nullable(Int64))], ["id"], [cat_check("t_a_pos", call("gt", [cat_row("a"), cat_int(0)]))]))
+    assert_eq(cat_code(c, cat_alter("t", [RetypeColumn("a", nullable(Int16), None)])), "Q6007")

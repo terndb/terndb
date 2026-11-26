@@ -15,12 +15,18 @@
 // format, type descriptors, the order-preserving key encoding and secondary-index entries
 // (`docs/spec/on-disk-format.md` §4, `docs/design/row-format.md`); and the in-memory B+tree over 16 KiB pages
 // laid out as `docs/spec/on-disk-format.md` §3 specifies (`docs/design/btree.md`). The `terndb` program
-// is `cli/`, a project of its own; and the interactive shell it runs (`docs/design/shell.md`).
+// is `cli/`, a project of its own; and the interactive shell it runs (`docs/design/shell.md`); and
+// the block-device seam with its simulated device, which injects every disk fault of
+// `docs/spec/isolation.md` §7.3, and the page checksum checked on every read through it
+// (`docs/spec/on-disk-format.md` §3.1, §9 D11, D14, D15); and the buffer pool over it: fixed frames,
+// latches, the clock, and write-back under the WAL rule (§2.1, §6.5, `docs/design/buffer.md`); and the
+// write-ahead log's records, segments, writer with group commit, and reader (`docs/spec/on-disk-format.md`
+// §6, `docs/design/wal.md`).
 
 package {
   name    = "terndb"
   version = "0.0.1"
-  sysl    = "0.13.6"
+  sysl    = "0.13.7"
 }
 
 // `docs/` holds the specifications and the survey's standalone probe programs, none of them part of
@@ -29,7 +35,9 @@ exclude = ["docs", "tests"]
 
 // A result's size is not known until it is built or read, so buffers grow on the heap. The one file
 // read is the host's time zone database, which `at_zone` and `from_zone` look a zone up in
-// (`exec_zone.sysl`). Sockets are opened only by the server (`server.sysl`).
+// (`exec_zone.sysl`). Sockets are opened only by the server (`server.sysl`). A page file is opened
+// only by the block device over the host's files (`block_device.sysl`), and a WAL directory is listed,
+// renamed in and synced only by `wal_segment.sysl`.
 requires {
   heap  = true
   posix = true

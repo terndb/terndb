@@ -1,0 +1,264 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.threads.{Barrier, barrier, scope}
+
+// Group commit with threads (`wal.sysl`, `on-disk-format.md` §6.7, §9 D14): committers waiting
+// together share one sync, every commit returns only once its record is durable, mini-transactions
+// stay contiguous while threads append at once, and a failed sync fails every waiter.
+
+private wg_has(xs: Buf[u64], x: u64) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+/** Appends commit `txn`, waits at `b` until every thread has appended, then waits for it to be
+ * durable, and checks that it is.
+ */
+private wg_append_then_wait(w: *Wal, b: &sync Barrier, txn: u64)
+    val a = w.append(wt_commit(txn)).unwrap()
+    b.wait()
+    w.wait_durable(a.end).unwrap()
+    assert(w.durable_lsn() >= a.end, s"commit $txn returned before LSN ${a.end} was durable")
+
+@test
+committers_waiting_together_share_one_sync()
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+    val b = barrier(8)
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_append_then_wait(p, b, u64(i) + 1)))
+
+    assert_eq(w.flushes(), u64(1))
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(8))
+
+    for t in 1..<9
+        assert(wg_has(got, u64(t)), s"commit $t is missing from $got")
+
+/** `m` commits of transactions `base`, `base + 1`, …, each checked durable once it returns. */
+private wg_commits(w: *Wal, base: u64, m: u64)
+    for j in 0..<m
+        val a = w.commit(wt_commit(base + j)).unwrap()
+        assert(w.durable_lsn() >= a.end, s"commit ${base + j} returned before LSN ${a.end} was durable")
+
+@test
+every_commit_of_many_threads_returns_only_once_durable_and_survives_a_crash()
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_commits(p, u64(i) * 1000, 40)))
+
+    assert(w.flushes() <= 320)
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(320))
+
+    // Each thread's commits are in the log in the order the thread made them.
+    for i in 0..<8
+        var next = u64(i) * 1000
+
+        for t in got
+            if t / 1000 == u64(i)
+                assert_eq(t, next)
+                next += 1
+
+        assert_eq(next, u64(i) * 1000 + 40)
+
+/** `m` mini-transactions of three records of `base + j`, each followed by its commit. */
+private wg_mtrs(w: *Wal, base: u64, m: u64)
+    for j in 0..<m
+        val t = base + j
+        w.append_mtr(wr_buf([wt_overflow(t, 30), wt_overflow(t, 300), wt_overflow(t, 3000)]).view()).unwrap()
+        w.commit(wt_commit(t)).unwrap()
+
+@test
+mini_transactions_stay_contiguous_while_threads_append_at_once()
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+
+    scope((s) ->
+        for i in 0..<6
+            s.spawn(() -> wg_mtrs(p, u64(i) * 1000, 25)))
+
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_read(d)
+    assert_eq(got.len(), usize(6 * 25 * 4))
+    var i: usize = 0
+
+    while i < got.len()
+        if wal_kind(got[i].body) == WkOverflowWrite
+            val t = got[i].txn
+            assert_eq(got[i].flags, WalMtrCont)
+            assert_eq(got[i + 1].txn, t)
+            assert_eq(got[i + 1].flags, WalMtrCont)
+            assert_eq(got[i + 2].txn, t)
+            assert_eq(got[i + 2].flags, u8(0))
+            i += 3
+        else
+            assert_eq(wal_kind(got[i].body), WkTxnCommit)
+            i += 1
+
+/** Waits for `lsn` and expects the failed sync's `io_error`. */
+private wg_wait_fails(w: *Wal, b: &sync Barrier, lsn: u64)
+    b.wait()
+    assert_eq(wr_code(w.wait_durable(lsn)), "D4004")
+    assert_eq(wr_code(w.append(wt_commit(999))), "D4004")
+
+@test
+a_failed_sync_fails_every_committer_waiting_on_it()
+    val (d, w) = wt_new(1)
+    val ends = buf[u64]()
+
+    for t in 1..<9
+        ends.push(w.append(wt_commit(u64(t))).unwrap().end)
+
+    // Eight commits fill 512 bytes of block 1: one write, then the sync, which fails.
+    val s0 = wt_seg(d, 0)
+    s0.schedule(s0.next_op() + 1, DkSyncFail(KeepAll))
+    val p: *Wal = &*w
+    val b = barrier(8)
+    val v = ends.view()
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_wait_fails(p, b, v[i])))
+
+    assert_eq(w.flushes(), u64(0))
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+    assert(w.failed())
+
+@test
+appends_go_on_while_a_flush_is_under_way()
+    // A thread flushing over and over while others append: nothing appended is lost or doubled.
+    val (d, w) = wt_new(1)
+    val p: *Wal = &*w
+
+    scope((s) ->
+        s.spawn(() ->
+            for _ in 0..<200
+                p.flush().unwrap())
+
+        for i in 0..<4
+            s.spawn(() ->
+                for j in 0..<50
+                    p.append(wt_commit(u64(i) * 1000 + u64(j))).unwrap()))
+
+    w.flush().unwrap()
+    d.crash(KeepNone)
+    d.restart()
+    val got = wt_txns(wt_read(d))
+    assert_eq(got.len(), usize(200))
+
+    for i in 0..<4
+        for j in 0..<50
+            assert(wg_has(got, u64(i) * 1000 + u64(j)))
+
+// After a failed write or sync the log keeps the error and hands it to every caller on every thread.
+// Each gets a copy of its own: a count is not atomic, and the callers drop their shares at once.
+
+/** The error of `r`, or one of code "ok" when it succeeded. */
+private wg_err[T](r: Result[T, CodecError]) -> CodecError = r match
+    Ok(_) -> CodecError("ok", "", "the call succeeded", buf[Detail](), 0)
+    Err(e) -> e
+
+/** Waits at `b`, then expects every call of the failed log to be refused with the one error it kept. */
+private wg_refused_everywhere(w: *Wal, b: &sync Barrier, lsn: u64)
+    b.wait()
+    val e = wg_err(w.wait_durable(lsn))
+    assert_eq(e.code, "D4004")
+    assert_eq(wg_err(w.append(wt_commit(999))), e)
+    assert_eq(wg_err(w.append_mtr(wr_buf([wt_commit(998), wt_commit(997)]).view())), e)
+    assert_eq(wg_err(w.commit(wt_commit(996))), e)
+    assert_eq(wg_err(w.flush()), e)
+    assert_eq(wg_err(w.wait_durable(0)), e)
+    assert_eq(wg_err(w.recycle(0xffffffffffff)), e)
+    assert(w.failed())
+
+/** A log of eight appended commits filling 512 bytes of block 1, whose flush meets `fault`. */
+private wg_failing(fault: DiskFault, at: u64) -> (&SimWalDir, &Wal, Buf[u64])
+    val (d, w) = wt_new(1)
+    val ends = buf[u64]()
+
+    for t in 1..<9
+        ends.push(w.append(wt_commit(u64(t))).unwrap().end)
+
+    val s0 = wt_seg(d, 0)
+    s0.schedule(s0.next_op() + at, fault)
+    (d, w, ends)
+
+/** `n` threads meeting the failed flush of a log `wg_failing` made, each refused everywhere. */
+private wg_refuse_threads(w: &Wal, ends: Buf[u64], n: usize)
+    val p: *Wal = &*w
+    val b = barrier(n)
+    val v = ends.view()
+
+    scope((s) ->
+        for i in 0..<n
+            s.spawn(() -> wg_refused_everywhere(p, b, v[i % v.len])))
+
+    assert_eq(w.flushes(), u64(0))
+    assert_eq(w.durable_lsn(), WalFirstLsn)
+
+@test
+many_rounds_of_a_failed_sync_refuse_every_call_of_sixteen_threads()
+    for _ in 0..<40
+        val (_, w, ends) = wg_failing(DkSyncFail(KeepAll), 1)
+        wg_refuse_threads(w, ends, 16)
+
+@test
+a_failed_write_fails_every_committer_waiting_on_it()
+    val (_, w, ends) = wg_failing(DkTornWrite(wr_buf([u8(2), u8(1), u8(0), u8(3)]), 1, KeepAll), 0)
+    wg_refuse_threads(w, ends, 8)
+
+@test
+a_failed_sync_keeping_nothing_fails_every_committer_waiting_on_it()
+    val (_, w, ends) = wg_failing(DkSyncFail(KeepNone), 1)
+    wg_refuse_threads(w, ends, 8)
+
+@test
+committers_arriving_after_a_failed_sync_are_each_refused_with_its_error()
+    val (_, w, ends) = wg_failing(DkSyncFail(KeepAll), 1)
+    val first = wg_err(w.flush())
+    assert_eq(first.code, "D4004")
+    val p: *Wal = &*w
+    val b = barrier(8)
+    val v = ends.view()
+
+    scope((s) ->
+        for i in 0..<8
+            s.spawn(() -> wg_refused_everywhere(p, b, v[i])))
+
+    assert_eq(wg_err(w.flush()), first)
+
+@test
+one_thread_after_a_failed_sync_is_refused_with_its_error()
+    val (_, w, ends) = wg_failing(DkSyncFail(KeepAll), 1)
+    wg_refuse_threads(w, ends, 1)
+
+@test
+a_fresh_error_equals_the_one_it_copies()
+    val ds = buf[Detail]()
+    ds.push(Detail("path", "seg-0001"))
+    ds.push(Detail("syscall", "fsync"))
+    val e = CodecError("D4004", "/statement", s"a sync of ${ds.len()} failed", ds, 7)
+    val f = e.fresh()
+    assert_eq(f, e)
+    assert_eq(f.node, u64(7))
+    assert_eq(f.details.len(), usize(2))
+    assert_eq(f.detail("syscall"), Some("fsync"))
+
+@test
+a_fresh_error_with_no_details_and_empty_strings_equals_the_one_it_copies()
+    val e = CodecError("", "", "", buf[Detail](), 0)
+    assert_eq(e.fresh(), e)

@@ -1,0 +1,162 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Retypes end to end (`ddl.md` §8.5 rule 2): SQL run over the wire against an in-memory engine, the
+// `convert_column` job running at the commit of the `ALTER TABLE` that started it; the guard checked
+// on the retyping transaction's own writes; a check constraint and a unique index beside the
+// conversion; and a rollback.
+
+/** A connection to a new engine holding `public.t(id int64, a text, b int64 DEFAULT 100000)`. */
+private sv_db() -> SqSession
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    s.ok("CREATE SCHEMA public; CREATE TABLE t (id int64 PRIMARY KEY, a text, b int64 DEFAULT 100000)")
+    s
+
+/** How the last job the engine ran ended: "succeeded", or its code; "none" when it ran none. */
+private sv_last_job(s: SqSession) -> string
+    val js = s.e.store.jobs
+    if js.len() == 0 then return "none"
+
+    js[js.len() - 1].end match
+        JobSucceeded -> "succeeded"
+        JobFailed(code, _) -> code
+
+/** The first column of each of `rows` as an integer: -999 for null, -998 for another value. */
+private sv_ints(rows: Buf[Value]) -> Buf[i128]
+    val out = buf[i128]()
+
+    for r in rows
+        out.push(r match
+            Record(fs) -> fs[0] match
+                Value.Int(n) -> n
+                Value.Null -> -999
+                _ -> -998
+            _ -> -997)
+
+    out
+
+private sv_is(xs: []const i128) -> Buf[i128]
+    val b = buf[i128]()
+    b.extend(xs)
+    b
+
+/** The first column of each of `rows` as text: "?" for another value. */
+private sv_strs(rows: Buf[Value]) -> Buf[string]
+    val out = buf[string]()
+
+    for r in rows
+        out.push(r match
+            Record(fs) -> fs[0] match
+                Value.Text(x) -> x
+                _ -> "?"
+            _ -> "?")
+
+    out
+
+private sv_is_text(xs: []const string) -> Buf[string]
+    val b = buf[string]()
+    b.extend(xs)
+    b
+
+private sv_kind(s: SqSession) -> string
+    val js = s.e.store.jobs
+    if js.len() == 0 then "none" else js[js.len() - 1].kind
+
+@test
+an_alter_column_type_converts_every_row_through_its_job()
+    var s = sv_db()
+    s.ok("INSERT INTO t (id, a) VALUES (1, '10'), (2, '-3'), (3, NULL)")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64")
+    assert_eq(sv_kind(s), "convert_column")
+    assert_eq(sv_last_job(s), "succeeded")
+    assert(sv_ints(s.rows("SELECT a FROM t ORDER BY id")) == sv_is([10, -3, -999]), "converted, the null kept")
+    assert(sv_ints(s.rows("SELECT id FROM t WHERE a > 0")) == sv_is([1]), "compared as integers")
+
+@test
+an_alter_column_type_using_an_expression_converts_through_it()
+    var s = sv_db()
+    s.ok("INSERT INTO t (id, a) VALUES (1, 'abc'), (2, '')")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64 USING length(a)")
+    assert_eq(sv_last_job(s), "succeeded")
+    assert(sv_ints(s.rows("SELECT a FROM t ORDER BY id")) == sv_is([3, 0]), "lengths")
+    s.ok("INSERT INTO t (id, a) VALUES (3, 7)")
+    assert(sv_ints(s.rows("SELECT a FROM t ORDER BY id")) == sv_is([3, 0, 7]), "a new row in the new type")
+
+@test
+an_alter_column_type_that_does_not_convert_commits_and_its_job_fails()
+    var s = sv_db()
+    s.ok("INSERT INTO t (id, a) VALUES (1, '1'), (2, 'two')")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64")
+    assert_eq(sv_last_job(s), st_code(cast_value(Text("two"), Text, Int64)))
+    assert(sv_strs(s.rows("SELECT a FROM t ORDER BY id")) == sv_is_text(["1", "two"]), "still text")
+    s.ok("INSERT INTO t (id, a) VALUES (3, 'three')")
+
+@test
+the_retyping_transaction_writes_its_rows_under_the_guard()
+    var s = sv_db()
+    s.ok("BEGIN")
+    s.ok("ALTER TABLE t ALTER COLUMN b TYPE int16")
+    assert_eq(s.code("INSERT INTO t (id, a) VALUES (1, 'x')"), st_code(cast_value(Int(100000), Int64, Int16)))
+
+@test
+the_retyping_transaction_writes_a_row_the_guard_accepts_and_it_converts()
+    var s = sv_db()
+    s.ok("ALTER TABLE t ALTER COLUMN b SET DEFAULT 7")
+    s.ok("BEGIN")
+    s.ok("ALTER TABLE t ALTER COLUMN b TYPE int16")
+    s.ok("INSERT INTO t (id, a) VALUES (1, 'x')")
+    s.ok("COMMIT")
+    assert_eq(sv_last_job(s), "succeeded")
+    assert(sv_ints(s.rows("SELECT b FROM t")) == sv_is([7]), "converted")
+
+@test
+a_retype_rolled_back_in_sql_leaves_the_column_as_it_was()
+    var s = sv_db()
+    s.ok("INSERT INTO t (id, a) VALUES (1, '5')")
+    s.ok("BEGIN")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64")
+    s.ok("ROLLBACK")
+    assert_eq(sv_last_job(s), "none")
+    assert(sv_strs(s.rows("SELECT a FROM t")) == sv_is_text(["5"]), "still text")
+
+@test
+a_check_on_another_column_is_enforced_through_a_conversion()
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    s.ok("CREATE SCHEMA public; CREATE TABLE t (id int64 PRIMARY KEY, a text, b int64 CHECK (b > 0))")
+    s.ok("INSERT INTO t VALUES (1, '4', 1)")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64")
+    assert_eq(sv_last_job(s), "succeeded")
+    assert_eq(s.code("INSERT INTO t VALUES (2, 5, -1)"), "T3002")
+    s.ok("INSERT INTO t VALUES (2, 5, 2)")
+    assert(sv_ints(s.rows("SELECT a FROM t ORDER BY id")) == sv_is([4, 5]), "both rows")
+
+@test
+a_retype_of_a_column_a_check_reads_is_refused_in_sql()
+    val e = ew_engine()
+    var s = SqSession(e, ew_duo(e), 0)
+    s.ok("CREATE SCHEMA public; CREATE TABLE t (id int64 PRIMARY KEY, a int64 CHECK (a > 0))")
+    assert_eq(s.code("ALTER TABLE t ALTER COLUMN a TYPE int16"), "Q6007")
+
+@test
+a_unique_index_over_a_converted_column_holds_its_new_values()
+    var s = sv_db()
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    s.ok("INSERT INTO t (id, a) VALUES (1, 'ab'), (2, 'abc')")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64 USING length(a)")
+    assert_eq(sv_last_job(s), "succeeded")
+    assert_eq(s.code("INSERT INTO t (id, a) VALUES (3, 2)"), "T3001")
+    assert_eq(s.code("UPDATE t SET a = 3 WHERE id = 1"), "T3001")
+    s.ok("INSERT INTO t (id, a) VALUES (3, 4)")
+
+@test
+a_unique_index_that_a_conversion_would_break_fails_the_job()
+    var s = sv_db()
+    s.ok("CREATE UNIQUE INDEX t_a ON t (a)")
+    s.ok("INSERT INTO t (id, a) VALUES (1, 'ab'), (2, 'cd')")
+    s.ok("ALTER TABLE t ALTER COLUMN a TYPE int64 USING length(a)")
+    assert_eq(sv_last_job(s), "T3001")
+    assert(sv_strs(s.rows("SELECT a FROM t ORDER BY id")) == sv_is_text(["ab", "cd"]), "still text")

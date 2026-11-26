@@ -293,17 +293,29 @@ struct BtCursor
      * leaf by a descent with its fence, since nodes have no sibling links (§3.3).
      */
     next(*self) -> Option[BtEntry]
+        val key = buf[u8]()
+
+        self.next_into(key) match
+            Some(v) ->
+                val value = buf[u8]()
+                value.extend(v)
+                Some(BtEntry(key, value))
+            None -> None
+
+    /** The next entry of the range with nothing copied but its key, which replaces what `key` held:
+     * its value is read where its page holds it, valid until the tree next changes. None once the
+     * range is exhausted.
+     */
+    next_into(*self, key: Buf[u8]) -> Option[[]const u8]
         while !self.done
             val p = unswizzle(self.leaf)
 
             if self.forward
                 if self.pos < node_count(p)
-                    val k = slot_key(p, self.pos)
-                    if !below_hi(k.view(), self.hi) then break
-                    val v = buf[u8]()
-                    v.extend(slot_value(p, self.pos))
+                    whole_key(p, self.pos, key)
+                    if !below_hi(key.view(), self.hi) then break
                     self.pos += 1
-                    return Some(BtEntry(k, v))
+                    return Some(slot_value(p, self.pos - 1))
 
                 if upper_infinite(p) then break
                 val path = buf[BtStep]()
@@ -312,12 +324,10 @@ struct BtCursor
                 self.leaf = swizzle(next)
             else
                 if self.pos > 0
-                    val k = slot_key(p, self.pos - 1)
-                    if !above_lo(k.view(), self.lo) then break
-                    val v = buf[u8]()
-                    v.extend(slot_value(p, self.pos - 1))
+                    whole_key(p, self.pos - 1, key)
+                    if !above_lo(key.view(), self.lo) then break
                     self.pos -= 1
-                    return Some(BtEntry(k, v))
+                    return Some(slot_value(p, self.pos))
 
                 if lower_infinite(p) then break
                 val path = buf[BtStep]()
@@ -327,6 +337,12 @@ struct BtCursor
 
         self.done = true
         None
+
+// Slot `i`'s whole key, the node prefix then its suffix, in place of what `key` held.
+private whole_key(p: *PageFrame, i: usize, key: Buf[u8])
+    key.clear()
+    key.extend(node_prefix(p))
+    key.extend(slot_suffix(p, i))
 
 private below_hi(k: []const u8, hi: KeyBound) -> bool = hi match
     KeyAny -> true

@@ -472,7 +472,8 @@ struct UndoRows
 
         self.layouts.push(RowLayout(oid, schema, w))
 
-    private widths_of(self, oid: u64, schema: u16) -> Option[Buf[usize]]
+    /** The column widths rows of table `oid` in schema version `schema` are laid out with, if declared. */
+    private[terndb] widths_of(self, oid: u64, schema: u16) -> Option[Buf[usize]]
         for l in self.layouts
             if l.oid == oid && l.schema == schema then return Some(l.widths)
 
@@ -576,6 +577,13 @@ struct UndoRows
             None -> ()
 
         Ok(out)
+
+    /** A cursor over the rows of table `oid` with keys between `lo` and `hi`, ascending, ghosts
+     * included, each read where its page holds it; none when no row of the table was ever written.
+     */
+    table_cursor(self, oid: u64, lo: KeyBound, hi: KeyBound) -> Option[BtCursor] = self.tree_of(oid) match
+        Some(t) -> Some(t.cursor(lo, hi, true))
+        None -> None
 
     /** How many rows the leaf holds, ghosts included. */
     row_count(self) -> usize
@@ -1042,6 +1050,30 @@ encode_leaf_row(img: RowImage, widths: []const usize) -> Result[Buf[u8], CodecEr
  * which needs an overflow chain this store never writes.
  */
 decode_leaf_row(bytes: []const u8, widths: []const usize) -> Result[RowImage, CodecError]
+    val spans = buf[ColumnSpan]()
+    val hd = leaf_spans(bytes, widths, spans)?
+    val cols = buf[ColumnImage]()
+
+    for s in spans
+        cols.push(if s.is_null then ColumnImage(true, buf[u8]()) else ColumnImage(false, undo_bytes(s.of(bytes))))
+
+    Ok(RowImage(hd, cols))
+
+/** Where one non-key column of a clustered-leaf value lies: null, or the `len` octets at `at`. */
+struct ColumnSpan derives Eq
+    is_null: bool
+    at: usize
+    len: usize
+
+    /** The column's octets within the value `bytes` it was found in. */
+    of(self, bytes: []const u8) -> []const u8 = bytes[self.at..<self.at + self.len]
+
+/** The header of the clustered-leaf value `bytes` laid out as `widths` say, with `spans` (emptied
+ * first) given where each of its columns lies: what `decode_leaf_row` reads, checked the same way,
+ * with no column copied out of `bytes`.
+ */
+leaf_spans(bytes: []const u8, widths: []const usize, spans: Buf[ColumnSpan]) -> Result[RowHeader, CodecError]
+    spans.clear()
     val hd = decode_row_header(bytes)?
     if hd.flags & RowHasExternal != 0 then return corrupt("a row with a column out of line, which needs an overflow chain")
     val n = widths.len
@@ -1054,7 +1086,6 @@ decode_leaf_row(bytes: []const u8, widths: []const usize) -> Result[RowImage, Co
     for i in n..<bitmap * 8
         if nulls[i / 8] >> u8(i % 8) & 1 == 1 then return corrupt("a bit past the last column is set in the null bitmap")
 
-    val cols = buf[ColumnImage]()
     var vars: usize = 0
 
     for i in 0..<n
@@ -1063,19 +1094,20 @@ decode_leaf_row(bytes: []const u8, widths: []const usize) -> Result[RowImage, Co
 
         if w == 0
             vars += 1
-            cols.push(ColumnImage(absent, buf[u8]()))
+            spans.push(ColumnSpan(absent, 0, 0))
         else
             if at + w > bytes.len then return corrupt("a row shorter than its fixed area")
             val one = bytes[at..<at + w]
-            at += w
 
             if absent
                 for b in one
                     if b != 0 then return corrupt(s"null column $i is not zero-filled")
 
-                cols.push(ColumnImage(true, buf[u8]()))
+                spans.push(ColumnSpan(true, 0, 0))
             else
-                cols.push(ColumnImage(false, undo_bytes(one)))
+                spans.push(ColumnSpan(false, at, w))
+
+            at += w
 
     if at + 2 * vars > bytes.len then return corrupt("a row shorter than its variable offsets")
     val offsets = at
@@ -1089,15 +1121,15 @@ decode_leaf_row(bytes: []const u8, widths: []const usize) -> Result[RowImage, Co
             k += 1
             if end < start || area + end > bytes.len then return corrupt("a variable offset is out of order")
 
-            if cols[i].is_null
+            if spans[i].is_null
                 if end != start then return corrupt(s"null column $i has bytes")
             else
-                cols[i] = ColumnImage(false, undo_bytes(bytes[area + start..<area + end]))
+                spans[i] = ColumnSpan(false, area + start, end - start)
 
             start = end
 
     if area + start != bytes.len then return corrupt("bytes follow the last variable column")
-    Ok(RowImage(hd, cols))
+    Ok(hd)
 
 /** Frees every page of the tree under `p`, children first. */
 private[terndb] free_tree_pages(space: &PageSpace, p: *PageFrame)

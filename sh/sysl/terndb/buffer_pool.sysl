@@ -1,0 +1,444 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.container.{Map, map}
+import sysl.encoding.{get_u64_le, put_u64_le}
+import sysl.path.join
+import sysl.slices.{copy, fill}
+
+// The buffer pool (`docs/design/buffer.md`): a fixed number of 16 KiB frames between the engine and
+// page I/O. A page is fixed into a frame under a shared or an exclusive latch, read through its
+// segment's `PageIo` on a miss, and unfixed; an exclusive unfix that changed the page records the
+// LSN of the record it applied as the page's `page_lsn` and marks the frame dirty. A dirty page is
+// written back on eviction or by a flush, and never before the log is durable up to its `page_lsn`
+// (`on-disk-format.md` §6.5 rule 1, §9 D5). Eviction is the clock: a frame with its reference bit set
+// gets a second chance, and a fixed frame is never a victim. After any sync fails the pool refuses
+// every I/O (§9 D14).
+
+/** The latch a fix holds on its frame. */
+enum LatchMode
+    /** Any number of fixes may read the page at once. */
+    LatchShared
+    /** One fix, alone, may change the page. */
+    LatchExclusive
+
+/** A fix of page `pid` in frame `frame`, held under `mode` until it is handed back to `unfix`. */
+struct PageFix derives Eq
+    pid: u64
+    frame: usize
+    mode: LatchMode
+
+/** The log, as the pool sees it: how far it is durable, and a way to make it durable further
+ * (`on-disk-format.md` §6.7). The pool asks for nothing else of it.
+ */
+trait WalHorizon
+    /** The end of the longest prefix of the log known to be synced (§6.7 rule 1). */
+    durable_lsn(self) -> u64
+
+    /** Makes the log durable up to at least `lsn`, or fails. On success `durable_lsn` is at least
+     * `lsn`; a log that answers otherwise breaks the pool's contract and stops the program.
+     */
+    flush_to(*self, lsn: u64) -> Result[unit, CodecError]
+
+/** Where each segment's device comes from: segment `number` of page space `space` (§2.1, §2.3). The
+ * pool asks once per segment and keeps the device.
+ */
+trait SegmentSource
+    open_segment(*self, space: u64, number: u64) -> Result[&BlockDevice, CodecError]
+
+/** The page space a PID names (§2.1): 0 data, 1 undo. */
+const DataSpace: u64 = 0
+const UndoSpace: u64 = 1
+
+/** The segment holding `pid`, as the key `space << 60 | number` (§2.1): a data page number `n` is
+ * in segment `n >> 16`, an undo page number in `n >> 12`. A swizzled PID or one of a reserved
+ * space is `data_corrupted`, as `pid_slot` says.
+ */
+segment_of(pid: u64) -> Result[u64, CodecError]
+    val _ = pid_slot(pid)?
+    val space = (pid >> 60) & 0x7
+    val number = pid & PidNumberMask
+    val seg = if space == DataSpace then number / SegmentPages else number / UndoSegmentPages
+    Ok((space << 60) | seg)
+
+/** The space of a segment key. */
+segment_space(key: u64) -> u64 = key >> 60
+
+/** The segment number of a segment key. */
+segment_number(key: u64) -> u64 = key & PidNumberMask
+
+/** The path of a segment's file under the database directory (§2): `data.<gen>/<n:08x>.tseg` or
+ * `undo.<gen>/<n:012x>.tund`, every number lowercase hexadecimal (§2 rule 1).
+ */
+segment_path(generation: u32, space: u64, number: u64) -> string
+    require space == DataSpace || space == UndoSpace, "a segment is of the data or the undo space"
+
+    if space == DataSpace then f"data.${generation}%x/${number}%08x.tseg" else f"undo.${generation}%x/${number}%012x.tund"
+
+/** The segments of a database directory on the host's files, generation `generation`. A segment's
+ * file must exist: creating one, and syncing its directory after (§2 rule 3), is the opener's.
+ */
+struct FileSegments
+    dir: string
+    generation: u32
+end FileSegments
+
+impl SegmentSource for FileSegments
+    open_segment(*self, space: u64, number: u64) -> Result[&BlockDevice, CodecError]
+        val file = join(self.dir, segment_path(self.generation, space, number))
+
+        open_file_device(file) match
+            Ok(d) ->
+                val dev: &BlockDevice = d
+                Ok(dev)
+            Err(e) -> Err(refusal("D4004", s"segment $file: ${e.message()}", [Detail("errno", s"${e.code()}"), Detail("file", file)]))
+
+/** What a frame is doing, beside the page's bytes (§3.1: the latch and the eviction state live in
+ * the frame descriptor, never in the page).
+ */
+struct FrameDesc
+    /** The page in the frame, or `NoPage`. */
+    pid: u64
+    /** How many fixes hold the frame. */
+    pins: u32
+    /** Whether the one fix holding it holds it exclusively. */
+    exclusive: bool
+    /** Whether the bytes differ from what was last written of the page. */
+    dirty: bool
+    /** The LSN of the record that first dirtied the page since it was last written. */
+    rec_lsn: u64
+    /** The clock's reference bit. */
+    referenced: bool
+
+/** What a free frame's `pid` holds: bit 63 set, so no page's. */
+const NoPage: u64 = 0xFFFFFFFFFFFFFFFF
+
+/** What the pool has done, for the tests and for tuning. */
+struct BufStats derives Eq
+    hits: u64
+    misses: u64
+    reads: u64
+    writes: u64
+    syncs: u64
+    evictions: u64
+
+/** The page LSN of the page held in `page` (§3.1 `page_lsn`). */
+private page_lsn_of(page: []const u8) -> u64 = get_u64_le(page[8..<16]).unwrap()
+
+/** The buffer pool. Build one with `buffer_pool`. It is single-threaded, like the store
+ * (`docs/design/store.md` § Concurrency): a fix that would wait for a latch its own thread holds
+ * stops the program, since it would wait for ever.
+ */
+struct BufferPool
+    frames: Buf[FrameDesc]
+    bytes: Buf[u8]
+    table: Map[u64, usize]
+    hand: usize
+    source: &SegmentSource
+    wal: &WalHorizon
+    segments: Map[u64, &PageIo]
+    /** The segments written since their last sync, ascending. */
+    unsynced: Buf[u64]
+    /** The page image a write is made from, so the frame's own bytes are never sealed. */
+    io_buf: Buf[u8]
+    /** Set when a sync has failed: what every I/O is refused with from then on (§9 D14). */
+    failure: Option[CodecError]
+    stats: BufStats
+
+    /** How many frames the pool has. */
+    capacity(self) -> usize = self.frames.len()
+
+    /** What the pool has done so far. */
+    counts(self) -> BufStats = self.stats
+
+    /** Whether a sync has failed, which leaves recovery from storage as the only way on. */
+    failed(self) -> bool = self.failure.is_some()
+
+    /** Whether page `pid` is in a frame. */
+    resident(self, pid: u64) -> bool = self.table.has(pid)
+
+    /** How many fixes hold page `pid`: 0 when it is not resident. */
+    pins(self, pid: u64) -> u32 = self.table.get(pid) match
+        Some(i) -> self.frames[i].pins
+        None -> 0
+
+    /** Whether page `pid` is resident and changed since it was last written. */
+    is_dirty(self, pid: u64) -> bool = self.table.get(pid) match
+        Some(i) -> self.frames[i].dirty
+        None -> false
+
+    /** The LSN of the record that first dirtied page `pid` since it was last written, if it is dirty:
+     * its entry in the dirty page table a checkpoint records.
+     */
+    rec_lsn(self, pid: u64) -> Option[u64] = self.table.get(pid) match
+        Some(i) -> if self.frames[i].dirty then Some(self.frames[i].rec_lsn) else None
+        None -> None
+
+    /** How many resident pages are dirty. */
+    dirty_count(self) -> usize
+        var n: usize = 0
+
+        for f in self.frames
+            if f.dirty then n += 1
+
+        n
+
+    /** How many segments have been written since their last sync. */
+    unsynced_segments(self) -> usize = self.unsynced.len()
+
+    private frame_bytes(self, i: usize) -> []const u8 = self.bytes.view()[i * DbPageSize..<(i + 1) * DbPageSize]
+
+    @views(self)
+    private frame_bytes_mut(*self, i: usize) -> []u8 = self.bytes.view_mut()[i * DbPageSize..<(i + 1) * DbPageSize]
+
+    /** Stops the program unless `h` is a fix the pool holds now. */
+    private check_fix(self, h: PageFix)
+        if h.frame >= self.frames.len() then panic(s"unfix of page ${h.pid}: frame ${h.frame} is not one of the pool's")
+        val f = self.frames[h.frame]
+        if f.pid != h.pid || f.pins == 0 then panic(s"unfix of page ${h.pid}, which no fix holds")
+        if f.exclusive != (h.mode == LatchExclusive) then panic(s"unfix of page ${h.pid} under a latch its fix does not hold")
+
+    /** The bytes of the page `h` holds. */
+    page(self, h: PageFix) -> []const u8
+        self.check_fix(h)
+        self.frame_bytes(h.frame)
+
+    /** The bytes of the page `h` holds, to change: `h` must hold its frame exclusively. */
+    @views(self)
+    page_mut(*self, h: PageFix) -> []u8
+        self.check_fix(h)
+        if h.mode != LatchExclusive then panic(s"page ${h.pid} is changed under a shared latch")
+        self.frame_bytes_mut(h.frame)
+
+    /** The error every I/O is refused with once a sync has failed, if one has. */
+    private refuse_io(self) -> Result[unit, CodecError] = self.failure match
+        Some(e) -> Err(e)
+        None -> Ok(())
+
+    /** The page I/O of segment `key`, opening it the first time. */
+    private segment(*self, key: u64) -> Result[&PageIo, CodecError]
+        self.segments.get(key) match
+            Some(io) -> return Ok(io)
+            None -> ()
+
+        val dev = self.source.open_segment(segment_space(key), segment_number(key))?
+        val io = page_io(dev)
+        self.segments.put(key, io)
+        Ok(io)
+
+    /** Notes that segment `key` has a write no sync has covered. */
+    private note_unsynced(*self, key: u64)
+        var at: usize = 0
+
+        while at < self.unsynced.len() && self.unsynced[at] < key
+            at += 1
+
+        if at < self.unsynced.len() && self.unsynced[at] == key then return
+        self.unsynced.push(key)
+        var i = self.unsynced.len() - 1
+
+        while i > at
+            self.unsynced[i] = self.unsynced[i - 1]
+            i -= 1
+
+        self.unsynced[at] = key
+
+    /** Makes the log durable up to `lsn`, asking it to flush when it is not yet (§6.5 rule 1). */
+    private wal_durable_to(*self, lsn: u64) -> Result[unit, CodecError]
+        if self.wal.durable_lsn() >= lsn then return Ok(())
+        self.wal.flush_to(lsn)?
+        val now = self.wal.durable_lsn()
+        if now < lsn then panic(s"the log flushed to $lsn and is durable only to $now")
+        Ok(())
+
+    /** Writes the page in frame `i` to its segment, once the log is durable up to its `page_lsn`.
+     * The write is made from a copy, which is what the checksum is sealed into (§3.1 rule 3).
+     */
+    private write_frame(*self, i: usize) -> Result[unit, CodecError]
+        self.refuse_io()?
+        val pid = self.frames[i].pid
+        val key = segment_of(pid)?
+        val lsn = page_lsn_of(self.frame_bytes(i))
+        self.wal_durable_to(lsn)?
+        val io = self.segment(key)?
+        copy(self.io_buf.view_mut(), self.frame_bytes(i))
+        // The write may fail after the device took part of it, so the segment owes a sync either way.
+        self.note_unsynced(key)
+        io.write(pid, self.io_buf.view_mut())?
+        self.stats.writes += 1
+        self.frames[i].dirty = false
+        self.frames[i].rec_lsn = 0
+        Ok(())
+
+    /** A frame no fix holds, emptied of its page, which is written first if it is dirty: the clock
+     * passes over fixed frames, clears a set reference bit, and takes the first frame that has
+     * neither. Every frame fixed is `resource_exhausted`.
+     */
+    private victim(*self) -> Result[usize, CodecError]
+        val n = self.frames.len()
+        var steps: usize = 0
+
+        while steps < 2 * n
+            val i = self.hand
+            self.hand = (self.hand + 1) % n
+            steps += 1
+            val f = self.frames[i]
+            if f.pins > 0 then continue
+            if f.pid == NoPage then return Ok(i)
+
+            if f.referenced
+                self.frames[i].referenced = false
+                continue
+
+            if f.dirty then self.write_frame(i)?
+            val _ = self.table.remove(f.pid)
+            self.frames[i] = FrameDesc(NoPage, 0, false, false, 0, false)
+            self.stats.evictions += 1
+            return Ok(i)
+
+        Err(refusal("T1008", s"every one of the buffer pool's $n frames is fixed", [Detail("frames", s"$n")]))
+
+    /** Fixes resident frame `i` under `mode`. */
+    private take(*self, i: usize, mode: LatchMode) -> PageFix
+        val f = self.frames[i]
+        if f.exclusive then panic(s"page ${f.pid} is fixed exclusively: a second fix would wait for ever")
+        if mode == LatchExclusive && f.pins > 0 then panic(s"page ${f.pid} is fixed: an exclusive fix would wait for ever")
+        self.frames[i].pins = f.pins + 1
+        self.frames[i].exclusive = mode == LatchExclusive
+        self.frames[i].referenced = true
+        PageFix(f.pid, i, mode)
+
+    /** Fixes page `pid` under `mode`, reading it through its segment's page I/O if it is not
+     * resident. A read that fails is `io_error`, a page that fails its checks `data_corrupted`, and
+     * either names the PID and leaves the frame free (§9 D15). Every frame fixed is
+     * `resource_exhausted`. A fix of a page its own caller holds exclusively, or an exclusive fix of
+     * one it holds at all, stops the program.
+     */
+    fix(*self, pid: u64, mode: LatchMode) -> Result[PageFix, CodecError]
+        self.table.get(pid) match
+            Some(i) ->
+                self.stats.hits += 1
+                return Ok(self.take(i, mode))
+            None -> ()
+
+        val key = segment_of(pid)?
+        self.refuse_io()?
+        val i = self.victim()?
+        self.stats.misses += 1
+        val io = self.segment(key)?
+        self.stats.reads += 1
+
+        io.read(pid, self.frame_bytes_mut(i)) match
+            Err(e) ->
+                fill(self.frame_bytes_mut(i), 0)
+                return Err(e)
+            Ok(_) -> ()
+
+        self.frames[i] = FrameDesc(pid, 0, false, false, 0, false)
+        self.table.put(pid, i)
+        Ok(self.take(i, mode))
+
+    /** Fixes page `pid`, which is new, exclusively, without reading it: its frame is zeros but for
+     * the header's `pid` (§3.1), for the caller to initialize. A page that is resident stops the
+     * program.
+     */
+    fix_new(*self, pid: u64) -> Result[PageFix, CodecError]
+        if self.table.has(pid) then panic(s"page $pid is new and is already resident")
+        val _ = segment_of(pid)?
+        val i = self.victim()?
+        fill(self.frame_bytes_mut(i), 0)
+        put_u64_le(self.frame_bytes_mut(i)[16..<24], pid)
+        self.frames[i] = FrameDesc(pid, 0, false, false, 0, false)
+        self.table.put(pid, i)
+        Ok(self.take(i, LatchExclusive))
+
+    /** Hands back fix `h`, which did not change the page. Handing back a fix the pool does not hold
+     * stops the program.
+     */
+    unfix(*self, h: PageFix)
+        self.check_fix(h)
+        self.frames[h.frame].pins -= 1
+        self.frames[h.frame].exclusive = false
+
+    /** Hands back exclusive fix `h`, which changed the page by applying the log record at `lsn`: the
+     * page's `page_lsn` becomes `lsn` (§6.5 rule 4) and the frame is dirty. An LSN below the page's
+     * own stops the program, since LSNs only increase (§9 D19).
+     */
+    unfix_dirty(*self, h: PageFix, lsn: u64)
+        self.check_fix(h)
+        if h.mode != LatchExclusive then panic(s"page ${h.pid} is marked changed under a shared latch")
+        val had = page_lsn_of(self.frame_bytes(h.frame))
+        if lsn < had then panic(s"page ${h.pid} is at LSN $had and a record at $lsn is applied to it")
+        put_u64_le(self.frame_bytes_mut(h.frame)[8..<16], lsn)
+        if !self.frames[h.frame].dirty then self.frames[h.frame].rec_lsn = lsn
+        self.frames[h.frame].dirty = true
+        self.frames[h.frame].pins -= 1
+        self.frames[h.frame].exclusive = false
+
+    /** Writes page `pid` back if it is resident and dirty, once the log is durable up to its
+     * `page_lsn`. A page fixed exclusively is being changed by its caller, and flushing it stops the
+     * program.
+     */
+    flush_page(*self, pid: u64) -> Result[unit, CodecError]
+        self.table.get(pid) match
+            Some(i) ->
+                if self.frames[i].exclusive then panic(s"page $pid is flushed while it is fixed exclusively")
+                if self.frames[i].dirty then self.write_frame(i)?
+                Ok(())
+            None -> Ok(())
+
+    /** Makes every segment written since its last sync durable, in segment order. A sync that fails
+     * is fatal (§9 D14): it and every later I/O of the pool is `io_error`.
+     */
+    sync(*self) -> Result[unit, CodecError]
+        self.refuse_io()?
+
+        while self.unsynced.len() > 0
+            val key = self.unsynced[0]
+            val io = self.segment(key)?
+            self.stats.syncs += 1
+
+            io.sync() match
+                Ok(_) -> ()
+                Err(e) ->
+                    self.failure = Some(refusal("D4004", s"a sync failed: the database must be recovered from storage (${e.message})", [
+                        Detail("errno", e.detail("errno").unwrap_or("")), Detail("file", e.detail("file").unwrap_or(""))]))
+                    return Err(e)
+
+            val _ = self.unsynced.remove(0)
+
+        Ok(())
+
+    /** Writes every dirty page back, the log first made durable up to the highest `page_lsn` among
+     * them, then syncs (`sync`). Afterwards nothing resident is dirty and everything written is
+     * durable. A page fixed exclusively stops the program, as in `flush_page`.
+     */
+    flush_all(*self) -> Result[unit, CodecError]
+        self.refuse_io()?
+        var top: u64 = 0
+
+        for i in 0..<self.frames.len()
+            val f = self.frames[i]
+            if f.exclusive then panic(s"page ${f.pid} is flushed while it is fixed exclusively")
+            if f.dirty && page_lsn_of(self.frame_bytes(i)) > top then top = page_lsn_of(self.frame_bytes(i))
+
+        self.wal_durable_to(top)?
+
+        for i in 0..<self.frames.len()
+            if self.frames[i].dirty then self.write_frame(i)?
+
+        self.sync()
+end BufferPool
+
+/** A pool of `capacity` frames over the segments `source` opens, writing no page before `wal` is
+ * durable up to its `page_lsn`.
+ */
+buffer_pool(capacity: usize, source: &SegmentSource, wal: &WalHorizon) -> &BufferPool
+    require capacity > 0, "a buffer pool has at least one frame"
+    val frames = buf[FrameDesc]()
+
+    for i in 0..<capacity
+        frames.push(FrameDesc(NoPage, 0, false, false, 0, false))
+
+    BufferPool(frames, buf_filled(capacity * DbPageSize, u8(0)), map(), 0, source, wal, map(), buf[u64](),
+        buf_filled(DbPageSize, u8(0)), None, BufStats(0, 0, 0, 0, 0, 0))

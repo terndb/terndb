@@ -45,6 +45,19 @@ struct CodecError derives Eq
      */
     nodeless(self) -> CodecError = CodecError(self.code, self.path, self.message, self.details, 0)
 
+    /** An equal refusal that shares no count with this one: every string and the details are
+     * copies. A refusal kept where several threads reach it (the log's failed sync) hands each one
+     * of these, made under the lock that guards the kept one, since a count is not atomic and the
+     * threads drop their shares at once.
+     */
+    fresh(self) -> CodecError
+        val ds = buf[Detail]()
+
+        for d in self.details
+            ds.push(Detail(d.key.copy(), d.value.copy()))
+
+        CodecError(self.code.copy(), self.path.copy(), self.message.copy(), ds, self.node)
+
     /** The text of detail `key`, if it has one. */
     detail(self, key: string) -> Option[string]
         for d in self.details

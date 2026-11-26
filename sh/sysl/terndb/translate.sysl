@@ -15,30 +15,174 @@ import sysl.buf.{Buf, buf}
 // A named type is a reference resolved in the reader's catalog, so a column declared with one has its
 // current structure in every version; what changed is the value's shape, which is what the record
 // rule reads.
+//
+// A version that completes a column's conversion (`ddl.md` §8.5 rule 2, `SchemaVersion.completes`)
+// is the one step that is not a cast: the column's value there is the conversion its retype recorded
+// (`using`, or the strict cast of the column when none was given), evaluated over the row as the
+// version before it holds it, as a definition expression (§2.12) is. Its job proved, before the
+// version was committed, that it succeeds on every row a snapshot after it can see, and an unaware
+// writer's rows are proved at its commit (§6.4 rule 2), so here too a failure is `D1001` to a reader;
+// the job and reconciliation take the conversion's own error instead.
 
 private corrupt[T]() -> Result[T, CodecError] = fail("D1001", "a stored value does not convert to its column's type")
 
-/** The value `v` that column `id` of table `t` holds in a row encoded in schema version `schema`, as
- * a value of the column's type in `t`'s current version, `c` resolving named types.
+/** Each of `rows`, rows of table `t` encoded in their own schema versions, as a record of the
+ * columns of `t`'s current version (`ddl.md` §5.3), `c` resolving named types: each column matched
+ * by id, one added since reading its fill (a literal, else null), one dropped since skipped, and one
+ * present carried through every version between in order, by the lossless conversion where its type
+ * changed and by its recorded conversion where a version completes one. A row already in the current
+ * version is answered as it is. A recorded conversion that fails answers its own error.
  */
-private[terndb] translated_column(c: MemCatalog, t: CatTable, id: u32, schema: u64, v: Value) -> Result[Value, CodecError]
-    var ty: Option[Type] = None
-    var out = v
+private[terndb] translated_rows(c: MemCatalog, t: CatTable, rows: Buf[StoredRow]) -> Result[Buf[Value], CodecError]
+    val out = buf[Value]()
+    val now = t.schema_version()
+    val schemas = buf[u64]()
 
-    for version in t.versions
-        if version.number >= schema
-            for col in version.columns
-                if col.id == id
-                    ty match
-                        Some(prev) -> if prev != col.ty then out = converted_value(c, out, prev, col.ty)?
-                        None -> ()
+    for r in rows
+        out.push(r.value)
+        var seen = r.schema == now
 
-                    ty = Some(col.ty)
+        for s in schemas
+            if s == r.schema then seen = true
 
-    ty match
-        Some(last) -> if reaches_named(last) then converted_value(c, out, last, last) else Ok(out)
-        None -> Ok(out)
-end translated_column
+        if !seen then schemas.push(r.schema)
+
+    for s in schemas
+        val at = buf[usize]()
+        val values = buf[Value]()
+
+        for i in 0..<rows.len()
+            if rows[i].schema == s
+                at.push(i)
+                values.push(rows[i].value)
+
+        val done = translated_group(c, t, s, values)?
+
+        for k in 0..<at.len()
+            out[at[k]] = done[k]
+
+    Ok(out)
+end translated_rows
+
+/** `values`, rows of table `t` all encoded in schema version `schema`, carried version by version to
+ * `t`'s current one (`translated_rows`).
+ */
+private translated_group(c: MemCatalog, t: CatTable, schema: u64, values: Buf[Value]) -> Result[Buf[Value], CodecError]
+    var p = t.versions.len()
+
+    for i in 0..<t.versions.len()
+        if t.versions[i].number == schema then p = i
+
+    if p == t.versions.len() then return fail("D1001", "the row is not encoded in a schema version of its table")
+    val first = t.versions[p].columns
+    var cols = first
+    var rows = values
+
+    for q in (p + 1)..<t.versions.len()
+        val next = t.versions[q]
+        val (ids, computed) = recorded_conversions(c, cols, next, rows)?
+        val stepped = buf[Value]()
+
+        for n in 0..<rows.len()
+            val fields = rows[n] match
+                Record(fs) -> fs
+                _ -> return fail("D1001", "a stored row is not a record")
+
+            val out = buf[Value]()
+
+            for col in next.columns
+                var v = fill_value(col.fill)
+
+                for j in 0..<cols.len()
+                    if cols[j].id == col.id && j < fields.len()
+                        v = fields[j]
+                        var recorded = false
+
+                        for k in 0..<ids.len()
+                            if ids[k] == col.id
+                                v = computed[k][n]
+                                recorded = true
+
+                        if !recorded && cols[j].ty != col.ty then v = converted_value(c, v, cols[j].ty, col.ty)?
+
+                out.push(v)
+
+            stepped.push(Record(out))
+
+        rows = stepped
+        cols = next.columns
+
+    // A value of a named type takes the type's current shape, for each column the row itself held.
+    val out = buf[Value]()
+
+    for row in rows
+        val fields = row match
+            Record(fs) -> fs
+            _ -> return fail("D1001", "a stored row is not a record")
+
+        val shaped = buf[Value]()
+
+        for j in 0..<cols.len()
+            var v = if j < fields.len() then fields[j] else Null
+            var held = false
+
+            for f in first
+                if f.id == cols[j].id then held = true
+
+            if held && reaches_named(cols[j].ty) then v = converted_value(c, v, cols[j].ty, cols[j].ty)?
+            shaped.push(v)
+
+        out.push(Record(shaped))
+
+    Ok(out)
+end translated_group
+
+/** The columns version `next` completes the conversion of, by id, each with its value in every one
+ * of `rows` (rows of the version whose columns are `cols`): the conversion `cols` records for it,
+ * evaluated over the rows and coerced to the column's type in `next`.
+ */
+private recorded_conversions(c: MemCatalog, cols: Buf[CatColumn], next: SchemaVersion, rows: Buf[Value]) -> Result[(Buf[u32], Buf[Buf[Value]]), CodecError]
+    val ids = buf[u32]()
+    val exprs = buf[Expr]()
+    val types = buf[Type]()
+
+    for id in next.completes
+        for col in cols
+            if col.id == id
+                col.using match
+                    Some(u) ->
+                        for to in next.columns
+                            if to.id == id
+                                ids.push(id)
+                                exprs.push(u)
+                                types.push(to.ty)
+                    None -> ()
+
+    val computed = buf[Buf[Value]]()
+
+    if exprs.len() == 0 || rows.len() == 0
+        for _ in exprs
+            computed.push(buf[Value]())
+
+        return Ok((ids, computed))
+
+    val fs = buf[Field]()
+
+    for col in cols
+        fs.push(Field(col.name, resolve_type(c, col.ty)?))
+
+    val vs = def_vectors(c, record(fs.view()), rows, exprs)?
+
+    for k in 0..<vs.len()
+        computed.push(values_of(coerce_vector(vs[k], resolve_type(c, types[k])?)?))
+
+    Ok((ids, computed))
+end recorded_conversions
+
+/** The value a row of an older version reads for a column added since: its fill. */
+private fill_value(fill: Option[Expr]) -> Value = fill match
+    Some(Literal(_, v)) -> v
+    _ -> Null
 
 /** `v`, a value of `from`, as a value of `to`, where `from` converts to `to` losslessly (`ddl.md` §5.3
  * rule 3). A null stays null; `D1001` where `v` does not convert.

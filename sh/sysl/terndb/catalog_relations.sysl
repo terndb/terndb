@@ -7,12 +7,13 @@ import sysl.buf.{Buf, buf}
 // of its snapshot with its transaction's own DDL applied (`catalog_mvcc.sysl`), so that DDL of the
 // same transaction is visible and another's uncommitted DDL is not (§4.1 rule 5). A type is reported
 // structurally as `type` and `type_text`, a definition expression in its text form (§4.1 rule 4,
-// `text_tree.sysl`). They are read-only: the type checker sees them as views, which DML refuses
+// `text_tree.sysl`) and in its canonical encoding beside it. They are read-only: the type checker sees them as views, which DML refuses
 // (`Q5003`).
 //
-// `catalog.jobs` and `catalog.schema_versions` are not served: no background job is run or recorded,
-// so no job row exists, and a schema version keeps neither the commit that created it nor whether a
-// stored row may still carry it. A `job` inside a state is reported as 0 for the same reason.
+// `catalog.jobs` and `catalog.schema_versions` are not served: a job runs to its end inside the
+// commit that started it and is recorded by the store, not as a catalog row (`store_jobs.sysl`), and
+// a schema version keeps neither the commit that created it nor whether a stored row may still carry
+// it. A `job` inside a state is reported as 0, since no job is ever queued or running.
 
 /** The column list of relation `name` of namespace `catalog`, or `None` where §4.2 serves none. */
 catalog_relation(name: string) -> Option[Buf[Field]]
@@ -26,10 +27,12 @@ catalog_relation(name: string) -> Option[Buf[Field]]
             Field("default", nullable(Text)), Field("generated", nullable(Text)),
             Field("identity", nullable(union_of([empty_f("always"), empty_f("by_default")]))),
             Field("state", union_of([empty_f("ready"), job_f("filling"),
-                Field("converting", record([oid_f("job"), bytes_f("to_type"), text_f("to_type_text")]))]))])
+                Field("converting", record([oid_f("job"), bytes_f("to_type"), text_f("to_type_text")]))])),
+            Field("default_tree", nullable(Bytes)), Field("generated_tree", nullable(Bytes))])
         "indexes" -> items_of([oid_f("oid"), oid_f("table_oid"), text_f("namespace"), text_f("name"), Field("unique", Bool),
-            Field("keys", list(record([Field("column", nullable(Text)), text_f("expr"), Field("descending", Bool)]))),
-            Field("predicate", nullable(Text)), Field("state", union_of([job_f("building"), empty_f("ready"), job_f("failed")]))])
+            Field("keys", list(record([Field("column", nullable(Text)), text_f("expr"), Field("descending", Bool), bytes_f("expr_tree")]))),
+            Field("predicate", nullable(Text)), Field("state", union_of([job_f("building"), empty_f("ready"), job_f("failed")])),
+            Field("predicate_tree", nullable(Bytes))])
         "constraints" -> items_of([oid_f("oid"), oid_f("table_oid"), text_f("namespace"), text_f("name"), Field("validated", Bool),
             Field("kind", constraint_kind_type())])
         "types" -> items_of([oid_f("oid"), text_f("namespace"), text_f("name"), text_f("owner"),
@@ -82,7 +85,7 @@ private constraint_kind_type() -> Type
         Field("primary_key", record([names])),
         Field("unique", record([names, oid_f("index_oid")])),
         Field("not_null", record([text_f("column")])),
-        Field("check", record([text_f("expr")])),
+        Field("check", record([text_f("expr"), bytes_f("expr_tree")])),
         Field("foreign_key", record([names, oid_f("ref_table_oid"), Field("ref_columns", list(Text)), Field("on_delete", fk_action_type()),
             Field("on_update", fk_action_type()), Field("deferred", Bool)]))])
 
@@ -184,6 +187,15 @@ private opt_text(e: Option[Expr]) -> Value = e match
     Some(x) -> Text(expr_text(x))
     None -> Null
 
+/** Expression `e` in its canonical encoding, as a `…_tree` column reports it beside its text form. */
+private expr_bytes(e: Expr) -> Value = encode_expr(e) match
+    Ok(b) -> Bytes(b)
+    Err(_) -> Bytes(buf[u8]())
+
+private opt_bytes(e: Option[Expr]) -> Value = e match
+    Some(x) -> expr_bytes(x)
+    None -> Null
+
 /** One row per column of each table's current schema version, then one per column of each view. */
 private column_rows(c: MemCatalog, out: Buf[Value])
     for t in c.tables
@@ -204,13 +216,13 @@ private column_rows(c: MemCatalog, out: Buf[Value])
 
             out.push(rec([UInt(t.oid), UInt(u64(col.id)), UInt(u64(i)), Text(col.name), type_bytes(c, col.ty), type_text_of(c, col.ty),
                 type_name_of(col.ty), Bool(col.ty.is_nullable()), Bool(contains_id(t.primary_key, col.id)), opt_text(col.default),
-                opt_text(col.generated), identity, state]))
+                opt_text(col.generated), identity, state, opt_bytes(col.default), opt_bytes(col.generated)]))
 
     for v in c.views
         for i in 0..<v.columns.len()
             val f = v.columns[i]
             out.push(rec([UInt(v.oid), UInt(u64(i) + 1), UInt(u64(i)), Text(f.name), type_bytes(c, f.ty), type_text_of(c, f.ty),
-                type_name_of(f.ty), Bool(f.ty.is_nullable()), Bool(false), Null, Null, Null, variant(0, rec([]))]))
+                type_name_of(f.ty), Bool(f.ty.is_nullable()), Bool(false), Null, Null, Null, variant(0, rec([])), Null, Null]))
 end column_rows
 
 private contains_id(ids: Buf[u32], id: u32) -> bool
@@ -227,8 +239,8 @@ private index_row(c: MemCatalog, x: CatIndex) -> Value
         val key = k.key match
             KeyOn(id) ->
                 val name = t.column_by_id(id).map(col -> col.name).unwrap_or("")
-                rec([Text(name), Text(expr_text(Col("row", name))), Bool(k.descending)])
-            KeyOver(e) -> rec([Null, Text(expr_text(e)), Bool(k.descending)])
+                rec([Text(name), Text(expr_text(Col("row", name))), Bool(k.descending), expr_bytes(Col("row", name))])
+            KeyOver(e) -> rec([Null, Text(expr_text(e)), Bool(k.descending), expr_bytes(e)])
 
         keys.push(key)
 
@@ -237,7 +249,8 @@ private index_row(c: MemCatalog, x: CatIndex) -> Value
         IndexReady -> variant(1, rec([]))
         IndexFailed -> variant(2, rec([UInt(0)]))
 
-    rec([UInt(x.oid), UInt(x.table), Text(ns_name(c, t.ns)), Text(x.name), Bool(x.unique), Relation(keys), opt_text(x.predicate), state])
+    rec([UInt(x.oid), UInt(x.table), Text(ns_name(c, t.ns)), Text(x.name), Bool(x.unique), Relation(keys), opt_text(x.predicate), state,
+        opt_bytes(x.predicate)])
 
 /** The constraints of each table, then its not-null columns, each listed as a `not_null` constraint
  * though it is no object (§2.6): oid 0, named `<table>_<column>_not_null`, validated.
@@ -250,7 +263,7 @@ private constraint_rows(c: MemCatalog, out: Buf[Value])
             val kind = k.kind match
                 ConPrimaryKey(ids) -> variant(0, rec([texts(c.column_names(t, ids))]))
                 ConUnique(ids) -> variant(1, rec([texts(c.column_names(t, ids)), UInt(k.index)]))
-                ConCheck(e) -> variant(3, rec([Text(expr_text(e))]))
+                ConCheck(e) -> variant(3, rec([Text(expr_text(e)), expr_bytes(e)]))
                 ConForeignKey(ids, target, ref_ids, on_delete, on_update, deferred) ->
                     val ref_names = c.table_by_oid(target) match
                         Some(j) -> c.column_names(c.tables[j], ref_ids)

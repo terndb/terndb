@@ -1,0 +1,755 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.checksum.crc32c
+import sysl.encoding.{get_u32_le, get_u64_le, put_u16_le, put_u32_le, put_u64_le}
+
+// The WAL's records (`wal_record.sysl`, `on-disk-format.md` §6.1–§6.4): LSN arithmetic, every record
+// kind round-tripping through its encoding (at its largest as well), the header's layout and CRC,
+// what the encoder refuses, and what a frame that passes its CRC but does not parse is.
+
+/** `n` bytes counting up from `seed`. */
+wr_bytes(n: usize, seed: u8) -> Buf[u8]
+    val out = buf[u8]()
+
+    for i in 0..<n
+        out.push(u8((usize(seed) + i) % 251))
+
+    out
+
+/** A `Buf` of `xs`. */
+wr_buf[T](xs: []const T) -> Buf[T]
+    val out = buf[T]()
+    out.extend(xs)
+    out
+
+private wr_entry(slot: u16, key_len: usize, value_len: usize) -> WalEntry =
+    WalEntry(slot, 0x0102, wr_bytes(key_len, 3), wr_bytes(value_len, 7))
+
+/** A body of each kind with every field set to something other than zero. */
+wr_sample(kind: u8) -> WalBody = kind match
+    WkPad -> WbPad(24)
+    WkPageInit -> WbPageInit(0x1000000000000007, 3, 0x81, 0x55aa, 2, 1, wr_bytes(5, 1), wr_bytes(9, 2))
+    WkFpi -> WbFpi(42, 0, wr_bytes(DbPageSize, 9))
+    WkNodeInsert -> WbNodeInsert(42, wr_entry(17, 11, 23))
+    WkNodeDelete -> WbNodeDelete(42, 300)
+    WkNodePatch -> WbNodePatch(42, 5, wr_buf([WalPatch(20, wr_bytes(3, 4)), WalPatch(100, wr_bytes(0, 0)), WalPatch(4000, wr_bytes(17, 5))]))
+    WkRowHeader -> WbRowHeader(42, 6, 0x123456789, 0x1000000000000099, 0x8001)
+    WkNodeSlotFlags -> WbNodeSlotFlags(42, 7, 0xbeef)
+    WkNodeTruncate -> WbNodeTruncate(42, 31, wr_bytes(12, 6), 0xfeedface)
+    WkNodeBulk -> WbNodeBulk(42, wr_buf([wr_entry(0, 1, 2), wr_entry(1, 0, 0), wr_entry(2, 40, 300)]))
+    WkNodeSetExtra -> WbNodeSetExtra(42, 0x7fffffffffffffff)
+    WkNodeCompact -> WbNodeCompact(42)
+    WkOverflowWrite -> WbOverflowWrite(42, 43, wr_bytes(5000, 8))
+    WkUndoAppend -> WbUndoAppend(0x1000000000000003, 128, wr_bytes(77, 9))
+    WkPageAlloc -> WbPageAlloc(2, 4095)
+    WkPageFree -> WbPageFree(2, 65535)
+    WkFormatPage -> WbFormatPage(42, wr_bytes(DbPageSize, 10))
+    WkTxnCommit -> WbTxnCommit(-5, 0x1000000000000123, 99, 1)
+    WkTxnAbort -> WbTxnAbort
+    WkCheckpointBegin -> WbCheckpointBegin
+    WkCheckpointEnd -> WbCheckpointEnd(WalCheckpoint(4096, 4096, 10, 20, 30, 40, 50, wr_buf([WalActiveTxn(7, 8, 9), WalActiveTxn(10, 11, 0)])))
+    WkFileCreate -> WbFileCreate(1, 3)
+    WkFileExtend -> WbFileExtend(0, 2, 65536)
+    WkFileDelete -> WbFileDelete(1, 0xffffffffffffffff)
+    WkUndoTruncate -> WbUndoTruncate(0x1000000000004000)
+    WkFormatUpgrade -> WbFormatUpgrade(1, 2)
+    WkFormatMin -> WbFormatMin(2)
+    WkTimelineSwitch -> WbTimelineSwitch(1, 2, 77, wr_bytes(16, 11))
+    WkRestorePoint -> WbRestorePoint(wr_bytes(9, 12))
+    WkPurgeHorizon -> WbPurgeHorizon(555)
+    WkSyncConfig -> WbSyncConfig(2, wr_buf([wr_bytes(3, 1), wr_bytes(0, 0), wr_bytes(8, 2)]))
+    _ -> panic(s"no sample of kind $kind")
+
+/** Encodes `rec` at LSN `lsn`, checks the frame, decodes it, and expects `rec` back. */
+wr_roundtrips(rec: WalRecord, lsn: u64)
+    val at = WalRecord(lsn, rec.txn, rec.flags, rec.undo_next, rec.body)
+    var b = wal_encoded(at).unwrap()
+    assert_eq(b.len() % 8, usize(0))
+    assert_eq(usize(wal_frame_len(b.view())), b.len())
+    assert(wal_frame_valid(b.view(), lsn))
+    assert_eq(b[24], wal_kind(rec.body))
+    assert_eq(wal_decode(b.view()), Ok(at))
+
+/** The sample of `kind` round-trips, plain and in a transaction. */
+wr_kind_roundtrips(kind: u8)
+    wr_roundtrips(wal_record(0, wr_sample(kind)), 4096)
+    if kind != WkPad then wr_roundtrips(wal_record(0x1234, wr_sample(kind)), 0x40000008)
+
+/** The error code of a result, or "ok". */
+wr_code[T](r: Result[T, CodecError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(e) -> e.code
+
+/** Seals an encoded record's CRC again after a test has changed its bytes. */
+wr_reseal(b: []u8) = put_u32_le(b[0..<4], crc32c(b[4..<b.len]))
+
+// -- LSN arithmetic --------------------------------------------------------------------------------
+
+@test
+the_format_segment_is_64_mib_and_its_records_start_after_a_4_kib_header()
+    assert_eq(wal_segment_size(WalFormatShift), u64(67108864))
+    assert_eq(wal_segment_capacity(WalFormatShift), u64(67104768))
+    assert_eq(wal_segment_first_record(0, WalFormatShift), WalFirstLsn)
+
+@test
+an_lsn_lies_in_segment_lsn_shifted_by_26_at_its_low_bits()
+    val lsn: u64 = 3 * 67108864 + 12345
+    assert_eq(wal_segment_of(lsn, WalFormatShift), u64(3))
+    assert_eq(wal_segment_offset(lsn, WalFormatShift), u64(12345))
+    assert_eq(wal_segment_lsn(3, WalFormatShift), u64(3 * 67108864))
+
+@test
+the_last_byte_of_a_segment_is_in_it_and_the_next_is_in_the_next()
+    val end = wal_segment_size(WalFormatShift)
+    assert_eq(wal_segment_of(end - 1, WalFormatShift), u64(0))
+    assert_eq(wal_segment_offset(end - 1, WalFormatShift), end - 1)
+    assert_eq(wal_segment_of(end, WalFormatShift), u64(1))
+    assert_eq(wal_segment_offset(end, WalFormatShift), u64(0))
+
+@test
+the_largest_lsn_lies_in_the_last_segment()
+    val top: u64 = 0xffffffffffffffff
+    assert_eq(wal_segment_of(top, WalFormatShift), top >> 26)
+    assert_eq(wal_segment_offset(top, WalFormatShift), u64(67108863))
+
+@test
+a_smaller_segment_shifts_the_same_way()
+    assert_eq(wal_segment_size(16), u64(65536))
+    assert_eq(wal_segment_of(65536 * 5 + 7, 16), u64(5))
+    assert_eq(wal_segment_first_record(5, 16), u64(65536 * 5 + 4096))
+    assert_eq(wal_segment_capacity(16), u64(61440))
+
+@test
+the_record_after_one_is_where_it_ends()
+    assert_eq(wal_next_record(4096 + 40, 16), u64(4136))
+
+@test
+a_record_ending_at_its_segment_s_end_is_followed_past_the_next_header()
+    assert_eq(wal_next_record(65536, 16), u64(65536 + 4096))
+
+@test
+a_record_ending_less_than_a_header_before_the_end_is_followed_in_the_next_segment()
+    assert_eq(wal_next_record(65536 - 24, 16), u64(65536 + 4096))
+    assert_eq(wal_next_record(65536 - 8, 16), u64(65536 + 4096))
+
+@test
+a_record_ending_exactly_a_header_before_the_end_is_followed_there()
+    assert_eq(wal_next_record(65536 - 32, 16), u64(65536 - 32))
+
+@test
+blocks_round_down_and_up_to_4_kib()
+    assert_eq(wal_block_floor(4096), u64(4096))
+    assert_eq(wal_block_floor(8191), u64(4096))
+    assert_eq(wal_block_ceil(4096), u64(4096))
+    assert_eq(wal_block_ceil(4097), u64(8192))
+    assert_eq(wal_block_ceil(0), u64(0))
+
+// -- every kind round-trips --------------------------------------------------------------------------
+
+@test
+a_pad_round_trips()
+    wr_kind_roundtrips(WkPad)
+
+@test
+an_empty_pad_round_trips()
+    wr_roundtrips(wal_record(0, WbPad(0)), 4096)
+
+@test
+page_init_round_trips()
+    wr_kind_roundtrips(WkPageInit)
+
+@test
+page_init_of_a_page_that_is_not_a_node_round_trips_with_empty_fences()
+    wr_roundtrips(wal_record(0, WbPageInit(9, 5, 0, 0, 1, 0, buf[u8](), buf[u8]())), 4096)
+
+@test
+an_fpi_round_trips()
+    wr_kind_roundtrips(WkFpi)
+
+@test
+an_lz4_fpi_round_trips()
+    wr_roundtrips(wal_record(0, WbFpi(42, 1, wr_bytes(3000, 1))), 4096)
+
+@test
+node_insert_round_trips()
+    wr_kind_roundtrips(WkNodeInsert)
+
+@test
+node_delete_round_trips()
+    wr_kind_roundtrips(WkNodeDelete)
+
+@test
+node_patch_round_trips()
+    wr_kind_roundtrips(WkNodePatch)
+
+@test
+node_patch_of_no_changes_round_trips()
+    wr_roundtrips(wal_record(0, WbNodePatch(42, 0, buf[WalPatch]())), 4096)
+
+@test
+row_header_round_trips()
+    wr_kind_roundtrips(WkRowHeader)
+
+@test
+node_slot_flags_round_trips()
+    wr_kind_roundtrips(WkNodeSlotFlags)
+
+@test
+node_truncate_round_trips()
+    wr_kind_roundtrips(WkNodeTruncate)
+
+@test
+node_truncate_to_an_open_upper_fence_round_trips()
+    wr_roundtrips(wal_record(0, WbNodeTruncate(42, 0, buf[u8](), 0)), 4096)
+
+@test
+node_bulk_round_trips()
+    wr_kind_roundtrips(WkNodeBulk)
+
+@test
+node_bulk_of_no_entries_round_trips()
+    wr_roundtrips(wal_record(0, WbNodeBulk(42, buf[WalEntry]())), 4096)
+
+@test
+node_set_extra_round_trips()
+    wr_kind_roundtrips(WkNodeSetExtra)
+
+@test
+node_compact_round_trips()
+    wr_kind_roundtrips(WkNodeCompact)
+
+@test
+overflow_write_round_trips()
+    wr_kind_roundtrips(WkOverflowWrite)
+
+@test
+undo_append_round_trips()
+    wr_kind_roundtrips(WkUndoAppend)
+
+@test
+page_alloc_round_trips()
+    wr_kind_roundtrips(WkPageAlloc)
+
+@test
+page_free_round_trips()
+    wr_kind_roundtrips(WkPageFree)
+
+@test
+format_page_round_trips()
+    wr_kind_roundtrips(WkFormatPage)
+
+@test
+txn_commit_round_trips()
+    wr_kind_roundtrips(WkTxnCommit)
+
+@test
+txn_commit_at_the_extremes_of_its_fields_round_trips()
+    wr_roundtrips(wal_record(0xffffffffffffffff, WbTxnCommit(-9223372036854775807 - 1, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff)), 4096)
+
+@test
+txn_abort_round_trips()
+    wr_kind_roundtrips(WkTxnAbort)
+
+@test
+checkpoint_begin_round_trips()
+    wr_kind_roundtrips(WkCheckpointBegin)
+
+@test
+checkpoint_end_round_trips()
+    wr_kind_roundtrips(WkCheckpointEnd)
+
+@test
+checkpoint_end_with_no_active_transaction_round_trips()
+    wr_roundtrips(wal_record(0, WbCheckpointEnd(WalCheckpoint(1, 2, 3, 4, 5, 6, 7, buf[WalActiveTxn]()))), 4096)
+
+@test
+file_create_round_trips()
+    wr_kind_roundtrips(WkFileCreate)
+
+@test
+file_extend_round_trips()
+    wr_kind_roundtrips(WkFileExtend)
+
+@test
+file_delete_round_trips()
+    wr_kind_roundtrips(WkFileDelete)
+
+@test
+undo_truncate_round_trips()
+    wr_kind_roundtrips(WkUndoTruncate)
+
+@test
+format_upgrade_round_trips()
+    wr_kind_roundtrips(WkFormatUpgrade)
+
+@test
+format_min_round_trips()
+    wr_kind_roundtrips(WkFormatMin)
+
+@test
+timeline_switch_round_trips_naming_its_own_lsn()
+    wr_kind_roundtrips(WkTimelineSwitch)
+    var b = wal_encoded(WalRecord(0x5000, 0, 0, 0, wr_sample(WkTimelineSwitch))).unwrap()
+    assert_eq(get_u64_le(b.view()[40..<48]).unwrap(), u64(0x5000))
+
+@test
+restore_point_round_trips()
+    wr_kind_roundtrips(WkRestorePoint)
+
+@test
+restore_point_with_an_empty_name_round_trips()
+    wr_roundtrips(wal_record(0, WbRestorePoint(buf[u8]())), 4096)
+
+@test
+purge_horizon_round_trips()
+    wr_kind_roundtrips(WkPurgeHorizon)
+
+@test
+sync_config_round_trips()
+    wr_kind_roundtrips(WkSyncConfig)
+
+@test
+sync_config_with_no_standby_round_trips()
+    wr_roundtrips(wal_record(0, WbSyncConfig(0, buf[Buf[u8]]())), 4096)
+
+@test
+every_kind_of_section_6_4_has_a_sample_that_round_trips()
+    var kinds = 0
+
+    for k in 0..<64
+        val kind = u8(k)
+        if kind <= WkFormatPage || (kind >= WkTxnCommit && kind <= WkSyncConfig)
+            wr_kind_roundtrips(kind)
+            kinds += 1
+
+    assert_eq(kinds, 31)
+
+@test
+a_compensation_page_record_round_trips_with_its_undo_next()
+    for kind in [WkPageInit, WkNodeInsert, WkNodeDelete, WkNodePatch, WkRowHeader, WkNodeCompact, WkUndoAppend, WkFormatPage]
+        wr_roundtrips(WalRecord(0, 5, WalCompensation, 0x1000000000000777, wr_sample(kind)), 4096)
+
+@test
+a_compensation_record_carries_undo_next_after_its_payload()
+    val plain = wal_encoded(WalRecord(4096, 5, 0, 0, WbNodeDelete(42, 1))).unwrap()
+    val comp = wal_encoded(WalRecord(4096, 5, WalCompensation, 0x99, WbNodeDelete(42, 1))).unwrap()
+    // pid 8 + slot 2 = 10 payload bytes; padded to 48 plain, 56 with undo_next at 42.
+    assert_eq(plain.len(), usize(48))
+    assert_eq(comp.len(), usize(56))
+    assert_eq(get_u64_le(comp.view()[42..<50]).unwrap(), u64(0x99))
+
+@test
+mtr_cont_round_trips_and_compensation_with_it()
+    wr_roundtrips(WalRecord(0, 5, WalMtrCont, 0, wr_sample(WkNodeInsert)), 4096)
+    wr_roundtrips(WalRecord(0, 5, WalMtrCont | WalCompensation, 3, wr_sample(WkNodeInsert)), 4096)
+
+// -- at the largest each field allows ----------------------------------------------------------------
+
+@test
+an_fpi_with_the_largest_image_a_u16_length_holds_round_trips()
+    wr_roundtrips(wal_record(0, WbFpi(42, 1, wr_bytes(65535, 1))), 4096)
+
+@test
+node_insert_with_the_largest_key_and_value_round_trips()
+    wr_roundtrips(wal_record(0, WbNodeInsert(42, wr_entry(65535, 65535, 65535))), 4096)
+
+@test
+node_patch_with_the_most_changes_round_trips()
+    val patches = buf[WalPatch]()
+
+    for i in 0..<65535
+        patches.push(WalPatch(u16(i), wr_bytes(i % 3, u8(i % 200))))
+
+    wr_roundtrips(wal_record(0, WbNodePatch(42, 65535, patches)), 4096)
+
+@test
+node_patch_with_the_longest_change_round_trips()
+    wr_roundtrips(wal_record(0, WbNodePatch(42, 1, wr_buf([WalPatch(65535, wr_bytes(65535, 3))]))), 4096)
+
+@test
+node_bulk_with_the_most_entries_round_trips()
+    val entries = buf[WalEntry]()
+
+    for i in 0..<65535
+        entries.push(wr_entry(u16(i), i % 4, i % 5))
+
+    wr_roundtrips(wal_record(0, WbNodeBulk(42, entries)), 4096)
+
+@test
+page_init_with_the_longest_fences_round_trips()
+    wr_roundtrips(wal_record(0, WbPageInit(1, 2, 3, 4, 5, 6, wr_bytes(65535, 1), wr_bytes(65535, 2))), 4096)
+
+@test
+node_truncate_with_the_longest_fence_round_trips()
+    wr_roundtrips(wal_record(0, WbNodeTruncate(1, 65535, wr_bytes(65535, 4), 0xffffffffffffffff)), 4096)
+
+@test
+undo_append_of_the_most_bytes_round_trips()
+    wr_roundtrips(wal_record(0, WbUndoAppend(1, 65535, wr_bytes(65535, 5))), 4096)
+
+@test
+restore_point_with_the_longest_name_round_trips()
+    wr_roundtrips(wal_record(0, WbRestorePoint(wr_bytes(65535, 6))), 4096)
+
+@test
+sync_config_with_the_most_and_longest_names_round_trips()
+    val names = buf[Buf[u8]]()
+
+    for i in 0..<255
+        names.push(wr_bytes(255, u8(i)))
+
+    wr_roundtrips(wal_record(0, WbSyncConfig(255, names)), 4096)
+
+@test
+checkpoint_end_with_a_hundred_thousand_active_transactions_round_trips()
+    val txns = buf[WalActiveTxn]()
+
+    for i in 0..<100000
+        txns.push(WalActiveTxn(u64(i), u64(i) * 3, u64(i) * 7))
+
+    wr_roundtrips(wal_record(0, WbCheckpointEnd(WalCheckpoint(1, 2, 3, 4, 5, 6, 7, txns))), 4096)
+
+@test
+the_largest_record_a_format_segment_holds_round_trips()
+    // 32 header + pid, next_pid and used (20) + the payload = the segment's whole capacity.
+    val payload = usize(wal_segment_capacity(WalFormatShift)) - 52
+    val rec = wal_record(9, WbOverflowWrite(1, 2, wr_bytes(payload, 1)))
+    var b = wal_encoded(WalRecord(4096, 9, 0, 0, rec.body)).unwrap()
+    assert_eq(u64(b.len()), wal_segment_capacity(WalFormatShift))
+    assert(wal_len_fits(wal_frame_len(b.view()), 4096, WalFormatShift))
+    assert_eq(wal_decode(b.view()), Ok(WalRecord(4096, 9, 0, 0, rec.body)))
+
+@test
+the_largest_pad_a_format_segment_holds_round_trips()
+    val size = wal_segment_capacity(WalFormatShift) - 32
+    wr_roundtrips(wal_record(0, WbPad(size)), 4096)
+
+// -- the header's layout -------------------------------------------------------------------------------
+
+@test
+a_commit_record_lays_its_header_out_as_section_6_2_says()
+    var b = wal_encoded(WalRecord(0x0102030405060708, 0x1112131415161718, WalMtrCont, 0, WbTxnCommit(1, 2, 3, 4))).unwrap()
+    val v = b.view()
+    assert_eq(b.len(), usize(64))
+    assert_eq(get_u32_le(v[0..<4]).unwrap(), crc32c(v[4..<64]))
+    assert_eq(get_u32_le(v[4..<8]).unwrap(), u32(64))
+    assert_eq(get_u64_le(v[8..<16]).unwrap(), u64(0x0102030405060708))
+    assert_eq(get_u64_le(v[16..<24]).unwrap(), u64(0x1112131415161718))
+    assert_eq(v[24], WkTxnCommit)
+    assert_eq(v[25], WalMtrCont)
+    assert_eq(v[26], u8(1))
+    assert_eq(v[27], u8(0))
+    assert_eq(get_u32_le(v[28..<32]).unwrap(), u32(0))
+    assert_eq(get_u64_le(v[32..<40]).unwrap(), u64(1))
+    assert_eq(get_u64_le(v[56..<64]).unwrap(), u64(4))
+
+@test
+a_record_is_padded_with_zeros_to_a_multiple_of_8()
+    // PAGE_ALLOC: pid 8 + page_index 2 = 10 payload bytes, so 42 bytes padded to 48.
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbPageAlloc(1, 2))).unwrap()
+    assert_eq(b.len(), usize(48))
+
+    for i in 42..<48
+        assert_eq(b[i], u8(0))
+
+@test
+a_record_already_a_multiple_of_8_gets_no_padding()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbUndoTruncate(1))).unwrap()
+    assert_eq(b.len(), usize(40))
+
+@test
+a_pad_s_payload_is_zeros()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbPad(40))).unwrap()
+    assert_eq(b.len(), usize(72))
+
+    for i in 32..<72
+        assert_eq(b[i], u8(0))
+
+@test
+encoding_appends_after_what_the_buffer_already_holds()
+    val out = buf[u8]()
+    out.extend([1, 2, 3])
+    val n = wal_encode(WalRecord(4096, 0, 0, 0, WbTxnAbort), out).unwrap()
+    assert_eq(n, usize(32))
+    assert_eq(out.len(), usize(35))
+    assert(wal_frame_valid(out.view()[3..<35], 4096))
+
+@test
+stamping_sets_the_lsn_and_mtr_cont_and_reseals()
+    var b = wal_encoded(WalRecord(0, 0, 0, 0, WbNodeDelete(1, 2))).unwrap()
+    wal_stamp(b.view_mut(), 0x9000, true)
+    assert(wal_frame_valid(b.view(), 0x9000))
+    assert_eq(wal_decode(b.view()).unwrap().flags, WalMtrCont)
+    wal_stamp(b.view_mut(), 0xa000, false)
+    assert(wal_frame_valid(b.view(), 0xa000))
+    assert_eq(wal_decode(b.view()).unwrap(), WalRecord(0xa000, 0, 0, 0, WbNodeDelete(1, 2)))
+
+@test
+stamping_a_timeline_switch_sets_its_switch_lsn()
+    var b = wal_encoded(WalRecord(0, 0, 0, 0, wr_sample(WkTimelineSwitch))).unwrap()
+    wal_stamp(b.view_mut(), 0x7008, false)
+    assert_eq(wal_decode(b.view()), Ok(WalRecord(0x7008, 0, 0, 0, wr_sample(WkTimelineSwitch))))
+
+@test
+stamping_keeps_the_compensation_flag()
+    var b = wal_encoded(WalRecord(0, 0, WalCompensation, 4, WbNodeDelete(1, 2))).unwrap()
+    wal_stamp(b.view_mut(), 4096, true)
+    assert_eq(wal_decode(b.view()).unwrap().flags, WalMtrCont | WalCompensation)
+
+// -- what the encoder refuses ------------------------------------------------------------------------
+
+private wr_refused(body: WalBody)
+    val out = buf[u8]()
+    out.push(7)
+    assert_eq(wr_code(wal_encode(wal_record(0, body), out)), "D2003")
+    assert_eq(out.len(), usize(1))
+
+@test
+an_fpi_image_past_a_u16_is_refused()
+    wr_refused(WbFpi(1, 0, wr_bytes(65536, 0)))
+
+@test
+an_fpi_codec_other_than_none_or_lz4_is_refused()
+    wr_refused(WbFpi(1, 2, wr_bytes(1, 0)))
+
+@test
+a_key_past_a_u16_is_refused()
+    wr_refused(WbNodeInsert(1, wr_entry(0, 65536, 0)))
+
+@test
+a_value_past_a_u16_is_refused()
+    wr_refused(WbNodeInsert(1, wr_entry(0, 0, 65536)))
+
+@test
+a_bulk_entry_past_a_u16_is_refused()
+    wr_refused(WbNodeBulk(1, wr_buf([wr_entry(0, 1, 1), wr_entry(1, 65536, 0)])))
+
+@test
+more_bulk_entries_than_a_u16_counts_are_refused()
+    val entries = buf[WalEntry]()
+
+    for i in 0..<65536
+        entries.push(wr_entry(0, 0, 0))
+
+    wr_refused(WbNodeBulk(1, entries))
+
+@test
+more_patches_than_a_u16_counts_are_refused()
+    val patches = buf[WalPatch]()
+
+    for i in 0..<65536
+        patches.push(WalPatch(0, buf[u8]()))
+
+    wr_refused(WbNodePatch(1, 0, patches))
+
+@test
+a_patch_past_a_u16_is_refused()
+    wr_refused(WbNodePatch(1, 0, wr_buf([WalPatch(0, wr_bytes(65536, 0))])))
+
+@test
+a_fence_past_a_u16_is_refused()
+    wr_refused(WbPageInit(1, 0, 0, 0, 0, 0, wr_bytes(65536, 0), buf[u8]()))
+    wr_refused(WbPageInit(1, 0, 0, 0, 0, 0, buf[u8](), wr_bytes(65536, 0)))
+    wr_refused(WbNodeTruncate(1, 0, wr_bytes(65536, 0), 0))
+
+@test
+an_undo_append_past_a_u16_is_refused()
+    wr_refused(WbUndoAppend(1, 0, wr_bytes(65536, 0)))
+
+@test
+a_restore_point_name_past_a_u16_is_refused()
+    wr_refused(WbRestorePoint(wr_bytes(65536, 0)))
+
+@test
+a_format_page_that_is_not_one_page_is_refused()
+    wr_refused(WbFormatPage(1, wr_bytes(DbPageSize - 1, 0)))
+    wr_refused(WbFormatPage(1, wr_bytes(DbPageSize + 1, 0)))
+
+@test
+a_promotion_id_that_is_not_16_bytes_is_refused()
+    wr_refused(WbTimelineSwitch(1, 2, 3, wr_bytes(15, 0)))
+    wr_refused(WbTimelineSwitch(1, 2, 3, wr_bytes(17, 0)))
+
+@test
+more_standbys_than_a_u8_counts_are_refused()
+    val names = buf[Buf[u8]]()
+
+    for i in 0..<256
+        names.push(buf[u8]())
+
+    wr_refused(WbSyncConfig(1, names))
+
+@test
+a_standby_name_past_a_u8_is_refused()
+    wr_refused(WbSyncConfig(1, wr_buf([wr_bytes(256, 0)])))
+
+@test
+a_flag_bit_section_6_2_does_not_define_is_refused()
+    val out = buf[u8]()
+    assert_eq(wr_code(wal_encode(WalRecord(0, 0, 4, 0, WbNodeCompact(1)), out)), "D2003")
+    assert_eq(wr_code(wal_encode(WalRecord(0, 0, 0x80, 0, WbNodeCompact(1)), out)), "D2003")
+    assert_eq(out.len(), usize(0))
+
+@test
+a_compensation_record_that_is_not_a_page_record_is_refused()
+    val out = buf[u8]()
+    assert_eq(wr_code(wal_encode(WalRecord(0, 0, WalCompensation, 1, WbTxnCommit(1, 2, 3, 4)), out)), "D2003")
+    assert_eq(wr_code(wal_encode(WalRecord(0, 0, WalCompensation, 1, WbTxnAbort), out)), "D2003")
+
+@test
+a_pad_with_a_flag_is_refused()
+    val out = buf[u8]()
+    assert_eq(wr_code(wal_encode(WalRecord(0, 0, WalMtrCont, 0, WbPad(8)), out)), "D2003")
+    assert_eq(wr_code(wal_encode(WalRecord(0, 0, WalCompensation, 0, WbPad(8)), out)), "D2003")
+
+// -- the frame check -----------------------------------------------------------------------------------
+
+@test
+a_frame_is_valid_only_at_the_lsn_it_names()
+    var b = wal_encoded(WalRecord(8192, 0, 0, 0, WbTxnAbort)).unwrap()
+    assert(wal_frame_valid(b.view(), 8192))
+    assert(!wal_frame_valid(b.view(), 8192 + 67108864))
+    assert(!wal_frame_valid(b.view(), 4096))
+
+@test
+a_frame_with_any_bit_flipped_fails_its_crc()
+    var b = wal_encoded(WalRecord(8192, 3, 0, 0, WbTxnCommit(1, 2, 3, 4))).unwrap()
+
+    for bit in 0..<b.len() * 8
+        var c = b.copy()
+        c[bit / 8] = c[bit / 8] ^ (u8(1) << u8(bit % 8))
+        assert(!wal_frame_valid(c.view(), 8192), s"bit $bit")
+
+@test
+a_length_is_refused_when_zero_short_unaligned_or_past_the_segment()
+    assert(!wal_len_fits(0, 4096, 16))
+    assert(!wal_len_fits(24, 4096, 16))
+    assert(!wal_len_fits(36, 4096, 16))
+    assert(!wal_len_fits(33, 4096, 16))
+    assert(wal_len_fits(32, 4096, 16))
+    assert(wal_len_fits(61440, 4096, 16))
+    assert(!wal_len_fits(61448, 4096, 16))
+    assert(wal_len_fits(32, 65536 - 32, 16))
+    assert(!wal_len_fits(40, 65536 - 32, 16))
+    assert(!wal_len_fits(0xfffffff8, 4096, WalFormatShift))
+
+// -- what a frame that holds but does not parse is -------------------------------------------------------
+
+private wr_header(kind: u8, flags: u8, payload: []const u8) -> Buf[u8]
+    var b = buf_filled(WalHeaderSize, u8(0))
+    b.extend(payload)
+
+    while b.len() % 8 != 0
+        b.push(0)
+
+    put_u32_le(b.view_mut()[4..<8], u32(b.len()))
+    put_u64_le(b.view_mut()[8..<16], 4096)
+    b[24] = kind
+    b[25] = flags
+    put_u16_le(b.view_mut()[26..<28], 1)
+    wr_reseal(b.view_mut())
+    b
+
+@test
+an_unknown_kind_is_corruption()
+    for kind in [u8(17), u8(31), u8(46), u8(0x40), u8(0x4f), u8(255)]
+        val b = wr_header(kind, 0, wr_bytes(8, 0).view())
+        assert(wal_frame_valid(b.view(), 4096))
+        assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+a_payload_that_ends_early_is_corruption()
+    // A NODE_INSERT whose key length runs past the record.
+    val p = buf[u8]()
+    p.extend([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, 0, 0, 0])
+    assert_eq(wr_code(wal_decode(wr_header(WkNodeInsert, 0, p.view()).view())), "D1001")
+
+@test
+a_payload_with_a_word_left_over_is_corruption()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbUndoTruncate(1))).unwrap()
+    b.extend([0, 0, 0, 0, 0, 0, 0, 0])
+    put_u32_le(b.view_mut()[4..<8], u32(b.len()))
+    wr_reseal(b.view_mut())
+    assert(wal_frame_valid(b.view(), 4096))
+    assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+padding_that_is_not_zeros_is_corruption()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbPageAlloc(1, 2))).unwrap()
+    b[47] = 1
+    wr_reseal(b.view_mut())
+    assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+a_pad_with_a_flag_is_corruption()
+    assert_eq(wr_code(wal_decode(wr_header(WkPad, WalMtrCont, wr_bytes(0, 0).view()).view())), "D1001")
+    assert_eq(wr_code(wal_decode(wr_header(WkPad, WalCompensation, wr_bytes(8, 0).view()).view())), "D1001")
+
+@test
+a_compensation_flag_on_a_record_that_is_not_a_page_record_is_corruption()
+    assert_eq(wr_code(wal_decode(wr_header(WkTxnAbort, WalCompensation, wr_bytes(8, 0).view()).view())), "D1001")
+
+@test
+a_compensation_record_missing_its_undo_next_is_corruption()
+    // NODE_COMPACT: pid only, then nothing where undo_next should be.
+    assert_eq(wr_code(wal_decode(wr_header(WkNodeCompact, WalCompensation, wr_bytes(8, 0).view()).view())), "D1001")
+
+@test
+an_fpi_naming_an_unknown_codec_is_corruption()
+    val p = buf[u8]()
+    p.extend([1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0])
+    assert_eq(wr_code(wal_decode(wr_header(WkFpi, 0, p.view()).view())), "D1001")
+
+@test
+a_timeline_switch_naming_another_lsn_is_corruption()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, wr_sample(WkTimelineSwitch))).unwrap()
+    put_u64_le(b.view_mut()[40..<48], 4104)
+    wr_reseal(b.view_mut())
+    assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+a_checkpoint_claiming_more_transactions_than_it_holds_is_corruption()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, wr_sample(WkCheckpointEnd))).unwrap()
+    put_u32_le(b.view_mut()[88..<92], 0xffffffff)
+    wr_reseal(b.view_mut())
+    assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+a_length_that_disagrees_with_the_bytes_is_corruption()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbTxnAbort)).unwrap()
+    b.extend([0, 0, 0, 0, 0, 0, 0, 0])
+    assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+record_format_zero_is_corruption()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbTxnAbort)).unwrap()
+    b[26] = 0
+    wr_reseal(b.view_mut())
+    assert_eq(wr_code(wal_decode(b.view())), "D1001")
+
+@test
+a_newer_record_format_is_unsupported()
+    var b = wal_encoded(WalRecord(4096, 0, 0, 0, WbTxnAbort)).unwrap()
+    b[26] = 2
+    wr_reseal(b.view_mut())
+    assert_eq(wr_code(wal_decode(b.view())), "D3001")
+    b[26] = 0
+    b[27] = 1
+    wr_reseal(b.view_mut())
+    assert_eq(wr_code(wal_decode(b.view())), "D3001")
+
+@test
+corruption_names_the_lsn()
+    val b = wr_header(99, 0, wr_bytes(8, 0).view())
+    val e = wal_decode(b.view()).unwrap_err()
+    assert_eq(e.detail("lsn"), Some("4096"))
+
+@test
+reserved_bytes_and_flag_bits_are_ignored()
+    var b = wal_encoded(WalRecord(4096, 7, WalMtrCont, 0, WbNodeDelete(1, 2))).unwrap()
+    b[25] = b[25] | 0xf0
+    put_u32_le(b.view_mut()[28..<32], 0xdeadbeef)
+    wr_reseal(b.view_mut())
+    assert_eq(wal_decode(b.view()), Ok(WalRecord(4096, 7, WalMtrCont, 0, WbNodeDelete(1, 2))))

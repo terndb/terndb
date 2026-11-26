@@ -439,7 +439,7 @@ client that happens to share the address space.*
 | Getter | Accepts |
 |---|---|
 | `terndb_column_get_bool` | `bool` |
-| `…_get_i8`, `_i16`, `_i32`, `_i64` | `int8`, `int16`, `int32` and `date`, `int64` and `time`, `datetime`, `timestamp` |
+| `…_get_i8`, `_i16`, `_i32`, `_i64` | `int8`, `int16`, `int32` and `date`, `int64` and `time`, `timestamp`, `timestamptz` (any precision), `interval_dt`, `money` |
 | `…_get_u8`, `_u16`, `_u32`, `_u64` | the unsigned integers of that width |
 | `…_get_f32`, `_f64` | `float32`, `float64` |
 | `…_get_i128(col, i, &lo, &hi)` | `int128`, and `decimal`'s unscaled value (scale from `terndb_type_decimal`) |
@@ -629,8 +629,9 @@ typedef struct terndb_log_record   terndb_log_record;
 #define TERNDB_TYPE_BYTES      9
 #define TERNDB_TYPE_DATE      10
 #define TERNDB_TYPE_TIME      11
+#define TERNDB_TYPE_TIMESTAMP 12          /* zoneless; TERNDB_TYPE_DATETIME is the same kind */
 #define TERNDB_TYPE_DATETIME  12
-#define TERNDB_TYPE_TIMESTAMP 13
+#define TERNDB_TYPE_TIMESTAMPTZ 13
 #define TERNDB_TYPE_INTERVAL  14
 #define TERNDB_TYPE_UUID      15
 #define TERNDB_TYPE_RECORD    16
@@ -643,6 +644,30 @@ typedef struct terndb_log_record   terndb_log_record;
 #define TERNDB_TYPE_UINT32    24
 #define TERNDB_TYPE_UINT64    25
 #define TERNDB_TYPE_JSON      26
+#define TERNDB_TYPE_NUMERIC   27          /* tree 1.1: query-tree.md §2.7 */
+#define TERNDB_TYPE_JSONB     28
+#define TERNDB_TYPE_XML       29
+#define TERNDB_TYPE_MONEY     30
+#define TERNDB_TYPE_INET      31
+#define TERNDB_TYPE_VARCHAR   64
+#define TERNDB_TYPE_CHAR      65
+#define TERNDB_TYPE_VARBINARY 66
+#define TERNDB_TYPE_BINARY    67
+#define TERNDB_TYPE_DECFLOAT  68
+#define TERNDB_TYPE_TIME_P    69
+#define TERNDB_TYPE_TIMESTAMP_P 70
+#define TERNDB_TYPE_TIMESTAMPTZ_P 71
+#define TERNDB_TYPE_TIMETZ    72
+#define TERNDB_TYPE_INTERVAL_YM 73
+#define TERNDB_TYPE_INTERVAL_DT 74
+#define TERNDB_TYPE_ARRAY     75
+#define TERNDB_TYPE_RANGE     76
+#define TERNDB_TYPE_MULTIRANGE 77
+#define TERNDB_TYPE_CIDR      78
+#define TERNDB_TYPE_MACADDR   79
+#define TERNDB_TYPE_MACADDR8  80
+#define TERNDB_TYPE_BIT       81
+#define TERNDB_TYPE_VARBIT    82
 
 #define TERNDB_LOG_ERROR 1
 #define TERNDB_LOG_WARN  2
@@ -1010,13 +1035,15 @@ by §1–§11. A function not listed has exactly the behaviour its section gives
 `p09-export/`) showed that an exported C API with handles and a callback works, but not this one. The items below
 go to the sysl session; the ABI above is not to be bent around them.
 
-**At sysl 0.13.6 items 1–11 are met** and `libterndb` is built on them (`capi/`, `sh/sysl/terndb/capi/`):
+**From sysl 0.13.6 items 1–11 are met** and `libterndb` is built on them (`capi/`, `sh/sysl/terndb/capi/`; the
+probes are in `docs/phase0/sysl-survey/p16-capi013/`, `FINDINGS.md` § "Status at sysl 0.13.5"):
 `into_raw`/`from_raw`; `*unit` as `void *` and `*const T` as `const T *`; `usize` as `size_t` and a `*[N]T`
 parameter as `T name[N]`; a `c type` for C's `int` and `char`; `--header`, `--header-guard`, `#define`s from
 exported constants, opaque handle `typedef`s; `build-c --shared` exporting exactly the header's functions, with
 `--install-name`, `--compatibility-version` and `--current-version`; a trap in an export ending the process
 without unwinding (sysl `ffi.md` § "A trap inside an export"); `@thread_local`; an allocator pair told each block's
-size and boundary; and `sysl.io.poll.WakeFd`. Item 12 is not met.
+size and boundary; and `sysl.io.poll.WakeFd`. 0.13.6 is the floor: in 0.13.5 an `@export`ed function-pointer
+alias could not be compared with `null`. Item 12 is not met. The text below is each requirement as written.
 
 1. **Hand C a counted `&T` and take it back** (`into_raw` / `from_raw` or an exported `&T` parameter and return).
    0.11.0 has no way to keep a reference-counted object alive while only C holds it, so the probe kept every

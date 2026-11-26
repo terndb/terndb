@@ -27,7 +27,7 @@ node, with each buffer held as a typed `Buf` instead of raw octets:
 | `int8` … `int64`, `uint8` … `uint64` | `I8s` … `I64s`, `U8s` … `U64s` | `values` |
 | `int128`, `decimal(p, s)` | `I128s` (a decimal's unscaled value) | `values` |
 | `date` | `I32s` (days) | `values` |
-| `time`, `datetime`, `timestamp` | `I64s` (microseconds) | `values` |
+| `time`, `timestamp` (`datetime`), `timestamptz` | `I64s` (microseconds) | `values` |
 | `float32`, `float64` | `F32s`, `F64s` | `values` |
 | `interval` | `Intervals(Buf[Ival])` | `values`, 16 octets |
 | `uuid` | `Uuids(Buf[u128])` | `values` (RFC 9562 order on the wire) |
@@ -84,8 +84,8 @@ Operators are **pulled**: `trait Operator { next_batch(*self) -> Result[Option[C
 CodecError] }`. `Some` is a batch of at least one row — an operator never hands up an empty batch,
 which matches §6.4 rule 1 for the result — and `None` is the end. An operator holds its input as an
 `&Operator`, so a tree is built from trait objects and dispatches once per batch. `Sort`,
-`Distinct` and a merge join drain their input on their first call, and every join its right input;
-the rest stream.
+`Distinct` drain their input on their first call, and every join its right input (a hash join its
+left input too when that is the smaller); the rest stream.
 
 Expressions are evaluated over a batch against an `Env`: the binders visible at the node (§8.3),
 each a name and a vector, and the execution's context — the parameter values (§10.1) and the
@@ -217,18 +217,30 @@ of every binder's columns in §8.4 order instead, which `flatten` builds: the re
 `CompositeDistinctOp` compares rows by their flat columns but hands up composites, so the binders
 stay visible above it.
 
-**Merge join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
+**Hash join**, used whenever `on` has a conjunct `eq(a, b)` or `same(a, b)` (through any nesting
 of `and`) with `a` reading only left binders and `b` only right ones; one of the two may instead be
 a literal or a parameter, one value on every row (`same(true, d.k)` joins an uncorrelated subquery
-back to its one-row domain). Both inputs are drained. Each
-key is evaluated over each side, coerced to the two operands' common type, and both sides sorted by
-the keys with `cmp` (§3.3) through one vector of both sides' keys, so that a left and a right row
-compare as two rows of it. Runs of equal keys on the two sides are a group, and every pair of a
-group is a candidate. **`cmp` orders nulls, but `eq` never matches them**: under `eq`, a row whose
-key holds a null at any depth (a null field of a record key, a null payload of a union key) never
-enters a group, since `eq` of it is null or `false` and never `true` (§3.2); under `same` nulls are
-ordinary values and match each other (§3.1). The other conjuncts of `on`, the residual, are tested
-on the candidates only.
+back to its one-row domain). Each key is evaluated over each side and coerced to the two operands'
+common type, and each column of keys is hashed a vector at a time (`value_hash.sysl`, §3.4): rapidhash
+(`sysl.checksum.hash64`) over each scalar slot's canonical words — every NaN alike, `-0.0` as
+`+0.0`, a number by its value with trailing decimal zeros dropped, so that the integer widths and the
+decimal scales agree — a record's fields in order, a union's discriminant and payload, a list's
+elements in order and a bag's as a wrapping sum, which no order changes. A row's hash combines its
+keys'. **The table goes on the smaller side**: the right input is drained, and the left read ahead
+until it holds as many rows; the right rows are then built on and the left input probes the table a
+batch at a time as it streams, or, when the left input ended with fewer rows, the left rows are built
+on and each right row probes them. A table groups its rows by `same` keys (open addressing on the
+hash; keys whose hashes agree are compared with `same_slots`, so a collision costs a comparison and
+never a wrong match), and every pair of a probing row and the group it finds is a candidate. **`eq`
+never matches a null**: under `eq`, a row whose key holds a null at any depth (a null field of a
+record key, a null payload of a union key) is neither built on nor looked up, since `eq` of it is null
+or `false` and never `true` (§3.2); under `same` nulls are ordinary values and match each other
+(§3.1). The other conjuncts of `on`, the residual, are tested on the candidates only.
+
+**There is no merge join.** One would sort both sides by their keys only to find the runs of equal
+keys, draining both inputs to do it, where the hash join finds the same pairs with no sort and drains
+one side; and a join's output is a bag (§6.5 rule 7), so no consumer could use the order a merge
+leaves.
 
 **Block nested-loop join**, for every other `on` (and an absent one, a cross join). The right input
 is drained; each left batch is paired with every right row, row-major.
@@ -237,35 +249,39 @@ is drained; each left batch is paired with every right row, row-major.
 into one composite with `take` and `on` (or the residual) is evaluated over it like any expression.
 Per left row the operator counts matches (to two) and notes whether `on` was null for some pair; per
 right row it notes a match. Once a left row's pairs are all tested — at the end of its batch for the
-nested loop, after the last group for the merge — it is finished: null-extended (`left`, `full`,
+nested loop and for a hash join probing with the left rows, after the last right row has probed when
+the left rows are built on — it is finished: null-extended (`left`, `full`,
 `single` with no match), kept or dropped (`semi`, `anti`), or marked. A second match for one left
 row under `single` is `R0003` at once. After the last left row, `right` and `full` null-extend the
 right rows nothing matched. Output is queued as pieces of at most `BatchSize` rows and handed up in
 batches of exactly `BatchSize` until the last, never empty.
 
-**Semi, anti and mark joins whose `on` is keys alone** test no pair: a left row in a group of equal
-keys has a right row making `on` `true`, which is all they ask, so the group answers every left row
-in it at once.
+**Semi, anti and mark joins whose `on` is keys alone** test no pair: a left row whose keys find a
+group of right rows has a right row making `on` `true`, which is all they ask; built on the left, a
+group a right row finds answers each of its left rows at once.
 
-**A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a merge
+**A mark's null** (§6.5 rule 5) needs to know whether `on` was null for some pair, which a hash
 join's keys do not say for a left row they did not match. When `on` is `bool` it never is. Otherwise
 a pair can have `on` null only where its `same` keys agree (`same` is never null), some `eq` key
 holds a null on one side, and the `eq` keys holding none on either side agree (two non-null keys that
-differ are `false`; a pair whose keys all agree was a candidate and was tested). So both sides are
-partitioned by the `same` keys; a partition's right rows are grouped by which `eq` keys hold a null
-(a mask), and each unmatched left row looks up, in each group, the rows agreeing with it on the keys
-neither holds a null in, sorted by those keys once per pair of masks. With scalar keys and no residual
-a row found decides the mark (null); otherwise `on` is evaluated on the pairs found. A `not in` over a
-subquery with nulls is therefore a sort and a search per row, not a pair per right row.
+differ are `false`; a pair whose keys all agree was a candidate and was tested). So the right rows
+are grouped by which `eq` keys hold a null (a mask), and each unmatched left row looks up, in each
+group, the rows agreeing with it on the `same` keys and on the `eq` keys neither holds a null in, in a
+hash table of the group by those keys, built once per pair of masks and kept for every later left
+batch. With scalar keys and no residual a row found decides the mark (null); otherwise `on` is
+evaluated on the pairs found. A `not in` over a subquery with nulls is therefore a lookup per row and
+mask, not a pair per right row.
 
 **Work counts.** Every operator of an execution shares one `Work` (`exec_eval.sysl`, in `Ctx`): the
-pairs a join tested `on` on and the rows it sorted by its keys. They depend only on the plan and the
-rows, so a test bounds them to catch a plan that does quadratic work, whatever the machine's speed
-(`unnest_work_tests.sysl`).
+pairs a join tested `on` on, the rows a hash join built tables of and looked up, and the key
+comparisons agreeing hashes cost. They depend only on the plan and the rows, so a test bounds them to
+catch a plan that does quadratic work, whatever the machine's speed (`unnest_work_tests.sysl`,
+`exec_hash_join_tests.sysl`). `Work` also carries the hash the joins use, `key_hash()`, which a test
+narrows to force collisions and prove that the keys are re-checked.
 
 **When `on` is evaluated** is §6.5 rule 8, written into the spec by this work: only on pairs, so
-never when a side is empty (the merge join evaluates no key then), and a conjunct may go unevaluated
-on a pair another conjunct already makes not `true` — which is what lets the merge join skip the
+never when a side is empty (the hash join evaluates no key then), and a conjunct may go unevaluated
+on a pair another conjunct already makes not `true` — which is what lets the hash join skip the
 pairs whose keys differ.
 
 **An empty right input ends an `inner` or `semi` join** before its left input is read, since neither
@@ -273,10 +289,9 @@ can emit a row (§6.5 rule 10). The unnester relies on it: it joins each uncorre
 outer side's domain with the domain on the right, so over an empty outer side the subtree is never
 evaluated and raises nothing (§6.6 rule 4).
 
-**Hash join is the intended equi-join** once sysl has a fast seeded hash (the survey's gap, §6):
-build on the smaller side, probe streaming, with the same composite batches and the same per-row
-bookkeeping. Until then the merge join is the equi-join; it is blocking on both sides, where a hash
-join would block on the build side only.
+**A hash join built on the right streams its left input**: it reads ahead only as many left rows as
+the right has, and hands up output as each left batch is probed. Built on the left, it has read the
+left input whole, which then held fewer rows than the right.
 
 ### 4.2 Nested relations and correlation
 
@@ -399,7 +414,17 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
 
 - **Scan** (§6.1): `ScanOp` reads the rows visible at the snapshot in its access path's key range
   (§4.6) from the store on its first pull, in key order, and hands them up in `BatchSize` batches. A
-  correlated scan is planned again per outer row (§4.2) and so read and logged once per row.
+  correlated scan is planned again per outer row (§4.2) and so read and logged once per row. The
+  store decodes the rows straight into the batches' vectors (`Store.scan_vectors`,
+  `store_scan.sysl`): a row whose current image the reader sees, in the table's current schema
+  version, is read where its page holds it, its key components decoded as values and each scalar or
+  octet-string column from its stored octets into its lane, with no image, record or per-column
+  value built; every other row (rebuilt through the undo log, `LOCK_ONLY`, an older schema version)
+  takes the general path and is appended as values. A non-key column the statement does not read
+  through the scan's binder (the logged predicate's columns, below) is not decoded at all, and its
+  slots hold its type's placeholder; so a damaged value in an unread column is found by the first
+  read that decodes it, while the row's layout is checked on every read. A DML target decodes every
+  column, since an updated row is written back whole. `Store.reads` counts the work (`ReadWork`).
 - **The logged predicate** (`isolation.md` §4.4). A `Filter` directly over a `Scan` is the scan's
   logged predicate unless it holds a subquery: the store keeps it as a closure that evaluates the
   typed filter on a one-row vector of a write image, counting an error or an image of another schema
@@ -439,7 +464,7 @@ validation, runtime, a constraint, the store's — aborts the transaction with i
 
 Not yet: translation of a row of an older schema version (`ddl.md` §5.3).
 
-### 4.6 Access paths: the primary key
+### 4.6 Access paths: the primary key and secondary indexes
 
 The code is `exec_access.sysl`. A scan of a table that a `Filter` sits directly over, and the target
 scan of an `Update` or `Delete`, read only the range of the table's B+tree that the filter's
@@ -477,13 +502,138 @@ comparisons of the **primary key** allow; the filter itself still runs over ever
   tests assert each access path visits only its range, and a differential test compares random
   predicates with the same predicate under `or false`, which is never narrowed.
 
-Not yet: secondary and unique indexes (`store_index.sysl`) as access paths. A read through one must
-fetch each primary row and check its visibility, and must not use an index whose build has not
-finished; that is a later item.
+#### Secondary indexes
+
+The same conjuncts may instead narrow the scan to a range of a secondary index's entries
+(`store_index.sysl`, `Store.scan_index`); the tests are `exec_access_index_tests.sysl`.
+
+- **Which indexes.** Only an index whose state in the transaction's catalog is `ready` (`ddl.md` §2.5
+  rule 5), unique or not, a `unique` constraint's included; one still `building` — in the transaction
+  that created it, or a constraint's whose validation is deferred — is never read through.
+- **Which conjuncts count.** As for the primary key, a comparison `eq`, `lt`, `le`, `gt` or `ge`
+  whose one operand is fixed for the statement (a `Literal`, `Null`, `Param` or `Cast` of these) and
+  whose other is a component of the index: a bare `Col` of the scan's binder for a column
+  component, or, for an expression component, an expression that **is** the definition node for
+  node — the same columns of the binder, literals, calls, casts and field accesses (`matches_def`).
+  An equivalent but different expression (`lower(lower(s))`, `200 / d` for `100 / d`) does not count.
+  The operand's value is converted to the component's type as a key column's is (same type, or
+  integers by value); any other pair is left to the filter.
+- **Partial indexes** are used only when every conjunct of the index's predicate (split at its `and`s)
+  is, node for node, one of the filter's conjuncts. This is an exact-match check, which §2.5 rule 3
+  allows: `k > 1` does not count as implying `k > 0`, and a predicate missing a conjunct is not used.
+- **The range.** Entries are compared as values in the total order (`query-tree.md` §3.3), so a
+  component's direction does not matter. Equalities on a leading run of the components fix a prefix of
+  the entry's value; the component after them may take one bound on each side, the tighter one where
+  several are given. A bound on that component also excludes its null entries, which sort first and
+  satisfy no comparison. An entry's value holds its null components (the index of a nullable column
+  must find `b = 'x'`'s rows whose next component is null).
+- **Reading.** The store visits the entries in the range, fetches each row they name by key (each
+  once, in key order, so the result is the full scan's, order included), reads its version visible at
+  the snapshot and keeps it unless that version's own entry lies outside the range — an entry is never
+  removed, so it may name a row whose version has left the value, or that an aborted transaction
+  inserted. A row whose visible version has no entry (a partial index's predicate not true of it) is
+  handed up for the filter to reject. A row one of whose versions the index's definition could not be
+  evaluated over has no entry and is kept in `unindexed`; every read through the index fetches it, so
+  the filter raises the error a full scan would raise on it.
+- **Decoding** (`IndexScanOp`, `Store.scan_index_vectors`). The rows fetched are built into vectors
+  as a `ScanOp`'s are (§4.5): through a plain index (every component a column, no predicate), a row
+  whose current image the reader sees, in the current schema version, has its entry read from the
+  index's columns of that image, and of its other non-key columns only those the statement reads
+  are decoded. A row rebuilt through the undo log, a `LOCK_ONLY` one, one of an older schema version,
+  and every row read through an index over expressions or with a predicate take the general path
+  (the visible version rebuilt, its entry evaluated, translated) and are appended as values. A DML
+  target reading through an index decodes every column, as through the primary key.
+- **Logged.** The read is logged with the same predicate as a full scan's, the filter (`isolation.md`
+  §4.4: `key ∈ [a, b) ∧ F` is `F`, since `F` implies the range), found or not, so a phantom inserted
+  into the range, a row updated into or out of it, and write skew through it fail a serializable
+  commit exactly as they do through a full scan.
+- **The choice** (`access_of`), one rule and no cost model:
+  1. a conjunct comparing any column of the binder with a fixed null reads nothing (`NoRows`);
+  2. else a lookup of the whole primary key;
+  3. else a `ready` unique index with every component fixed by an equality, the first in catalog order;
+  4. else the primary-key range or index range fixing the most leading components, then the one whose
+     next component is bounded, ties going to the primary key and then to the earlier index; a path
+     fixing and bounding nothing is no path, and with none the scan reads every row.
+- **Measured.** `Store.entries_read` counts the index entries visited and `Store.rows_fetched` the rows
+  fetched by key; a read through an index visits no leaf entry (`slots_read`). A differential test
+  compares random predicates over random data, with stale entries, against the same predicate under
+  `or false`, in a reader's snapshot and in a writer's own uncommitted state.
+
+The referencing side of a foreign-key check (`Store.referencing`, `store.md`) reads through a `ready`
+index with no predicate whose leading components are the referencing columns in order, when the table
+has one, and makes a pass over the whole referencing table otherwise.
+
+### 4.7 Predicate pushdown
+
+The code is `plan_pushdown.sysl`. SQL's comma joins and `CROSS JOIN` arrive as a cross join under a
+`Filter`; after unnesting, the tree is rewritten so that each conjunct of a `Filter` over joins, and of
+a join's `on`, is evaluated as low as it may be, and the rewritten tree is type-checked again before it
+is planned. The join itself chooses its keys from its `on` (§4.1), so the rewrite targets "an inner
+join of these inputs with these conjuncts in its `on`", whatever the equi-join's algorithm.
+
+- **Safe conjuncts.** Only a conjunct that can raise no runtime error and draws nothing volatile
+  moves below a join: one built of `Col`, `Row`, `Field`, literals, nulls and parameters with `eq`,
+  `ne`, `lt`, `le`, `gt`, `ge`, `same`, `is_null`, `is_not_null`, `and`, `or`, `not` and `coalesce`
+  (`query-tree.md` §4.1's implicit coercions are lossless, so a comparison's raise nothing). Evaluating it on more
+  rows or fewer changes no error. Any other conjunct — arithmetic, a cast, `next_value`, a
+  subquery — stays where it was written; above a region it is evaluated on the rows the region
+  keeps, which `query-tree.md` §6.4 rule 3 allows, since a safe conjunct is not `true` on the rows
+  removed.
+- **Inner-join regions.** A tree of `inner` joins whose `on` is absent or safe, with the safe
+  `Filter`s directly over or between them, is one region: its leaves (the inputs that are not such
+  joins) and a pool of conjuncts. A `Filter` over a join and the join with those conjuncts in its
+  `on` have one result (§6.4 rule 3, §6.5 rule 8). Each conjunct is placed at the lowest point that
+  sees every binder it reads: a conjunct of one leaf becomes a `Filter` over that leaf (taken into a
+  safe `Filter` already there, so a scan's access path sees it, §4.6); one of several leaves goes into
+  the `on` of the join that first meets them, where an `eq` across its inputs is a key; one reading no
+  leaf (a constant such as `1 = 0`, or an outer row's value) filters the leftmost leaf.
+- **Shape.** The region keeps its own tree unless every leaf is safe to evaluate — a scan of a table
+  (not a view), a `ParamScan`, and filters, projections, `Distinct` and joins of these by safe
+  expressions — since only then can the shape not change which errors are raised. The bracketing of
+  the leaves *in their order* with the fewest joins that no key joins is then taken if it has fewer
+  than the region's own (`a, b, c where a.k = c.k and b.k = c.k` is `a ⋈ (b ⋈ c)`), which keeps the
+  columns in §8.4 order. Where the region's columns are read only by name — under a `Project`,
+  `Aggregate` or `Nest`, through `Filter`, `Sort`, `Limit`, `Distinct`, `Window` and `Unnest` — and
+  that still leaves such a join, a left-deep order joining next the first leaf a key joins to those
+  joined so far is taken if it has fewer still (`a-c, a-d, b-d` is `((a ⋈ c) ⋈ d) ⋈ b`). At the root,
+  in a `SetOp` input or under a `Tag`, the leaves' order is the result's and is never changed.
+- **Empty right inputs.** An `inner` join's empty right input ends it before its left input is read
+  (§4.1, §6.5 rule 10). A conjunct moved into a right input can make it empty, which would leave
+  the left input's errors unraised, so a conjunct moves into a right input only when the left input
+  beside it, at every level of the region, is safe to evaluate; otherwise it waits in the `on` of
+  the join above.
+- **A join whose `on` is not safe** is evaluated on every pair of its inputs: its safe `on`
+  conjuncts reading one input move into it (the rest may go unevaluated on a pair they make not
+  `true`, §6.5 rule 8), into the right input only beside a safe left input, and a `Filter` over it
+  keeps every conjunct, since fewer pairs would leave `on`'s errors unraised.
+- **Outer joins.** A safe `Filter` conjunct that rejects a side's nulls — a comparison, or
+  `is_not_null`, with a bare column of that side as an operand (§3.2: null when an operand is) —
+  removes every row that side was null-extended in, and is not `true` on them, so the rest of the
+  filter may go unevaluated there: `left` with its right side rejected and `right` with its left
+  side rejected are `inner`, and `full` is `right`, `left` or `inner`. It becomes `inner` only when
+  its left input is safe to evaluate, by the rule above. With the join still outer, a safe `Filter`
+  conjunct reading only a `left` or `right` join's preserved side moves into that side when `on` is
+  safe (a row it removes takes all its output rows with it, and `on` would have raised nothing on
+  their pairs); a safe `on` conjunct reading only the null-supplying side moves into it (a row it
+  removes was null-extended either way). Nothing moves past a `full` join that stays one, and a
+  `coalesce` or `is_null` of the null-supplying side is never taken as rejecting.
+- **Result type.** An outer join made `inner` makes the columns it null-extended non-null, so the
+  rewritten tree's result type may be the query's with fewer nullable types; `unnest_plan` accepts it
+  when it coerces to the query's (`query-tree.md` §4.1), and the rows are sent under the query's type. A rewritten
+  tree that does not type is a fallback, and the unnested tree is planned instead.
+- **Errors, as the tests check them.** A division by zero on a row whose key matches nothing is not
+  evaluated, as §6.4 rule 3 allows (as written the filter evaluates it on every pair and raises
+  `R0002`); on a row a key matches it is raised either way; over an empty side nothing is evaluated;
+  and a key lookup chosen by a pushed conjunct never reads the row the division would fail on.
+- **Measured.** `plan_pushdown_tests.sysl` counts the pairs the joins tested (`Work`): a 2-, 3- or
+  4-way comma join of different keys tests only the pairs of equal keys, and a pushed key conjunct
+  is checked by the leaf entries the store's scans visited. A differential test runs random comma,
+  inner, cross and outer joins over random tables with nulls and duplicates pushed down and as
+  written.
 
 ## 5. What this note relies on in `query-tree.md`
 
-§3.1–§3.3 for every comparison and for `Sort`, `Distinct` and the merge join's keys; §4.1–§4.2 for
+§3.1–§3.3 for every comparison and for `Sort` and `Distinct`; §3.1 and §3.4 for the hash join's keys; §4.1–§4.2 for
 the coercions the executor applies; §4.4 for arithmetic; §6.2–§6.15 for
 the operators; §7.1–§7.12 for the expressions; §8.2–§8.4 for the binders a join exposes and
 its output columns; §10.1 for parameters. Rules written into it by this work: the evaluation of
@@ -505,8 +655,9 @@ conflict check, and the columns `C` a read uses.
 ## 6. Where the survey's sysl gaps cost speed
 
 The survey (`docs/phase0/sysl-survey/FINDINGS.md`, row 6) found no SIMD mask → bits, no gather and
-no compress. Every kernel is a plain loop the compiler may auto-vectorise; these are the ones the
-gaps hold back:
+no compress; sysl 0.13.5 has `mask.bits()`, `gather`, `compress` and `table.lookup`, and `hash64` and `crc32c`
+(see its 0.13.5 status), so the gaps named in this document are now closed in sysl and open only in this code. Every
+kernel is a plain loop the compiler may auto-vectorise; these are the ones the gaps held back:
 
 - **mask → bits**: building a validity bitmap from a kernel's per-row result (every comparison,
   `is_null`, `Field` of a nullable record); `Filter`'s row list.

@@ -255,8 +255,24 @@ end with_generated
 /** The constraints `rows`, about to be written, must meet (`ddl.md` §2.6): every check constraint of
  * the table for inserted rows (`changed` absent), else those reading a column of `changed`, and NOT
  * NULL for every top-level column. Unique keys are the store's (`T3001`), foreign keys `fk_effects`'.
+ * The guard of a `converting` column (§8.5 rule 2) is checked the same way: its recorded conversion
+ * is evaluated over the rows, and one that fails refuses the write with the conversion's own code.
  */
 private check_rows(s: &Store, ctx: Ctx, tg: Target, rows: ColumnVector, changed: Option[Buf[string]]) -> Result[unit, CodecError]
+    val guards = buf[Expr]()
+
+    for c in tg.table.columns
+        if c.state == ColumnConverting
+            c.using match
+                Some(u) ->
+                    val due = changed match
+                        Some(cs) -> reads_any(u, cs)
+                        None -> true
+
+                    if due then guards.push(u)
+                None -> ()
+
+    val _ = eval_defs(s, ctx, rows, guards)?
     val checks = buf[Expr]()
     val names = buf[string]()
 
@@ -977,7 +993,8 @@ private run_update(s: &Store, t: &Txn, ctx: Ctx, typing: Typing, table: QualName
     val none = buf[TKey]()
     // The rows `filter` keeps, or whose pairs an inner join's `on` keeps, lie in the key range its
     // comparisons of the target's primary key allow (`exec_access.sysl`).
-    val scan = store_scan(db, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), access_of(db, tg.table, binder, f, c))
+    // Every column is decoded: an updated row is written back whole.
+    val scan = store_scan(db, tg.oid, tg.row, read_pred(db, tg.table, binders, tg.row, logged, c), access_of(db, tg.table, binder, f, c), None)
     val target = Lowered(scan, binder, tg.row, none)
 
     val input = joined match

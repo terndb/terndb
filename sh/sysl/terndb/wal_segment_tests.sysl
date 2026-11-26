@@ -1,0 +1,274 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.checksum.crc32c
+import sysl.encoding.{get_u16_le, get_u32_le, get_u64_le, put_u16_le, put_u32_le}
+import sysl.fs.{NotFound, NotOpen, Other, make_temp_dir, remove_dir_all}
+
+// The WAL's segment files (`wal_segment.sysl`, `on-disk-format.md` §6.6): names, the header block and
+// what makes a segment count as missing, and the two directories, simulated and the host's.
+
+/** The database UUID the WAL tests use. */
+ws_uuid() -> Buf[u8] = wr_bytes(16, 40)
+
+/** A header for segment `first` of the test log on `timeline`. */
+private ws_header(timeline: u32, first: u64) -> Buf[u8] = wal_segment_header(wal_config(ws_uuid().view(), timeline), first, 0x1234)
+
+/** Seals a header block's CRC again after a test changed it. */
+ws_reseal(h: []u8) = put_u32_le(h[0..<4], crc32c(h[4..<4096]))
+
+// -- names -----------------------------------------------------------------------------------------
+
+@test
+a_segment_is_named_by_its_timeline_and_first_lsn_in_lower_case_hex()
+    assert_eq(wal_segment_name(1, 0), "00000001-0000000000000000.twal")
+    assert_eq(wal_segment_name(0xabcdef12, 0x1234000000), "abcdef12-0000001234000000.twal")
+
+@test
+the_largest_timeline_and_lsn_fill_their_digits()
+    assert_eq(wal_segment_name(0xffffffff, 0xfffffffffc000000), "ffffffff-fffffffffc000000.twal")
+
+@test
+a_segment_name_parses_back()
+    assert_eq(wal_parse_segment_name("00000001-0000000004000000.twal"), Some((u32(1), u64(0x4000000))))
+    assert_eq(wal_parse_segment_name(wal_segment_name(0xffffffff, 0xfffffffffc000000)), Some((u32(0xffffffff), u64(0xfffffffffc000000))))
+
+@test
+a_name_that_is_not_a_segment_s_does_not_parse()
+    assert_eq(wal_parse_segment_name("CONTROL"), None)
+    assert_eq(wal_parse_segment_name(""), None)
+    assert_eq(wal_parse_segment_name("00000001-0000000004000000.wal1"), None)
+    assert_eq(wal_parse_segment_name("00000001_0000000004000000.twal"), None)
+    assert_eq(wal_parse_segment_name("0000001-00000000004000000.twal"), None)
+    assert_eq(wal_parse_segment_name("00000001-000000000400000.twal"), None)
+    assert_eq(wal_parse_segment_name("00000001-00000000040000000.twal"), None)
+    assert_eq(wal_parse_segment_name("0000000G-0000000004000000.twal"), None)
+    assert_eq(wal_parse_segment_name("00000001-000000000400000A.twal"), None)
+
+// -- the header --------------------------------------------------------------------------------------
+
+@test
+a_header_lays_its_fields_out_as_section_6_6_says()
+    val h = ws_header(7, 0x8000000)
+    val v = h.view()
+    assert_eq(h.len(), usize(4096))
+    assert_eq(get_u32_le(v[0..<4]).unwrap(), crc32c(v[4..<4096]))
+    assert_eq(v[4], u8(0x54))
+    assert_eq(v[11], u8(0x31))
+    assert_eq(get_u16_le(v[12..<14]).unwrap(), WalFormat)
+    assert_eq(get_u16_le(v[14..<16]).unwrap(), u16(0))
+    assert_eq(v[16], ws_uuid()[0])
+    assert_eq(v[31], ws_uuid()[15])
+    assert_eq(get_u32_le(v[32..<36]).unwrap(), u32(7))
+    assert_eq(get_u32_le(v[36..<40]).unwrap(), u32(7))
+    assert_eq(get_u64_le(v[40..<48]).unwrap(), u64(0x8000000))
+    assert_eq(get_u64_le(v[48..<56]).unwrap(), u64(0x1234))
+
+    for i in 56..<4096
+        assert_eq(v[i], u8(0))
+
+@test
+a_header_checks_as_its_own_segment()
+    assert_eq(wal_check_segment_header(ws_header(1, 0).view(), wal_config(ws_uuid().view(), 1), 0), Ok(true))
+
+@test
+a_header_with_any_bit_flipped_counts_as_missing()
+    val cfg = wal_config(ws_uuid().view(), 1)
+    val h = ws_header(1, 0)
+
+    for bit in [0, 31, 32, 100, 300, 500, 4095 * 8 + 7]
+        var c = h.copy()
+        c[bit / 8] = c[bit / 8] ^ (u8(1) << u8(bit % 8))
+        assert_eq(wal_check_segment_header(c.view(), cfg, 0), Ok(false), s"bit $bit")
+
+@test
+a_header_of_another_database_counts_as_missing()
+    val other = wr_bytes(16, 41)
+    assert_eq(wal_check_segment_header(ws_header(1, 0).view(), wal_config(other.view(), 1), 0), Ok(false))
+
+@test
+a_header_of_another_timeline_counts_as_missing()
+    assert_eq(wal_check_segment_header(ws_header(2, 0).view(), wal_config(ws_uuid().view(), 1), 0), Ok(false))
+
+@test
+a_header_whose_term_is_not_its_timeline_counts_as_missing()
+    var h = ws_header(1, 0)
+    put_u32_le(h.view_mut()[36..<40], 2)
+    ws_reseal(h.view_mut())
+    assert_eq(wal_check_segment_header(h.view(), wal_config(ws_uuid().view(), 1), 0), Ok(false))
+
+@test
+a_header_for_another_first_lsn_counts_as_missing()
+    assert_eq(wal_check_segment_header(ws_header(1, 0x4000000).view(), wal_config(ws_uuid().view(), 1), 0), Ok(false))
+
+@test
+a_header_with_another_magic_counts_as_missing()
+    var h = ws_header(1, 0)
+    h[11] = 0x32
+    ws_reseal(h.view_mut())
+    assert_eq(wal_check_segment_header(h.view(), wal_config(ws_uuid().view(), 1), 0), Ok(false))
+
+@test
+a_header_shorter_than_a_block_counts_as_missing()
+    val h = ws_header(1, 0)
+    assert_eq(wal_check_segment_header(h.view()[0..<4095], wal_config(ws_uuid().view(), 1), 0), Ok(false))
+
+@test
+an_all_zero_header_counts_as_missing()
+    val h = buf_filled(4096, u8(0))
+    assert_eq(wal_check_segment_header(h.view(), wal_config(ws_uuid().view(), 1), 0), Ok(false))
+
+@test
+a_header_of_a_newer_wal_format_is_unsupported()
+    var h = ws_header(1, 0)
+    put_u16_le(h.view_mut()[12..<14], 2)
+    ws_reseal(h.view_mut())
+    assert_eq(wr_code(wal_check_segment_header(h.view(), wal_config(ws_uuid().view(), 1), 0)), "D3001")
+
+@test
+a_header_with_a_key_version_is_unsupported()
+    var h = ws_header(1, 0)
+    put_u16_le(h.view_mut()[14..<16], 1)
+    ws_reseal(h.view_mut())
+    assert_eq(wr_code(wal_check_segment_header(h.view(), wal_config(ws_uuid().view(), 1), 0)), "D3001")
+
+@test
+reserved_header_bytes_are_ignored()
+    var h = ws_header(1, 0)
+    h[100] = 0xff
+    h[4095] = 0x01
+    ws_reseal(h.view_mut())
+    assert_eq(wal_check_segment_header(h.view(), wal_config(ws_uuid().view(), 1), 0), Ok(true))
+
+// -- the simulated directory ---------------------------------------------------------------------------
+
+@test
+a_new_simulated_directory_is_empty()
+    val d = sim_wal_dir(1)
+    assert_eq(d.list().unwrap().len(), usize(0))
+    assert_eq(d.has("x"), Ok(false))
+    assert(d.open("x").is_err())
+
+@test
+a_simulated_directory_creates_opens_renames_and_removes()
+    val d = sim_wal_dir(1)
+    val a = d.create("a").unwrap()
+    assert_eq(a.write_page(0, buf_filled(DbPageSize, u8(5)).view()), Ok(()))
+    assert_eq(d.has("a"), Ok(true))
+    assert_eq(d.rename("a", "b"), Ok(()))
+    assert_eq(d.has("a"), Ok(false))
+    val b = d.open("b").unwrap()
+    var page = buf_filled(DbPageSize, u8(0))
+    assert_eq(b.read_page(0, page.view_mut()), Ok(()))
+    assert_eq(page[9], u8(5))
+    assert_eq(d.remove("b"), Ok(()))
+    assert_eq(d.list().unwrap().len(), usize(0))
+
+@test
+a_simulated_rename_over_a_file_replaces_it()
+    val d = sim_wal_dir(1)
+    d.create("a").unwrap().write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    d.create("b").unwrap().write_page(0, buf_filled(DbPageSize, u8(2)).view()).unwrap()
+    d.rename("a", "b").unwrap()
+    assert_eq(d.list().unwrap().len(), usize(1))
+    assert_eq(d.disk("b").unwrap().extent(), u64(1))
+    var page = buf_filled(DbPageSize, u8(0))
+    d.open("b").unwrap().read_page(0, page.view_mut()).unwrap()
+    assert_eq(page[0], u8(1))
+
+@test
+a_simulated_rename_or_remove_of_a_missing_file_is_not_found()
+    val d = sim_wal_dir(1)
+    assert_eq(d.rename("a", "b"), Err(NotFound))
+    assert_eq(d.remove("a"), Err(NotFound))
+
+@test
+creating_over_a_simulated_file_empties_it()
+    val d = sim_wal_dir(1)
+    d.create("a").unwrap().write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    val again = d.create("a").unwrap()
+    assert_eq(again.page_count(), Ok(u64(0)))
+    assert_eq(d.list().unwrap().len(), usize(1))
+
+@test
+a_simulated_crash_takes_every_device_down_and_restart_brings_them_back()
+    val d = sim_wal_dir(1)
+    val a = d.create("a").unwrap()
+    val b = d.create("b").unwrap()
+    a.write_page(0, buf_filled(DbPageSize, u8(1)).view()).unwrap()
+    a.sync().unwrap()
+    b.write_page(0, buf_filled(DbPageSize, u8(2)).view()).unwrap()
+    d.crash(KeepNone)
+    assert(d.is_down())
+    assert_eq(d.list(), Err(NotOpen))
+    assert_eq(d.has("a"), Err(NotOpen))
+    assert_eq(d.sync(), Err(NotOpen))
+    d.restart()
+    assert(!d.is_down())
+    assert_eq(d.disk("a").unwrap().durable_count(), u64(1))
+    assert_eq(d.disk("b").unwrap().durable_count(), u64(0))
+
+@test
+a_simulated_directory_s_devices_draw_faults_at_its_rates()
+    val d = sim_wal_dir_with(3, FaultRates(0, 0, 0, 1000000, 0, 0))
+    val a = d.create("a").unwrap()
+    assert_eq(a.sync(), Err(Other(ErrnoIo)))
+
+// -- the host's directory -------------------------------------------------------------------------------
+
+@test
+a_file_directory_creates_lists_renames_removes_and_syncs()
+    val path = make_temp_dir("terndb-wal-dir").unwrap()
+    val d = file_wal_dir(path)
+    assert_eq(d.name(), path)
+    assert_eq(d.list().unwrap().len(), usize(0))
+    val a = d.create("00000001-0000000000000000.twal").unwrap()
+    assert_eq(a.write_blocks(1, buf_filled(4096, u8(9)).view()), Ok(()))
+    assert_eq(a.sync(), Ok(()))
+    assert_eq(d.sync(), Ok(()))
+    assert_eq(d.has("00000001-0000000000000000.twal"), Ok(true))
+    assert_eq(d.rename("00000001-0000000000000000.twal", "00000001-0000000004000000.twal"), Ok(()))
+    assert_eq(d.has("00000001-0000000000000000.twal"), Ok(false))
+    val names = d.list().unwrap()
+    assert_eq(names.len(), usize(1))
+    assert_eq(names[0], "00000001-0000000004000000.twal")
+    val b = d.open("00000001-0000000004000000.twal").unwrap()
+    assert_eq(b.page_count(), Ok(u64(1)))
+    var page = buf_filled(DbPageSize, u8(1))
+    assert_eq(b.read_page(0, page.view_mut()), Ok(()))
+    assert_eq(page[0], u8(0))
+    assert_eq(page[4096], u8(9))
+    assert_eq(page[8192], u8(0))
+    assert_eq(d.remove("00000001-0000000004000000.twal"), Ok(()))
+    assert_eq(d.list().unwrap().len(), usize(0))
+    remove_dir_all(path).unwrap()
+
+@test
+a_file_directory_s_missing_file_is_not_found()
+    val path = make_temp_dir("terndb-wal-missing").unwrap()
+    val d = file_wal_dir(path)
+    assert_eq(d.has("x"), Ok(false))
+    assert(d.open("x").is_err())
+    assert(d.remove("x").is_err())
+    remove_dir_all(path).unwrap()
+
+@test
+a_log_round_trips_through_host_files()
+    val path = make_temp_dir("terndb-wal-host").unwrap()
+    val d = file_wal_dir(path)
+    val cfg = wal_config_sized(ws_uuid().view(), 1, 16)
+    val w = wal_create(d, cfg).unwrap()
+    w.commit(wt_commit(1)).unwrap()
+    w.append_mtr(wr_buf([wt_overflow(2, 9000), wt_overflow(3, 100)]).view()).unwrap()
+    w.flush().unwrap()
+    w.commit(wt_overflow(4, 10)).unwrap()
+    val got = wal_reader(d, cfg, WalFirstLsn, w.durable_lsn()).rest().unwrap()
+    assert_eq(got.len(), usize(4))
+    assert_eq(got[0].txn, u64(1))
+    assert_eq(got[1].flags, WalMtrCont)
+    assert_eq(got[3].txn, u64(4))
+    val again = wal_open(d, cfg, WalFirstLsn, w.durable_lsn()).unwrap()
+    again.commit(wt_commit(5)).unwrap()
+    assert_eq(wal_reader(d, cfg, WalFirstLsn, 0).rest().unwrap().len(), usize(5))
+    remove_dir_all(path).unwrap()

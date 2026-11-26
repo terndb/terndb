@@ -223,9 +223,9 @@ private mt_rel(r: Rel) -> string = r match
 @test
 the_catalog_queries_read_the_catalog_relations()
     assert_eq(mt_scans(catalog_tables_query()), "catalog.tables -> oid namespace name owner primary_key")
-    assert_eq(mt_scans(catalog_views_query()), "catalog.views -> oid namespace name owner query")
-    assert_eq(mt_scans(catalog_columns_query(7)), "catalog.columns filtered -> ordinal name type_text nullable default generated identity")
-    assert_eq(mt_scans(catalog_indexes_query(7)), "catalog.indexes filtered -> name unique keys predicate state")
+    assert_eq(mt_scans(catalog_views_query()), "catalog.views -> oid namespace name owner query query_tree")
+    assert_eq(mt_scans(catalog_columns_query(7)), "catalog.columns filtered -> ordinal name type_text nullable default generated identity default_tree generated_tree")
+    assert_eq(mt_scans(catalog_indexes_query(7)), "catalog.indexes filtered -> name unique keys predicate state predicate_tree")
     assert_eq(mt_scans(catalog_constraints_query(7)), "catalog.constraints filtered -> name validated kind")
 
 @test

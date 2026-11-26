@@ -128,6 +128,17 @@ read their columns by name:
   A view prints its columns and its definition. A name that matches nothing is an error:
   `Did not find any relation named "x".`
 
+  Every expression `\d` shows (an expression index key, a partial index's `WHERE`, a `CHECK`, a default and a
+  generated column's expression) and a view's definition are **printed as SQL** from the trees the catalog
+  relations report beside their text (`ddl.md` §4.1 rule 4: `default_tree`, `generated_tree`, `expr_tree`,
+  `predicate_tree`, `query_tree`), by `sql_print.sysl` ([`sql.md`](sql.md) § Printing trees as SQL): `CHECK
+  (score >= 0)`, `(lower(name))`, `WHERE NOT deleted`, `View definition: SELECT …`. The text reads back through the
+  front end to the same tree. A table's ready columns type the constants as the front end would, so a default
+  of `0` on an `int64` column shows as `0`, not `0::int64`; a view's scanned tables are looked up as a statement's
+  are. A construct SQL has no spelling for (a record, a `Match`, a `try` cast, a window) shows in the tree's text
+  form, that node alone. A catalog row without a tree that decodes shows its text form. Column names in index
+  keys are quoted where SQL would need it.
+
 ## Line editing
 
 Interactive input uses `sysl.term.edit`, the sysl library's line editor, with the terminal in raw mode while a

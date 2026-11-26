@@ -1,0 +1,230 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.checksum.hash64
+import sysl.encoding.put_u64_le
+
+// Hashing values (`query-tree.md` §3.4), a column vector at a time, and the slot equality a hash
+// table re-checks its candidates with. Both follow `same` (§3.1), so `same(a, b)` implies equal
+// hashes: every NaN hashes alike, `-0.0` hashes as `+0.0`, a number hashes by its value whatever its
+// scale or integer width, and a bag by its elements whatever their order.
+
+/** The hash a hash join buckets its keys by: rapidhash (`sysl.checksum.hash64`) under `seed`, the
+ * hash of a row of keys masked by `mask`. Every execution uses `key_hash()`. A narrower `mask` makes
+ * unequal keys collide, which is how a test proves that a join re-checks the keys a hash brings
+ * together rather than trusting it.
+ */
+struct KeyHash
+    seed: u64
+    mask: u64
+
+/** The hash of every execution: seed 0, nothing masked. */
+key_hash() -> KeyHash = KeyHash(0, 0xffff_ffff_ffff_ffff)
+
+// Each kind of slot hashes three words, the last naming the kind, so that the words of one kind are
+// never read as another's.
+private const NullWord: u64 = 0x6e75_6c6c
+private const BoolWord: u64 = 0x626f_6f6c
+private const NumberWord: u64 = 0x6e75_6d62
+private const FloatWord: u64 = 0x666c_6f61
+private const IntervalWord: u64 = 0x696e_7476
+private const UuidWord: u64 = 0x7575_6964
+private const RecordWord: u64 = 0x7265_636f
+private const UnionWord: u64 = 0x756e_696f
+private const ListWord: u64 = 0x6c69_7374
+private const BagWord: u64 = 0x6261_6773
+
+/** `hash64` of the 24 octets of `a`, `b` and `c`, little-endian. */
+private words(h: KeyHash, a: u64, b: u64, c: u64) -> u64
+    var w: [24]u8 = [0; 24]
+    val _ = put_u64_le(w[0..<8], a)
+    val _ = put_u64_le(w[8..<16], b)
+    val _ = put_u64_le(w[16..<24], c)
+    hash64(w[0..<24], h.seed)
+
+/** Two hashes as one, in order: a record's fields or a row's keys. */
+private[terndb] combine(h: KeyHash, acc: u64, x: u64) -> u64 = words(h, acc, x, RecordWord)
+
+private null_hash(h: KeyHash) -> u64 = words(h, 0, 0, NullWord)
+
+/** A number `x` scaled by `10^-scale`, by its value: trailing decimal zeros are dropped first, so
+ * `1.50` (150 at scale 2), `1.5` (15 at scale 1) and, for zero scale, the integer `x` of any width
+ * hash alike (§3.1 rule 2).
+ */
+private number_hash(h: KeyHash, x: i128, scale: u64) -> u64
+    var n = x
+    var s = scale
+
+    while s > 0 && n % 10 == 0
+        n = n / 10
+        s -= 1
+
+    words(h, u64.wrap(n), u64.wrap(n >> 64), s +% NumberWord)
+
+/** Every NaN alike and `-0.0` as `+0.0` (§3.1 rule 3); a `float32` as the `float64` it widens to. */
+private float_hash(h: KeyHash, x: real) -> u64
+    val bits: u64 = if x.is_nan() then 0x7ff8_0000_0000_0000 elif x == 0.0 then 0 else x.bits()
+    words(h, bits, 0, FloatWord)
+
+/** The scale of a decimal type, 0 for every other. */
+private scale_of(t: Type) -> u64 = t.base() match
+    Decimal(_, s) -> u64(s)
+    _ -> 0
+
+private is_bag_type(t: Type) -> bool = t.base() match
+    Bag(_) -> true
+    _ -> false
+
+/** The hash of every slot of `v` (§3.4 rule 1). A record's is its fields' in order, a union's its
+ * discriminant's and its payload's, a list's its elements' in order and a bag's the wrapping sum of
+ * its elements', which no order changes; every child vector is hashed once, whole, before the slots
+ * that hold it are.
+ */
+hash_column(h: KeyHash, v: ColumnVector) -> Buf[u64]
+    val n = v.len
+    val out = buf[u64]()
+
+    v.lanes match
+        Bools(x) ->
+            for i in 0..<n
+                out.push(words(h, u64(x[i]), 0, BoolWord))
+        I8s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        I16s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        I32s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        I64s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        I128s(x) ->
+            val s = scale_of(v.ty)
+
+            for i in 0..<n
+                out.push(number_hash(h, x[i], s))
+        U8s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        U16s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        U32s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        U64s(x) ->
+            for i in 0..<n
+                out.push(number_hash(h, i128(x[i]), 0))
+        F32s(x) ->
+            for i in 0..<n
+                out.push(float_hash(h, real(x[i])))
+        F64s(x) ->
+            for i in 0..<n
+                out.push(float_hash(h, x[i]))
+        Intervals(x) ->
+            for i in 0..<n
+                val md = u64(u32.wrap(x[i].months)) | (u64(u32.wrap(x[i].days)) << 32)
+                out.push(words(h, md, u64.wrap(x[i].micros), IntervalWord))
+        Uuids(x) ->
+            for i in 0..<n
+                out.push(words(h, u64.wrap(x[i]), u64.wrap(x[i] >> 64), UuidWord))
+        Bins(offsets, data) ->
+            for i in 0..<n
+                out.push(hash64(data.view()[usize(offsets[i])..<usize(offsets[i + 1])], h.seed))
+        Members(cs) ->
+            for _ in 0..<n
+                out.push(words(h, u64(cs.len()), 0, RecordWord))
+
+            for c in cs
+                val ch = hash_column(h, c)
+
+                for i in 0..<n
+                    out[i] = combine(h, out[i], ch[i])
+        Tags(tags, offsets, cs) ->
+            val chs = buf[Buf[u64]]()
+
+            for c in cs
+                chs.push(hash_column(h, c))
+
+            for i in 0..<n
+                if v.is_valid(i)
+                    val t = usize(tags[i])
+                    out.push(words(h, u64(t), chs[t][usize(offsets[i])], UnionWord))
+                else
+                    out.push(0)
+        Elems(offsets, c) ->
+            val ch = hash_column(h, *c)
+            val bag = is_bag_type(v.ty)
+
+            for i in 0..<n
+                val (a, b) = (usize(offsets[i]), usize(offsets[i + 1]))
+
+                if bag
+                    var sum: u64 = 0
+
+                    for e in a..<b
+                        sum = sum +% ch[e]
+
+                    out.push(words(h, sum, u64(b - a), BagWord))
+                else
+                    var acc = words(h, u64(b - a), 0, ListWord)
+
+                    for e in a..<b
+                        acc = words(h, acc, ch[e], ListWord)
+
+                    out.push(acc)
+
+    if v.has_nulls()
+        val z = null_hash(h)
+
+        for i in 0..<n
+            if !v.is_valid(i) then out[i] = z
+
+    out
+end hash_column
+
+/** The hash of one value `x` of `t`: the hash its slot has in any vector of `t`. */
+hash_value(h: KeyHash, t: Type, x: Value) -> u64 = hash_column(h, vector_of(t, [x]))[0]
+
+// -- slot equality ------------------------------------------------------------------------------
+
+private octets_equal(x: []const u8, y: []const u8) -> bool
+    if x.len != y.len then return false
+
+    for i in 0..<x.len
+        if x[i] != y[i] then return false
+
+    true
+
+private floats_same(x: real, y: real) -> bool = (x.is_nan() && y.is_nan()) || x == y
+
+/** `same` (§3.1) of slot `i` of `a` and slot `j` of `b`, two vectors of one type: read from the
+ * lanes for a scalar, through `same` on the two values for a record, a union or a relation.
+ */
+same_slots(a: ColumnVector, i: usize, b: ColumnVector, j: usize) -> bool
+    val va = a.is_valid(i)
+    val vb = b.is_valid(j)
+
+    if !va || !vb then return !va && !vb
+
+    (a.lanes, b.lanes) match
+        (Bools(x), Bools(y)) -> x[i] == y[j]
+        (I8s(x), I8s(y)) -> x[i] == y[j]
+        (I16s(x), I16s(y)) -> x[i] == y[j]
+        (I32s(x), I32s(y)) -> x[i] == y[j]
+        (I64s(x), I64s(y)) -> x[i] == y[j]
+        (I128s(x), I128s(y)) -> x[i] == y[j]
+        (U8s(x), U8s(y)) -> x[i] == y[j]
+        (U16s(x), U16s(y)) -> x[i] == y[j]
+        (U32s(x), U32s(y)) -> x[i] == y[j]
+        (U64s(x), U64s(y)) -> x[i] == y[j]
+        (F32s(x), F32s(y)) -> floats_same(real(x[i]), real(y[j]))
+        (F64s(x), F64s(y)) -> floats_same(x[i], y[j])
+        (Intervals(x), Intervals(y)) -> x[i] == y[j]
+        (Uuids(x), Uuids(y)) -> x[i] == y[j]
+        (Bins(xo, xd), Bins(yo, yd)) ->
+            octets_equal(xd.view()[usize(xo[i])..<usize(xo[i + 1])], yd.view()[usize(yo[j])..<usize(yo[j + 1])])
+        _ -> same(a.ty, value_at(a, i), value_at(b, j))
+end same_slots

@@ -52,7 +52,25 @@ impl MemCatalog
     new_version(*self, ti: usize) -> Result[(), CodecError]
         val next = self.tables[ti].schema_version() + 1
         if next > MaxSchemaVersion then return fail("Q6012", s"table '${self.tables[ti].name}' has used every schema version; rewrite it")
-        self.tables[ti].versions.push(SchemaVersion(next, self.tables[ti].columns.copy()))
+        self.tables[ti].versions.push(SchemaVersion(next, self.tables[ti].columns.copy(), buf[u32]()))
+        Ok(())
+
+    /** Column `id` of table `ti`'s conversion ended (`ddl.md` §8.5 rule 2, step 2): when it
+     * `succeeded`, the column takes its target type; either way it is `ready` with no target or
+     * conversion, in a new schema version that, on success, records that it completes the conversion.
+     */
+    end_conversion(*self, ti: usize, id: u32, succeeded: bool) -> Result[(), CodecError]
+        for ci in 0..<self.tables[ti].columns.len()
+            val c = self.tables[ti].columns[ci]
+
+            if c.id == id
+                if succeeded then self.tables[ti].columns[ci].ty = c.target.unwrap_or(c.ty)
+                self.tables[ti].columns[ci].state = ColumnReady
+                self.tables[ti].columns[ci].target = None
+                self.tables[ti].columns[ci].using = None
+
+        self.new_version(ti)?
+        if succeeded then self.tables[ti].versions[self.tables[ti].versions.len() - 1].completes.push(id)
         Ok(())
 
     /** Every stored definition of table `ti` with `rename` applied. */
@@ -401,7 +419,7 @@ impl MemCatalog
         if !self.name_free(self.tables[ti].ns, check) then return fail("Q6002", s"'$check' is already used")
         val oid = self.oid()
         val e = Call("is_not_null", items_of([Col("row", name)]))
-        self.constraints.push(CatConstraint(oid, self.tables[ti].oid, check, ConCheck(e), false, true, 0))
+        self.constraints.push(CatConstraint(oid, self.tables[ti].oid, check, ConCheck(e), false, true, 0, Some(c.id)))
         Ok(false)
 
     // -- named types, §2.8 rule 5 -----------------------------------------------------------------

@@ -1,0 +1,198 @@
+module sh.sysl.terndb
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+// A seeded property test of the WAL over a simulated directory whose devices draw crashes, torn
+// writes, lost writes, failed syncs and read errors: random mini-transactions, commits, flushes,
+// crashes and recycling, checked against a reference model of the log. The model holds every record
+// appended since the scan's start, at the LSN and with the flags the appender gave it, and `acked`,
+// the highest `durable_lsn` the log reported. After every failure the process dies, the log is
+// reopened and scanned, and what it holds must be exactly a prefix of the model's records that
+// reaches every acknowledged one: nothing acknowledged lost, nothing invented, nothing after a gap
+// (`on-disk-format.md` §6.7, §6.9, §9 D1, D12, D14). Every assertion names its seed.
+
+/** What the log must hold: `recs` from `from` on, and everything below `acked` among them. */
+private struct WpModel
+    recs: Buf[WalRecord]
+    ends: Buf[u64]
+    from: u64
+    acked: u64
+    recoveries: u64
+    recycled: u64
+
+/** `xs` without its first `n`. */
+private wp_drop[T](xs: Buf[T], n: usize) -> Buf[T]
+    val out = buf[T]()
+    out.extend(xs.view()[n..<xs.len()])
+    out
+
+private wp_rates() ->FaultRates = FaultRates(2000, 4000, 4000, 3000, 3000, 0)
+
+/** A record of transaction `txn` of a kind and size the generator picks. */
+private wp_record(g: *Rng, txn: u64) -> WalRecord = g.below(5) match
+    0 -> wt_commit(txn)
+    1 -> wal_record(txn, WbNodeCompact(txn))
+    2 -> wt_overflow(txn, usize(g.below(9000)))
+    3 -> wt_overflow(txn, usize(g.below(200)))
+    _ -> WalRecord(0, txn, WalCompensation, txn * 3, WbNodeDelete(txn, u16(txn % 1000)))
+
+/** Scans the log, retrying past read errors and the crashes the scan itself meets. */
+private wp_scan(d: &SimWalDir, m: *WpModel, seed: u64) -> Buf[WalRecord]
+    var tries = 0
+
+    while true
+        tries += 1
+        assert(tries < 500, s"seed $seed: the scan never got through")
+
+        wal_reader(d, wt_cfg(), m.from, m.acked).rest() match
+            Ok(got) -> return got
+            Err(e) ->
+                assert_eq(e.code, "D4004", s"seed $seed: the scan failed with ${e.message}")
+                d.crash(KeepDrawn)
+                d.restart()
+
+    buf[WalRecord]()
+
+/** The process dies; the log is reopened, retrying past the faults the reopening meets, and what it
+ * holds is checked against the model, which then becomes what was found.
+ */
+private wp_recover(d: &SimWalDir, m: *WpModel, seed: u64) -> &Wal
+    m.recoveries += 1
+    d.crash(KeepDrawn)
+    d.restart()
+    var tries = 0
+    var opened: Option[&Wal] = None
+
+    while opened.is_none()
+        tries += 1
+        assert(tries < 500, s"seed $seed: the log never reopened")
+
+        wal_open(d, wt_cfg(), m.from, m.acked) match
+            Ok(x) -> opened = Some(x)
+            Err(e) ->
+                assert_eq(e.code, "D4004", s"seed $seed: reopening failed with ${e.message}")
+                d.crash(KeepDrawn)
+                d.restart()
+
+    val w = opened.unwrap()
+    val got = wp_scan(d, m, seed)
+    assert(got.len() <= m.recs.len(), s"seed $seed: the log holds ${got.len()} records, more than the ${m.recs.len()} appended")
+
+    for i in 0..<got.len()
+        assert_eq(got[i], m.recs[i], s"seed $seed: record $i")
+
+    for i in got.len()..<m.recs.len()
+        assert(m.ends[i] > m.acked, s"seed $seed: record $i, durable at ${m.ends[i]} <= ${m.acked}, is lost")
+
+    m.recs.truncate(got.len())
+    m.ends.truncate(got.len())
+    m.acked = w.durable_lsn()
+    w
+
+private wp_run(seed: u64, steps: u64) -> WpModel
+    val d = sim_wal_dir_with(seed, wp_rates())
+    var g = rng(seed, 0x57414c)
+    var m = WpModel(buf[WalRecord](), buf[u64](), WalFirstLsn, WalFirstLsn, 0, 0)
+
+    var w = wal_create(d, wt_cfg()) match
+        Ok(w) -> w
+        Err(_) -> wp_recover(d, &m, seed)
+
+    var txn: u64 = 1
+
+    for _ in 0..<steps
+        val choice = g.below(20)
+        var ok = true
+
+        if choice < 10
+            val n = 1 + g.below(3)
+            val recs = buf[WalRecord]()
+
+            for _ in 0..<n
+                recs.push(wp_record(&g, txn))
+                txn += 1
+
+            w.append_mtr(recs.view()) match
+                Ok(a) ->
+                    for i in 0..<recs.len()
+                        val r = recs[i]
+                        val flags = (r.flags & WalCompensation) | (if i + 1 < recs.len() then WalMtrCont else u8(0))
+                        m.recs.push(WalRecord(a.lsns[i], r.txn, flags, r.undo_next, r.body))
+                        m.ends.push(if i + 1 < recs.len() then a.lsns[i + 1] else a.end)
+                Err(e) ->
+                    assert_eq(e.code, "D4004", s"seed $seed: an append failed with ${e.message}")
+                    ok = false
+        elif choice < 14
+            val r = wt_commit(txn)
+            txn += 1
+
+            w.append(r) match
+                Ok(a) ->
+                    m.recs.push(WalRecord(a.lsns[0], r.txn, 0, 0, r.body))
+                    m.ends.push(a.end)
+
+                    w.wait_durable(a.end) match
+                        Ok(_) -> assert(w.durable_lsn() >= a.end, s"seed $seed: a commit returned before it was durable")
+                        Err(e) ->
+                            assert_eq(e.code, "D4004", s"seed $seed: a commit failed with ${e.message}")
+                            ok = false
+                Err(e) ->
+                    assert_eq(e.code, "D4004", s"seed $seed: an append failed with ${e.message}")
+                    ok = false
+        elif choice < 17
+            ok = w.flush().is_ok()
+        elif choice < 18
+            ok = false
+        else
+            // Recycle below the start of the segment the acknowledged end lies in, and scan from the
+            // first record there, which starts a mini-transaction since none spans segments.
+            val bound = wal_segment_lsn(wal_segment_of(m.acked, 16), 16)
+            var j: usize = 0
+
+            while j < m.recs.len() && m.recs[j].lsn < bound
+                j += 1
+
+            if j > 0 && j < m.recs.len() && m.ends[j] <= m.acked
+                w.recycle(bound) match
+                    Ok(n) ->
+                        m.recycled += n
+                        m.from = m.recs[j].lsn
+                        m.recs = wp_drop(m.recs, j)
+                        m.ends = wp_drop(m.ends, j)
+                    Err(e) ->
+                        assert_eq(e.code, "D4004", s"seed $seed: recycling failed with ${e.message}")
+                        ok = false
+
+        if ok
+            if w.durable_lsn() > m.acked then m.acked = w.durable_lsn()
+        else
+            w = wp_recover(d, &m, seed)
+
+    wp_recover(d, &m, seed)
+    m
+
+@test
+the_log_holds_a_prefix_reaching_every_acknowledged_record_over_many_seeds()
+    var recoveries: u64 = 0
+    var recycled: u64 = 0
+    var held: u64 = 0
+
+    for seed in 1..<81
+        val m = wp_run(u64(seed), 160)
+        recoveries += m.recoveries
+        recycled += m.recycled
+        held += u64(m.recs.len())
+
+    // The run met what it was meant to: crashes and faults to recover from, and segments recycled.
+    assert(recoveries > 400, s"only $recoveries recoveries")
+    assert(recycled > 20, s"only $recycled segments recycled")
+    assert(held > 1000, s"only $held records held")
+
+@test
+the_same_seed_gives_the_same_log()
+    val a = wp_run(7, 120)
+    val b = wp_run(7, 120)
+    assert_eq(a.recs, b.recs)
+    assert_eq(a.recoveries, b.recoveries)

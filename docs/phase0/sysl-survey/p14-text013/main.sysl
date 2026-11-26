@@ -1,0 +1,6 @@
+// Utf8 validation of a key or a string column without building a string.
+import sysl.text.{is_utf8, validate_utf8}
+
+val bad: [4]u8 = [104, 0xff, 105, 106]
+print(is_utf8("héllo".bytes), is_utf8(bad[..]))
+print(validate_utf8(bad[..]), validate_utf8("héllo".bytes))

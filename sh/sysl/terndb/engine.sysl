@@ -126,6 +126,8 @@ struct Engine
             trial.apply(env, role) match
                 Ok(_) -> ()
                 Err(e) -> return Err(failure_of(e))
+
+            result = ddl_result(env.statement)
         else
             val typed = type_errors(env, self.store.catalog)
             if typed.len() > 0 then return Err(failure_all(typed))
@@ -306,7 +308,28 @@ struct EngineConn
             Ok(_) -> ()
             Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
 
-        if is_ddl(r.env.statement)
+        val awaited = r.env.statement match
+            AwaitJobs(txid) -> Some(txid)
+            _ -> None
+
+        if awaited.is_some()
+            // Every job has finished by the time the commit that started it returned (`store_jobs.sysl`),
+            // so there is nothing to wait for, and no catalog to change.
+            val rows = store.await_jobs(awaited.unwrap())
+            r.counts.push(u64(rows.len()))
+            r.ready = buf[Buf[u8]]()
+
+            if rows.len() > 0
+                val batch = encode_batch(r.result.unwrap(), rows.view(), 0) match
+                    Ok(b) -> b
+                    Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
+
+                r.ready = rebatch(r.result, items_of([batch]), u64(i), r.options) match
+                    Ok(b) -> b
+                    Err(e) -> return Err(failure_in(store.abort_with(r.txn, e), r.txn, tuple))
+
+            r.at = 0
+        elif is_ddl(r.env.statement)
             store.ddl(r.txn, r.env, self.role) match
                 Ok(Wait(h)) -> return Ok(Some(h))
                 Ok(Done(_)) -> r.counts.push(0)
@@ -375,6 +398,13 @@ impl Executor for EngineConn
         val c = self.engine.validate(s.envelope.view(), self.role) match
             Ok(c) -> c
             Err(f) -> return Err(self.engine.aborting(explicit, f))
+
+        // `AwaitJobs` would hold an explicit transaction's snapshot for the length of a job (`ddl.md`
+        // §3.2 rule 4).
+        c.env.statement match
+            AwaitJobs(_) -> if explicit.is_some()
+                return Err(self.engine.aborting(explicit, failure("Q6010", "AwaitJobs may not run inside an explicit transaction")))
+            _ -> ()
 
         val params = bind(c.env, store.catalog, s.params.view()) match
             Ok(p) -> p

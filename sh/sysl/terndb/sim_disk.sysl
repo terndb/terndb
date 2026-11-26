@@ -1,0 +1,426 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.fs.{IoError, NotOpen, Other}
+import sysl.rand.{Rng, rng}
+import sysl.slices.copy
+
+// The simulated block device (`isolation.md` §7.3): a `BlockDevice` in memory whose every fault is
+// decided by a seed, so a seed reproduces a run exactly.
+//
+// It keeps two things: the media, which is what survives a crash, and the volatile cache, the writes
+// acknowledged since the last sync in the order they were made. A read sees the newest write of the
+// page, cached or not. A sync moves the whole cache to the media. A crash resolves each cached write
+// sector by sector — none of it, all of it, or any subset of its four sectors reaches the media
+// (`on-disk-format.md` §1 rule 6) — then empties the cache and takes the device down until `restart`.
+// A write of blocks covers only its own sectors of the page, and only those can reach the media.
+//
+// Each I/O (a read, a write or a sync) has a number, counted from 0. A test schedules a fault at a
+// number; otherwise each fault is drawn at the rate `FaultRates` gives it, in parts per million, from
+// the device's own generator. Every decision either way is written to the trace, so two runs from one
+// seed give equal traces.
+
+/** How a crash, or a failed sync, resolves the writes still in the cache. */
+enum CrashKeep derives Eq
+    /** None of them reaches the media. */
+    KeepNone
+    /** All of them reach the media whole. */
+    KeepAll
+    /** The generator decides, write by write: none of it, all of it, or a subset of its sectors. */
+    KeepDrawn
+    /** Cached write `i` (oldest first) keeps the sectors whose bits are set in `masks[i]`, bit `s`
+     * for sector `s`; a write past the end of `masks` keeps none.
+     */
+    KeepSectors(masks: Buf[u8])
+
+/** A fault the device injects at one I/O. */
+enum DiskFault derives Eq
+    /** The process dies at this I/O, before it runs; the cache is resolved as `keep` says. */
+    DkCrash(keep: CrashKeep)
+    /** At a write: the page's sectors reach the media in `order`, and the process dies after the
+     * first `cut` of them. The writes cached before it are resolved as `rest` says, first.
+     */
+    DkTornWrite(order: Buf[u8], cut: usize, rest: CrashKeep)
+    /** At a write: the write is acknowledged and read back, and no crash keeps it. Only a sync before
+     * the next crash makes it durable.
+     */
+    DkLostWrite
+    /** At a sync: it fails with `EIO`, the cache is resolved as `keep` says and emptied, and a read
+     * then sees the media. A later sync has nothing left to do and succeeds.
+     */
+    DkSyncFail(keep: CrashKeep)
+    /** At a read: it fails with `EIO`, once. */
+    DkReadError
+    /** Before this I/O, which then runs as usual: bit `bit` of page `page` flips on the media. */
+    DkBitFlip(page: u64, bit: u64)
+
+/** How often each fault is drawn, in parts per million of the I/Os it can happen at. */
+struct FaultRates derives Eq
+    crash: u64
+    torn_write: u64
+    lost_write: u64
+    sync_fail: u64
+    read_error: u64
+    bit_flip: u64
+
+/** No fault drawn at random: only the scheduled ones happen. */
+no_disk_faults() -> FaultRates = FaultRates(0, 0, 0, 0, 0, 0)
+
+/** A fault a test scheduled at I/O number `op`. */
+struct ScheduledFault
+    op: u64
+    fault: DiskFault
+
+/** A write the device acknowledged and has not synced: the page as a read sees it after the write,
+ * and the sectors the write covers, the only ones it can bring to the media.
+ */
+struct CachedWrite
+    page: u64
+    bytes: Buf[u8]
+    lost: bool
+    covers: u8
+
+/** The three kinds of I/O a fault is decided at. */
+enum DiskOp
+    DiskRead
+    DiskWrite
+    DiskSync
+
+private fits(f: DiskFault, op: DiskOp) -> bool = f match
+    DkCrash(_) -> true
+    DkBitFlip(_, _) -> true
+    DkTornWrite(_, _, _) -> op == DiskWrite
+    DkLostWrite -> op == DiskWrite
+    DkSyncFail(_) -> op == DiskSync
+    DkReadError -> op == DiskRead
+
+private op_word(op: DiskOp) -> string = op match
+    DiskRead -> "read"
+    DiskWrite -> "write"
+    DiskSync -> "sync"
+
+/** The simulated device. Build one with `sim_disk`. */
+struct SimDisk
+    label: string
+    g: Rng
+    rates: FaultRates
+    media: Buf[Buf[u8]]
+    cache: Buf[CachedWrite]
+    plan: Buf[ScheduledFault]
+    ops: u64
+    down: bool
+    events: Buf[string]
+
+    /** Schedules `fault` at I/O number `op`. The I/O must be one the fault can happen at (a torn
+     * write at a write, say); one that is not stops the test when it comes.
+     */
+    schedule(self, op: u64, fault: DiskFault) = self.plan.push(ScheduledFault(op, fault))
+
+    /** The number the next I/O will have. */
+    next_op(self) -> u64 = self.ops
+
+    /** Whether a crash has taken the device down: every I/O is `NotOpen` until `restart`. */
+    is_down(self) -> bool = self.down
+
+    /** Brings the device back after a crash, as a new process opening the file finds it. */
+    restart(*self)
+        self.down = false
+        self.events.push(s"op ${self.ops}: restart")
+
+    /** The process dies now, between I/Os: the cache is resolved as `keep` says and the device goes
+     * down. A device already down is left as it is. It is how a crash at another device of the same
+     * process reaches this one.
+     */
+    crash_now(*self, keep: CrashKeep)
+        if !self.down then self.crash(self.ops, keep)
+
+    /** How many acknowledged writes no sync has covered yet. */
+    unsynced(self) -> usize = self.cache.len()
+
+    /** How many pages the media holds: what a restart would find. */
+    durable_count(self) -> u64 = u64(self.media.len())
+
+    /** A copy of page `n` as the media holds it: zeros if nothing ever reached it. */
+    durable_page(self, n: u64) -> Buf[u8]
+        var out = buf_filled(DbPageSize, u8(0))
+        if n < u64(self.media.len()) then copy(out.view_mut(), self.media[usize(n)].view())
+        out
+
+    /** Every fault decision so far, one line each, in order. */
+    trace(self) -> Buf[string] = self.events.copy()
+
+    /** Flips bit `bit` (0 is the low bit of byte 0) of page `n` on the media, if the media holds it. */
+    flip_bit(self, n: u64, bit: u64)
+        if n >= u64(self.media.len()) || bit >= u64(DbPageSize * 8)
+            self.events.push(s"op ${self.ops}: bit $bit of page $n is not on the media")
+            return
+
+        val at = usize(bit / 8)
+        val p = self.media[usize(n)]
+        p[at] = p[at] ^ (u8(1) << u8(bit % 8))
+        self.events.push(s"op ${self.ops}: bit $bit of page $n flipped")
+
+    /** How many pages the device holds now: the media, or a cached write past its end. */
+    extent(self) -> u64
+        var n = u64(self.media.len())
+
+        for w in self.cache
+            if w.page + 1 > n then n = w.page + 1
+
+        n
+
+    /** Page `n` as a read sees it: the newest cached write of it, or the media. */
+    private current(self, n: u64, into: []u8)
+        var i = self.cache.len()
+
+        while i > 0
+            i -= 1
+            if self.cache[i].page == n
+                copy(into, self.cache[i].bytes.view())
+                return
+
+        if n < u64(self.media.len()) then copy(into, self.media[usize(n)].view()) else fill_zero(into)
+
+    /** Whether a fault drawn at `rate` parts per million happens now. */
+    private hit(*self, rate: u64) -> bool = rate > 0 && self.g.below(1000000) < rate
+
+    /** A random order of a page's sectors. */
+    private drawn_order(*self) -> Buf[u8]
+        val order = buf[u8]()
+
+        for s in 0..<SectorsPerPage
+            order.push(u8(s))
+
+        var i = SectorsPerPage
+
+        while i > 1
+            val j = usize(self.g.below(u64(i)))
+            i -= 1
+            val t = order[i]
+            order[i] = order[j]
+            order[j] = t
+
+        order
+
+    /** The fault at this I/O, scheduled or drawn, if there is one. */
+    private fault_at(*self, op: DiskOp) -> Option[DiskFault]
+        for i in 0..<self.plan.len()
+            if self.plan[i].op == self.ops
+                val f = self.plan.remove(i).fault
+                if !fits(f, op) then panic(s"a fault scheduled at I/O ${self.ops} cannot happen at a ${op_word(op)}")
+                return Some(f)
+
+        if self.hit(self.rates.crash) then return Some(DkCrash(KeepDrawn))
+
+        if self.media.len() > 0 && self.hit(self.rates.bit_flip)
+            val page = self.g.below(u64(self.media.len()))
+            return Some(DkBitFlip(page, self.g.below(u64(DbPageSize * 8))))
+
+        op match
+            DiskRead -> if self.hit(self.rates.read_error) then return Some(DkReadError)
+            DiskWrite ->
+                if self.hit(self.rates.torn_write)
+                    val order = self.drawn_order()
+                    return Some(DkTornWrite(order, usize(1 + self.g.below(u64(SectorsPerPage - 1))), KeepDrawn))
+
+                if self.hit(self.rates.lost_write) then return Some(DkLostWrite)
+            DiskSync -> if self.hit(self.rates.sync_fail) then return Some(DkSyncFail(KeepDrawn))
+
+        None
+
+    /** Starts I/O number `ops`: its fault, with a bit flip already done, since the I/O then runs. */
+    private begin(*self, op: DiskOp) -> Option[DiskFault]
+        val f = self.fault_at(op)
+
+        val left = f match
+            Some(DkBitFlip(page, bit)) ->
+                self.flip_bit(page, bit)
+                None
+            other -> other
+
+        self.ops += 1
+        left
+
+    /** Which sectors cached write `i` keeps under `keep`. */
+    private kept(*self, keep: CrashKeep, i: usize) -> u8 = keep match
+        KeepNone -> 0
+        KeepAll -> 0x0f
+        KeepSectors(masks) -> if i < masks.len() then masks[i] & 0x0f else 0
+        KeepDrawn -> self.g.below(4) match
+            0 -> 0
+            1 -> 0x0f
+            _ -> u8(1 + self.g.below(14))
+
+    /** Writes the sectors of `bytes` set in `mask` to page `n` of the media, growing it to hold `n`. */
+    private to_media(self, n: u64, bytes: []const u8, mask: u8)
+        if mask == 0 then return
+
+        while u64(self.media.len()) <= n
+            self.media.push(buf_filled(DbPageSize, u8(0)))
+
+        var p = self.media[usize(n)]
+
+        for s in 0..<SectorsPerPage
+            if mask & (u8(1) << u8(s)) != 0
+                val at = s * DiskSectorSize
+                copy(p.view_mut()[at..<at + DiskSectorSize], bytes[at..<at + DiskSectorSize])
+
+    /** Resolves every cached write as `keep` says, oldest first, and empties the cache. A lost write
+     * keeps nothing.
+     */
+    private resolve(*self, keep: CrashKeep, why: string)
+        for i in 0..<self.cache.len()
+            val w = self.cache[i]
+            val mask = if w.lost then u8(0) else self.kept(keep, i) & w.covers
+            self.events.push(s"$why: cached write $i of page ${w.page} keeps sectors $mask")
+            self.to_media(w.page, w.bytes.view(), mask)
+
+        self.cache.clear()
+
+    private crash(*self, op: u64, keep: CrashKeep)
+        self.events.push(s"op $op: crash")
+        self.resolve(keep, s"op $op: crash")
+        self.down = true
+end SimDisk
+
+private fill_zero(into: []u8)
+    for i in 0..<into.len
+        into[i] = 0
+
+/** Whether `order` names each of a page's sectors once. */
+private is_sector_order(order: Buf[u8]) -> bool
+    if order.len() != SectorsPerPage then return false
+    var seen: u8 = 0
+
+    for s in order
+        if usize(s) >= SectorsPerPage then return false
+        seen = seen | (u8(1) << s)
+
+    seen == 0x0f
+
+impl BlockDevice for SimDisk
+    name(self) -> string = self.label
+
+    page_count(*self) -> Result[u64, IoError] = if self.down then Err(NotOpen) else Ok(self.extent())
+
+    read_page(*self, n: u64, into: []u8) -> Result[unit, IoError]
+        if self.down then return Err(NotOpen)
+        val op = self.ops
+
+        self.begin(DiskRead) match
+            Some(DkCrash(keep)) ->
+                self.crash(op, keep)
+                return Err(NotOpen)
+            Some(DkReadError) ->
+                self.events.push(s"op $op: read of page $n fails")
+                return Err(Other(ErrnoIo))
+            _ -> ()
+
+        if into.len != DbPageSize || n >= self.extent() then return Err(Other(ErrnoInvalid))
+        self.current(n, into)
+        Ok(())
+
+    write_page(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+        if self.down then return Err(NotOpen)
+        val op = self.ops
+
+        self.begin(DiskWrite) match
+            Some(DkCrash(keep)) ->
+                self.crash(op, keep)
+                return Err(NotOpen)
+            Some(DkTornWrite(order, cut, rest)) ->
+                if !is_sector_order(order) || cut > SectorsPerPage then panic(s"a torn write at I/O $op names no order of a page's sectors")
+                self.crash(op, rest)
+                var mask: u8 = 0
+
+                for i in 0..<cut
+                    mask = mask | (u8(1) << order[i])
+
+                self.events.push(s"op $op: write of page $n tears after $cut sectors, keeping sectors $mask")
+                if bytes.len == DbPageSize then self.to_media(n, bytes, mask)
+                return Err(NotOpen)
+            Some(DkLostWrite) ->
+                if bytes.len != DbPageSize then return Err(Other(ErrnoInvalid))
+                self.events.push(s"op $op: write of page $n will be lost")
+                self.cache.push(CachedWrite(n, buf_of_bytes(bytes), true, 0x0f))
+                return Ok(())
+            _ -> ()
+
+        if bytes.len != DbPageSize then return Err(Other(ErrnoInvalid))
+        self.cache.push(CachedWrite(n, buf_of_bytes(bytes), false, 0x0f))
+        Ok(())
+
+    write_blocks(*self, n: u64, bytes: []const u8) -> Result[unit, IoError]
+        if self.down then return Err(NotOpen)
+        val op = self.ops
+        val fits = blocks_fit_a_page(n, bytes)
+        val page = n / u64(SectorsPerPage)
+        val first = usize(n % u64(SectorsPerPage))
+        var covers: u8 = 0
+        var image = buf_filled(DbPageSize, u8(0))
+
+        // The page as a read will see it after the write, taken before a crash resolves the cache.
+        if fits
+            for s in first..<first + bytes.len / DiskSectorSize
+                covers = covers | (u8(1) << u8(s))
+
+            self.current(page, image.view_mut())
+            copy(image.view_mut()[first * DiskSectorSize..<first * DiskSectorSize + bytes.len], bytes)
+
+        self.begin(DiskWrite) match
+            Some(DkCrash(keep)) ->
+                self.crash(op, keep)
+                return Err(NotOpen)
+            Some(DkTornWrite(order, cut, rest)) ->
+                if !is_sector_order(order) || cut > SectorsPerPage then panic(s"a torn write at I/O $op names no order of a page's sectors")
+                self.crash(op, rest)
+                var mask: u8 = 0
+
+                for i in 0..<cut
+                    mask = mask | (u8(1) << order[i])
+
+                mask = mask & covers
+                self.events.push(s"op $op: write of blocks of page $page tears after $cut sectors, keeping sectors $mask")
+                if fits then self.to_media(page, image.view(), mask)
+                return Err(NotOpen)
+            Some(DkLostWrite) ->
+                if !fits then return Err(Other(ErrnoInvalid))
+                self.events.push(s"op $op: write of blocks of page $page will be lost")
+                self.cache.push(CachedWrite(page, image, true, covers))
+                return Ok(())
+            _ -> ()
+
+        if !fits then return Err(Other(ErrnoInvalid))
+        self.cache.push(CachedWrite(page, image, false, covers))
+        Ok(())
+
+    sync(*self) -> Result[unit, IoError]
+        if self.down then return Err(NotOpen)
+        val op = self.ops
+
+        self.begin(DiskSync) match
+            Some(DkCrash(keep)) ->
+                self.crash(op, keep)
+                return Err(NotOpen)
+            Some(DkSyncFail(keep)) ->
+                self.resolve(keep, s"op $op: sync fails")
+                return Err(Other(ErrnoIo))
+            _ -> ()
+
+        for w in self.cache
+            self.to_media(w.page, w.bytes.view(), w.covers)
+
+        self.cache.clear()
+        Ok(())
+
+private buf_of_bytes(bytes: []const u8) -> Buf[u8]
+    val out = buf[u8]()
+    out.extend(bytes)
+    out
+
+/** A simulated device whose faults are only the ones a test schedules. */
+sim_disk(seed: u64) -> &SimDisk = sim_disk_with(seed, no_disk_faults())
+
+/** A simulated device drawing faults at `rates` from a generator seeded with `seed`. */
+sim_disk_with(seed: u64, rates: FaultRates) -> &SimDisk =
+    SimDisk(s"sim-$seed", rng(seed, 0x5349444b), rates, buf[Buf[u8]](), buf[CachedWrite](), buf[ScheduledFault](), 0, false, buf[string]())

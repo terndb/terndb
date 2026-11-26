@@ -428,27 +428,50 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 | 0x0B | `bytes` | |
 | 0x0C | `date` | |
 | 0x0D | `time` | |
-| 0x0E | `datetime` (civil, no zone) | |
-| 0x0F | `timestamp` (an instant) | |
+| 0x0E | `timestamp` (civil, no zone; alias `datetime`) | |
+| 0x0F | `timestamptz` (an instant) | |
 | 0x10 | `interval` | |
 | 0x11 | `uuid` | |
 | 0x12 | reserved; never assigned | |
 | 0x13–0x16 | `uint8`, `uint16`, `uint32`, `uint64` | |
 | 0x17 | `json` | |
-| 0x18–0x1F | reserved for scalar types | |
-| 0x20 | relation, `bag<E>` or `list<E>` | `ordered` u8 (0 = bag, 1 = list), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor: a record (0x23), a union (0x21) or a scalar |
+| 0x18 | `numeric` | |
+| 0x19 | `jsonb` | |
+| 0x1A | `xml` | |
+| 0x1B | `money` | |
+| 0x1C, 0x1D | `inet`, `cidr` | |
+| 0x1E, 0x1F | `macaddr`, `macaddr8` | |
+| 0x20 | relation, `bag<E>` or `list<E>` | `ordered` u8 (0 = bag, 1 = list), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor: a record (0x23), a union (0x21), a scalar, an array (0x30) or a relation (0x20) |
 | 0x21 | union `union<t₁: R₁, …>` | `n` u32 (1–65,536), then n × (`name_len` u16, tag UTF-8, the payload's record descriptor, tag 0x23) |
 | 0x22 | reserved; never assigned | |
 | 0x23 | record `{n₁: T₁, …}` | `n` u16 (0–65,535), then n × (`name_len` u16, name UTF-8, `nullable` u8, the field's descriptor) |
+| 0x24, 0x25 | `varchar(n)`, `char(n)` | `n` u32 |
+| 0x26, 0x27 | `varbinary(n)`, `binary(n)` | `n` u32 |
+| 0x28 | `decimal(p, s)` with `39 ≤ p ≤ 1000` | `p` u16, `s` u16 (0–`p`) |
+| 0x29 | `decfloat(p)` | `p` u8 (16 or 34) |
+| 0x2A–0x2C | `time(p)`, `timestamp(p)`, `timestamptz(p)` with `p < 6` | `p` u8 (0–5) |
+| 0x2D | `timetz(p)` | `p` u8 (0–6) |
+| 0x2E | `interval_ym(q, l)` | `q` u8, `l` u8 (`query-tree.md` §12.3 kind 73's numbering) |
+| 0x2F | `interval_dt(q, l, p)` | `q` u8, `l` u8, `p` u8 (kind 74's numbering) |
+| 0x30 | `array<E, m>` | `m` u32 (0 for no bound), `nullable` u8 (1 when `E` is nullable), then `E`'s descriptor (any descriptor) |
+| 0x31, 0x32 | `range<T>`, `multirange<T>` | `T`'s descriptor |
+| 0x33, 0x34 | `bit(n)`, `varbit(n)` | `n` u32 (`varbit`: 0 for no bound) |
+| 0x35–0x3F | reserved for scalar and constructed types | |
 
 1. **Nullability.** A column's own nullability is `sys.columns.nullable`, and its descriptor is of the non-null
-   type. Inside a descriptor, nullability is the `nullable` octet of a record field or of a relation element.
-   These are every place a type can occur in a stored type, because a union payload is a non-null record
-   (`query-tree.md` §2.4) and a relation's element is not a relation (§2.5). The nullable wrapper (kind 20 of
+   type. Inside a descriptor, nullability is the `nullable` octet of a record field, a relation element or an
+   array element. These are every place a type can occur in a stored type, because a union payload is a non-null
+   record (`query-tree.md` §2.4), a relation or array element's own nullability is that octet (§2.5, §2.13),
+   and a range's subtype is a non-null scalar (§2.19). A relation whose element is a relation stores each
+   element as a nested relation value (§4.5 rule 3). The nullable wrapper (kind 20 of
    `query-tree.md` §12.3) therefore has no tag of its own.
 2. **Structural.** A descriptor never names a catalog object. A column declared with a named type (`ddl.md`
    §2.8) stores the structure the name denotes, and the name is kept beside it in `sys.columns.type_oid`.
-   An enum is a union whose payloads are all `{}` and is stored as one.
+   An enum is a union whose payloads are all `{}` and is stored as one. A domain stores its base type's
+   descriptor, a distinct type its source's, and a structured type its structure, a union (`query-tree.md`
+   §2.20); `type_oid` keeps the name, which for a distinct or structured type is also its identity.
+   `decimal(p, s)` is tag 0x09 for `p ≤ 38` and 0x28 above, and the precision-6 `time`, `timestamp` and
+   `timestamptz` are 0x0D–0x0F, never 0x2A–0x2C, so the correspondence stays one to one.
 3. **Canonical.** Names are non-empty and unique within their record or union, and a `nullable` or `ordered` octet
    is 0 or 1. A reader MUST treat an unknown or reserved tag, or a descriptor that breaks these rules, as
    `data_corrupted`.
@@ -468,12 +491,30 @@ one descriptor, every descriptor denotes exactly one type, and the type column b
 | `text` | variable | UTF-8. A writer MUST store valid UTF-8 and a reader MAY verify it |
 | `json` | variable | its canonical form (`query-tree.md` §3.5), UTF-8 |
 | `bytes` | variable | raw |
-| `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian) |
+| `date` | 4 | `i32` days since 1970-01-01 (proleptic Gregorian); `i32` min and max are `-infinity` and `infinity`, as `i64` min and max are for every timestamp type below (`query-tree.md` §2.11 rule 9), so keys order them first and last with no special case |
 | `time` | 8 | `i64` microseconds since midnight |
-| `datetime` | 8 | `i64` microseconds since 1970-01-01T00:00:00 civil time, with no zone |
-| `timestamp` | 8 | `i64` microseconds since the Unix epoch, 1970-01-01T00:00:00Z |
+| `timestamp` | 8 | `i64` microseconds since 1970-01-01T00:00:00 civil time, with no zone |
+| `timestamptz` | 8 | `i64` microseconds since the Unix epoch, 1970-01-01T00:00:00Z |
+| `time(p)`, `timestamp(p)`, `timestamptz(p)` | 8 | as the type of precision 6; the value is a multiple of 10^(6 − p) µs |
+| `timetz(p)` | 12 | `i64` microseconds since midnight, then `i32` offset in seconds east of UTC |
 | `interval` | 16 | `i32` months, `i32` days, `i64` microseconds |
+| `interval_ym` | 4 | `i32` months |
+| `interval_dt` | 8 | `i64` microseconds |
 | `uuid` | 16 | the 16 bytes in RFC 9562 order |
+| `varchar(n)` | variable | UTF-8, as `text` |
+| `char(n)` | variable | UTF-8 **without** its trailing U+0020; a reader pads to `n` code points. A stored value ending in U+0020, or longer than `n` code points, is corruption |
+| `varbinary(n)`, `binary(n)` | variable | raw; `binary(n)` exactly `n` bytes |
+| `xml` | variable | UTF-8, the text as given |
+| `numeric`, `decimal` 39 ≤ p ≤ 1000 | variable | `u8` class (0 finite, 1 NaN, 2 +∞, 3 −∞), then for a finite value `u8` sign (0 or 1), `u16` display scale, `i16` weight (the power of 10,000 of the first digit group), and the base-10,000 digit groups as `u16`, most significant first, without leading or trailing zero groups (zero has none and sign 0) |
+| `decfloat(16)`, `decfloat(34)` | 8, 16 | IEEE 754-2008 BID encoding; the canonical quiet NaN only |
+| `money` | 8 | `i64` hundredths |
+| `inet`, `cidr` | 18 | family (4 or 6), prefix length, 16 address bytes (IPv4 in the first 4, the rest zero) |
+| `macaddr`, `macaddr8` | 6, 8 | the octets |
+| `bit(n)`, `varbit(n)` | variable | `u32` bit count, then ⌈count/8⌉ bytes, most significant bit first, padding bits zero |
+| `jsonb` | variable | one value: `u8` tag (0 null, 1 false, 2 true, 3 number, 4 string, 5 array, 6 object), then a number's `numeric` encoding (`u32` length first), a string's `u32` length and UTF-8, or an array's or object's `u32` count, `u32` end offset per element (per member, for an object), and the elements (for an object, each member a key — `u32` length, UTF-8 — then a value), objects' members in key order (`query-tree.md` §2.16) |
+| array | variable | as a relation value (§4.5), each element its type's encoding |
+| range | variable | `u8` flags (`query-tree.md` §2.19 rule 6), then each finite bound, a variable-width bound preceded by its `u32` length |
+| multirange | variable | `u32` count, `u32` end offset per range, the ranges |
 | record | variable | §4.5 |
 | relation | variable | §4.5 |
 | union | variable | §4.5 |
@@ -491,7 +532,8 @@ A **relation value** (a column of type `relation`, at any depth):
 | 1 | 3 | reserved |
 | 4 | 4 | `count` (u32) |
 | 8 | 4 × count | end offset of each element (u32), relative to the first element |
-| … | … | the elements, each the encoding of the element type: a **record** (§4.2) for a record element, a union value (below) for a union element, the §4.4 encoding for a scalar element. When the element type is nullable, each element is preceded by one byte, 0 = null or 1 = value, and a null element has nothing after that byte |
+| … | … | the elements, each the encoding of the element type: a **record** (§4.2) for a record element, a union value (below) for a union element, a relation value for a relation or array element, the §4.4
+encoding for a scalar element. When the element type is nullable, each element is preceded by one byte, 0 = null or 1 = value, and a null element has nothing after that byte |
 
 1. A `list` relation keeps its elements in order. A `bag` relation stores them in insertion order and promises no
    order.
@@ -514,21 +556,39 @@ Keys MUST compare correctly with `memcmp`, so that prefix compression, `head` an
 
 | type | encoding |
 |------|----------|
-| `intN`, `date`, `time`, `datetime`, `timestamp`, `decimal` | big-endian with the sign bit inverted |
+| `intN`, `date`, `time`, `timestamp`, `timestamptz` (any precision), `decimal` p ≤ 38, `money`, `interval_ym`, `interval_dt` | big-endian with the sign bit inverted |
 | `bool`, `uintN` | big-endian unsigned |
 | an enum: a union whose payloads are all `{}` | its discriminant as a big-endian `u16`, so keys order by declaration order (`query-tree.md` §3.3) |
 | `float32`, `float64` | big-endian bits; when the sign is 1 invert all bits, else invert the sign bit. −0 MUST be stored as +0, and every NaN as the one canonical quiet NaN, which sorts last |
 | `uuid` | the 16 bytes |
 | `interval` | months, days, microseconds, each as `iN` above |
 | `text`, `bytes` | the bytes with each 0x00 escaped as 0x00 0xFF, then the terminator 0x00 0x00 |
+| `varchar(n)`, `varbinary(n)`, `binary(n)` | as `text` and `bytes` |
+| `char(n)` | the value **padded** to `n` code points, as `text`: padded values of one length order by code points exactly as PAD SPACE compares them (`query-tree.md` §2.8 rule 4) |
+| `numeric`, `decimal` 39 ≤ p ≤ 1000, `decfloat` | a class byte: 0x00 −∞, 0x01 negative, 0x02 zero, 0x03 positive, 0x04 +∞, 0x05 NaN. A non-zero finite value, normalised to digits `d₁d₂…dₖ` (`d₁ ≠ 0`, no trailing zero) and exponent `E` with value `0.d₁…dₖ × 10^E`, follows with `E` as a big-endian `i32` with the sign bit inverted, then the digits in pairs, each pair `10a + b` (the last padded with 0) written as the byte `pair + 1`, then 0x00; for a negative value every byte after the class byte is inverted. Equal values of different scales or cohorts encode alike |
+| `timetz` | the UTC time (µs minus offset × 10⁶) as a big-endian `i64`, then the offset as a big-endian `i32`, each with the sign bit inverted |
+| `inet`, `cidr` | the family byte, the address with the bits past the prefix zeroed (4 or 16 bytes), the prefix length, the whole address |
+| `macaddr`, `macaddr8` | the octets |
+| `bit(n)`, `varbit(n)` | the packed bytes escaped and terminated as `bytes`, then the bit count as a big-endian `u32` |
+| array | for each element 0x01, then (when the element type is nullable) 0x00 for null or 0x01 and the element's key encoding, or just the element's key encoding; then 0x00 |
+| record | each field's key encoding in order, a nullable field prefixed as rule 1 prefixes a nullable component |
+| range | 0x00 for empty; else 0x01, the lower bound (0x00 when −∞, else 0x01, the value's encoding, then 0x01 inclusive or 0x02 exclusive), the upper bound (0x01, the value's encoding, then 0x01 exclusive or 0x02 inclusive; or 0x02 when +∞) |
+| multirange | each range as 0x01 and its range encoding, then 0x00 |
+| `jsonb` | a rank byte (0x01 null, 0x02 string, 0x03 number, 0x04 boolean, 0x05 array, 0x06 object), then: a string as `text`; a number as `numeric`; a boolean 0x00 or 0x01; an array its count as a big-endian `u32` and each element; an object its member count as a big-endian `u32` and each key (as `text`) and value, in stored order |
+| a domain, a distinct type | the base's or source's encoding |
 
 1. A nullable component of a secondary-index key is prefixed with 0x00 for NULL (nulls first) or 0x01 for a
    value. Primary-key columns are NOT NULL and have no prefix.
 2. A descending component has every byte of its encoding inverted, prefix included.
 3. A composite key is the concatenation of its components.
-4. `text` compares by binary UTF-8 in v1; there are no collations. When collations come (`query-tree.md` §3.1),
-   a collated key component stores its ICU sort key in the `text` encoding above and sets `key_spec` flag bit 2.
-   Relation, record and `json` values, and unions other than enums, MUST NOT be key components.
+4. A character string component compares by binary UTF-8 under `ucs_basic`, the default. A component under
+   another collation (`query-tree.md` §2.21) stores its Unicode Collation Algorithm sort key (for `char(n)`, of
+   the padded value) in the `text` encoding above and sets `key_spec` flag bit 2; the collation's name is in the
+   index's catalog row, and the sort key is computed by TernDB's own UCA implementation of the Unicode version
+   the format pins, so a key never changes under a host library upgrade.
+   Relation values (`bag`, `list`, so multisets), `json`, `xml`, structured types, and unions other than enums
+   MUST NOT be key components; a record is one only when every field could be. A bad component is refused
+   when the index is defined (`Q6005`).
 5. A key component that is an expression (`ddl.md` §2.5) is encoded by its result type, as a column of that type
    would be.
 
@@ -769,7 +829,9 @@ each segment are its header, so records start at offset 4,096 and the first LSN 
 
 1. Records are 8-byte aligned, padded at the end with zeros that are counted in `len`.
 2. A record MUST NOT span WAL segments. A record that does not fit in what remains of a segment is preceded by a
-   PAD record that fills the segment.
+   PAD record that fills the segment. Where fewer than 32 bytes remain, too few for a PAD's header, they are left
+   zeros and are not a record: the next record is the next segment's first, at offset 4,096, and a reader skips
+   them the same way. A record is therefore at most 2²⁶ − 4,096 bytes.
 3. The `lsn` field lets a reader reject a stale record left in a recycled segment, whose position does not match
    its stored LSN.
 
@@ -778,7 +840,10 @@ each segment are its header, so records start at offset 4,096 and the first LSN 
 1. **Every redo record modifies at most one page**, and names it in its payload's first 8 bytes (`pid`).
 2. A change that touches several pages (a split, an insert plus its allocation, an overflow chain) is a
    **mini-transaction**: its records are reserved contiguously in the WAL buffer, every record but the last has
-   `MTR_CONT`, and recovery applies a mini-transaction only when its last record is present and valid.
+   `MTR_CONT`, and recovery applies a mini-transaction only when its last record is present and valid. Its
+   records lie in one segment with no other record, PAD included, between them: one that does not fit in what
+   remains of a segment starts the next, after a PAD (§6.2 rule 2), so a mini-transaction is at most 2²⁶ − 4,096
+   bytes. A PAD inside a mini-transaction is corruption (`data_corrupted`).
 3. Latches held for a mini-transaction are released only after its records are in the WAL buffer.
 
 *Rationale:* the one-page rule is what makes redo partitionable by page (§6.9). Grouping is what makes a structure
@@ -790,7 +855,7 @@ Page records (payload starts with `pid` u64):
 
 | kind | name | payload after `pid` |
 |-----:|------|---------------------|
-| 1  | `PAGE_INIT` | `type` u8, `flags` u8, `owner` u64, `format` u16, `level` u16, plus the fences for a node |
+| 1  | `PAGE_INIT` | `type` u8, `flags` u8, `owner` u64, `format` u16, `level` u16, then the lower and the upper fence of a node, each `len` u16 and its bytes; both are empty (`len` 0) for a page that is not a node |
 | 2  | `FPI` | `codec` u8 (0 none, 1 LZ4), `len` u16, the image: the full page **before** the change that follows it |
 | 3  | `NODE_INSERT` | `slot` u16, `slot_flags` u16, `key_len` u16, `value_len` u16, key suffix, value |
 | 4  | `NODE_DELETE` | `slot` u16 |
@@ -863,6 +928,10 @@ Segment files are named `<timeline:08x>-<first lsn:016x>.twal` and are exactly 6
 | 48 | 8  | `prev_segment_crc`: the CRC of the previous segment's header (0 for the first) |
 | 56 | 4040 | reserved |
 
+`first_lsn` is the segment's own first LSN, k × 2²⁶, the one its name carries. v1 writes `wal_format` 1 and
+`rec_format` 1; a header whose CRC holds but whose `wal_format` or `key_version` this release does not read, or a
+record of a newer `rec_format`, is `format_unsupported`, not the end of the log.
+
 A segment MAY be recycled (renamed and rewritten) only once it is below every retention bound: the checkpoint's
 `redo_lsn`, the archiver, every replication slot and any running backup.
 
@@ -875,7 +944,8 @@ A segment MAY be recycled (renamed and rewritten) only once it is below every re
    `synchronous = off`, which is TernDB's asynchronous commit (`isolation.md` §6), it MAY be acknowledged before;
    the flush rule is otherwise unchanged, so a crash loses only a WAL suffix.
 3. **No flush rewrites a durable block.** A flush that ends in the middle of a 4 KiB block MUST first pad to the
-   block boundary with a PAD record, and the next flush starts in a fresh block. *Rationale:* a torn rewrite of a
+   block boundary with a PAD record, and the next flush starts in a fresh block. Where fewer than 32 bytes
+   remain before the boundary, the PAD runs through the following block as well. *Rationale:* a torn rewrite of a
    partly durable block would destroy commits already acknowledged, which Postgres and InnoDB risk by rewriting
    their last log page. Padding costs at most 4 KiB per sync, which a group amortizes.
 4. Several in-flight writes of one flush MAY complete in any order. `durable_lsn` advances only over a prefix whose
@@ -904,8 +974,12 @@ Recovery runs on open whenever CONTROL `state` is not 0 (clean). It has three ph
 Load its transaction table. Scan forward from `redo_lsn`, maintaining for each transaction its `last_undo` (from
 `UNDO_APPEND`) and its `undo_next` (from COMPENSATION records), removing a transaction at its COMMIT or ABORT, and
 raising `next_txn_id`, `next_oid` and `undo_high` over every value seen. **The end of the log** is the first
-position where any of these holds: the CRC fails; `lsn` ≠ the position; `len` is 0, not a multiple of 8, or runs
-past the segment; the segment file is missing; or its header's `db_uuid` or `timeline` is wrong. A trailing
+position where any of these holds: the CRC fails; `lsn` ≠ the position; `len` is less than 32 (0 included), not
+a multiple of 8, or runs past the segment; the segment file is missing or too short to hold the record; or its
+header fails its CRC, or its `magic`, `db_uuid`, `timeline`, `term` or `first_lsn` is wrong. These are a torn or
+unwritten tail, not corruption, except before a position the reader knows was durable (the end of the
+`CHECKPOINT_END` it starts from, or a restore's `min_recovery_lsn`): an end before that is `data_corrupted`. A
+record whose CRC and `lsn` hold but that does not parse as its kind is `data_corrupted` wherever it lies. A trailing
 mini-transaction whose last record lies past the end is discarded whole. Records beyond the end MUST NOT be
 applied, even if some of them would validate.
 
@@ -927,8 +1001,13 @@ their `txn` throughout, so the database MAY open for new transactions as soon as
 in the background (as InnoDB does). A crash during undo leaves COMPENSATION records whose `undo_next` keeps undo
 from being repeated (ARIES's CLRs).
 
-After recovery the engine MUST write a PAD from the end of the log to the next block boundary before it appends,
-MUST delete or ignore every later segment, and MUST take a checkpoint before CONTROL's `state` reads 1 again.
+After recovery the engine MUST delete every later segment, and then MUST write a PAD from the end of the log to
+the end of its segment and make it durable before it appends, and MUST take a checkpoint before CONTROL's `state`
+reads 1 again. The end here is the start of a trailing mini-transaction that was discarded. *Rationale:* a block
+a crashed flush wrote can survive past one it lost, whole and at its own LSN; a PAD only to the next block
+boundary would leave it to be read as the log's once new records reach it, and one to the segment's end
+overwrites every such block. A later segment may hold such records too, which is why it is deleted rather than
+ignored. When the end's segment is itself missing or not this log's, it is deleted and made afresh instead.
 
 ### 6.10 Rollback at run time
 

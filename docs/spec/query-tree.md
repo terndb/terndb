@@ -46,25 +46,29 @@ rule. Text marked *Informative* has no force.
 | `bool` | `false`, `true` | Predicates. |
 | `int8`, `int16`, `int32`, `int64`, `int128` | two's-complement integers of that width | 16/32/64 match SQL's `smallint`/`integer`/`bigint`; `int8` matches Substrait's `i8` and every client language's byte; `int128` holds exact sums of `int64` without falling to decimal. |
 | `uint8`, `uint16`, `uint32`, `uint64` | unsigned integers of that width | Counters, hashes, sizes and C interop, without a sign bit's halving of the range. |
-| `decimal(p, s)` | exact numbers with `p` significant digits, `s` of them after the point; `1 ≤ p ≤ 38`, `0 ≤ s ≤ p` | Money and exact arithmetic. 38 digits fit an `int128` unscaled value, so decimals are fixed-width and vectorisable. |
+| `decimal(p, s)` | exact numbers with `p` significant digits, `s` of them after the point; `1 ≤ p ≤ 1000`, `0 ≤ s ≤ p` | Money and exact arithmetic. Up to 38 digits fit an `int128` unscaled value, so those decimals are fixed-width and vectorisable; `39 ≤ p ≤ 1000` is held as `numeric` is (§2.10). |
 | `float32`, `float64` | IEEE 754 binary32/binary64, including ±0, ±∞ and NaN | Measurements, scores, vectors' components. |
 | `text` | any sequence of Unicode scalar values, encoded UTF-8; NUL is allowed | Strings. Length-prefixed everywhere, so NUL needs no exclusion. |
 | `bytes` | any octet sequence | Opaque data. |
-| `date` | a proleptic Gregorian calendar day, years −4713 … 294276 | Calendar dates. |
+| `date` | a proleptic Gregorian calendar day, years −4713 … 294276, and `-infinity`, `infinity` (§2.11 rule 9) | Calendar dates. |
 | `time` | a time of day with microsecond precision, `00:00:00` … `23:59:59.999999` | Wall-clock time without a date. |
-| `datetime` | a civil date and time with microsecond precision and **no** zone | A local reading ("the meeting is at 09:00"). |
-| `timestamp` | an instant: microseconds since 1970-01-01T00:00:00Z | A point on the global timeline. |
+| `timestamp` (alias `datetime`) | a civil date and time with microsecond precision and **no** zone | A local reading ("the meeting is at 09:00"); SQL's `TIMESTAMP WITHOUT TIME ZONE`. |
+| `timestamptz` | an instant: microseconds since 1970-01-01T00:00:00Z | A point on the global timeline; SQL's `TIMESTAMP WITH TIME ZONE`. |
 | `interval` | a triple (`months`: int32, `days`: int32, `micros`: int64) | Calendar arithmetic needs months and days kept apart from elapsed time. |
 | `uuid` | 128 bits | Identifiers. |
 | `json` | a JSON text (RFC 8259) in canonical form (§3.5) | Interop with schemaless documents. Nesting in TernDB's own data stays relational (§2.5); `json` is never how a nested result is encoded. |
 
-1. There is no `char(n)`/`varchar(n)`, no `timetz`, no `money` and no arbitrary-precision `numeric`
-   in version 1.0; `decimal` takes at most 38 digits. A length or range limit is a constraint, not a
-   type.
-   *Rationale: Postgres's `timestamp`/`timestamptz` split is the source of its most common time bug;
-   TernDB names the two concepts `datetime` and `timestamp` and never converts between them
-   implicitly. `timetz` has no coherent meaning.*
-2. Microsecond precision gives `timestamp` a range of about ±292,000 years in an `int64`. Nanosecond
+1. This table is the core. §2.7–§2.21 add **every data type of ISO/IEC 9075:2023** and the
+   **PostgreSQL types clients expect**, each with the reference that requires it. A length, precision,
+   scale or interval qualifier that SQL makes part of a data type is part of the tree type (§2.6):
+   `varchar(10)` and `varchar(20)` are different types, as are `time(3)` and `time`. `time`,
+   `timestamp` and `timestamptz` written without a precision have precision 6.
+   *Rationale: the user's decisions of 2026-11-25 (`docs/decisions.md` Q78–Q80). `TIMESTAMP` is the
+   standard's zoneless type (ISO/IEC 9075-2 §6.1 `<datetime type>`, whose default is `WITHOUT TIME
+   ZONE`), and `timestamptz` the instant; `datetime` remains a name of the zoneless type. The two stay
+   apart as before: no implicit coercion and no cast joins them, and every conversion between them names
+   its zone (§7.6), so Postgres's most common time bug — a session zone silently applied — cannot occur.*
+2. Microsecond precision gives `timestamptz` a range of about ±292,000 years in an `int64`. Nanosecond
    precision would cut that range to 1677–2262.
 
 ### 2.2 Nullability
@@ -101,13 +105,15 @@ rule. Text marked *Informative* has no force.
 
 1. A relation type is `bag<E>` (a multiset: no order, duplicates counted) or `list<E>` (a sequence:
    order is part of the value).
-2. The element type `E` MUST be a record type, a union whose payloads are records, or a scalar
-   (§2.1), and MAY be nullable (§2.2); it MUST NOT itself be a relation type (`Q3014`). A null element
+2. The element type `E` MUST be a record type, a union whose payloads are records, a scalar
+   (§2.1, §2.7), an array, or itself a relation type — so ISO's multiset of multisets is
+   `bag<bag<T>>` — and MAY be nullable (§2.2); anything else is `Q3014`. A null element
    is one element whose value is null: it counts in the relation's length, and the wire marks it in the
    element column's validity (`wire-protocol.md` §6.2). Relation types may nest to any depth through
    record fields: `bag<{id: int64, posts: list<{id: int64}>}>` is legal.
-   A relation whose element is a scalar, such as `list<int64>`, is a **scalar relation**: under its
-   binder it exposes one column, `value`, of the element type, and `Row(binder)` is that value.
+   A relation whose element is a scalar, such as `list<int64>`, an array or a relation, is a **scalar
+   relation**: under its binder it exposes one column, `value`, of the element type, and `Row(binder)`
+   is that value; so `Unnest` of a `bag<bag<T>>` yields rows whose `value` is a `bag<T>`.
 3. Relation-valued columns are values like any other: they can be stored in a table column, passed as
    parameters, compared (§3), hashed, grouped on and indexed.
 4. A relation value is never null unless its type is `bag<E>?`/`list<E>?`; the absence of rows is the
@@ -115,8 +121,463 @@ rule. Text marked *Informative* has no force.
 
 ### 2.6 Type identity
 
-Two types are **identical** iff they are the same scalar (with the same `p, s` for decimal), or
-structurally identical per §2.3–2.5, with identical nullability at every level.
+Two types are **identical** iff they are the same scalar with the same parameters (`p, s` for
+decimal; the length of a string type; the precision of a time type or `decfloat`; the qualifier of an
+interval type), or structurally identical per §2.3–2.5 and §2.13–2.19 (an array's maximum cardinality
+included), with identical nullability at every level. A distinct or structured type (§2.20) is
+**nominal**: it is identical only to itself.
+
+### 2.7 The SQL types
+
+These types complete §2.1. The kind is the §12.3 type kind, which is also the wire's and the C ABI's type id.
+Each type's section (§2.8–§2.21) gives its values, literals, casts, comparison, encodings, operators and its null
+and edge behaviour; the encodings are fixed by §12.6 (parameters and literals), `on-disk-format.md` §4.3–§4.6
+(rows and keys) and `wire-protocol.md` §6.2–§6.3 (results), and the sections only summarise them.
+
+| Type | Kind | Section | Required by |
+|---|---|---|---|
+| `varchar(n)`, `char(n)` | 64, 65 | §2.8 | ISO/IEC 9075-2:2023 §6.1 `<character string type>` |
+| `varbinary(n)`, `binary(n)` | 66, 67 | §2.9 | ISO/IEC 9075-2:2023 §6.1 `<binary string type>` |
+| `numeric`; `decimal(p, s)` with `p > 38` | 27; 7 | §2.10 | ISO/IEC 9075-2:2023 §6.1 `<exact numeric type>`; PostgreSQL 17 §8.1.2 |
+| `decfloat(16)`, `decfloat(34)` | 68 | §2.10 | ISO/IEC 9075-2:2023 §6.1 `<decimal floating-point type>` |
+| `money` | 30 | §2.10 | PostgreSQL 17 §8.2 |
+| `time(p)`, `timestamp(p)`, `timestamptz(p)` for `p < 6` | 69, 70, 71 | §2.11 | ISO/IEC 9075-2:2023 §6.1 `<datetime type>` |
+| `timetz(p)` | 72 | §2.11 | ISO/IEC 9075-2:2023 §6.1 `<datetime type>` (`TIME WITH TIME ZONE`) |
+| `interval_ym(q, l)`, `interval_dt(q, l, p)` | 73, 74 | §2.12 | ISO/IEC 9075-2:2023 §6.1 `<interval type>`, §10.1 `<interval qualifier>` |
+| `array<T>`, `array<T, m>` | 75 | §2.13 | ISO/IEC 9075-2:2023 §6.1 `<array type>`; PostgreSQL 17 §8.15 |
+| `bag<T>` as a multiset | 18 | §2.14 | ISO/IEC 9075-2:2023 §6.1 `<multiset type>` |
+| records as rows | 16 | §2.15 | ISO/IEC 9075-2:2023 §6.1 `<row type>`; PostgreSQL 17 §8.16 |
+| `json`; `jsonb` | 26; 28 | §2.16 | ISO/IEC 9075-2:2023 §6.1 `<JSON type>`; PostgreSQL 17 §8.14 |
+| `xml` | 29 | §2.17 | ISO/IEC 9075-14:2023 `<XML type>`; PostgreSQL 17 §8.13 |
+| `inet`, `cidr`, `macaddr`, `macaddr8` | 31, 78, 79, 80 | §2.18 | PostgreSQL 17 §8.9 |
+| `bit(n)`, `varbit(n)` | 81, 82 | §2.18 | PostgreSQL 17 §8.10 |
+| `range<T>`, `multirange<T>` | 76, 77 | §2.19 | PostgreSQL 17 §8.17 |
+| enums, domains | 17, 32 | §2.20 | PostgreSQL 17 §8.7, §8.18; ISO/IEC 9075-2:2023 `<domain definition>` |
+| distinct and structured types | 33, 34 | §2.20 | ISO/IEC 9075-2:2023 `<user-defined type definition>` |
+
+1. **Parameters out of range.** A type parameter outside the range its section gives (`varchar(0)`, `time(7)`,
+   `decfloat(20)`, an interval qualifier whose end field precedes its start) is `Q3019`.
+2. **Values out of a type's domain.** A `Literal` value that is not a value of its type (a `varchar(3)` literal of
+   four code points, a `char(n)` literal that is not exactly `n` code points, a `cidr` with host bits set, a range
+   whose lower bound exceeds its upper) is `Q3020`; a bound parameter value that is not is `Q4006`.
+3. **Functions without a rule here.** A function a section names but gives no rule for behaves as the reference
+   cited for it documents it. The item that implements the function (`docs/design/sql-types-plan.md`) writes its
+   rule into its section before it lands, and a test pins every rule it writes.
+4. **SQL spellings** of every type are in `sql.md` §4.1.
+
+### 2.8 Character strings
+
+1. **Values.** `text` holds any sequence of Unicode scalar values (§2.1). `varchar(n)` holds a `text` of at most `n`
+   code points and `char(n)` one of exactly `n` code points; `1 ≤ n ≤ 2³¹ − 1`. Every character string is UTF-8;
+   the national forms (`NATIONAL CHARACTER`, `NCHAR`, `NVARCHAR`, `NCLOB`) are the same types, because UTF-8
+   already holds every national character set.
+2. **Assignment.** A value stored into a `varchar(n)` column or field (§4.1 rule 15) that has `L > n` code points
+   loses code points `n + 1 … L` if they are all U+0020, and is otherwise `R0009` (SQLSTATE 22001,
+   *string data, right truncation*). A value stored into `char(n)` follows the same rule and is then padded on
+   the right with U+0020 to `n` code points.
+3. **Casts.** `Cast` to `varchar(n)` of a longer value keeps the first `n` code points; to `char(n)` it keeps the
+   first `n` and pads a shorter value with U+0020. A cast is the explicit, truncating conversion of ISO/IEC 9075-2
+   §6.13, so it never raises `R0009`. `char(n)` to `text` or `varchar(m)` keeps the padding (`m ≥ n`; a smaller
+   `m` truncates). Every type castable to `text` (§7.6) is castable to `varchar(n)` and `char(n)` through its text
+   form, and back.
+4. **Comparison.** `text` and `varchar(n)` compare by the collation of the comparison (§2.21), binary code point
+   order when none is named, with **no padding**. A comparison (`eq` … `ge`, `same`, `cmp`, and the hash) of which
+   an operand has type `char(n)` is **PAD SPACE**: the shorter operand is first extended with U+0020 to the
+   longer's length, as ISO/IEC 9075-2 §8.2 requires. So `'ab'::char(4) = 'ab'` is true, `same` on `char` values
+   ignores trailing spaces, and `'a'::char(1) < 'a' || U&'\0009'` is false (the pad space sorts above a tab).
+5. **Encoding.** Parameters, literals and results carry the value's UTF-8 (`char(n)` padded to `n` code points).
+   A row stores `char(n)` without its trailing U+0020, and a key holds it padded (DISK §4.4, §4.6).
+6. **Operators.** `concat` (`||`): `varchar(n)` with `varchar(m)` is `varchar(n + m)`, `char(n)` with `char(m)`
+   is `char(n + m)` (each `text` when the sum exceeds 2³¹ − 1), any other string operand makes it `text`;
+   `length`/`char_length` (code points; a `char(n)` value's is `n`), `octet_length`, `position(s, t) → int64`
+   (1-based, 0 when absent), `substring(s, from, for)`, `overlay(s, r, from, for)`, `trim(s, chars, side)` with
+   side `both`, `leading` or `trailing`, `lower`, `upper`, `like`, `similar_to` (ISO/IEC 9075-2 §8.6),
+   `normalize(s, form)` and `is_normalized(s, form)` for NFC, NFD, NFKC and NFKD; and the PostgreSQL functions
+   `replace`, `split_part`, `left`, `right`, `lpad`, `rpad`, `repeat`, `reverse`, `ltrim`, `rtrim`, `btrim`,
+   `initcap`, `ascii`, `chr`, `strpos`, `starts_with`, `regexp_like`, `regexp_replace`, `regexp_substr`,
+   `regexp_count`, `regexp_split_to_array` (PostgreSQL 17 §9.4, §9.7). Results are `text` unless stated.
+7. **Nulls and edges.** The empty string is a value, never null. `char(n)` of the empty string is `n` spaces.
+   `position('', t)` is 1. `substring` with a start below 1 counts the missing positions against `for`
+   (`substring('abc', 0, 2)` is `'a'`); a negative `for` is `R0006`. Every function is strict.
+8. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<character string type>` (`CHARACTER`, `CHARACTER VARYING`,
+   `CHARACTER LARGE OBJECT` and the `NATIONAL` forms; features E021, T041, F421); PostgreSQL 17 §8.3.
+
+### 2.9 Binary strings
+
+1. **Values.** `bytes` holds any octet sequence; `varbinary(n)` one of at most `n` octets and `binary(n)` one of
+   exactly `n`; `1 ≤ n ≤ 2³¹ − 1`.
+2. **Assignment, casts.** As §2.8 rules 2 and 3 with octets for code points and X'00' for U+0020: storing a longer
+   value is `R0009` unless the excess octets are all X'00'; `binary(n)` pads with X'00'; a `Cast` truncates or
+   pads. `bytes ↔ uuid` stays (§7.6); every binary type casts to and from `text` through the `\x` hex form.
+3. **Comparison.** Unsigned octet-lexicographic, a proper prefix first, no padding for any of the three.
+4. **Encoding.** As `bytes` everywhere; a row stores `binary(n)` as its `n` octets in the variable area.
+5. **Operators.** `concat` (`||`), `octet_length` (and `length`, the same), `position`, `substring`, `overlay`,
+   `trim` (of X'00' unless given octets), and the PostgreSQL `get_byte`, `set_byte`, `get_bit`, `set_bit`,
+   `encode(bytes, text)`/`decode(text, text)` for `hex`, `base64` and `escape`, `md5`, `sha224`, `sha256`, `sha384`,
+   `sha512` (PostgreSQL 17 §9.5). Strict.
+6. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<binary string type>` (`BINARY`, `BINARY VARYING`,
+   `BINARY LARGE OBJECT`; features T021, T022, T041); PostgreSQL 17 §8.4 (`bytea`).
+
+### 2.10 Numbers: `numeric`, large decimals, `decfloat`, `money`, `float(p)`
+
+1. **`numeric`.** An exact decimal of any magnitude up to 131,072 digits before the point and 16,383 after, or
+   one of the three special values `NaN`, `Infinity` and `-Infinity`. A finite value also carries its **display
+   scale**, the number of digits after the point it was written or computed with: `1.50` prints `1.50`.
+   Equality, order and hashing ignore the display scale (`same(1.5, 1.50)` is true); which of two `same` values
+   with different display scales a `Distinct` or grouping keeps is unspecified.
+2. **`decimal(p, s)` with `39 ≤ p ≤ 1000`** holds what its `p, s` allow, as `numeric` holds it (no special
+   values, display scale `s`). `p ≤ 38` keeps its fixed-width `int128` form.
+3. **`decfloat(p)`**, `p` 16 or 34: an IEEE 754-2008 decimal64 (`p = 16`) or decimal128 (`p = 34`) value: a
+   finite number with a coefficient of at most `p` digits, its exponent kept (so `1.0` and `1.00` are different
+   members of one cohort and print differently), ±0, ±∞ and one quiet NaN. A signalling NaN or a NaN payload is
+   read as the quiet NaN. Arithmetic rounds half to even and, like float arithmetic, never raises: an overflow is
+   ±∞ and an invalid operation NaN.
+4. **`money`**: an `int64` count of hundredths, from `-92233720368547758.08` to `92233720368547758.07`, printed
+   with exactly two fraction digits and no currency symbol or grouping (`-1234.50`). The fraction is fixed at two
+   digits: the tree has no session locale (§1 rule 4), so PostgreSQL's `lc_monetary` is the compatibility
+   layer's concern.
+5. **`float(p)`** is a SQL spelling only: `1 ≤ p ≤ 24` is `float32`, `25 ≤ p ≤ 53` is `float64`.
+6. **Casts.** Every numeric type casts to every other (§7.6): into `numeric` exactly; into `decfloat` rounding half
+   to even; from a `decfloat` or `numeric` special value into a type without it, `R0006`; `money` to and from
+   `numeric`, `decimal` and the integers (an integer is a whole number of units). All cast to and from `text`.
+7. **Comparison.** By numeric value: `numeric` and `decfloat` order `-Infinity` < finite < `Infinity` < `NaN`,
+   with every NaN `same` and −0 `same` as +0, as floats do (§3.3 rule 3); members of one `decfloat` cohort are
+   `same`. `money` as its `int64`.
+8. **Arithmetic** (§4.4 rules 5–7). `numeric` results take PostgreSQL's display scales: the larger operand scale
+   for `add`/`sub`, their sum for `mul`, and for `div` at least 16 significant digits and no fewer than either
+   operand's scale (PostgreSQL 17 `select_div_scale`), at most 16,383. A result beyond the digit limits is `R0001`;
+   division by zero is `R0002` except that NaN divided by zero is NaN. Infinities follow IEEE 754 except that
+   `Infinity − Infinity` and `0 × Infinity` are NaN.
+9. **Operators.** `add sub mul div mod neg abs`, `ceil`, `floor`, `round(x, s)`, `trunc(x, s)`, `sign`, `sqrt`,
+   `exp`, `ln`, `log10`, `log(b, x)`, `power`, `width_bucket`, and the PostgreSQL `scale`, `min_scale`,
+   `trim_scale`, `gcd`, `lcm`, `factorial`; for `decfloat` also `quantize(x, y)`, `normalize_decfloat(x)` and
+   `totalorder(x, y)` (IEEE 754 §5.3.2, §5.10). `money` has `add`, `sub`, `neg`, `mul` and `div` by an integer,
+   `numeric` or `float64` (rounded half away from zero to a hundredth), and `div(money, money) → float64`.
+10. **Nulls and edges.** Strict. `numeric` NaN equals NaN, unlike IEEE. `numeric` has no −0; a `decfloat` −0 is
+    `same` as +0 but prints `-0`.
+11. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<exact numeric type>` (`NUMERIC` and `DECIMAL` without a precision:
+    an implementation-defined precision, which TernDB takes from PostgreSQL), `<decimal floating-point type>`
+    (`DECFLOAT`, feature T076), `<approximate numeric type>` (`FLOAT(p)`); PostgreSQL 17 §8.1.2 (unconstrained
+    `numeric`, its special values), §8.1.3 (`float(p)`), §8.2 (`money`).
+
+### 2.11 Datetimes
+
+1. **Values.** `time(p)`, `timestamp(p)` and `timestamptz(p)`, `0 ≤ p ≤ 6`, hold the values of `time`,
+   `timestamp` and `timestamptz` whose fraction of a second is a multiple of 10^(6 − p) µs. `timetz(p)` holds a
+   pair: a `time(p)` and an offset from UTC of −15:59:59 … +15:59:59 in whole seconds, positive east. Hours
+   run 00–23; there is no `24:00:00` and no leap second (`:60` is `R0006`).
+2. **Precision.** Storing, casting or coercing to a smaller `p` rounds half away from zero. A `time` that rounds
+   to 24:00:00 is `R0001`; a `timestamp` rolls into the next day.
+3. **Literals.** Text forms (§3.5): `timetz` is the `time` form then the offset `±HH:MM`, with `:SS` when the
+   offset has seconds; `Z` is parsed as `+00:00`. SQL's typed literals follow ISO/IEC 9075-2 §5.3: a `TIME` or
+   `TIMESTAMP` literal whose text carries an offset is `WITH TIME ZONE`, and a literal's precision is the number
+   of fraction digits it writes (`sql.md` §2.5).
+4. **Casts.** `date → timestamp(p)` (midnight); `timestamp(p) → date` and `→ time(p)` (the parts);
+   `timetz → time` (drops the offset); text both ways. A cast between `timestamp` and `timestamptz`, from
+   `timestamptz` to `date`, `time` or `timetz`, or from `time` to `timetz` depends on a zone and is `Q3012`; the
+   zone functions do it with the zone named (`at_zone`, `from_zone`, §7.6, and `at_zone(timetz, text) → timetz`,
+   which uses the zone's offset at the statement's timestamp).
+5. **Comparison.** Chronological. `timetz` orders by its UTC time (the time of day minus the offset, which may
+   fall outside one day), then by offset; so `12:00+01:00` and `11:00+00:00` are **not** `same`, and `eq` agrees
+   (PostgreSQL's reading; ISO compares the UTC times only, `docs/decisions.md` Q78).
+6. **Encoding.** As the unprecise types: the precision is in the type, not the value. `timetz` is 12 octets: the
+   `int64` µs since midnight, then the `int32` offset in seconds (§12.6).
+7. **Operators.** `add`/`sub` with intervals (§4.4 rule 9); `sub(date, date) → int32` (days);
+   `sub(timestamp, timestamp)` and `sub(timestamptz, timestamptz) → interval_dt(day to second, 9, 6)`;
+   `sub(time, time) → interval_dt(hour to second, 9, 6)`; `add(date, time) → timestamp`; `extract(field, x) →
+   numeric` for the ISO fields `year`, `month`, `day`, `hour`, `minute`, `second`, `timezone_hour`,
+   `timezone_minute` and PostgreSQL's `epoch`, `dow`, `isodow`, `doy`, `week`, `quarter`, `isoyear`, `century`,
+   `decade`, `millennium`, `microseconds`, `milliseconds`, `julian`, `timezone`; `date_trunc(field, x[, zone])`,
+   `date_bin`, `date_part`, `make_date`, `make_time`, `make_timestamp`, `make_timestamptz(…, zone)`, `age`,
+   `overlaps` (ISO/IEC 9075-2 §8.14), `isfinite`; `current_date(zone) → date`, `current_time(p, zone) →
+   timetz(p)`, `current_timestamp(p) → timestamptz(p)`, `localtime(p, zone) → time(p)`,
+   `localtimestamp(p, zone) → timestamp(p)`, all stable within a statement and computed from
+   `statement_timestamp()`; the SQL front end supplies the zone from its session (`sql.md` §5.10).
+8. **Nulls and edges.** Strict. A result outside the type's range is `R0001`. A zone that is not one is `R0006`.
+9. **Infinity.** `date`, `timestamp` and `timestamptz` (at every precision) also hold `-infinity` and
+   `infinity`, PostgreSQL's special values, held as the least and greatest values of their integer: `date`'s
+   `int32` −2³¹ and 2³¹ − 1, the timestamps' `int64` −2⁶³ and 2⁶³ − 1. No finite value uses those two
+   integers, so the finite range of `timestamptz` ends at `+294247-01-10T04:00:54.775806Z`. The encodings are
+   unchanged (§12.6, `on-disk-format.md` §4.4 and §4.6, `wire-protocol.md` §6.3): every encoding of these types
+   is its integer, so the infinities sort below and above every finite value in `cmp`, the orderings, keys and
+   `memcmp` alike, and `same(infinity, infinity)` is true. A decoder MUST read those integers as the
+   infinities, never as dates.
+   - **Text.** `infinity` and `-infinity` print so; `+infinity` and every case are parsed (`sql.md`
+     `DATE 'infinity'`).
+   - **Arithmetic** (PostgreSQL's). An infinity plus or minus any interval or day count is itself;
+     a finite result that would reach either reserved integer is `R0001`. A difference with an infinite
+     operand (`sub(date, date)`, `sub(timestamp, timestamp)`, `sub(timestamptz, timestamptz)`, `age`) is
+     `R0001` (SQLSTATE 22008), since no interval is infinite; so is `infinity − infinity`.
+   - **Casts.** `date ↔ timestamp`, the zone functions and precision changes keep an infinity; an infinite
+     `timestamp` or `timestamptz` cast to `time` or `timetz`, or an infinity into a type that has none, is
+     `R0006`.
+   - **Functions.** `extract` of `year`, `isoyear`, `decade`, `century`, `millennium`, `epoch` and `julian` is
+     the `numeric` `Infinity` or `-Infinity`; of any other field, null. `date_trunc` and `date_bin` keep an
+     infinity; `isfinite` is false. A window `range` offset (§6.8) moves an infinite key nowhere.
+10. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<datetime type>` (`DATE`, `TIME`, `TIMESTAMP`, each `WITH` and
+   `WITHOUT TIME ZONE`, with `<time precision>` and `<timestamp precision>`; features F051, F411, F555);
+   PostgreSQL 17 §8.5.
+
+### 2.12 Intervals
+
+1. **Values.** `interval` (§2.1) stays PostgreSQL's (months, days, µs) triple; SQL's `INTERVAL` without a qualifier
+   names it. The standard's qualified intervals are two further types:
+   - `interval_ym(q, l)`, `q` one of `year`, `month`, `year to month`: a signed whole number of months; with `q`
+     `year`, a multiple of 12. Its leading field (years, or months for `month`) has at most `l` digits,
+     `1 ≤ l ≤ 9`.
+   - `interval_dt(q, l, p)`, `q` one of `day`, `hour`, `minute`, `second`, `day to hour`, `day to minute`,
+     `day to second`, `hour to minute`, `hour to second`, `minute to second`: a signed number of µs, a day being
+     exactly 86,400 s; a multiple of `q`'s last field (one hour for `day to hour`), and of 10^(6 − p) µs when the
+     last field is `second`, `0 ≤ p ≤ 6` (`p` is 0 otherwise); its leading field has at most `l` digits.
+2. **Comparison.** `interval_ym` and `interval_dt` are totally ordered by their one number, so they are
+   orderable and may be keys, unlike `interval` (§3.2 rule 4). The two families never meet: no common type,
+   coercion or cast joins them (`Q3001`, `Q3012`), as ISO/IEC 9075-2 makes year-month and day-time
+   intervals incomparable.
+3. **Coercions and casts.** Within a family, to a qualifier and precisions that hold every value (§4.1 rule 12);
+   each family to `interval` (`interval_ym` to (months, 0, 0); `interval_dt` to (0, whole days, the remaining
+   µs)), lossless. `Cast` from `interval` to `interval_ym` needs zero days and µs, and to `interval_dt` zero
+   months, else `R0006`. `Cast` to a qualifier with a coarser last field truncates toward zero (ISO/IEC 9075-2
+   §6.13); a leading field beyond `l` digits is `R0001` (SQLSTATE 22015, *interval field overflow*). An exact
+   number casts to and from a single-field qualifier (`CAST(5 AS INTERVAL DAY)`). Text both ways.
+4. **Text forms.** `interval_ym`: `P`, then `<n>Y` and `<n>M` for each non-zero part, `P0M` for zero, with a
+   leading `-` when negative (`-P1Y2M`). `interval_dt`: `P`, `<n>D` when there are days, then `T` and `<n>H`,
+   `<n>M`, `<s>S` for each non-zero part (`s` with the `time` fraction rule), `PT0S` for zero, a leading `-` when
+   negative (`P1DT2H0.5S`). SQL's literals use ISO's interval strings with the qualifier written
+   (`INTERVAL '1-2' YEAR TO MONTH`, `INTERVAL '3 04:05:06.5' DAY TO SECOND`; `sql.md` §2.5).
+5. **Arithmetic** (§4.4 rule 8). `add`/`sub`/`neg`/`abs` within a family give the family with the wider qualifier
+   and precisions; `mul` and `div` by an exact number or a float round half away from zero to the type's last
+   field. Overflow of `l` digits is `R0001`.
+6. **Encoding.** `interval_ym` is an `int32` of months, `interval_dt` an `int64` of µs (§12.6).
+7. **Nulls and edges.** Strict. `extract` reads the fields of a qualified interval as the qualifier names them.
+8. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<interval type>`, §10.1 `<interval qualifier>` (feature F052);
+   PostgreSQL 17 §8.5.4, whose `INTERVAL` with fields TernDB reads as these types.
+
+### 2.13 Arrays
+
+1. **Values.** `array<T>` is an ordered sequence of zero or more elements of type `T`, indexed from 1;
+   `array<T, m>` has at most `m`, `1 ≤ m ≤ 2³¹ − 1`. `T` is any type, including an array, a record or a relation
+   type, and is usually nullable: SQL's `T ARRAY` is `array<T?>`. An array is a value, not a relation: it is
+   compared with `eq`, has a text form and may be a key, and it is a relation only after `Unnest` (§6.14) or a
+   `Cast` to `list<T>`.
+2. **Construction.** `array_of(x₁, …, xₙ)` (the common type of its arguments, `n ≥ 0`, an empty call needs a
+   `Cast`), and in SQL `ARRAY[…]`, `ARRAY(query)` (a `Cast` of the query's `list` or `bag`; a bag gives an
+   unspecified order) and the text form.
+3. **Assignment and casts.** Storing an array of more than `m` elements is `R0012` (SQLSTATE 2202F, *array data,
+   right truncation*), and so is a `Cast` to `array<T, m>`. Casts are elementwise (`array<T> → array<U>` when
+   `T` casts to `U`), `array<T> ↔ list<T>` (order kept), and to and from `text`.
+4. **Text form.** PostgreSQL's: `{`, the elements' text forms separated by `,`, `}`; null is `NULL`; an element
+   is double-quoted, with `\` before `"` and `\`, when it is empty, equals `NULL` in any case, or contains
+   `{`, `}`, `,`, `"`, `\` or white space. A nested array is a nested `{…}` (`{{1,2},{3}}`; nested arrays need
+   not be rectangular).
+5. **Comparison.** `eq` is ISO's: `false` when the cardinalities differ or a pair of elements is `eq`-false,
+   else null when a pair is null, else `true`. `lt` … `ge` and `cmp` are lexicographic by element (`cmp` with
+   null lowest, §3.3), a proper prefix first, as `list<E>` (§3.3 rule 7); an element pair that is null before
+   one has decided makes `lt` null, as for records (§3.2 rule 2). `same` is elementwise `same`.
+6. **Operators.** `element(a, i)` (SQL `a[i]`; an index outside `1 … cardinality(a)` is `R0011`, SQLSTATE 2202E,
+   *array element error*, and a null index gives null), `try_element(a, i)` (null outside the bounds, which is
+   PostgreSQL's `a[i]`), `slice(a, i, j)` (PostgreSQL's `a[i:j]`, clamped), `cardinality → int64`,
+   `max_cardinality` (null when unbounded), `concat` (`||`; the bound is the sum, or none), `array_append`,
+   `array_prepend`, `trim_array(a, n)`, `array_position`, `array_positions`, `array_remove`, `array_replace`,
+   `array_to_string`, `string_to_array`, `array_length(a, 1)`, `array_lower`, `array_upper`, `array_ndims`,
+   `contains_all` (`@>`), `contained_by` (`<@`), `overlaps` (`&&`), and the aggregate `array_agg`. SQL's
+   `x = ANY (a)` and `x op ALL (a)` read an array as the relation `Unnest` gives (`sql.md` §5.8).
+7. **Encoding.** As a relation of `T` (DISK §4.5, WIRE §6.2 relation node); the key form is in DISK §4.6.
+8. **Nulls and edges.** A null array and an empty array differ: `cardinality(null)` is null, of `{}` 0.
+   PostgreSQL's multi-dimensional arrays (one value of fixed rank and rectangular shape) and its non-1 lower
+   bounds are **deferred** (decision Q95): an array of arrays holds a matrix meanwhile, and the compatibility
+   layer cannot yet carry a PostgreSQL array value of rank above 1 or a lower bound other than 1 (`R0006`); SQL's `T[m]` does not bound the array, as in PostgreSQL, while
+   `T ARRAY[m]` does, as in ISO.
+9. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<array type>` (features S091, S092, S094–S098); PostgreSQL 17 §8.15.
+
+### 2.14 Multisets
+
+1. SQL's `T MULTISET` is `bag<T?>` (§2.5): the existing relation type, so a multiset can be stored, nested,
+   unnested and grouped like any bag. Its element is any type §2.5 rule 2 allows, a multiset included:
+   `T MULTISET MULTISET` is `bag<bag<T?>?>` (decision Q94).
+2. **Operators.** `cardinality → int64`, `set(m)` (duplicates removed by `same`), `element(m)` (the one element;
+   null for an empty multiset, `R0003` for more than one), `member_of(x, m)`, `submultiset_of(m₁, m₂)`,
+   `is_a_set(m)`, `multiset_union`, `multiset_intersect` and `multiset_except`, each with `all` or `distinct`,
+   the aggregates `collect`, `fusion` and `intersection`, and `Unnest`. `multiset_eq(m₁, m₂)` is SQL's `=` on
+   multisets: null when either is null; `false` when the cardinalities differ; `true` when they are `same` and
+   neither holds an element containing a null; otherwise, after pairing off `same` non-null elements, null when
+   every remaining element of each side could pair with a null-containing element of the other, else `false`.
+   `eq` and the orderings stay refused on relation types (§3.2 rule 4, `Q3006`).
+3. **Encoding, text.** A bag's (DISK §4.5, WIRE §6.2). A multiset has no text form and is not a key component.
+4. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<multiset type>` (features S271, S272, S274, S275); PostgreSQL has
+   none.
+
+### 2.15 Rows
+
+1. SQL's `ROW(f₁ T₁, …)` is the record `{f₁: T₁, …}` (§2.3), and a PostgreSQL composite type is a named record
+   (`ddl.md` §2.8). A row value constructor `ROW(a, b)` or `(a, b)` outside a comparison builds a `Record` with
+   fields `f1`, `f2`, …, as PostgreSQL names them.
+2. **Comparison** is §3.2 rule 2's row comparison, which is ISO's. A record whose fields are all orderable and
+   key-encodable may be a key component (DISK §4.6).
+3. **Text form.** PostgreSQL's composite form: `(`, the fields' text forms separated by `,`, `)`; a null field is
+   empty; a field is double-quoted, with `"` doubled and `\` before `\`, when it is the empty string or contains
+   `(`, `)`, `,`, `"`, `\` or white space.
+4. **Operators.** `Field` (SQL `x.f` and `(x).f`), `Record`, comparisons, and SQL's `IS [NOT] DISTINCT FROM`
+   (`not(same(…))`, `same`).
+5. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<row type>` (feature T051); PostgreSQL 17 §8.16.
+
+### 2.16 JSON
+
+1. **`json`** (§2.1, §3.5) is ISO's JSON type, held in RFC 8785 canonical form, unchanged. It refuses a name twice
+   in one object, which ISO leaves to `WITH UNIQUE KEYS`.
+2. **`jsonb`** is PostgreSQL's: a JSON value whose objects have unique keys (the **last** of duplicates wins),
+   held with each object's keys ordered by octet length, then octets, as PostgreSQL stores them; whose numbers
+   are `numeric` values (any precision, display scale kept: `1.10` stays `1.10`; no NaN or infinity); and whose
+   strings are any text without U+0000. Its text form is PostgreSQL's output: `", "` between members and
+   elements, `": "` after a key, strings escaped with `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t` and `\u00XX` for
+   other controls, numbers in their `numeric` text form. Nesting deeper than 256 is `R0006`.
+3. **Comparison.** `json` as before (`eq`, no ordering). `jsonb` is orderable, by PostgreSQL 17 §8.14.4's
+   order: object > array > boolean > number > string > null; objects by pair count, then key and value pairs in
+   stored order; arrays by element count, then elements; strings by octets (PostgreSQL uses the database
+   collation); numbers numerically, so `1.0` and `1` are `same`.
+4. **Casts.** `json ↔ jsonb` (to `json` by RFC 8785, `R0006` for a number outside binary64), `text ↔ jsonb`, and
+   `jsonb` to `bool`, the numeric types and `text` when it is a scalar of that kind (else `R0006`).
+5. **Operators.** For both: ISO's SQL/JSON functions `is_json(text, kind, unique)` (SQL `IS JSON [VALUE | ARRAY |
+   OBJECT | SCALAR] [WITH UNIQUE KEYS]`), `json_value`, `json_query`, `json_exists`, `json_table`, `json_object`,
+   `json_array`, `json_objectagg`, `json_arrayagg`, `json_scalar`, `json_serialize` and the SQL/JSON path
+   language, lax and strict (ISO/IEC 9075-2:2023, features T811–T840); for `jsonb` PostgreSQL's `->`,
+   `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `||`, `-`, `#-`, `@?`, `@@`, subscripts, `jsonb_set`,
+   `jsonb_insert`, `jsonb_typeof`, `jsonb_array_length`, `jsonb_each`, `jsonb_object_keys`,
+   `jsonb_array_elements`, `jsonb_build_object`, `jsonb_build_array`, `jsonb_agg`, `jsonb_object_agg`, `to_jsonb`,
+   `jsonb_strip_nulls`, `jsonb_pretty` and `jsonb_path_query`/`_exists`/`_match` (PostgreSQL 17 §9.16).
+6. **Encoding.** `jsonb`: a binary form in rows (DISK §4.4), its text form in parameters and results.
+7. **Nulls and edges.** JSON `null` is a value, not SQL null: `'null'::jsonb` is not null, and `->` of a missing
+   key is SQL null.
+8. *Required by:* ISO/IEC 9075-2:2023 §6.1 `<JSON type>` (feature T801) and its SQL/JSON functions; PostgreSQL 17
+   §8.14 (`jsonb`).
+
+### 2.17 XML
+
+1. **Values.** `xml` holds a well-formed XML 1.0 document or content (ISO's `XML(CONTENT(ANY))`, PostgreSQL's
+   `xml`), as the text it was given, UTF-8; an encoding declaration naming another encoding is `R0006`.
+2. **Comparison.** None: `eq`/`ne` on `xml` is `Q3018`, ordering `Q3007`, and so is grouping, `Distinct`, a
+   set operation's comparison or a key on it (`Q6005`), as in ISO and PostgreSQL. `same` is octet equality.
+3. **Casts.** `text`, `varchar`, `char → xml` parse as `xmlparse(content …)`: text that is not well-formed is
+   `R0014` (SQLSTATE 2200N, *invalid XML content*), and a document form that is not a document `R0013` (2200M).
+   `xml → text` serialises.
+4. **Operators.** ISO/IEC 9075-14's `xmlparse(document | content, …)`, `xmlserialize`, `xmlelement`,
+   `xmlattributes`, `xmlforest`, `xmlconcat`, `xmlagg`, `xmlcomment`, `xmlpi`, `xmltext`, `xmlexists`, `xmlquery`,
+   `xmltable` and `is_document`, and PostgreSQL's `xpath`, `xpath_exists` and `xml_is_well_formed`. Path
+   expressions are XPath 1.0, as PostgreSQL's are; ISO's full XQuery is **deferred** (decision Q95).
+5. **Encoding.** Its text everywhere.
+6. *Required by:* ISO/IEC 9075-14:2023 (SQL/XML) `<XML type>` (features X010 onward); PostgreSQL 17 §8.13.
+
+### 2.18 Network addresses and bit strings
+
+1. **`inet`**: an IPv4 or IPv6 host address with a prefix length (0–32 or 0–128). **`cidr`**: a network, whose
+   address bits past the prefix are zero (else `R0006`). Text: dotted quad or RFC 5952 IPv6, then `/bits`, which
+   `inet` omits for a full-length prefix; `cidr` input also takes PostgreSQL's abbreviated IPv4 (`10/8`).
+   Ordering is PostgreSQL's: family (IPv4 first), then the bits both prefixes cover, then the prefix length, then
+   the whole address. `cidr → inet` is an implicit coercion; `Cast(inet → cidr)` zeroes the host bits.
+   Operators: `<<`, `<<=`, `>>`, `>>=`, `&&`, `~`, `&`, `|`, `add`/`sub` of an `int64`, `sub(inet, inet) → int64`,
+   `host`, `hostmask`, `masklen`, `netmask`, `network`, `broadcast`, `family`, `set_masklen`, `abbrev`,
+   `inet_same_family`, `inet_merge` (PostgreSQL 17 §9.12).
+2. **`macaddr`** (6 octets) and **`macaddr8`** (8 octets, EUI-64): text is lower-case hex pairs separated by `:`;
+   input also takes PostgreSQL's other separators. Ordered by octets. `macaddr → macaddr8` is implicit (FF:FE
+   inserted); `Cast(macaddr8 → macaddr)` needs octets 4–5 to be FF:FE (else `R0006`). Operators `~`, `&`, `|`,
+   `trunc`, `macaddr8_set7bit`.
+3. **`bit(n)`** holds exactly `n` bits and **`varbit(n)`** at most `n` (`1 ≤ n ≤ 2³¹ − 1`; `varbit` without a
+   length is unbounded). Storing a `bit(n)` value of another length is `R0010` (SQLSTATE 22026, *string data,
+   length mismatch*), and a `varbit(n)` value longer than `n` is `R0009`; a `Cast` truncates or zero-pads on the
+   right. Text is the bits as `0` and `1`. Ordered bitwise, a proper prefix first. Operators: `&`, `|`, `#`
+   (exclusive or) and `~` (operands of different lengths are `R0010`), `<<`, `>>` (length kept), `||`, `length`,
+   `octet_length`, `position`, `substring`, `overlay`, `get_bit`, `set_bit`, `bit_count`, and casts to and from
+   `int32` and `int64`.
+4. **Encoding.** `inet`/`cidr`: 18 octets (family 4 or 6, prefix length, 16 address octets, an IPv4 address in
+   the first 4); `macaddr`/`macaddr8`: their octets; `bit`/`varbit`: a `uint32` bit count, then the bits packed
+   most significant first, the last octet zero-padded (§12.6).
+5. *Required by:* PostgreSQL 17 §8.9 (`inet`, `cidr`, `macaddr`, `macaddr8`) and §8.10 (`bit`, `bit varying`).
+   ISO had `BIT` and `BIT VARYING` in SQL-92 and removed them in SQL:2003, so only PostgreSQL requires them.
+
+### 2.19 Ranges and multiranges
+
+1. **`range<T>`**, `T` an orderable, key-encodable scalar (`Q3014` otherwise): either **empty**, or a lower and an
+   upper bound, each inclusive, exclusive or infinite (an infinite bound is exclusive), with lower ≤ upper
+   (`R0015` otherwise, SQLSTATE 22000). A range whose bounds are equal and not both inclusive is empty. Over a
+   discrete `T` (the integers, `date`) a range is held canonical, `[lower, upper)`. PostgreSQL's `int4range`,
+   `int8range`, `numrange`, `tsrange`, `tstzrange` and `daterange` are `range<int32>`, `range<int64>`,
+   `range<numeric>`, `range<timestamp>`, `range<timestamptz>` and `range<date>`; a `numeric` NaN bound is
+   `R0006`.
+2. **`multirange<T>`**: a set of non-empty ranges that neither overlap nor touch, held in order.
+3. **Text forms.** PostgreSQL's: `empty`, or `[` or `(`, the lower bound (nothing when infinite), `,`, the upper
+   bound, `]` or `)`, bounds quoted as array elements are (§2.13 rule 4); a multirange is `{`, its ranges
+   separated by `,`, `}`.
+4. **Comparison.** `eq` and `same` on the canonical form. Order: empty first, then by lower bound (−∞ first; at
+   one value an inclusive bound before an exclusive one), then by upper bound (at one value exclusive before
+   inclusive; +∞ last). Multiranges compare range by range, a proper prefix first.
+5. **Operators.** Constructors `range(lo, hi, bounds)` and PostgreSQL's named ones (`int4range(1, 5, '[]')`; a
+   null bound is infinite), `multirange(r…)`; `contains` (`@>`, of a range or an element), `contained_by` (`<@`),
+   `overlaps` (`&&`), `strictly_left` (`<<`), `strictly_right` (`>>`), `not_extends_right` (`&<`),
+   `not_extends_left` (`&>`), `adjacent` (`-|-`), `add` (union; non-contiguous ranges are `R0016`), `mul`
+   (intersection), `sub` (difference; a result in two pieces is `R0016`), `lower`, `upper`, `isempty`,
+   `lower_inc`, `upper_inc`, `lower_inf`, `upper_inf`, `range_merge`, the aggregates `range_agg` (to a
+   multirange) and `range_intersect_agg`, and `Unnest` of a multirange (PostgreSQL 17 §9.20).
+6. **Encoding.** A flags octet (bit 0 empty, bit 1 lower inclusive, bit 2 upper inclusive, bit 3 lower infinite,
+   bit 4 upper infinite), then each finite bound (§12.6); a multirange is a count and its ranges. A result column
+   is a record node `{flags: uint8, lower: T?, upper: T?}`, a bound null when it is infinite or the range
+   empty (`wire-protocol.md` §6.2).
+7. *Required by:* PostgreSQL 17 §8.17 (range and multirange types). ISO has none; its `PERIOD` is a pair of
+   columns, not a type.
+
+### 2.20 Enums, domains, distinct and structured types
+
+These are named in the catalog (`ddl.md` §2.8).
+
+1. **Enum.** PostgreSQL's `CREATE TYPE … AS ENUM` is a named union whose payloads are all `{}` (§2.4 rule 1). Its
+   text form is the tag; `Cast` from text takes a tag (`R0006` for any other text); it orders by declaration
+   (§3.3 rule 6) and may be a key. Functions `enum_first`, `enum_last`, `enum_range`.
+2. **Domain.** ISO's `CREATE DOMAIN d AS T` names `T` with a default, `NOT NULL` and checks. It is an **alias**: its
+   values are `T`'s and it is identical to `T`, but a reference to it (kind 32) is kept in the tree, and every
+   value **assigned** to something declared with it — a column, a field, a parameter, a `Cast` target — must
+   pass its constraints (`T3004`, `T3002`). `T` may be any type, another domain included.
+3. **Distinct type.** ISO's `CREATE TYPE d AS T FINAL`, `T` a predefined type: **nominal** (§2.6), referenced by
+   kind 33. Its values and every encoding are `T`'s, and a result column of type `d` is sent as `T`. No implicit
+   coercion joins `d` and `T`; `Cast` goes both ways. Comparisons between two `d` values are `T`'s; no other
+   function of `T` applies to `d` without a `Cast` (`Q3002`).
+4. **Structured type.** ISO's `CREATE TYPE t AS (a T, …) [UNDER s] [NOT] INSTANTIABLE [NOT] FINAL`: **nominal**,
+   referenced by kind 34. A value of `t` is an instance of `t` or of one of its subtypes, its **most specific
+   type**. Its structure — how it is stored and sent — is a union with one variant per instantiable type of the
+   hierarchy rooted at `t`, in creation order, each payload the record of that type's attributes, inherited ones
+   first; so a value of a subtype coerces implicitly to its supertype (§4.1 rule 16), the supertype's attributes
+   are the union's shared columns (§2.4 rule 4), and a new subtype appends a variant. Operations: the
+   constructor `t(a, …)` (SQL `NEW t(…)`, and `t()` with null attributes), observers (`Field`), mutators
+   (`with_field(x, name, value)`, SQL `SET x.a = v`), `treat(x, s)` (`R0006` when the most specific type is not
+   `s` or below it), `is_of(x, [types], only)`, `specifictype(x) → text`. Comparison: none (`Q3018`) unless an
+   ordering is defined; `CREATE ORDERING FOR t EQUALS ONLY BY STATE` gives `eq` as the same most specific type
+   with `eq` attributes. `same` is always structural. Methods, `REF` types and typed tables are deferred
+   (decision Q95).
+5. *Required by:* ISO/IEC 9075-2:2023 `<domain definition>` (feature F251), `<user-defined type
+   definition>` (features S011 distinct types, S023 and S024 structured types), `<user-defined ordering
+   definition>`; PostgreSQL 17 §8.7 (enums), §8.18 (domains).
+
+### 2.21 Collations
+
+1. **Now.** Every text comparison is binary: unsigned octets of UTF-8, which is code point order, ISO's `UCS_BASIC`
+   and PostgreSQL's `C`. §3.1 rule 4 reserves the hook: a collation is a property of the **comparison**, never of
+   the type.
+2. **Required.** ISO/IEC 9075-2:2023 requires a `<collate clause>` on expressions, columns and `ORDER BY` items,
+   collation derivation, and named collations (features F690, F692); PostgreSQL clients expect ICU locale
+   collations, case-insensitive (nondeterministic) ones among them (PostgreSQL 17 §24.2). TernDB provides:
+   - collations `ucs_basic` (binary, the default), `unicode` (the Unicode Collation Algorithm with the DUCET and
+     CLDR root order) and BCP 47 locale names with CLDR tailorings and `-u-` keywords (`de-DE`,
+     `und-u-ks-level2` for case-insensitive); an unknown name is `Q3021`. TernDB implements the UCA and the
+     CLDR tailorings itself, in sysl, at the Unicode and CLDR versions the on-disk format pins; it uses no
+     host collation library (decision Q92);
+   - an optional trailing `collation: text` argument on `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `same`, `like`,
+     `position`, `min`, `max`, and an optional `collation` field on `SortKey`, on `Aggregate` and `Distinct`
+     keys, on `SetOp` and on `Join` keys, appended in a minor version (§13.2) whose absence means binary;
+   - a column's declared collation in the catalog (`ddl.md` §2.3), which the SQL front end applies by ISO's
+     derivation rules (`sql.md` §4.2); the tree itself never applies a collation it is not given;
+   - a **nondeterministic** collation makes different strings `same`, so its `same`, hash and keys use the UCA
+     sort key (DISK §4.6 rule 4), and a unique index under it is unique by the collation's equality;
+   - `char(n)`'s PAD SPACE (§2.8 rule 4) under every collation; every other comparison is NO PAD.
+   `lower`/`upper` stay locale-free.
+3. *Required by:* ISO/IEC 9075-2:2023 `<collate clause>`, `<collation definition>`; PostgreSQL 17
+   §24.2.
 
 ## 3. Value semantics: equality, ordering, hashing
 
@@ -144,6 +605,13 @@ constraints and hash indexes.
 8. `list<E>`: same length and `same` element by element.
 9. `bag<E>`: equal as multisets under `same` — there is a bijection pairing each element of one with a
    `same` element of the other.
+10. The types of §2.8–§2.21: as each section's comparison rule says. In short: `char(n)` pads (§2.8 rule 4);
+    `numeric`, large `decimal`s and `decfloat` compare by value, whatever the display scale or cohort; `timetz`
+    by UTC time and offset; `interval_ym` and `interval_dt` by their one number; arrays and multiranges
+    elementwise as `list`; ranges by canonical form; `jsonb` structurally with numbers by value; `xml`, the
+    string types other than `char`, the binary types, `inet`, `cidr`, the MAC and bit types and `money` by
+    their encodings' octets or numbers; a distinct type as its source; a structured type by most specific type,
+    then attributes.
 
 ### 3.2 SQL equality `eq` and comparisons
 
@@ -165,6 +633,12 @@ null.
    operator.
    *Rationale: three-valued multiset equality has no useful definition; use `same`. Intervals and
    unions have no natural order; `Sort` still orders them through `cmp`.*
+   The `interval` of this rule is the (months, days, µs) triple; `interval_ym` and `interval_dt` are
+   orderable (§2.12). Arrays, ranges, multiranges, `jsonb`, enums and records of orderable fields are
+   orderable; a multiset is a relation type (`Q3006`, use `multiset_eq`, §2.14).
+5. `eq`, `ne` and the orderings on `xml`, or on a structured type without an ordering (§2.20), are
+   `Q3018`, by type as in rule 4. A distinct type compares only with its own type.
+6. Arrays: `eq` is elementwise (§2.13 rule 5), three-valued as for records.
 
 ### 3.3 Total order `cmp`
 
@@ -176,17 +650,24 @@ null.
 3. Floats: −∞ < negative < −0 = +0 < positive < +∞ < NaN.
 4. `text`, `bytes` and `json` (canonical form): unsigned octet-lexicographic (for valid UTF-8 this is
    code point order); a proper prefix sorts first.
-5. `date`, `time`, `datetime`, `timestamp`: chronologically. `uuid`: as a 128-bit big-endian unsigned
+5. `date`, `time`, `timestamp`, `timestamptz`: chronologically, `-infinity` first and `infinity` last
+   (§2.11 rule 9). `uuid`: as a 128-bit big-endian unsigned
    number. `interval`: lexicographically on (`months`, `days`, `micros`).
 6. Records: lexicographic by field. Unions: by discriminant, then payload.
 7. `list<E>`: lexicographic by element; a proper prefix sorts first.
 8. `bag<E>`: compare the two bags' elements each sorted ascending by `cmp`, as lists.
+9. The types of §2.8–§2.21 in the order each section gives; that order is the one their key encoding
+   (`on-disk-format.md` §4.6) yields with `memcmp`. `xml` and a structured type without an ordering
+   order by their stored octets, for `Sort` only.
 
 ### 3.4 Hashing
 
 1. Any hash a server uses for grouping, joining or indexing MUST satisfy `same(a,b) ⇒ hash(a) =
    hash(b)`. In particular every NaN hashes alike, −0.0 and +0.0 hash alike, numerically equal
-   decimals of different scales hash alike, and a bag's hash is independent of element order.
+   decimals of different scales hash alike, and a bag's hash is independent of element order. So do a
+   `char(n)` value and its trailing-space variants, `numeric` values of different display scales,
+   members of one `decfloat` cohort, `jsonb` numbers equal in value, and strings equal under a
+   nondeterministic collation (whose hash is of the sort key, §2.21).
 2. The hash function itself is not part of this specification. Where a hash is persisted, it is fixed
    by `on-disk-format.md`.
 
@@ -206,15 +687,30 @@ MUST raise `R0006` (or yield null under `try`) on anything else, including surro
 | `bytes` | `\x` then two lowercase hex digits per octet | uppercase hex digits |
 | `date` | ISO 8601 `YYYY-MM-DD`, astronomical year numbering; a year outside 0000–9999 has a sign and at least five digits (`-04713-11-24`) | — |
 | `time` | `HH:MM:SS`, then `.` and 1–6 digits when the fraction is non-zero, trailing zeros removed | 0–6 fraction digits |
-| `datetime` | the `date` form, `T`, the `time` form; no zone | a space in place of `T` |
-| `timestamp` | the `datetime` form of the instant in UTC, then `Z` | an offset `±HH:MM` in place of `Z`, converted to UTC; no zone at all is refused |
+| `timestamp` | the `date` form, `T`, the `time` form; no zone | a space in place of `T` |
+| `timestamptz` | the `timestamp` form of the instant in UTC, then `Z` | an offset `±HH:MM` in place of `Z`, converted to UTC; no zone at all is refused |
 | `interval` | `P`, then `<n>M`, `<n>D` and `T<s>S` for each non-zero component, `n` a signed integer and `s` signed seconds with the `time` fraction rule; `PT0S` for zero (`P14M-3DT90.5S`) | — |
 | `uuid` | RFC 9562 `8-4-4-4-12` lowercase hex | uppercase hex |
 | `json` | its canonical form: the RFC 8785 serialisation of the parsed text | any RFC 8259 JSON text, canonicalised on parse |
+| `varchar(n)`, `char(n)` | the value (`char(n)` padded to `n`) | a longer text by the rules of §2.8 |
+| `varbinary(n)`, `binary(n)` | as `bytes` | as `bytes` |
+| `numeric`, `decimal(p > 38)` | as `decimal`, with the display scale's fraction digits; `NaN`, `Infinity`, `-Infinity` | an exponent (`1.5e3`), which sets the display scale; `inf`, `-inf`, `nan` in any case |
+| `decfloat` | IEEE 754 to-scientific-string, keeping the exponent (`1.50`, `1.5E+10`); `-0`, `Infinity`, `-Infinity`, `NaN` | any decimal or exponent form; `inf`, `nan`, `sNaN` (read as `NaN`) in any case |
+| `money` | `-`? digits, `.`, two digits | one fraction digit or none |
+| `time(p)`, `timestamp(p)`, `timestamptz(p)` | as the type without a precision | more fraction digits, rounded (§2.11) |
+| `timetz` | the `time` form, then `±HH:MM`, and `:SS` when the offset has seconds | `Z` |
+| `interval_ym`, `interval_dt` | §2.12 rule 4 | — |
+| arrays | §2.13 rule 4 | white space around elements and braces |
+| records | §2.15 rule 3 | white space outside quotes |
+| enums | the tag | — |
+| `jsonb` | §2.16 rule 2 | any RFC 8259 JSON text |
+| `xml` | the value | any well-formed content (§2.17) |
+| `inet`, `cidr`, `macaddr`, `macaddr8`, `bit`, `varbit` | §2.18 | §2.18 |
+| ranges, multiranges | §2.19 rule 3 | white space around bounds |
 
 A `json` value is always held in canonical form, so `same` on `json` is octet equality of canonical
-forms. A `json` literal or parameter value that is not canonical is `Q1007`. Records, unions and
-relations have no text form in version 1.0.
+forms. A `json` literal or parameter value that is not canonical is `Q1007`. Unions other than enums,
+`bag` and `list` relations, structured types and multisets have no text form.
 
 The table is made exact by these rules:
 
@@ -230,12 +726,14 @@ The table is made exact by these rules:
    (`1e21`, `1.5e-7`). Parsing accepts `[+-]? digits ("." digits)? ([eE] [+-]? digits)?`, leading
    zeros allowed, and exactly the six names `inf`, `-inf`, `nan`, `Infinity`, `-Infinity`, `NaN`. A
    finite text whose value rounds past the type's largest finite value is `R0006`, not an infinity.
-4. **Dates.** The parsable range is `-04713-01-01` through `+294276-12-31`. A `datetime` or
-   `timestamp` must also fit the `int64` of microseconds it is held in, so the latest `timestamp` is
-   `+294247-01-10T04:00:54.775807Z`. A date or interval text is accepted only where it is exactly the
+4. **Dates.** The parsable range is `-04713-01-01` through `+294276-12-31`. A `timestamp` or
+   `timestamptz` must also fit the `int64` of microseconds it is held in, short of the two integers
+   reserved for the infinities, so the latest finite `timestamptz` is `+294247-01-10T04:00:54.775806Z`.
+   `date`, `timestamp` and `timestamptz` also print and parse `infinity` and `-infinity` (§2.11 rule 9;
+   `+infinity` and any case parsed). A date or interval text is accepted only where it is exactly the
    printed form of the value it reads as: no redundant sign or zero in the year, no zero component,
    no day past its month's end.
-5. **Offsets.** A `timestamp` offset is `+` or `-`, then hours `00`–`23`, `:` and minutes `00`–`59`.
+5. **Offsets.** A `timestamptz` offset is `+` or `-`, then hours `00`–`23`, `:` and minutes `00`–`59`.
 6. **`json`.** The canonical form is RFC 8785's, so a positive number exponent is written `e+`
    (`1e+21`) and `-0` is `0`. A text RFC 8785 cannot canonicalise is refused: a name twice in one
    object, a number outside binary64's finite range, an unpaired surrogate escape, and arrays and
@@ -263,11 +761,33 @@ argument, a `SetOp` column, an insert or update target, an `If` arm, a `Values` 
 5. **Null widening**: `T → T?`, at any depth (a record field, a relation's element).
 6. **Order forgetting**: `list<E> → bag<E>`.
 7. **Structural**: a record, union or relation coerces to another of the same shape (names, tags,
-   order) when each component coerces.
+   order) when each component coerces; so does an array (rule 13), a range or a multirange.
+8. **String widening**: `varchar(n) → varchar(m) → text` for `m ≥ n`; `char(n) → varchar(m)` for
+   `m ≥ n`, and `char(n) → text`, keeping the padding (§2.8 rule 3).
+9. **Binary and bit widening**: `varbinary(n) → varbinary(m) → bytes` and `binary(n) → varbinary(m)`
+   for `m ≥ n`, `binary(n) → bytes`; `varbit(n) → varbit(m) → varbit` and `bit(n) → varbit(m)` for
+   `m ≥ n`.
+10. **Exact widening**: every integer type and every `decimal(p, s)` `→ numeric`, one step.
+11. **Decimal float widening**: `decfloat(16) → decfloat(34)`; `int8` … `int32`, `uint8` … `uint32`
+    and `decimal(p ≤ 16, s) → decfloat(16)`; `int64`, `uint64` and `decimal(p ≤ 34, s) →
+    decfloat(34)`.
+12. **Precision widening**: `time(p) → time(p')`, and likewise `timestamp`, `timestamptz` and
+    `timetz`, for `p' ≥ p`; `interval_ym` and `interval_dt` to a qualifier and precisions of the same
+    family that hold every value; `interval_ym → interval` and `interval_dt → interval` (§2.12 rule 3).
+13. **Array widening**: `array<T, m> → array<T, m'> → array<T>` for `m' ≥ m`.
+14. **Network widening**: `cidr → inet`; `macaddr → macaddr8`.
+15. **Assignment**: only where the expected type is that of an `Insert`, `Update` or `Upsert` target
+    column, a field of one, or a type declared with a domain (§2.20): any character string type to
+    `varchar(n)` or `char(n)` (§2.8 rule 2, `R0009`); any binary string type to `varbinary(n)` or
+    `binary(n)` (§2.9 rule 2); `bit` and `varbit` to `bit(n)` (`R0010`) or `varbit(n)` (`R0009`); an
+    array to `array<T, m>` (`R0012`); and a datetime type to the same type of smaller precision,
+    rounded (§2.11 rule 2). These checks run on the value at the write; they are the store
+    assignment of ISO/IEC 9075-2 §9.2.
+16. **Subtype to supertype**: a structured type to each of its supertypes (§2.20 rule 4).
 
 Everything else MUST be refused with `Q3001`, in particular: integer or decimal to float and back,
-any type to or from `text` or `json`, `bool` to or from integer, `datetime` to or from `timestamp`, `date` to
-`datetime`, `T?` to `T`, and `bag<E>` to `list<E>`. These are written as an explicit `Cast` (§7.6),
+any type to or from `text` or `json`, `bool` to or from integer, `timestamp` to or from `timestamptz`,
+`date` to `timestamp`, a distinct type to or from its source, `T?` to `T`, and `bag<E>` to `list<E>`. These are written as an explicit `Cast` (§7.6),
 an `assert_not_null` call, or a `Sort`.
 *Rationale: every implicit conversion Postgres performs has a known silent-wrong-answer case; the
 ones kept are lossless.*
@@ -277,6 +797,14 @@ ones kept are lossless.*
 Where two or more types must unify (`SetOp` columns, `If` arms, `coalesce`, `Values` rows, binary
 arithmetic and comparison operands), the **common type** is the least type every input coerces to by
 §4.1. If none exists, the node is refused with `Q3001` (or `Q3010` for `SetOp`).
+
+The least type is unique for the types of §2.7, which makes it, for example: `varchar(n)` and
+`varchar(m)` → `varchar(max(n, m))`; `char(n)` and `char(m)` → `char(max(n, m))`; `char(n)` and
+`varchar(m)` → `varchar(max(n, m))`; any character string type and `text` → `text`; `decimal` and
+`numeric` → `numeric`; `time(p)` and `time(q)` → `time(max(p, q))`; `interval_dt` qualifiers → the
+one spanning both, with the larger precisions. Assignment (§4.1 rule 15) does not take part: the
+common type of `text` and `varchar(3)` is `text`. A comparison of which an operand is `char(n)` keeps
+PAD SPACE after coercion (§2.8 rule 4).
 
 ### 4.3 Function and operator resolution
 
@@ -298,13 +826,30 @@ Operators are functions with stable names (§7.12). A call `f(a₁…aₙ)` reso
    signed and an unsigned operand meet at the signed type that holds both); the result has that type.
    `neg` of an unsigned value is refused (`Q3002`). Overflow is the runtime error `R0001`; integers never wrap. `div` truncates toward zero;
    `mod`'s sign follows the dividend; division by zero is `R0002`.
-2. Decimal `add`/`sub`: `s = max(s₁, s₂)`, `p = min(38, max(p₁ − s₁, p₂ − s₂) + s + 1)`. `mul`:
-   `s = s₁ + s₂`, `p = min(38, p₁ + p₂)`; if `s > 38` the call is refused with `Q3011`. `div`:
-   `s = max(6, s₁, s₂)`, `p = 38`, rounded half away from zero. `mod`, whose result is smaller than
-   its divisor: `s = max(s₁, s₂)`, `p = min(38, p₂ − s₂ + s)`. An integer operand of a decimal one is
-   its `decimal(p, 0)` of §4.1 rule 2. A result outside the result type's range is `R0001`.
+2. Decimal `add`/`sub`: `s = max(s₁, s₂)`, `p = min(P, max(p₁ − s₁, p₂ − s₂) + s + 1)`. `mul`:
+   `s = s₁ + s₂`, `p = min(P, p₁ + p₂)`; if `s > P` the call is refused with `Q3011`. `div`:
+   `s = max(6, s₁, s₂)`, `p = P`, rounded half away from zero. `mod`, whose result is smaller than
+   its divisor: `s = max(s₁, s₂)`, `p = min(P, p₂ − s₂ + s)`. `P` is 38 when both operands have
+   `p ≤ 38`, so the fixed-width decimals stay fixed-width, and 1000 otherwise. An integer operand of a
+   decimal one is its `decimal(p, 0)` of §4.1 rule 2. A result outside the result type's range is
+   `R0001`.
 3. Float arithmetic is IEEE 754 in the operands' common type; it never raises errors.
-4. Mixing float with integer or decimal operands is refused (`Q3002`).
+4. Mixing float with integer, decimal, `numeric`, `decfloat` or `money` operands is refused
+   (`Q3002`).
+5. `numeric`: an operand of an integer or decimal type beside a `numeric` one widens to `numeric`
+   (§4.1 rule 10), and the result is `numeric`, with the display scales of §2.10 rule 8.
+6. `decfloat`: operands meet at `decfloat(16)` or `decfloat(34)` (§4.1 rule 11); a `numeric` or a
+   `decimal(p > 34)` beside a `decfloat` is `Q3002`. IEEE 754 arithmetic, rounding half to even.
+7. `money`: §2.10 rule 9; overflow `R0001`, division by zero `R0002`.
+8. Intervals: `add`, `sub`, `neg`, `abs` within `interval_ym` or within `interval_dt` (the result
+   qualifier spans both operands', the precisions are the larger); `mul` and `div` of an interval by an
+   exact number or a float (§2.12 rule 5). `interval` keeps its existing calendar rules (§7.12).
+9. Datetimes: `add`/`sub` of `date` and an `int32` of days → `date`; `date` and `interval_ym` →
+   `date` (day clamped, §7.12 rule 4); `date` and `interval_dt` or `interval` → `timestamp`;
+   `timestamp(p)` or `timestamptz(p)` and any interval → the same type, with precision `max(p,
+   interval p)`; `time(p)` or `timetz(p)` and `interval_dt` → the same type, wrapping modulo 24 hours;
+   and the differences of §2.11 rule 7. `timestamptz` and `interval_dt` add exact µs; `timestamptz`
+   and `interval_ym` add calendar months in UTC.
 
 ## 5. Statements
 
@@ -396,7 +941,8 @@ rows (§10.4).
    not occur; this relaxes §7.12 rule 1 for a `Filter`'s predicate, and for an `Update`'s or
    `Delete`'s `filter` (§9.4). If every row's predicate evaluates without error, the `Filter` raises
    no error from it. *Rationale: a scan that reads only the key range a conjunct on the primary key
-   allows never evaluates the predicate on the rows outside it.*
+   allows, or the range of a secondary index's entries, never evaluates the predicate on the rows
+   outside it.*
 
 ### 6.5 Join
 
@@ -506,7 +1052,8 @@ following | unbounded_following, offset: Expr? }`. An invalid frame (start after
 the kinds are listed; a start of `unbounded_following` or an end of `unbounded_preceding`; an offset
 absent from a `preceding` or `following` bound or present on another; `range` with an offset and not
 exactly one order key) is `Q5008`. A `rows` or `groups` offset is `int64`; a `range` offset coerces
-to a numeric key's type, or is an `interval` for a `date`, `time`, `datetime` or `timestamp` key
+to a numeric key's type, or is an `interval` for a `date`, `time`, `timestamp` or `timestamptz` key
+of any precision, or an interval of the key's own family for an `interval_ym` or `interval_dt` key
 (`Q3001`). A frame's offsets see no binder (they MAY be parameters or literals).
 
 1. **Partitions, order and peers.** A call's `partition` and `order` expressions are evaluated on
@@ -539,7 +1086,7 @@ to a numeric key's type, or is an `interval` for a `date`, `time`, `datetime` or
      `p` in the order, an end of `k preceding` those not after `p`, and `k following` likewise with
      `f`. Integers and decimals compute `p` and `f` exactly (they never overflow). Floats compute them
      in `float64`; an infinite `v` moved toward the opposite infinity by an infinite `k` is that
-     opposite infinity, so it admits every non-NaN key. A `date`, `time`, `datetime` or `timestamp`
+     opposite infinity, so it admits every non-NaN key. A `date`, `time`, `timestamp` or `timestamptz`
      computes them as the calendar `add` (§7.12 rule 4) of `v` and `k`, or of `v` and `k` with each
      part negated, in microseconds (a `date` as its midnight, a `time` as that time of 1970-01-01, so
      it does not wrap); a value past `int64` microseconds is `R0001`. A null key lies before or after
@@ -681,8 +1228,10 @@ The whole current row of `binder` as a record (or, for a union-element relation,
 ### 7.3 Param, Null and Literal
 
 `Param` refers to the envelope's parameter `index` (0-based; `Q4001`). `Null(type)` is the null value
-of `type?`. `Literal(type, value)` is a constant: `type` MUST be a non-nullable scalar (§2.1; `Q3017`),
-and `value` is that type's §12.6 encoding (a `json` value in canonical form, `Q1007`). A
+of `type?`. `Literal(type, value)` is a constant: `type` MUST be a non-nullable scalar (§2.1, or a
+scalar of §2.7 — not an array, range, multirange, record, union or relation; `Q3017`),
+and `value` is that type's §12.6 encoding (a `json` value in canonical form, `Q1007`; any other value
+outside its type's domain, `Q3020`). A
 `decimal(p, s)` literal's unscaled value MUST have at most `p` digits, `−10ᵖ < v < 10ᵖ` whatever `s`
 is (`Q3011`, found by the decoder like `Q3017`, since the value is read by its type). A literal is
 kept in the shape form (§10.2); a front end puts a value in a literal only when it is a constant of
@@ -703,11 +1252,15 @@ be evaluated, so their runtime errors do not occur.
 `strict` raises `R0006` on a value that does not convert; `try` yields null. Permitted casts: between
 any two numeric types (range-checked; rounding half away from zero into decimal and integer targets);
 between `text` and every scalar (parsing and printing the forms of §3.5); `bytes` ↔ `uuid` (16 octets); records, unions and relations
-componentwise where shapes match; `list<E> → bag<E>`. Anything else, including `bag → list`,
-`timestamp ↔ datetime` and `T? → T`, is `Q3012`. Nullability is judged at every level: a nullable
+componentwise where shapes match; `list<E> → bag<E>`; and the casts each section of §2.8–§2.21
+lists under **Casts** (lengths truncate, precisions round, `date ↔ timestamp`, intervals, arrays,
+`jsonb`, `xml`, the network and bit types, enums from text, a distinct type and its source). Anything
+else, including `bag → list`, `timestamp ↔ timestamptz` and `T? → T`, is `Q3012`. Nullability is
+judged at every level: a nullable
 value (or component) casts only to a nullable type, except that a `try` cast's target is `type?`
 whatever `type` says, so `try` takes a nullable value to any permitted base. The zone conversions are functions
-(`at_zone(timestamp, text) → datetime`, `from_zone(datetime, text) → timestamp`); a non-null value is
+(`at_zone(timestamptz, text) → timestamp`, `from_zone(timestamp, text) → timestamptz`, each keeping its
+operand's precision); a non-null value is
 obtained from a nullable one with `assert_not_null(x) → T` (`R0004` on null).
 
 The zone conversions are strict. A zone is a name of the IANA time zone database (`Europe/Paris`), `UTC`, or a
@@ -715,8 +1268,8 @@ fixed offset written `+HH:MM` or `-HH:MM`; the database is the host's, so its ve
 text is `R0006`. `at_zone` reads the instant on the zone's wall clocks at the offset in force then. `from_zone`
 finds the instant the reading names there: a reading the zone shows twice (its clocks set back) is the **earlier**
 of the two instants, and a reading the zone skips (its clocks set forward) is read at the offset in force before
-the gap, so `02:30` in a skipped hour is `03:30` in the hour after. A value within two days of either end of the
-`int64` range is `R0001`.
+the gap, so `02:30` in a skipped hour is `03:30` in the hour after. A finite value within two days of either end of
+the `int64` range is `R0001`; an infinity converts to itself (§2.11 rule 9).
 
 ### 7.7 Match
 
@@ -767,8 +1320,10 @@ the core operators' names and typing:
   argument), all strict: `concat(text, text) → text`, `length(text) → int64`, `lower(text)` and
   `upper(text) → text`, `contains(text, text)` and `starts_with(text, text) → bool`,
   `like(text, text, text) → bool`;
-- time: `add(timestamp, interval)` computes calendar parts in UTC; `add(datetime, interval)` and
-  `add(date, interval) → datetime` compute in civil time; `statement_timestamp() → timestamp`;
+- time: `add(timestamptz, interval)` computes calendar parts in UTC; `add(timestamp, interval)` and
+  `add(date, interval) → timestamp` compute in civil time; `statement_timestamp() → timestamptz`;
+- the operators and functions of §2.8–§2.21, as each section's **Operators** rule names them, with
+  the typing of §4.4 rules 5–9 (§2.7 rule 3 for those given no rule yet);
 - sequences: `next_value(schema: text, name: text) → int64`, which draws the next value of a sequence
   (`ddl.md` §2.7). It is **volatile**: each call draws a new value, and it is never folded.
 
@@ -797,7 +1352,8 @@ How the functions evaluate, where the tables above leave it open:
 4. The calendar `add(t, interval)` adds the months first, keeping the day of the month but clamping
    it to the last day of the month reached (`2024-01-31` plus one month is `2024-02-29`), then the
    days, then the microseconds. A `date` is midnight of its day. A result beyond `int64`
-   microseconds is `R0001`.
+   microseconds, or on one of the two integers reserved for the infinities, is `R0001`; an infinite
+   operand gives itself (§2.11 rule 9).
 The core functions resolve before a catalog's own; a name no catalog has is `Q2007`. A function the
 catalog has that is not an aggregate, written as an `AggCall`, is `Q3002`.
 
@@ -1071,7 +1627,7 @@ after its `end`, is `Q1001`.
 | 5, 6 | `float32`, `float64` | — |
 | 7 | `decimal` | `uvar p, uvar s` |
 | 8, 9 | `text`, `bytes` | — |
-| 10–13 | `date`, `time`, `datetime`, `timestamp` | — |
+| 10–13 | `date`, `time`, `timestamp` (`datetime`), `timestamptz`, each of precision 6 | — |
 | 14, 15 | `interval`, `uuid` | — |
 | 16 | record | `list<(str, Type)>` |
 | 17 | union | `list<(str, Type)>` |
@@ -1081,15 +1637,36 @@ after its `end`, is `Q1001`.
 | 21 | `int8` | — |
 | 22–25 | `uint8`, `uint16`, `uint32`, `uint64` | — |
 | 26 | `json` | — |
-| 27–31 | reserved (scalar types) | |
-| 32 | named type reference (`ddl.md` §2.8) | `str schema, str name` |
-| 33–63 | reserved (named catalog types, `ddl.md`) | |
+| 27–31 | `numeric`, `jsonb`, `xml`, `money`, `inet` | — |
+| 32 | named type reference (`ddl.md` §2.8): a record, union, enum, domain or range alias | `str schema, str name` |
+| 33 | distinct type reference (§2.20 rule 3) | `str schema, str name` |
+| 34 | structured type reference (§2.20 rule 4) | `str schema, str name` |
+| 35–63 | reserved (named catalog types, `ddl.md`) | |
+| 64, 65 | `varchar(n)`, `char(n)` | `uvar n` |
+| 66, 67 | `varbinary(n)`, `binary(n)` | `uvar n` |
+| 68 | `decfloat(p)` | `uvar p` (16 or 34) |
+| 69–71 | `time(p)`, `timestamp(p)`, `timestamptz(p)` | `uvar p` (0–5) |
+| 72 | `timetz(p)` | `uvar p` (0–6) |
+| 73 | `interval_ym(q, l)` | `uvar q` (0 `year`, 1 `month`, 2 `year to month`), `uvar l` |
+| 74 | `interval_dt(q, l, p)` | `uvar q` (0 `day`, 1 `hour`, 2 `minute`, 3 `second`, 4 `day to hour`, 5 `day to minute`, 6 `day to second`, 7 `hour to minute`, 8 `hour to second`, 9 `minute to second`), `uvar l`, `uvar p` |
+| 75 | `array` | `Type` element, `uvar m` (0 for no bound) |
+| 76, 77 | `range`, `multirange` | `Type` subtype |
+| 78–80 | `cidr`, `macaddr`, `macaddr8` | — |
+| 81, 82 | `bit(n)`, `varbit(n)` | `uvar n` (`varbit`: 0 for no bound) |
+| 83–127 | reserved (scalar and constructed types) | |
+
+The precision-6 forms of `time`, `timestamp` and `timestamptz` are kinds 11–13, never kinds 69–71
+(`Q1003`), so one type has one encoding; `timetz` has kind 72 at every precision. `decimal` (kind 7)
+takes `1 ≤ p ≤ 1000`. A parameter out of its range is `Q3019` (§2.7 rule 1). Kinds 27–34 and 64–82
+are tree schema 1.1 (§13.2): an envelope of minor 0 that uses one is `Q1002`.
 
 A named type reference denotes the structure its catalog type defines, resolved at validation against
 the statement's catalog snapshot (an unknown name is `Q6004`); it is an alias, so type identity (§2.6)
 compares the structures. It MAY appear wherever a statement declares a type: a `ParamDecl`, `Values`
-columns, `Cast`, `Tag`, `Variant`, inside another type, and in DDL statements. A named type is always
-a record or a union, never nullable, so a nullable wrapper around a reference is canonical. Because
+columns, `Cast`, `Tag`, `Variant`, inside another type, and in DDL statements. A named type is never
+nullable, so a nullable wrapper around a reference is canonical. Kinds 33 and 34 are references too,
+resolved the same way, but **nominal** (§2.6): their identity is the name, and their structure is
+what is stored and sent (§2.20). Because
 the reference is kept in the encoding, it is part of the statement's shape (§10.2). A result type is always **structural**: a server MUST NOT send a named catalog
 type (kinds 32–63) in a statement's result type, and sends the structure the name denotes
 (`wire-protocol.md` §6.1).
@@ -1109,7 +1686,8 @@ Rel kinds: 1 `Scan`, 2 `Values`, 3 `ParamScan`, 4 `Filter`, 5 `Project`, 6 `Join
 (`OnConflict.target`, `action`) is an `enum` followed by the chosen alternative's fields (`target`: 0
 `columns`, then `list<str>`, 1 `constraint`, then `str`; `action`: 0 `nothing`, 1 `update`, then `set`
 and `where`). An optional list (`CteDef.columns`) is `opt<list<…>>`; `Values.rows` is
-`list<list<node>>`. Kind 0 and kinds 64 and above in every family are reserved.
+`list<list<node>>`. Kind 0 and kinds 64 and above in every family are reserved, except the type
+kinds §12.3 assigns.
 
 A `Literal`'s value can be read only through its type, so the decoder checks that type as it reads
 it: one that is not a non-null scalar is refused with `Q3017` during decoding, the one `Q3…` code the
@@ -1128,13 +1706,30 @@ A parameter value is encoded by its declared type, with no tags (the type is kno
 | `bool` | one octet |
 | `intN` | N/8 octets, little-endian two's complement |
 | `uintN` | N/8 octets, little-endian unsigned |
-| `decimal(p, s)` | 16 octets, little-endian unscaled `int128` |
+| `decimal(p ≤ 38, s)` | 16 octets, little-endian unscaled `int128` |
 | `float32`/`float64` | IEEE 754, little-endian |
 | `text`, `bytes`, `json` | `uvar` length, octets (`json`: its canonical form, §3.5) |
-| `date` | `int32` LE, days since 1970-01-01 |
-| `time`, `datetime`, `timestamp` | `int64` LE microseconds (since midnight; since 1970-01-01T00:00 civil; since the Unix epoch) |
+| `date` | `int32` LE, days since 1970-01-01; −2³¹ and 2³¹ − 1 are `-infinity` and `infinity` (§2.11 rule 9), as −2⁶³ and 2⁶³ − 1 are for the timestamps below |
+| `time`, `timestamp`, `timestamptz`, any precision | `int64` LE microseconds (since midnight; since 1970-01-01T00:00 civil; since the Unix epoch) |
+| `timetz` | `int64` LE microseconds since midnight, then `int32` LE offset in seconds east of UTC |
 | `interval` | `int32` months, `int32` days, `int64` micros, each LE |
+| `interval_ym` | `int32` LE months |
+| `interval_dt` | `int64` LE microseconds |
 | `uuid` | 16 octets, RFC 9562 order |
+| `varchar`, `char`, `xml` | as `text` (`char(n)` padded to `n` code points) |
+| `varbinary`, `binary` | as `bytes` |
+| `numeric`, `decimal(p > 38)` | `uvar` length, then the value's text form (§3.5), ASCII |
+| `jsonb` | `uvar` length, then its text form (§2.16 rule 2) |
+| `decfloat(16)`, `decfloat(34)` | 8 or 16 octets, IEEE 754-2008 BID encoding, LE |
+| `money` | `int64` LE hundredths |
+| `inet`, `cidr` | 18 octets: family (4 or 6), prefix length, 16 address octets (IPv4 in the first 4, the rest zero) |
+| `macaddr`, `macaddr8` | 6 or 8 octets |
+| `bit`, `varbit` | `uint32` LE bit count, then ⌈count/8⌉ octets, most significant bit first, padding bits zero |
+| `array` | `uvar` count, then each element (by the element type, so a nullable element has its tag) |
+| `range` | one flags octet (§2.19 rule 6), then the lower bound when finite, then the upper when finite |
+| `multirange` | `uvar` count, then each range |
+| distinct type | as its source |
+| structured type | as its structure, a union (§2.20 rule 4) |
 | `T?` | `0x00` for null, or `0x01` then the `T` encoding |
 | record | each field in order |
 | union | `uvar` discriminant, then the payload record |
@@ -1226,8 +1821,11 @@ its plans as Substrait.
 | scalar, in-predicate and `exists` subqueries | `Scalar`, `In`, `Exists` |
 | `SingularOrList`, `MultiOrList` | `In` over `Values` |
 | types `boolean i8 i16 i32 i64 fp32 fp64 string binary date time uuid decimal(p≤38)` | the matching scalar |
-| `timestamp`, `timestamp_tz`, precision variants with precision ≤ 6 | `datetime`, `timestamp` |
-| `interval_year`, `interval_day`, `interval_compound` | `interval` |
+| `timestamp`, `timestamp_tz`, precision variants with precision ≤ 6 | `timestamp(p)`, `timestamptz(p)` |
+| `varchar<L>`, `fixed_char<L>`, `fixed_binary<L>` | `varchar(L)`, `char(L)`, `binary(L)` |
+| `interval_year` | `interval_ym(year to month, 9)` |
+| `interval_day<P>` with `P ≤ 6` | `interval_dt(day to second, 9, P)` |
+| `interval_compound` | `interval` |
 | `struct` (names from the enclosing `NamedStruct`, else `f0`, `f1`, …) | record |
 | `list<struct>`, `list<T>` of a mapped scalar `T` | `list<record>`, `list<T>` |
 
@@ -1235,8 +1833,7 @@ its plans as Substrait.
 
 | Substrait | Code | Why |
 |---|---|---|
-| `varchar<L>`, `fixed_char`, `fixed_binary` | `Q7002` | A length is a constraint in TernDB, not a type. |
-| precision > 6 timestamps | `Q7002` | Microsecond values cannot hold them losslessly. |
+| precision > 6 timestamps and day intervals | `Q7002` | Microsecond values cannot hold them losslessly. |
 | `map`, `list` of a list, user-defined types | `Q7002` | No equivalent type in 1.0. |
 | multiple grouping sets, `ExpandRel` | `Q7001` | Grouping sets are not in 1.0. |
 | `ExtensionLeaf/Single/MultiRel`, `ExchangeRel`, `DdlRel`, local files | `Q7001` | Opaque, distributed or DDL: outside the tree. |
@@ -1347,8 +1944,8 @@ GraphQL `search(text: $q, first: 10)` returns `[SearchResult]`, where `SearchRes
 and both implement an interface with `id` and `createdAt`.
 
 ```
-SR = union<Post: {id: int64, created_at: timestamp, title: text},
-           Photo: {id: int64, created_at: timestamp, url: text}>
+SR = union<Post: {id: int64, created_at: timestamptz, title: text},
+           Photo: {id: int64, created_at: timestamptz, url: text}>
 ```
 
 Parameters: `$0: text`, `$1: int64` = 10.

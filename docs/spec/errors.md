@@ -28,6 +28,9 @@ from.*
 5. **Retryable** (column R): the request, and for a `T` code the transaction, had no effect and MAY be re-run from
    its beginning (`isolation.md` §5.3). **Fatal** (column F): the connection is closed after the error
    (`wire-protocol.md` §8.1 rule 8). A code with neither mark is neither.
+6. **SQLSTATE.** A code whose meaning has a standard SQLSTATE (ISO/IEC 9075-2's table of SQLSTATE values, or
+   PostgreSQL's where ISO has none) names it at the end of its meaning; the PostgreSQL compatibility layer reports
+   that SQLSTATE. A code that names none maps to its class's general SQLSTATE there.
 
 ## 2. Query tree: validation (`Q`)
 
@@ -66,15 +69,20 @@ during the handshake.
 | `Q3011` | `decimal_out_of_range` | Decimal precision or scale out of range, or a decimal literal with more than `p` digits (`query-tree.md` §7.3). |
 | `Q3012` | `cast_not_permitted` | Cast not permitted. |
 | `Q3013` | `misplaced_aggregate` | Aggregate or window function outside `Aggregate`/`Window`. |
-| `Q3014` | `invalid_member_type` | Union payload not a record, or relation element not a record, union or scalar. |
+| `Q3014` | `invalid_member_type` | Union payload not a record, or relation element not a record, union, scalar, array or relation (`query-tree.md` §2.5 rule 2); a range subtype that is not an orderable scalar (§2.19). |
 | `Q3015` | `duplicate_member_name` | Duplicate or empty field or tag name in a type (`query-tree.md` §2.3, §2.4). |
 | `Q3016` | `union_too_wide` | A union with no variants or more than 65,536 (`query-tree.md` §2.4: `1 ≤ k ≤ 65,536`). |
 | `Q3017` | `invalid_literal` | A `Literal` whose type is not a non-null scalar (`query-tree.md` §7.3). |
+| `Q3018` | `incomparable_type` | `eq`, `ne` or an ordering, grouping, `Distinct` or set-operation comparison on `xml`, or on a structured type without an ordering (`query-tree.md` §3.2 rule 5, §2.17, §2.20). SQLSTATE 42883. |
+| `Q3019` | `invalid_type_parameter` | A type parameter out of its range: a string or bit length, a datetime or `decfloat` precision, an interval qualifier or precision, an array bound (`query-tree.md` §2.7 rule 1). |
+| `Q3020` | `literal_out_of_domain` | A `Literal` value that is not a value of its type (`query-tree.md` §2.7 rule 2). |
+| `Q3021` | `unknown_collation` | A collation name that names no collation (`query-tree.md` §2.21). SQLSTATE 42704. |
 | `Q4001` | `param_index_out_of_range` | Parameter index out of range. |
 | `Q4002` | `param_unused` | Declared parameter never referenced. |
 | `Q4003` | `param_type_mismatch` | Bound value's type differs from the declaration. |
 | `Q4004` | `param_count_mismatch` | Wrong number of bound values. |
 | `Q4005` | `null_param` | Null bound to a non-nullable parameter. |
+| `Q4006` | `param_value_out_of_domain` | A bound value that is not a value of its parameter's type: too long for its length, not of a `char(n)`'s or `bit(n)`'s length, a non-canonical range (`query-tree.md` §2.7 rule 2). |
 | `Q5001` | `invalid_recursion` | Invalid recursive CTE (non-linear, unstratified, mutual, missing column types). |
 | `Q5002` | `node_not_allowed` | Node not allowed here (DML not at root, `Action` outside `returning`). |
 | `Q5003` | `invalid_dml_target` | DML target is not a table, or column not writable. |
@@ -124,6 +132,7 @@ during the handshake.
 | `Q8011` | `sql_order_not_in_select` | An `ORDER BY` or `GROUP BY` position out of range, or an `ORDER BY` that must name an output column and does not (`sql.md` §5.5, §5.6). |
 | `Q8012` | `sql_column_count_mismatch` | A column list or `VALUES` row of the wrong length (`sql.md` §3.2, §5.3, §5.4). |
 | `Q8013` | `sql_invalid_table_definition` | Two primary keys, a column given twice, `NULL` with `NOT NULL`, or two defaults (`sql.md` §3.4). |
+| `Q8014` | `sql_collation_conflict` | Two operands whose implicit collations differ and no `COLLATE` decides (`sql.md` §4.2). SQLSTATE 42P21. |
 
 ## 3. Query tree: runtime (`R`)
 
@@ -139,6 +148,14 @@ Raised during evaluation. None is retryable or fatal.
 | `R0006` | `invalid_value` | A value does not convert (cast failure), or is out of a node's domain (negative limit, a null or negative window frame offset, a negative `lag`/`lead` offset), or names no time zone (`at_zone`, `from_zone`, `query-tree.md` §7.6). |
 | `R0007` | `row_affected_twice` | A target row affected twice by one statement. |
 | `R0008` | `sequence_exhausted` | `next_value` or an identity column would pass a non-cycling sequence's bound, or draws from one already exhausted (`ddl.md` §2.7 rules 4 and 6). |
+| `R0009` | `string_data_right_truncation` | A value stored into a `varchar(n)`, `char(n)`, `varbinary(n)`, `binary(n)` or `varbit(n)` is longer than `n` beyond trailing spaces (or X'00') (`query-tree.md` §2.8 rule 2, §2.9, §2.18). SQLSTATE 22001. |
+| `R0010` | `string_data_length_mismatch` | A `bit(n)` value stored of another length, or bitwise operands of different lengths (`query-tree.md` §2.18 rule 3). SQLSTATE 22026. |
+| `R0011` | `array_element_error` | An array subscript outside the array's bounds (`query-tree.md` §2.13 rule 6). SQLSTATE 2202E. |
+| `R0012` | `array_data_right_truncation` | An array stored into, or cast to, an array type of smaller maximum cardinality (`query-tree.md` §2.13 rule 3). SQLSTATE 2202F. |
+| `R0013` | `invalid_xml_document` | A text parsed as an XML document is not one (`query-tree.md` §2.17 rule 3). SQLSTATE 2200M. |
+| `R0014` | `invalid_xml_content` | A text parsed as XML content is not well-formed (`query-tree.md` §2.17 rule 3). SQLSTATE 2200N. |
+| `R0015` | `invalid_range_bounds` | A range whose lower bound is above its upper bound (`query-tree.md` §2.19 rule 1). SQLSTATE 22000. |
+| `R0016` | `range_not_contiguous` | A range union or difference whose result is not one range (`query-tree.md` §2.19 rule 5). SQLSTATE 22000. |
 
 ## 4. Transactions and isolation (`T`)
 
@@ -153,7 +170,7 @@ Raised under the rules of `isolation.md` §5. Levels: SER serializable, SI snaps
 | `T1005` | `replica_lag_timeout` | `after` or `max_lag` not satisfied within `replica_wait_timeout` (§3.6) | replica | yes |
 | `T1006` | `replica_conflict` | WAL replay needed to remove a structure or undo this replica transaction uses (§5.6) | replica | yes |
 | `T1007` | `cancelled` | the client, an administrator or a shutdown cancelled it before commit | all | yes |
-| `T1008` | `resource_exhausted` | memory, undo space or disk full, or a snapshot past `max_snapshot_age` or `undo_retention_limit` (§5.5); the transaction is aborted | all | yes, after back-off |
+| `T1008` | `resource_exhausted` | memory (including every buffer-pool frame fixed, `details.frames`), undo space or disk full, or a snapshot past `max_snapshot_age` or `undo_retention_limit` (§5.5); the transaction is aborted | all | yes, after back-off |
 | `T2001` | `commit_unknown` | the server cannot say whether the commit happened (e.g. it lost the WAL device mid-commit) | all | **no**: resolve first (§5.4) |
 | `T2002` | `commit_not_confirmed` | a commit at `remote` or `remote_apply` waited `synchronous_commit_timeout` for its quorum; the transaction **is committed** on the primary (`replication.md` §6.4) | all | no |
 | `T2003` | `token_not_in_history` | `after` names a commit this server's history does not contain, because a failover lost it (§3.6 R3, `replication.md` §8.3) | all | no |
@@ -207,6 +224,7 @@ Raised under the rules of `on-disk-format.md`. None is retryable.
 | `D1001` | `data_corrupted` | A checksum or structural check failed; the server stops serving the object (`isolation.md` §8, `on-disk-format.md` §3.1). |
 | `D2001` | `key_too_long` | An encoded key longer than 1,024 bytes (`on-disk-format.md` §3.6). |
 | `D2002` | `entry_too_large` | An entry cannot be brought within 4,000 bytes by moving columns out of line (§4.7). |
+| `D2003` | `wal_record_unwritable` | A WAL record or mini-transaction the format cannot express: a field past its width, a flag its kind cannot carry, or more bytes than one segment holds (§6.2 rule 2, §6.3, §6.4). |
 | `D3001` | `format_unsupported` | The database's format is newer than this release, or a feature flag it does not know is set (§7.2, §3.10); the open is refused. |
 | `D3002` | `format_read_only` | A write to a database opened read-only because its format is older than this release can write (§7.2). |
 | `D3003` | `clone_unsupported` | An on-disk clone on a filesystem without reflink (§8.4). |

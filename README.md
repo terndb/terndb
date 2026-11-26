@@ -12,13 +12,19 @@ TernDB is in design. What runs so far is one program, `terndb`: a psql-like shel
 
 ## Quick start
 
-Build it from the repository's root:
+On an Apple Silicon Mac, install it with Homebrew:
+
+```
+brew install terndb/tap/terndb
+```
+
+Or build it from the repository's root, with [sysl](https://github.com/sysl-lang/sysl) 0.13.7 or later:
 
 ```
 sysl build cli
 ```
 
-Run `cli/terndb` for a shell over an in-memory database of its own, which lasts as long as the shell does. Type
+The examples below run a source build, `cli/terndb`; an installed one is plain `terndb`. Run `cli/terndb` for a shell over an in-memory database of its own, which lasts as long as the shell does. Type
 statements ending in `;` (they may span lines), `\dt` to list tables, `\d name` to describe one, `\?` for help and
 `\q` to quit:
 

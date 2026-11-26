@@ -1,0 +1,681 @@
+module sh.sysl.terndb
+
+import sysl.buf.{Buf, buf}
+import sysl.checksum.crc32c
+import sysl.encoding.{get_u16_le, get_u32_le, get_u64_le, push_u16_le, push_u32_le, push_u64_le, put_u32_le, put_u64_le}
+
+// The write-ahead log's records (`on-disk-format.md` §6.1–§6.4): LSN arithmetic, the 32-byte record
+// header and its CRC32C, and a typed body for every record kind, encoded and decoded byte for byte as
+// §6.4 lays it out. What is decided here that the spec leaves open is in `docs/design/wal.md`.
+
+/** The size of the record header (§6.2). */
+const WalHeaderSize: usize = 32
+
+/** The I/O block a WAL flush writes whole (§1 rule 5, §6.7 rule 3). */
+const WalBlock: u64 = 4096
+
+/** The bytes at the start of every segment that hold its header, not records (§6.1). */
+const WalSegmentHeaderSize: u64 = 4096
+
+/** log2 of the segment size the format fixes: 64 MiB (§6.1, §6.6). */
+const WalFormatShift: u64 = 26
+
+/** The first LSN of a database (§6.1). */
+const WalFirstLsn: u64 = 4096
+
+/** The record format this release writes and reads (§6.2 `rec_format`). */
+const WalRecFormat: u16 = 1
+
+/** Flag bit 0: more records of this mini-transaction follow (§6.2). */
+const WalMtrCont: u8 = 1
+
+/** Flag bit 1: written by rollback, and followed by `undo_next` (§6.2, §6.4). */
+const WalCompensation: u8 = 2
+
+// The record kinds of §6.4.
+const WkPad: u8 = 0
+const WkPageInit: u8 = 1
+const WkFpi: u8 = 2
+const WkNodeInsert: u8 = 3
+const WkNodeDelete: u8 = 4
+const WkNodePatch: u8 = 5
+const WkRowHeader: u8 = 6
+const WkNodeSlotFlags: u8 = 7
+const WkNodeTruncate: u8 = 8
+const WkNodeBulk: u8 = 9
+const WkNodeSetExtra: u8 = 10
+const WkNodeCompact: u8 = 11
+const WkOverflowWrite: u8 = 12
+const WkUndoAppend: u8 = 13
+const WkPageAlloc: u8 = 14
+const WkPageFree: u8 = 15
+const WkFormatPage: u8 = 16
+const WkTxnCommit: u8 = 32
+const WkTxnAbort: u8 = 33
+const WkCheckpointBegin: u8 = 34
+const WkCheckpointEnd: u8 = 35
+const WkFileCreate: u8 = 36
+const WkFileExtend: u8 = 37
+const WkFileDelete: u8 = 38
+const WkUndoTruncate: u8 = 39
+const WkFormatUpgrade: u8 = 40
+const WkFormatMin: u8 = 41
+const WkTimelineSwitch: u8 = 42
+const WkRestorePoint: u8 = 43
+const WkPurgeHorizon: u8 = 44
+const WkSyncConfig: u8 = 45
+
+// -- LSN arithmetic (§6.1) -------------------------------------------------------------------------
+
+/** The bytes of a segment of size 2^`shift`. */
+wal_segment_size(shift: u64) -> u64 = u64(1) << shift
+
+/** The segment LSN `lsn` lies in. */
+wal_segment_of(lsn: u64, shift: u64) -> u64 = lsn >> shift
+
+/** Where LSN `lsn` lies within its segment. */
+wal_segment_offset(lsn: u64, shift: u64) -> u64 = lsn & (wal_segment_size(shift) - 1)
+
+/** The first LSN of segment `k`: its header's. */
+wal_segment_lsn(k: u64, shift: u64) -> u64 = k << shift
+
+/** The LSN of segment `k`'s first record, just past its header. */
+wal_segment_first_record(k: u64, shift: u64) -> u64 = wal_segment_lsn(k, shift) + WalSegmentHeaderSize
+
+/** The longest record a segment holds: everything past its header (§6.2 rule 2). */
+wal_segment_capacity(shift: u64) -> u64 = wal_segment_size(shift) - WalSegmentHeaderSize
+
+/** Where the record after one ending at `end` starts: `end` itself, or the next segment's first
+ * record when `end` is the segment's end or leaves less room than a record header there.
+ */
+wal_next_record(end: u64, shift: u64) -> u64
+    val off = wal_segment_offset(end, shift)
+    if off == 0 then return end + WalSegmentHeaderSize
+    if wal_segment_size(shift) - off < u64(WalHeaderSize) then return wal_segment_first_record(wal_segment_of(end, shift) + 1, shift)
+    end
+
+/** The start of the 4 KiB block `lsn` lies in. */
+wal_block_floor(lsn: u64) -> u64 = lsn - lsn % WalBlock
+
+/** `lsn` rounded up to a 4 KiB block boundary. */
+wal_block_ceil(lsn: u64) -> u64 = wal_block_floor(lsn + WalBlock - 1)
+
+// -- typed records (§6.4) --------------------------------------------------------------------------
+
+/** A `NODE_INSERT` body, which `NODE_BULK` repeats. */
+struct WalEntry derives Eq
+    slot: u16
+    slot_flags: u16
+    key: Buf[u8]
+    value: Buf[u8]
+
+/** One in-place byte change of `NODE_PATCH`. */
+struct WalPatch derives Eq
+    offset: u16
+    bytes: Buf[u8]
+
+/** One row of `CHECKPOINT_END`'s active-transaction table. */
+struct WalActiveTxn derives Eq
+    txn: u64
+    last_undo: u64
+    undo_next: u64
+
+/** `CHECKPOINT_END`'s payload. */
+struct WalCheckpoint derives Eq
+    begin_lsn: u64
+    redo_lsn: u64
+    next_txn_id: u64
+    next_oid: u64
+    undo_low: u64
+    undo_high: u64
+    last_commit_seq: u64
+    txns: Buf[WalActiveTxn]
+
+/** A record's payload, one variant per kind of §6.4, every field as the table names it.
+ *
+ * `WbPad` carries how many payload bytes the pad has. `WbPageInit` always carries both fences, each
+ * empty for a page that is not a node. `WbTimelineSwitch` has no `switch_lsn`: it is the record's own
+ * LSN, written from it and checked against it.
+ */
+enum WalBody derives Eq
+    WbPad(size: u64)
+    WbPageInit(pid: u64, page_type: u8, page_flags: u8, owner: u64, format: u16, level: u16, lower: Buf[u8], upper: Buf[u8])
+    WbFpi(pid: u64, codec: u8, image: Buf[u8])
+    WbNodeInsert(pid: u64, entry: WalEntry)
+    WbNodeDelete(pid: u64, slot: u16)
+    WbNodePatch(pid: u64, slot: u16, patches: Buf[WalPatch])
+    WbRowHeader(pid: u64, slot: u16, txn: u64, undo: u64, row_flags: u16)
+    WbNodeSlotFlags(pid: u64, slot: u16, slot_flags: u16)
+    WbNodeTruncate(pid: u64, from_slot: u16, upper: Buf[u8], extra: u64)
+    WbNodeBulk(pid: u64, entries: Buf[WalEntry])
+    WbNodeSetExtra(pid: u64, extra: u64)
+    WbNodeCompact(pid: u64)
+    WbOverflowWrite(pid: u64, next_pid: u64, payload: Buf[u8])
+    WbUndoAppend(pid: u64, offset: u16, bytes: Buf[u8])
+    WbPageAlloc(pid: u64, page_index: u16)
+    WbPageFree(pid: u64, page_index: u16)
+    WbFormatPage(pid: u64, page: Buf[u8])
+    WbTxnCommit(commit_time: i64, last_undo: u64, commit_seq: u64, commit_flags: u64)
+    WbTxnAbort
+    WbCheckpointBegin
+    WbCheckpointEnd(cp: WalCheckpoint)
+    WbFileCreate(space: u8, segment_no: u64)
+    WbFileExtend(space: u8, segment_no: u64, new_page_count: u32)
+    WbFileDelete(space: u8, segment_no: u64)
+    WbUndoTruncate(new_undo_low: u64)
+    WbFormatUpgrade(from_format: u16, to_format: u16)
+    WbFormatMin(new_min: u16)
+    WbTimelineSwitch(old_timeline: u32, new_timeline: u32, last_commit_seq: u64, promotion_id: Buf[u8])
+    WbRestorePoint(name: Buf[u8])
+    WbPurgeHorizon(horizon: u64)
+    WbSyncConfig(quorum: u8, names: Buf[Buf[u8]])
+
+/** A record: its header's fields and its body. `undo_next` is written only when `flags` has
+ * `WalCompensation`, and is 0 otherwise.
+ */
+struct WalRecord derives Eq
+    lsn: u64
+    txn: u64
+    flags: u8
+    undo_next: u64
+    body: WalBody
+
+/** A record of `body` for transaction `txn`, at no LSN yet and with no flags. */
+wal_record(txn: u64, body: WalBody) -> WalRecord = WalRecord(0, txn, 0, 0, body)
+
+/** The kind byte of a body (§6.4). */
+wal_kind(body: WalBody) -> u8 = body match
+    WbPad(_) -> WkPad
+    WbPageInit(_, _, _, _, _, _, _, _) -> WkPageInit
+    WbFpi(_, _, _) -> WkFpi
+    WbNodeInsert(_, _) -> WkNodeInsert
+    WbNodeDelete(_, _) -> WkNodeDelete
+    WbNodePatch(_, _, _) -> WkNodePatch
+    WbRowHeader(_, _, _, _, _) -> WkRowHeader
+    WbNodeSlotFlags(_, _, _) -> WkNodeSlotFlags
+    WbNodeTruncate(_, _, _, _) -> WkNodeTruncate
+    WbNodeBulk(_, _) -> WkNodeBulk
+    WbNodeSetExtra(_, _) -> WkNodeSetExtra
+    WbNodeCompact(_) -> WkNodeCompact
+    WbOverflowWrite(_, _, _) -> WkOverflowWrite
+    WbUndoAppend(_, _, _) -> WkUndoAppend
+    WbPageAlloc(_, _) -> WkPageAlloc
+    WbPageFree(_, _) -> WkPageFree
+    WbFormatPage(_, _) -> WkFormatPage
+    WbTxnCommit(_, _, _, _) -> WkTxnCommit
+    WbTxnAbort -> WkTxnAbort
+    WbCheckpointBegin -> WkCheckpointBegin
+    WbCheckpointEnd(_) -> WkCheckpointEnd
+    WbFileCreate(_, _) -> WkFileCreate
+    WbFileExtend(_, _, _) -> WkFileExtend
+    WbFileDelete(_, _) -> WkFileDelete
+    WbUndoTruncate(_) -> WkUndoTruncate
+    WbFormatUpgrade(_, _) -> WkFormatUpgrade
+    WbFormatMin(_) -> WkFormatMin
+    WbTimelineSwitch(_, _, _, _) -> WkTimelineSwitch
+    WbRestorePoint(_) -> WkRestorePoint
+    WbPurgeHorizon(_) -> WkPurgeHorizon
+    WbSyncConfig(_, _) -> WkSyncConfig
+
+/** Whether kind `kind` is a page record, whose payload starts with the page it modifies (§6.3 rule 1). */
+wal_is_page_kind(kind: u8) -> bool = kind >= WkPageInit && kind <= WkFormatPage
+
+// -- encoding --------------------------------------------------------------------------------------
+
+private unwritable[T](message: string) -> Result[T, CodecError] = fail("D2003", s"a WAL record cannot be written: $message")
+
+private push_u8(out: Buf[u8], v: u8) = out.push(v)
+
+private push_field16(out: Buf[u8], n: usize, what: string) -> Result[unit, CodecError]
+    if n > 65535 then return unwritable(s"$what is $n, past a u16")
+    push_u16_le(out, u16(n))
+    Ok(())
+
+private push_bytes16(out: Buf[u8], b: Buf[u8], what: string) -> Result[unit, CodecError]
+    push_field16(out, b.len(), what)?
+    out.extend(b.view())
+    Ok(())
+
+private push_entry(out: Buf[u8], e: WalEntry) -> Result[unit, CodecError]
+    push_u16_le(out, e.slot)
+    push_u16_le(out, e.slot_flags)
+    push_field16(out, e.key.len(), "a key's length")?
+    push_field16(out, e.value.len(), "a value's length")?
+    out.extend(e.key.view())
+    out.extend(e.value.view())
+    Ok(())
+
+/** Writes `body`'s payload as §6.4 lays it out, `lsn` standing for `switch_lsn`. */
+private push_payload(out: Buf[u8], body: WalBody, lsn: u64) -> Result[unit, CodecError]
+    body match
+        WbPad(size) ->
+            for _ in 0..<size
+                out.push(0)
+        WbPageInit(pid, page_type, page_flags, owner, format, level, lower, upper) ->
+            push_u64_le(out, pid)
+            push_u8(out, page_type)
+            push_u8(out, page_flags)
+            push_u64_le(out, owner)
+            push_u16_le(out, format)
+            push_u16_le(out, level)
+            push_bytes16(out, lower, "a lower fence's length")?
+            push_bytes16(out, upper, "an upper fence's length")?
+        WbFpi(pid, codec, image) ->
+            if codec > 1 then return unwritable(s"FPI codec $codec is neither 0 (none) nor 1 (LZ4)")
+            push_u64_le(out, pid)
+            push_u8(out, codec)
+            push_bytes16(out, image, "an image's length")?
+        WbNodeInsert(pid, entry) ->
+            push_u64_le(out, pid)
+            push_entry(out, entry)?
+        WbNodeDelete(pid, slot) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, slot)
+        WbNodePatch(pid, slot, patches) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, slot)
+            push_field16(out, patches.len(), "a patch count")?
+
+            for p in patches
+                push_u16_le(out, p.offset)
+                push_bytes16(out, p.bytes, "a patch's length")?
+        WbRowHeader(pid, slot, txn, undo, row_flags) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, slot)
+            push_u64_le(out, txn)
+            push_u64_le(out, undo)
+            push_u16_le(out, row_flags)
+        WbNodeSlotFlags(pid, slot, slot_flags) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, slot)
+            push_u16_le(out, slot_flags)
+        WbNodeTruncate(pid, from_slot, upper, extra) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, from_slot)
+            push_bytes16(out, upper, "an upper fence's length")?
+            push_u64_le(out, extra)
+        WbNodeBulk(pid, entries) ->
+            push_u64_le(out, pid)
+            push_field16(out, entries.len(), "an entry count")?
+
+            for e in entries
+                push_entry(out, e)?
+        WbNodeSetExtra(pid, extra) ->
+            push_u64_le(out, pid)
+            push_u64_le(out, extra)
+        WbNodeCompact(pid) -> push_u64_le(out, pid)
+        WbOverflowWrite(pid, next_pid, payload) ->
+            if u64(payload.len()) > 0xffffffff then return unwritable(s"an overflow payload of ${payload.len()} bytes is past a u32")
+            push_u64_le(out, pid)
+            push_u64_le(out, next_pid)
+            push_u32_le(out, u32(payload.len()))
+            out.extend(payload.view())
+        WbUndoAppend(pid, offset, bytes) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, offset)
+            push_bytes16(out, bytes, "an undo append's length")?
+        WbPageAlloc(pid, page_index) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, page_index)
+        WbPageFree(pid, page_index) ->
+            push_u64_le(out, pid)
+            push_u16_le(out, page_index)
+        WbFormatPage(pid, page) ->
+            if page.len() != DbPageSize then return unwritable(s"FORMAT_PAGE carries ${page.len()} bytes, not one page")
+            push_u64_le(out, pid)
+            out.extend(page.view())
+        WbTxnCommit(commit_time, last_undo, commit_seq, commit_flags) ->
+            push_u64_le(out, u64.wrap(commit_time))
+            push_u64_le(out, last_undo)
+            push_u64_le(out, commit_seq)
+            push_u64_le(out, commit_flags)
+        WbTxnAbort -> ()
+        WbCheckpointBegin -> ()
+        WbCheckpointEnd(cp) ->
+            if u64(cp.txns.len()) > 0xffffffff then return unwritable(s"a checkpoint of ${cp.txns.len()} transactions is past a u32")
+            push_u64_le(out, cp.begin_lsn)
+            push_u64_le(out, cp.redo_lsn)
+            push_u64_le(out, cp.next_txn_id)
+            push_u64_le(out, cp.next_oid)
+            push_u64_le(out, cp.undo_low)
+            push_u64_le(out, cp.undo_high)
+            push_u64_le(out, cp.last_commit_seq)
+            push_u32_le(out, u32(cp.txns.len()))
+
+            for t in cp.txns
+                push_u64_le(out, t.txn)
+                push_u64_le(out, t.last_undo)
+                push_u64_le(out, t.undo_next)
+        WbFileCreate(space, segment_no) ->
+            push_u8(out, space)
+            push_u64_le(out, segment_no)
+        WbFileExtend(space, segment_no, new_page_count) ->
+            push_u8(out, space)
+            push_u64_le(out, segment_no)
+            push_u32_le(out, new_page_count)
+        WbFileDelete(space, segment_no) ->
+            push_u8(out, space)
+            push_u64_le(out, segment_no)
+        WbUndoTruncate(new_undo_low) -> push_u64_le(out, new_undo_low)
+        WbFormatUpgrade(from_format, to_format) ->
+            push_u16_le(out, from_format)
+            push_u16_le(out, to_format)
+        WbFormatMin(new_min) -> push_u16_le(out, new_min)
+        WbTimelineSwitch(old_timeline, new_timeline, last_commit_seq, promotion_id) ->
+            if promotion_id.len() != 16 then return unwritable(s"a promotion id is ${promotion_id.len()} bytes, not 16")
+            push_u32_le(out, old_timeline)
+            push_u32_le(out, new_timeline)
+            push_u64_le(out, lsn)
+            push_u64_le(out, last_commit_seq)
+            out.extend(promotion_id.view())
+        WbRestorePoint(name) -> push_bytes16(out, name, "a restore point's name length")?
+        WbPurgeHorizon(horizon) -> push_u64_le(out, horizon)
+        WbSyncConfig(quorum, names) ->
+            if names.len() > 255 then return unwritable(s"a synchronous configuration of ${names.len()} names is past a u8")
+            push_u8(out, quorum)
+            push_u8(out, u8(names.len()))
+
+            for n in names
+                if n.len() > 255 then return unwritable(s"a synchronous standby's name of ${n.len()} bytes is past a u8")
+                push_u8(out, u8(n.len()))
+                out.extend(n.view())
+
+    Ok(())
+
+/** Where `switch_lsn` sits in a `TIMELINE_SWITCH` record: after the two timelines. */
+private const SwitchLsnAt: usize = WalHeaderSize + 8
+
+/** Appends `rec` to `out` as it goes into the log: the header, the payload, `undo_next` for a
+ * compensation record, and zeros up to a multiple of 8, with the CRC over [4, len) (§6.2). Answers
+ * the record's length. `D2003` refuses a record that §6.4 cannot express: a field past its width, a
+ * pad or a record other than a page record flagged `COMPENSATION`, a pad flagged `MTR_CONT`, or a
+ * flag bit §6.2 does not define.
+ */
+wal_encode(rec: WalRecord, out: Buf[u8]) -> Result[usize, CodecError]
+    val kind = wal_kind(rec.body)
+    if rec.flags & ~(WalMtrCont | WalCompensation) != 0 then return unwritable(s"flags ${rec.flags} set a bit §6.2 does not define")
+    if rec.flags & WalCompensation != 0 && !wal_is_page_kind(kind) then return unwritable(s"a record of kind $kind is not a page record, so it cannot be a compensation record")
+    if kind == WkPad && rec.flags != 0 then return unwritable("a pad carries no flags")
+    val start = out.len()
+
+    for _ in 0..<WalHeaderSize
+        out.push(0)
+
+    push_payload(out, rec.body, rec.lsn) match
+        Err(e) ->
+            out.truncate(start)
+            return Err(e)
+        Ok(_) -> ()
+
+    if rec.flags & WalCompensation != 0 then push_u64_le(out, rec.undo_next)
+
+    while (out.len() - start) % 8 != 0
+        out.push(0)
+
+    val len = out.len() - start
+
+    if u64(len) > 0xffffffff
+        out.truncate(start)
+        return unwritable(s"a record of $len bytes is past a u32")
+
+    val h = out.view_mut()[start..<start + len]
+    put_u32_le(h[4..<8], u32(len))
+    put_u64_le(h[8..<16], rec.lsn)
+    put_u64_le(h[16..<24], rec.txn)
+    h[24] = kind
+    h[25] = rec.flags
+    h[26] = u8(WalRecFormat & 0xff)
+    h[27] = u8(WalRecFormat >> 8)
+    put_u32_le(h[0..<4], crc32c(h[4..<len]))
+    Ok(len)
+
+/** `rec` encoded alone. */
+wal_encoded(rec: WalRecord) -> Result[Buf[u8], CodecError]
+    val out = buf[u8]()
+    wal_encode(rec, out)?
+    Ok(out)
+
+/** Sets an encoded record's LSN, and its `MTR_CONT` bit to `cont`, and seals it with its CRC again:
+ * what the appender does once it knows where the record goes. A `TIMELINE_SWITCH` names its own LSN
+ * in its payload as well.
+ */
+wal_stamp(rec: []u8, lsn: u64, cont: bool)
+    put_u64_le(rec[8..<16], lsn)
+    rec[25] = if cont then rec[25] | WalMtrCont else rec[25] & ~WalMtrCont
+    if rec[24] == WkTimelineSwitch then put_u64_le(rec[SwitchLsnAt..<SwitchLsnAt + 8], lsn)
+    put_u32_le(rec[0..<4], crc32c(rec[4..<rec.len]))
+
+// -- the frame check (§6.9: what ends the log) -----------------------------------------------------
+
+/** The `len` a record header at the start of `header` claims. */
+wal_frame_len(header: []const u8) -> u32 = get_u32_le(header[4..<8]).unwrap()
+
+/** Whether a `len` read at offset `off` of a segment of size 2^`shift` can be a record's: at least a
+ * header, a multiple of 8, and within the segment. A `len` that is not ends the log (§6.9).
+ */
+wal_len_fits(len: u32, off: u64, shift: u64) -> bool =
+    usize(len) >= WalHeaderSize && len % 8 == 0 && off + u64(len) <= wal_segment_size(shift)
+
+/** Whether `rec`, the `len` bytes read at LSN `pos`, is a record that was written there: its CRC
+ * holds over [4, len) and its `lsn` is `pos`. A record that is not ends the log (§6.9).
+ */
+wal_frame_valid(rec: []const u8, pos: u64) -> bool =
+    get_u32_le(rec[0..<4]).unwrap() == crc32c(rec[4..<rec.len]) && get_u64_le(rec[8..<16]).unwrap() == pos
+
+// -- decoding --------------------------------------------------------------------------------------
+
+private malformed[T](lsn: u64, message: string) -> Result[T, CodecError] =
+    Err(refusal("D1001", s"the WAL record at LSN $lsn $message", [Detail("lsn", s"$lsn")]))
+
+/** A read position in one record's bytes. */
+private struct WalCursor
+    bytes: []const u8
+    at: usize
+    lsn: u64
+
+    take(*self, n: usize) -> Result[[]const u8, CodecError]
+        if n > self.bytes.len - self.at then return malformed(self.lsn, "ends inside its payload")
+        val from = self.at
+        self.at += n
+        Ok(self.bytes[from..<self.at])
+
+    le8(*self) -> Result[u8, CodecError] = Ok(self.take(1)?[0])
+
+    le16(*self) -> Result[u16, CodecError] = Ok(get_u16_le(self.take(2)?).unwrap())
+
+    le32(*self) -> Result[u32, CodecError] = Ok(get_u32_le(self.take(4)?).unwrap())
+
+    le64(*self) -> Result[u64, CodecError] = Ok(get_u64_le(self.take(8)?).unwrap())
+
+    bytes_of(*self, n: usize) -> Result[Buf[u8], CodecError]
+        val out = buf[u8]()
+        out.extend(self.take(n)?)
+        Ok(out)
+
+    bytes16(*self) -> Result[Buf[u8], CodecError]
+        val n = self.le16()?
+        self.bytes_of(usize(n))
+
+    entry(*self) -> Result[WalEntry, CodecError]
+        val slot = self.le16()?
+        val slot_flags = self.le16()?
+        val key_len = self.le16()?
+        val value_len = self.le16()?
+        val key = self.bytes_of(usize(key_len))?
+        Ok(WalEntry(slot, slot_flags, key, self.bytes_of(usize(value_len))?))
+end WalCursor
+
+private read_body(c: *WalCursor, kind: u8, lsn: u64, payload: usize) -> Result[WalBody, CodecError]
+    kind match
+        WkPad ->
+            c.take(payload)?
+            Ok(WbPad(u64(payload)))
+        WkPageInit ->
+            val pid = c.le64()?
+            val page_type = c.le8()?
+            val page_flags = c.le8()?
+            val owner = c.le64()?
+            val format = c.le16()?
+            val level = c.le16()?
+            val lower = c.bytes16()?
+            Ok(WbPageInit(pid, page_type, page_flags, owner, format, level, lower, c.bytes16()?))
+        WkFpi ->
+            val pid = c.le64()?
+            val codec = c.le8()?
+            if codec > 1 then return malformed(lsn, s"names FPI codec $codec")
+            Ok(WbFpi(pid, codec, c.bytes16()?))
+        WkNodeInsert ->
+            val pid = c.le64()?
+            Ok(WbNodeInsert(pid, c.entry()?))
+        WkNodeDelete ->
+            val pid = c.le64()?
+            Ok(WbNodeDelete(pid, c.le16()?))
+        WkNodePatch ->
+            val pid = c.le64()?
+            val slot = c.le16()?
+            val n = c.le16()?
+            val patches = buf[WalPatch]()
+
+            for _ in 0..<n
+                val offset = c.le16()?
+                patches.push(WalPatch(offset, c.bytes16()?))
+
+            Ok(WbNodePatch(pid, slot, patches))
+        WkRowHeader ->
+            val pid = c.le64()?
+            val slot = c.le16()?
+            val txn = c.le64()?
+            val undo = c.le64()?
+            Ok(WbRowHeader(pid, slot, txn, undo, c.le16()?))
+        WkNodeSlotFlags ->
+            val pid = c.le64()?
+            val slot = c.le16()?
+            Ok(WbNodeSlotFlags(pid, slot, c.le16()?))
+        WkNodeTruncate ->
+            val pid = c.le64()?
+            val from_slot = c.le16()?
+            val upper = c.bytes16()?
+            Ok(WbNodeTruncate(pid, from_slot, upper, c.le64()?))
+        WkNodeBulk ->
+            val pid = c.le64()?
+            val n = c.le16()?
+            val entries = buf[WalEntry]()
+
+            for _ in 0..<n
+                entries.push(c.entry()?)
+
+            Ok(WbNodeBulk(pid, entries))
+        WkNodeSetExtra ->
+            val pid = c.le64()?
+            Ok(WbNodeSetExtra(pid, c.le64()?))
+        WkNodeCompact -> Ok(WbNodeCompact(c.le64()?))
+        WkOverflowWrite ->
+            val pid = c.le64()?
+            val next_pid = c.le64()?
+            val used = c.le32()?
+            Ok(WbOverflowWrite(pid, next_pid, c.bytes_of(usize(used))?))
+        WkUndoAppend ->
+            val pid = c.le64()?
+            val offset = c.le16()?
+            Ok(WbUndoAppend(pid, offset, c.bytes16()?))
+        WkPageAlloc ->
+            val pid = c.le64()?
+            Ok(WbPageAlloc(pid, c.le16()?))
+        WkPageFree ->
+            val pid = c.le64()?
+            Ok(WbPageFree(pid, c.le16()?))
+        WkFormatPage ->
+            val pid = c.le64()?
+            Ok(WbFormatPage(pid, c.bytes_of(DbPageSize)?))
+        WkTxnCommit ->
+            val commit_time = i64.wrap(c.le64()?)
+            val last_undo = c.le64()?
+            val commit_seq = c.le64()?
+            Ok(WbTxnCommit(commit_time, last_undo, commit_seq, c.le64()?))
+        WkTxnAbort -> Ok(WbTxnAbort)
+        WkCheckpointBegin -> Ok(WbCheckpointBegin)
+        WkCheckpointEnd ->
+            val begin_lsn = c.le64()?
+            val redo_lsn = c.le64()?
+            val next_txn_id = c.le64()?
+            val next_oid = c.le64()?
+            val undo_low = c.le64()?
+            val undo_high = c.le64()?
+            val last_commit_seq = c.le64()?
+            val n = c.le32()?
+            // Each row is 24 bytes: a count the record cannot hold is refused before anything is built.
+            if u64(n) * 24 > u64(c.bytes.len - c.at) then return malformed(lsn, s"claims $n active transactions, more than it holds")
+            val txns = buf[WalActiveTxn]()
+
+            for _ in 0..<n
+                val txn = c.le64()?
+                val last_undo = c.le64()?
+                txns.push(WalActiveTxn(txn, last_undo, c.le64()?))
+
+            Ok(WbCheckpointEnd(WalCheckpoint(begin_lsn, redo_lsn, next_txn_id, next_oid, undo_low, undo_high, last_commit_seq, txns)))
+        WkFileCreate ->
+            val space = c.le8()?
+            Ok(WbFileCreate(space, c.le64()?))
+        WkFileExtend ->
+            val space = c.le8()?
+            val segment_no = c.le64()?
+            Ok(WbFileExtend(space, segment_no, c.le32()?))
+        WkFileDelete ->
+            val space = c.le8()?
+            Ok(WbFileDelete(space, c.le64()?))
+        WkUndoTruncate -> Ok(WbUndoTruncate(c.le64()?))
+        WkFormatUpgrade ->
+            val from_format = c.le16()?
+            Ok(WbFormatUpgrade(from_format, c.le16()?))
+        WkFormatMin -> Ok(WbFormatMin(c.le16()?))
+        WkTimelineSwitch ->
+            val old_timeline = c.le32()?
+            val new_timeline = c.le32()?
+            val switch_lsn = c.le64()?
+            if switch_lsn != lsn then return malformed(lsn, s"names switch LSN $switch_lsn, not its own")
+            val last_commit_seq = c.le64()?
+            Ok(WbTimelineSwitch(old_timeline, new_timeline, last_commit_seq, c.bytes_of(16)?))
+        WkRestorePoint -> Ok(WbRestorePoint(c.bytes16()?))
+        WkPurgeHorizon -> Ok(WbPurgeHorizon(c.le64()?))
+        WkSyncConfig ->
+            val quorum = c.le8()?
+            val n = c.le8()?
+            val names = buf[Buf[u8]]()
+
+            for _ in 0..<n
+                val len = c.le8()?
+                names.push(c.bytes_of(usize(len))?)
+
+            Ok(WbSyncConfig(quorum, names))
+        _ -> malformed(lsn, s"has kind $kind, which §6.4 does not define")
+
+/** The record in `rec`, a frame `wal_frame_valid` has passed. Its fields are read as §6.4 lays them
+ * out; a record that does not parse — an unknown kind, a payload that ends early or runs on past its
+ * padding, a flag on a record that cannot carry it — is `data_corrupted` (`D1001`), because a
+ * frame whose CRC and LSN hold was not torn. A `rec_format` newer than this release's is
+ * `format_unsupported` (`D3001`). Reserved bytes and flag bits are ignored (§1 rule 3).
+ */
+wal_decode(rec: []const u8) -> Result[WalRecord, CodecError]
+    val lsn = get_u64_le(rec[8..<16]).unwrap()
+    if rec.len < WalHeaderSize || rec.len != usize(wal_frame_len(rec)) then return malformed(lsn, s"is ${rec.len} bytes, not the length its header claims")
+    val txn = get_u64_le(rec[16..<24]).unwrap()
+    val kind = rec[24]
+    val flags = rec[25] & (WalMtrCont | WalCompensation)
+    val format = get_u16_le(rec[26..<28]).unwrap()
+
+    if format > WalRecFormat
+        return Err(refusal("D3001", s"the WAL record at LSN $lsn has record format $format, newer than this release's $WalRecFormat", [Detail("lsn", s"$lsn")]))
+
+    if format == 0 then return malformed(lsn, "has record format 0")
+    if kind == WkPad && flags != 0 then return malformed(lsn, s"is a pad with flags $flags")
+    if flags & WalCompensation != 0 && !wal_is_page_kind(kind) then return malformed(lsn, s"of kind $kind is flagged a compensation record")
+    var c = WalCursor(rec, WalHeaderSize, lsn)
+    val body = read_body(&c, kind, lsn, rec.len - WalHeaderSize)?
+    val undo_next = if flags & WalCompensation != 0 then c.le64()? else u64(0)
+    val rest = rec.len - c.at
+    if rest >= 8 then return malformed(lsn, s"has $rest bytes past its payload")
+
+    for i in c.at..<rec.len
+        if rec[i] != 0 then return malformed(lsn, "has padding that is not zeros")
+
+    Ok(WalRecord(lsn, txn, flags, undo_next, body))
