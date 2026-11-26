@@ -227,7 +227,7 @@ Raised by `libterndb` itself under the rules of `c-api.md`, never sent on the wi
 | `C1004` | `concurrent_use` | A connection, or a transaction or statement of it, used by two threads at once. |
 | `C1005` | `invalid_state` | A call that the handle's state does not allow yet (result counts before the end, an operation's error while pending, a second `terndb_init` with other arguments). |
 | `C1006` | `closed` | A call on a handle whose connection or database has been closed. |
-| `C1007` | `not_supported` | An operation the database's mode does not support (snapshot or promotion of a disk-mode database). |
+| `C1007` | `not_supported` | An operation the database's mode does not support (snapshot or promotion of a disk-mode database), or one this build of the library lacks (disk storage or network mode, `c-api.md` §4.2 rule 9). |
 | `C1008` | `not_initialized` | A call before `terndb_init`. |
 | `C1009` | `abi_mismatch` | The caller's header is of another ABI major, or a newer minor, than the library. |
 | `C2001` | `out_of_memory` | The allocator returned NULL outside any transaction. |

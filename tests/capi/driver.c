@@ -812,13 +812,21 @@ static void test_borrowed_pointers_stable(void) {
 
 /* ---- §8 golden vectors and the walk ------------------------------------------------------------ */
 
-static void check_golden(terndb_conn *c, const uint8_t *env, size_t env_len, const uint8_t *gold, size_t gold_len,
-                         const uint8_t *type, size_t type_len) {
-    terndb_result *r = run(c, NULL, env, env_len);
+static void check_golden(terndb_conn *c, const uint8_t *env, size_t env_len, const uint8_t *params, size_t params_len,
+                         const uint8_t *gold, size_t gold_len, const uint8_t *type, size_t type_len) {
+    terndb_result *r = NULL;
+    EXPECT_OK(terndb_execute(c, NULL, NULL, NULL, env, env_len, params, params_len, &r, &err_));
     const uint8_t *tb;
     size_t tl;
     terndb_result_type_bytes(r, &tb, &tl);
-    CHECK(tl == type_len && memcmp(tb, type, tl) == 0);
+    if (tl != type_len || memcmp(tb, type, tl) != 0) {
+        fprintf(stderr, "result type differs from the golden vector's:\n");
+        for (size_t i = 0; i < tl; i++) fprintf(stderr, "%02X ", tb[i]);
+        fprintf(stderr, "\ngolden:\n");
+        for (size_t i = 0; i < type_len; i++) fprintf(stderr, "%02X ", type[i]);
+        fprintf(stderr, "\n");
+        exit(1);
+    }
     terndb_batch *b = NULL;
     CHECK(terndb_result_next(r, &b, &(terndb_error *){NULL}) == 1);
     const uint8_t *p;
@@ -841,10 +849,11 @@ static void test_golden_vectors_embedded(void) {
     init();
     terndb_db *db = open_db();
     terndb_conn *c = session(db);
-    check_golden(c, ENV_V15, ENV_V15_LEN, GOLD_V15_BATCH, GOLD_V15_BATCH_LEN, GOLD_V15_TYPE, GOLD_V15_TYPE_LEN);
-    check_golden(c, ENV_V16, ENV_V16_LEN, GOLD_V16_BATCH, GOLD_V16_BATCH_LEN, GOLD_V16_TYPE, GOLD_V16_TYPE_LEN);
-    check_golden(c, ENV_V16_NO_NULL, ENV_V16_NO_NULL_LEN, GOLD_V16_NO_NULL_BATCH, GOLD_V16_NO_NULL_BATCH_LEN, GOLD_V16_TYPE,
+    check_golden(c, ENV_V15, ENV_V15_LEN, NULL, 0, GOLD_V15_BATCH, GOLD_V15_BATCH_LEN, GOLD_V15_TYPE, GOLD_V15_TYPE_LEN);
+    check_golden(c, ENV_V16, ENV_V16_LEN, PARAMS_V16, PARAMS_V16_LEN, GOLD_V16_BATCH, GOLD_V16_BATCH_LEN, GOLD_V16_TYPE,
                  GOLD_V16_TYPE_LEN);
+    check_golden(c, ENV_V16, ENV_V16_LEN, PARAMS_V16_NO_NULL, PARAMS_V16_NO_NULL_LEN, GOLD_V16_NO_NULL_BATCH,
+                 GOLD_V16_NO_NULL_BATCH_LEN, GOLD_V16_TYPE, GOLD_V16_TYPE_LEN);
 }
 
 static void test_golden_vectors_network(void) { SKIP("this build has no network mode (terndb_connect is C1007)"); }
@@ -2036,7 +2045,7 @@ static void test_disk_only_calls(void) {
     for (int i = 0; i < 3; i++) {
         CHECK(terndb_op_wait(ops[i], -1) == 1);
         EXPECT_CODE("C1007", terndb_op_error(ops[i], &err_));
-        CHECK(terndb_op_take_db(ops[i]) == NULL || i == 0);
+        if (i > 0) CHECK(terndb_op_take_db(ops[i]) == NULL); /* a snapshot yields no database */
     }
     uint64_t tags[4];
     CHECK(terndb_queue_drain(q, tags, 4) == 3);

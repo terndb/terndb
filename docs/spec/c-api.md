@@ -202,6 +202,11 @@ without new symbols.*
 7. Thread safety: any thread. Opening the same directory twice in one process is `D4001`, as from two processes.
 8. `terndb_open_async` does the same and completes through an operation (§6); `terndb_op_take_db` yields the
    handle.
+9. **A library built without disk storage** opens only an anonymous memory-mode database (`mode = memory`,
+   `durability = none`, an empty `dir`). Every other open, and `terndb_snapshot`, `terndb_clone` and
+   `terndb_promote` (§4.4) on any database, fails with `C1007` (`not_supported`, `details.reason =
+   "disk_storage"`) once the call's own argument and configuration checks have passed. A library built without
+   network mode answers `terndb_connect` likewise, with `details.reason = "network"`, after checking the URL's form.
 
 ### 4.3 Close
 
@@ -392,7 +397,9 @@ client that happens to share the address space.*
    batches already pulled ([WIRE] §4.5 rule 2).
 4. After the end, `terndb_result_counts(result, &ptr, &len, err)` gives `Complete.counts` (one `uint64_t` per
    parameter tuple, borrowed from the result) and `terndb_result_commit(result, &seq, err)` returns 1 with the
-   commit sequence number, or 0 when absent. Before the end both are `C1005`; after an error the counts are those
+   commit sequence number, or 0 when absent. The end is the caller's: the pull that answered 0 (or yielded NULL),
+   however early the request itself completed, so a caller never reads counts for batches it has not yet pulled.
+   Before the end both are `C1005`; after an error the counts are those
    of `Complete` had it been sent and are not available (`C1005`).
 5. `terndb_result_txid`, `terndb_result_snapshot`, `terndb_result_shape` (32 octets, borrowed) and
    `terndb_result_type` (NULL when the statement returns no value) are the `ResultHeader`'s and are available as
@@ -542,7 +549,9 @@ code, a handle-state error on a transaction or statement the [WIRE] code.
 
 ## 12. The header
 
-The header is `terndb.h`. The declarations below are the whole of ABI 1.0; §13 governs how it grows.
+The header is `terndb.h`. The declarations below are the whole of ABI 1.0; §13 governs how it grows. A
+generated header conforms when it declares the same things, compared declaration by declaration with comments,
+order, layout and parameter names set aside and a `#define` compared by the value it stands for.
 
 ```c
 #ifndef TERNDB_H
@@ -1001,6 +1010,14 @@ by §1–§11. A function not listed has exactly the behaviour its section gives
 `p09-export/`) showed that an exported C API with handles and a callback works, but not this one. The items below
 go to the sysl session; the ABI above is not to be bent around them.
 
+**At sysl 0.13.6 items 1–11 are met** and `libterndb` is built on them (`capi/`, `sh/sysl/terndb/capi/`):
+`into_raw`/`from_raw`; `*unit` as `void *` and `*const T` as `const T *`; `usize` as `size_t` and a `*[N]T`
+parameter as `T name[N]`; a `c type` for C's `int` and `char`; `--header`, `--header-guard`, `#define`s from
+exported constants, opaque handle `typedef`s; `build-c --shared` exporting exactly the header's functions, with
+`--install-name`, `--compatibility-version` and `--current-version`; a trap in an export ending the process
+without unwinding (sysl `ffi.md` § "A trap inside an export"); `@thread_local`; an allocator pair told each block's
+size and boundary; and `sysl.io.poll.WakeFd`. Item 12 is not met.
+
 1. **Hand C a counted `&T` and take it back** (`into_raw` / `from_raw` or an exported `&T` parameter and return).
    0.11.0 has no way to keep a reference-counted object alive while only C holds it, so the probe kept every
    handle in a module registry `Buf[&Db]`, which leaks slots, needs a lock to be thread-safe, and cannot detect a
@@ -1029,6 +1046,10 @@ go to the sysl session; the ABI above is not to be bent around them.
     library.
 11. The module must be a directory (0.11.0): the C ABI lives in `sh.sysl.terndb.capi/` as its own module. This is a
     layout fact, not a gap.
+12. **An allocation failure handed back to the program.** An allocator pair that answers NULL stops a sysl program
+    at the allocation, so §3 rule 3's `C2001` and `T1008` (`details.reason = "allocator"`) cannot be raised and
+    §15.2's `allocator_null_fails_cleanly` is skipped. Wanted: a way for a library to see an allocation fail, at
+    least at the boundary of each exported call.
 
 ## 15. Conformance
 
@@ -1040,13 +1061,16 @@ go to the sysl session; the ABI above is not to be bent around them.
 2. `terndb_init` with a newer minor or another major fails with `C1009`; any call but the four of §3 rule 1 before
    it fails with `C1008`.
 3. With a counting allocator installed, every allocation is matched by a `free` with the same size and alignment,
-   and the allocator sees no traffic after every handle has been freed and every database closed.
+   and the allocator sees no traffic after every handle has been freed and every database closed. A debug build
+   is exempt from the matching: it keeps every freed handle's memory for the life of the process (§2.4 rule 2), so
+   those blocks are never freed. *The two rules cannot both hold in one build.*
 4. After a test frees everything it made, `terndb_debug_live_handles()` returns its value before the test.
 5. (D) A call with a freed handle of every kind, and with a handle of the wrong kind, fails with `C1001` (or
    aborts, for functions without an error channel); a freed handle's address is never returned again.
 6. Two threads calling into one connection at once: exactly one call proceeds and the other fails with `C1004`.
 7. A sync call, `terndb_op_wait` or `terndb_queue_wait` from inside the log sink fails with `C1003` and does not
-   block.
+   block. The two waits have no error channel, so this is a release build's behaviour; a debug build aborts on
+   them, naming `C1003` (§12.1 rule 22).
 8. Every input buffer may be overwritten with garbage immediately after the call returns, sync or async, without
    changing the outcome.
 9. A batch stays readable, octet for octet, after its result is freed, its connection closed and its database

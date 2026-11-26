@@ -126,6 +126,17 @@ sources() -> Buf[SourceText]
     src(out, "wire_messages.sysl", embed("wire_messages.sysl"))
     src(out, "wire_params.sysl", embed("wire_params.sysl"))
     src(out, "wire_reassembler.sysl", embed("wire_reassembler.sysl"))
+    // The C ABI, `sh.sysl.terndb.capi`, a module directory of its own.
+    src(out, "capi/capi_batch.sysl", embed("capi/capi_batch.sysl"))
+    src(out, "capi/capi_codes.sysl", embed("capi/capi_codes.sysl"))
+    src(out, "capi/capi_config.sysl", embed("capi/capi_config.sysl"))
+    src(out, "capi/capi_conn.sysl", embed("capi/capi_conn.sysl"))
+    src(out, "capi/capi_core.sysl", embed("capi/capi_core.sysl"))
+    src(out, "capi/capi_db.sysl", embed("capi/capi_db.sysl"))
+    src(out, "capi/capi_error.sysl", embed("capi/capi_error.sysl"))
+    src(out, "capi/capi_exec.sysl", embed("capi/capi_exec.sysl"))
+    src(out, "capi/capi_log.sysl", embed("capi/capi_log.sysl"))
+    src(out, "capi/capi.sysl", embed("capi/capi.sysl"))
     out
 end sources
 
@@ -361,10 +372,11 @@ every_source_file_of_the_package_is_listed_in_sources()
         listed.add(s.file)
 
     var seen = 0
-    for name in entries(dir).unwrap()
-        if name.ends_with(".sysl") && !name.ends_with("_tests.sysl")
-            seen += 1
-            assert(listed.has(name), s"$name is a source file of the package and is not in sources()")
+    for (sub, prefix) in [(dir, ""), (join(dir, "capi"), "capi/")]
+        for name in entries(sub).unwrap()
+            if name.ends_with(".sysl") && !name.ends_with("_tests.sysl")
+                seen += 1
+                assert(listed.has(prefix + name), s"$prefix$name is a source file of the package and is not in sources()")
 
     assert_eq(seen, sources().len())
 

@@ -306,8 +306,10 @@ private run(todo: Buf[Done])
             Finish(r, counts, has, c) -> r.finish(counts, has, c)
             Ended(r, err) -> r.fail(err)
 
-/** An error with a [WIRE] code the library raises for the session (`W2008`). */
-wire_error_of(code: string, message: string) -> ErrorData = c_error(code, message)
+/** An error with a [WIRE] code the library raises for the session (`W2008`), retryable exactly as
+ * the registry says, as the session's own would be.
+ */
+wire_error_of(code: string, message: string) -> ErrorData = sh.sysl.terndb.wire_error(sh.sysl.terndb.failure(code, message), Unaffected)
 
 /** `T1007` (`cancelled`), with `details.reason` when given, as octets. */
 cancelled_octets(reason: string) -> Buf[u8]

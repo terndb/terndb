@@ -1,0 +1,425 @@
+module sh.sysl.terndb.capi
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.text.from_utf8
+import sh.sysl.terndb.{Detail, ErrorEntry, ExecOptions, Isolation, Remote, RemoteApply, Serializable, Synchronous,
+    Unaffected, WireError}
+
+// The C ABI's own pieces, tested from sysl: the static registry, configuration forms, URL forms, the
+// handle record, errors across threads, the completion queue, operations and results. What a C caller
+// sees of them is tested by the driver in `tests/capi/`.
+
+// -- the registry -------------------------------------------------------------------------------
+
+private struct Row
+    code: string
+    name: string
+
+/** The live rows of `errors.md`, read independently of the generator that wrote `capi_codes.sysl`. */
+private registry_rows() -> Buf[Row]
+    val text = from_utf8(embed("../../../../docs/spec/errors.md")).unwrap()
+    val rows = buf[Row]()
+    var in_area = false
+    for line in text.split("\n")
+        if line.starts_with("## ") then in_area = line.ends_with("`)")
+        elif in_area && line.starts_with("| `") && !line.contains("*Withdrawn*")
+            val cells = line.split("|")
+            val code = cells[1].trim().trim_matches("`")
+            val name = cells[2].trim().trim_matches("`")
+            if code.len == 5 then rows.push(Row(code, name))
+    rows
+
+@test
+the_code_table_is_the_registry_row_for_row()
+    val rows = registry_rows()
+    assert(rows.len() > 150, s"only ${rows.len()} rows")
+    assert_eq(CodeCount, rows.len())
+    for i in 0..<rows.len()
+        val c = code_at(i)
+        assert_eq(c.code_text, rows[i].code)
+        assert_eq(c.name_text, rows[i].name)
+        assert_eq(c_text(ptr_cast(c.code)), rows[i].code)
+        assert_eq(c_text(ptr_cast(c.name)), rows[i].name)
+
+@test
+the_code_table_holds_every_c_layer_code()
+    for code in ["C1001", "C1002", "C1003", "C1004", "C1005", "C1006", "C1007", "C1008", "C1009", "C2001", "D4001",
+            "D4002", "D4003", "D4004"]
+        var found = false
+        for i in 0..<CodeCount
+            if code_at(i).code_text == code then found = true
+        assert(found, code)
+
+@test
+a_code_past_the_table_is_empty()
+    assert_eq(code_at(CodeCount).code_text, "")
+    assert_eq(c_text(ptr_cast(code_at(CodeCount).code)), "")
+
+@test
+code_name_maps_a_code_to_its_name_and_an_unknown_one_to_null()
+    assert_eq(c_text(code_name(ptr_cast(c"T1007"))), "cancelled")
+    assert_eq(c_text(code_name(ptr_cast(c"C1009"))), "abi_mismatch")
+    assert(code_name(ptr_cast(c"T9999")) == null)
+    assert(code_name(ptr_cast(c"")) == null)
+    assert(code_name(ptr_cast(c"t1007")) == null)
+    assert(code_name(null) == null)
+
+@test
+the_version_is_static_text_and_the_abi_is_one_zero()
+    assert_eq(c_text(version()), ReleaseVersion)
+    assert_eq(abi_version(), 0x10000)
+    assert_eq(AbiVersion, (AbiMajor << 16) | AbiMinor)
+
+// -- configuration ------------------------------------------------------------------------------
+
+@test
+a_count_is_decimal_digits_no_larger_than_two_to_the_63_minus_one()
+    assert_eq(parse_count("0"), Some(u64(0)))
+    assert_eq(parse_count("42"), Some(u64(42)))
+    assert_eq(parse_count("9223372036854775807"), Some(u64(0x7fff_ffff_ffff_ffff)))
+    assert_eq(parse_count("9223372036854775808"), None)
+    assert_eq(parse_count("18446744073709551616"), None)
+    assert_eq(parse_count(""), None)
+    assert_eq(parse_count("-1"), None)
+    assert_eq(parse_count("+1"), None)
+    assert_eq(parse_count(" 1"), None)
+    assert_eq(parse_count("1 "), None)
+    assert_eq(parse_count("1e3"), None)
+
+@test
+every_key_of_the_table_takes_its_forms()
+    for (k, v) in [("mode", "disk"), ("mode", "memory"), ("durability", "none"), ("durability", "snapshot"),
+            ("durability", "log"), ("create", "never"), ("create", "if_missing"), ("create", "always"),
+            ("read_only", "true"), ("read_only", "false"), ("threads", "1"), ("memory_limit", "0"),
+            ("snapshot_interval_ms", "1"), ("max_snapshot_age_ms", "0"), ("isolation", "serializable"),
+            ("isolation", "snapshot"), ("isolation", "read_committed"), ("synchronous", "off"), ("synchronous", "on"),
+            ("synchronous", "remote"), ("synchronous", "remote_apply"), ("lock_timeout_ms", "0"),
+            ("statement_timeout_ms", "5"), ("user", "anyone"), ("application", ""), ("password", "p"), ("token", "t"),
+            ("auth_methods", "peer"), ("tls_ca_file", "/x"), ("tls_server_name", "h"), ("max_in_flight", "1"),
+            ("max_open_txns", "1")]
+        assert(check_setting(k, v).is_none(), s"$k = $v")
+
+@test
+a_value_outside_its_form_is_c1002_naming_the_key()
+    for (k, v) in [("mode", "Memory"), ("durability", ""), ("create", "maybe"), ("read_only", "1"), ("threads", "0"),
+            ("snapshot_interval_ms", "0"), ("max_in_flight", "0"), ("max_open_txns", "0"), ("memory_limit", "-5"),
+            ("isolation", "repeatable_read"), ("synchronous", "always"), ("lock_timeout_ms", "x")]
+        val e = check_setting(k, v).unwrap()
+        assert_eq(e.entries[0].code, "C1002")
+        assert_eq(e.entries[0].details[0].key, "key")
+        assert_eq(e.entries[0].details[0].value, k)
+
+@test
+an_unknown_key_is_c1002_naming_it()
+    for k in ["", "Mode", "mode ", "colour", "durable"]
+        val e = check_setting(k, "x").unwrap()
+        assert_eq(e.entries[0].code, "C1002")
+        assert_eq(e.entries[0].details[0].value, k)
+
+@test
+the_key_lists_of_each_call_are_keys_of_the_table()
+    for keys in [OpenKeys, SessionKeys, ConnectKeys, CloneKeys]
+        for k in keys
+            assert(check_setting(k, "x").is_none() || check_setting(k, "x").unwrap().entries[0].message.contains("value"), k)
+
+@test
+isolation_constants_and_words_round_trip()
+    for c in [IsoSerializable, IsoSnapshot, IsoReadCommitted]
+        assert_eq(isolation_code(isolation_level(c).unwrap()), c)
+    assert_eq(isolation_level(3), None)
+    assert_eq(isolation_level(-1), None)
+    assert_eq(isolation_of("serializable"), Some(Serializable))
+    assert_eq(isolation_of(""), None)
+    assert_eq(sync_of("remote"), Some(Remote))
+    assert_eq(sync_of("remote_apply"), Some(RemoteApply))
+    assert_eq(sync_of(""), None)
+
+@test
+the_default_window_is_four_mib()
+    assert_eq(exec_options_of(null).unwrap().credit, Some(u64(4194304)))
+
+// -- URLs (§5.1 rule 2) -------------------------------------------------------------------------
+
+@test
+the_two_url_forms_are_accepted()
+    assert(url_form_ok("terndb://host/db"))
+    assert(url_form_ok("terndb://host:7365/db"))
+    assert(url_form_ok("terndb+unix:///tmp/s?database=x"))
+
+@test
+anything_else_is_not_a_url()
+    for u in ["", "terndb://", "terndb:///db", "terndb://host", "terndb://host/", "http://host/db",
+            "terndb+unix:///tmp/s", "terndb+unix:///tmp/s?database=", "TERNDB://host/db"]
+        assert(!url_form_ok(u), u)
+
+// -- handles (§2.4) -----------------------------------------------------------------------------
+
+@test
+every_handle_begins_with_its_head()
+    assert_eq(offsetof(ConfigH, head), 0)
+    assert_eq(offsetof(DbH, head), 0)
+    assert_eq(offsetof(ConnH, head), 0)
+    assert_eq(offsetof(TxnOptionsH, head), 0)
+    assert_eq(offsetof(ExecOptionsH, head), 0)
+    assert_eq(offsetof(TxnH, head), 0)
+    assert_eq(offsetof(StmtH, head), 0)
+    assert_eq(offsetof(ResultH, head), 0)
+    assert_eq(offsetof(BatchH, head), 0)
+    assert_eq(offsetof(ColRec, head), 0)
+    assert_eq(offsetof(TypeRec, head), 0)
+    assert_eq(offsetof(ErrorH, head), 0)
+    assert_eq(offsetof(QueueH, head), 0)
+    assert_eq(offsetof(OpH, head), 0)
+    assert_eq(offsetof(MetricsH, head), 0)
+    assert_eq(offsetof(LogRecordH, head), 0)
+
+@test
+every_kind_is_distinct()
+    val kinds = [KindConfig, KindDb, KindConn, KindTxnOptions, KindExecOptions, KindTxn, KindStmt, KindResult, KindBatch,
+        KindColumn, KindType, KindError, KindQueue, KindOp, KindMetrics, KindLogRecord]
+    for i in 0..<kinds.len
+        for j in 0..<kinds.len
+            if i != j then assert(kinds[i] != kinds[j])
+
+@test
+a_null_handle_is_refused_as_null()
+    assert(check_handle(null, KindConfig) == NullHandle)
+
+@test
+a_live_handle_of_its_kind_passes_and_of_another_kind_is_bad()
+    var h = Head(KindQueue, sysl.sync.Atomic(Live))
+    val p: *const unit = ptr_cast(&h)
+    assert(check_handle(p, KindQueue) == NoRefusal)
+    assert(check_handle(p, KindDb) == BadHandle)
+
+@test
+a_freed_handle_is_bad_and_freeing_it_again_is_reported()
+    var h = Head(KindError, sysl.sync.Atomic(Live))
+    val p: *const unit = ptr_cast(&h)
+    assert(mark_freed(p))
+    assert(check_handle(p, KindError) == BadHandle)
+    assert(!mark_freed(p))
+
+@test
+a_debug_build_checks_handles()
+    // `sysl test` builds in debug, where every handle is checked (§2.4 rule 2).
+    assert(DebugChecks)
+    assert(debug_checks())
+
+// -- errors -------------------------------------------------------------------------------------
+
+@test
+a_c_layer_error_is_one_unaffected_entry_never_retryable()
+    val e = c_error_with("C1002", "x is NULL", details1("key", "x"))
+    assert_eq(e.entries.len(), 1)
+    assert_eq(e.entries[0].path, "")
+    assert(!e.retryable)
+    assert(e.txn_state == Unaffected)
+    assert_eq(e.txid, None)
+
+@test
+an_error_crosses_threads_as_octets_unchanged()
+    val e = c_error_with("C1007", "no disk", details1("reason", "disk_storage"))
+    assert_eq(error_from_octets(error_octets(e)), e)
+    val entries = buf[ErrorEntry]()
+    entries.push(ErrorEntry("T1001", "a", "/p", buf(), None))
+    entries.push(ErrorEntry("Q3001", "b", "", buf(), None))
+    val two = WireError(entries, true, sh.sysl.terndb.TxnEffect.Aborted, Some(7), Some(2))
+    assert_eq(error_from_octets(error_octets(two)), two)
+
+@test
+octets_that_are_no_error_read_back_as_c1005()
+    assert_eq(error_from_octets(buf()).entries[0].code, "C1005")
+
+@test
+a_cancellation_is_t1007_retryable_with_its_reason()
+    val e = error_from_octets(cancelled_octets("shutdown"))
+    assert_eq(e.entries[0].code, "T1007")
+    assert(e.retryable)
+    assert_eq(e.entries[0].details[0].value, "shutdown")
+    assert_eq(error_from_octets(cancelled_octets("")).entries[0].details.len(), 0)
+
+@test
+a_session_error_the_library_raises_is_retryable_as_the_registry_says()
+    // W2008 is retryable; the encoder refuses an error whose flag disagrees with the registry.
+    val e = wire_error_of("W2008", "full")
+    assert_eq(error_from_octets(error_octets(e)), e)
+
+@test
+an_error_handle_lends_static_codes_and_names()
+    val h = error_handle(c_error("C1004", "busy"))
+    assert(h.entries[0].code != null)
+    assert_eq(c_text(ptr_cast(h.entries[0].code)), "C1004")
+    assert_eq(c_text(ptr_cast(h.entries[0].name)), "concurrent_use")
+    error_free(h)
+
+@test
+an_unregistered_code_gets_a_copy_of_its_own()
+    val h = error_handle(c_error("Z0000", "?"))
+    assert_eq(c_text(ptr_cast(h.entries[0].code)), "Z0000")
+    assert_eq(c_text(ptr_cast(h.entries[0].name)), "")
+    error_free(h)
+
+// -- the queue and operations -------------------------------------------------------------------
+
+@test
+a_queue_gives_its_tags_back_oldest_first_once_each()
+    val q = new_queue().unwrap()
+    for t in 0..<5
+        q.push(u64(t))
+    var out = [0u64; 8]
+    assert_eq(q.take(&out[0], 2), 2)
+    assert_eq(out[0], 0)
+    assert_eq(out[1], 1)
+    assert_eq(q.take(&out[0], 8), 3)
+    assert_eq(out[2], 4)
+    assert_eq(q.take(&out[0], 8), 0)
+
+@test
+a_freed_queue_discards_completions()
+    val q = new_queue().unwrap()
+    q.m.with((s) -> s.freed = true)
+    q.push(9)
+    var out = [0u64; 1]
+    assert_eq(q.take(&out[0], 1), 0)
+
+@test
+a_queue_wait_times_out_with_nothing()
+    val q = new_queue().unwrap()
+    var out = [0u64; 1]
+    assert_eq(q.wait(&out[0], 1, 5), 0)
+    assert_eq(q.wait(&out[0], 0, -1), 0)
+
+@test
+an_operation_completes_once_and_appends_its_tag_once()
+    val q = new_queue().unwrap()
+    val op = new_op(OpCommit, Some(q), 42)
+    assert(!op.is_done())
+    op.succeed(SeqOut(true, 5))
+    op.fail(c_error("C1005", "late"))
+    assert(op.is_done())
+    assert(op.error().is_none())
+    var out = [0u64; 4]
+    assert_eq(q.take(&out[0], 4), 1)
+    assert_eq(out[0], 42)
+    op.take() match
+        SeqOut(p, s) ->
+            assert(p)
+            assert_eq(s, 5)
+        _ -> assert(false, "no output")
+    op.take() match
+        NoOut -> ()
+        _ -> assert(false, "taken twice")
+
+@test
+a_discarded_operation_appends_no_tag()
+    val q = new_queue().unwrap()
+    val op = new_op(OpExecute, Some(q), 3)
+    op.m.with((s) -> s.discarded = true)
+    op.succeed(NoOut)
+    var out = [0u64; 1]
+    assert_eq(q.take(&out[0], 1), 0)
+
+@test
+a_failed_operation_reports_its_error()
+    val op = new_op(OpPrepare, None, 0)
+    op.fail(c_error("C1006", "closed"))
+    assert_eq(op.error().unwrap().entries[0].code, "C1006")
+    assert(op.wait(0))
+
+@test
+a_pending_operation_wait_times_out()
+    val op = new_op(OpPrepare, None, 0)
+    assert(!op.wait(5))
+
+// -- results ------------------------------------------------------------------------------------
+
+private test_conn() -> &sync ConnCore
+    val db = start_db(false, 0, 1).unwrap()
+    new_conn(db, "terndb", "", 4, 4)
+
+@test
+batches_produced_before_a_pull_come_out_in_order()
+    val c = test_conn()
+    val r = new_result(c, 1)
+    val a = buf[u8]()
+    a.push(1)
+    val b = buf[u8]()
+    b.push(2)
+    r.push(a)
+    r.push(b)
+    for want in [1, 2]
+        val op = new_op(OpNext, None, 0)
+        r.next(op)
+        op.take() match
+            BatchOut(p) -> assert_eq(p[0], u8(want))
+            _ -> assert(false, "no batch")
+    c.db.close_detached()
+
+@test
+a_pull_before_a_batch_waits_for_it()
+    val c = test_conn()
+    val r = new_result(c, 1)
+    val op = new_op(OpNext, None, 0)
+    r.next(op)
+    assert(!op.is_done())
+    val p = buf[u8]()
+    p.push(7)
+    r.push(p)
+    assert(op.is_done())
+    c.db.close_detached()
+
+@test
+the_end_completes_every_waiter_and_marks_the_end_seen()
+    val c = test_conn()
+    val r = new_result(c, 1)
+    val w1 = new_op(OpNext, None, 0)
+    val w2 = new_op(OpNext, None, 0)
+    r.next(w1)
+    r.next(w2)
+    assert(!r.m.with((s) -> s.end_seen))
+    val counts = buf[u64]()
+    counts.push(3)
+    r.finish(counts, false, 0)
+    assert(w1.is_done() && w2.is_done())
+    assert(r.m.with((s) -> s.end_seen))
+    val again = new_op(OpNext, None, 0)
+    r.next(again)
+    again.take() match
+        EndOut -> ()
+        _ -> assert(false, "not the end")
+    c.db.close_detached()
+
+@test
+a_result_ended_but_not_yet_pulled_to_its_end_has_not_been_seen_to_end()
+    val c = test_conn()
+    val r = new_result(c, 1)
+    r.finish(buf(), true, 9)
+    assert_eq(r.ended(), 1)
+    assert(!r.m.with((s) -> s.end_seen))
+    c.db.close_detached()
+
+@test
+a_failure_after_the_end_changes_nothing_and_repeats_to_every_pull()
+    val c = test_conn()
+    val r = new_result(c, 1)
+    r.fail(cancelled_octets(""))
+    r.fail(error_octets(c_error("C1005", "second")))
+    for _ in 0..<2
+        val op = new_op(OpNext, None, 0)
+        r.next(op)
+        assert_eq(op.error().unwrap().entries[0].code, "T1007")
+    c.db.close_detached()
+
+// -- embedded credentials -----------------------------------------------------------------------
+
+@test
+an_embedded_session_logs_in_by_peer_and_nothing_else()
+    val creds = EmbeddedCredentials()
+    assert(creds.permits("terndb", "terndb", "peer"))
+    assert(!creds.permits("terndb", "terndb", "scram-sha-256"))
+    assert(!creds.permits("terndb", "terndb", "token"))
+    assert(creds.verifier("terndb").is_none())
+    assert(creds.peer_permits("", "anyone"))
