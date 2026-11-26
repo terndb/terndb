@@ -26,7 +26,8 @@ struct WalAppended derives Eq
 /** What `state` guards: the records appended since the last flush began, as the bytes of LSNs
  * [base, end), with the 4 KiB of each segment header they cross held as zeros, and `durable`, the
  * end of the prefix known synced (§6.7 rule 1). After a failed sync `failed` holds its error and the
- * log refuses everything (D14).
+ * log refuses everything (D14). The kept error shares no count with anything outside the lock, and
+ * every refusal handed out is a `fresh` copy made under it: the threads that get one drop it at once.
  */
 struct WalState
     shift: u64
@@ -285,7 +286,7 @@ struct Wal
 
         val st = self.state.lock_raw()
         defer self.state.unlock_raw()
-        if st.failed.is_some() then return Err(st.failed.unwrap())
+        if st.failed.is_some() then return Err(st.failed.unwrap().fresh())
         val total = u64(enc.len())
 
         if total > wal_segment_capacity(st.shift)
@@ -315,7 +316,7 @@ struct Wal
      */
     wait_durable(*self, lsn: u64) -> Result[unit, CodecError]
         val st0 = self.state.lock_raw()
-        val failed0 = st0.failed
+        val failed0: Option[CodecError] = if st0.failed.is_some() then Some(st0.failed.unwrap().fresh()) else None
         val done0 = st0.durable >= lsn || st0.durable >= st0.end
         self.state.unlock_raw()
         if failed0.is_some() then return Err(failed0.unwrap())
@@ -326,7 +327,7 @@ struct Wal
         val st = self.state.lock_raw()
 
         if st.failed.is_some()
-            val e = st.failed.unwrap()
+            val e = st.failed.unwrap().fresh()
             self.state.unlock_raw()
             return Err(e)
 
@@ -349,7 +350,7 @@ struct Wal
             Ok(_) ->
                 st2.durable = to
                 st2.flushes += 1
-            Err(e) -> st2.failed = Some(e)
+            Err(e) -> st2.failed = Some(e.fresh())
 
         self.state.unlock_raw()
         r
@@ -420,7 +421,7 @@ struct Wal
 
     private failure(*self) -> CodecError
         val st = self.state.lock_raw()
-        val e = st.failed.unwrap()
+        val e = st.failed.unwrap().fresh()
         self.state.unlock_raw()
         e
 end Wal
