@@ -3,8 +3,10 @@ module sh.sysl.terndb.capi
 
 import sysl.buf.{Buf, buf}
 import sysl.raw.ptr_cast
+import sysl.sync.Atomic
 import sysl.text.from_utf8
-import sh.sysl.terndb.{Detail, ErrorEntry, ExecOptions, Isolation, Remote, RemoteApply, Serializable, Synchronous,
+import sysl.threads.{Condvar, Mutex}
+import sh.sysl.terndb.{Cancel, Detail, ErrorEntry, ExecOptions, Isolation, Remote, RemoteApply, Serializable, Synchronous,
     Unaffected, WireError}
 
 // The C ABI's own pieces, tested from sysl: the static registry, configuration forms, URL forms, the
@@ -333,6 +335,222 @@ a_failed_operation_reports_its_error()
 a_pending_operation_wait_times_out()
     val op = new_op(OpPrepare, None, 0)
     assert(!op.wait(5))
+
+// -- what crosses between threads shares no count -----------------------------------------------
+//
+// A count is not atomic, so a value handed from a caller's thread to the engine thread, or back,
+// through a lock must share no storage with the sender's: each side drops its share on its own
+// thread. Writing into the sender's buffer after the handoff shows whether the receiver's is the same.
+
+/** A database whose requests stay queued: no engine thread drains them. */
+private idle_db() -> &sync DbCore =
+    DbCore(1, Mutex.new(DbQueue(buf(), false, false, None, None, 0)), Condvar.new(), Atomic(0), false, 0, 1, 0,
+        Atomic(0), Atomic(0), Atomic(0), Mutex.new(buf[AbortCount]()))
+
+private octets(xs: [3]u8) -> Buf[u8]
+    val b = buf[u8]()
+    for x in xs
+        b.push(x)
+    b
+
+/** The type octet and first payload octet of queued request `i`, or 0 and 0 for a close. */
+private queued(db: &sync DbCore, i: usize) -> (u8, u8) = db.m.with((s) -> s.reqs[i] match
+    OpenConn(_, w) -> (w.ty, w.payload[0])
+    ToConn(_, _, w) -> (w.ty, w.payload[0])
+    CloseConn(_) -> (0u8, 0u8))
+
+private queued_count(db: &sync DbCore) -> usize = db.m.with((s) -> s.reqs.len())
+
+@test
+a_posted_message_shares_no_storage_with_the_senders()
+    val db = idle_db()
+    val p = octets([1, 2, 3])
+    assert(db.post(ToConn(7, 1, Wire(0x51, p))))
+    p[0] = 99
+    assert_eq(queued(db, 0), (0x51u8, 1u8))
+
+@test
+a_posted_hello_shares_no_storage_with_the_senders()
+    val db = idle_db()
+    val conn = new_conn(db, "terndb", "", 4, 4)
+    val p = octets([4, 5, 6])
+    assert(db.post(OpenConn(conn, Wire(0x48, p))))
+    p[0] = 99
+    assert_eq(queued(db, 0), (0x48u8, 4u8))
+
+@test
+a_posted_close_is_queued_after_what_came_before_it()
+    val db = idle_db()
+    assert(db.post(ToConn(3, 1, Wire(0x51, octets([7, 8, 9])))))
+    assert(db.post(CloseConn(3)))
+    assert_eq(queued_count(db), 2)
+    assert_eq(queued(db, 0), (0x51u8, 7u8))
+    db.m.with((s) -> s.reqs[1] match
+        CloseConn(id) -> assert_eq(id, 3)
+        _ -> assert(false, "not a close"))
+
+@test
+a_request_to_a_stopping_database_is_refused_and_not_queued()
+    val db = idle_db()
+    db.stop(new_op(OpClose, None, 0))
+    assert(!db.post(ToConn(1, 1, Wire(0x51, octets([1, 2, 3])))))
+    assert(!db.post(CloseConn(1)))
+    assert_eq(queued_count(db), 0)
+    assert(db.is_closed())
+
+@test
+a_request_to_a_stopped_database_is_refused_and_not_queued()
+    val db = idle_db()
+    db.m.with((s) -> s.stopped = true)
+    assert(!db.post(ToConn(1, 1, Wire(0x51, octets([1, 2, 3])))))
+    assert_eq(queued_count(db), 0)
+
+@test
+an_operations_batch_shares_no_storage_with_what_completed_it()
+    val op = new_op(OpNext, None, 0)
+    val p = octets([1, 2, 3])
+    op.succeed(BatchOut(p))
+    p[0] = 99
+    op.take() match
+        BatchOut(q) -> assert_eq(q[0], 1)
+        _ -> assert(false, "no batch")
+
+@test
+an_operations_statement_shares_no_storage_with_what_completed_it()
+    val op = new_op(OpPrepare, None, 0)
+    val prepared = octets([1, 2, 3])
+    val envelope = octets([4, 5, 6])
+    op.succeed(StmtOut(9, Wire(0x50, prepared), envelope))
+    prepared[0] = 99
+    envelope[0] = 99
+    op.take() match
+        StmtOut(h, w, e) ->
+            assert_eq(h, 9)
+            assert_eq(w.ty, 0x50)
+            assert_eq(w.payload[0], 1)
+            assert_eq(e[0], 4)
+        _ -> assert(false, "no statement")
+
+@test
+an_operations_result_header_shares_no_storage_with_what_completed_it()
+    val db = idle_db()
+    val r = new_result(new_conn(db, "terndb", "", 4, 4), 1)
+    val op = new_op(OpExecute, None, 0)
+    val header = octets([1, 2, 3])
+    op.succeed(ResultOut(r, Wire(0x52, header)))
+    header[0] = 99
+    op.take() match
+        ResultOut(c, w) ->
+            assert_eq(c.stream, 1)
+            assert_eq(w.payload[0], 1)
+        _ -> assert(false, "no result")
+
+@test
+an_operations_error_shares_no_storage_with_what_failed_it()
+    val op = new_op(OpCommit, None, 0)
+    val err = error_octets(c_error("C1006", "closed"))
+    val first = err[0]
+    op.complete(Some(err), NoOut)
+    err[0] = first + 1
+    assert_eq(op.m.with((s) -> s.err.unwrap()[0]), first)
+    assert_eq(op.error().unwrap().entries[0].code, "C1006")
+
+@test
+an_operation_completed_with_no_buffer_keeps_its_scalars()
+    val op = new_op(OpStatus, None, 0)
+    op.succeed(StatusOut(2, true, 17))
+    op.take() match
+        StatusOut(st, present, seq) ->
+            assert_eq(st, 2)
+            assert(present)
+            assert_eq(seq, 17)
+        _ -> assert(false, "no status")
+
+@test
+a_batch_handed_to_a_waiting_pull_shares_no_storage_with_the_pushed_one()
+    val db = idle_db()
+    val r = new_result(new_conn(db, "terndb", "", 4, 4), 1)
+    val op = new_op(OpNext, None, 0)
+    r.next(op)
+    val p = octets([1, 2, 3])
+    r.push(p)
+    p[0] = 99
+    op.take() match
+        BatchOut(q) -> assert_eq(q[0], 1)
+        _ -> assert(false, "no batch")
+
+@test
+a_batch_kept_for_a_later_pull_shares_no_storage_with_the_pushed_one()
+    val db = idle_db()
+    val r = new_result(new_conn(db, "terndb", "", 4, 4), 1)
+    val p = octets([1, 2, 3])
+    r.push(p)
+    p[0] = 99
+    val op = new_op(OpNext, None, 0)
+    r.next(op)
+    op.take() match
+        BatchOut(q) -> assert_eq(q[0], 1)
+        _ -> assert(false, "no batch")
+
+/** The first envelope octet of the prepare kept for `stream`, or 0 where there is none. */
+private kept_envelope(conn: &sync ConnCore, stream: u64) -> u8 = conn.m.with((s) ->
+    var b: u8 = 0
+    for x in s.streams
+        if x.stream == stream
+            x.sink match
+                PrepareSink(_, _, e) -> b = e[0]
+                _ -> ()
+    b)
+
+@test
+a_prepares_envelope_kept_by_the_connection_shares_no_storage_with_the_senders()
+    val db = idle_db()
+    val conn = new_conn(db, "terndb", "", 4, 4)
+    val op = new_op(OpPrepare, None, 0)
+    val env = octets([5, 6, 7])
+    conn.request(Cancel, PrepareSink(op, 1, env), op)
+    env[0] = 99
+    assert(!op.is_done())
+    assert_eq(kept_envelope(conn, 1), 5)
+
+@test
+a_sink_found_for_a_stream_shares_no_storage_with_the_kept_one()
+    val db = idle_db()
+    val conn = new_conn(db, "terndb", "", 4, 4)
+    val op = new_op(OpPrepare, None, 0)
+    conn.request(Cancel, PrepareSink(op, 1, octets([5, 6, 7])), op)
+    conn.m.with((s) -> find_sink(s, 1) match
+        Some(PrepareSink(_, h, e)) ->
+            assert_eq(h, 1)
+            e[0] = 99
+        _ -> assert(false, "no prepare"))
+    assert_eq(kept_envelope(conn, 1), 5)
+
+@test
+a_sink_with_no_buffer_is_kept_as_it_was()
+    val db = idle_db()
+    val conn = new_conn(db, "terndb", "", 4, 4)
+    val op = new_op(OpCommit, None, 0)
+    conn.request(Cancel, ReplySink(op, OpCommit, None), op)
+    assert(!op.is_done())
+    assert(conn.m.with((s) -> s.streams.len() == 1 && s.streams[0].stream == 1))
+    conn.m.with((s) -> s.streams[0].sink match
+        ReplySink(_, k, t) ->
+            assert(k == OpCommit)
+            assert(t.is_none())
+        _ -> assert(false, "not a reply"))
+
+@test
+a_request_on_a_full_window_keeps_no_sink()
+    val db = idle_db()
+    val conn = new_conn(db, "terndb", "", 1, 4)
+    val first = new_op(OpPrepare, None, 0)
+    conn.request(Cancel, PrepareSink(first, 1, octets([5, 6, 7])), first)
+    val second = new_op(OpPrepare, None, 0)
+    conn.request(Cancel, PrepareSink(second, 2, octets([8, 9, 10])), second)
+    assert_eq(second.error().unwrap().entries[0].code, "W2008")
+    assert_eq(conn.m.with((s) -> s.streams.len()), 1)
+    assert_eq(kept_envelope(conn, 1), 5)
 
 // -- results ------------------------------------------------------------------------------------
 

@@ -33,6 +33,12 @@ struct Wire
     ty: u8
     payload: Buf[u8]
 
+/** An equal message that shares no count with `w`: its payload is a copy. A count is not atomic, so
+ * what one thread hands another through a lock is a `fresh` copy, and the sender drops its own share
+ * on its own thread without racing the receiver's.
+ */
+fresh_wire(w: Wire) -> Wire = Wire(w.ty, w.payload.copy())
+
 /** `m` as it would be framed at wire minor `minor`. */
 wire_of(m: Message, minor: u64) -> Wire = Wire(m.type_code(), encode_payload(m, minor).unwrap())
 
@@ -157,8 +163,10 @@ struct OpCore
             self.m.unlock_raw()
             return
         s.done = true
-        s.err = err
-        s.out = out
+        s.err = err match
+            Some(e) -> Some(e.copy())
+            None -> None
+        s.out = fresh_out(out)
         val discarded = s.discarded
         val q = if discarded then None else s.queue
         val tag = s.tag
@@ -210,6 +218,16 @@ struct OpCore
         self.m.unlock_raw()
         out
 
+/** An equal output that shares no count with `o`: every buffer in it is a copy, and a core is the
+ * same `&sync` one. An operation keeps one of these, since the thread that completes it drops its
+ * own share of `o` once the lock is let go, while the thread that takes it may be dropping its own.
+ */
+fresh_out(o: OpOut) -> OpOut = o match
+    StmtOut(handle, prepared, envelope) -> StmtOut(handle, fresh_wire(prepared), envelope.copy())
+    ResultOut(core, header) -> ResultOut(core, fresh_wire(header))
+    BatchOut(payload) -> BatchOut(payload.copy())
+    _ -> o
+
 /** A new pending operation of `kind`, appending `tag` to `q` (if any) when it completes. */
 new_op(kind: OpKind, q: Option[&sync QueueCore], tag: u64) -> &sync OpCore =
     OpCore(kind, Mutex.new(OpState(false, None, NoOut, false, q, tag, false, None, 0)), Condvar.new())
@@ -233,6 +251,12 @@ enum Req
     ToConn(conn: u64, stream: u64, w: Wire)
     /** The connection has been closed: its session rolls everything back. */
     CloseConn(conn: u64)
+
+/** An equal request that shares no count with `r`: its message is a `fresh_wire` copy. */
+fresh_req(r: Req) -> Req = r match
+    OpenConn(conn, hello) -> OpenConn(conn, fresh_wire(hello))
+    ToConn(conn, stream, w) -> ToConn(conn, stream, fresh_wire(w))
+    CloseConn(conn) -> CloseConn(conn)
 
 struct DbQueue
     reqs: Buf[Req]
@@ -268,11 +292,14 @@ struct DbCore
 
     is_closed(&sync self) -> bool = self.closed.load() != 0
 
-    /** Hands `r` to the engine thread; false when the database is closed. */
+    /** Hands `r` to the engine thread; false when the database is closed. What is queued is a
+     * `fresh` copy: the caller drops its own share of `r` on its thread while the engine thread
+     * drops the queued one on its own.
+     */
     post(&sync self, r: Req) -> bool
         val s = self.m.lock_raw()
         val ok = !s.stop && !s.stopped
-        if ok then s.reqs.push(r)
+        if ok then s.reqs.push(fresh_req(r))
         self.m.unlock_raw()
         if ok then self.cv.notify_all()
         ok

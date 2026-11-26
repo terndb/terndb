@@ -88,7 +88,7 @@ struct ConnCore
             return op.fail(wire_error_of("W2008", s"at most ${self.max_in_flight} requests may be in flight"))
         s.next_stream += 2
         val stream = s.next_stream - 1
-        s.streams.push(StreamSink(stream, sink))
+        s.streams.push(StreamSink(stream, fresh_sink(sink)))
         self.m.unlock_raw()
 
         op.m.with((o) ->
@@ -248,9 +248,20 @@ new_conn(db: &sync DbCore, user: string, application: string, max_in_flight: u64
     ConnCore(db.next_conn_id(), db, user, application, max_in_flight, max_open_txns,
         Mutex.new(ConnState(buf(), 0, 0, 0, false, false, 0)), Atomic(0))
 
-private find_sink(s: *ConnState, stream: u64) -> Option[Sink]
+/** An equal sink that shares no count with `k`: a prepare's envelope is a copy. The connection keeps
+ * one of these, since the thread that submits drops its own share of `k` once the lock is let go
+ * while the engine thread may be taking the kept one.
+ */
+fresh_sink(k: Sink) -> Sink = k match
+    PrepareSink(op, handle, envelope) -> PrepareSink(op, handle, envelope.copy())
+    _ -> k
+
+/** A `fresh_sink` copy of what `stream`'s answers go to, leaving it in place: the kept one may be
+ * taken and dropped by another thread once the lock is let go.
+ */
+find_sink(s: *ConnState, stream: u64) -> Option[Sink]
     for x in s.streams
-        if x.stream == stream then return Some(x.sink)
+        if x.stream == stream then return Some(fresh_sink(x.sink))
     None
 
 private take_sink(s: *ConnState, stream: u64) -> Option[Sink]
